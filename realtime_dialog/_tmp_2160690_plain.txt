@@ -1,0 +1,187 @@
+*拉取大模型音色列表
+*调试
+* 
+*请求参数
+*下方仅列出该接口特有的请求参数和部分公共参数。更多信息请见公共参数。
+* 
+*
+*返回参数
+*下方仅列出本接口特有的返回参数。更多信息请参见返回结构。
+* 
+*
+*请求示例
+* 
+*返回示例
+* 
+*错误码
+*下表为您列举了该接口与业务逻辑相关的错误码。公共错误码请参见公共错误码文档。
+**
+*
+*Languages object[]
+*语言信息
+* 
+* 
+* 
+*Avatar string
+*音色头像
+*Flag string 示例值：🇨🇳
+*旗
+*Icon string 示例值：😡
+*情感图标
+*Categories string[] 示例值：多语种
+*分类信息，比如["多语种", "中文"] 或 ["多情感", "普通", "快乐"]
+*ShortTrialURL string
+*短试听链接
+*Page integer 可选 示例值：1
+*当前页码
+*Categories object[]
+*分类信息
+* 
+*Limit integer 可选 示例值：30
+*页大小
+*ResourceID string 示例值：seed-tts-2.0
+*音色对应的模型版本
+*Age string 示例值：青年
+*年龄
+* 
+* 
+*Version string   示例值：2025-05-20
+*API的版本，取值：2025-05-20。
+*Name string 示例值：甜美桃子
+*音色名
+*Language string 示例值：zh-cn
+*语言
+*Description string 示例值：温柔的知心姐姐，对人耐心，总能用暖意化解他人烦恼。
+*描述
+* 
+* 
+* 
+* 
+* 
+* 
+*Text string 示例值：你看那片云像不像棉花糖？我们一起去追它好不好？
+*试听链接所对应的文本
+*VoiceType string 示例值：zh_female_tianmeitaozi_mars_bigtts
+*在tts接口里面用的音色
+*Total integer 示例值：1000
+*音色总个数
+*ResourceIDs string[]   示例值：seed-tts-2.0
+*获取不同模型版本对应的音色，seed-tts-1.0或者seed-tts-2.0
+*VoiceTypes string[] 可选 示例值：zh_female_tianmeitaozi_mars_bigtts
+*对应的音色id
+*POST /?Action=ListSpeakers&Version=2025-05-20 HTTP/1.1
+*Host: https://open.volcengineapi.com
+*Content-Type: application/json; charset=UTF-8
+*X-Date: 20260105T072305Z
+*X-Content-Sha256: 287e874e******d653b44d21e
+*Authorization: HMAC-SHA256 Credential=Adfks******wekfwe/20260105/cn-beijing/speech_saas_prod/request, SignedHeaders=host;x-content-sha256;x-date, Signature=47a7d934ff7b37c03938******cd7b8278a40a1057690c401e92246a0e41085f
+*
+*{
+*  "ResourceIDs": [
+*    "seed-tts-2.0"
+*  ],
+*  "VoiceTypes": [
+*    "zh_female_tianmeitaozi_mars_bigtts"
+*  ],
+*  "Page": 1,
+*  "Limit": "30"
+*}
+*Speakers object[] 示例值：参考下文示例
+*音色列表
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+* 
+*Label string 示例值：生气
+*情感
+*{
+*  "ResponseMetadata": {
+*    "RequestId": "20260105152308152031019124E4D2DA",
+*    "Action": "ListSpeakers",
+*    "Version": "2025-05-20",
+*    "Service": "speech_saas_prod",
+*    "Region": "cn-beijing"
+*  },
+*  "Result": {
+*    "Total": 1000,
+*    "Speakers": [
+*      {
+*        "VoiceType": "zh_female_tianmeitaozi_mars_bigtts",
+*        "Name": "甜美桃子",
+*        "Avatar": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_hz_ihsph/ljhwZthlaukjlkulzlp/portal/bigtts/avatar/开朗姐姐.png",
+*        "Gender": "女",
+*        "Age": "青年",
+*        "Categories": [
+*          {
+*            "Categories": [
+*              "多语种"
+*            ]
+*          }
+*        ],
+*        "NormalLabels": [
+*          "热门"
+*        ],
+*        "SpecialLabels": [
+*          "抖音同款"
+*        ],
+*        "TrialURL": "https://www.volcengine.com/",
+*        "ShortTrialURL": "Ta",
+*        "Languages": [
+*          {
+*            "Language": "zh-cn",
+*            "Text": "你看那片云像不像棉花糖？我们一起去追它好不好？",
+*            "Flag": "🇨🇳"
+*          }
+*        ],
+*        "Emotions": [
+*          {
+*            "Icon": "😡",
+*            "Label": "生气",
+*            "Value": "angry"
+*          }
+*        ],
+*        "Description": "温柔的知心姐姐，对人耐心，总能用暖意化解他人烦恼。",
+*        "ResourceID": "seed-tts-2.0"
+*      }
+*    ]
+*  }
+*}
+*NormalLabels string[] 示例值：热门
+*普通标签
+*Value string 示例值：angry
+*情感标识
+*Gender string 示例值：女
+*性别
+*Action string   示例值：ListSpeakers
+*要执行的操作，取值：ListSpeakers。
+*TrialURL string 示例值：https://www.volcengine.com/
+*试听链接
+*Emotions object[]
+*情感信息
+* 
+* 
+* 
+*SpecialLabels string[] 示例值：抖音同款
+*特殊标签
+错误信息
+状态码
+说明
+错误码
+The request has failed due to an unknown error.
+500
+
+InternalError
+The specified parameter %s is invalid.
+400
+
+InvalidParameter
