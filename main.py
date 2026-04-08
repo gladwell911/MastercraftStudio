@@ -1828,6 +1828,21 @@ class ChatFrame(wx.Frame):
         except Exception:
             pass
 
+    def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is None:
+            return
+        payload = {
+            "type": "history_changed",
+            "chat_id": str(chat_id or ""),
+            "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+            "ts": time.time(),
+        }
+        try:
+            server.broadcast_event(payload)
+        except Exception:
+            pass
+
     def _remote_turn_payload(self, turn: dict) -> dict:
         question = str(turn.get("question") or "")
         answer_md = str(turn.get("answer_md") or "")
@@ -1894,21 +1909,22 @@ class ChatFrame(wx.Frame):
         text = str(payload.get("text") or "").strip()
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
-        chat_id = str(payload.get("chat_id") or "").strip()
-        if chat_id and chat_id != self.active_chat_id:
-            if self._find_archived_chat(chat_id):
-                if threading.current_thread() is threading.main_thread():
-                    self._switch_current_chat(chat_id)
+        requested_chat_id = str(payload.get("chat_id") or "").strip()
+        if requested_chat_id:
+            if requested_chat_id != self.active_chat_id:
+                if self._find_archived_chat(requested_chat_id):
+                    self._switch_current_chat(requested_chat_id)
                 else:
-                    self.active_chat_id = chat_id
-                    self.current_chat_id = chat_id
-                    self._current_chat_state["id"] = chat_id
+                    self.active_chat_id = requested_chat_id
+                    self.current_chat_id = requested_chat_id
+                    self._current_chat_state["id"] = requested_chat_id
+            chat_id = requested_chat_id
         else:
-                self.active_chat_id = chat_id
-                self.current_chat_id = chat_id
+            chat_id = self.active_chat_id or self.current_chat_id or self._ensure_active_chat_id()
+            if not self.current_chat_id and self.active_chat_id:
+                self.current_chat_id = self.active_chat_id
+            if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
-        if not chat_id:
-            chat_id = self.active_chat_id or self.current_chat_id or ""
         if threading.current_thread() is threading.main_thread():
             current_model = self._resolve_current_model()
         else:
@@ -1928,8 +1944,50 @@ class ChatFrame(wx.Frame):
         return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
 
     def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
-        self._on_new_chat_clicked(None)
-        return 200, {"accepted": True, "chat_id": self.active_chat_id or self.current_chat_id or ""}
+        chat = self._start_remote_new_chat(payload)
+        return 200, {"accepted": True, **chat}
+
+    def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
+        previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+        self.current_chat_id = ""
+        self.active_chat_id = ""
+        self.active_session_turns = []
+        now = time.time()
+        self.active_session_started_at = now
+        self._current_chat_state = {
+            "id": "",
+            "title": str((payload or {}).get("title") or "新聊天"),
+            "title_manual": False,
+            "turns": self.active_session_turns,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.active_chat_id = str(uuid.uuid4())
+        self.current_chat_id = self.active_chat_id
+        self._current_chat_state["id"] = self.active_chat_id
+        model = str((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID).strip()
+        resolved = model_id_from_display_name(model)
+        if resolved in MODEL_IDS:
+            model = resolved
+        elif model not in MODEL_IDS:
+            model = DEFAULT_MODEL_ID
+        self.selected_model = model
+        if threading.current_thread() is threading.main_thread():
+            self.model_combo.SetValue(model_display_name(model))
+            self.input_edit.SetFocus()
+        self._current_chat_state["model"] = model
+        self._save_state()
+        self._refresh_history(archived["id"] if archived else previous_chat_id or None)
+        self._render_answer_list()
+        self.SetStatusText("已开始远程新聊天")
+        self._push_remote_history_changed(self.active_chat_id)
+        return {
+            "chat_id": self.active_chat_id,
+            "title": self._current_chat_state["title"],
+            "model": model,
+            "created_at": now,
+        }
 
     def _remote_api_reply_request_ui(self, payload: dict) -> tuple[int, dict]:
         text = str(payload.get("text") or "").strip()
@@ -3276,6 +3334,7 @@ class ChatFrame(wx.Frame):
         self._render_answer_list()
         self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
+        self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -3502,9 +3561,48 @@ class ChatFrame(wx.Frame):
         turns = chat.get("turns") or []
         self.active_session_turns = copy.deepcopy(turns)
         self.active_session_started_at = float(chat.get("created_at") or time.time())
+        self.active_chat_id = str(chat.get("source_chat_id") or chat.get("id") or "").strip() or str(uuid.uuid4())
+        self.active_openclaw_session_key = str(chat.get("openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
+        self.active_openclaw_session_id = str(chat.get("openclaw_session_id") or "").strip()
+        self.active_openclaw_session_file = str(chat.get("openclaw_session_file") or "").strip()
+        try:
+            self.active_openclaw_sync_offset = max(int(chat.get("openclaw_sync_offset") or 0), 0)
+        except Exception:
+            self.active_openclaw_sync_offset = 0
+        self.active_openclaw_last_event_id = str(chat.get("openclaw_last_event_id") or "").strip()
+        try:
+            self.active_openclaw_last_synced_at = float(chat.get("openclaw_last_synced_at") or 0.0)
+        except Exception:
+            self.active_openclaw_last_synced_at = 0.0
+        self.active_codex_thread_id = str(chat.get("codex_thread_id") or "").strip()
+        self.active_codex_turn_id = str(chat.get("codex_turn_id") or "").strip()
+        self.active_codex_turn_active = bool(chat.get("codex_turn_active", False))
+        self.active_codex_pending_prompt = str(chat.get("codex_pending_prompt") or "").strip()
+        pending_request = chat.get("codex_pending_request")
+        self.active_codex_pending_request = pending_request if isinstance(pending_request, dict) else None
+        request_queue = chat.get("codex_request_queue")
+        self.active_codex_request_queue = request_queue if isinstance(request_queue, list) else []
+        thread_flags = chat.get("codex_thread_flags")
+        self.active_codex_thread_flags = thread_flags if isinstance(thread_flags, list) else []
+        self.active_codex_latest_assistant_text = str(chat.get("codex_latest_assistant_text") or "").strip()
+        self.active_codex_latest_assistant_phase = str(chat.get("codex_latest_assistant_phase") or "").strip()
+        self.active_claudecode_session_id = str(chat.get("claudecode_session_id") or "").strip()
         self.current_chat_id = chat_id
         self._current_chat_state = copy.deepcopy(chat)
+        if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
+            self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1
+        resolved_model = ""
+        for t in reversed(self.active_session_turns):
+            m = str(t.get("model") or "").strip()
+            if is_visible_model_id(m):
+                resolved_model = m
+                break
+        if not resolved_model:
+            resolved_model = self.selected_model if is_visible_model_id(self.selected_model) else DEFAULT_MODEL_ID
+        self.selected_model = resolved_model
+        if threading.current_thread() is threading.main_thread():
+            self.model_combo.SetValue(self.selected_model)
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         return True

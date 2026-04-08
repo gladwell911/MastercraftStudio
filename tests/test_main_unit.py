@@ -270,6 +270,51 @@ def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
     assert seen["skipped"] == 1
 
 
+def test_switch_current_chat_restores_archived_runtime_state(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": 1.0}
+    ]
+    frame.archived_chats = [
+        {
+            "id": "chat-archived",
+            "source_chat_id": "chat-archived",
+            "title": "旧聊天",
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "codex/main", "created_at": 2.0}],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+            "codex_thread_id": "thread-archived",
+            "codex_turn_id": "turn-archived",
+            "codex_turn_active": True,
+            "codex_pending_prompt": "pending archived",
+            "codex_pending_request": {"request_id": 1},
+            "codex_request_queue": [{"request_id": 2}],
+            "codex_thread_flags": ["waitingOnUserInput"],
+            "codex_latest_assistant_text": "archived answer",
+            "codex_latest_assistant_phase": "complete",
+            "claudecode_session_id": "claude-archived",
+            "openclaw_session_key": "agent:main:main",
+            "openclaw_session_id": "openclaw-archived",
+            "openclaw_session_file": r"C:\\tmp\\archived.jsonl",
+            "openclaw_sync_offset": 12,
+            "openclaw_last_event_id": "evt-archived",
+            "openclaw_last_synced_at": 22.0,
+        }
+    ]
+
+    assert frame._switch_current_chat("chat-archived") is True
+    assert frame.active_chat_id == "chat-archived"
+    assert frame.current_chat_id == "chat-archived"
+    assert frame.active_session_turns[0]["question"] == "历史问题"
+    assert frame.active_codex_thread_id == "thread-archived"
+    assert frame.active_codex_turn_id == "turn-archived"
+    assert frame.active_codex_turn_active is True
+    assert frame.active_codex_pending_prompt == "pending archived"
+    assert frame.active_claudecode_session_id == "claude-archived"
+    assert frame.active_openclaw_session_id == "openclaw-archived"
+
+
 def test_render_answer_list_requests_listbox_repaint(frame, monkeypatch):
     frame.active_session_turns = [
         {"question": "问题", "answer_md": "回答", "model": "openai/gpt-5.2", "created_at": 1.0}
@@ -1439,6 +1484,32 @@ def test_new_chat_archives_with_async_rename(frame):
     frame._on_new_chat_clicked(None)
     assert seen["quick"] is True
     assert seen["async"] is True
+
+
+def test_new_chat_broadcasts_remote_history_changed(frame, monkeypatch):
+    frame.active_session_turns = []
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame._current_chat_state["id"] = "chat-old"
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda *_args, **_kwargs: None)
+    seen = []
+
+    class _Server:
+        def broadcast_event(self, payload):
+            seen.append(payload)
+
+    frame._remote_ws_server = _Server()
+
+    frame._on_new_chat_clicked(None)
+
+    assert any(payload.get("type") == "history_changed" for payload in seen)
+    status, body = frame._remote_api_history_list_ui()
+    assert status == 200
+    assert any(chat.get("chat_id") == frame.active_chat_id for chat in body["chats"])
 
 
 def test_busy_state_keeps_new_chat_enabled_while_request_running(frame):

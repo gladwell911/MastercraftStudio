@@ -84,6 +84,102 @@ def test_remote_message_with_chat_id_switches_target_chat(frame, monkeypatch):
     assert current_chat_id == "chat-b"
 
 
+def test_remote_message_with_chat_id_switches_archived_context_off_main_thread(
+    frame, monkeypatch
+):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "当前问题A",
+            "answer_md": "当前回答A",
+            "model": "codex/main",
+            "created_at": time.time(),
+        }
+    ]
+    frame._current_chat_state["id"] = "chat-a"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "聊天B",
+            "turns": [
+                {
+                    "question": "历史问题B",
+                    "answer_md": "历史回答B",
+                    "model": "codex/main",
+                    "created_at": time.time(),
+                }
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "pinned": False,
+        }
+    ]
+    fake_thread = object()
+    main_thread = object()
+    monkeypatch.setattr(main.threading, "current_thread", lambda: fake_thread)
+    monkeypatch.setattr(main.threading, "main_thread", lambda: main_thread)
+    seen = {}
+
+    def _submit(question, **kwargs):
+        seen["call"] = (
+            question,
+            kwargs,
+            frame.current_chat_id,
+            frame.active_session_turns[0]["question"],
+        )
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", _submit)
+
+    status, body = frame._remote_api_message_ui({"chat_id": "chat-b", "text": "hello B"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["chat_id"] == "chat-b"
+    question, kwargs, current_chat_id, loaded_question = seen["call"]
+    assert question == "hello B"
+    assert kwargs["chat_id"] == "chat-b"
+    assert current_chat_id == "chat-b"
+    assert loaded_question == "历史问题B"
+
+
+def test_remote_new_chat_while_running_returns_fresh_chat_id(frame, monkeypatch):
+    frame.is_running = True
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A",
+            "answer_md": "AA",
+            "model": "codex/main",
+            "created_at": time.time(),
+        }
+    ]
+    frame._current_chat_state["id"] = "chat-a"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_schedule_async_archive_rename", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", statuses.append)
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_new_chat_ui({"model": "codex/main"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["chat_id"]
+    assert body["chat_id"] != "chat-a"
+    assert frame.active_chat_id == body["chat_id"]
+    assert any(str(chat.get("id") or "") == "chat-a" for chat in frame.archived_chats)
+    assert statuses[-1] == "已开始远程新聊天"
+
+
 def test_remote_ws_state_reports_pending_request(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
@@ -184,9 +280,12 @@ def test_remote_ws_history_list_and_read(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     frame.active_chat_id = "active-1"
+    frame.current_chat_id = "active-1"
     frame.active_session_turns = [
         {"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": time.time()}
     ]
+    frame._current_chat_state["id"] = "active-1"
+    frame._current_chat_state["turns"] = frame.active_session_turns
     frame.archived_chats = [
         {
             "id": "arch-1",
