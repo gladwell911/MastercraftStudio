@@ -4,6 +4,33 @@ import config
 from dialog_worker import DialogWorker
 
 
+def _wx_target_is_alive(target) -> bool:
+    if target is None:
+        return False
+    try:
+        if isinstance(target, wx.Window):
+            if hasattr(target, "IsBeingDeleted") and target.IsBeingDeleted():
+                return False
+            if hasattr(target, "GetHandle") and not target.GetHandle():
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def wx_call_after_if_alive(func, *args, **kwargs) -> bool:
+    if wx.GetApp() is None:
+        return False
+    target = getattr(func, "__self__", None)
+    if target is not None and not _wx_target_is_alive(target):
+        return False
+    try:
+        wx.CallAfter(func, *args, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
 class MainFrame(wx.Frame):
     def __init__(self):
         super().__init__(parent=None, title="端到端语音通话", size=(980, 680))
@@ -126,7 +153,7 @@ class MainFrame(wx.Frame):
         self.speed_combo.Enable(enabled)
 
     def _on_worker_event_from_thread(self, event_type, payload):
-        wx.CallAfter(self.on_worker_event, event_type, payload)
+        wx_call_after_if_alive(self.on_worker_event, event_type, payload)
 
     def on_worker_event(self, event_type: str, payload: dict):
         if event_type == "connected":

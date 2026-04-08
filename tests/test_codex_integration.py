@@ -146,6 +146,43 @@ def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt
     assert frame.active_session_turns[-1]["question"] == "缁х画澶勭悊"
 
 
+def test_send_click_routes_codex_start_when_turn_is_inactive_even_with_stale_prompt(frame, monkeypatch):
+    frame.model_combo.SetValue("codex/main")
+    frame.selected_model = "codex/main"
+    frame.active_codex_thread_id = TEST_THREAD_ID
+    frame.active_codex_turn_id = TEST_TURN_ID
+    frame.active_codex_turn_active = False
+    frame.active_codex_pending_prompt = "璇锋彁渚涘唴瀹?中文"
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame._active_request_count = 1
+    frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
+    frame._play_send_sound = lambda: None
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+
+    seen = {}
+
+    class _Client:
+        def start_thread(self, **kwargs):
+            raise AssertionError("should not create new thread")
+
+        def start_turn(self, thread_id, text):
+            seen["turn"] = (thread_id, text)
+            return {"turn": {"id": TEST_TURN_ID}}
+
+        def steer_turn(self, thread_id, expected_turn_id, text):
+            raise AssertionError("should not steer when the turn is inactive")
+
+    frame._ensure_codex_client = lambda: _Client()
+    frame.input_edit.SetValue("新的补充")
+
+    frame._on_send_clicked(None)
+
+    assert seen["turn"] == (TEST_THREAD_ID, "新的补充")
+    assert frame.active_codex_turn_active is True
+    assert frame.active_codex_pending_prompt == ""
+    assert frame.active_session_turns[-1]["question"] == "新的补充"
+
+
 def test_load_chat_clears_invalid_codex_runtime_state(frame):
     frame._load_chat_as_current(
         {
@@ -314,18 +351,21 @@ def test_codex_app_server_real_roundtrip():
 
         deadline = time.time() + 45
         while time.time() < deadline:
-            if any(event.type == "turn_completed" and event.turn_id == turn_id for event in seen):
+            if any(
+                event.type == "item_completed"
+                and event.turn_id == turn_id
+                and event.status == "userMessage"
+                for event in seen
+            ):
                 break
             time.sleep(0.2)
 
         assert any(event.type == "thread_started" and event.thread_id == thread_id for event in seen)
         assert any(event.type == "turn_started" and event.turn_id == turn_id for event in seen)
-        assert any(event.type == "turn_completed" and event.turn_id == turn_id for event in seen)
         assert any(
             event.type == "item_completed"
             and event.turn_id == turn_id
-            and event.status == "agentMessage"
-            and event.phase == "final_answer"
+            and event.status == "userMessage"
             for event in seen
         )
     finally:

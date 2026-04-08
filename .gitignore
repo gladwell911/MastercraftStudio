@@ -7,7 +7,10 @@ build/
 *.egg
 
 # IDE
-.vscode/
+.vscode/*
+!.vscode/
+!.vscode/launch.json
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo
@@ -23,3 +26,5 @@ Thumbs.db
 # Local files
 .env
 *.local
+.venv/
+.venv311/

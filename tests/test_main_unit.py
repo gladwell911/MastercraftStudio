@@ -2,9 +2,11 @@
 import copy
 import time
 from pathlib import Path
+import asyncio
 
 import wx
 import pytest
+from aiohttp import ClientSession
 
 import main
 
@@ -70,6 +72,78 @@ def test_remote_ws_server_binds_to_localhost_by_default(frame, monkeypatch):
     finally:
         frame._remote_ws_server.stop()
         frame._remote_ws_server = None
+
+
+def test_remote_ws_server_supports_legacy_claudecode_env_names(frame, monkeypatch):
+    monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
+    monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)
+    monkeypatch.setenv("CLAUDECODE_REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("CLAUDECODE_REMOTE_CONTROL_PORT", "0")
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+
+    assert frame._build_remote_ws_url() == "ws://127.0.0.1:0/ws?token=secret"
+
+    frame._start_remote_ws_server_if_configured()
+    try:
+        assert frame._remote_ws_server.host == "127.0.0.1"
+        assert frame._remote_ws_server.bound_port > 0
+
+        async def _run():
+            session = ClientSession()
+            try:
+                ws = await session.ws_connect(f"http://127.0.0.1:{frame._remote_ws_server.bound_port}/ws?token=secret")
+                try:
+                    connected = (await ws.receive()).json()
+                    assert connected["type"] == "connected"
+                finally:
+                    await ws.close()
+            finally:
+                await session.close()
+
+        asyncio.run(_run())
+    finally:
+        frame._remote_ws_server.stop()
+        frame._remote_ws_server = None
+
+
+def test_remote_ws_server_autostarts_without_env_and_uses_default_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "1")
+    monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
+
+    frame = main.ChatFrame()
+    try:
+        assert frame.remote_control_token == main.DEFAULT_REMOTE_CONTROL_TOKEN
+        assert frame._remote_ws_server is not None
+        assert frame._remote_ws_server.bound_port > 0
+
+        async def _run():
+            session = ClientSession()
+            try:
+                ws = await session.ws_connect(
+                    f"http://127.0.0.1:{frame._remote_ws_server.bound_port}/ws?token={frame.remote_control_token}"
+                )
+                try:
+                    connected = (await ws.receive()).json()
+                    assert connected["type"] == "connected"
+                    assert connected["body"]["accepted"] is True
+                finally:
+                    await ws.close()
+            finally:
+                await session.close()
+
+        asyncio.run(_run())
+        saved_state = json.loads(frame.state_path.read_text(encoding="utf-8"))
+        assert saved_state["remote_control_token"] == main.DEFAULT_REMOTE_CONTROL_TOKEN
+    finally:
+        if frame._remote_ws_server is not None:
+            frame._remote_ws_server.stop()
+            frame._remote_ws_server = None
+        frame.Destroy()
 
 
 def test_char_hook_alt_c_submits_continue_from_any_focus(frame):
@@ -187,6 +261,51 @@ def test_adjacent_history_chat_id_keeps_advancing_after_switch(frame):
     assert frame._adjacent_history_chat_id(1) == "chat-b"
 
 
+def test_switch_current_chat_restores_archived_runtime_state(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": 1.0}
+    ]
+    frame.archived_chats = [
+        {
+            "id": "chat-archived",
+            "source_chat_id": "chat-archived",
+            "title": "旧聊天",
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "codex/main", "created_at": 2.0}],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+            "codex_thread_id": "thread-archived",
+            "codex_turn_id": "turn-archived",
+            "codex_turn_active": True,
+            "codex_pending_prompt": "pending archived",
+            "codex_pending_request": {"request_id": 1},
+            "codex_request_queue": [{"request_id": 2}],
+            "codex_thread_flags": ["waitingOnUserInput"],
+            "codex_latest_assistant_text": "archived answer",
+            "codex_latest_assistant_phase": "complete",
+            "claudecode_session_id": "claude-archived",
+            "openclaw_session_key": "agent:main:main",
+            "openclaw_session_id": "openclaw-archived",
+            "openclaw_session_file": r"C:\\tmp\\archived.jsonl",
+            "openclaw_sync_offset": 12,
+            "openclaw_last_event_id": "evt-archived",
+            "openclaw_last_synced_at": 22.0,
+        }
+    ]
+
+    assert frame._switch_current_chat("chat-archived") is True
+    assert frame.active_chat_id == "chat-archived"
+    assert frame.current_chat_id == "chat-archived"
+    assert frame.active_session_turns[0]["question"] == "历史问题"
+    assert frame.active_codex_thread_id == "thread-archived"
+    assert frame.active_codex_turn_id == "turn-archived"
+    assert frame.active_codex_turn_active is True
+    assert frame.active_codex_pending_prompt == "pending archived"
+    assert frame.active_claudecode_session_id == "claude-archived"
+    assert frame.active_openclaw_session_id == "openclaw-archived"
+
+
 def test_char_hook_ctrl_history_navigation_noops_without_archived_chats(frame):
     frame.active_chat_id = "chat-only"
     frame.archived_chats = []
@@ -295,6 +414,40 @@ def test_refresh_history_requests_listbox_repaint(frame, monkeypatch):
     frame._refresh_history()
 
     assert seen["calls"] == [(frame.history_list,)]
+
+
+def test_google_chat_remains_visible_in_history_after_done(frame, monkeypatch):
+    frame.active_chat_id = "chat-google"
+    frame.current_chat_id = "chat-google"
+    frame._current_chat_state = {
+        "id": "chat-google",
+        "title": "新聊天",
+        "title_manual": False,
+        "turns": frame.active_session_turns,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    frame.active_session_turns = [
+        {
+            "question": "解释一下 Gemini 模型",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "google/gemini-3.1-pro-preview",
+            "created_at": 1.0,
+            "request_status": "pending",
+        }
+    ]
+    frame.archived_chats = []
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+
+    frame._on_done(0, "Gemini 是 Google 的模型", "", "google/gemini-3.1-pro-preview", "", "chat-google")
+
+    choices = list(frame.history_list.GetStrings())
+    assert frame.history_ids[0] == "chat-google"
+    assert choices[0].startswith("[当前] ")
+    assert "解释一下 Gemini 模型"[:8] in choices[0]
+    assert frame.archived_chats == []
 
 
 def test_input_enter_during_ime_composition_does_not_send(frame):
@@ -445,6 +598,92 @@ def test_submit_question_renders_question_immediately_without_stealing_focus(fra
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert "马上显示的问题" in rows
     assert focused["n"] == 0
+
+
+def test_submit_question_keeps_new_chat_button_enabled_while_waiting(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    ok, message = frame._submit_question("等待中的问题", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    assert frame.is_running is True
+    assert frame.new_chat_button.IsEnabled() is True
+
+
+def test_new_chat_allowed_while_waiting_for_reply(frame, monkeypatch):
+    frame.is_running = True
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = [
+        {"question": "旧问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {"id": "chat-old", "turns": frame.active_session_turns}
+    seen = {}
+
+    def fake_archive(quick_title=False, schedule_async_rename=False):
+        seen["archive"] = (quick_title, schedule_async_rename)
+        return {"id": "chat-old"}
+
+    monkeypatch.setattr(frame, "_archive_active_session", fake_archive)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: seen.setdefault("history", True))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.setdefault("render", True))
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: seen.setdefault("focus", True))
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: seen.setdefault("status", text))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": seen.setdefault("push", chat_id))
+
+    frame._on_new_chat_clicked(None)
+
+    assert seen["archive"] == (True, True)
+    assert frame.current_chat_id == frame.active_chat_id
+    assert frame.active_chat_id != "chat-old"
+    assert seen["status"] == "已开始新聊天"
+
+
+def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
+    frame.active_session_turns = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+
+    frame._render_answer_list()
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "问题" in rows
+    assert "正在请求..." not in rows
+    assert "小诸葛" not in rows
+
+
+def test_on_done_renders_final_answer_after_hidden_requesting_placeholder(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0, "request_status": "pending"}
+    ]
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+
+    frame._render_answer_list()
+    before = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "正在请求..." not in before
+
+    frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-current")
+
+    after = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "小诸葛" in after
+    assert "最终回答" in after
 
 
 def test_submit_question_marks_turn_pending_with_recovery_metadata(frame, monkeypatch):
@@ -1441,6 +1680,32 @@ def test_new_chat_archives_with_async_rename(frame):
     assert seen["async"] is True
 
 
+def test_new_chat_broadcasts_remote_history_changed(frame, monkeypatch):
+    frame.active_session_turns = []
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame._current_chat_state["id"] = "chat-old"
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda *_args, **_kwargs: None)
+    seen = []
+
+    class _Server:
+        def broadcast_event(self, payload):
+            seen.append(payload)
+
+    frame._remote_ws_server = _Server()
+
+    frame._on_new_chat_clicked(None)
+
+    assert any(payload.get("type") == "history_changed" for payload in seen)
+    status, body = frame._remote_api_history_list_ui()
+    assert status == 200
+    assert any(chat.get("chat_id") == frame.active_chat_id for chat in body["chats"])
+
+
 def test_busy_state_keeps_new_chat_enabled_while_request_running(frame):
     frame._active_request_count = 1
 
@@ -1501,6 +1766,48 @@ def test_claudecode_done_does_not_rerender_ui_while_cli_runs(frame, monkeypatch)
     assert frame.active_session_turns[0]["answer_md"] == "Claude Code 回答"
     assert rendered["count"] == 1
     assert focused["count"] == 1
+
+
+def test_focus_latest_answer_skips_when_completion_window_is_not_foreground(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "小诸葛", ""), ("answer", 1, "小诸葛", "最新回答")]
+    calls = {"selection": 0, "focus": 0}
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: False)
+    monkeypatch.setattr(
+        frame.answer_list,
+        "SetSelection",
+        lambda *_args, **_kwargs: calls.__setitem__("selection", calls["selection"] + 1),
+    )
+    monkeypatch.setattr(
+        frame.answer_list,
+        "SetFocus",
+        lambda *_args, **_kwargs: calls.__setitem__("focus", calls["focus"] + 1),
+    )
+
+    frame._focus_latest_answer()
+
+    assert calls["selection"] == 0
+    assert calls["focus"] == 0
+
+
+def test_focus_latest_answer_only_focuses_when_completion_window_is_foreground(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "小诸葛", ""), ("answer", 1, "小诸葛", "最新回答")]
+    calls = {"selection": 0, "focus": 0}
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+    monkeypatch.setattr(
+        frame.answer_list,
+        "SetSelection",
+        lambda *_args, **_kwargs: calls.__setitem__("selection", calls["selection"] + 1),
+    )
+    monkeypatch.setattr(
+        frame.answer_list,
+        "SetFocus",
+        lambda *_args, **_kwargs: calls.__setitem__("focus", calls["focus"] + 1),
+    )
+
+    frame._focus_latest_answer()
+
+    assert calls["selection"] == 1
+    assert calls["focus"] == 1
 
 
 def test_background_delta_updates_archived_chat_without_switching_current(frame, monkeypatch):
@@ -1755,6 +2062,63 @@ def test_history_delete_removes_current_chat_from_persisted_state(frame, monkeyp
     assert data.get("active_session_turns") == []
 
 
+def test_history_delete_broadcasts_remote_history_changed(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "旧聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0, "pinned": False}
+    ]
+    frame.history_ids = ["chat-old"]
+    frame.history_list.Set(["旧聊天"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    seen = []
+
+    class _Server:
+        def broadcast_event(self, payload):
+            seen.append(payload)
+
+    frame._remote_ws_server = _Server()
+
+    frame._history_delete(None)
+
+    assert any(payload.get("type") == "history_changed" for payload in seen)
+
+
+def test_history_rename_broadcasts_remote_history_changed(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "旧聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0, "pinned": False}
+    ]
+    frame.history_ids = ["chat-old"]
+    frame.history_list.Set(["旧聊天"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    seen = []
+
+    class _Server:
+        def broadcast_event(self, payload):
+            seen.append(payload)
+
+    class _Dialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def get_value(self):
+            return "新标题"
+
+        def Destroy(self):
+            pass
+
+    frame._remote_ws_server = _Server()
+    monkeypatch.setattr(main, "RenameDialog", _Dialog)
+
+    frame._history_rename(None)
+
+    assert any(payload.get("type") == "history_changed" for payload in seen)
+
+
 def test_on_close_marks_current_chat_pending_turns_before_save(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
@@ -1946,6 +2310,8 @@ def test_model_ids_contains_new_models():
 
 def test_first_run_default_model_is_codex(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
     f = main.ChatFrame()
     try:
         assert f.selected_model == "openai/gpt-5.2"
@@ -1963,6 +2329,8 @@ def test_load_state_still_defaults_to_codex(monkeypatch, tmp_path):
     }
     (tmp_path / "app_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
     f = main.ChatFrame()
     try:
         assert f.selected_model == "openai/gpt-5.2"
@@ -1987,6 +2355,7 @@ def test_startup_shows_last_active_turns_in_answer_list(monkeypatch, tmp_path):
     }
     (tmp_path / "app_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     f = main.ChatFrame()
     try:
         assert f.selected_model == "codex/main"
@@ -2044,6 +2413,62 @@ def test_codex_worker_uses_target_chat_runtime_state_instead_of_current_chat(fra
     archived = frame._find_archived_chat(archived_chat_id)
     assert archived is not None
     assert archived["codex_turn_id"] == "33333333-3333-3333-3333-333333333333"
+
+
+def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.active_session_turns = [
+        {
+            "question": "继续当前 Codex 对话",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+        }
+    ]
+    frame.active_turn_idx = 0
+    frame._current_chat_state["codex_thread_id"] = "thread-old"
+    frame._current_chat_state["codex_turn_id"] = "turn-old"
+    frame._current_chat_state["codex_turn_active"] = False
+    frame._current_chat_state["codex_pending_prompt"] = "stale prompt"
+    frame._current_chat_state["codex_thread_flags"] = ["waitingOnUserInput"]
+    frame.active_codex_thread_id = "thread-old"
+    frame.active_codex_turn_id = "turn-old"
+    frame.active_codex_turn_active = False
+    frame.active_codex_pending_prompt = "stale prompt"
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+
+    seen = {"start_thread": 0, "turns": []}
+
+    class _Client:
+        def start_thread(self, **kwargs):
+            seen["start_thread"] += 1
+            seen["thread_kwargs"] = kwargs
+            return {"thread": {"id": "thread-new"}}
+
+        def start_turn(self, thread_id, text):
+            seen["turns"].append((thread_id, text))
+            if len(seen["turns"]) == 1:
+                raise RuntimeError("Codex app-server request failed: turn/start: thread not found: thread-old")
+            return {"turn": {"id": "turn-new"}}
+
+        def steer_turn(self, thread_id, expected_turn_id, text):
+            raise AssertionError("should not steer when the turn is inactive")
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker("chat-current", 0, "新的 Codex 问题", "codex/main")
+
+    assert seen["start_thread"] == 1
+    assert seen["turns"] == [("thread-old", "新的 Codex 问题"), ("thread-new", "新的 Codex 问题")]
+    assert frame.active_codex_thread_id == "thread-new"
+    assert frame.active_codex_turn_id == "turn-new"
+    assert frame.active_codex_turn_active is True
+    assert frame.active_session_turns[0]["codex_thread_id"] == "thread-new"
+    assert frame.active_session_turns[0]["codex_turn_id"] == "turn-new"
 
 
 @pytest.mark.parametrize(
@@ -2140,10 +2565,22 @@ def test_on_done_marks_pending_turn_failed_and_sets_request_error(frame):
 
 
 def test_model_display_name_maps_codex_and_claudecode():
+    assert main.model_display_name("openclaw/main") == "openclaw"
     assert main.model_display_name("codex/main") == "codex"
     assert main.model_display_name("claudecode/default") == "claudeCode"
+    assert main.model_id_from_display_name("openclaw") == "openclaw/main"
     assert main.model_id_from_display_name("codex") == "codex/main"
     assert main.model_id_from_display_name("claudeCode") == "claudecode/default"
+
+
+def test_model_combo_shows_display_names(frame):
+    choices = list(frame.model_combo.GetItems())
+    assert "openclaw" in choices
+    assert "codex" in choices
+    assert "claudeCode" in choices
+    assert "openclaw/main" not in choices
+    assert "codex/main" not in choices
+    assert "claudecode/default" not in choices
 
 
 def test_load_project_folder_appends_system_message_and_rerenders(frame, monkeypatch, tmp_path):
@@ -2360,6 +2797,33 @@ def test_close_not_vetoed_while_running(frame):
     frame._on_close(CloseEvent())
     assert calls["skip"] == 1
     assert calls["veto"] == 0
+
+
+def test_codex_ui_callbacks_skip_when_frame_is_being_deleted(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.view_mode = "active"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
+    frame.active_turn_idx = 0
+    frame.active_session_turns[0]["request_status"] = "pending"
+    frame.active_session_turns[0]["request_recoverable"] = True
+
+    scheduled = []
+    monkeypatch.setattr(frame, "IsBeingDeleted", lambda: True, raising=False)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: scheduled.append(("after", fn.__name__)))
+    monkeypatch.setattr(main.wx, "CallLater", lambda delay, fn, *args, **kwargs: scheduled.append(("later", delay, fn.__name__)) or type("T", (), {"IsRunning": lambda self: False, "Stop": lambda self: None})())
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: scheduled.append(("render",)))
+    monkeypatch.setattr(frame, "_save_state", lambda: scheduled.append(("save",)))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: scheduled.append(("sound",)))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: scheduled.append(("remote",)))
+    monkeypatch.setattr(frame, "SetStatusText", lambda *args, **kwargs: scheduled.append(("status",)))
+
+    frame._dispatch_codex_event_to_ui("chat-1", main.CodexEvent(type="agent_message_delta", text="x"))
+    frame._queue_answer_char_redirect("x")
+    frame._on_done(0, "完成", "", "codex/main", "", "chat-1")
+
+    assert all(item[0] not in {"after", "later"} for item in scheduled)
+    assert scheduled == [("status",), ("remote",), ("save",), ("render",), ("sound",)]
 
 def test_resolve_app_data_dir_frozen_uses_dist_history(monkeypatch):
     monkeypatch.setattr(main.sys, "frozen", True, raising=False)

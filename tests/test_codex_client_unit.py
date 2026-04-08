@@ -1,6 +1,7 @@
 import threading
 import time
 from types import SimpleNamespace
+from pathlib import Path
 
 import codex_client
 
@@ -13,6 +14,7 @@ def test_codex_model_helper():
 def test_codex_client_start_turn_sends_request_and_returns_result(monkeypatch):
     client = codex_client.CodexAppServerClient()
     sent = []
+    seen = {}
     monkeypatch.setattr(client, "_ensure_started", lambda: None)
     monkeypatch.setattr(client, "_send_json", lambda payload: sent.append(payload))
 
@@ -21,9 +23,17 @@ def test_codex_client_start_turn_sends_request_and_returns_result(monkeypatch):
         client._handle_message({"id": 1, "result": {"turn": {"id": "turn-1"}}})
 
     threading.Thread(target=_reply, daemon=True).start()
+    original_request = client._request_internal
+
+    def _capture_request(method, params=None, timeout=None):
+        seen["timeout"] = timeout
+        return original_request(method, params=params, timeout=timeout)
+
+    monkeypatch.setattr(client, "_request_internal", _capture_request)
     result = client.start_turn("thread-1", "hello")
 
     assert result["turn"]["id"] == "turn-1"
+    assert seen["timeout"] == codex_client.DEFAULT_CODEX_TURN_TIMEOUT
     assert sent == [
         {
             "id": 1,
@@ -39,6 +49,7 @@ def test_codex_client_start_turn_sends_request_and_returns_result(monkeypatch):
 def test_codex_client_steer_turn_sends_expected_payload(monkeypatch):
     client = codex_client.CodexAppServerClient()
     sent = []
+    seen = {}
     monkeypatch.setattr(client, "_ensure_started", lambda: None)
     monkeypatch.setattr(client, "_send_json", lambda payload: sent.append(payload))
 
@@ -47,11 +58,19 @@ def test_codex_client_steer_turn_sends_expected_payload(monkeypatch):
         client._handle_message({"id": 1, "result": {"turnId": "turn-1"}})
 
     threading.Thread(target=_reply, daemon=True).start()
+    original_request = client._request_internal
+
+    def _capture_request(method, params=None, timeout=None):
+        seen["timeout"] = timeout
+        return original_request(method, params=params, timeout=timeout)
+
+    monkeypatch.setattr(client, "_request_internal", _capture_request)
     client.steer_turn("thread-1", "turn-1", "补充信息")
 
     assert sent[0]["method"] == "turn/steer"
     assert sent[0]["params"]["expectedTurnId"] == "turn-1"
     assert sent[0]["params"]["input"][0]["text"] == "补充信息"
+    assert seen["timeout"] == codex_client.DEFAULT_CODEX_TURN_TIMEOUT
 
 
 def test_codex_client_maps_server_request_to_event():
@@ -134,6 +153,11 @@ def test_ensure_started_uses_resolved_launch_command(monkeypatch):
         return _Proc()
 
     monkeypatch.setattr(codex_client, "resolve_codex_launch_command", lambda: ["codex.cmd"])
+    monkeypatch.setattr(
+        codex_client,
+        "build_codex_app_server_env",
+        lambda cwd=None: ({"CODEX_HOME": r"C:\\tmp\\codex-home"}, Path(r"C:\\tmp\\codex-home")),
+    )
     monkeypatch.setattr(codex_client.subprocess, "Popen", _popen)
     monkeypatch.setattr(codex_client.threading, "Thread", lambda *args, **kwargs: SimpleNamespace(start=lambda: None))
     monkeypatch.setattr(client, "_initialize", lambda: seen.setdefault("initialized", True))
@@ -142,27 +166,44 @@ def test_ensure_started_uses_resolved_launch_command(monkeypatch):
 
     assert seen["call"]["args"] == [
         "codex.cmd",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-C",
-        str(codex_client.Path.cwd()),
         "app-server",
         "--listen",
         "stdio://",
+        "--analytics-default-enabled",
     ]
+    assert seen["call"]["kwargs"]["env"]["CODEX_HOME"] == r"C:\\tmp\\codex-home"
     assert seen["initialized"] is True
 
 
-def test_build_codex_app_server_command_includes_bypass_and_cwd(monkeypatch):
+def test_build_codex_app_server_command_uses_app_server_defaults(monkeypatch):
     monkeypatch.setattr(codex_client, "resolve_codex_launch_command", lambda: ["codex.cmd"])
 
     command = codex_client.build_codex_app_server_command(r"C:\code\codex")
 
     assert command == [
         "codex.cmd",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-C",
-        r"C:\code\codex",
         "app-server",
         "--listen",
         "stdio://",
+        "--analytics-default-enabled",
     ]
+
+
+def test_build_codex_app_server_env_seeds_clean_home(tmp_path, monkeypatch):
+    source_home = tmp_path / ".codex"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text("{\"token\": \"x\"}", encoding="utf-8")
+    (source_home / "config.toml").write_text("personality = \"pragmatic\"\n", encoding="utf-8")
+    (source_home / "state_5.sqlite").write_text("bad-state", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    env, codex_home = codex_client.build_codex_app_server_env(str(workspace))
+
+    assert codex_home.parent == workspace
+    assert codex_home.name.startswith(".codex-home-")
+    assert env["CODEX_HOME"] == str(codex_home)
+    assert (codex_home / "auth.json").read_text(encoding="utf-8") == "{\"token\": \"x\"}"
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == "personality = \"pragmatic\"\n"
+    assert not (codex_home / "state_5.sqlite").exists()

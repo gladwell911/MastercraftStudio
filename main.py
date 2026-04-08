@@ -77,6 +77,7 @@ VK_LMENU = 0xA4
 VK_RMENU = 0xA5
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
+DEFAULT_REMOTE_CONTROL_TOKEN = "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
 VK_PROCESSKEY = 0xE5
 VK_PACKET = 0xE7
 VK_V = 0x56
@@ -140,6 +141,45 @@ VOICE_OPTIMIZE_PROMPT = (
 )
 
 
+def _wx_target_is_alive(target) -> bool:
+    if target is None:
+        return False
+    try:
+        if isinstance(target, wx.Window):
+            if hasattr(target, "IsBeingDeleted") and target.IsBeingDeleted():
+                return False
+            if hasattr(target, "GetHandle") and not target.GetHandle():
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def wx_call_after_if_alive(func, *args, **kwargs) -> bool:
+    if wx.GetApp() is None:
+        return False
+    target = getattr(func, "__self__", None)
+    if target is not None and not _wx_target_is_alive(target):
+        return False
+    try:
+        wx.CallAfter(func, *args, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
+def wx_call_later_if_alive(delay_ms: int, func, *args, **kwargs):
+    if wx.GetApp() is None:
+        return None
+    target = getattr(func, "__self__", None)
+    if target is not None and not _wx_target_is_alive(target):
+        return None
+    try:
+        return wx.CallLater(delay_ms, func, *args, **kwargs)
+    except Exception:
+        return None
+
+
 class _Stripper(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -170,7 +210,7 @@ def model_display_name(model_id: str) -> str:
     if model_id.startswith("claudecode/"):
         return "claudeCode"
     if model_id.startswith("openclaw/"):
-        return "openClaw"
+        return "openclaw"
     return model_id
 
 
@@ -182,7 +222,7 @@ def model_id_from_display_name(display_name: str) -> str:
         return "codex/main"
     if display_name == "claudeCode":
         return "claudecode/default"
-    if display_name == "openClaw":
+    if display_name == "openclaw":
         return "openclaw/main"
     return display_name
 
@@ -388,7 +428,7 @@ class GlobalCtrlTapHook:
         if not self._hook:
             err = ctypes.get_last_error()
             if self.on_error:
-                wx.CallAfter(self.on_error, f"全局语音热键不可用（Windows Hook 安装失败，错误码 {err}）")
+                wx_call_after_if_alive(self.on_error, f"全局语音热键不可用（Windows Hook 安装失败，错误码 {err}）")
             self._using_fallback = True
             return
         self._last_hook_event_at = time.monotonic()
@@ -399,7 +439,7 @@ class GlobalCtrlTapHook:
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret == -1:
                     if self.on_error:
-                        wx.CallAfter(self.on_error, "全局语音热键不可用（消息循环异常）")
+                        wx_call_after_if_alive(self.on_error, "全局语音热键不可用（消息循环异常）")
                     break
                 if ret == 0:
                     break
@@ -426,7 +466,7 @@ class GlobalCtrlTapHook:
                 right_down = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
                 if (not self._hook or self._using_fallback) and (not self._fallback_notice_sent) and self.on_error:
                     self._fallback_notice_sent = True
-                    wx.CallAfter(self.on_error, "全局语音热键进入兼容模式（轮询）")
+                    wx_call_after_if_alive(self.on_error, "全局语音热键进入兼容模式（轮询）")
                 should_emit = self._should_use_poller_release()
                 if should_emit and was_left_down and (not left_down):
                     self._emit_ctrl_keyup(False, "left")
@@ -457,7 +497,7 @@ class GlobalCtrlTapHook:
             if (now - last) < 0.06:
                 return
             self._last_emit_at_by_side[side_key] = now
-        wx.CallAfter(self.on_ctrl_keyup, combo_used, side_key)
+        wx_call_after_if_alive(self.on_ctrl_keyup, combo_used, side_key)
 
 
 class RenameDialog(wx.Dialog):
@@ -637,6 +677,11 @@ class ChatFrame(wx.Frame):
         self.view_history_id = None
         self._current_chat_state = {}
         self.current_chat_id = None
+        self.remote_control_token = DEFAULT_REMOTE_CONTROL_TOKEN
+        self.remote_control_domain = ""
+        self.remote_control_host = "127.0.0.1"
+        self.remote_control_port = 18080
+        self.remote_control_autostart = True
 
         self.history_ids = []
         self.answer_meta = []
@@ -657,16 +702,16 @@ class ChatFrame(wx.Frame):
         self.realtime_call_role = DEFAULT_REALTIME_CALL_ROLE
         self.realtime_call_speech_rate = DEFAULT_REALTIME_CALL_SPEECH_RATE
         self._voice_input = VoiceInputController(
-            on_state_change=lambda text: wx.CallAfter(self._on_voice_state, text),
-            on_result=lambda text, mode: wx.CallAfter(self._on_voice_result, text, mode),
-            on_error=lambda msg: wx.CallAfter(self._on_voice_error, msg),
-            on_stop_recording=lambda: wx.CallAfter(self._on_voice_stop_recording),
+            on_state_change=lambda text: wx_call_after_if_alive(self._on_voice_state, text),
+            on_result=lambda text, mode: wx_call_after_if_alive(self._on_voice_result, text, mode),
+            on_error=lambda msg: wx_call_after_if_alive(self._on_voice_error, msg),
+            on_stop_recording=lambda: wx_call_after_if_alive(self._on_voice_stop_recording),
         )
         self._realtime_call = RealtimeCallController(
             settings=RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate),
-            on_status=lambda message: wx.CallAfter(self._on_realtime_call_status, message),
-            on_error=lambda message: wx.CallAfter(self._on_realtime_call_error, message),
-            on_active_change=lambda active: wx.CallAfter(self._on_realtime_call_active_changed, active),
+            on_status=lambda message: wx_call_after_if_alive(self._on_realtime_call_status, message),
+            on_error=lambda message: wx_call_after_if_alive(self._on_realtime_call_error, message),
+            on_active_change=lambda active: wx_call_after_if_alive(self._on_realtime_call_active_changed, active),
         )
         self._global_ctrl_hook = GlobalCtrlTapHook(self._on_global_ctrl_keyup, self._on_global_ctrl_hook_error)
 
@@ -679,9 +724,11 @@ class ChatFrame(wx.Frame):
         self._realtime_call.update_settings(
             RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate)
         )
-        wx.CallAfter(self._realtime_call.prepare)
+        self._initialize_remote_control_settings()
+        wx_call_after_if_alive(self._realtime_call.prepare)
         self._merge_legacy_archived_chats()
-        self._start_remote_ws_server_if_configured()
+        if self.remote_control_autostart:
+            self._start_remote_ws_server_if_configured()
         self._start_claudecode_remote_ws_server_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
         if self.active_session_turns:
@@ -703,7 +750,7 @@ class ChatFrame(wx.Frame):
         self._refresh_history()
         self._render_answer_list()
         self._set_input_hint_idle()
-        wx.CallAfter(self.input_edit.SetFocus)
+        wx_call_after_if_alive(self.input_edit.SetFocus)
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -732,8 +779,9 @@ class ChatFrame(wx.Frame):
         row.Add(wx.StaticText(panel, label="模型："), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         model_choices = []
         for choice in VISIBLE_MODEL_IDS:
-            if choice not in model_choices:
-                model_choices.append(choice)
+            display_choice = model_display_name(choice)
+            if display_choice not in model_choices:
+                model_choices.append(display_choice)
         self.model_combo = wx.ComboBox(panel, choices=model_choices, style=wx.CB_READONLY, size=(320, -1))
         row.Add(self.model_combo, 0, wx.ALIGN_CENTER_VERTICAL)
         right.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -1044,6 +1092,14 @@ class ChatFrame(wx.Frame):
             self.realtime_call_speech_rate = int(min(max(int(data.get("realtime_call_speech_rate", DEFAULT_REALTIME_CALL_SPEECH_RATE)), -50), 100))
         except Exception:
             self.realtime_call_speech_rate = DEFAULT_REALTIME_CALL_SPEECH_RATE
+        self.remote_control_token = str(data.get("remote_control_token") or self.remote_control_token or "").strip()
+        self.remote_control_domain = str(data.get("remote_control_domain") or self.remote_control_domain or "").strip()
+        self.remote_control_host = str(data.get("remote_control_host") or self.remote_control_host or "127.0.0.1").strip() or "127.0.0.1"
+        try:
+            self.remote_control_port = int(data.get("remote_control_port") or self.remote_control_port or 18080)
+        except Exception:
+            self.remote_control_port = 18080
+        self.remote_control_autostart = bool(data.get("remote_control_autostart", self.remote_control_autostart))
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         if self.active_session_turns and not self.active_chat_id:
@@ -1051,6 +1107,10 @@ class ChatFrame(wx.Frame):
         if self.active_session_turns and not self.active_openclaw_session_id:
             if any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
                 self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
+        if self.active_chat_id and not self.current_chat_id:
+            self.current_chat_id = self.active_chat_id
+        if self.active_chat_id and not self._current_chat_state.get("id"):
+            self._current_chat_state["id"] = self.active_chat_id
         self._sort_archived_chats()
         if changed:
             self._save_state()
@@ -1081,11 +1141,90 @@ class ChatFrame(wx.Frame):
             "active_session_started_at": self.active_session_started_at,
             "realtime_call_role": self.realtime_call_role,
             "realtime_call_speech_rate": self.realtime_call_speech_rate,
+            "remote_control_token": self.remote_control_token,
+            "remote_control_domain": self.remote_control_domain,
+            "remote_control_host": self.remote_control_host,
+            "remote_control_port": self.remote_control_port,
+            "remote_control_autostart": self.remote_control_autostart,
         }
         try:
             self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def _read_remote_control_setting(self, *names: str, default: str = "") -> str:
+        for name in names:
+            value = str(os.getenv(name) or "").strip()
+            if value:
+                return value
+        return default
+
+    def _read_remote_control_bool_setting(self, *names: str, default: bool = True) -> bool:
+        raw = self._read_remote_control_setting(*names, default="")
+        if not raw:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _initialize_remote_control_settings(self) -> None:
+        changed = False
+
+        token = self._read_remote_control_setting(
+            "REMOTE_CONTROL_TOKEN",
+            "CLAUDECODE_REMOTE_CONTROL_TOKEN",
+            default=DEFAULT_REMOTE_CONTROL_TOKEN,
+        )
+        if not token:
+            token = DEFAULT_REMOTE_CONTROL_TOKEN
+        if token != self.remote_control_token:
+            self.remote_control_token = token
+            changed = True
+
+        domain = self._read_remote_control_setting(
+            "REMOTE_CONTROL_DOMAIN",
+            "CLAUDECODE_REMOTE_CONTROL_DOMAIN",
+            default=self.remote_control_domain,
+        )
+        if domain != self.remote_control_domain:
+            self.remote_control_domain = domain
+            changed = True
+
+        host = self._read_remote_control_setting(
+            "REMOTE_CONTROL_HOST",
+            "CLAUDECODE_REMOTE_CONTROL_HOST",
+            default=self.remote_control_host or "127.0.0.1",
+        ).strip() or "127.0.0.1"
+        if host != self.remote_control_host:
+            self.remote_control_host = host
+            changed = True
+
+        port_text = self._read_remote_control_setting(
+            "REMOTE_CONTROL_PORT",
+            "CLAUDECODE_REMOTE_CONTROL_PORT",
+            default=str(self.remote_control_port or 18080),
+        ).strip() or "18080"
+        try:
+            port = int(port_text)
+        except Exception:
+            port = 18080
+        if port < 0:
+            port = 18080
+        if port == 0 and port_text != "0":
+            port = 18080
+        if port != self.remote_control_port:
+            self.remote_control_port = port
+            changed = True
+
+        autostart = self._read_remote_control_bool_setting(
+            "REMOTE_CONTROL_AUTOSTART",
+            "CLAUDECODE_REMOTE_CONTROL_AUTOSTART",
+            default=self.remote_control_autostart,
+        )
+        if autostart != self.remote_control_autostart:
+            self.remote_control_autostart = autostart
+            changed = True
+
+        if changed:
+            self._save_state()
 
     def _is_timestamp_like_archive_title(self, title: str) -> bool:
         text = str(title or "").strip()
@@ -1122,11 +1261,36 @@ class ChatFrame(wx.Frame):
             key=lambda c: (0 if c.get("pinned") else 1, -float(c.get("created_at") or c.get("updated_at") or 0.0))
         )
 
+    def _current_history_id(self) -> str:
+        return str(
+            self.active_chat_id
+            or self.current_chat_id
+            or (self._current_chat_state.get("id") if isinstance(self._current_chat_state, dict) else "")
+            or ""
+        ).strip()
+
+    def _current_history_title(self) -> str:
+        title = str((self._current_chat_state or {}).get("title") or "").strip()
+        title_manual = bool((self._current_chat_state or {}).get("title_manual"))
+        if title_manual and title:
+            return title
+        if self.active_session_turns:
+            summarized = self._summarize_last_turn_locally(self.active_session_turns).strip()
+            if summarized:
+                return summarized
+        return title or "新聊天"
+
     def _refresh_history(self, keep_id=None):
         self._sort_archived_chats()
         self.history_list.Clear()
         self.history_ids = []
+        current_id = self._current_history_id()
+        if current_id and self.active_session_turns:
+            self.history_list.Append(f"[当前] {self._current_history_title()}")
+            self.history_ids.append(current_id)
         for c in self.archived_chats:
+            if current_id and str(c.get("id") or "") == current_id:
+                continue
             title = str(c.get("title") or "新聊天")
             disp = f"[置顶] {title}" if c.get("pinned") else title
             self.history_list.Append(disp)
@@ -1159,6 +1323,7 @@ class ChatFrame(wx.Frame):
         for i, t in enumerate(turns):
             q = str(t.get("question") or "")
             a_md, a = self._turn_answer_markdown(t)
+            show_pending_placeholder = a_md != REQUESTING_TEXT
             show_user_rows = not (
                 (is_openclaw_model(str(t.get("model") or "")) or is_codex_model(str(t.get("model") or "")) or is_claudecode_model(str(t.get("model") or "")))
                 and (not q.strip())
@@ -1169,12 +1334,13 @@ class ChatFrame(wx.Frame):
                 self.answer_meta.append(("user", i, "我", ""))
                 self.answer_list.Append(q)
                 self.answer_meta.append(("question", i, q, ""))
-            self.answer_list.Append("小诸葛")
-            self.answer_meta.append(("ai", i, "小诸葛", ""))
-            self.answer_list.Append(a)
-            self.answer_meta.append(("answer", i, a, a_md))
-            if self.view_mode == "active" and i == self.active_turn_idx:
-                self._active_answer_row_index = self.answer_list.GetCount() - 1
+            if show_pending_placeholder:
+                self.answer_list.Append("小诸葛")
+                self.answer_meta.append(("ai", i, "小诸葛", ""))
+                self.answer_list.Append(a)
+                self.answer_meta.append(("answer", i, a, a_md))
+                if self.view_mode == "active" and i == self.active_turn_idx:
+                    self._active_answer_row_index = self.answer_list.GetCount() - 1
         if self.answer_list.GetCount() > 0 and self.answer_list.GetSelection() == wx.NOT_FOUND:
             # 首次渲染时仅设置选中项，不主动把焦点移到回答列表。
             self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
@@ -1191,6 +1357,10 @@ class ChatFrame(wx.Frame):
 
     def _is_foreground_window(self) -> bool:
         return self.IsActive()
+
+    def _can_focus_completion_result(self) -> bool:
+        # 只在窗口本来就在前台且未最小化时，才允许把焦点移到最新回答。
+        return self._is_foreground_window() and not self.IsIconized()
 
     def _find_answer_row_index(self, turn_idx: int) -> int:
         for row, meta in enumerate(self.answer_meta):
@@ -1374,7 +1544,7 @@ class ChatFrame(wx.Frame):
         needs_replay = file_changed or session_changed
         offset = 0 if needs_replay else previous_offset
         new_offset, events = read_session_events(session_file, offset=offset)
-        wx.CallAfter(
+        wx_call_after_if_alive(
             self._apply_openclaw_sync_batch,
             {
                 "session_id": session_id,
@@ -1685,6 +1855,32 @@ class ChatFrame(wx.Frame):
         self.active_turn_idx = len(self.active_session_turns) - 1
         return True
 
+    @staticmethod
+    def _codex_error_text(exc: Exception | str) -> str:
+        return str(exc or "").strip().lower()
+
+    def _is_codex_thread_missing_error(self, exc: Exception | str) -> bool:
+        text = self._codex_error_text(exc)
+        return "thread not found" in text or "unknown thread" in text
+
+    def _is_codex_no_active_turn_error(self, exc: Exception | str) -> bool:
+        text = self._codex_error_text(exc)
+        return "no active turn to steer" in text
+
+    def _codex_should_steer_turn(self, target_chat: dict, is_current_target: bool) -> bool:
+        if not is_current_target:
+            return False
+        if not bool(target_chat.get("codex_turn_active")) and not self.active_codex_turn_active:
+            return False
+        pending_prompt = str(
+            (target_chat.get("codex_pending_prompt") if isinstance(target_chat, dict) else "") or
+            (self.active_codex_pending_prompt if is_current_target else "")
+        ).strip()
+        thread_flags = target_chat.get("codex_thread_flags") if isinstance(target_chat, dict) else []
+        if is_current_target and not pending_prompt:
+            thread_flags = self.active_codex_thread_flags
+        return bool(pending_prompt or "waitingOnUserInput" in (thread_flags or []))
+
     def _mark_turn_request_done(self, turn: dict) -> None:
         turn["request_status"] = "done"
         turn["request_error"] = ""
@@ -1711,39 +1907,78 @@ class ChatFrame(wx.Frame):
         recovery_context = bool(getattr(self, "_codex_recovery_context", False))
         use_shared_client = (not from_recovery) and (not recovery_context) and chat_id in {self.active_chat_id, self.current_chat_id, ""}
         client = self._ensure_codex_client() if use_shared_client else self._get_or_create_codex_client(chat_id or self.active_chat_id or self.current_chat_id or "")
+
+        def _sync_codex_thread_state(new_thread_id: str = "", new_turn_id: str = "", active: bool | None = None) -> None:
+            if not isinstance(target_chat, dict):
+                return
+            if new_thread_id is not None:
+                target_chat["codex_thread_id"] = str(new_thread_id or "").strip()
+                if is_current_target:
+                    self.active_codex_thread_id = str(new_thread_id or "").strip()
+            if new_turn_id is not None:
+                target_chat["codex_turn_id"] = str(new_turn_id or "").strip()
+                if is_current_target:
+                    self.active_codex_turn_id = str(new_turn_id or "").strip()
+            if active is not None:
+                target_chat["codex_turn_active"] = bool(active)
+                if is_current_target:
+                    self.active_codex_turn_active = bool(active)
+
+        def _clear_stale_codex_thread_state() -> None:
+            _sync_codex_thread_state("", "", active=False)
+            target_chat["codex_pending_prompt"] = ""
+            target_chat["codex_pending_request"] = None
+            target_chat["codex_thread_flags"] = []
+            if is_current_target:
+                self.active_codex_pending_prompt = ""
+                self.active_codex_pending_request = None
+                self.active_codex_thread_flags = []
+
+        def _start_new_thread() -> str:
+            thread_resp = client.start_thread(
+                cwd=self._workspace_dir_for_codex(),
+                approval_policy="never",
+                sandbox="danger-full-access",
+                personality="pragmatic",
+            )
+            new_thread_id = str((thread_resp.get("thread") or {}).get("id") or "").strip()
+            if not new_thread_id:
+                raise RuntimeError("Codex app-server did not return a thread id.")
+            _sync_codex_thread_state(new_thread_id, "", active=False)
+            return new_thread_id
+
+        def _send_turn(thread_value: str, steer: bool) -> dict:
+            if steer:
+                if not turn_id:
+                    raise RuntimeError("Codex app-server cannot steer without an active turn id.")
+                return client.steer_turn(thread_value, turn_id, question)
+            return client.start_turn(thread_value, question)
+
         try:
             target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
             if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
                 target_turns = self.active_session_turns
             if not thread_id:
-                thread_resp = client.start_thread(
-                    cwd=self._workspace_dir_for_codex(),
-                    approval_policy="never",
-                    sandbox="danger-full-access",
-                    personality="pragmatic",
-                )
-                thread_id = str((thread_resp.get("thread") or {}).get("id") or "").strip()
-                if thread_id:
-                    target_chat["codex_thread_id"] = thread_id
-                    if is_current_target:
-                        self.active_codex_thread_id = thread_id
-            pending_prompt = str(
-                (target_chat.get("codex_pending_prompt") if isinstance(target_chat, dict) else "") or
-                (self.active_codex_pending_prompt if is_current_target else "")
-            ).strip()
-            thread_flags = target_chat.get("codex_thread_flags") if isinstance(target_chat, dict) else []
-            if is_current_target and not pending_prompt:
-                thread_flags = self.active_codex_thread_flags
-            if not turn_id or not (pending_prompt or "waitingOnUserInput" in (thread_flags or [])):
-                turn_resp = client.start_turn(thread_id, question)
-            else:
-                turn_resp = client.steer_turn(thread_id, turn_id, question)
+                thread_id = _start_new_thread()
+            should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
+            try:
+                turn_resp = _send_turn(thread_id, should_steer)
+            except Exception as exc:
+                if should_steer and self._is_codex_no_active_turn_error(exc):
+                    should_steer = False
+                    turn_resp = _send_turn(thread_id, should_steer)
+                elif self._is_codex_thread_missing_error(exc):
+                    _clear_stale_codex_thread_state()
+                    thread_id = _start_new_thread()
+                    should_steer = False
+                    turn_resp = _send_turn(thread_id, should_steer)
+                else:
+                    raise
             new_turn_id = str((turn_resp.get("turn") or turn_resp.get("turnId") or {}).get("id") if isinstance(turn_resp.get("turn"), dict) else (turn_resp.get("turnId") or "")).strip()
             if new_turn_id:
-                target_chat["codex_turn_id"] = new_turn_id
-                if is_current_target:
-                    self.active_codex_turn_id = new_turn_id
-            target_chat["codex_turn_active"] = True
+                _sync_codex_thread_state(thread_id, new_turn_id, active=True)
+            else:
+                _sync_codex_thread_state(thread_id, "", active=True)
             if is_current_target:
                 self.active_codex_turn_active = True
                 self.active_codex_pending_prompt = ""
@@ -1757,18 +1992,69 @@ class ChatFrame(wx.Frame):
                 turn["request_status"] = "pending"
             self._save_state()
         except Exception as exc:
-            wx.CallAfter(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
 
     def _start_claudecode_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, session_id: str) -> None:
         def _worker() -> None:
             try:
-                client = ClaudeCodeClient()
-                full_text, new_session_id = client.stream_chat(question, session_id=session_id)
+                client = ClaudeCodeClient(full_auto=True)
+                # 保存客户端引用，以便在用户发送消息时使用
+                self._active_claudecode_client = client
+                def on_delta(delta):
+                    wx_call_after_if_alive(self._on_delta, turn_idx, delta)
+
+                def on_user_input(params: dict) -> str:
+                    """处理用户输入请求"""
+                    from claudecode_remote_protocol import format_remote_user_input_request, parse_remote_user_input_reply
+
+                    # 格式化请求消息
+                    request_msg = format_remote_user_input_request(params)
+
+                    # 显示请求消息
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n")
+
+                    # 显示交互式界面（如果有回调）
+                    if hasattr(self, '_show_claudecode_user_input'):
+                        wx_call_after_if_alive(self._show_claudecode_user_input, turn_idx, params, client)
+
+                    # 返回空字符串，让 Claude Code 等待 stdin
+                    # 用户会通过发送消息来提供输入，该消息会被拦截并写入 stdin
+                    return ""
+
+                def on_approval(params: dict) -> str:
+                    """处理批准请求"""
+                    from claudecode_remote_protocol import format_remote_approval_request, parse_remote_approval_reply
+
+                    # 格式化请求消息
+                    request_msg = format_remote_approval_request(params)
+
+                    # 显示请求消息
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n")
+
+                    # 显示交互式界面（如果有回调）
+                    if hasattr(self, '_show_claudecode_approval'):
+                        wx_call_after_if_alive(self._show_claudecode_approval, turn_idx, params, client)
+
+                    # 返回空字符串，让 Claude Code 等待 stdin
+                    # 用户会通过发送消息来提供批准，该消息会被拦截并写入 stdin
+                    return ""
+
+                full_text, new_session_id = client.stream_chat(
+                    question,
+                    session_id=session_id,
+                    on_delta=on_delta,
+                    on_user_input=on_user_input,
+                    on_approval=on_approval
+                )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
-                wx.CallAfter(self._on_done, turn_idx, full_text, "", DEFAULT_CLAUDECODE_MODEL, "", chat_id)
+                wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", DEFAULT_CLAUDECODE_MODEL, "", chat_id)
             except Exception as exc:
-                wx.CallAfter(self._on_done, turn_idx, "", str(exc), DEFAULT_CLAUDECODE_MODEL, "", chat_id)
+                error_msg = str(exc)
+                wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, DEFAULT_CLAUDECODE_MODEL, "", chat_id)
+            finally:
+                # 清除客户端引用
+                self._active_claudecode_client = None
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1820,6 +2106,21 @@ class ChatFrame(wx.Frame):
             "type": "final_answer",
             "chat_id": resolved_chat_id,
             "text": str(text or ""),
+            "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+            "ts": time.time(),
+        }
+        try:
+            server.broadcast_event(payload)
+        except Exception:
+            pass
+
+    def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is None:
+            return
+        payload = {
+            "type": "history_changed",
+            "chat_id": str(chat_id or ""),
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": time.time(),
         }
@@ -1894,21 +2195,22 @@ class ChatFrame(wx.Frame):
         text = str(payload.get("text") or "").strip()
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
-        chat_id = str(payload.get("chat_id") or "").strip()
-        if chat_id and chat_id != self.active_chat_id:
-            if self._find_archived_chat(chat_id):
-                if threading.current_thread() is threading.main_thread():
-                    self._switch_current_chat(chat_id)
+        requested_chat_id = str(payload.get("chat_id") or "").strip()
+        if requested_chat_id:
+            if requested_chat_id != self.active_chat_id:
+                if self._find_archived_chat(requested_chat_id):
+                    self._switch_current_chat(requested_chat_id)
                 else:
-                    self.active_chat_id = chat_id
-                    self.current_chat_id = chat_id
-                    self._current_chat_state["id"] = chat_id
+                    self.active_chat_id = requested_chat_id
+                    self.current_chat_id = requested_chat_id
+                    self._current_chat_state["id"] = requested_chat_id
+            chat_id = requested_chat_id
         else:
-                self.active_chat_id = chat_id
-                self.current_chat_id = chat_id
+            chat_id = self.active_chat_id or self.current_chat_id or self._ensure_active_chat_id()
+            if not self.current_chat_id and self.active_chat_id:
+                self.current_chat_id = self.active_chat_id
+            if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
-        if not chat_id:
-            chat_id = self.active_chat_id or self.current_chat_id or ""
         if threading.current_thread() is threading.main_thread():
             current_model = self._resolve_current_model()
         else:
@@ -1928,8 +2230,50 @@ class ChatFrame(wx.Frame):
         return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
 
     def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
-        self._on_new_chat_clicked(None)
-        return 200, {"accepted": True, "chat_id": self.active_chat_id or self.current_chat_id or ""}
+        chat = self._start_remote_new_chat(payload)
+        return 200, {"accepted": True, **chat}
+
+    def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
+        previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+        self.current_chat_id = ""
+        self.active_chat_id = ""
+        self.active_session_turns = []
+        now = time.time()
+        self.active_session_started_at = now
+        self._current_chat_state = {
+            "id": "",
+            "title": str((payload or {}).get("title") or "新聊天"),
+            "title_manual": False,
+            "turns": self.active_session_turns,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.active_chat_id = str(uuid.uuid4())
+        self.current_chat_id = self.active_chat_id
+        self._current_chat_state["id"] = self.active_chat_id
+        model = str((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID).strip()
+        resolved = model_id_from_display_name(model)
+        if resolved in MODEL_IDS:
+            model = resolved
+        elif model not in MODEL_IDS:
+            model = DEFAULT_MODEL_ID
+        self.selected_model = model
+        if threading.current_thread() is threading.main_thread():
+            self.model_combo.SetValue(model_display_name(model))
+            self.input_edit.SetFocus()
+        self._current_chat_state["model"] = model
+        self._save_state()
+        self._refresh_history(archived["id"] if archived else previous_chat_id or None)
+        self._render_answer_list()
+        self.SetStatusText("已开始远程新聊天")
+        self._push_remote_history_changed(self.active_chat_id)
+        return {
+            "chat_id": self.active_chat_id,
+            "title": self._current_chat_state["title"],
+            "model": model,
+            "created_at": now,
+        }
 
     def _remote_api_reply_request_ui(self, payload: dict) -> tuple[int, dict]:
         text = str(payload.get("text") or "").strip()
@@ -1985,6 +2329,7 @@ class ChatFrame(wx.Frame):
         chat["title_manual"] = True
         self._save_state()
         self._refresh_history(chat_id)
+        self._push_remote_history_changed(chat_id)
         return 200, {"accepted": True, "chat_id": chat_id, "title": title}
 
     def _remote_api_update_settings_ui(self, payload: dict) -> tuple[int, dict]:
@@ -2018,9 +2363,7 @@ class ChatFrame(wx.Frame):
     def _dispatch_codex_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
         if not event or not self._should_queue_codex_ui_event(chat_id, event):
             return
-        if wx.GetApp() is None:
-            return
-        wx.CallAfter(self._on_codex_event_for_chat, chat_id, event)
+        self._call_after_if_alive(self._on_codex_event_for_chat, chat_id, event)
 
     def _on_codex_event(self, event: CodexEvent) -> None:
         self._on_codex_event_for_chat(self.active_chat_id or self.current_chat_id or "", event)
@@ -2051,7 +2394,7 @@ class ChatFrame(wx.Frame):
         ):
             if not getattr(self, "_codex_background_flush_scheduled", False):
                 self._codex_background_flush_scheduled = True
-                wx.CallLater(0, self._flush_codex_background_updates)
+                self._call_later_if_alive(0, self._flush_codex_background_updates)
             return
         if event.type == "server_request":
             self.active_codex_pending_request = None
@@ -2104,7 +2447,7 @@ class ChatFrame(wx.Frame):
                 self._save_state()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
                 self._render_answer_list()
-                wx.CallLater(120, self._focus_latest_answer)
+                self._call_later_if_alive(120, self._focus_latest_answer)
                 return
             if event.text:
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
@@ -2169,13 +2512,21 @@ class ChatFrame(wx.Frame):
         self._save_state()
 
     def _read_remote_control_token(self) -> str:
-        return str(os.getenv("REMOTE_CONTROL_TOKEN") or "").strip()
+        return self._read_remote_control_setting(
+            "REMOTE_CONTROL_TOKEN",
+            "CLAUDECODE_REMOTE_CONTROL_TOKEN",
+            default=DEFAULT_REMOTE_CONTROL_TOKEN,
+        )
 
     def _build_remote_ws_url(self) -> str:
         token = self._read_remote_control_token()
         if not token:
             return ""
-        domain = str(os.getenv("REMOTE_CONTROL_DOMAIN") or "").strip()
+        domain = self._read_remote_control_setting(
+            "REMOTE_CONTROL_DOMAIN",
+            "CLAUDECODE_REMOTE_CONTROL_DOMAIN",
+            default=self.remote_control_domain,
+        )
         if domain:
             if domain.startswith("ws://") or domain.startswith("wss://"):
                 base = domain
@@ -2186,8 +2537,16 @@ class ChatFrame(wx.Frame):
             else:
                 base = "wss://" + domain
         else:
-            host = str(os.getenv("REMOTE_CONTROL_HOST") or "127.0.0.1").strip() or "127.0.0.1"
-            port = str(os.getenv("REMOTE_CONTROL_PORT") or "18080").strip() or "18080"
+            host = self._read_remote_control_setting(
+                "REMOTE_CONTROL_HOST",
+                "CLAUDECODE_REMOTE_CONTROL_HOST",
+                default=self.remote_control_host or "127.0.0.1",
+            ) or "127.0.0.1"
+            port = self._read_remote_control_setting(
+                "REMOTE_CONTROL_PORT",
+                "CLAUDECODE_REMOTE_CONTROL_PORT",
+                default=str(self.remote_control_port or 18080),
+            ) or "18080"
             base = f"ws://{host}:{port}"
         base = base.rstrip("/")
         if not base.endswith("/ws"):
@@ -2207,13 +2566,25 @@ class ChatFrame(wx.Frame):
         self.SetStatusText("已复制远程控制地址")
 
     def _start_remote_ws_server_if_configured(self) -> None:
-        token = self._read_remote_control_token()
+        token = self._read_remote_control_token() or self.remote_control_token
         if not token or getattr(self, "_remote_ws_server", None) is not None:
             return
-        host = str(os.getenv("REMOTE_CONTROL_HOST") or "127.0.0.1").strip() or "127.0.0.1"
-        port_text = str(os.getenv("REMOTE_CONTROL_PORT") or "").strip()
+        host = self._read_remote_control_setting(
+            "REMOTE_CONTROL_HOST",
+            "CLAUDECODE_REMOTE_CONTROL_HOST",
+            default=self.remote_control_host or "127.0.0.1",
+        ) or "127.0.0.1"
+        port_text = self._read_remote_control_setting(
+            "REMOTE_CONTROL_PORT",
+            "CLAUDECODE_REMOTE_CONTROL_PORT",
+            default=str(self.remote_control_port or 18080),
+        )
         if not port_text:
-            domain = str(os.getenv("REMOTE_CONTROL_DOMAIN") or "").strip()
+            domain = self._read_remote_control_setting(
+                "REMOTE_CONTROL_DOMAIN",
+                "CLAUDECODE_REMOTE_CONTROL_DOMAIN",
+                default=self.remote_control_domain,
+            )
             if ":" in domain:
                 port_text = domain.rsplit(":", 1)[-1]
         try:
@@ -2381,6 +2752,25 @@ class ChatFrame(wx.Frame):
     def _on_global_ctrl_hook_error(self, message: str) -> None:
         self.SetStatusText(message)
 
+    def _is_ui_alive(self) -> bool:
+        app = wx.GetApp()
+        if app is None:
+            return False
+        try:
+            if hasattr(self, "IsBeingDeleted") and self.IsBeingDeleted():
+                return False
+            if hasattr(self, "GetHandle") and not self.GetHandle():
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _call_after_if_alive(self, func, *args, **kwargs) -> bool:
+        return wx_call_after_if_alive(func, *args, **kwargs)
+
+    def _call_later_if_alive(self, delay_ms: int, func, *args, **kwargs):
+        return wx_call_later_if_alive(delay_ms, func, *args, **kwargs)
+
     def _is_send_shortcut(self, key, ctrl, alt):
         return ((not ctrl) and (not alt) and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)) or (alt and key in (ord("S"), ord("s")))
 
@@ -2522,6 +2912,16 @@ class ChatFrame(wx.Frame):
         q = str(question or "").strip()
         if not q:
             return False, "请输入问题，输入框内容为空"
+
+        # 检查是否有活跃的 Claude Code 客户端在等待输入
+        if hasattr(self, '_active_claudecode_client') and self._active_claudecode_client is not None:
+            # 将消息发送到 Claude Code 的 stdin 队列
+            self._active_claudecode_client.send_user_input(q)
+            # 清空输入框
+            self.input_edit.SetValue("")
+            self.input_edit.SetFocus()
+            return True, ""
+
         resolved_model = str(model or self._resolve_current_model() or "").strip()
         resolved_model = model_id_from_display_name(resolved_model)
         if resolved_model not in MODEL_IDS and not (is_codex_model(resolved_model) or is_claudecode_model(resolved_model) or is_openclaw_model(resolved_model)):
@@ -2557,7 +2957,6 @@ class ChatFrame(wx.Frame):
             self.active_turn_idx = len(self.active_session_turns) - 1
             self._mark_turn_request_pending(turn, resolved_model, q)
             self.is_running = True
-            self.new_chat_button.Disable()
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
             self._save_state()
@@ -2584,7 +2983,6 @@ class ChatFrame(wx.Frame):
             self.active_claudecode_session_id = str(self.active_claudecode_session_id or "").strip()
         self.is_running = True
         self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
-        self.new_chat_button.Disable()
         self.input_edit.SetValue("")
         self.input_edit.SetFocus()
         self._save_state()
@@ -2649,7 +3047,7 @@ class ChatFrame(wx.Frame):
         self.realtime_call_role = normalized.role
         self.realtime_call_speech_rate = normalized.speech_rate
         message = self._realtime_call.update_settings(normalized)
-        wx.CallAfter(self._realtime_call.prepare)
+        wx_call_after_if_alive(self._realtime_call.prepare)
         self._save_state()
         self.SetStatusText(message)
 
@@ -2696,7 +3094,7 @@ class ChatFrame(wx.Frame):
         self._answer_committed_buffer += ch
         if self._answer_redirect_timer and self._answer_redirect_timer.IsRunning():
             self._answer_redirect_timer.Stop()
-        self._answer_redirect_timer = wx.CallLater(220, self._flush_answer_committed_buffer_to_input)
+        self._answer_redirect_timer = self._call_later_if_alive(220, self._flush_answer_committed_buffer_to_input)
 
     def _flush_answer_committed_buffer_to_input(self) -> None:
         text = self._answer_committed_buffer
@@ -2850,7 +3248,7 @@ class ChatFrame(wx.Frame):
         if mode == MODE_OPTIMIZE:
             def _worker():
                 optimized = self._optimize_voice_text(text)
-                wx.CallAfter(self._on_voice_optimized_result, optimized)
+                wx_call_after_if_alive(self._on_voice_optimized_result, optimized)
 
             threading.Thread(target=_worker, daemon=True).start()
             return
@@ -2872,7 +3270,7 @@ class ChatFrame(wx.Frame):
             self.SetStatusText("语音输入失败：无法写入当前焦点位置")
             self._play_voice_wrong_sound()
             return
-        wx.CallLater(200, self._speak_text_via_screen_reader, text)
+        wx_call_later_if_alive(200, self._speak_text_via_screen_reader, text)
 
     def _on_voice_stop_recording(self):
         self._play_voice_end_sound()
@@ -2923,12 +3321,36 @@ class ChatFrame(wx.Frame):
                 skip_done = True
                 full = ""
             elif is_claudecode_model(model):
-                full, new_session_id = ClaudeCodeClient().stream_chat(question, session_id=str(self.active_claudecode_session_id or ""))
+                def on_delta(d):
+                    wx_call_after_if_alive(self._on_delta, turn_idx, d)
+
+                def on_user_input(params: dict) -> str:
+                    """处理用户输入请求"""
+                    from claudecode_remote_protocol import format_remote_user_input_request
+                    request_msg = format_remote_user_input_request(params)
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n")
+                    return ""
+
+                def on_approval(params: dict) -> str:
+                    """处理批准请求"""
+                    from claudecode_remote_protocol import format_remote_approval_request
+                    request_msg = format_remote_approval_request(params)
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n")
+                    return ""
+
+                client = ClaudeCodeClient(full_auto=True)
+                full, new_session_id = client.stream_chat(
+                    question,
+                    session_id=str(self.active_claudecode_session_id or ""),
+                    on_delta=on_delta,
+                    on_user_input=on_user_input,
+                    on_approval=on_approval
+                )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
             else:
                 def on_delta(d):
-                    wx.CallAfter(self._on_delta, turn_idx, d)
+                    wx_call_after_if_alive(self._on_delta, turn_idx, d)
 
                 c = ChatClient(api_key=api_key, model=model)
                 full = c.stream_chat(question, on_delta, history_turns=history_turns)
@@ -2947,7 +3369,7 @@ class ChatFrame(wx.Frame):
                         err = str(fb_e)
         if skip_done and not err:
             return
-        wx.CallAfter(self._on_done, turn_idx, full, err, used_model, fallback_msg)
+        self._call_after_if_alive(self._on_done, turn_idx, full, err, used_model, fallback_msg)
 
     def _on_delta(self, turn_idx: int, delta: str, chat_id: str = ""):
         self._on_delta_for_chat(turn_idx, delta, chat_id or self.active_chat_id or self.current_chat_id or "")
@@ -2955,7 +3377,7 @@ class ChatFrame(wx.Frame):
     def _on_delta_for_chat(self, turn_idx: int, delta: str, chat_id: str = ""):
         if not delta:
             return
-        if self.current_chat_id is None and self.active_chat_id:
+        if self.active_chat_id and self.current_chat_id != self.active_chat_id:
             self.current_chat_id = self.active_chat_id
         target_turns = self.active_session_turns
         if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""}:
@@ -2973,7 +3395,7 @@ class ChatFrame(wx.Frame):
         self._save_state()
 
     def _on_done(self, turn_idx: int, full: str, err: str, used_model: str, fallback_msg: str, chat_id: str = ""):
-        if self.current_chat_id is None and self.active_chat_id:
+        if self.active_chat_id and self.current_chat_id != self.active_chat_id:
             self.current_chat_id = self.active_chat_id
         should_render = True
         if turn_idx < 0 and is_openclaw_model(used_model) and not err:
@@ -3033,14 +3455,18 @@ class ChatFrame(wx.Frame):
         if is_codex_model(used_model) or is_claudecode_model(used_model):
             self._push_remote_state(chat_id or self.active_chat_id or self.current_chat_id or "")
         self._save_state()
+        if self._is_ui_alive():
+            self._refresh_history(chat_id or self.active_chat_id or self.current_chat_id or None)
 
         if should_render and self.view_mode == "active":
             self._render_answer_list()
-            wx.CallLater(120, self._focus_latest_answer)
+            self._call_later_if_alive(120, self._focus_latest_answer)
         if (not is_openclaw_model(used_model)) or err:
             self._play_finish_sound()
 
     def _focus_latest_answer(self):
+        if not self._can_focus_completion_result():
+            return
         for i in range(len(self.answer_meta) - 1, -1, -1):
             if self.answer_meta[i][0] == "answer":
                 self.answer_list.SetSelection(i)
@@ -3146,7 +3572,7 @@ class ChatFrame(wx.Frame):
             except Exception:
                 title = ""
             if title:
-                wx.CallAfter(self._apply_archived_title, chat_id, title)
+                wx_call_after_if_alive(self._apply_archived_title, chat_id, title)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3248,9 +3674,6 @@ class ChatFrame(wx.Frame):
         self.SetStatusText(f"已载入项目：{folder_name}")
 
     def _on_new_chat_clicked(self, _):
-        if self.is_running:
-            wx.MessageBox("当前正在请求中，请稍后再新建聊天。", "提示", wx.OK | wx.ICON_INFORMATION)
-            return
         if self._has_openclaw_turns() or ((not self.active_session_turns) and is_openclaw_model(self._resolve_current_model())):
             self.active_session_turns = []
             self._current_chat_state["turns"] = self.active_session_turns
@@ -3276,6 +3699,7 @@ class ChatFrame(wx.Frame):
         self._render_answer_list()
         self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
+        self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -3390,6 +3814,11 @@ class ChatFrame(wx.Frame):
             return False
 
         selected_id = self.history_ids[idx]
+        if selected_id in {self.active_chat_id, self.current_chat_id}:
+            self.view_mode = "active"
+            self.view_history_id = None
+            self._render_answer_list()
+            return True
         chat = self._find_archived_chat(selected_id)
         if not chat:
             return False
@@ -3502,9 +3931,48 @@ class ChatFrame(wx.Frame):
         turns = chat.get("turns") or []
         self.active_session_turns = copy.deepcopy(turns)
         self.active_session_started_at = float(chat.get("created_at") or time.time())
+        self.active_chat_id = str(chat.get("source_chat_id") or chat.get("id") or "").strip() or str(uuid.uuid4())
+        self.active_openclaw_session_key = str(chat.get("openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
+        self.active_openclaw_session_id = str(chat.get("openclaw_session_id") or "").strip()
+        self.active_openclaw_session_file = str(chat.get("openclaw_session_file") or "").strip()
+        try:
+            self.active_openclaw_sync_offset = max(int(chat.get("openclaw_sync_offset") or 0), 0)
+        except Exception:
+            self.active_openclaw_sync_offset = 0
+        self.active_openclaw_last_event_id = str(chat.get("openclaw_last_event_id") or "").strip()
+        try:
+            self.active_openclaw_last_synced_at = float(chat.get("openclaw_last_synced_at") or 0.0)
+        except Exception:
+            self.active_openclaw_last_synced_at = 0.0
+        self.active_codex_thread_id = str(chat.get("codex_thread_id") or "").strip()
+        self.active_codex_turn_id = str(chat.get("codex_turn_id") or "").strip()
+        self.active_codex_turn_active = bool(chat.get("codex_turn_active", False))
+        self.active_codex_pending_prompt = str(chat.get("codex_pending_prompt") or "").strip()
+        pending_request = chat.get("codex_pending_request")
+        self.active_codex_pending_request = pending_request if isinstance(pending_request, dict) else None
+        request_queue = chat.get("codex_request_queue")
+        self.active_codex_request_queue = request_queue if isinstance(request_queue, list) else []
+        thread_flags = chat.get("codex_thread_flags")
+        self.active_codex_thread_flags = thread_flags if isinstance(thread_flags, list) else []
+        self.active_codex_latest_assistant_text = str(chat.get("codex_latest_assistant_text") or "").strip()
+        self.active_codex_latest_assistant_phase = str(chat.get("codex_latest_assistant_phase") or "").strip()
+        self.active_claudecode_session_id = str(chat.get("claudecode_session_id") or "").strip()
         self.current_chat_id = chat_id
         self._current_chat_state = copy.deepcopy(chat)
+        if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
+            self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1
+        resolved_model = ""
+        for t in reversed(self.active_session_turns):
+            m = str(t.get("model") or "").strip()
+            if is_visible_model_id(m):
+                resolved_model = m
+                break
+        if not resolved_model:
+            resolved_model = self.selected_model if is_visible_model_id(self.selected_model) else DEFAULT_MODEL_ID
+        self.selected_model = resolved_model
+        if threading.current_thread() is threading.main_thread():
+            self.model_combo.SetValue(self.selected_model)
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         return True
@@ -3560,6 +4028,7 @@ class ChatFrame(wx.Frame):
             self._current_chat_state = {"id": "", "turns": self.active_session_turns}
         self._save_state()
         self._refresh_history()
+        self._push_remote_history_changed(cid)
         self._render_answer_list()
 
     def _cleanup_chat_detail_pages(self, chat: dict) -> None:
@@ -3590,6 +4059,7 @@ class ChatFrame(wx.Frame):
         c["pinned"] = not bool(c.get("pinned"))
         self._save_state()
         self._refresh_history(c.get("id"))
+        self._push_remote_history_changed(c.get("id"))
 
     def _history_clear_non_pinned(self, _):
         if not self._confirm("确定清空所有非置顶聊天吗？"):
@@ -3600,6 +4070,7 @@ class ChatFrame(wx.Frame):
             self.view_history_id = None
         self._save_state()
         self._refresh_history()
+        self._push_remote_history_changed()
         self._render_answer_list()
 
     def _history_rename(self, _):
@@ -3617,12 +4088,30 @@ class ChatFrame(wx.Frame):
                 c["title_manual"] = True
                 self._save_state()
                 self._refresh_history(c.get("id"))
+                self._push_remote_history_changed(c.get("id"))
         d.Destroy()
 
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
         self._voice_input.cancel()
         self._realtime_call.shutdown()
+        if self._answer_redirect_timer:
+            try:
+                if self._answer_redirect_timer.IsRunning():
+                    self._answer_redirect_timer.Stop()
+            except Exception:
+                pass
+            self._answer_redirect_timer = None
+        for client in list(getattr(self, "_codex_clients", {}).values()):
+            try:
+                client.close()
+            except Exception:
+                pass
+        if getattr(self, "_codex_client", None) is not None:
+            try:
+                self._codex_client.close()
+            except Exception:
+                pass
         if self._remote_ws_server:
             try:
                 self._remote_ws_server.stop()
