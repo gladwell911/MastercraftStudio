@@ -295,6 +295,7 @@ def test_remote_ws_history_list_and_read(frame, monkeypatch):
         {"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": time.time()}
     ]
     frame._current_chat_state["id"] = "active-1"
+    frame._current_chat_state["model"] = "codex/main"
     frame._current_chat_state["turns"] = frame.active_session_turns
     frame.archived_chats = [
         {

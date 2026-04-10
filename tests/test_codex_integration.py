@@ -33,7 +33,7 @@ def test_model_combo_contains_codex(frame):
 
 
 def test_send_click_routes_codex_start(frame, monkeypatch):
-    frame.model_combo.SetValue("codex/main")
+    frame.model_combo.SetValue("codex")
     frame.selected_model = "codex/main"
     frame._active_request_count = 0
     frame.active_codex_thread_id = ""
@@ -74,7 +74,7 @@ def test_send_click_routes_codex_start(frame, monkeypatch):
 
 
 def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):
-    frame.model_combo.SetValue("codex/main")
+    frame.model_combo.SetValue("codex")
     frame.selected_model = "codex/main"
     frame.active_codex_thread_id = TEST_THREAD_ID
     frame.active_codex_turn_id = TEST_TURN_ID
@@ -110,7 +110,7 @@ def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):
 
 
 def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt(frame, monkeypatch):
-    frame.model_combo.SetValue("codex/main")
+    frame.model_combo.SetValue("codex")
     frame.selected_model = "codex/main"
     frame.active_codex_thread_id = TEST_THREAD_ID
     frame.active_codex_turn_id = TEST_TURN_ID
@@ -147,7 +147,7 @@ def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt
 
 
 def test_send_click_routes_codex_start_when_turn_is_inactive_even_with_stale_prompt(frame, monkeypatch):
-    frame.model_combo.SetValue("codex/main")
+    frame.model_combo.SetValue("codex")
     frame.selected_model = "codex/main"
     frame.active_codex_thread_id = TEST_THREAD_ID
     frame.active_codex_turn_id = TEST_TURN_ID
