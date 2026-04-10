@@ -1,4 +1,18 @@
-import wx_app
+import sys
+import types
+
+config_stub = types.ModuleType("config")
+config_stub.VOICE_OPTIONS = [{"id": "speaker-a", "name": "Speaker A"}]
+config_stub.DEFAULT_SPEAKER = "speaker-a"
+config_stub.DEFAULT_SPEED_RATIO = 0.0
+config_stub.speed_ratio_to_speech_rate = lambda ratio: 0
+sys.modules.setdefault("config", config_stub)
+
+dialog_worker_stub = types.ModuleType("dialog_worker")
+dialog_worker_stub.DialogWorker = object
+sys.modules.setdefault("dialog_worker", dialog_worker_stub)
+
+from realtime_dialog import wx_app
 
 
 class _FakeTextCtrl:
@@ -66,3 +80,26 @@ def test_log_like_events_do_not_append_chat():
     frame.on_worker_event("connected", {"logid": "abc"})
 
     assert frame.chat_text.appended == []
+
+
+def test_worker_thread_dispatch_uses_safe_call_after(monkeypatch):
+    frame = wx_app.MainFrame.__new__(wx_app.MainFrame)
+    seen = {}
+    monkeypatch.setattr(frame, "IsBeingDeleted", lambda: False, raising=False)
+    monkeypatch.setattr(frame, "GetHandle", lambda: 1, raising=False)
+    monkeypatch.setattr(wx_app.wx, "GetApp", lambda: object())
+    monkeypatch.setattr(
+        wx_app.wx,
+        "CallAfter",
+        lambda fn, *args, **kwargs: (seen.setdefault("call", (fn.__name__, args, kwargs)), fn(*args, **kwargs)),
+    )
+
+    def _on_worker_event(event_type, payload):
+        seen.setdefault("event", (event_type, payload))
+
+    monkeypatch.setattr(frame, "on_worker_event", _on_worker_event)
+
+    frame._on_worker_event_from_thread("status", {"message": "Connected"})
+
+    assert seen["call"][1] == ("status", {"message": "Connected"})
+    assert seen["event"] == ("status", {"message": "Connected"})

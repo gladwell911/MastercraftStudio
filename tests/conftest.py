@@ -23,12 +23,15 @@ def disable_system_hooks(monkeypatch):
     monkeypatch.setattr(main.GlobalCtrlTapHook, "start", lambda self: None)
     monkeypatch.setattr(main.GlobalCtrlTapHook, "stop", lambda self: None)
     monkeypatch.setenv("AUTO_START_QUICK_TUNNEL", "0")
+    monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "0")
     monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)
+    monkeypatch.delenv("REMOTE_CONTROL_DOMAIN", raising=False)
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_HOST", raising=False)
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_PORT", raising=False)
+    monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_DOMAIN", raising=False)
 
 
 @pytest.fixture

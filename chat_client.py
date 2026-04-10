@@ -5,9 +5,24 @@ from typing import Callable
 import requests
 
 BASE_URL = "https://openrouter.ai/api/v1"
+DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 DEFAULT_MODEL = "openai/gpt-5.2"
 TIMEOUT_SECONDS = 60
+DOUBAO_API_KEY = "b977c688-3f5f-488f-b58f-933c8f042567"
+DOUBAO_MODEL_MAP = {
+    "doubao-2.0-pro": "doubao-seed-2-0-pro-260215",
+    "doubao-2.0-lite": "doubao-seed-2-0-lite-260215",
+    "doubao-2.0-mini": "doubao-seed-2-0-mini-260215",
+}
+
+
+def is_doubao_model(model: str | None) -> bool:
+    return str(model or "").strip() in DOUBAO_MODEL_MAP
+
+
+def resolve_doubao_model(model: str | None) -> str:
+    return DOUBAO_MODEL_MAP.get(str(model or "").strip(), "")
 
 
 class ChatClient:
@@ -44,6 +59,8 @@ class ChatClient:
 
     def stream_chat(self, user_text: str, on_delta: Callable[[str], None], history_turns: list[dict] | None = None) -> str:
         messages = self._build_messages(user_text, history_turns=history_turns)
+        if is_doubao_model(self.model):
+            return self._stream_doubao_request(messages, on_delta)
         need_web = self._should_use_web(user_text)
         if not need_web:
             return self._stream_request(self.model, messages, on_delta)
@@ -116,6 +133,53 @@ class ChatClient:
         except requests.RequestException as exc:
             raise RuntimeError(f"网络请求失败：{exc}") from exc
 
+        return "".join(parts)
+
+    def _stream_doubao_request(self, messages: list[dict], on_delta: Callable[[str], None]) -> str:
+        resolved_model = resolve_doubao_model(self.model)
+        url = f"{DOUBAO_BASE_URL}{CHAT_COMPLETIONS_PATH}"
+        payload = {
+            "model": resolved_model,
+            "messages": messages,
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {DOUBAO_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        parts: list[str] = []
+        try:
+            with requests.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True) as resp:
+                if resp.status_code == 401:
+                    raise RuntimeError("豆包请求失败：401 未授权。请检查豆包 API Key。")
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"豆包请求失败：HTTP {resp.status_code}。{self._extract_error_detail(resp)}")
+
+                for raw_line in resp.iter_lines(decode_unicode=False):
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = self._first_choice(obj).get("delta", {}).get("content", "")
+                    if delta:
+                        parts.append(delta)
+                        on_delta(delta)
+        except requests.Timeout as exc:
+            raise RuntimeError("豆包请求超时：60 秒内未完成，请稍后重试。") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"豆包网络请求失败：{exc}") from exc
+
+        if not parts:
+            raise RuntimeError("豆包未返回任何内容。")
         return "".join(parts)
 
     def _should_use_web(self, user_text: str) -> bool:

@@ -198,11 +198,11 @@ def test_send_uses_current_combobox_model_every_time(frame, monkeypatch):
     frame._on_send_clicked(None)
 
     frame.input_edit.SetValue("q2")
-    frame.model_combo.SetValue("qwen/qwen3-8b")
+    frame.model_combo.SetValue("qwen/qwen3.5-plus-02-15")
     frame._on_send_clicked(None)
 
     assert used_models[0] == "openai/gpt-5.2"
-    assert used_models[1] == "qwen/qwen3-8b"
+    assert used_models[1] == "qwen/qwen3.5-plus-02-15"
 
 
 def test_same_session_can_switch_models_per_question(frame, monkeypatch):
@@ -227,12 +227,12 @@ def test_same_session_can_switch_models_per_question(frame, monkeypatch):
     frame._on_send_clicked(None)
 
     frame.input_edit.SetValue("第二个问题")
-    frame.model_combo.SetStringSelection("qwen/qwen3-8b")
+    frame.model_combo.SetStringSelection("openai/gpt-5.2")
     frame._on_send_clicked(None)
 
-    assert used_models == ["google/gemini-3.1-pro-preview", "qwen/qwen3-8b"]
+    assert used_models == ["google/gemini-3.1-pro-preview", "openai/gpt-5.2"]
     assert frame.active_session_turns[-2]["model"] == "google/gemini-3.1-pro-preview"
-    assert frame.active_session_turns[-1]["model"] == "qwen/qwen3-8b"
+    assert frame.active_session_turns[-1]["model"] == "openai/gpt-5.2"
 
 
 def test_unavailable_model_falls_back_and_still_returns_answer(frame, monkeypatch):

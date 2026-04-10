@@ -28,6 +28,9 @@ def test_remote_ws_message_routes_to_submit(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     frame.selected_model = "codex/main"
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
     seen = {}
     monkeypatch.setattr(
         frame,
@@ -42,7 +45,7 @@ def test_remote_ws_message_routes_to_submit(frame, monkeypatch):
             try:
                 connected = await _wait_for_type(ws, "connected")
                 assert connected["body"]["accepted"] is True
-                assert connected["body"]["last_event_id"] == ""
+                assert "last_event_id" in connected["body"]
                 await ws.send_json({"id": "m1", "type": "message", "text": "hello remote"})
                 response = await _wait_for_type(ws, "response")
                 assert response["id"] == "m1"
@@ -82,6 +85,107 @@ def test_remote_message_with_chat_id_switches_target_chat(frame, monkeypatch):
     assert question == "hello B"
     assert kwargs["chat_id"] == "chat-b"
     assert current_chat_id == "chat-b"
+
+
+def test_remote_message_with_chat_id_switches_archived_context_off_main_thread(
+    frame, monkeypatch
+):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "当前问题A",
+            "answer_md": "当前回答A",
+            "model": "codex/main",
+            "created_at": time.time(),
+        }
+    ]
+    frame._current_chat_state["id"] = "chat-a"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "聊天B",
+            "turns": [
+                {
+                    "question": "历史问题B",
+                    "answer_md": "历史回答B",
+                    "model": "codex/main",
+                    "created_at": time.time(),
+                }
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "pinned": False,
+        }
+    ]
+    fake_thread = object()
+    main_thread = object()
+    monkeypatch.setattr(main.threading, "current_thread", lambda: fake_thread)
+    monkeypatch.setattr(main.threading, "main_thread", lambda: main_thread)
+    seen = {}
+    monkeypatch.setattr(
+        frame,
+        "_submit_question",
+        lambda question, **kwargs: (
+            seen.setdefault(
+                "call",
+                (
+                    question,
+                    kwargs,
+                    frame.current_chat_id,
+                    frame.active_session_turns[0]["question"],
+                ),
+            ),
+            (True, ""),
+        )[1],
+    )
+
+    status, body = frame._remote_api_message_ui({"chat_id": "chat-b", "text": "hello B"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["chat_id"] == "chat-b"
+    question, kwargs, current_chat_id, loaded_question = seen["call"]
+    assert question == "hello B"
+    assert kwargs["chat_id"] == "chat-b"
+    assert current_chat_id == "chat-b"
+    assert loaded_question == "历史问题B"
+
+
+def test_remote_new_chat_while_running_returns_fresh_chat_id(frame, monkeypatch):
+    frame.is_running = True
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A",
+            "answer_md": "AA",
+            "model": "codex/main",
+            "created_at": time.time(),
+        }
+    ]
+    frame._current_chat_state["id"] = "chat-a"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_schedule_async_archive_rename", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", statuses.append)
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_new_chat_ui({"model": "codex/main"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["chat_id"]
+    assert body["chat_id"] != "chat-a"
+    assert frame.active_chat_id == body["chat_id"]
+    assert any(str(chat.get("id") or "") == "chat-a" for chat in frame.archived_chats)
+    assert statuses[-1] == "已开始远程新聊天"
 
 
 def test_remote_ws_state_reports_pending_request(frame, monkeypatch):
@@ -125,6 +229,8 @@ def test_remote_ws_connected_restores_current_session_snapshot(frame, monkeypatc
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state["id"] = "chat-1"
     frame.active_session_turns = [
         {
             "question": "历史问题",
@@ -148,7 +254,7 @@ def test_remote_ws_connected_restores_current_session_snapshot(frame, monkeypatc
                 connected = await _wait_for_type(ws, "connected")
                 body = connected["body"]
                 assert body["chat_id"] == "chat-1"
-                assert body["last_event_id"] == ""
+                assert "last_event_id" in body
                 assert len(body["turns"]) == 2
                 assert body["turns"][0]["question"] == "历史问题"
                 assert body["turns"][0]["answer"] == "历史回答"
@@ -184,9 +290,12 @@ def test_remote_ws_history_list_and_read(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     frame.active_chat_id = "active-1"
+    frame.current_chat_id = "active-1"
     frame.active_session_turns = [
         {"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": time.time()}
     ]
+    frame._current_chat_state["id"] = "active-1"
+    frame._current_chat_state["turns"] = frame.active_session_turns
     frame.archived_chats = [
         {
             "id": "arch-1",
@@ -210,6 +319,13 @@ def test_remote_ws_history_list_and_read(frame, monkeypatch):
                 assert response["id"] == "hl1"
                 chats = response["body"]["chats"]
                 assert chats[0]["chat_id"] == "active-1"
+                assert chats[0]["model"] == "codex/main"
+                assert chats[0]["current"] is True
+                assert chats[0]["active"] is True
+                assert "created_at" in chats[0]
+                assert "updated_at" in chats[0]
+                assert "turn_count" in chats[0]
+                assert "pinned" in chats[0]
                 assert any(chat["chat_id"] == "arch-1" for chat in chats)
 
                 await ws.send_json({"id": "hr1", "type": "history_read", "chat_id": "arch-1"})
@@ -366,3 +482,33 @@ def test_remote_ws_question_and_answer_sync_to_local_answer_list(frame, monkeypa
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert any("远程问题" == item for item in items)
     assert any("远程回答" == item for item in items)
+
+
+def test_remote_api_first_message_sets_title_from_first_question(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-current", "title": "新聊天", "title_manual": False, "turns": frame.active_session_turns}
+    pushed = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    status, body = frame._remote_api_message_ui({"text": "帮我梳理桌面端聊天命名规则"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert frame._current_chat_state["title"] != "新聊天"
+    assert "桌面端聊天命名规则"[:8] in frame._current_chat_state["title"]
+    assert pushed

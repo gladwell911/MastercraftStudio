@@ -3,6 +3,8 @@ import os
 import shutil
 import subprocess
 import threading
+import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -10,8 +12,9 @@ from typing import Callable
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
-DEFAULT_INITIALIZE_TIMEOUT = 15
+DEFAULT_INITIALIZE_TIMEOUT = 45
 DEFAULT_REQUEST_TIMEOUT = 60
+DEFAULT_CODEX_TURN_TIMEOUT = 300
 DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX = "danger-full-access"
 
@@ -26,7 +29,7 @@ def resolve_codex_launch_command() -> list[str]:
         return [override]
 
     if os.name == "nt":
-        for candidate in ("codex.cmd", "codex.exe", "codex.bat", "codex"):
+        for candidate in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
             resolved = shutil.which(candidate)
             if resolved:
                 return [resolved]
@@ -45,16 +48,42 @@ def resolve_codex_launch_command() -> list[str]:
 
 
 def build_codex_app_server_command(cwd: str | None = None) -> list[str]:
-    workspace = str(cwd or "").strip() or str(Path.cwd())
     return [
         *resolve_codex_launch_command(),
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-C",
-        workspace,
         "app-server",
         "--listen",
         "stdio://",
+        "--analytics-default-enabled",
     ]
+
+
+def _codex_home_seed_files() -> tuple[str, ...]:
+    return ("auth.json", "cap_sid", "config.toml", "models_cache.json", "version.json")
+
+
+def _copy_codex_home_seed(source_home: Path, target_home: Path) -> None:
+    for filename in _codex_home_seed_files():
+        source_file = source_home / filename
+        if not source_file.exists() or not source_file.is_file():
+            continue
+        try:
+            shutil.copy2(source_file, target_home / filename)
+        except Exception:
+            pass
+
+
+def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], Path | None]:
+    env = os.environ.copy()
+    workspace = Path(str(cwd or "").strip() or Path.cwd())
+    try:
+        codex_home = workspace / f".codex-home-{uuid.uuid4().hex[:8]}"
+        codex_home.mkdir(parents=True, exist_ok=False)
+    except Exception:
+        codex_home = Path(tempfile.mkdtemp(prefix=".codex-home-"))
+    source_home = Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex"
+    _copy_codex_home_seed(source_home, codex_home)
+    env["CODEX_HOME"] = str(codex_home)
+    return env, codex_home
 
 
 @dataclass
@@ -91,24 +120,31 @@ class CodexAppServerClient:
         self._initialized = False
         self._initializing = False
         self._closed = False
+        self._codex_home_dir: Path | None = None
 
     def close(self) -> None:
         self._closed = True
         proc = self._proc
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
+        if proc is not None:
             try:
-                proc.kill()
+                proc.terminate()
             except Exception:
                 pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         self._proc = None
+        codex_home_dir = self._codex_home_dir
+        self._codex_home_dir = None
+        if codex_home_dir is not None:
+            try:
+                shutil.rmtree(codex_home_dir)
+            except Exception:
+                pass
 
     def start_thread(
         self,
@@ -154,16 +190,17 @@ class CodexAppServerClient:
             },
         )
 
-    def start_turn(self, thread_id: str, text: str) -> dict:
+    def start_turn(self, thread_id: str, text: str, timeout: int | None = None) -> dict:
         return self.request(
             "turn/start",
             {
                 "threadId": str(thread_id or "").strip(),
                 "input": [{"type": "text", "text": str(text or "")}],
             },
+            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )
 
-    def steer_turn(self, thread_id: str, expected_turn_id: str, text: str) -> dict:
+    def steer_turn(self, thread_id: str, expected_turn_id: str, text: str, timeout: int | None = None) -> dict:
         return self.request(
             "turn/steer",
             {
@@ -171,6 +208,7 @@ class CodexAppServerClient:
                 "expectedTurnId": str(expected_turn_id or "").strip(),
                 "input": [{"type": "text", "text": str(text or "")}],
             },
+            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )
 
     def respond_tool_request_user_input(self, request_id: str | int, answers: dict[str, list[str]]) -> None:
@@ -224,7 +262,7 @@ class CodexAppServerClient:
             errors="replace",
             shell=False,
             bufsize=1,
-            env=os.environ.copy(),
+            env=self._build_launch_env(),
         )
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
@@ -232,6 +270,11 @@ class CodexAppServerClient:
         self._stderr_thread.start()
         self._initialized = False
         self._initialize()
+
+    def _build_launch_env(self) -> dict[str, str]:
+        env, codex_home_dir = build_codex_app_server_env()
+        self._codex_home_dir = codex_home_dir
+        return env
 
     def _initialize(self) -> None:
         if self._initialized or self._initializing:

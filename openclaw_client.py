@@ -264,12 +264,20 @@ class OpenClawClient:
 
         stdout = str(completed.stdout or "").strip()
         stderr = str(completed.stderr or "").strip()
-        data = self._parse_json(stdout)
+        try:
+            data = self._parse_json(stdout)
+        except RuntimeError:
+            if completed.returncode == 0:
+                data = {}
+            else:
+                raise
         if completed.returncode != 0:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 请求失败：{detail}")
 
         reply = self._extract_text(data)
+        if not reply and stdout and completed.returncode == 0:
+            reply = self._extract_plain_stdout(stdout)
         if not reply:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 未返回可显示内容：{detail}")
@@ -371,6 +379,17 @@ class OpenClawClient:
             if text:
                 parts.append(text)
         return "\n\n".join(parts).strip()
+
+    def _extract_plain_stdout(self, stdout: str) -> str:
+        lines = []
+        for raw_line in str(stdout or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(("[plugins]", "[tool", "[agent]")):
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
 
     def _extract_error_detail(self, data: dict, stderr: str, stdout: str) -> str:
         text = normalize_openclaw_text(self._extract_text(data))

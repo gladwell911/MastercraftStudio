@@ -68,6 +68,24 @@ def test_openclaw_client_stream_chat_parses_json_after_plugin_logs(monkeypatch):
     assert out == "日志后面的正常回复"
 
 
+def test_openclaw_client_stream_chat_uses_plain_stdout_when_json_is_not_emitted(monkeypatch):
+    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="completed changes:\nopenclaw/main -> openclaw\ncodex/main -> codex\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+    seen = []
+    out = client.stream_chat("rename model display labels", session_id="zgwd-1", on_delta=seen.append)
+    assert out == "completed changes:\nopenclaw/main -> openclaw\ncodex/main -> codex"
+    assert seen == [out]
+
+
 def test_openclaw_client_stream_chat_raises_with_payload_error(monkeypatch):
     client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
 
