@@ -31,3 +31,4 @@ Thumbs.db
 .codex-home-*/
 codex-home-*/
 app_state.json
+.worktrees/
