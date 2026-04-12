@@ -21,6 +21,12 @@ class RemoteWebSocketServer:
         on_update_settings: Callable[[dict], tuple[int, dict]] | None = None,
         on_history_list: Callable[[], tuple[int, dict]] | None = None,
         on_history_read: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_snapshot: Callable[[dict | None], tuple[int, dict]] | None = None,
+        on_notes_pull_since: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_push_ops: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_subscribe: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_ack: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_ping: Callable[[dict], tuple[int, dict]] | None = None,
     ) -> None:
         self.host = str(host or "127.0.0.1").strip() or "127.0.0.1"
         self.port = max(int(port or 0), 0)
@@ -33,6 +39,12 @@ class RemoteWebSocketServer:
         self.on_state = on_state
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
+        self.on_notes_snapshot = on_notes_snapshot
+        self.on_notes_pull_since = on_notes_pull_since
+        self.on_notes_push_ops = on_notes_push_ops
+        self.on_notes_subscribe = on_notes_subscribe
+        self.on_notes_ack = on_notes_ack
+        self.on_notes_ping = on_notes_ping
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._app: web.Application | None = None
@@ -249,6 +261,51 @@ class RemoteWebSocketServer:
                 )
                 return
             status, body = await asyncio.to_thread(self.on_history_read, payload)
+        elif message_type == "notes_snapshot":
+            if not callable(self.on_notes_snapshot):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            try:
+                status, body = await asyncio.to_thread(self.on_notes_snapshot, payload)
+            except TypeError:
+                status, body = await asyncio.to_thread(self.on_notes_snapshot)
+        elif message_type == "notes_pull_since":
+            if not callable(self.on_notes_pull_since):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            status, body = await asyncio.to_thread(self.on_notes_pull_since, payload)
+        elif message_type == "notes_push_ops":
+            if not callable(self.on_notes_push_ops):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            status, body = await asyncio.to_thread(self.on_notes_push_ops, payload)
+        elif message_type == "notes_subscribe":
+            if not callable(self.on_notes_subscribe):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            status, body = await asyncio.to_thread(self.on_notes_subscribe, payload)
+        elif message_type == "notes_ack":
+            if not callable(self.on_notes_ack):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            status, body = await asyncio.to_thread(self.on_notes_ack, payload)
+        elif message_type == "notes_ping":
+            if not callable(self.on_notes_ping):
+                await ws.send_json(
+                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
+                )
+                return
+            status, body = await asyncio.to_thread(self.on_notes_ping, payload)
         else:
             await ws.send_json(
                 {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}

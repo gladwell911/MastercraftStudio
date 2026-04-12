@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import platform
 import re
 import shutil
 import threading
@@ -29,6 +30,10 @@ from codex_client import (
     DEFAULT_CODEX_MODEL,
     is_codex_model,
 )
+from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
+from notes_store import NotesStore
+from notes_sync import NotesSyncService
+from notes_ui import DesktopNotesController
 from openclaw_client import (
     DEFAULT_OPENCLAW_AGENT,
     DEFAULT_OPENCLAW_SESSION_KEY,
@@ -212,7 +217,17 @@ _CHAT_TITLE_RULES_CACHE: dict | None = None
 
 
 def shared_chat_title_rules_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "rc" / "assets" / "chat_title_rules.json"
+    current = Path(__file__).resolve()
+    seen: set[Path] = set()
+    for base in [current.parent, *current.parents, Path.cwd().resolve(), *Path.cwd().resolve().parents]:
+        base = Path(base).resolve()
+        if base in seen:
+            continue
+        seen.add(base)
+        candidate = base / "rc" / "assets" / "chat_title_rules.json"
+        if candidate.exists():
+            return candidate
+    return current.parents[2] / "rc" / "assets" / "chat_title_rules.json"
 
 
 def load_chat_title_rules(path: Path | None = None, *, refresh: bool = False) -> dict:
@@ -705,6 +720,18 @@ class ChatFrame(wx.Frame):
         self.state_path = self.app_data_dir / APP_STATE_FILE
         self.detail_pages_dir = self.app_data_dir / "detail_pages"
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
+        self.notes_db_path = self.app_data_dir / "notes.db"
+        self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
+        self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
+        self.notes_store.initialize()
+        self.notes_sync = NotesSyncService(
+            self.notes_store,
+            broadcaster=self._on_notes_sync_push_result,
+            on_remote_ops_applied=self._on_notes_remote_ops_applied,
+            on_status_changed=self._on_notes_sync_status_changed,
+        )
+        self._current_notes_state = {}
+        self.notes_sync_hint = ""
         self.send_sound = self._resolve_sound_path("send")
         self.reply_sound = self._resolve_sound_path("reply")
         self.voice_begin_sound = self._resolve_sound_path("inputBegin")
@@ -788,6 +815,7 @@ class ChatFrame(wx.Frame):
         self._global_ctrl_hook = GlobalCtrlTapHook(self._on_global_ctrl_keyup, self._on_global_ctrl_hook_error)
 
         self._build_ui()
+        self.notes_controller = DesktopNotesController(self, self.notes_store)
         self._bind_events()
         self._register_global_hotkey()
         self._global_ctrl_hook.start()
@@ -825,14 +853,20 @@ class ChatFrame(wx.Frame):
         wx_call_after_if_alive(self.input_edit.SetFocus)
 
     def _build_ui(self):
-        panel = wx.Panel(self)
+        frame_panel = wx.Panel(self)
+        frame_root = wx.BoxSizer(wx.VERTICAL)
+        self.chat_root_panel = wx.Panel(frame_panel)
+        frame_root.Add(self.chat_root_panel, 1, wx.EXPAND)
+        frame_panel.SetSizer(frame_root)
+
+        panel = self.chat_root_panel
         root = wx.BoxSizer(wx.HORIZONTAL)
         left = wx.BoxSizer(wx.VERTICAL)
         left.Add(wx.StaticText(panel, label="历史聊天："), 0, wx.LEFT | wx.TOP, 10)
         self.history_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.history_list.SetName("历史聊天")
-        left.Add(self.history_list, 1, wx.EXPAND | wx.ALL, 10)
-        root.Add(left, 1, wx.EXPAND)
+        left.Add(self.history_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        self._notes_search_query = ""
 
         right = wx.BoxSizer(wx.VERTICAL)
         right.Add(wx.StaticText(panel, label="输入："), 0, wx.LEFT | wx.TOP, 10)
@@ -863,11 +897,83 @@ class ChatFrame(wx.Frame):
         root.Add(right, 2, wx.EXPAND)
         panel.SetSizer(root)
 
+        self._notes_notebook_ids = []
+        self._notes_entry_ids = []
+        self.notes_list_panel = wx.Panel(panel)
+        list_panel_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.notes_section_label = wx.StaticText(self.notes_list_panel, label="笔记")
+        list_panel_sizer.Add(self.notes_section_label, 0, wx.BOTTOM, 6)
+        self.notes_notebook_list = wx.ListBox(self.notes_list_panel, style=wx.LB_SINGLE)
+        self.notes_notebook_list.SetName("笔记")
+        self.notes_notebook_list.SetToolTip("笔记")
+        list_panel_sizer.Add(self.notes_notebook_list, 1, wx.EXPAND)
+        self.notes_list_panel.SetSizer(list_panel_sizer)
+        left.Add(self.notes_list_panel, 1, wx.EXPAND | wx.ALL, 10)
+        root.Add(left, 1, wx.EXPAND)
+
+        self.notes_detail_panel = wx.Panel(panel)
+        detail_sizer = wx.BoxSizer(wx.VERTICAL)
+        detail_header = wx.BoxSizer(wx.HORIZONTAL)
+        self.notes_detail_title = wx.StaticText(self.notes_detail_panel, label="笔记详情")
+        detail_header.Add(self.notes_detail_title, 1, wx.ALIGN_CENTER_VERTICAL)
+        detail_sizer.Add(detail_header, 0, wx.EXPAND | wx.ALL, 8)
+        self.notes_entry_list = wx.ListBox(self.notes_detail_panel, style=wx.LB_SINGLE)
+        self.notes_entry_list.SetName("笔记条目列表")
+        detail_sizer.Add(self.notes_entry_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.notes_detail_panel.SetSizer(detail_sizer)
+
+        self.notes_edit_panel = wx.Panel(panel)
+        edit_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.notes_edit_title = wx.StaticText(self.notes_edit_panel, label="笔记")
+        edit_sizer.Add(self.notes_edit_title, 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        self.notes_editor = wx.TextCtrl(self.notes_edit_panel, style=wx.TE_MULTILINE)
+        self.notes_editor.SetName("笔记")
+        self.notes_editor.SetToolTip("笔记")
+        edit_sizer.Add(self.notes_editor, 1, wx.EXPAND | wx.ALL, 10)
+        self.notes_edit_panel.SetSizer(edit_sizer)
+        self.notes_content_label = wx.StaticText(panel, label="笔记：")
+        right.Add(self.notes_content_label, 0, wx.LEFT, 10)
+        right.Add(self.notes_detail_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        right.Add(self.notes_edit_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.send_button.MoveAfterInTabOrder(self.input_edit)
         self.new_chat_button.MoveAfterInTabOrder(self.send_button)
         self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
         self.history_list.MoveAfterInTabOrder(self.model_combo)
-        self.answer_list.MoveAfterInTabOrder(self.history_list)
+        self.notes_list_panel.MoveAfterInTabOrder(self.history_list)
+        self.answer_list.MoveAfterInTabOrder(self.notes_list_panel)
+        self.chat_root_panel.SetSizer(root)
+
+        self.root_tab_order = [
+            self.input_edit,
+            self.send_button,
+            self.new_chat_button,
+            self.model_combo,
+            self.history_list,
+            self.notes_notebook_list,
+            self.answer_list,
+            self.notes_entry_list,
+            self.notes_editor,
+        ]
+        for previous, nxt in zip(self.root_tab_order, self.root_tab_order[1:]):
+            try:
+                nxt.MoveAfterInTabOrder(previous)
+            except Exception:
+                pass
+        self.chat_tab_order = [
+            self.input_edit,
+            self.send_button,
+            self.new_chat_button,
+            self.model_combo,
+            self.history_list,
+            self.notes_notebook_list,
+            self.answer_list,
+        ]
+        self.notes_tab_order = [
+            self.notes_notebook_list,
+            self.notes_entry_list,
+            self.notes_editor,
+        ]
+        self._sync_notes_ui()
 
     def _bind_events(self):
         self.send_button.Bind(wx.EVT_BUTTON, self._on_send_clicked)
@@ -900,6 +1006,19 @@ class ChatFrame(wx.Frame):
         self.model_combo.Bind(wx.EVT_KEY_DOWN, self._on_any_key_down_escape_minimize)
         self.send_button.Bind(wx.EVT_KEY_DOWN, self._on_any_key_down_escape_minimize)
         self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._on_any_key_down_escape_minimize)
+
+        if hasattr(self, "notes_notebook_list"):
+            self.notes_notebook_list.Bind(wx.EVT_LISTBOX, self._on_notes_notebook_selected)
+            self.notes_notebook_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._notes_open_selected_notebook())
+            self.notes_notebook_list.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_notebook_list.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
+            self.notes_entry_list.Bind(wx.EVT_LISTBOX, self._on_notes_entry_selected)
+            self.notes_entry_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._notes_edit_entry())
+            self.notes_entry_list.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_entry_list.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
+            self.notes_editor.Bind(wx.EVT_TEXT, self._on_notes_editor_changed)
+            self.notes_editor.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_editor.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
 
     def _resolve_sound_path(self, name: str):
         base = os.path.dirname(os.path.abspath(__file__))
@@ -1170,6 +1289,9 @@ class ChatFrame(wx.Frame):
         except Exception:
             self.remote_control_port = 18080
         self.remote_control_autostart = bool(data.get("remote_control_autostart", self.remote_control_autostart))
+        notes_state = data.get("notes_ui_state")
+        if isinstance(notes_state, dict):
+            self._current_notes_state = notes_state
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         if self.active_session_turns and not self.active_chat_id:
@@ -1181,11 +1303,19 @@ class ChatFrame(wx.Frame):
             self.current_chat_id = self.active_chat_id
         if self.active_chat_id and not self._current_chat_state.get("id"):
             self._current_chat_state["id"] = self.active_chat_id
+        if hasattr(self, "notes_controller"):
+            self.notes_controller.restore_state(self._current_notes_state)
+            self._notes_refresh_ui()
         self._sort_archived_chats()
         if changed:
             self._save_state()
 
     def _save_state(self):
+        if hasattr(self, "notes_controller"):
+            capture = getattr(self.notes_controller, "capture_editor_state", None)
+            if callable(capture):
+                capture()
+            self._current_notes_state = self.notes_controller.to_state_dict()
         data = {
             "selected_model_id": self.selected_model,
             "archived_chats": self.archived_chats,
@@ -1216,6 +1346,7 @@ class ChatFrame(wx.Frame):
             "remote_control_host": self.remote_control_host,
             "remote_control_port": self.remote_control_port,
             "remote_control_autostart": self.remote_control_autostart,
+            "notes_ui_state": self._current_notes_state,
         }
         try:
             self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2387,6 +2518,63 @@ class ChatFrame(wx.Frame):
         except Exception:
             pass
 
+    def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is None:
+            return
+        payload = {
+            "type": "notes_changed",
+            "cursor": str(cursor or self.notes_store.current_cursor() or "0"),
+            "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+            "ts": time.time(),
+        }
+        try:
+            server.broadcast_event(payload)
+        except Exception:
+            pass
+
+    def _push_remote_notes_conflict(self, payload: dict | None = None) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is None:
+            return
+        conflict = dict(payload or {})
+        conflict.update(
+            {
+                "type": "notes_conflict",
+                "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+                "ts": time.time(),
+            }
+        )
+        try:
+            server.broadcast_event(conflict)
+        except Exception:
+            pass
+
+    def _push_remote_notes_sync_status(self, status: str | dict, *, cursor: str | None = None, message: str | None = None) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is None:
+            return
+        payload = dict(status) if isinstance(status, dict) else {"status": str(status or "")}
+        if cursor is not None:
+            payload["cursor"] = str(cursor or "")
+        if message is not None:
+            payload["message"] = str(message or "")
+        payload.update({"type": "notes_sync_status", "event_id": f"evt-{uuid.uuid4().hex[:8]}", "ts": time.time()})
+        try:
+            server.broadcast_event(payload)
+        except Exception:
+            pass
+
+    def _on_notes_sync_push_result(self, result: dict | None = None) -> None:
+        result = dict(result or {})
+        cursor = str(result.get("cursor") or self.notes_store.current_cursor() or "0")
+        self._push_remote_notes_changed(cursor)
+        if result.get("conflicts"):
+            self._push_remote_notes_conflict({"conflicts": list(result.get("conflicts") or []), "cursor": cursor})
+            self._push_remote_notes_sync_status({"status": "conflict"}, cursor=cursor, message="notes_conflict")
+        else:
+            self._push_remote_notes_sync_status({"status": "synced"}, cursor=cursor, message="notes_sync_status")
+
     def _remote_turn_payload(self, turn: dict) -> dict:
         question = str(turn.get("question") or "")
         answer_md = str(turn.get("answer_md") or "")
@@ -2653,6 +2841,31 @@ class ChatFrame(wx.Frame):
         )
         return 200, {"accepted": True, **chat}
 
+    def _remote_api_notes_snapshot(self, _payload: dict | None = None) -> tuple[int, dict]:
+        return 200, self.notes_sync.snapshot()
+
+    def _remote_api_notes_pull_since(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        cursor = str(payload.get("cursor") or "0").strip() or "0"
+        return 200, self.notes_sync.pull_since(cursor)
+
+    def _remote_api_notes_push_ops(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        result = self.notes_sync.push_ops(list(payload.get("ops") or []))
+        return 200, result
+
+    def _remote_api_notes_subscribe(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        return 200, self.notes_sync.subscribe(payload)
+
+    def _remote_api_notes_ack(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        return 200, self.notes_sync.ack(payload)
+
+    def _remote_api_notes_ping(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        return 200, self.notes_sync.ping(payload)
+
     def _remote_api_rename_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         title = str(payload.get("title") or "").strip()
@@ -2899,6 +3112,12 @@ class ChatFrame(wx.Frame):
             on_update_settings=self._remote_api_update_settings_ui,
             on_history_list=self._remote_api_history_list_ui,
             on_history_read=self._remote_api_history_read_ui,
+            on_notes_snapshot=self._remote_api_notes_snapshot,
+            on_notes_pull_since=self._remote_api_notes_pull_since,
+            on_notes_push_ops=self._remote_api_notes_push_ops,
+            on_notes_subscribe=self._remote_api_notes_subscribe,
+            on_notes_ack=self._remote_api_notes_ack,
+            on_notes_ping=self._remote_api_notes_ping,
         )
         self._remote_ws_server.start()
         published_url = f"{runtime['published_base']}?token={token}"
@@ -2914,10 +3133,32 @@ class ChatFrame(wx.Frame):
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
+        notes_has_focus = bool(
+            getattr(self, "notes_notebook_list", None)
+            and (
+                self.notes_notebook_list.HasFocus()
+                or self.notes_entry_list.HasFocus()
+                or self.notes_editor.HasFocus()
+            )
+        )
         if key == wx.WXK_ALT and event.AltDown() and not event.ControlDown():
             self._arm_tools_menu_open()
             return
         self._suppress_tools_menu_open()
+        if (
+            key == wx.WXK_MENU
+            and notes_has_focus
+        ):
+            self._show_notes_menu()
+            return
+        if (
+            key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+            and notes_has_focus
+            and not event.ControlDown()
+            and not event.AltDown()
+        ):
+            self._on_notes_key_down(event)
+            return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             and self.history_list.HasFocus()
@@ -2975,6 +3216,12 @@ class ChatFrame(wx.Frame):
         return raw == 27
 
     def _on_any_key_down_escape_minimize(self, event) -> bool:
+        if getattr(self, "notes_editor", None):
+            try:
+                if getattr(self, "notes_controller", None) and self.notes_controller.notes_view == "note_edit":
+                    return False
+            except Exception:
+                pass
         if self._is_real_escape_keydown(event):
             self._minimize_to_tray()
             return True
@@ -4292,6 +4539,692 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._history_rename, id=i_ren)
         self.PopupMenu(m)
         m.Destroy()
+
+    def _notes_current_notebook(self):
+        notebook_id = str(self.notes_controller.active_notebook_id or self._notes_selected_notebook_id() or "").strip()
+        if not notebook_id:
+            return None
+        return self.notes_store.get_notebook(notebook_id, include_deleted=True)
+
+    def _notes_current_entry(self):
+        entry_id = str(self.notes_controller.active_entry_id or self._notes_selected_entry_id() or "").strip()
+        if not entry_id:
+            return None
+        return self.notes_store.get_entry(entry_id, include_deleted=True)
+
+    def _notes_selected_notebook_id(self) -> str:
+        idx = self.notes_notebook_list.GetSelection()
+        if idx != wx.NOT_FOUND and 0 <= idx < len(getattr(self, "_notes_notebook_ids", [])):
+            return str(self._notes_notebook_ids[idx])
+        return str(self.notes_controller.active_notebook_id or "")
+
+    def _notes_selected_entry_id(self) -> str:
+        idx = self.notes_entry_list.GetSelection()
+        if idx != wx.NOT_FOUND and 0 <= idx < len(getattr(self, "_notes_entry_ids", [])):
+            return str(self._notes_entry_ids[idx])
+        return str(self.notes_controller.active_entry_id or "")
+
+    def _notes_sync_view_visibility(self) -> None:
+        controller = getattr(self, "notes_controller", None)
+        view = str(getattr(controller, "notes_view", "notes_list") or "notes_list")
+        show_notes_list = True
+        show_note_detail = view == "note_detail"
+        show_note_edit = view == "note_edit"
+        if hasattr(self, "notes_content_label"):
+            self.notes_content_label.SetLabel("笔记详情：" if show_note_detail else ("笔记条目编辑：" if show_note_edit else "笔记："))
+        if hasattr(self, "notes_list_panel"):
+            self.notes_list_panel.Show(show_notes_list)
+        if hasattr(self, "notes_detail_panel"):
+            self.notes_detail_panel.Show(show_note_detail)
+        if hasattr(self, "notes_edit_panel"):
+            self.notes_edit_panel.Show(show_note_edit)
+        try:
+            self.notes_notebook_list.Enable(self.notes_notebook_list.GetCount() > 0)
+        except Exception:
+            pass
+        try:
+            self.notes_entry_list.Enable(show_note_detail and bool(str(getattr(controller, "active_notebook_id", "") or "").strip()))
+        except Exception:
+            pass
+        try:
+            self.notes_editor.Enable(show_note_edit)
+        except Exception:
+            pass
+        try:
+            self.Layout()
+        except Exception:
+            pass
+
+    def _notes_refresh_notebooks(self, select_id: str | None = None) -> None:
+        query = str(getattr(self, "_notes_search_query", "") or "").strip()
+        notebooks = self.notes_store.search_notebooks(query) if query else self.notes_store.list_notebooks()
+        self._notes_notebook_ids = [nb.id for nb in notebooks]
+        self.notes_notebook_list.Clear()
+        if not notebooks:
+            self.notes_notebook_list.Append("暂无笔记本")
+            self.notes_notebook_list.Enable(False)
+            return
+        self.notes_notebook_list.Enable(True)
+        for notebook in notebooks:
+            label = f"{'★ ' if notebook.pinned else ''}{notebook.title}"
+            self.notes_notebook_list.Append(label)
+        target = str(select_id or self.notes_controller.active_notebook_id or notebooks[0].id)
+        if target in self._notes_notebook_ids:
+            self.notes_notebook_list.SetSelection(self._notes_notebook_ids.index(target))
+        else:
+            self.notes_notebook_list.SetSelection(0)
+
+    def _notes_refresh_entries(self, notebook_id: str | None = None, select_id: str | None = None) -> None:
+        notebook_id = str(notebook_id or self.notes_controller.active_notebook_id or "").strip()
+        self._notes_entry_ids = []
+        self.notes_entry_list.Clear()
+        if not notebook_id:
+            self.notes_entry_list.Append("请选择笔记本")
+            self.notes_entry_list.Enable(False)
+            return
+        entries = self.notes_store.list_entries(notebook_id)
+        self.notes_entry_list.Enable(True)
+        self._notes_entry_ids = [entry.id for entry in entries]
+        if not entries:
+            self.notes_entry_list.Append("暂无条目")
+            return
+        for entry in entries:
+            prefix = "★ " if entry.pinned else ""
+            self.notes_entry_list.Append(f"{prefix}{entry.content[:32]}")
+        target = str(select_id or self.notes_controller.active_entry_id or entries[0].id)
+        if target in self._notes_entry_ids:
+            self.notes_entry_list.SetSelection(self._notes_entry_ids.index(target))
+        else:
+            self.notes_entry_list.SetSelection(0)
+
+    def _notes_sync_editor(self) -> None:
+        entry = self._notes_current_entry()
+        draft = ""
+        if self.notes_controller.entry_editor_dirty:
+            draft = self.notes_controller.entry_editor_draft
+        elif entry is not None:
+            draft = entry.content
+        elif self.notes_controller.entry_editor_draft:
+            draft = self.notes_controller.entry_editor_draft
+        try:
+            self._notes_editor_syncing = True
+            self.notes_editor.SetValue(draft)
+            self.notes_editor.SetInsertionPointEnd()
+        except Exception:
+            pass
+        finally:
+            self._notes_editor_syncing = False
+
+    def _notes_refresh_ui(self) -> None:
+        if not hasattr(self, "notes_notebook_list"):
+            return
+        if not hasattr(self, "notes_controller"):
+            return
+        self._notes_sync_view_visibility()
+        self._notes_refresh_notebooks()
+        self._notes_refresh_entries()
+        self._notes_sync_view_visibility()
+        if self.notes_controller.notes_view == "note_edit":
+            self._notes_sync_editor()
+        elif self.notes_controller.notes_view == "note_detail" and self.notes_entry_list.GetCount() > 0:
+            self._notes_sync_editor()
+
+    def _sync_notes_ui(self) -> None:
+        self._notes_refresh_ui()
+
+    def _open_notes_root(self) -> None:
+        if not hasattr(self, "notes_controller"):
+            return
+        self.notes_controller.root_tab = "notes"
+        if not self.notes_controller.active_notebook_id:
+            first = self.notes_store.list_notebooks()
+            if first:
+                self.notes_controller.active_notebook_id = first[0].id
+        self.notes_controller.notes_view = "notes_list"
+        self.notes_controller.active_entry_id = ""
+        self.notes_controller.entry_editor_dirty = False
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        try:
+            self.notes_notebook_list.SetFocus()
+        except Exception:
+            pass
+
+    def _open_chat_root(self) -> None:
+        try:
+            self.input_edit.SetFocus()
+        except Exception:
+            pass
+
+    def _on_notes_editor_changed(self, event) -> None:
+        if getattr(self, "_notes_editor_syncing", False):
+            if event is not None:
+                event.Skip()
+            return
+        if not hasattr(self, "notes_controller"):
+            return
+        draft = ""
+        try:
+            draft = str(self.notes_editor.GetValue() or "")
+        except Exception:
+            draft = str(self.notes_controller.entry_editor_draft or "")
+        self.notes_controller.root_tab = "notes"
+        self.notes_controller.notes_view = "note_edit"
+        capture = getattr(self.notes_controller, "capture_editor_state", None)
+        if callable(capture):
+            capture()
+        self.notes_controller.entry_editor_draft = draft
+        self.notes_controller.entry_editor_dirty = True
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        if event is not None:
+            event.Skip()
+
+    def _prompt_notes_dirty_exit(self) -> str:
+        dlg = wx.MessageDialog(self, "笔记有未保存更改。", "未保存更改", wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+        try:
+            try:
+                dlg.SetYesNoCancelLabels("保存", "不保存", "取消")
+            except Exception:
+                pass
+            ret = dlg.ShowModal()
+        finally:
+            dlg.Destroy()
+        if ret == wx.ID_YES:
+            return "save"
+        if ret == wx.ID_NO:
+            return "discard"
+        return "cancel"
+
+    def _notes_discard_current_entry_edits(self) -> bool:
+        if not hasattr(self, "notes_controller"):
+            return False
+        entry = self._notes_current_entry()
+        should_drop = (
+            entry is not None
+            and not str(entry.content or "").strip()
+            and int(getattr(entry, "version", 0) or 0) <= 1
+            and not bool(getattr(entry, "origin_entry_id", None))
+            and not bool(getattr(entry, "is_conflict_copy", False))
+        )
+        if should_drop:
+            try:
+                self.notes_store.purge_entry(entry.id)
+            except Exception:
+                pass
+            self.notes_controller.active_entry_id = ""
+            self._notes_after_local_mutation()
+        self.notes_controller.entry_editor_dirty = False
+        self.notes_controller.entry_editor_draft = ""
+        self.notes_controller.notes_view = "note_detail"
+        self.notes_controller.entry_editor_base_version = 0
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        return True
+
+    def _notes_request_exit_edit(self) -> bool:
+        if not hasattr(self, "notes_controller"):
+            return False
+        if self.notes_controller.notes_view != "note_edit":
+            self.notes_controller.notes_view = "note_detail"
+            self._current_notes_state = self.notes_controller.to_state_dict()
+            self._notes_refresh_ui()
+            return True
+        if not self.notes_controller.entry_editor_dirty:
+            return self._notes_discard_current_entry_edits()
+        choice = self._prompt_notes_dirty_exit()
+        if choice == "save":
+            return self._notes_save_current_entry()
+        if choice == "discard":
+            return self._notes_discard_current_entry_edits()
+        return False
+
+    def _notes_sync_status_text(self, status: str | dict, message: str | None = None) -> str:
+        if message:
+            return str(message)
+        if isinstance(status, dict):
+            status = str(status.get("status") or "")
+        mapping = {
+            "pending": "待同步",
+            "sending": "同步中",
+            "failed": "同步失败",
+            "acked": "笔记已同步",
+            "synced": "笔记已同步",
+            "saved": "笔记已保存",
+            "conflict": "冲突",
+        }
+        return mapping.get(str(status or ""), str(status or ""))
+
+    def _on_notes_sync_status_changed(self, status: str | dict, *, message: str | None = None, cursor: str | None = None) -> None:
+        text = self._notes_sync_status_text(status, message)
+        self._show_notes_sync_hint(text)
+        self._push_remote_notes_sync_status(status, cursor=cursor, message=text)
+
+    def _notes_after_local_mutation(self, *, message: str = "待同步") -> None:
+        cursor = self.notes_store.current_cursor()
+        self._push_remote_notes_changed(cursor)
+        self._on_notes_sync_status_changed("pending", message=message, cursor=cursor)
+
+    def _show_notes_sync_hint(self, message: str) -> None:
+        self.notes_sync_hint = str(message or "")
+        try:
+            self.SetStatusText(self.notes_sync_hint)
+        except Exception:
+            pass
+
+    def _on_notes_remote_ops_applied(self, result: dict | None) -> None:
+        result = dict(result or {})
+        active_entry_id = str(getattr(self.notes_controller, "active_entry_id", "") or "").strip()
+        active_changed = False
+        if active_entry_id:
+            for op_result in list(result.get("applied") or []):
+                if not isinstance(op_result, dict):
+                    continue
+                entry = op_result.get("entry")
+                if isinstance(entry, dict) and str(entry.get("id") or "") == active_entry_id:
+                    active_changed = True
+                    break
+                conflicts = list(op_result.get("conflicts") or [])
+                for conflict in conflicts:
+                    if isinstance(conflict, dict) and str(conflict.get("origin_entry_id") or "") == active_entry_id:
+                        active_changed = True
+                        break
+                if active_changed:
+                    break
+            if not active_changed:
+                for conflict in list(result.get("conflicts") or []):
+                    if isinstance(conflict, dict) and str(conflict.get("origin_entry_id") or "") == active_entry_id:
+                        active_changed = True
+                        break
+        self._notes_refresh_ui()
+        cursor = str(result.get("cursor") or self.notes_store.current_cursor() or "0")
+        if active_changed:
+            message = "当前编辑的笔记已被远程更新，已刷新。"
+            if any(isinstance(item, dict) for item in list(result.get("conflicts") or [])):
+                message = "当前编辑的笔记已产生冲突，已刷新。"
+            self._show_notes_sync_hint(message)
+            self._push_remote_notes_conflict({"entry_id": active_entry_id, "cursor": cursor, "conflicts": list(result.get("conflicts") or [])})
+            self._push_remote_notes_sync_status({"status": "conflict"}, cursor=cursor, message=message)
+        else:
+            self._show_notes_sync_hint("笔记已同步")
+            self._push_remote_notes_sync_status({"status": "synced"}, cursor=cursor, message="笔记已同步")
+
+    def _show_notes_menu(self) -> None:
+        if self.notes_editor.HasFocus():
+            return
+        show_notebook_actions = self.notes_notebook_list.HasFocus() or self.notes_controller.notes_view == "notes_list"
+        show_entry_actions = self.notes_entry_list.HasFocus() or self.notes_controller.notes_view == "note_detail"
+        menu = wx.Menu()
+        if show_notebook_actions:
+            i_open_nb = wx.NewIdRef()
+            i_new_nb = wx.NewIdRef()
+            i_del_nb = wx.NewIdRef()
+            i_search_nb = wx.NewIdRef()
+            i_ren_nb = wx.NewIdRef()
+            menu.Append(i_open_nb, "打开笔记")
+            menu.AppendSeparator()
+            menu.Append(i_new_nb, "新建笔记")
+            menu.Append(i_del_nb, "删除笔记")
+            menu.Append(i_search_nb, "搜索笔记")
+            menu.Append(i_ren_nb, "重命名笔记")
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_open_selected_notebook(), id=i_open_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_notebook(), id=i_new_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_notebook(), id=i_del_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_prompt_search(), id=i_search_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_rename_notebook(), id=i_ren_nb)
+        elif show_entry_actions:
+            i_new_entry = wx.NewIdRef()
+            i_del_entry = wx.NewIdRef()
+            i_edit_entry = wx.NewIdRef()
+            i_pin_entry = wx.NewIdRef()
+            i_bottom_entry = wx.NewIdRef()
+            i_import_file = wx.NewIdRef()
+            i_import_clip = wx.NewIdRef()
+            menu.Append(i_new_entry, "新建笔记条目")
+            menu.Append(i_del_entry, "删除笔记条目")
+            menu.Append(i_edit_entry, "编辑笔记条目")
+            menu.Append(i_pin_entry, "置顶笔记条目")
+            menu.Append(i_bottom_entry, "置底笔记条目")
+            menu.AppendSeparator()
+            menu.Append(i_import_file, "从文件导入")
+            menu.Append(i_import_clip, "从剪贴板导入")
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_entry(), id=i_new_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_pin_entry(), id=i_pin_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_bottom(), id=i_bottom_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_file(), id=i_import_file)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_clipboard(), id=i_import_clip)
+        else:
+            menu.Destroy()
+            return
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _notes_apply_search(self, query: str | None = None) -> None:
+        if query is not None:
+            self._notes_search_query = str(query or "")
+        self._notes_refresh_notebooks()
+        self._notes_refresh_entries()
+
+    def _notes_prompt_search(self) -> bool:
+        initial = str(getattr(self, "_notes_search_query", "") or "").strip()
+        dlg = wx.TextEntryDialog(self, "请输入要搜索的笔记名称：", "搜索笔记", initial)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                try:
+                    self.notes_notebook_list.SetFocus()
+                except Exception:
+                    pass
+                return False
+            self._notes_apply_search(dlg.GetValue())
+            try:
+                self.notes_notebook_list.SetFocus()
+            except Exception:
+                pass
+            return True
+        finally:
+            dlg.Destroy()
+
+    def _notes_select_notebook(self, notebook_id: str, entry_id: str | None = None, view: str = "note_detail") -> None:
+        self.notes_controller.root_tab = "notes"
+        self.notes_controller.active_notebook_id = str(notebook_id or "")
+        self.notes_controller.active_entry_id = str(entry_id or "")
+        self.notes_controller.notes_view = str(view or "note_detail")
+        self.notes_controller.entry_editor_dirty = False
+        if self.notes_controller.notes_view != "note_edit":
+            self.notes_controller.entry_editor_base_version = 0
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        try:
+            if self.notes_controller.notes_view == "notes_list":
+                self.notes_notebook_list.SetFocus()
+            elif self.notes_controller.notes_view == "note_detail":
+                self.notes_entry_list.SetFocus()
+        except Exception:
+            pass
+
+    def _notes_select_entry(self, entry_id: str, view: str = "note_edit") -> None:
+        self.notes_controller.root_tab = "notes"
+        self.notes_controller.active_entry_id = str(entry_id or "")
+        self.notes_controller.notes_view = str(view or "note_edit")
+        self.notes_controller.entry_editor_dirty = False
+        entry = self.notes_store.get_entry(entry_id, include_deleted=True)
+        self.notes_controller.entry_editor_base_version = int(entry.version if entry is not None else 0)
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        try:
+            if self.notes_controller.notes_view == "note_edit":
+                self.notes_editor.SetFocus()
+        except Exception:
+            pass
+
+    def _notes_set_view(self, view: str) -> None:
+        self.notes_controller.root_tab = "notes"
+        self.notes_controller.notes_view = str(view or "notes_list")
+        if self.notes_controller.notes_view != "note_edit":
+            self.notes_controller.entry_editor_dirty = False
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+
+    def _notes_save_current_entry(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        capture = getattr(self.notes_controller, "capture_editor_state", None)
+        if callable(capture):
+            capture()
+        content = str(self.notes_editor.GetValue() or "").strip()
+        entry = self._notes_current_entry()
+        if entry is None:
+            if not content:
+                return False
+            entry = self.notes_store.create_entry(notebook.id, content, source="manual")
+        else:
+            base_version = int(getattr(self.notes_controller, "entry_editor_base_version", 0) or 0)
+            if base_version and entry.version != base_version:
+                source_label = "电脑端"
+                conflict_content = f"【冲突副本：来自{source_label}】\n{content}"
+                conflict = self.notes_store.create_entry(
+                    notebook.id,
+                    conflict_content,
+                    source=str(entry.source or "manual"),
+                    entry_id=None,
+                    device_id=self.notes_store.device_id,
+                    last_modified_by="desktop",
+                    is_conflict_copy=True,
+                    origin_entry_id=entry.id,
+                )
+                self.notes_controller.active_entry_id = conflict.id
+                self.notes_controller.entry_editor_base_version = conflict.version
+                self.notes_controller.entry_editor_draft = conflict_content
+                self.notes_controller.entry_editor_dirty = False
+                self.notes_controller.notes_view = "note_detail"
+                self._current_notes_state = self.notes_controller.to_state_dict()
+                self._notes_refresh_ui()
+                self._push_remote_notes_conflict(conflict.to_dict())
+                self._on_notes_sync_status_changed("conflict", cursor=self.notes_store.current_cursor(), message="冲突副本已创建")
+                self._push_remote_notes_changed(self.notes_store.current_cursor())
+                return True
+            entry = self.notes_store.update_entry(entry.id, content, source="manual")
+        self.notes_controller.active_entry_id = entry.id
+        self.notes_controller.entry_editor_draft = content
+        self.notes_controller.entry_editor_dirty = False
+        self.notes_controller.entry_editor_base_version = entry.version
+        self.notes_controller.notes_view = "note_detail"
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        try:
+            self.notes_entry_list.SetFocus()
+        except Exception:
+            pass
+        self._notes_after_local_mutation(message="笔记已保存，待同步")
+        return True
+
+    def _notes_create_notebook(self) -> bool:
+        dlg = wx.TextEntryDialog(self, "请输入笔记本名称", "新建笔记本")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title = str(dlg.GetValue() or "").strip()
+        finally:
+            dlg.Destroy()
+        if not title:
+            return False
+        notebook = self.notes_store.create_notebook(title)
+        self._notes_select_notebook(notebook.id, view="note_detail")
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_rename_notebook(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        dlg = wx.TextEntryDialog(self, "请输入新的笔记本名称", "重命名笔记本", value=notebook.title)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title = str(dlg.GetValue() or "").strip()
+        finally:
+            dlg.Destroy()
+        if not title:
+            return False
+        self.notes_store.rename_notebook(notebook.id, title)
+        self._notes_refresh_ui()
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_delete_notebook(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        if not self._confirm("确定删除该笔记本吗？"):
+            return False
+        self.notes_store.delete_notebook(notebook.id)
+        self.notes_controller.active_notebook_id = ""
+        self.notes_controller.active_entry_id = ""
+        self.notes_controller.notes_view = "notes_list"
+        self.notes_controller.entry_editor_dirty = False
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_create_entry(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        self.notes_controller.root_tab = "notes"
+        self.notes_controller.active_notebook_id = notebook.id
+        self.notes_controller.active_entry_id = ""
+        self.notes_controller.notes_view = "note_edit"
+        self.notes_controller.entry_editor_draft = ""
+        self.notes_controller.entry_editor_dirty = False
+        self.notes_controller.entry_editor_base_version = 0
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_ui()
+        return True
+
+    def _notes_edit_entry(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is None:
+            return False
+        self._notes_select_entry(entry.id, view="note_edit")
+        return True
+
+    def _notes_delete_entry(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is None:
+            return False
+        if not self._confirm("确定删除该条目吗？"):
+            return False
+        notebook_id = entry.notebook_id
+        self.notes_store.delete_entry(entry.id)
+        self.notes_controller.active_entry_id = ""
+        self.notes_controller.notes_view = "note_detail"
+        self.notes_controller.entry_editor_dirty = False
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_entries(notebook_id)
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_pin_entry(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is None:
+            return False
+        self.notes_store.pin_entry(entry.id)
+        self._notes_refresh_ui()
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_move_entry_to_bottom(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is None:
+            return False
+        self.notes_store.move_entry_to_bottom(entry.id)
+        self._notes_refresh_ui()
+        self._notes_after_local_mutation()
+        return True
+
+    def _notes_import_from_file(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        dlg = wx.FileDialog(self, "选择导入文件", wildcard="文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            path = Path(dlg.GetPath())
+        finally:
+            dlg.Destroy()
+        created = import_note_entries_from_file(self.notes_store, notebook.id, path)
+        if created:
+            self._notes_select_notebook(notebook.id, created[0].id, view="note_detail")
+            self._notes_after_local_mutation()
+        return bool(created)
+
+    def _notes_get_clipboard_text(self) -> str:
+        if wx.TheClipboard.Open():
+            try:
+                data = wx.TextDataObject()
+                if wx.TheClipboard.GetData(data):
+                    return data.GetText()
+            finally:
+                wx.TheClipboard.Close()
+        return ""
+
+    def _notes_import_from_clipboard(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        text = self._notes_get_clipboard_text()
+        created = import_note_entries_from_clipboard(self.notes_store, notebook.id, text)
+        if created:
+            self._notes_select_notebook(notebook.id, created[0].id, view="note_detail")
+            self._notes_after_local_mutation()
+        return bool(created)
+
+    def _on_notes_key_down(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE and getattr(self, "notes_controller", None) and self.notes_controller.notes_view == "note_edit":
+            if self._notes_request_exit_edit():
+                return
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        if key == wx.WXK_MENU:
+            self._show_notes_menu()
+            return
+        if (
+            getattr(self, "notes_controller", None)
+            and self.notes_controller.notes_view == "note_edit"
+            and ((event.ControlDown() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)) or (event.AltDown() and key in (ord("S"), ord("s"))))
+        ):
+            self._notes_save_current_entry()
+            return
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.notes_notebook_list.HasFocus():
+                if self._notes_open_selected_notebook():
+                    return
+            if self.notes_entry_list.HasFocus():
+                entry_id = self._notes_selected_entry_id()
+                if entry_id:
+                    self._notes_select_entry(entry_id, view="note_edit")
+                    return
+        if key == wx.WXK_BACK:
+            if self.notes_entry_list.HasFocus() and getattr(self, "notes_controller", None) and self.notes_controller.notes_view == "note_detail":
+                notebook_id = self._notes_selected_notebook_id()
+                if notebook_id:
+                    self._notes_select_notebook(notebook_id, view="notes_list")
+                    return
+        if key == wx.WXK_DELETE:
+            if self.notes_entry_list.HasFocus():
+                self._notes_delete_entry()
+                return
+            if self.notes_notebook_list.HasFocus():
+                self._notes_delete_notebook()
+                return
+        event.Skip()
+
+    def _on_notes_context(self, _event):
+        self._show_notes_menu()
+
+    def _on_notes_notebook_selected(self, _event):
+        notebook_id = self._notes_selected_notebook_id()
+        if notebook_id:
+            self._notes_select_notebook(notebook_id, view="notes_list")
+        else:
+            self._notes_refresh_ui()
+
+    def _on_notes_entry_selected(self, _event):
+        entry_id = self._notes_selected_entry_id()
+        if entry_id:
+            self._notes_select_entry(entry_id, view=self.notes_controller.notes_view or "note_detail")
+
+    def _notes_open_selected_notebook(self) -> bool:
+        notebook_id = self._notes_selected_notebook_id()
+        if not notebook_id:
+            return False
+        self._notes_select_notebook(notebook_id, view="note_detail")
+        return True
 
     def _confirm(self, message: str, title: str = "确认") -> bool:
         # 默认按钮使用“是”，避免键盘焦点默认落在“否”。

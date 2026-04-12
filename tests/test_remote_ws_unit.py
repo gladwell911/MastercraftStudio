@@ -75,3 +75,57 @@ def test_remote_ws_server_routes_and_auth():
         asyncio.run(_run())
     finally:
         server.stop()
+
+
+def test_remote_ws_server_routes_notes_apis():
+    server = RemoteWebSocketServer(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        on_message=lambda payload: (200, {"accepted": True}),
+        on_new_chat=lambda payload: (200, {"accepted": True}),
+        on_reply_request=lambda payload: (200, {"accepted": True}),
+        on_state=lambda: (200, {"accepted": True, "status": "idle"}),
+        on_notes_snapshot=lambda _payload=None: (200, {"accepted": True, "cursor": "9", "notebooks": [], "entries": []}),
+        on_notes_pull_since=lambda payload: (200, {"accepted": True, "cursor": payload.get("cursor"), "ops": []}),
+        on_notes_push_ops=lambda payload: (200, {"accepted": True, "cursor": "10", "applied": payload.get("ops") or [], "conflicts": []}),
+        on_notes_subscribe=lambda payload: (200, {"accepted": True, "cursor": "11", "subscribed": True, "payload": payload}),
+        on_notes_ack=lambda payload: (200, {"accepted": True, "cursor": "12", "acked": payload.get("op_ids") or []}),
+        on_notes_ping=lambda payload: (200, {"accepted": True, "cursor": "13", "pong": True, "payload": payload}),
+    )
+    server.start()
+    try:
+        async def _run():
+            session, ws = await _connect(server.bound_port)
+            try:
+                await ws.receive()
+                await ws.send_json({"id": "ns1", "type": "notes_snapshot"})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "9"
+
+                await ws.send_json({"id": "np1", "type": "notes_pull_since", "cursor": "7"})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "7"
+
+                await ws.send_json({"id": "nps", "type": "notes_push_ops", "ops": [{"entity_type": "entry"}]})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "10"
+
+                await ws.send_json({"id": "nss", "type": "notes_subscribe", "cursor": "8"})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "11"
+
+                await ws.send_json({"id": "na", "type": "notes_ack", "op_ids": ["op-1"]})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "12"
+
+                await ws.send_json({"id": "np", "type": "notes_ping", "cursor": "9"})
+                response = (await ws.receive()).json()
+                assert response["body"]["cursor"] == "13"
+            finally:
+                await ws.close()
+                await session.close()
+
+        asyncio.run(_run())
+    finally:
+        server.stop()

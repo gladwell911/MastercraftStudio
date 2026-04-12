@@ -15,6 +15,12 @@ class RemoteControlHttpServer:
         on_new_chat: Callable[[dict], tuple[int, dict]],
         on_reply_request: Callable[[dict], tuple[int, dict]],
         on_state: Callable[[], tuple[int, dict]],
+        on_notes_snapshot: Callable[[], tuple[int, dict]] | None = None,
+        on_notes_pull_since: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_push_ops: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_subscribe: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_ack: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_ping: Callable[[dict], tuple[int, dict]] | None = None,
     ) -> None:
         self.host = str(host or "127.0.0.1").strip() or "127.0.0.1"
         self.port = max(int(port or 0), 0)
@@ -23,6 +29,12 @@ class RemoteControlHttpServer:
         self.on_new_chat = on_new_chat
         self.on_reply_request = on_reply_request
         self.on_state = on_state
+        self.on_notes_snapshot = on_notes_snapshot
+        self.on_notes_pull_since = on_notes_pull_since
+        self.on_notes_push_ops = on_notes_push_ops
+        self.on_notes_subscribe = on_notes_subscribe
+        self.on_notes_ack = on_notes_ack
+        self.on_notes_ping = on_notes_ping
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -47,6 +59,16 @@ class RemoteControlHttpServer:
                     outer._write_json(self, 401, {"accepted": False, "error": "unauthorized"})
                     return
                 if self.path != "/api/remote/state":
+                    if self.path == "/api/remote/notes_snapshot":
+                        if not callable(outer.on_notes_snapshot):
+                            outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                            return
+                        try:
+                            status, body = outer.on_notes_snapshot()
+                        except TypeError:
+                            status, body = outer.on_notes_snapshot({})
+                        outer._write_json(self, status, body)
+                        return
                     outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
                     return
                 status, payload = outer.on_state()
@@ -70,6 +92,51 @@ class RemoteControlHttpServer:
                     return
                 if self.path == "/api/remote/reply-request":
                     status, body = outer.on_reply_request(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_snapshot":
+                    if not callable(outer.on_notes_snapshot):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    try:
+                        status, body = outer.on_notes_snapshot()
+                    except TypeError:
+                        status, body = outer.on_notes_snapshot(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_pull_since":
+                    if not callable(outer.on_notes_pull_since):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    status, body = outer.on_notes_pull_since(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_push_ops":
+                    if not callable(outer.on_notes_push_ops):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    status, body = outer.on_notes_push_ops(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_subscribe":
+                    if not callable(outer.on_notes_subscribe):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    status, body = outer.on_notes_subscribe(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_ack":
+                    if not callable(outer.on_notes_ack):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    status, body = outer.on_notes_ack(payload)
+                    outer._write_json(self, status, body)
+                    return
+                if self.path == "/api/remote/notes_ping":
+                    if not callable(outer.on_notes_ping):
+                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
+                        return
+                    status, body = outer.on_notes_ping(payload)
                     outer._write_json(self, status, body)
                     return
                 outer._write_json(self, 404, {"accepted": False, "error": "not_found"})

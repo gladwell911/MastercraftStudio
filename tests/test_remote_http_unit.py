@@ -50,6 +50,79 @@ def test_remote_http_server_routes_and_auth():
         server.stop()
 
 
+def test_remote_http_server_routes_notes_apis():
+    server = RemoteControlHttpServer(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        on_message=lambda payload: (200, {"accepted": True}),
+        on_new_chat=lambda payload: (200, {"accepted": True}),
+        on_reply_request=lambda payload: (200, {"accepted": True}),
+        on_state=lambda: (200, {"accepted": True, "status": "idle"}),
+        on_notes_snapshot=lambda: (200, {"accepted": True, "cursor": "9", "notebooks": [], "entries": []}),
+        on_notes_pull_since=lambda payload: (200, {"accepted": True, "cursor": payload.get("cursor"), "ops": []}),
+        on_notes_push_ops=lambda payload: (200, {"accepted": True, "cursor": "10", "applied": payload.get("ops") or [], "conflicts": []}),
+        on_notes_subscribe=lambda payload: (200, {"accepted": True, "cursor": "11", "subscribed": True, "payload": payload}),
+        on_notes_ack=lambda payload: (200, {"accepted": True, "cursor": "12", "acked": payload.get("op_ids") or []}),
+        on_notes_ping=lambda payload: (200, {"accepted": True, "cursor": "13", "pong": True, "payload": payload}),
+    )
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        headers = {"X-Remote-Token": "secret"}
+
+        response = requests.get(f"{base}/api/remote/notes_snapshot", headers=headers, timeout=5)
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "9"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_pull_since",
+            headers=headers,
+            json={"cursor": "7"},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "7"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_push_ops",
+            headers=headers,
+            json={"ops": [{"entity_type": "entry"}]},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "10"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_subscribe",
+            headers=headers,
+            json={"cursor": "8"},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "11"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_ack",
+            headers=headers,
+            json={"op_ids": ["op-1"]},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "12"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_ping",
+            headers=headers,
+            json={"cursor": "9"},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        assert response.json()["cursor"] == "13"
+    finally:
+        server.stop()
+
+
 def test_remote_http_server_accepts_non_utf8_json_when_charset_is_declared():
     server = RemoteControlHttpServer(
         host="127.0.0.1",

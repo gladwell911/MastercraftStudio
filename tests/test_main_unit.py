@@ -1645,10 +1645,30 @@ def test_bind_events_registers_both_hotkey_ids():
         def __init__(self):
             self.send_button = _Ctrl("send_button")
             self.new_chat_button = _Ctrl("new_chat_button")
+            self.notes_button = _Ctrl("notes_button")
             self.model_combo = _Ctrl("model_combo")
             self.input_edit = _Ctrl("input_edit")
             self.answer_list = _Ctrl("answer_list")
             self.history_list = _Ctrl("history_list")
+            self.notes_search_ctrl = _Ctrl("notes_search_ctrl")
+            self.notes_search_button = _Ctrl("notes_search_button")
+            self.notes_clear_search_button = _Ctrl("notes_clear_search_button")
+            self.notes_notebook_list = _Ctrl("notes_notebook_list")
+            self.notes_new_notebook_button = _Ctrl("notes_new_notebook_button")
+            self.notes_rename_notebook_button = _Ctrl("notes_rename_notebook_button")
+            self.notes_delete_notebook_button = _Ctrl("notes_delete_notebook_button")
+            self.notes_back_button = _Ctrl("notes_back_button")
+            self.notes_entry_list = _Ctrl("notes_entry_list")
+            self.notes_new_entry_button = _Ctrl("notes_new_entry_button")
+            self.notes_edit_entry_button = _Ctrl("notes_edit_entry_button")
+            self.notes_delete_entry_button = _Ctrl("notes_delete_entry_button")
+            self.notes_pin_entry_button = _Ctrl("notes_pin_entry_button")
+            self.notes_bottom_entry_button = _Ctrl("notes_bottom_entry_button")
+            self.notes_import_file_button = _Ctrl("notes_import_file_button")
+            self.notes_import_clipboard_button = _Ctrl("notes_import_clipboard_button")
+            self.notes_editor = _Ctrl("notes_editor")
+            self.notes_save_button = _Ctrl("notes_save_button")
+            self.notes_cancel_button = _Ctrl("notes_cancel_button")
 
         def Bind(self, _event, _handler, id=None):
             frame_bind_calls.append(id)
@@ -1708,6 +1728,21 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_history_context(self, *_args):
+            return None
+
+        def _on_notes_key_down(self, *_args):
+            return None
+
+        def _on_notes_context(self, *_args):
+            return None
+
+        def _on_notes_notebook_selected(self, *_args):
+            return None
+
+        def _on_notes_entry_selected(self, *_args):
+            return None
+
+        def _on_notes_editor_changed(self, *_args):
             return None
 
     dummy = _DummyFrame()
@@ -2117,6 +2152,205 @@ def test_load_chat_title_rules_reads_shared_json(tmp_path):
 
     assert rules["leading_phrases"] == ["绝对前缀"]
 
+
+def test_shared_chat_title_rules_path_points_to_repo_assets():
+    assert main.shared_chat_title_rules_path() == Path(r"c:\code\rc\assets\chat_title_rules.json")
+
+
+def test_load_state_restores_notes_ui_state(frame, tmp_path):
+    notebook = frame.notes_store.create_notebook("恢复测试")
+    entry = frame.notes_store.create_entry(notebook.id, "保存过的草稿", source="manual")
+
+    class _Editor:
+        def __init__(self):
+            self.value = ""
+            self.cursor = None
+            self.scroll = None
+            self.scroll_get_calls = 0
+            self.scroll_set_calls = []
+
+        def SetValue(self, value):
+            self.value = value
+
+        def SetInsertionPoint(self, cursor):
+            self.cursor = cursor
+
+        def GetScrollPos(self, orientation):
+            self.scroll_get_calls += 1
+            return self.scroll
+
+        def SetScrollPos(self, orientation, pos, refresh=True):
+            self.scroll_set_calls.append((orientation, pos, refresh))
+            self.scroll = pos
+
+        def GetValue(self):
+            return self.value
+
+    frame.notes_editor = _Editor()
+    frame.state_path = tmp_path / "app_state.json"
+    frame._current_notes_state = {}
+    frame.state_path.write_text(
+        json.dumps(
+            {
+                "notes_ui_state": {
+                    "active_root_tab": "notes",
+                    "notes_view": "note_edit",
+                    "active_notebook_id": notebook.id,
+                    "active_entry_id": entry.id,
+                    "entry_editor_draft": "未保存草稿",
+                    "entry_editor_dirty": True,
+                    "entry_editor_cursor": 2,
+                    "entry_editor_scroll": 8,
+                    "last_sync_cursor": "42",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    frame._load_state()
+
+    assert frame._current_notes_state["active_root_tab"] == "notes"
+    assert frame._current_notes_state["notes_view"] == "note_edit"
+    assert frame._current_notes_state["entry_editor_draft"] == "未保存草稿"
+    assert frame.notes_editor.value == "未保存草稿"
+    assert frame.notes_editor.cursor == 2
+    assert frame.notes_editor.scroll == 8
+    assert frame.notes_editor.scroll_set_calls[-1][1] == 8
+    assert frame._current_notes_state["last_sync_cursor"] == "42"
+
+
+def test_save_state_captures_notes_editor_cursor_and_scroll(frame):
+    class _Editor:
+        def __init__(self):
+            self.value = ""
+            self.cursor = 0
+            self.scroll = 0
+            self.scroll_get_calls = 0
+            self.scroll_set_calls = []
+
+        def SetValue(self, value):
+            self.value = value
+
+        def GetValue(self):
+            return self.value
+
+        def SetInsertionPoint(self, cursor):
+            self.cursor = cursor
+
+        def GetInsertionPoint(self):
+            return self.cursor
+
+        def SetInsertionPointEnd(self):
+            self.cursor = len(self.value)
+
+        def GetScrollPos(self, orientation):
+            self.scroll_get_calls += 1
+            return self.scroll
+
+        def SetScrollPos(self, orientation, pos, refresh=True):
+            self.scroll_set_calls.append((orientation, pos, refresh))
+            self.scroll = pos
+
+    notebook = frame.notes_store.create_notebook("save cursor notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "save cursor entry", source="manual")
+    frame.notes_editor = _Editor()
+    frame._notes_select_entry(entry.id, view="note_edit")
+    frame.notes_editor.value = "edited cursor draft"
+    frame.notes_editor.cursor = 7
+    frame.notes_editor.scroll = 13
+    frame._on_notes_editor_changed(None)
+    frame._save_state()
+
+    saved_state = json.loads(frame.state_path.read_text(encoding="utf-8"))["notes_ui_state"]
+    assert saved_state["entry_editor_draft"] == "edited cursor draft"
+    assert saved_state["entry_editor_cursor"] == 7
+    assert saved_state["entry_editor_scroll"] == 13
+
+
+def test_notes_transport_broadcasts_conflict_and_sync_status(frame):
+    seen = []
+
+    class _Server:
+        def broadcast_event(self, payload):
+            seen.append(payload)
+
+    frame._remote_ws_server = _Server()
+
+    frame._push_remote_notes_conflict({"entry_id": "e1", "message": "conflict"})
+    frame._push_remote_notes_sync_status("synced", cursor="44", message="ok")
+
+    types = [item["type"] for item in seen]
+    assert "notes_conflict" in types
+    assert "notes_sync_status" in types
+
+
+def test_remote_notes_apis_delegate_to_notes_sync(frame):
+    class _FakeNotesSync:
+        def __init__(self):
+            self.snapshot_calls = 0
+            self.pull_calls = []
+            self.push_calls = []
+            self.subscribe_calls = []
+            self.ack_calls = []
+            self.ping_calls = 0
+
+        def snapshot(self):
+            self.snapshot_calls += 1
+            return {"cursor": "10", "notebooks": [], "entries": []}
+
+        def pull_since(self, cursor):
+            self.pull_calls.append(cursor)
+            return {"cursor": f"{cursor}-next", "ops": []}
+
+        def push_ops(self, ops):
+            self.push_calls.append(list(ops))
+            return {"cursor": "11", "applied": [], "conflicts": []}
+
+        def subscribe(self, payload=None):
+            self.subscribe_calls.append(dict(payload or {}))
+            return {"cursor": "12", "subscribed": True}
+
+        def ack(self, payload=None):
+            self.ack_calls.append(dict(payload or {}))
+            return {"cursor": "13", "acked": True}
+
+        def ping(self, payload=None):
+            self.ping_calls += 1
+            return {"cursor": "14", "pong": True}
+
+    fake = _FakeNotesSync()
+    frame.notes_sync = fake
+
+    status, body = frame._remote_api_notes_snapshot(None)
+    assert status == 200
+    assert body["cursor"] == "10"
+
+    status, body = frame._remote_api_notes_pull_since({"cursor": "7"})
+    assert status == 200
+    assert body["cursor"] == "7-next"
+    assert fake.pull_calls == ["7"]
+
+    status, body = frame._remote_api_notes_push_ops({"ops": [{"entity_type": "entry"}]})
+    assert status == 200
+    assert body["cursor"] == "11"
+    assert fake.push_calls == [[{"entity_type": "entry"}]]
+
+    status, body = frame._remote_api_notes_subscribe({"cursor": "1"})
+    assert status == 200
+    assert body["cursor"] == "12"
+    assert fake.subscribe_calls == [{"cursor": "1"}]
+
+    status, body = frame._remote_api_notes_ack({"op_ids": ["op-1"]})
+    assert status == 200
+    assert body["cursor"] == "13"
+    assert fake.ack_calls == [{"op_ids": ["op-1"]}]
+
+    status, body = frame._remote_api_notes_ping({"cursor": "9"})
+    assert status == 200
+    assert body["cursor"] == "14"
+    assert fake.ping_calls == 1
 
 def test_title_source_turns_keeps_only_first_question(frame):
     turns = [
@@ -2759,7 +2993,7 @@ def test_cli_auto_title_updates_after_background_answer(frame, monkeypatch):
 
     archived = frame._find_archived_chat("chat-old")
     assert archived["title"] != "新聊天"
-    assert "CLI 刷新问题"[:6] in archived["title"]
+    assert "CLI刷新问题" in archived["title"].replace(" ", "")
 
 
 def test_claudecode_auto_title_updates_after_background_answer(frame, monkeypatch):

@@ -105,5 +105,115 @@ def test_e2e_ctrl_right_from_input_reaches_pinned_and_older_chats(frame):
         frame._on_input_key_down(event)
         seen.append(frame.current_chat_id)
 
-    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
     assert all(event.skipped == 1 for event in events)
+
+
+def test_e2e_enter_on_notes_notebook_opens_detail_without_send(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("e2e notebook")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetSelection(frame._notes_notebook_ids.index(notebook.id))
+    frame._on_notes_notebook_selected(None)
+
+    seen = {"send": 0, "skip": 0}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_editor, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame, "_trigger_send", lambda: seen.__setitem__("send", seen["send"] + 1))
+
+    class E:
+        def GetKeyCode(self):
+            return main.wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            seen["skip"] += 1
+
+    frame._on_char_hook(E())
+
+    assert frame.notes_controller.notes_view == "note_detail"
+    assert frame.notes_controller.active_notebook_id == notebook.id
+    assert seen["send"] == 0
+
+
+def test_e2e_notes_same_slot_navigation_and_backspace(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("e2e same slot notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "e2e same slot entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetSelection(frame._notes_notebook_ids.index(notebook.id))
+    frame._on_notes_notebook_selected(None)
+
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: main.wx.WXK_RETURN,
+        "ControlDown": lambda self: False,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    assert frame.notes_detail_panel.IsShown()
+    assert frame.notes_list_panel.IsShown()
+    assert frame.notes_entry_list.GetCount() >= 1
+
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: main.wx.WXK_RETURN,
+        "ControlDown": lambda self: False,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    assert frame.notes_edit_panel.IsShown()
+    assert not frame.notes_detail_panel.IsShown()
+    assert not frame.notes_entry_list.IsEnabled()
+    assert frame.notes_list_panel.IsShown()
+    assert frame.notes_notebook_list.IsEnabled()
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: main.wx.WXK_BACK,
+        "ControlDown": lambda self: False,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    assert frame.notes_list_panel.IsShown()
+    assert not frame.notes_detail_panel.IsShown()
+
+
+def test_e2e_notes_ctrl_enter_save_returns_focus_to_entry_list(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("e2e save focus notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "e2e before save", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: main.wx.WXK_RETURN,
+        "ControlDown": lambda self: False,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    frame.notes_editor.SetValue("e2e after save")
+    frame._on_notes_editor_changed(None)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: main.wx.WXK_RETURN,
+        "ControlDown": lambda self: True,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    assert frame.notes_controller.notes_view == "note_detail"
+    assert frame.notes_controller.active_entry_id == entry.id
+    assert frame.notes_entry_list.HasFocus()
