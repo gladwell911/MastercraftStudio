@@ -19,6 +19,11 @@ class NotesSyncService:
         return self.store.snapshot()
 
     def pull_since(self, cursor: str) -> dict:
+        normalized_cursor = str(cursor or "0").strip() or "0"
+        if normalized_cursor == "0":
+            snapshot = self.store.snapshot()
+            snapshot["cursor"] = str(snapshot.get("cursor") or self.store.current_cursor() or "0")
+            return snapshot
         ops, next_cursor = self.store.list_ops_since(cursor)
         return {"cursor": next_cursor, "ops": ops}
 

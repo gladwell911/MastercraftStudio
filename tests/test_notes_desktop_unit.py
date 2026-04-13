@@ -338,6 +338,74 @@ def test_notes_controller_restore_prefers_edit_detail_or_list(tmp_path):
     assert controller.notes_view == "notes_list"
 
 
+def test_notes_controller_restore_keeps_unsaved_new_entry_draft(tmp_path):
+    class FakeEditor:
+        def __init__(self):
+            self.value = ""
+            self.cursor = None
+            self.scroll = None
+
+        def SetValue(self, value):
+            self.value = value
+
+        def SetInsertionPoint(self, cursor):
+            self.cursor = cursor
+
+        def ShowPosition(self, scroll):
+            self.scroll = scroll
+
+    class FakeFrame:
+        def __init__(self, store):
+            self.notes_store = store
+            self.notes_editor = FakeEditor()
+            self._current_notes_state = {}
+
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("unsaved draft notebook")
+    frame = FakeFrame(store)
+    controller = main.DesktopNotesController(frame, store)
+
+    controller.restore_state(
+        {
+            "active_root_tab": "notes",
+            "notes_view": "note_edit",
+            "active_notebook_id": notebook.id,
+            "active_entry_id": "",
+            "entry_editor_draft": "unsaved draft content",
+            "entry_editor_dirty": True,
+            "entry_editor_cursor": 5,
+            "entry_editor_scroll": 2,
+        }
+    )
+
+    assert controller.notes_view == "note_edit"
+    assert controller.active_notebook_id == notebook.id
+    assert controller.active_entry_id == ""
+    assert controller.entry_editor_draft == "unsaved draft content"
+    assert controller.entry_editor_dirty is True
+    assert frame.notes_editor.value == "unsaved draft content"
+    assert frame._current_notes_state["entry_editor_draft"] == "unsaved draft content"
+
+
+def test_notes_store_persists_entries_across_reopen(tmp_path):
+    db_path = tmp_path / "notes.db"
+    store = main.NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("persist notebook")
+    entry = store.create_entry(notebook.id, "persisted entry content", source="manual")
+
+    reopened = main.NotesStore(db_path, device_id="desktop-test")
+    reopened.initialize()
+
+    reopened_notebook = reopened.get_notebook(notebook.id)
+    reopened_entry = reopened.get_entry(entry.id)
+    assert reopened_notebook is not None
+    assert reopened_entry is not None
+    assert reopened_entry.content == "persisted entry content"
+    assert [item.id for item in reopened.list_entries(notebook.id)] == [entry.id]
+
+
 def test_chatframe_exposes_notes_root_widgets(frame):
     assert hasattr(frame, "notes_list_panel")
     assert hasattr(frame, "notes_detail_panel")
@@ -458,6 +526,36 @@ def test_notes_notebook_menu_includes_open_and_routes_to_detail(frame, monkeypat
 
     assert frame.notes_controller.notes_view == "note_detail"
     assert frame.notes_controller.active_notebook_id == notebook.id
+
+
+def test_notes_notebook_menu_includes_copy_and_copies_all_entries(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("copy notebook")
+    frame.notes_store.create_entry(notebook.id, "first line\n\nsecond paragraph", source="manual")
+    frame.notes_store.create_entry(notebook.id, "second entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetSelection(frame._notes_notebook_ids.index(notebook.id))
+
+    captured = {"items": [], "copied": None}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: captured.__setitem__("copied", text) or True)
+
+    frame._show_notes_menu()
+
+    labels = [label for label, _item_id in captured["items"]]
+    assert "复制笔记" in labels
+
+    copy_item_id = next(item_id for label, item_id in captured["items"] if label == "复制笔记")
+    event = wx.CommandEvent(wx.wxEVT_MENU, copy_item_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    expected = "\n\n".join(item.content for item in frame.notes_store.list_entries(notebook.id))
+    assert captured["copied"] == expected
 
 
 def test_notes_detail_view_reuses_list_slot_and_backspace_returns_to_notebook_list(frame, monkeypatch):
@@ -833,6 +931,22 @@ def test_notes_menu_actions_create_and_edit_notes(frame, monkeypatch):
     assert frame.notes_store.get_entry(entry.id) is None
 
 
+def test_notes_create_entry_from_detail_keeps_blank_draft_and_focuses_editor(frame):
+    notebook = frame.notes_store.create_notebook("existing notebook")
+    existing = frame.notes_store.create_entry(notebook.id, "existing content", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(existing.id))
+
+    assert frame._notes_create_entry() is True
+
+    assert frame.notes_controller.notes_view == "note_edit"
+    assert frame.notes_controller.active_notebook_id == notebook.id
+    assert frame.notes_controller.active_entry_id == ""
+    assert frame.notes_editor.GetValue() == ""
+    assert frame.notes_editor.HasFocus()
+    assert frame.notes_store.list_entries(notebook.id) == [existing]
+
+
 def test_notes_menu_actions_search_and_import_entries(frame, monkeypatch, tmp_path):
     class _TextEntryDialog:
         def __init__(self, _parent, _message, _title, value=""):
@@ -919,6 +1033,86 @@ def test_notes_keyboard_and_menu_key_routes(frame, monkeypatch):
     frame._on_notes_key_down(_Event(ord("S"), alt=True))
     assert seen["menu"] == 1
     assert seen["save"] == 1
+
+
+def test_notes_ctrl_c_shortcuts_copy_notebook_and_entry(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("copy shortcut notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "copy shortcut entry", source="manual")
+    seen = {"notebook": 0, "entry": 0}
+
+    monkeypatch.setattr(frame, "_notes_copy_notebook_to_clipboard", lambda: seen.__setitem__("notebook", seen["notebook"] + 1) or True)
+    monkeypatch.setattr(frame, "_notes_copy_entry_to_clipboard", lambda: seen.__setitem__("entry", seen["entry"] + 1) or True)
+
+    class _Event:
+        def __init__(self, notebook_focus=False, entry_focus=False):
+            self._notebook_focus = notebook_focus
+            self._entry_focus = entry_focus
+
+        def GetKeyCode(self):
+            return ord("C")
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            return None
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(_Event(notebook_focus=True))
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_Event(entry_focus=True))
+
+    assert seen["notebook"] == 1
+    assert seen["entry"] == 1
+
+
+def test_notes_alt_x_shortcuts_create_notebook_and_entry(frame, monkeypatch):
+    seen = {"notebook": 0, "entry": 0}
+    notebook = frame.notes_store.create_notebook("shortcut notebook")
+
+    monkeypatch.setattr(frame, "_notes_create_notebook", lambda: seen.__setitem__("notebook", seen["notebook"] + 1) or True)
+    monkeypatch.setattr(frame, "_notes_create_entry", lambda: seen.__setitem__("entry", seen["entry"] + 1) or True)
+
+    class _Event:
+        def __init__(self, *, notebook_focus=False, entry_focus=False):
+            self.skipped = False
+            self._notebook_focus = notebook_focus
+            self._entry_focus = entry_focus
+
+        def GetKeyCode(self):
+            return ord("X")
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return True
+
+        def Skip(self):
+            self.skipped = True
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(_Event(notebook_focus=True))
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_Event(entry_focus=True))
+
+    assert seen["notebook"] == 1
+    assert seen["entry"] == 1
 
 
 def test_notes_prompt_search_applies_query_and_returns_focus_to_notebook_list(frame, monkeypatch):

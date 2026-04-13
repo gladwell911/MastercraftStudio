@@ -1,0 +1,24 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+personality = "pragmatic"
+
+[windows]
+sandbox = "elevated"
+
+[features]
+multi_agent = true
+
+[projects.'C:\Users\gladwell']
+trust_level = "trusted"
+
+[projects.'C:\code\rc']
+trust_level = "trusted"
+
+[projects.'C:\code\codex1']
+trust_level = "trusted"
+
+[projects.'C:\']
+trust_level = "trusted"
+
+[projects.'C:\code\ds']
+trust_level = "trusted"

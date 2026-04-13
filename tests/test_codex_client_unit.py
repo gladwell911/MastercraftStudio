@@ -202,8 +202,53 @@ def test_build_codex_app_server_env_seeds_clean_home(tmp_path, monkeypatch):
     env, codex_home = codex_client.build_codex_app_server_env(str(workspace))
 
     assert codex_home.parent == workspace
-    assert codex_home.name.startswith(".codex-home-")
+    assert codex_home.name == ".codex-home"
     assert env["CODEX_HOME"] == str(codex_home)
     assert (codex_home / "auth.json").read_text(encoding="utf-8") == "{\"token\": \"x\"}"
     assert (codex_home / "config.toml").read_text(encoding="utf-8") == "personality = \"pragmatic\"\n"
     assert not (codex_home / "state_5.sqlite").exists()
+
+
+def test_build_codex_app_server_env_reuses_persistent_workspace_home(tmp_path, monkeypatch):
+    source_home = tmp_path / ".codex"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text("{\"token\": \"x\"}", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = workspace / ".codex-home"
+    codex_home.mkdir()
+    (codex_home / "rollout.db").write_text("keep", encoding="utf-8")
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    env, reused_home = codex_client.build_codex_app_server_env(str(workspace))
+
+    assert reused_home == codex_home
+    assert env["CODEX_HOME"] == str(codex_home)
+    assert (codex_home / "rollout.db").read_text(encoding="utf-8") == "keep"
+    assert (codex_home / "auth.json").read_text(encoding="utf-8") == "{\"token\": \"x\"}"
+
+
+def test_close_keeps_persistent_codex_home(tmp_path):
+    client = codex_client.CodexAppServerClient()
+
+    class _Proc:
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+        def poll(self):
+            return None
+
+    codex_home = tmp_path / ".codex-home"
+    codex_home.mkdir()
+    (codex_home / "rollout.db").write_text("keep", encoding="utf-8")
+    client._proc = _Proc()
+    client._codex_home_dir = codex_home
+    client._owns_codex_home_dir = False
+
+    client.close()
+
+    assert codex_home.exists()
+    assert (codex_home / "rollout.db").read_text(encoding="utf-8") == "keep"

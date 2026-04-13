@@ -55,26 +55,31 @@ class DesktopNotesController:
         editor = getattr(self.frame, "notes_editor", None)
         if editor is None:
             return
-        if hasattr(editor, "SetValue"):
-            try:
-                editor.SetValue(draft)
-            except Exception:
-                pass
-        if hasattr(editor, "SetInsertionPoint"):
-            try:
-                editor.SetInsertionPoint(cursor)
-            except Exception:
-                pass
-        if hasattr(editor, "SetScrollPos"):
-            try:
-                editor.SetScrollPos(wx.VERTICAL, scroll, True)
-            except Exception:
-                pass
-        elif hasattr(editor, "ShowPosition"):
-            try:
-                editor.ShowPosition(scroll)
-            except Exception:
-                pass
+        previous_syncing = bool(getattr(self.frame, "_notes_editor_syncing", False))
+        self.frame._notes_editor_syncing = True
+        try:
+            if hasattr(editor, "SetValue"):
+                try:
+                    editor.SetValue(draft)
+                except Exception:
+                    pass
+            if hasattr(editor, "SetInsertionPoint"):
+                try:
+                    editor.SetInsertionPoint(cursor)
+                except Exception:
+                    pass
+            if hasattr(editor, "SetScrollPos"):
+                try:
+                    editor.SetScrollPos(wx.VERTICAL, scroll, True)
+                except Exception:
+                    pass
+            elif hasattr(editor, "ShowPosition"):
+                try:
+                    editor.ShowPosition(scroll)
+                except Exception:
+                    pass
+        finally:
+            self.frame._notes_editor_syncing = previous_syncing
 
     def capture_editor_state(self) -> None:
         editor = getattr(self.frame, "notes_editor", None)
@@ -157,6 +162,15 @@ class DesktopNotesController:
                 self.entry_editor_scroll = saved_scroll
                 entry = self._lookup_entry(saved_entry_id)
                 self.entry_editor_base_version = saved_base_version or (entry.version if entry is not None else 0)
+                self._restore_editor_state(saved_draft, saved_cursor, saved_scroll)
+            elif saved_notes_view == "note_edit" and not saved_entry_id and (saved_dirty or saved_draft):
+                self.notes_view = "note_edit"
+                self.active_entry_id = ""
+                self.entry_editor_draft = saved_draft
+                self.entry_editor_dirty = saved_dirty
+                self.entry_editor_cursor = saved_cursor
+                self.entry_editor_scroll = saved_scroll
+                self.entry_editor_base_version = 0
                 self._restore_editor_state(saved_draft, saved_cursor, saved_scroll)
             else:
                 self.notes_view = "note_detail"

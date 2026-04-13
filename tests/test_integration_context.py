@@ -90,34 +90,84 @@ def test_controls_remain_focusable_after_send(frame, monkeypatch):
     assert frame.history_list.IsEnabled()
 
 
-def test_activate_history_triggers_async_rename_for_current_chat(frame):
-    frame.active_session_turns = [
-        {"question": "当前问题", "answer_md": "当前回答", "model": "openai/gpt-5.2", "created_at": time.time()}
-    ]
+def test_activate_history_enters_history_view_without_reordering_or_archiving(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答", "model": "openai/gpt-5.2", "created_at": time.time()}]
+    frame.active_session_turns = list(frame._current_chat_state["turns"])
     frame.archived_chats = [
+        {
+            "id": "hist-1",
+            "title": "更早聊天",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 99.0,
+            "turns": [{"question": "更早问题", "answer_md": "更早回答", "model": "openai/gpt-5.2", "created_at": 1.0}],
+        },
         {
             "id": "hist-2",
             "title": "历史2",
-            "pinned": False,
-            "created_at": time.time(),
-            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": time.time()}],
+            "pinned": True,
+            "created_at": 2.0,
+            "updated_at": 1.0,
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": 2.0}],
         }
     ]
     frame._refresh_history("hist-2")
     frame.history_list.SetSelection(frame.history_ids.index("hist-2"))
 
-    seen = {"quick": None, "async": None}
+    seen = {"archived": 0}
+    frame._archive_active_session = lambda **kwargs: seen.__setitem__("archived", seen["archived"] + 1)
 
-    def fake_archive(quick_title=False, schedule_async_rename=False):
-        seen["quick"] = quick_title
-        seen["async"] = schedule_async_rename
-        frame.active_session_turns = []
-        return None
-
-    frame._archive_active_session = fake_archive
     assert frame._activate_selected_history()
-    assert seen["quick"] is True
-    assert seen["async"] is True
+    assert seen["archived"] == 0
+    assert frame.current_chat_id == "chat-current"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-2"
+    assert frame.history_ids == ["chat-current", "hist-2", "hist-1"]
+    assert frame.history_list.GetSelection() == 1
+    assert frame.answer_list.GetString(1) == "历史问题"
+
+
+def test_history_enter_switches_view_while_current_reply_is_pending(frame, monkeypatch):
+    frame.is_running = True
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 4.0, "request_status": "pending"}]
+    frame.active_session_turns = list(frame._current_chat_state["turns"])
+    frame.archived_chats = [
+        {
+            "id": "hist-1",
+            "title": "历史会话",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": 1.0}],
+        }
+    ]
+    frame._refresh_history("hist-1")
+    frame.history_list.SetSelection(frame.history_ids.index("hist-1"))
+    shown = {"dialog": 0}
+    monkeypatch.setattr(frame, "_show_ok_dialog", lambda *_args, **_kwargs: shown.__setitem__("dialog", shown["dialog"] + 1))
+
+    class E:
+        def GetKeyCode(self):
+            return main.wx.WXK_RETURN
+
+        def Skip(self):
+            return None
+
+    frame._on_history_key_down(E())
+
+    assert shown["dialog"] == 0
+    assert frame.is_running is True
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-1"
+    assert frame.answer_list.GetString(1) == "历史问题"
 
 
 def test_ctrl_history_navigation_walks_through_all_chats_in_order(frame):
@@ -137,6 +187,8 @@ def test_ctrl_history_navigation_walks_through_all_chats_in_order(frame):
     assert frame._adjacent_history_chat_id(1) == "chat-b"
     assert frame._switch_current_chat("chat-b") is True
     assert frame._adjacent_history_chat_id(1) == "chat-a"
+    assert frame._switch_current_chat("chat-a") is True
+    assert frame._adjacent_history_chat_id(1) is None
 
 
 def test_ctrl_history_navigation_reaches_all_chats_with_pinned_history(frame):
@@ -162,7 +214,108 @@ def test_ctrl_history_navigation_reaches_all_chats_with_pinned_history(frame):
         assert frame._switch_current_chat(target) is True
         seen.append(frame.current_chat_id)
 
-    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+    assert frame._adjacent_history_chat_id(1) is None
+
+
+def test_global_hotkey_switches_visible_chat_content(frame, monkeypatch):
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答", "created_at": 4.0}]
+    frame._current_chat_state["updated_at"] = 4.0
+    frame.archived_chats = [
+        {
+            "id": "chat-next",
+            "title": "下一个聊天",
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "codex/main", "created_at": 2.0}],
+            "created_at": 2.0,
+            "updated_at": 3.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda **kwargs: None)
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-next"
+    frame._refresh_history()
+    frame._render_answer_list()
+
+    class E:
+        def GetId(self):
+            return main.HOTKEY_ID_CHAT_NEXT
+
+    frame._on_global_hotkey(E())
+
+    assert frame.current_chat_id == "chat-next"
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame.history_ids[0] == "chat-next"
+    assert frame.history_list.GetSelection() == 0
+    assert frame.answer_list.GetCount() == 4
+    assert frame.answer_list.GetString(0) == "我"
+    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_list.GetString(2) == "小诸葛"
+    assert frame.answer_list.GetString(3) == "历史回答"
+
+
+def test_submit_question_from_history_view_continues_selected_chat_without_duplicate_archive(frame, monkeypatch):
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda **kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
+
+    class FakeChatClient:
+        def __init__(self, api_key, model):
+            self.model = model
+
+        def stream_chat(self, user_text, on_delta, history_turns=None):
+            on_delta("继续回答片段")
+            return "继续回答完成"
+
+    monkeypatch.setattr(main, "ChatClient", FakeChatClient)
+
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame.active_session_started_at = 10.0
+    frame.active_session_turns = [{"question": "当前问题", "answer_md": "当前回答", "model": "openai/gpt-5.2", "created_at": 10.0}]
+    frame.archived_chats = [
+        {
+            "id": "hist-2",
+            "title": "历史2",
+            "pinned": False,
+            "created_at": 2.0,
+            "updated_at": 2.0,
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": 2.0}],
+        }
+    ]
+    frame.view_mode = "history"
+    frame.view_history_id = "hist-2"
+    frame._refresh_history("hist-2")
+    frame.input_edit.SetValue("继续追问")
+
+    frame._on_send_clicked(None)
+
+    assert frame.current_chat_id == "hist-2"
+    assert frame.active_chat_id == "hist-2"
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert len(frame.archived_chats) == 2
+    assert len(frame.active_session_turns) == 2
+    assert frame.active_session_turns[-1]["question"] == "继续追问"
+    archived = frame._archive_active_session(quick_title=True, schedule_async_rename=False, save_after_archive=False)
+    assert archived is frame._find_archived_chat("hist-2")
+    archived = frame._find_archived_chat("hist-2")
+    assert archived is not None
+    assert archived["created_at"] == 2.0
+    assert archived["turns"][-1]["question"] == "继续追问"
+    assert frame.history_ids == ["chat-current", "hist-2"]
 
 
 def test_voice_result_empty_after_normalization_is_skipped(frame):

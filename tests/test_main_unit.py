@@ -251,6 +251,49 @@ def test_char_hook_alt_c_submits_continue_from_any_focus(frame):
     assert seen["call"][1]["source"] == "local"
 
 
+def test_answer_list_ctrl_c_still_copies_answer_text(frame, monkeypatch):
+    copied = {"text": None}
+
+    class _Clipboard:
+        def Open(self):
+            return True
+
+        def SetData(self, data):
+            copied["text"] = data.GetText()
+            return True
+
+        def Close(self):
+            return True
+
+    monkeypatch.setattr(main.wx, "TheClipboard", _Clipboard())
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+    monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)
+
+    frame.answer_meta = [("answer", 0, "plain answer", "rich answer")]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("answer row")
+    frame.answer_list.SetSelection(0)
+
+    class E:
+        def GetKeyCode(self):
+            return ord("C")
+
+        def ControlDown(self):
+            return True
+
+        def StopPropagation(self):
+            return None
+
+        def Skip(self):
+            raise AssertionError("should not skip")
+
+    frame._on_answer_key_down(E())
+
+    assert copied["text"] == "rich answer"
+    assert statuses[-1] == "已复制"
+
+
 def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
     frame.active_chat_id = "chat-b"
     frame.archived_chats = [
@@ -2221,6 +2264,37 @@ def test_load_state_restores_notes_ui_state(frame, tmp_path):
     assert frame._current_notes_state["last_sync_cursor"] == "42"
 
 
+def test_load_state_restores_note_detail_view_for_existing_notebook(frame, tmp_path):
+    notebook = frame.notes_store.create_notebook("detail restore notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "detail restore entry", source="manual")
+    frame.state_path = tmp_path / "app_state.json"
+    frame._current_notes_state = {}
+    frame.state_path.write_text(
+        json.dumps(
+            {
+                "notes_ui_state": {
+                    "active_root_tab": "notes",
+                    "notes_view": "note_detail",
+                    "active_notebook_id": notebook.id,
+                    "active_entry_id": entry.id,
+                    "entry_editor_draft": "",
+                    "entry_editor_dirty": False,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    frame._load_state()
+
+    assert frame._current_notes_state["active_root_tab"] == "notes"
+    assert frame._current_notes_state["notes_view"] == "note_detail"
+    assert frame.notes_controller.notes_view == "note_detail"
+    assert frame.notes_controller.active_notebook_id == notebook.id
+    assert frame.notes_controller.active_entry_id == entry.id
+
+
 def test_save_state_captures_notes_editor_cursor_and_scroll(frame):
     class _Editor:
         def __init__(self):
@@ -3218,6 +3292,125 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
     assert frame.active_codex_turn_active is True
     assert frame.active_session_turns[0]["codex_thread_id"] == "thread-new"
     assert frame.active_session_turns[0]["codex_turn_id"] == "turn-new"
+
+
+def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.active_session_turns = [
+        {
+            "question": "第一轮",
+            "answer_md": "第一轮回答",
+            "model": "codex/main",
+            "created_at": 1.0,
+        },
+        {
+            "question": "第二轮",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 2.0,
+        },
+    ]
+    frame.active_turn_idx = 1
+    frame._current_chat_state["codex_thread_id"] = "thread-saved"
+    frame.active_codex_thread_id = "thread-saved"
+    frame.active_codex_turn_id = ""
+    frame.active_codex_turn_active = False
+
+    seen = {"resume": [], "turn": []}
+
+    class _Client:
+        def resume_thread(self, thread_id, **kwargs):
+            seen["resume"].append((thread_id, kwargs))
+            return {"thread": {"id": thread_id}}
+
+        def start_turn(self, thread_id, text):
+            seen["turn"].append((thread_id, text))
+            return {"turn": {"id": "turn-new"}}
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker("chat-current", 1, "第三轮", "codex/main")
+
+    assert seen["resume"] == [
+        (
+            "thread-saved",
+            {
+                "approval_policy": "never",
+                "sandbox": "danger-full-access",
+                "personality": "pragmatic",
+                "cwd": frame._workspace_dir_for_codex(),
+            },
+        )
+    ]
+    assert seen["turn"] == [("thread-saved", "第三轮")]
+    assert frame.active_codex_thread_id == "thread-saved"
+    assert frame.active_codex_turn_id == "turn-new"
+
+
+def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.active_session_turns = [
+        {
+            "question": "第一轮问题",
+            "answer_md": "第一轮回答",
+            "model": "codex/main",
+            "created_at": 1.0,
+        },
+        {
+            "question": "第二轮问题",
+            "answer_md": "第二轮回答",
+            "model": "codex/main",
+            "created_at": 2.0,
+        },
+        {
+            "question": "第三轮问题",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 3.0,
+        },
+    ]
+    frame.active_turn_idx = 2
+    frame._current_chat_state["codex_thread_id"] = "thread-stale"
+    frame.active_codex_thread_id = "thread-stale"
+    frame.active_codex_turn_id = ""
+    frame.active_codex_turn_active = False
+
+    seen = {"resume": [], "start_thread": 0, "turn": []}
+
+    class _Client:
+        def resume_thread(self, thread_id, **kwargs):
+            seen["resume"].append((thread_id, kwargs))
+            raise RuntimeError("Codex app-server request failed: thread/resume: no rollout found for thread id thread-stale")
+
+        def start_thread(self, **kwargs):
+            seen["start_thread"] += 1
+            return {"thread": {"id": "thread-new"}}
+
+        def start_turn(self, thread_id, text):
+            seen["turn"].append((thread_id, text))
+            return {"turn": {"id": "turn-new"}}
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker("chat-current", 2, "第三轮问题", "codex/main")
+
+    assert len(seen["resume"]) == 1
+    assert seen["start_thread"] == 1
+    assert seen["turn"][0][0] == "thread-new"
+    assert "第一轮问题" in seen["turn"][0][1]
+    assert "第一轮回答" in seen["turn"][0][1]
+    assert "第二轮问题" in seen["turn"][0][1]
+    assert "第三轮问题" in seen["turn"][0][1]
+    assert frame.active_codex_thread_id == "thread-new"
+    assert frame.active_codex_turn_id == "turn-new"
 
 
 @pytest.mark.parametrize(

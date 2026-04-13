@@ -217,3 +217,60 @@ def test_e2e_notes_ctrl_enter_save_returns_focus_to_entry_list(frame, monkeypatc
     assert frame.notes_controller.notes_view == "note_detail"
     assert frame.notes_controller.active_entry_id == entry.id
     assert frame.notes_entry_list.HasFocus()
+
+
+def test_e2e_notes_alt_x_creates_blank_entry_from_detail_list(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("e2e alt x notebook")
+    existing = frame.notes_store.create_entry(notebook.id, "existing e2e entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(existing.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: ord("X"),
+        "ControlDown": lambda self: False,
+        "AltDown": lambda self: True,
+        "Skip": lambda self: None,
+    })())
+
+    assert frame.notes_controller.notes_view == "note_edit"
+    assert frame.notes_controller.active_entry_id == ""
+    assert frame.notes_editor.GetValue() == ""
+    assert frame.notes_editor.HasFocus()
+    entries = frame.notes_store.list_entries(notebook.id)
+    assert len(entries) == 1
+    assert entries[0].id == existing.id
+
+
+def test_e2e_notes_ctrl_c_copies_notebook_and_selected_entry(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("e2e copy notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "e2e copied first", source="manual")
+    frame.notes_store.create_entry(notebook.id, "e2e copied second", source="manual")
+    copied = {"texts": []}
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied["texts"].append(text) or True)
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetSelection(frame._notes_notebook_ids.index(notebook.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: ord("C"),
+        "ControlDown": lambda self: True,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(type("Evt", (), {
+        "GetKeyCode": lambda self: ord("C"),
+        "ControlDown": lambda self: True,
+        "AltDown": lambda self: False,
+        "Skip": lambda self: None,
+    })())
+
+    assert copied["texts"][0] == "\n\n".join(item.content for item in frame.notes_store.list_entries(notebook.id))
+    assert copied["texts"][1] == "e2e copied first"

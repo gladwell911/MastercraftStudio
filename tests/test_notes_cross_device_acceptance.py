@@ -93,9 +93,10 @@ def test_notes_acceptance_online_sync_pushes_changes_between_remote_clients(fram
                     },
                 )
                 body = pull["body"]
-                assert body["ops"]
-                assert any(op["entity_type"] == "notebook" for op in body["ops"])
-                assert any(op["entity_type"] == "entry" for op in body["ops"])
+                assert body["notebooks"]
+                assert body["entries"]
+                assert any(item["id"] == "nb-remote-1" for item in body["notebooks"])
+                assert any(item["id"] == "entry-remote-1" for item in body["entries"])
             finally:
                 await ws_a.close()
                 await ws_b.close()
@@ -170,6 +171,44 @@ def test_notes_acceptance_offline_conflict_generates_conflict_copy_after_reconne
         assert len(conflict_copies) == 1
         assert "手机端" in conflict_copies[0].content
         assert "手机端离线修改" in conflict_copies[0].content
+    finally:
+        frame._remote_ws_server.stop()
+        frame._remote_ws_server = None
+
+
+def test_notes_acceptance_initial_pull_since_zero_returns_existing_snapshot(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    notebook = frame.notes_store.create_notebook("234")
+    entry = frame.notes_store.create_entry(notebook.id, "desktop existing body", source="manual")
+
+    frame._start_remote_ws_server_if_configured()
+    try:
+        async def _run():
+            session, ws = await _connect_notes_client(frame._remote_ws_server.bound_port)
+            try:
+                subscribe = await _request(ws, {"id": "sub-init", "type": "notes_subscribe", "cursor": "0"})
+                assert subscribe["ok"] is True
+
+                pull = await _request(
+                    ws,
+                    {
+                        "id": "pull-init",
+                        "type": "notes_pull_since",
+                        "cursor": "0",
+                    },
+                )
+                body = pull["body"]
+                assert body["notebooks"]
+                assert body["entries"]
+                assert any(item["id"] == notebook.id for item in body["notebooks"])
+                assert any(item["id"] == entry.id for item in body["entries"])
+            finally:
+                await ws.close()
+                await session.close()
+
+        asyncio.run(_run())
     finally:
         frame._remote_ws_server.stop()
         frame._remote_ws_server = None

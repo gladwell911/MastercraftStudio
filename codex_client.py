@@ -3,11 +3,10 @@ import os
 import shutil
 import subprocess
 import threading
-import tempfile
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+import tempfile
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -76,8 +75,8 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
     env = os.environ.copy()
     workspace = Path(str(cwd or "").strip() or Path.cwd())
     try:
-        codex_home = workspace / f".codex-home-{uuid.uuid4().hex[:8]}"
-        codex_home.mkdir(parents=True, exist_ok=False)
+        codex_home = workspace / ".codex-home"
+        codex_home.mkdir(parents=True, exist_ok=True)
     except Exception:
         codex_home = Path(tempfile.mkdtemp(prefix=".codex-home-"))
     source_home = Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex"
@@ -121,6 +120,7 @@ class CodexAppServerClient:
         self._initializing = False
         self._closed = False
         self._codex_home_dir: Path | None = None
+        self._owns_codex_home_dir = False
 
     def close(self) -> None:
         self._closed = True
@@ -140,7 +140,9 @@ class CodexAppServerClient:
         self._proc = None
         codex_home_dir = self._codex_home_dir
         self._codex_home_dir = None
-        if codex_home_dir is not None:
+        owns_codex_home_dir = bool(self._owns_codex_home_dir)
+        self._owns_codex_home_dir = False
+        if codex_home_dir is not None and owns_codex_home_dir:
             try:
                 shutil.rmtree(codex_home_dir)
             except Exception:
@@ -274,6 +276,7 @@ class CodexAppServerClient:
     def _build_launch_env(self) -> dict[str, str]:
         env, codex_home_dir = build_codex_app_server_env()
         self._codex_home_dir = codex_home_dir
+        self._owns_codex_home_dir = bool(codex_home_dir and codex_home_dir.name.startswith(".codex-home-"))
         return env
 
     def _initialize(self) -> None:

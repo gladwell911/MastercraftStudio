@@ -98,4 +98,4 @@ def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
         frame._on_char_hook(E())
         seen.append(frame.current_chat_id)
 
-    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]

@@ -2252,9 +2252,37 @@ class ChatFrame(wx.Frame):
         text = self._codex_error_text(exc)
         return "thread not found" in text or "unknown thread" in text
 
+    def _is_codex_rollout_missing_error(self, exc: Exception | str) -> bool:
+        text = self._codex_error_text(exc)
+        return "no rollout found" in text
+
     def _is_codex_no_active_turn_error(self, exc: Exception | str) -> bool:
         text = self._codex_error_text(exc)
         return "no active turn to steer" in text
+
+    def _build_codex_rollout_recovery_prompt(self, history_turns: list[dict], question: str) -> str:
+        clean_question = str(question or "").strip()
+        transcript_parts = []
+        for turn in history_turns or []:
+            if not isinstance(turn, dict):
+                continue
+            prior_question = str(turn.get("question") or "").strip()
+            prior_answer = str(turn.get("answer_md") or "").strip()
+            if prior_answer == REQUESTING_TEXT:
+                prior_answer = ""
+            if prior_question:
+                transcript_parts.append(f"用户：{prior_question}")
+            if prior_answer:
+                transcript_parts.append(f"Codex：{prior_answer}")
+        if not transcript_parts:
+            return clean_question
+        transcript = "\n".join(transcript_parts)
+        return (
+            "下面是当前聊天在本地保存的历史记录，请把它当作本次会话上下文继续：\n"
+            f"{transcript}\n\n"
+            "请基于以上上下文继续回答下面这个新问题：\n"
+            f"{clean_question}"
+        )
 
     def _codex_should_steer_turn(self, target_chat: dict, is_current_target: bool) -> bool:
         if not is_current_target:
@@ -2285,6 +2313,43 @@ class ChatFrame(wx.Frame):
             self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _ensure_codex_thread_resumed(self, client, thread_id: str) -> None:
+        thread_value = str(thread_id or "").strip()
+        if not thread_value or not hasattr(client, "resume_thread"):
+            return
+        resumed = getattr(client, "_zgwd_resumed_thread_ids", None)
+        if not isinstance(resumed, set):
+            resumed = set()
+            setattr(client, "_zgwd_resumed_thread_ids", resumed)
+        if thread_value in resumed:
+            return
+        client.resume_thread(
+            thread_value,
+            approval_policy="never",
+            sandbox="danger-full-access",
+            personality="pragmatic",
+            cwd=self._workspace_dir_for_codex(),
+        )
+        resumed.add(thread_value)
+
+    @staticmethod
+    def _remember_codex_thread_resumed(client, thread_id: str) -> None:
+        thread_value = str(thread_id or "").strip()
+        if not thread_value:
+            return
+        resumed = getattr(client, "_zgwd_resumed_thread_ids", None)
+        if not isinstance(resumed, set):
+            resumed = set()
+            setattr(client, "_zgwd_resumed_thread_ids", resumed)
+        resumed.add(thread_value)
+
+    @staticmethod
+    def _forget_codex_thread_resume(client, thread_id: str) -> None:
+        resumed = getattr(client, "_zgwd_resumed_thread_ids", None)
+        if not isinstance(resumed, set):
+            return
+        resumed.discard(str(thread_id or "").strip())
 
     def _run_codex_turn_worker(self, chat_id: str, turn_idx: int, question: str, model: str, from_recovery: bool = False) -> None:
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
@@ -2334,6 +2399,7 @@ class ChatFrame(wx.Frame):
             if not new_thread_id:
                 raise RuntimeError("Codex app-server did not return a thread id.")
             _sync_codex_thread_state(new_thread_id, "", active=False)
+            self._remember_codex_thread_resumed(client, new_thread_id)
             return new_thread_id
 
         def _send_turn(thread_value: str, steer: bool) -> dict:
@@ -2347,20 +2413,39 @@ class ChatFrame(wx.Frame):
             target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
             if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
                 target_turns = self.active_session_turns
+            send_question = question
             if not thread_id:
                 thread_id = _start_new_thread()
+            else:
+                try:
+                    self._ensure_codex_thread_resumed(client, thread_id)
+                except Exception as exc:
+                    if self._is_codex_thread_missing_error(exc) or self._is_codex_rollout_missing_error(exc):
+                        self._forget_codex_thread_resume(client, thread_id)
+                        _clear_stale_codex_thread_state()
+                        history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+                        send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
+                        thread_id = _start_new_thread()
+                    else:
+                        raise
             should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
             try:
-                turn_resp = _send_turn(thread_id, should_steer)
+                if should_steer:
+                    turn_resp = _send_turn(thread_id, should_steer)
+                else:
+                    turn_resp = client.start_turn(thread_id, send_question)
             except Exception as exc:
                 if should_steer and self._is_codex_no_active_turn_error(exc):
                     should_steer = False
-                    turn_resp = _send_turn(thread_id, should_steer)
+                    turn_resp = client.start_turn(thread_id, send_question)
                 elif self._is_codex_thread_missing_error(exc):
+                    self._forget_codex_thread_resume(client, thread_id)
                     _clear_stale_codex_thread_state()
+                    history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+                    send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
                     thread_id = _start_new_thread()
                     should_steer = False
-                    turn_resp = _send_turn(thread_id, should_steer)
+                    turn_resp = client.start_turn(thread_id, send_question)
                 else:
                     raise
             new_turn_id = str((turn_resp.get("turn") or turn_resp.get("turnId") or {}).get("id") if isinstance(turn_resp.get("turn"), dict) else (turn_resp.get("turnId") or "")).strip()
@@ -4547,7 +4632,13 @@ class ChatFrame(wx.Frame):
         return self.notes_store.get_notebook(notebook_id, include_deleted=True)
 
     def _notes_current_entry(self):
-        entry_id = str(self.notes_controller.active_entry_id or self._notes_selected_entry_id() or "").strip()
+        active_entry_id = str(getattr(self.notes_controller, "active_entry_id", "") or "").strip()
+        if active_entry_id:
+            entry_id = active_entry_id
+        elif str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit":
+            entry_id = ""
+        else:
+            entry_id = str(self._notes_selected_entry_id() or "").strip()
         if not entry_id:
             return None
         return self.notes_store.get_entry(entry_id, include_deleted=True)
@@ -4665,8 +4756,6 @@ class ChatFrame(wx.Frame):
         self._notes_refresh_entries()
         self._notes_sync_view_visibility()
         if self.notes_controller.notes_view == "note_edit":
-            self._notes_sync_editor()
-        elif self.notes_controller.notes_view == "note_detail" and self.notes_entry_list.GetCount() > 0:
             self._notes_sync_editor()
 
     def _sync_notes_ui(self) -> None:
@@ -4857,22 +4946,26 @@ class ChatFrame(wx.Frame):
         if show_notebook_actions:
             i_open_nb = wx.NewIdRef()
             i_new_nb = wx.NewIdRef()
+            i_copy_nb = wx.NewIdRef()
             i_del_nb = wx.NewIdRef()
             i_search_nb = wx.NewIdRef()
             i_ren_nb = wx.NewIdRef()
             menu.Append(i_open_nb, "打开笔记")
             menu.AppendSeparator()
             menu.Append(i_new_nb, "新建笔记")
+            menu.Append(i_copy_nb, "复制笔记")
             menu.Append(i_del_nb, "删除笔记")
             menu.Append(i_search_nb, "搜索笔记")
             menu.Append(i_ren_nb, "重命名笔记")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_open_selected_notebook(), id=i_open_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_notebook(), id=i_new_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_notebook_to_clipboard(), id=i_copy_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_notebook(), id=i_del_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_prompt_search(), id=i_search_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_rename_notebook(), id=i_ren_nb)
         elif show_entry_actions:
             i_new_entry = wx.NewIdRef()
+            i_copy_entry = wx.NewIdRef()
             i_del_entry = wx.NewIdRef()
             i_edit_entry = wx.NewIdRef()
             i_pin_entry = wx.NewIdRef()
@@ -4880,6 +4973,7 @@ class ChatFrame(wx.Frame):
             i_import_file = wx.NewIdRef()
             i_import_clip = wx.NewIdRef()
             menu.Append(i_new_entry, "新建笔记条目")
+            menu.Append(i_copy_entry, "复制笔记条目")
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
             menu.Append(i_pin_entry, "置顶笔记条目")
@@ -4888,6 +4982,7 @@ class ChatFrame(wx.Frame):
             menu.Append(i_import_file, "从文件导入")
             menu.Append(i_import_clip, "从剪贴板导入")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_entry(), id=i_new_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_entry_to_clipboard(), id=i_copy_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_pin_entry(), id=i_pin_entry)
@@ -5082,6 +5177,10 @@ class ChatFrame(wx.Frame):
         self.notes_controller.entry_editor_base_version = 0
         self._current_notes_state = self.notes_controller.to_state_dict()
         self._notes_refresh_ui()
+        try:
+            self.notes_editor.SetFocus()
+        except Exception:
+            pass
         return True
 
     def _notes_edit_entry(self) -> bool:
@@ -5152,6 +5251,42 @@ class ChatFrame(wx.Frame):
                 wx.TheClipboard.Close()
         return ""
 
+    def _set_clipboard_text(self, text: str) -> bool:
+        payload = str(text or "")
+        if not payload:
+            return False
+        if wx.TheClipboard.Open():
+            try:
+                return bool(wx.TheClipboard.SetData(wx.TextDataObject(payload)))
+            finally:
+                wx.TheClipboard.Close()
+        return False
+
+    def _notes_copy_notebook_to_clipboard(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        entries = self.notes_store.list_entries(notebook.id)
+        text = "\n\n".join(str(entry.content or "") for entry in entries if str(entry.content or "").strip())
+        if not text:
+            return False
+        if not self._set_clipboard_text(text):
+            return False
+        self.SetStatusText("已复制笔记")
+        return True
+
+    def _notes_copy_entry_to_clipboard(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is None:
+            return False
+        text = str(entry.content or "")
+        if not text.strip():
+            return False
+        if not self._set_clipboard_text(text):
+            return False
+        self.SetStatusText("已复制笔记条目")
+        return True
+
     def _notes_import_from_clipboard(self) -> bool:
         notebook = self._notes_current_notebook()
         if notebook is None:
@@ -5173,6 +5308,20 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_MENU:
             self._show_notes_menu()
             return
+        if event.AltDown() and key in (ord("X"), ord("x")):
+            if self.notes_notebook_list.HasFocus():
+                if self._notes_create_notebook():
+                    return
+            if self.notes_entry_list.HasFocus():
+                if self._notes_create_entry():
+                    return
+        if event.ControlDown() and key in (ord("C"), ord("c")):
+            if self.notes_notebook_list.HasFocus():
+                if self._notes_copy_notebook_to_clipboard():
+                    return
+            if self.notes_entry_list.HasFocus():
+                if self._notes_copy_entry_to_clipboard():
+                    return
         if (
             getattr(self, "notes_controller", None)
             and self.notes_controller.notes_view == "note_edit"

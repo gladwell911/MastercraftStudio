@@ -117,6 +117,37 @@ def test_notes_acceptance_menu_key_opens_notes_menu_and_routes_actions(frame, mo
     assert seen["file"] == 1
 
 
+def test_notes_acceptance_menu_new_entry_creates_blank_draft_and_focuses_editor(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("menu new entry notebook")
+    existing = frame.notes_store.create_entry(notebook.id, "existing entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, existing.id)
+    captured = {"items": []}
+
+    def _popup(menu):
+        captured["items"] = [
+            (item.GetItemLabelText(), item.GetId())
+            for item in menu.GetMenuItems()
+            if not item.IsSeparator()
+        ]
+
+    monkeypatch.setattr(frame, "PopupMenu", _popup)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_key_event(wx.WXK_MENU))
+
+    new_item_id = next(item_id for label, item_id in captured["items"] if label == "新建笔记条目")
+    event = wx.CommandEvent(wx.wxEVT_MENU, new_item_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert frame.notes_controller.notes_view == "note_edit"
+    assert frame.notes_controller.active_entry_id == ""
+    assert frame.notes_editor.GetValue() == ""
+    assert frame.notes_editor.HasFocus()
+    assert frame.notes_store.list_entries(notebook.id) == [existing]
+
+
 def test_notes_acceptance_file_and_clipboard_imports_create_entries_from_ui(frame, monkeypatch, tmp_path):
     notebook = frame.notes_store.create_notebook("import notebook")
     frame._notes_select_notebook(notebook.id, view="note_detail")
@@ -202,6 +233,83 @@ def test_notes_acceptance_notebook_menu_includes_open_and_routes_to_detail(frame
 
     assert frame.notes_controller.notes_view == "note_detail"
     assert frame.notes_controller.active_notebook_id == notebook.id
+
+
+def test_notes_acceptance_copy_actions_from_notebook_and_entry_menus(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("acceptance copy notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "copied entry", source="manual")
+    frame.notes_store.create_entry(notebook.id, "another copied entry", source="manual")
+    copied = {"texts": []}
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied["texts"].append(text) or True)
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    _select_row_by_id(frame.notes_notebook_list, frame._notes_notebook_ids, notebook.id)
+    captured = {"items": []}
+
+    def _popup(menu):
+        captured["items"] = [
+            (item.GetItemLabelText(), item.GetId())
+            for item in menu.GetMenuItems()
+            if not item.IsSeparator()
+        ]
+
+    monkeypatch.setattr(frame, "PopupMenu", _popup)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(_key_event(wx.WXK_MENU))
+    copy_notebook_id = next(item_id for label, item_id in captured["items"] if label == "复制笔记")
+    event = wx.CommandEvent(wx.wxEVT_MENU, copy_notebook_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, entry.id)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_key_event(wx.WXK_MENU))
+    copy_entry_id = next(item_id for label, item_id in captured["items"] if label == "复制笔记条目")
+    event = wx.CommandEvent(wx.wxEVT_MENU, copy_entry_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert copied["texts"][0] == "\n\n".join(item.content for item in frame.notes_store.list_entries(notebook.id))
+    assert copied["texts"][1] == "copied entry"
+
+
+def test_notes_acceptance_alt_x_creates_notebook_and_entry(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("acceptance shortcut notebook")
+    entry_seen = {"notebook": 0, "entry": 0}
+
+    original_create_notebook = frame._notes_create_notebook
+    original_create_entry = frame._notes_create_entry
+
+    def _create_notebook():
+        entry_seen["notebook"] += 1
+        return True
+
+    def _create_entry():
+        entry_seen["entry"] += 1
+        return original_create_entry()
+
+    monkeypatch.setattr(frame, "_notes_create_notebook", _create_notebook)
+    monkeypatch.setattr(frame, "_notes_create_entry", _create_entry)
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(_key_event(ord("X"), alt=True))
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_key_event(ord("X"), alt=True))
+
+    assert entry_seen["notebook"] == 1
+    assert entry_seen["entry"] == 1
+    assert frame.notes_controller.notes_view == "note_edit"
+    assert frame.notes_controller.active_entry_id == ""
+    assert frame.notes_editor.GetValue() == ""
+    assert frame.notes_editor.HasFocus()
 
 
 def test_notes_acceptance_char_hook_enter_opens_notebook_without_send(frame, monkeypatch):
