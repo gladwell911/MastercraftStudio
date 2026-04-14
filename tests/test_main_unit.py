@@ -3795,11 +3795,11 @@ def test_codex_ui_callbacks_skip_when_frame_is_being_deleted(frame, monkeypatch)
     assert all(item[0] not in {"after", "later"} for item in scheduled)
     assert scheduled == [("status",), ("remote",), ("save",), ("render",), ("sound",)]
 
-def test_resolve_app_data_dir_frozen_uses_dist_history(monkeypatch):
+def test_resolve_app_data_dir_frozen_uses_executable_sibling_history(monkeypatch):
     monkeypatch.setattr(main.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(main.sys, "executable", r"C:\code\windowsZhuge\dist\zgwd\zgwd.exe", raising=False)
+    monkeypatch.setattr(main.sys, "executable", r"C:\code\cx\ms\ms.exe", raising=False)
     p = main.resolve_app_data_dir()
-    assert str(p).lower().endswith("dist\\history")
+    assert p == Path(r"C:\code\cx\history")
 
 
 def test_merge_legacy_archived_chats_adds_missing_and_prefers_richer(frame, tmp_path, monkeypatch):

@@ -205,11 +205,9 @@ class _Stripper(HTMLParser):
 
 
 def resolve_app_data_dir() -> Path:
-    # Keep history/state in a stable workspace location shared across versions.
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
-        if exe_dir.parent.name.lower() == "dist":
-            return exe_dir.parent / "history"
+        return exe_dir.parent / "history"
     return Path(__file__).resolve().parent / "dist" / "history"
 
 
