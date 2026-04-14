@@ -146,6 +146,32 @@ def test_remote_create_preserves_full_incoming_metadata(tmp_path):
     assert entry.last_modified_by == "mobile"
 
 
+def test_entries_are_listed_in_chronological_order_by_default(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("chronological notebook")
+    first = store.create_entry(
+        notebook.id,
+        "first entry",
+        source="manual",
+        created_at="2026-04-12T10:00:00+00:00",
+        updated_at="2026-04-12T10:00:00+00:00",
+        sort_order=100,
+    )
+    second = store.create_entry(
+        notebook.id,
+        "second entry",
+        source="manual",
+        created_at="2026-04-12T10:00:01+00:00",
+        updated_at="2026-04-12T10:00:01+00:00",
+        sort_order=101,
+    )
+
+    entries = store.list_entries(notebook.id)
+
+    assert [item.id for item in entries] == [first.id, second.id]
+
+
 def test_remote_notebook_create_uses_payload_updated_at_fallback(tmp_path):
     store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
     store.initialize()
@@ -170,6 +196,20 @@ def test_remote_notebook_create_uses_payload_updated_at_fallback(tmp_path):
     assert notebook is not None
     assert notebook.created_at == "2026-04-12T02:03:04+00:00"
     assert notebook.updated_at == "2026-04-12T02:03:04+00:00"
+
+
+def test_pull_since_returns_snapshot_when_client_cursor_is_ahead_of_desktop_store(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    sync = main.NotesSyncService(store)
+    notebook = store.create_notebook("周三起床")
+
+    result = sync.pull_since("999")
+
+    assert result["cursor"] == store.current_cursor()
+    assert "notebooks" in result
+    assert "entries" in result
+    assert any(item["id"] == notebook.id for item in result["notebooks"])
 
 
 def test_conflict_copy_labels_use_semantic_source_words(tmp_path):

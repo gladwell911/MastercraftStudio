@@ -302,7 +302,7 @@ class NotesStore:
         query = "SELECT * FROM note_entries WHERE notebook_id = ?"
         if not include_deleted:
             query += " AND deleted_at IS NULL"
-        query += " ORDER BY pinned DESC, sort_order DESC, updated_at DESC, created_at DESC"
+        query += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, updated_at ASC"
         with self._connect() as conn:
             rows = conn.execute(query, (notebook_id,)).fetchall()
         return [NoteEntry.from_row(dict(row)) for row in rows]
@@ -311,7 +311,7 @@ class NotesStore:
         query = "SELECT * FROM note_entries"
         if not include_deleted:
             query += " WHERE deleted_at IS NULL"
-        query += " ORDER BY updated_at DESC, created_at DESC"
+        query += " ORDER BY sort_order ASC, created_at ASC, updated_at ASC"
         with self._connect() as conn:
             rows = conn.execute(query).fetchall()
         return [NoteEntry.from_row(dict(row)) for row in rows]
@@ -542,11 +542,11 @@ class NotesStore:
             raise KeyError(entry_id)
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COALESCE(MIN(sort_order), 0) AS min_sort_order FROM note_entries WHERE notebook_id = ?",
+                "SELECT COALESCE(MAX(sort_order), 0) AS max_sort_order FROM note_entries WHERE notebook_id = ?",
                 (entry.notebook_id,),
             ).fetchone()
-            min_sort_order = int(row["min_sort_order"] if row is not None else 0)
-        return self._set_entry_sort_order(entry_id, min_sort_order - 1, pinned=False, record_outbox=record_outbox)
+            max_sort_order = int(row["max_sort_order"] if row is not None else 0)
+        return self._set_entry_sort_order(entry_id, max_sort_order + 1, pinned=False, record_outbox=record_outbox)
 
     def _set_entry_sort_order(self, entry_id: str, sort_order: int, *, pinned: bool | None = None, record_outbox: bool = True) -> NoteEntry:
         entry = self.get_entry(entry_id, include_deleted=True)
@@ -606,7 +606,7 @@ class NotesStore:
         params: list[object] = [notebook_id, pattern]
         if not include_deleted:
             sql += " AND deleted_at IS NULL"
-        sql += " ORDER BY pinned DESC, sort_order DESC, updated_at DESC, created_at DESC"
+        sql += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, updated_at ASC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [NoteEntry.from_row(dict(row)) for row in rows]

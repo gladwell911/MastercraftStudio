@@ -20,9 +20,18 @@ class NotesSyncService:
 
     def pull_since(self, cursor: str) -> dict:
         normalized_cursor = str(cursor or "0").strip() or "0"
-        if normalized_cursor == "0":
+        current_cursor = str(self.store.current_cursor() or "0")
+        try:
+            requested_value = int(normalized_cursor)
+        except Exception:
+            requested_value = 0
+        try:
+            current_value = int(current_cursor)
+        except Exception:
+            current_value = 0
+        if requested_value <= 0 or requested_value > current_value:
             snapshot = self.store.snapshot()
-            snapshot["cursor"] = str(snapshot.get("cursor") or self.store.current_cursor() or "0")
+            snapshot["cursor"] = str(snapshot.get("cursor") or current_cursor or "0")
             return snapshot
         ops, next_cursor = self.store.list_ops_since(cursor)
         return {"cursor": next_cursor, "ops": ops}

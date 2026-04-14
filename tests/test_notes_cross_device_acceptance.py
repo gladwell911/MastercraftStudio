@@ -212,3 +212,59 @@ def test_notes_acceptance_initial_pull_since_zero_returns_existing_snapshot(fram
     finally:
         frame._remote_ws_server.stop()
         frame._remote_ws_server = None
+
+
+def test_notes_acceptance_incremental_pull_returns_desktop_created_notebook_and_entries(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    existing = frame.notes_store.create_notebook("existing notebook")
+    frame.notes_store.create_entry(existing.id, "existing body", source="manual")
+    baseline_cursor = frame.notes_store.current_cursor()
+
+    created = frame.notes_store.create_notebook("周三中午")
+    first = frame.notes_store.create_entry(created.id, "第一条", source="manual")
+    second = frame.notes_store.create_entry(created.id, "第二条", source="manual")
+
+    frame._start_remote_ws_server_if_configured()
+    try:
+        async def _run():
+            session, ws = await _connect_notes_client(frame._remote_ws_server.bound_port)
+            try:
+                pull = await _request(
+                    ws,
+                    {
+                        "id": "pull-incremental",
+                        "type": "notes_pull_since",
+                        "cursor": baseline_cursor,
+                    },
+                )
+                body = pull["body"]
+                ops = list(body.get("ops") or [])
+                assert len(ops) >= 3
+                assert any(
+                    item.get("entity_type") == "notebook"
+                    and item.get("entity_id") == created.id
+                    and item.get("payload", {}).get("title") == "周三中午"
+                    for item in ops
+                )
+                assert any(
+                    item.get("entity_type") == "entry"
+                    and item.get("entity_id") == first.id
+                    and item.get("payload", {}).get("content") == "第一条"
+                    for item in ops
+                )
+                assert any(
+                    item.get("entity_type") == "entry"
+                    and item.get("entity_id") == second.id
+                    and item.get("payload", {}).get("content") == "第二条"
+                    for item in ops
+                )
+            finally:
+                await ws.close()
+                await session.close()
+
+        asyncio.run(_run())
+    finally:
+        frame._remote_ws_server.stop()
+        frame._remote_ws_server = None
