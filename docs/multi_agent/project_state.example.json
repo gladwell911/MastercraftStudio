@@ -1,0 +1,34 @@
+{
+  "project_goal": "Build a desktop app and a mobile app that share the same login, sync, and notification behavior.",
+  "last_updated": null,
+  "desktop": {
+    "status": "NOT_STARTED",
+    "current_task": "",
+    "done_items": [],
+    "changed_files": [],
+    "blocked_by": [],
+    "next_step": "",
+    "handoff_items": []
+  },
+  "mobile": {
+    "status": "NOT_STARTED",
+    "current_task": "",
+    "done_items": [],
+    "changed_files": [],
+    "blocked_by": [],
+    "next_step": "",
+    "handoff_items": []
+  },
+  "integration": {
+    "status": "NOT_STARTED",
+    "api_contract_ready": false,
+    "ready_for_joint_test": false,
+    "risks": [],
+    "open_items": []
+  },
+  "coordinator": {
+    "cycle": 0,
+    "last_actions": [],
+    "waiting_for_user": false
+  }
+}

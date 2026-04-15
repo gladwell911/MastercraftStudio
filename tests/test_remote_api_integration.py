@@ -510,6 +510,109 @@ def test_remote_api_first_message_sets_title_from_first_question(frame, monkeypa
 
     assert status == 200
     assert body["accepted"] is True
-    assert frame._current_chat_state["title"] != "新聊天"
-    assert "桌面端聊天命名规则"[:8] in frame._current_chat_state["title"]
-    assert pushed
+    assert frame._current_chat_state["title"] == "新聊天"
+    assert pushed == []
+
+def test_remote_api_first_message_keeps_default_title_and_schedules_auto_rename_v2(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "心聊天",
+        "title_manual": False,
+        "title_source": "default",
+        "title_updated_at": 1.0,
+        "title_revision": 1,
+        "turns": frame.active_session_turns,
+    }
+    scheduled = []
+    monkeypatch.setattr(
+        frame,
+        "_schedule_first_question_auto_title",
+        lambda chat_id, question: scheduled.append((chat_id, question)),
+    )
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    status, body = frame._remote_api_message_ui({"text": "桌面端聊天命名规则怎么改"})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert frame._current_chat_state["title"] == "心聊天"
+    assert scheduled == [("chat-current", "桌面端聊天命名规则怎么改")]
+
+
+def test_remote_api_rename_chat_uses_newer_manual_title_v2(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "心聊天",
+            "title_manual": False,
+            "title_source": "default",
+            "title_updated_at": 10.0,
+            "title_revision": 1,
+        }
+    )
+
+    status, body = frame._remote_api_rename_chat_ui(
+        {
+            "chat_id": "chat-current",
+            "title": "手机改名",
+            "title_source": "manual",
+            "title_updated_at": 20.0,
+            "title_revision": 2,
+        }
+    )
+
+    assert status == 200
+    assert body["title"] == "手机改名"
+    assert body["title_source"] == "manual"
+    assert body["title_revision"] == 2
+    assert frame._current_chat_state["title"] == "手机改名"
+
+
+def test_remote_api_rename_chat_keeps_newer_manual_title_over_stale_auto_update_v2(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "桌面手动改名",
+            "title_manual": True,
+            "title_source": "manual",
+            "title_updated_at": 30.0,
+            "title_revision": 3,
+        }
+    )
+
+    status, body = frame._remote_api_rename_chat_ui(
+        {
+            "chat_id": "chat-current",
+            "title": "旧自动标题",
+            "title_source": "auto",
+            "title_updated_at": 20.0,
+            "title_revision": 2,
+        }
+    )
+
+    assert status == 200
+    assert body["title"] == "桌面手动改名"
+    assert body["title_source"] == "manual"
+    assert body["title_revision"] == 3
+    assert frame._current_chat_state["title"] == "桌面手动改名"

@@ -570,7 +570,7 @@ def test_google_chat_remains_visible_in_history_after_done(frame, monkeypatch):
     choices = list(frame.history_list.GetStrings())
     assert frame.history_ids[0] == "chat-google"
     assert choices[0].startswith("[当前] ")
-    assert "解释一下 Gemini 模型"[:8] in choices[0]
+    assert choices[0] == "[当前] 新聊天"
     assert frame.archived_chats == []
 
 
@@ -2074,7 +2074,7 @@ def test_archive_title_uses_first_question_only(frame):
     frame.active_session_started_at = time.time()
     archived = frame._archive_active_session(quick_title=True)
     assert archived is not None
-    assert "安卓自动化测试方案怎么做"[:8] in archived["title"]
+    assert archived["title"] == "新聊天"
     assert "整理成执行清单"[:6] not in archived["title"]
 
 
@@ -2095,7 +2095,7 @@ def test_load_chat_as_current_coerces_string_title_manual_false(frame):
 
     assert archived is not None
     assert archived["title_manual"] is False
-    assert "安卓自动化测试方案怎么做"[:8] in archived["title"]
+    assert archived["title"] == "神匠工坊"
     assert "整理成执行清单"[:6] not in archived["title"]
 
 
@@ -2121,8 +2121,7 @@ def test_submit_question_sets_auto_title_from_first_question(frame, monkeypatch)
 
     assert ok is True
     assert message == ""
-    assert frame._current_chat_state["title"] != "新聊天"
-    assert "安卓自动化测试方案"[:8] in frame._current_chat_state["title"]
+    assert frame._current_chat_state["title"] == "新聊天"
 
 
 def test_submit_question_renames_placeholder_history_chat_immediately(frame, monkeypatch):
@@ -2154,18 +2153,67 @@ def test_submit_question_renames_placeholder_history_chat_immediately(frame, mon
     assert ok is True
     assert message == ""
     items = list(frame.history_list.GetStrings())
-    assert items == [f"[当前] {frame._current_chat_state['title']}"]
-    assert "心聊天" not in items[0]
+    assert items == ["[当前] 心聊天"]
 
 
-def test_auto_title_respects_manual_lock(frame):
-    frame._current_chat_state["title"] = "手动标题"
-    frame._current_chat_state["title_manual"] = True
+def test_next_default_chat_title_uses_xinliaotian_sequence(frame):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "心聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-b", "title": "心聊天1", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+    ]
+    frame._current_chat_state["title"] = "别的标题"
 
-    title = frame._apply_auto_title_from_first_question("帮我整理安卓自动化测试方案")
+    assert frame._next_default_chat_title() == "心聊天2"
 
-    assert title == "手动标题"
+
+def test_generate_first_question_title_retries_three_times_then_keeps_default(frame, monkeypatch):
+    seen = {"calls": 0}
+
+    class _FailingClient:
+        def generate_chat_title(self, _prompt):
+            seen["calls"] += 1
+            return ""
+
+    monkeypatch.setattr(main, "ChatClient", lambda *args, **kwargs: _FailingClient())
+
+    title = frame._generate_first_question_title("帮我整理安卓自动化测试方案")
+
+    assert title == ""
+    assert seen["calls"] == 3
+
+
+def test_schedule_first_question_auto_title_respects_manual_lock(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "手动标题",
+            "title_manual": True,
+            "title_source": "manual",
+            "title_updated_at": 20.0,
+            "title_revision": 4,
+        }
+    )
+    pushed = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
+
+    class _ImmediateThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(frame, "_generate_first_question_title", lambda _question: "自动标题")
+
+    frame._schedule_first_question_auto_title("chat-current", "首次提问")
+
     assert frame._current_chat_state["title"] == "手动标题"
+    assert pushed == []
 
 
 def test_compact_first_question_title_removes_request_wrappers(frame):
@@ -3876,8 +3924,9 @@ def test_normalize_archived_chat_preserves_manual_titles(frame):
         "turns": [{"question": "q", "answer_md": "a"}],
     }
     changed = frame._normalize_archived_chat(chat)
-    assert changed is False
+    assert changed is True
     assert chat["title"] == "手动改过的标题"
+    assert chat["title_source"] == "manual"
 
 
 

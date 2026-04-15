@@ -1552,6 +1552,20 @@ class ChatFrame(wx.Frame):
             title_manual = bool(title_manual)
             chat["title_manual"] = title_manual
             changed = True
+        title_source = str(chat.get("title_source") or "").strip() or (
+            "manual" if title_manual else "default"
+        )
+        if chat.get("title_source") != title_source:
+            chat["title_source"] = title_source
+            changed = True
+        title_updated_at = float(chat.get("title_updated_at") or chat.get("updated_at") or chat.get("created_at") or 0.0)
+        if float(chat.get("title_updated_at") or 0.0) != title_updated_at:
+            chat["title_updated_at"] = title_updated_at
+            changed = True
+        title_revision = int(chat.get("title_revision") or 1)
+        if int(chat.get("title_revision") or 0) != title_revision:
+            chat["title_revision"] = title_revision
+            changed = True
         if not isinstance(chat.get("pinned"), bool):
             chat["pinned"] = bool(chat.get("pinned"))
             changed = True
@@ -1608,28 +1622,116 @@ class ChatFrame(wx.Frame):
         normalized = normalized.strip()
         return normalized[:max_length].strip() if normalized else ""
 
-    def _apply_auto_title_from_first_question(self, question: str, *, push_remote: bool = False) -> str:
-        title_manual = self._current_chat_state.get("title_manual")
-        if isinstance(title_manual, str):
-            title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
-        else:
-            title_manual = bool(title_manual)
-        if title_manual:
-            return str(self._current_chat_state.get("title") or "").strip()
-        title = self._compact_first_question_title(str(question or "").strip(), 18)
-        if not title:
-            title = self._summarize_recent_topic(
-                [{"question": str(question or "").strip(), "answer_md": "", "model": self._resolve_current_model()}],
-                os.getenv("OPENROUTER_API_KEY", "").strip(),
-            )
-        if not title:
+    @staticmethod
+    def _is_default_chat_title(title: str) -> bool:
+        text = str(title or "").strip()
+        return text == EMPTY_CURRENT_CHAT_TITLE or bool(re.fullmatch(rf"{re.escape(EMPTY_CURRENT_CHAT_TITLE)}\d+", text))
+
+    def _next_default_chat_title(self) -> str:
+        existing_titles = {
+            str(chat.get("title") or "").strip()
+            for chat in self.archived_chats
+            if isinstance(chat, dict)
+        }
+        current_title = str((self._current_chat_state or {}).get("title") or "").strip()
+        if current_title:
+            existing_titles.add(current_title)
+        if EMPTY_CURRENT_CHAT_TITLE not in existing_titles:
+            return EMPTY_CURRENT_CHAT_TITLE
+        index = 1
+        while f"{EMPTY_CURRENT_CHAT_TITLE}{index}" in existing_titles:
+            index += 1
+        return f"{EMPTY_CURRENT_CHAT_TITLE}{index}"
+
+    def _bump_chat_title_revision(self, chat: dict, source: str, updated_at: float | None = None, title: str | None = None) -> None:
+        timestamp = float(updated_at or time.time())
+        next_title = str(title if title is not None else chat.get("title") or "").strip() or EMPTY_CURRENT_CHAT_TITLE
+        chat["title"] = next_title
+        chat["title_manual"] = source == "manual"
+        chat["title_source"] = source
+        chat["title_updated_at"] = timestamp
+        chat["title_revision"] = int(chat.get("title_revision") or 0) + 1
+        chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), timestamp)
+
+    @staticmethod
+    def _title_source_priority(source: str) -> int:
+        normalized = str(source or "").strip().lower()
+        if normalized == "manual":
+            return 2
+        if normalized == "auto":
+            return 1
+        return 0
+
+    def _generate_first_question_title(self, question: str) -> str:
+        prompt = str(question or "").strip()
+        if not prompt:
             return ""
-        self._current_chat_state["title"] = title
-        self._current_chat_state["updated_at"] = time.time()
-        self._refresh_history(self.active_chat_id or self.current_chat_id or None)
-        if push_remote:
-            self._push_remote_history_changed(self.active_chat_id or self.current_chat_id or "")
-        return title
+        for _ in range(3):
+            try:
+                client = ChatClient(
+                    api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+                    model="doubao-2.0-mini",
+                    timeout=15,
+                )
+                title = client.generate_chat_title(prompt).strip()[:40]
+            except Exception:
+                title = ""
+            if title:
+                return title
+        return ""
+
+    def _apply_generated_first_question_title(self, chat_id: str, question: str, title: str) -> None:
+        resolved_chat_id = str(chat_id or "").strip()
+        if not resolved_chat_id or not title:
+            return
+        if resolved_chat_id in {self.active_chat_id, self.current_chat_id}:
+            chat = self._current_chat_state
+        else:
+            chat = self._find_archived_chat(resolved_chat_id)
+        if not isinstance(chat, dict):
+            return
+        if bool(chat.get("title_manual")) or str(chat.get("title_source") or "").strip() == "manual":
+            return
+        if not self._is_default_chat_title(str(chat.get("title") or "")):
+            return
+        if not self._compact_first_question_title(question, 120):
+            return
+        self._bump_chat_title_revision(chat, "auto", title=title)
+        self._save_state()
+        self._refresh_history(resolved_chat_id)
+        self._push_remote_history_changed(resolved_chat_id)
+
+    def _schedule_first_question_auto_title(self, chat_id: str, question: str) -> None:
+        resolved_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        normalized_question = str(question or "").strip()
+        if not resolved_chat_id or not normalized_question:
+            return
+        if resolved_chat_id in {self.active_chat_id, self.current_chat_id}:
+            chat = self._current_chat_state
+        else:
+            chat = self._find_archived_chat(resolved_chat_id)
+        if not isinstance(chat, dict):
+            return
+        if bool(chat.get("title_manual")) or str(chat.get("title_source") or "").strip() == "manual":
+            return
+        if not self._is_default_chat_title(str(chat.get("title") or "")):
+            return
+        if chat.get("first_question_auto_title_scheduled"):
+            return
+        chat["first_question_auto_title_scheduled"] = True
+
+        def _worker() -> None:
+            title = self._generate_first_question_title(normalized_question)
+            if not title:
+                return
+            wx_call_after_if_alive(
+                self._apply_generated_first_question_title,
+                resolved_chat_id,
+                normalized_question,
+                title,
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _sort_archived_chats(self):
         self.archived_chats.sort(
@@ -1649,10 +1751,6 @@ class ChatFrame(wx.Frame):
         title_manual = bool((self._current_chat_state or {}).get("title_manual"))
         if title_manual and title:
             return title
-        if self.active_session_turns:
-            summarized = self._summarize_last_turn_locally(self.active_session_turns).strip()
-            if summarized:
-                return summarized
         return title or EMPTY_CURRENT_CHAT_TITLE
 
     def _refresh_history(self, keep_id=None):
@@ -2004,7 +2102,7 @@ class ChatFrame(wx.Frame):
             self._apply_nonrecoverable_turn_metadata(self.active_session_turns[-1], "openclaw/main", text)
             self.active_turn_idx = len(self.active_session_turns) - 1
             if len([turn for turn in self.active_session_turns if str((turn or {}).get("question") or "").strip()]) == 1:
-                self._apply_auto_title_from_first_question(text, push_remote=True)
+                self._schedule_first_question_auto_title(self.active_chat_id or self.current_chat_id, text)
             return "visible"
 
         merged = self._merge_openclaw_assistant_event(text, event)
@@ -2705,6 +2803,9 @@ class ChatFrame(wx.Frame):
             "model": model,
             "created_at": created_at,
             "updated_at": updated_at,
+            "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
+            "title_updated_at": float(chat.get("title_updated_at") or updated_at),
+            "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
             "running": False,
             "request_kind": request_kind,
@@ -2731,6 +2832,9 @@ class ChatFrame(wx.Frame):
         chat["current"] = True
         chat["active"] = True
         chat["pinned"] = bool(chat.get("pinned"))
+        chat["title_source"] = str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default"))
+        chat["title_updated_at"] = float(chat.get("title_updated_at") or chat["updated_at"])
+        chat["title_revision"] = int(chat.get("title_revision") or 1)
         return chat
 
     def _codex_answer_filter_menu_label(self) -> str:
@@ -2849,11 +2953,15 @@ class ChatFrame(wx.Frame):
         self.active_chat_id = ""
         self.active_session_turns = []
         now = time.time()
+        default_title = str((payload or {}).get("title") or "").strip() or self._next_default_chat_title()
         self.active_session_started_at = now
         self._current_chat_state = {
             "id": "",
-            "title": str((payload or {}).get("title") or EMPTY_CURRENT_CHAT_TITLE),
+            "title": default_title,
             "title_manual": False,
+            "title_source": "default",
+            "title_updated_at": now,
+            "title_revision": 1,
             "turns": self.active_session_turns,
             "created_at": now,
             "updated_at": now,
@@ -2882,6 +2990,9 @@ class ChatFrame(wx.Frame):
             "title": self._current_chat_state["title"],
             "model": model,
             "created_at": now,
+            "title_source": self._current_chat_state["title_source"],
+            "title_updated_at": self._current_chat_state["title_updated_at"],
+            "title_revision": self._current_chat_state["title_revision"],
         }
 
     def _remote_api_reply_request_ui(self, payload: dict) -> tuple[int, dict]:
@@ -2959,12 +3070,52 @@ class ChatFrame(wx.Frame):
             chat = self._current_chat_state
         if not isinstance(chat, dict):
             return 404, {"accepted": False, "error": "not_found"}
+        incoming_source = str(payload.get("title_source") or "manual").strip() or "manual"
+        incoming_updated_at = float(payload.get("title_updated_at") or time.time())
+        current_updated_at = float(chat.get("title_updated_at") or chat.get("updated_at") or 0.0)
+        incoming_revision = int(payload.get("title_revision") or (int(chat.get("title_revision") or 0) + 1))
+        current_revision = int(chat.get("title_revision") or 0)
+        current_source = str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")).strip() or "default"
+        incoming_priority = self._title_source_priority(incoming_source)
+        current_priority = self._title_source_priority(current_source)
+        if incoming_updated_at < current_updated_at:
+            return 200, {
+                "accepted": True,
+                "chat_id": chat_id,
+                "title": str(chat.get("title") or title),
+                "title_source": current_source,
+                "title_updated_at": current_updated_at,
+                "title_revision": current_revision,
+            }
+        if incoming_updated_at == current_updated_at and incoming_priority < current_priority:
+            return 200, {
+                "accepted": True,
+                "chat_id": chat_id,
+                "title": str(chat.get("title") or title),
+                "title_source": current_source,
+                "title_updated_at": current_updated_at,
+                "title_revision": current_revision,
+            }
+        resolved_revision = incoming_revision
+        if incoming_updated_at == current_updated_at and incoming_priority == current_priority:
+            resolved_revision = max(current_revision, incoming_revision)
         chat["title"] = title
-        chat["title_manual"] = True
+        chat["title_manual"] = incoming_source == "manual"
+        chat["title_source"] = incoming_source
+        chat["title_updated_at"] = incoming_updated_at
+        chat["title_revision"] = resolved_revision
+        chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), incoming_updated_at)
         self._save_state()
         self._refresh_history(chat_id)
         self._push_remote_history_changed(chat_id)
-        return 200, {"accepted": True, "chat_id": chat_id, "title": title}
+        return 200, {
+            "accepted": True,
+            "chat_id": chat_id,
+            "title": title,
+            "title_source": incoming_source,
+            "title_updated_at": incoming_updated_at,
+            "title_revision": resolved_revision,
+        }
 
     def _remote_api_update_settings_ui(self, payload: dict) -> tuple[int, dict]:
         if "codex_answer_english_filter_enabled" in payload:
@@ -3583,8 +3734,11 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["id"] = self.active_chat_id or self.current_chat_id or ""
         self._current_chat_state["model"] = resolved_model
         self._current_chat_state["turns"] = self.active_session_turns
-        self._current_chat_state.setdefault("title", EMPTY_CURRENT_CHAT_TITLE)
+        self._current_chat_state.setdefault("title", self._next_default_chat_title())
         self._current_chat_state.setdefault("title_manual", False)
+        self._current_chat_state.setdefault("title_source", "default")
+        self._current_chat_state.setdefault("title_updated_at", time.time())
+        self._current_chat_state.setdefault("title_revision", 1)
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
             self._ensure_active_openclaw_session_id()
@@ -3599,7 +3753,7 @@ class ChatFrame(wx.Frame):
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
             if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-                self._apply_auto_title_from_first_question(q, push_remote=(source != "local"))
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, q)
             self._mark_turn_request_pending(turn, resolved_model, q)
             self.is_running = True
             self.input_edit.SetValue("")
@@ -3624,7 +3778,7 @@ class ChatFrame(wx.Frame):
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
         if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-            self._apply_auto_title_from_first_question(q, push_remote=(source != "local"))
+            self._schedule_first_question_auto_title(chat_id or self.active_chat_id, q)
         self._mark_turn_request_pending(turn, resolved_model, q)
         if is_claudecode_model(resolved_model):
             self.active_claudecode_session_id = str(self.active_claudecode_session_id or "").strip()
@@ -4177,27 +4331,7 @@ class ChatFrame(wx.Frame):
         self._refresh_history(chat_id)
 
     def _schedule_async_archive_rename(self, chat_id: str, turns_snapshot: list[dict], model_snapshot: str) -> None:
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        if not api_key:
-            return
-
-        def _worker():
-            title = ""
-            try:
-                transcript = self._build_title_transcript(turns_snapshot)
-                client = ChatClient(api_key=api_key, model=model_snapshot or DEFAULT_MODEL, timeout=15)
-                prompt = (
-                    "请根据给定聊天片段生成一个准确、简洁的中文标题（6-16字），"
-                    "只输出标题，不要标点和引号。\n\n"
-                    f"{transcript}"
-                )
-                title = client.generate_chat_title(prompt).strip()[:40]
-            except Exception:
-                title = ""
-            if title:
-                wx_call_after_if_alive(self._apply_archived_title, chat_id, title)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        return
 
     def _archive_active_session(self, quick_title: bool = False, schedule_async_rename: bool = False, save_after_archive: bool = True):
         if not self.active_session_turns:
@@ -4210,16 +4344,18 @@ class ChatFrame(wx.Frame):
             title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
         else:
             title_manual = bool(title_manual)
-        if title_manual and str(self._current_chat_state.get("title") or "").strip():
-            title = str(self._current_chat_state.get("title") or "").strip()
-        else:
-            title = self._summarize_recent_topic(turns_snapshot, api_key)
+        title = str(self._current_chat_state.get("title") or "").strip()
+        if not title:
+            title = self._next_default_chat_title()
         created = self.active_session_started_at or time.time()
         archived_id = str(self.active_chat_id or self.current_chat_id or uuid.uuid4())
         archived = {
             "id": archived_id,
             "title": title,
             "title_manual": title_manual,
+            "title_source": str(self._current_chat_state.get("title_source") or ("manual" if title_manual else "default")),
+            "title_updated_at": float(self._current_chat_state.get("title_updated_at") or time.time()),
+            "title_revision": int(self._current_chat_state.get("title_revision") or 1),
             "pinned": False,
             "created_at": created,
             "turns": turns_snapshot,
@@ -4314,7 +4450,18 @@ class ChatFrame(wx.Frame):
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
         self.current_chat_id = ""
         self.active_chat_id = ""
-        self._current_chat_state = {"id": "", "title": EMPTY_CURRENT_CHAT_TITLE, "title_manual": False, "turns": self.active_session_turns}
+        now = time.time()
+        self._current_chat_state = {
+            "id": "",
+            "title": self._next_default_chat_title(),
+            "title_manual": False,
+            "title_source": "default",
+            "title_updated_at": now,
+            "title_revision": 1,
+            "turns": self.active_session_turns,
+            "created_at": now,
+            "updated_at": now,
+        }
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id

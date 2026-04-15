@@ -1,0 +1,47 @@
+{
+  "project_goal": "Build a desktop app and a mobile app that share the same login, sync, and notification behavior.",
+  "last_updated": "2026-04-14T06:42:25.177816+00:00",
+  "desktop": {
+    "status": "IN_PROGRESS",
+    "current_task": "Set up desktop app shell",
+    "done_items": [],
+    "changed_files": [],
+    "blocked_by": [],
+    "next_step": "Continue working on Set up desktop app shell",
+    "handoff_items": []
+  },
+  "mobile": {
+    "status": "IN_PROGRESS",
+    "current_task": "Set up mobile app shell",
+    "done_items": [],
+    "changed_files": [],
+    "blocked_by": [],
+    "next_step": "Continue working on Set up mobile app shell",
+    "handoff_items": []
+  },
+  "integration": {
+    "status": "NOT_STARTED",
+    "api_contract_ready": false,
+    "ready_for_joint_test": false,
+    "risks": [],
+    "open_items": []
+  },
+  "coordinator": {
+    "cycle": 1,
+    "last_actions": [
+      {
+        "worker": "desktop",
+        "task_id": "desktop-001",
+        "worker_status": "IN_PROGRESS",
+        "timestamp": "2026-04-14T06:42:25.177816+00:00"
+      },
+      {
+        "worker": "mobile",
+        "task_id": "mobile-001",
+        "worker_status": "IN_PROGRESS",
+        "timestamp": "2026-04-14T06:42:25.177816+00:00"
+      }
+    ],
+    "waiting_for_user": false
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "desktop": [
+    {
+      "id": "desktop-001",
+      "title": "Set up desktop app shell",
+      "description": "Initialize navigation, state container, and auth module boundaries.",
+      "status": "NOT_STARTED",
+      "depends_on": []
+    },
+    {
+      "id": "desktop-002",
+      "title": "Implement desktop login flow",
+      "description": "Build login UI and wire it to the shared auth contract.",
+      "status": "NOT_STARTED",
+      "depends_on": ["contract-auth-001"]
+    }
+  ],
+  "mobile": [
+    {
+      "id": "mobile-001",
+      "title": "Set up mobile app shell",
+      "description": "Initialize navigation, state container, and auth module boundaries.",
+      "status": "NOT_STARTED",
+      "depends_on": []
+    },
+    {
+      "id": "mobile-002",
+      "title": "Implement mobile login flow",
+      "description": "Build login UI and wire it to the shared auth contract.",
+      "status": "NOT_STARTED",
+      "depends_on": ["contract-auth-001"]
+    }
+  ],
+  "shared": [
+    {
+      "id": "contract-auth-001",
+      "title": "Define auth API contract",
+      "description": "Agree on request and response schema for login and refresh token.",
+      "status": "NOT_STARTED",
+      "owner": "coordinator"
+    }
+  ]
+}

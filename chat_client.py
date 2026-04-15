@@ -211,6 +211,8 @@ class ChatClient:
             return False
 
     def generate_chat_title(self, transcript: str) -> str:
+        if is_doubao_model(self.model):
+            return self._generate_doubao_chat_title(transcript)
         url = f"{self.base_url}{CHAT_COMPLETIONS_PATH}"
         payload = {
             "model": self.model,
@@ -223,6 +225,36 @@ class ChatClient:
         }
         try:
             resp = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout)
+            if resp.status_code >= 400:
+                return ""
+            data = resp.json()
+            text = str(self._first_choice(data).get("message", {}).get("content", "")).strip()
+            if not text:
+                return ""
+            return text.splitlines()[0][:40]
+        except Exception:
+            return ""
+
+    def _generate_doubao_chat_title(self, transcript: str) -> str:
+        resolved_model = resolve_doubao_model(self.model)
+        if not resolved_model:
+            return ""
+        url = f"{DOUBAO_BASE_URL}{CHAT_COMPLETIONS_PATH}"
+        payload = {
+            "model": resolved_model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "你是标题助手。请根据对话内容生成一个简洁中文标题，长度 8-20 字，不要引号。"},
+                {"role": "user", "content": transcript},
+            ],
+            "temperature": 0.2,
+        }
+        headers = {
+            "Authorization": f"Bearer {DOUBAO_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code >= 400:
                 return ""
             data = resp.json()
