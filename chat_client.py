@@ -218,7 +218,7 @@ class ChatClient:
             "model": self.model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": "你是标题助手。请根据对话内容生成一个简洁中文标题，长度 8-20 字，不要引号。"},
+                {"role": "system", "content": "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"},
                 {"role": "user", "content": transcript},
             ],
             "temperature": 0.2,
@@ -244,7 +244,7 @@ class ChatClient:
             "model": resolved_model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": "你是标题助手。请根据对话内容生成一个简洁中文标题，长度 8-20 字，不要引号。"},
+                {"role": "system", "content": "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"},
                 {"role": "user", "content": transcript},
             ],
             "temperature": 0.2,

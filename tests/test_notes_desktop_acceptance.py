@@ -276,6 +276,57 @@ def test_notes_acceptance_copy_actions_from_notebook_and_entry_menus(frame, monk
     assert copied["texts"][1] == "copied entry"
 
 
+def test_notes_acceptance_export_actions_from_notebook_and_entry_menus(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("acceptance export notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first exported entry", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second exported entry", source="manual")
+    third = frame.notes_store.create_entry(notebook.id, "third exported entry", source="manual")
+    copied = {"texts": []}
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied["texts"].append(text) or True)
+
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    _select_row_by_id(frame.notes_notebook_list, frame._notes_notebook_ids, notebook.id)
+    captured = {"items": []}
+
+    def _popup(menu):
+        captured["items"] = [
+            (item.GetItemLabelText(), item.GetId())
+            for item in menu.GetMenuItems()
+            if not item.IsSeparator()
+        ]
+
+    monkeypatch.setattr(frame, "PopupMenu", _popup)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    frame._on_notes_key_down(_key_event(wx.WXK_MENU))
+    export_notebook_id = next(item_id for label, item_id in captured["items"] if label == "导出到剪贴板")
+    event = wx.CommandEvent(wx.wxEVT_MENU, export_notebook_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, second.id)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    frame._on_notes_key_down(_key_event(wx.WXK_MENU))
+    export_down_id = next(item_id for label, item_id in captured["items"] if label == "向下导出全部到剪贴板")
+    export_up_id = next(item_id for label, item_id in captured["items"] if label == "向上导出全部到剪贴板")
+
+    down_event = wx.CommandEvent(wx.wxEVT_MENU, export_down_id)
+    down_event.SetEventObject(frame)
+    frame.ProcessEvent(down_event)
+
+    up_event = wx.CommandEvent(wx.wxEVT_MENU, export_up_id)
+    up_event.SetEventObject(frame)
+    frame.ProcessEvent(up_event)
+
+    assert copied["texts"] == [
+        "\n\n".join([first.content, second.content, third.content]),
+        "\n\n".join([second.content, third.content]),
+        "\n\n".join([first.content, second.content]),
+    ]
+
+
 def test_notes_acceptance_alt_x_creates_notebook_and_entry(frame, monkeypatch):
     notebook = frame.notes_store.create_notebook("acceptance shortcut notebook")
     entry_seen = {"notebook": 0, "entry": 0}

@@ -598,6 +598,75 @@ def test_notes_notebook_menu_includes_copy_and_copies_all_entries(frame, monkeyp
     assert captured["copied"] == expected
 
 
+def test_notes_notebook_menu_includes_export_to_clipboard_and_exports_all_entries(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("export notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first export", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second export", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetSelection(frame._notes_notebook_ids.index(notebook.id))
+
+    captured = {"items": [], "copied": None}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: captured.__setitem__("copied", text) or True)
+
+    frame._show_notes_menu()
+
+    labels = [label for label, _item_id in captured["items"]]
+    assert "导出到剪贴板" in labels
+
+    export_item_id = next(item_id for label, item_id in captured["items"] if label == "导出到剪贴板")
+    event = wx.CommandEvent(wx.wxEVT_MENU, export_item_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert captured["copied"] == "\n\n".join([first.content, second.content])
+
+
+def test_notes_entry_menu_exports_all_entries_from_selected_row_upward_and_downward(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("range export notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first entry", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second entry", source="manual")
+    third = frame.notes_store.create_entry(notebook.id, "third entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(second.id))
+
+    captured = {"items": [], "copied": []}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: captured["copied"].append(text) or True)
+
+    frame._show_notes_menu()
+
+    labels = [label for label, _item_id in captured["items"]]
+    assert "向下导出全部到剪贴板" in labels
+    assert "向上导出全部到剪贴板" in labels
+
+    down_item_id = next(item_id for label, item_id in captured["items"] if label == "向下导出全部到剪贴板")
+    up_item_id = next(item_id for label, item_id in captured["items"] if label == "向上导出全部到剪贴板")
+
+    down_event = wx.CommandEvent(wx.wxEVT_MENU, down_item_id)
+    down_event.SetEventObject(frame)
+    frame.ProcessEvent(down_event)
+
+    up_event = wx.CommandEvent(wx.wxEVT_MENU, up_item_id)
+    up_event.SetEventObject(frame)
+    frame.ProcessEvent(up_event)
+
+    assert captured["copied"] == [
+        "\n\n".join([second.content, third.content]),
+        "\n\n".join([first.content, second.content]),
+    ]
+
+
 def test_notes_detail_view_reuses_list_slot_and_backspace_returns_to_notebook_list(frame, monkeypatch):
     notebook = frame.notes_store.create_notebook("same slot notebook")
     entry = frame.notes_store.create_entry(notebook.id, "entry in same slot", source="manual")

@@ -2228,6 +2228,24 @@ def test_compact_first_question_title_removes_what_is_wrapper(frame):
     assert title == "MCP 协议"
 
 
+def test_compact_first_question_title_prefers_concise_topic_phrase(frame):
+    title = frame._compact_first_question_title("用户需要介绍好吃的")
+
+    assert title == "美食推荐"
+
+
+def test_generate_first_question_title_compacts_verbose_model_output(frame, monkeypatch):
+    class _VerboseClient:
+        def generate_chat_title(self, _prompt):
+            return "用户需要介绍好吃的"
+
+    monkeypatch.setattr(main, "ChatClient", lambda *args, **kwargs: _VerboseClient())
+
+    title = frame._generate_first_question_title("给我推荐一些好吃的")
+
+    assert title == "美食推荐"
+
+
 def test_load_chat_title_rules_reads_shared_json(tmp_path):
     custom_rules = {
         "leading_phrases": ["绝对前缀"],

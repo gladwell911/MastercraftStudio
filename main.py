@@ -1620,6 +1620,17 @@ class ChatFrame(wx.Frame):
                 normalized,
             )
         normalized = normalized.strip()
+        semantic_patterns = (
+            (("好吃", "美食", "餐厅", "菜谱", "吃什么"), "美食推荐"),
+            (("旅游", "景点", "行程", "攻略"), "旅行攻略"),
+            (("简历", "求职", "面试"), "求职准备"),
+            (("自动化", "测试"), "自动化测试"),
+            (("笔记", "同步"), "笔记同步"),
+        )
+        for keywords, replacement in semantic_patterns:
+            if any(keyword in normalized for keyword in keywords):
+                normalized = replacement
+                break
         return normalized[:max_length].strip() if normalized else ""
 
     @staticmethod
@@ -1677,7 +1688,8 @@ class ChatFrame(wx.Frame):
             except Exception:
                 title = ""
             if title:
-                return title
+                compact = self._compact_first_question_title(title, 12)
+                return compact or title
         return ""
 
     def _apply_generated_first_question_title(self, chat_id: str, question: str, title: str) -> None:
@@ -4866,7 +4878,8 @@ class ChatFrame(wx.Frame):
             return
         for entry in entries:
             prefix = "★ " if entry.pinned else ""
-            self.notes_entry_list.Append(f"{prefix}{entry.content[:32]}")
+            label = re.sub(r"\s*[\r\n]+\s*", " / ", str(entry.content or "")).strip()
+            self.notes_entry_list.Append(f"{prefix}{label}")
         target = str(select_id or self.notes_controller.active_entry_id or entries[0].id)
         if target in self._notes_entry_ids:
             self.notes_entry_list.SetSelection(self._notes_entry_ids.index(target))
@@ -5091,6 +5104,7 @@ class ChatFrame(wx.Frame):
         if show_notebook_actions:
             i_open_nb = wx.NewIdRef()
             i_new_nb = wx.NewIdRef()
+            i_export_nb = wx.NewIdRef()
             i_copy_nb = wx.NewIdRef()
             i_del_nb = wx.NewIdRef()
             i_search_nb = wx.NewIdRef()
@@ -5098,12 +5112,14 @@ class ChatFrame(wx.Frame):
             menu.Append(i_open_nb, "打开笔记")
             menu.AppendSeparator()
             menu.Append(i_new_nb, "新建笔记")
+            menu.Append(i_export_nb, "导出到剪贴板")
             menu.Append(i_copy_nb, "复制笔记")
             menu.Append(i_del_nb, "删除笔记")
             menu.Append(i_search_nb, "搜索笔记")
             menu.Append(i_ren_nb, "重命名笔记")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_open_selected_notebook(), id=i_open_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_notebook(), id=i_new_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_notebook_to_clipboard(), id=i_export_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_notebook_to_clipboard(), id=i_copy_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_notebook(), id=i_del_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_prompt_search(), id=i_search_nb)
@@ -5111,6 +5127,8 @@ class ChatFrame(wx.Frame):
         elif show_entry_actions:
             i_new_entry = wx.NewIdRef()
             i_copy_entry = wx.NewIdRef()
+            i_export_down = wx.NewIdRef()
+            i_export_up = wx.NewIdRef()
             i_del_entry = wx.NewIdRef()
             i_edit_entry = wx.NewIdRef()
             i_pin_entry = wx.NewIdRef()
@@ -5119,6 +5137,8 @@ class ChatFrame(wx.Frame):
             i_import_clip = wx.NewIdRef()
             menu.Append(i_new_entry, "新建笔记条目")
             menu.Append(i_copy_entry, "复制笔记条目")
+            menu.Append(i_export_down, "向下导出全部到剪贴板")
+            menu.Append(i_export_up, "向上导出全部到剪贴板")
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
             menu.Append(i_pin_entry, "置顶笔记条目")
@@ -5128,6 +5148,8 @@ class ChatFrame(wx.Frame):
             menu.Append(i_import_clip, "从剪贴板导入")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_entry(), id=i_new_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_entry_to_clipboard(), id=i_copy_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("down"), id=i_export_down)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("up"), id=i_export_up)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_pin_entry(), id=i_pin_entry)
@@ -5406,6 +5428,49 @@ class ChatFrame(wx.Frame):
             finally:
                 wx.TheClipboard.Close()
         return False
+
+    @staticmethod
+    def _notes_export_text(entries) -> str:
+        parts = [str(getattr(entry, "content", "") or "") for entry in list(entries or [])]
+        if not any(part.strip() for part in parts):
+            return ""
+        return "\n\n".join(parts)
+
+    def _notes_export_entries_to_clipboard(self, entries, *, status_text: str) -> bool:
+        text = self._notes_export_text(entries)
+        if not text:
+            return False
+        if not self._set_clipboard_text(text):
+            return False
+        self.SetStatusText(status_text)
+        return True
+
+    def _notes_export_selected_range_to_clipboard(self, direction: str) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        selected_entry_id = str(self._notes_selected_entry_id() or "").strip()
+        if not selected_entry_id:
+            return False
+        entries = self.notes_store.list_entries(notebook.id)
+        entry_ids = [str(entry.id) for entry in entries]
+        if selected_entry_id not in entry_ids:
+            return False
+        selected_index = entry_ids.index(selected_entry_id)
+        if str(direction or "") == "up":
+            export_entries = entries[: selected_index + 1]
+            status_text = "已向上导出笔记条目到剪贴板"
+        else:
+            export_entries = entries[selected_index:]
+            status_text = "已向下导出笔记条目到剪贴板"
+        return self._notes_export_entries_to_clipboard(export_entries, status_text=status_text)
+
+    def _notes_export_notebook_to_clipboard(self) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        entries = self.notes_store.list_entries(notebook.id)
+        return self._notes_export_entries_to_clipboard(entries, status_text="已导出笔记到剪贴板")
 
     def _notes_copy_notebook_to_clipboard(self) -> bool:
         notebook = self._notes_current_notebook()
