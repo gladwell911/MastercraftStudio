@@ -1,9 +1,12 @@
 ﻿import ctypes
 import copy
+import asyncio
 import json
 import os
 import platform
 import re
+import socket
+import subprocess
 import shutil
 import threading
 import time
@@ -16,11 +19,14 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 import markdown
 import wx
 import wx.adv
+from aiohttp import ClientSession, ClientTimeout, WSMsgType
 
 from chat_client import ChatClient, DEFAULT_MODEL
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -87,6 +93,7 @@ VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 DEFAULT_REMOTE_CONTROL_TOKEN = "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
 DEFAULT_REMOTE_CONTROL_DOMAIN = "wss://rc.tingyou.cc/ws"
+REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS = 5
 VK_PROCESSKEY = 0xE5
 VK_PACKET = 0xE7
 VK_V = 0x56
@@ -157,18 +164,30 @@ def _wx_target_is_alive(target) -> bool:
     if target is None:
         return False
     try:
-        if isinstance(target, wx.Window):
-            if hasattr(target, "IsBeingDeleted") and target.IsBeingDeleted():
-                return False
-            if hasattr(target, "GetHandle") and not target.GetHandle():
-                return False
+        if hasattr(target, "IsBeingDeleted") and target.IsBeingDeleted():
+            return False
+        if hasattr(target, "GetHandle") and not target.GetHandle():
+            return False
         return True
     except Exception:
         return False
 
 
+def _wx_app_allows_ui_timers() -> bool:
+    app = wx.GetApp()
+    if app is None:
+        return False
+    try:
+        top_window = app.GetTopWindow() if hasattr(app, "GetTopWindow") else None
+    except Exception:
+        return False
+    if top_window is None:
+        return True
+    return _wx_target_is_alive(top_window)
+
+
 def wx_call_after_if_alive(func, *args, **kwargs) -> bool:
-    if wx.GetApp() is None:
+    if not _wx_app_allows_ui_timers():
         return False
     target = getattr(func, "__self__", None)
     if target is not None and not _wx_target_is_alive(target):
@@ -181,7 +200,7 @@ def wx_call_after_if_alive(func, *args, **kwargs) -> bool:
 
 
 def wx_call_later_if_alive(delay_ms: int, func, *args, **kwargs):
-    if wx.GetApp() is None:
+    if not _wx_app_allows_ui_timers():
         return None
     target = getattr(func, "__self__", None)
     if target is not None and not _wx_target_is_alive(target):
@@ -718,6 +737,8 @@ class ChatFrame(wx.Frame):
         self.state_path = self.app_data_dir / APP_STATE_FILE
         self.detail_pages_dir = self.app_data_dir / "detail_pages"
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_uploads_dir = self.app_data_dir / "chat_uploads"
+        self.chat_uploads_dir.mkdir(parents=True, exist_ok=True)
         self.notes_db_path = self.app_data_dir / "notes.db"
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
@@ -789,6 +810,7 @@ class ChatFrame(wx.Frame):
         self.input_hint_state = "输入"
         self._answer_committed_buffer = ""
         self._answer_redirect_timer = None
+        self._pending_input_attachments = []
         self._openclaw_sync_thread = None
         self._openclaw_sync_stop = threading.Event()
         self._openclaw_sync_lock = threading.Lock()
@@ -826,7 +848,7 @@ class ChatFrame(wx.Frame):
         wx_call_after_if_alive(self._realtime_call.prepare)
         self._merge_legacy_archived_chats()
         if self.remote_control_autostart:
-            self._start_remote_ws_server_if_configured()
+            self._start_remote_ws_server_if_configured(ensure_connectivity=True)
         self._start_claudecode_remote_ws_server_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
         if self.active_session_turns:
@@ -941,36 +963,10 @@ class ChatFrame(wx.Frame):
         self.answer_list.MoveAfterInTabOrder(self.notes_list_panel)
         self.chat_root_panel.SetSizer(root)
 
-        self.root_tab_order = [
-            self.input_edit,
-            self.send_button,
-            self.new_chat_button,
-            self.model_combo,
-            self.history_list,
-            self.notes_notebook_list,
-            self.answer_list,
-            self.notes_entry_list,
-            self.notes_editor,
-        ]
-        for previous, nxt in zip(self.root_tab_order, self.root_tab_order[1:]):
-            try:
-                nxt.MoveAfterInTabOrder(previous)
-            except Exception:
-                pass
-        self.chat_tab_order = [
-            self.input_edit,
-            self.send_button,
-            self.new_chat_button,
-            self.model_combo,
-            self.history_list,
-            self.notes_notebook_list,
-            self.answer_list,
-        ]
-        self.notes_tab_order = [
-            self.notes_notebook_list,
-            self.notes_entry_list,
-            self.notes_editor,
-        ]
+        self.root_tab_order = []
+        self.chat_tab_order = []
+        self.notes_tab_order = []
+        self._notes_rebuild_tab_order()
         self._sync_notes_ui()
 
     def _bind_events(self):
@@ -1795,6 +1791,147 @@ class ChatFrame(wx.Frame):
             return []
         return self.active_session_turns
 
+    def _attachment_label(self, attachment: dict, *, incoming: bool = False) -> str:
+        name = str((attachment or {}).get("name") or Path(str((attachment or {}).get("path") or "")).name or "未知附件").strip()
+        is_image = str((attachment or {}).get("kind") or "").strip() == "image"
+        if incoming:
+            kind = "图片" if is_image else "文件"
+            return f"CLI 发来{kind}：{name}"
+        success = str((attachment or {}).get("status") or "").strip() == "success"
+        if is_image:
+            return "图片上传成功" if success else "图片上传失败"
+        return f"{name} {'上传成功' if success else '上传失败'}"
+
+    def _append_turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> None:
+        for attachment in attachments or []:
+            label = self._attachment_label(attachment, incoming=incoming)
+            open_path = str((attachment or {}).get("open_path") or (attachment or {}).get("path") or "").strip()
+            self.answer_list.Append(label)
+            self.answer_meta.append(("attachment", turn_idx, label, open_path))
+
+    def _input_attachment_marker_text(self, attachments: list[dict]) -> str:
+        names = [str((item or {}).get("name") or "").strip() for item in attachments or [] if str((item or {}).get("name") or "").strip()]
+        if not names:
+            return ""
+        return f"【附件】{'、'.join(names)}"
+
+    def _strip_attachment_markers(self, text: str) -> str:
+        lines = []
+        for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if line.startswith("【附件】"):
+                continue
+            lines.append(raw_line)
+        return "\n".join(lines).strip()
+
+    def _normalize_attachment_kind(self, path: str) -> str:
+        suffix = Path(str(path or "")).suffix.lower()
+        return "image" if suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"} else "file"
+
+    def _normalize_outgoing_attachments(self, attachments: list[dict]) -> tuple[list[dict], list[dict]]:
+        success = []
+        failed = []
+        for item in attachments or []:
+            path = str((item or {}).get("path") or "").strip()
+            name = str((item or {}).get("name") or Path(path).name or "未知附件").strip()
+            exists = bool(path) and Path(path).is_file()
+            normalized = {
+                "name": name,
+                "path": path,
+                "kind": str((item or {}).get("kind") or self._normalize_attachment_kind(path)).strip() or "file",
+                "direction": "outgoing",
+                "status": "success" if exists else "failed",
+                "open_path": path if exists else "",
+            }
+            (success if exists else failed).append(normalized)
+        return success, failed
+
+    def _record_received_attachment(self, turn: dict, attachment: dict) -> bool:
+        if not isinstance(turn, dict) or not isinstance(attachment, dict):
+            return False
+        attachments = turn.setdefault("received_attachments", [])
+        if not isinstance(attachments, list):
+            attachments = []
+            turn["received_attachments"] = attachments
+        open_path = str(attachment.get("open_path") or attachment.get("path") or "").strip()
+        for existing in attachments:
+            if str((existing or {}).get("open_path") or (existing or {}).get("path") or "").strip() == open_path:
+                return False
+        attachments.append(attachment)
+        return True
+
+    def _extract_existing_file_attachments_from_text(self, text: str, source: str) -> list[dict]:
+        matches = []
+        for candidate in re.findall(r"(?:[A-Za-z]:[\\/][^\s<>\|\?\*\"']+|/[^\s<>\|\?\*\"']+)", str(text or "")):
+            path = str(candidate or "").strip().rstrip(".,;:)]}")
+            if not path:
+                continue
+            try:
+                file_path = Path(path)
+            except Exception:
+                continue
+            if not file_path.is_file():
+                continue
+            matches.append(
+                {
+                    "name": file_path.name,
+                    "path": str(file_path),
+                    "kind": self._normalize_attachment_kind(str(file_path)),
+                    "direction": "incoming",
+                    "status": "success",
+                    "open_path": str(file_path),
+                    "source": source,
+                }
+            )
+        deduped = []
+        seen = set()
+        for item in matches:
+            key = str(item.get("open_path") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _summarize_attachment_send_text(self, success: list[dict], failed: list[dict]) -> str:
+        outgoing = success + failed
+        if not outgoing:
+            return ""
+        names = "、".join(str(item.get("name") or "").strip() for item in outgoing if str(item.get("name") or "").strip())
+        has_only_one_image = len(outgoing) == 1 and str(outgoing[0].get("kind") or "") == "image"
+        suffix = "图片" if has_only_one_image else "文件"
+        status = "已成功上传" if success and not failed else ("上传失败" if failed and not success else "已部分上传")
+        return f"{names} {suffix}{status}".strip()
+
+    def _build_cli_attachment_context(self, attachments: list[dict]) -> str:
+        lines = []
+        for item in attachments or []:
+            path = str((item or {}).get("path") or "").strip()
+            if not path:
+                continue
+            kind = "图片" if str((item or {}).get("kind") or "") == "image" else "文件"
+            lines.append(f"- {kind}：{path}")
+        if not lines:
+            return ""
+        return "请结合以下本地附件继续处理：\n" + "\n".join(lines)
+
+    def _build_codex_input_items(self, question: str, attachments: list[dict]) -> list[dict]:
+        items = []
+        text = str(question or "").strip()
+        file_context = self._build_cli_attachment_context([item for item in attachments or [] if str((item or {}).get("kind") or "") != "image"])
+        if text and file_context:
+            items.append({"type": "text", "text": f"{text}\n\n{file_context}"})
+        elif text:
+            items.append({"type": "text", "text": text})
+        elif file_context:
+            items.append({"type": "text", "text": file_context})
+        for item in attachments or []:
+            if str((item or {}).get("kind") or "") == "image":
+                path = str((item or {}).get("path") or "").strip()
+                if path:
+                    items.append({"type": "localImage", "path": path})
+        return items or [{"type": "text", "text": ""}]
+
     def _render_answer_list(self):
         self.answer_list.Clear()
         self.answer_meta = []
@@ -1808,24 +1945,37 @@ class ChatFrame(wx.Frame):
         for i, t in enumerate(turns):
             q = str(t.get("question") or "")
             a_md, a = self._turn_answer_markdown(t)
-            show_pending_placeholder = a_md != REQUESTING_TEXT
-            show_user_rows = not (
+            attachments = t.get("attachments") if isinstance(t.get("attachments"), list) else []
+            received_attachments = t.get("received_attachments") if isinstance(t.get("received_attachments"), list) else []
+            suppress_empty_answer_row = bool(t.get("suppress_empty_answer_row")) and (not str(a_md or "").strip())
+            attachment_only_summary = bool(attachments) and suppress_empty_answer_row and any(
+                token in q for token in ("上传成功", "已成功上传", "上传失败", "已部分上传")
+            )
+            show_pending_placeholder = (a_md != REQUESTING_TEXT) and (not suppress_empty_answer_row)
+            show_user_rows = bool(attachments) or not (
                 (is_openclaw_model(str(t.get("model") or "")) or is_codex_model(str(t.get("model") or "")) or is_claudecode_model(str(t.get("model") or "")))
                 and (not q.strip())
                 and bool(a_md.strip())
             )
-            if show_user_rows:
+            should_show_user_label = show_user_rows and ((q.strip() and not attachment_only_summary) or bool(attachments))
+            if should_show_user_label:
                 self.answer_list.Append("我")
                 self.answer_meta.append(("user", i, "我", ""))
-                self.answer_list.Append(q)
-                self.answer_meta.append(("question", i, q, ""))
+                if q.strip() and not attachment_only_summary:
+                    self.answer_list.Append(q)
+                    self.answer_meta.append(("question", i, q, ""))
+            if attachments:
+                self._append_turn_attachment_rows(i, attachments, incoming=False)
             if show_pending_placeholder:
                 self.answer_list.Append("小诸葛")
                 self.answer_meta.append(("ai", i, "小诸葛", ""))
                 self.answer_list.Append(a)
                 self.answer_meta.append(("answer", i, a, a_md))
+                self._append_turn_attachment_rows(i, received_attachments, incoming=True)
                 if self.view_mode == "active" and i == self.active_turn_idx:
                     self._active_answer_row_index = self.answer_list.GetCount() - 1
+            elif received_attachments:
+                self._append_turn_attachment_rows(i, received_attachments, incoming=True)
         if self.answer_list.GetCount() > 0 and self.answer_list.GetSelection() == wx.NOT_FOUND:
             # 首次渲染时仅设置选中项，不主动把焦点移到回答列表。
             self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
@@ -1866,8 +2016,17 @@ class ChatFrame(wx.Frame):
             return False
         answer_md = str(self.active_session_turns[turn_idx].get("answer_md") or "")
         text = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(md_to_plain(answer_md))
+        item_type, idx, current_meta_text, current_meta_md = self.answer_meta[row]
+        if current_meta_text == text and current_meta_md == answer_md:
+            return True
+        current_text = ""
+        try:
+            current_text = self.answer_list.GetString(row)
+        except Exception:
+            current_text = ""
+        if current_text == text and current_meta_md == answer_md:
+            return True
         self.answer_list.SetString(row, text)
-        item_type, idx, _, _ = self.answer_meta[row]
         self.answer_meta[row] = (item_type, idx, text, answer_md)
         self._request_listbox_repaint(self.answer_list)
         return True
@@ -2510,18 +2669,36 @@ class ChatFrame(wx.Frame):
             self._remember_codex_thread_resumed(client, new_thread_id)
             return new_thread_id
 
-        def _send_turn(thread_value: str, steer: bool) -> dict:
+        def _start_turn_with_items(thread_value: str, items: list[dict]) -> dict:
+            if hasattr(client, "start_turn_items"):
+                return client.start_turn_items(thread_value, items)
+            text = str((items or [{}])[0].get("text") or "") if items else ""
+            return client.start_turn(thread_value, text)
+
+        def _steer_turn_with_items(thread_value: str, expected_turn_id: str, items: list[dict]) -> dict:
+            if hasattr(client, "steer_turn_items"):
+                return client.steer_turn_items(thread_value, expected_turn_id, items)
+            text = str((items or [{}])[0].get("text") or "") if items else ""
+            return client.steer_turn(thread_value, expected_turn_id, text)
+
+        def _send_turn(thread_value: str, steer: bool, items: list[dict]) -> dict:
             if steer:
                 if not turn_id:
                     raise RuntimeError("Codex app-server cannot steer without an active turn id.")
-                return client.steer_turn(thread_value, turn_id, question)
-            return client.start_turn(thread_value, question)
+                return _steer_turn_with_items(thread_value, turn_id, items)
+            return _start_turn_with_items(thread_value, items)
 
         try:
             target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
             if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
                 target_turns = self.active_session_turns
+            turn_attachments = []
+            if 0 <= turn_idx < len(target_turns):
+                maybe_attachments = target_turns[turn_idx].get("attachments") if isinstance(target_turns[turn_idx], dict) else []
+                if isinstance(maybe_attachments, list):
+                    turn_attachments = [item for item in maybe_attachments if str((item or {}).get("status") or "") == "success"]
             send_question = question
+            input_items = self._build_codex_input_items(send_question, turn_attachments)
             if not thread_id:
                 thread_id = _start_new_thread()
             else:
@@ -2533,27 +2710,29 @@ class ChatFrame(wx.Frame):
                         _clear_stale_codex_thread_state()
                         history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
                         send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
+                        input_items = self._build_codex_input_items(send_question, turn_attachments)
                         thread_id = _start_new_thread()
                     else:
                         raise
             should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
             try:
                 if should_steer:
-                    turn_resp = _send_turn(thread_id, should_steer)
+                    turn_resp = _send_turn(thread_id, should_steer, input_items)
                 else:
-                    turn_resp = client.start_turn(thread_id, send_question)
+                    turn_resp = _start_turn_with_items(thread_id, input_items)
             except Exception as exc:
                 if should_steer and self._is_codex_no_active_turn_error(exc):
                     should_steer = False
-                    turn_resp = client.start_turn(thread_id, send_question)
+                    turn_resp = _start_turn_with_items(thread_id, input_items)
                 elif self._is_codex_thread_missing_error(exc):
                     self._forget_codex_thread_resume(client, thread_id)
                     _clear_stale_codex_thread_state()
                     history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
                     send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
+                    input_items = self._build_codex_input_items(send_question, turn_attachments)
                     thread_id = _start_new_thread()
                     should_steer = False
-                    turn_resp = client.start_turn(thread_id, send_question)
+                    turn_resp = _start_turn_with_items(thread_id, input_items)
                 else:
                     raise
             new_turn_id = str((turn_resp.get("turn") or turn_resp.get("turnId") or {}).get("id") if isinstance(turn_resp.get("turn"), dict) else (turn_resp.get("turnId") or "")).strip()
@@ -2859,14 +3038,85 @@ class ChatFrame(wx.Frame):
         if self.view_mode in {"active", "history"}:
             self._render_answer_list()
 
+    def _queue_input_attachments(self, attachments: list[dict], *, update_input: bool = True) -> bool:
+        success, failed = self._normalize_outgoing_attachments(attachments)
+        self._pending_input_attachments.extend(success + failed)
+        if update_input and (success or failed):
+            marker = self._input_attachment_marker_text(success + failed)
+            current = self.input_edit.GetValue()
+            if marker and marker not in current:
+                next_value = f"{current}\n{marker}".strip() if current.strip() else marker
+                self.input_edit.SetValue(next_value)
+                self.input_edit.SetInsertionPointEnd()
+            self.input_edit.SetFocus()
+        return bool(success or failed)
+
+    def _load_chat_attachments_via_dialog(self) -> bool:
+        dlg = wx.FileDialog(
+            self,
+            "选择图片或文件",
+            wildcard="所有文件 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            paths = [str(path or "").strip() for path in dlg.GetPaths() if str(path or "").strip()]
+        finally:
+            dlg.Destroy()
+        attachments = [{"name": Path(path).name, "path": path, "kind": self._normalize_attachment_kind(path)} for path in paths]
+        if not attachments:
+            return False
+        self._pending_input_attachments = []
+        self._queue_input_attachments(attachments, update_input=False)
+        ok, message = self._submit_question("", source="local")
+        if not ok and message:
+            wx.MessageBox(message, "提示", wx.OK | wx.ICON_WARNING)
+        return ok
+
+    def _read_clipboard_attachments(self) -> list[dict]:
+        attachments = []
+        if not wx.TheClipboard.Open():
+            return attachments
+        try:
+            file_data = wx.FileDataObject()
+            if wx.TheClipboard.GetData(file_data):
+                for path in file_data.GetFilenames():
+                    text = str(path or "").strip()
+                    if text:
+                        attachments.append({"name": Path(text).name, "path": text, "kind": self._normalize_attachment_kind(text)})
+            if attachments:
+                return attachments
+            bitmap_data = wx.BitmapDataObject()
+            if wx.TheClipboard.GetData(bitmap_data):
+                bitmap = bitmap_data.GetBitmap()
+                if bitmap and bitmap.IsOk():
+                    file_path = self.chat_uploads_dir / f"clipboard_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.png"
+                    if bitmap.SaveFile(str(file_path), wx.BITMAP_TYPE_PNG):
+                        attachments.append({"name": file_path.name, "path": str(file_path), "kind": "image"})
+        finally:
+            wx.TheClipboard.Close()
+        return attachments
+
+    def _try_paste_clipboard_attachments_to_input(self) -> bool:
+        attachments = self._read_clipboard_attachments()
+        if not attachments:
+            return False
+        self._queue_input_attachments(attachments, update_input=True)
+        self.SetStatusText("已添加附件到输入框")
+        return True
+
     def _show_tools_menu(self) -> None:
         menu = wx.Menu()
         voice_id = wx.NewIdRef()
         filter_id = wx.NewIdRef()
+        attach_id = wx.NewIdRef()
         menu.Append(voice_id, "语音通话设置")
+        menu.Append(attach_id, "载入图片或文件")
         filter_item = menu.AppendCheckItem(filter_id, "过滤英文内容")
         filter_item.Check(bool(self.codex_answer_english_filter_enabled))
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=voice_id)
+        self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=attach_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=filter_id)
         try:
             self.PopupMenu(menu, (0, 0))
@@ -3231,14 +3481,30 @@ class ChatFrame(wx.Frame):
         if event.type in {"item_completed", "agent_message_delta", "plan_updated", "diff_updated", "stderr"}:
             self.active_codex_latest_assistant_text = str(event.text or "")
             self.active_codex_latest_assistant_phase = str(event.phase or "")
+            if event.type == "item_completed" and str(event.status or "") == "imageView":
+                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+                if target_idx >= 0 and target_idx < len(self.active_session_turns):
+                    path = str((event.data or {}).get("path") or "").strip()
+                    if path and Path(path).is_file():
+                        attachment = {
+                            "name": Path(path).name,
+                            "path": path,
+                            "kind": "image",
+                            "direction": "incoming",
+                            "status": "success",
+                            "open_path": path,
+                            "source": "codex",
+                        }
+                        if self._record_received_attachment(self.active_session_turns[target_idx], attachment):
+                            self._save_state()
+                            self._render_answer_list()
+                return
             if event.type == "item_completed" and event.phase == "final_answer":
                 self.active_codex_pending_prompt = str(event.text or "")
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
-                    if not str(turn.get("question") or "").strip():
-                        turn["question"] = str(event.text or "")
-                    elif (
+                    if (
                         not str(turn.get("answer_md") or "").strip()
                         or str(turn.get("answer_md") or "") == REQUESTING_TEXT
                     ):
@@ -3339,7 +3605,149 @@ class ChatFrame(wx.Frame):
                 wx.TheClipboard.Close()
         self.SetStatusText("已复制远程控制地址")
 
-    def _start_remote_ws_server_if_configured(self) -> None:
+    def _run_remote_check_command(self, args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess | None:
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": timeout,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            return subprocess.run(args, **kwargs)
+        except Exception:
+            return None
+
+    def _query_cloudflared_service(self) -> dict:
+        result = self._run_remote_check_command(["sc.exe", "query", "cloudflared"])
+        text = ""
+        if result is not None:
+            text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        normalized = text.lower()
+        exists = bool(result and (result.returncode == 0 or "state" in normalized))
+        running = "running" in normalized
+        return {"exists": exists, "running": running, "detail": text}
+
+    def _start_cloudflared_service(self) -> bool:
+        state = self._query_cloudflared_service()
+        if not state["exists"]:
+            return False
+        if state["running"]:
+            return True
+        deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            result = self._run_remote_check_command(["sc.exe", "start", "cloudflared"], timeout=15.0)
+            detail = ""
+            if result is not None:
+                detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+            if result is not None and (result.returncode == 0 or "already running" in detail):
+                break
+            time.sleep(0.2)
+        deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if self._query_cloudflared_service()["running"]:
+                return True
+            time.sleep(0.2)
+        return self._query_cloudflared_service()["running"]
+
+    def _kill_cloudflared_processes(self) -> None:
+        self._run_remote_check_command(["taskkill", "/F", "/IM", "cloudflared.exe"], timeout=15.0)
+
+    def _restart_cloudflared_service(self) -> bool:
+        state = self._query_cloudflared_service()
+        if not state["exists"]:
+            return False
+        self._run_remote_check_command(["sc.exe", "stop", "cloudflared"], timeout=15.0)
+        deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if not self._query_cloudflared_service()["running"]:
+                break
+            time.sleep(0.2)
+        if self._query_cloudflared_service()["running"]:
+            self._kill_cloudflared_processes()
+            deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                if not self._query_cloudflared_service()["running"]:
+                    break
+                time.sleep(0.2)
+        return self._start_cloudflared_service()
+
+    def _remote_runtime_probe_host(self) -> str:
+        host = str(self.remote_control_host or "127.0.0.1").strip() or "127.0.0.1"
+        return "127.0.0.1" if host in {"0.0.0.0", "::", "::0"} else host
+
+    def _remote_local_listener_ready(self, port: int) -> bool:
+        try:
+            with socket.create_connection((self._remote_runtime_probe_host(), int(port)), timeout=2.0):
+                return True
+        except Exception:
+            return False
+
+    def _verify_remote_local_health(self, token: str, port: int) -> tuple[bool, str]:
+        probe_host = self._remote_runtime_probe_host()
+        url = f"http://{probe_host}:{int(port)}/healthz?token={token}"
+        try:
+            with urllib_request.urlopen(url, timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib_error.URLError as exc:
+            return False, f"本地监听检查失败：{exc}"
+        except Exception as exc:
+            return False, f"本地健康检查失败：{exc}"
+        accepted = bool(payload.get("accepted"))
+        return accepted, ("" if accepted else f"本地健康检查返回异常：{payload}")
+
+    async def _verify_remote_public_ws_async(self, url: str) -> tuple[bool, str]:
+        timeout = ClientTimeout(total=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as ws:
+                    message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+        except Exception as exc:
+            return False, f"公网隧道握手失败：{exc}"
+        if message.type != WSMsgType.TEXT:
+            return False, f"公网隧道返回了非文本消息：{message.type}"
+        try:
+            payload = json.loads(message.data)
+        except Exception as exc:
+            return False, f"公网隧道返回了无效响应：{exc}"
+        ok = payload.get("type") == "connected" and bool(payload.get("ok")) and bool((payload.get("body") or {}).get("accepted"))
+        return ok, ("" if ok else f"公网隧道响应异常：{payload}")
+
+    def _verify_remote_public_ws(self, url: str) -> tuple[bool, str]:
+        return asyncio.run(self._verify_remote_public_ws_async(url))
+
+    def _ensure_remote_ws_startup_connectivity(self, *, token: str, published_url: str) -> None:
+        runtime = self._remote_runtime_config()
+        if not runtime["fixed_domain_mode"] or getattr(self, "_remote_ws_server", None) is None:
+            return
+        port = int(getattr(self._remote_ws_server, "bound_port", 0) or runtime["port"] or 0)
+        if port <= 0:
+            raise RuntimeError("远程控制本地监听端口无效。")
+        if not self._remote_local_listener_ready(port):
+            raise RuntimeError(f"远程控制端口 {port} 未正常监听。")
+        local_ok, local_detail = self._verify_remote_local_health(token, port)
+        if not local_ok:
+            raise RuntimeError(local_detail or "远程控制本地健康检查失败。")
+        if not self._start_cloudflared_service():
+            raise RuntimeError("cloudflared 服务未安装或无法启动。")
+        public_ok, public_detail = self._verify_remote_public_ws(published_url)
+        if public_ok:
+            self.SetStatusText(
+                f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
+            )
+            return
+        if not self._restart_cloudflared_service():
+            raise RuntimeError(public_detail or "cloudflared 重启失败。")
+        public_ok, public_detail = self._verify_remote_public_ws(published_url)
+        if not public_ok:
+            raise RuntimeError(public_detail or "rc.tingyou.cc 公网隧道验证失败。")
+        self.SetStatusText(
+            f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
+        )
+
+    def _start_remote_ws_server_if_configured(self, *, ensure_connectivity: bool = False) -> None:
         token = self._read_remote_control_token() or self.remote_control_token
         if not token or getattr(self, "_remote_ws_server", None) is not None:
             return
@@ -3373,6 +3781,8 @@ class ChatFrame(wx.Frame):
         self.SetStatusText(
             f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
         )
+        if ensure_connectivity:
+            self._ensure_remote_ws_startup_connectivity(token=token, published_url=published_url)
 
     def _start_claudecode_remote_ws_server_if_configured(self) -> None:
         return
@@ -3484,6 +3894,9 @@ class ChatFrame(wx.Frame):
             direction = -1 if key == wx.WXK_LEFT else 1
             chat_id = self._adjacent_history_chat_id(direction)
             if chat_id and self._switch_current_chat(chat_id):
+                return
+        if event.ControlDown() and key in (ord("V"), ord("v")) and self.input_edit.HasFocus():
+            if self._try_paste_clipboard_attachments_to_input():
                 return
         if self._is_send_shortcut(key, event.ControlDown(), event.AltDown()) and self._has_input_ime_candidates():
             event.Skip()
@@ -3713,8 +4126,13 @@ class ChatFrame(wx.Frame):
             return
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
-        q = str(question or "").strip()
-        if not q:
+        raw_question = str(question or "")
+        q = self._strip_attachment_markers(raw_question)
+        requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
+        success_attachments, failed_attachments = self._normalize_outgoing_attachments(requested_attachments)
+        outgoing_attachments = success_attachments + failed_attachments
+        display_question = q
+        if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
 
         # 检查是否有活跃的 Claude Code 客户端在等待输入
@@ -3751,25 +4169,51 @@ class ChatFrame(wx.Frame):
         self._current_chat_state.setdefault("title_source", "default")
         self._current_chat_state.setdefault("title_updated_at", time.time())
         self._current_chat_state.setdefault("title_revision", 1)
+        worker_question = q
+        if success_attachments and not is_codex_model(resolved_model):
+            attachment_context = self._build_cli_attachment_context(success_attachments)
+            worker_question = f"{q}\n\n{attachment_context}".strip() if q else attachment_context
+        if (not success_attachments) and (not q):
+            turn = {
+                "question": display_question,
+                "answer_md": "",
+                "model": resolved_model,
+                "created_at": time.time(),
+                "attachments": outgoing_attachments,
+                "suppress_empty_answer_row": True,
+            }
+            self.active_session_turns.append(turn)
+            self.active_turn_idx = len(self.active_session_turns) - 1
+            self._pending_input_attachments = []
+            self.input_edit.SetValue("")
+            self.input_edit.SetFocus()
+            self._save_state()
+            self.view_mode = "active"
+            self.view_history_id = None
+            self._active_answer_row_index = -1
+            self._render_answer_list()
+            return True, ""
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
             self._ensure_active_openclaw_session_id()
             turn = {
-                "question": q,
+                "question": display_question,
                 "answer_md": "",
                 "model": resolved_model,
                 "created_at": time.time(),
                 "origin": "local" if source == "local" else source,
                 "question_origin": "local" if source == "local" else source,
+                "attachments": outgoing_attachments,
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
             if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, q)
-            self._mark_turn_request_pending(turn, resolved_model, q)
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._mark_turn_request_pending(turn, resolved_model, worker_question)
             self.is_running = True
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
+            self._pending_input_attachments = []
             self._save_state()
             self._play_send_sound()
             self.SetStatusText("已发送")
@@ -3777,27 +4221,29 @@ class ChatFrame(wx.Frame):
             self.view_history_id = None
             self._active_answer_row_index = -1
             self._refresh_openclaw_sync_lifecycle()
-            threading.Thread(target=self._worker, args=("", self.active_turn_idx, q, resolved_model, False, chat_id or self.active_chat_id), daemon=True).start()
+            threading.Thread(target=self._worker, args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id), daemon=True).start()
             return True, ""
 
         turn_idx = len(self.active_session_turns)
         turn = {
-            "question": q,
+            "question": display_question,
             "answer_md": REQUESTING_TEXT,
             "model": resolved_model,
             "created_at": time.time(),
+            "attachments": outgoing_attachments,
         }
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
         if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-            self._schedule_first_question_auto_title(chat_id or self.active_chat_id, q)
-        self._mark_turn_request_pending(turn, resolved_model, q)
+            self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+        self._mark_turn_request_pending(turn, resolved_model, worker_question)
         if is_claudecode_model(resolved_model):
             self.active_claudecode_session_id = str(self.active_claudecode_session_id or "").strip()
         self.is_running = True
         self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
         self.input_edit.SetValue("")
         self.input_edit.SetFocus()
+        self._pending_input_attachments = []
         self._save_state()
         self._play_send_sound()
         self.SetStatusText("已发送")
@@ -3809,9 +4255,9 @@ class ChatFrame(wx.Frame):
         if is_codex_model(resolved_model) and source == "local":
             self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
         elif is_claudecode_model(resolved_model) and source == "local":
-            self._start_claudecode_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, self.active_claudecode_session_id)
+            self._start_claudecode_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, worker_question, self.active_claudecode_session_id)
         else:
-            t = threading.Thread(target=self._worker, args=(os.getenv("OPENROUTER_API_KEY", "").strip(), turn_idx, q, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
+            t = threading.Thread(target=self._worker, args=(os.getenv("OPENROUTER_API_KEY", "").strip(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
             t.start()
         return True, ""
 
@@ -4244,6 +4690,9 @@ class ChatFrame(wx.Frame):
                     self._mark_turn_request_failed(target_turns[turn_idx], err)
                 else:
                     self._mark_turn_request_done(target_turns[turn_idx])
+            if not err:
+                for attachment in self._extract_existing_file_attachments_from_text(str(target_turns[turn_idx].get("answer_md") or ""), str(used_model or "")):
+                    self._record_received_attachment(target_turns[turn_idx], attachment)
             self._active_request_count = 0
             if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""} and isinstance(target_chat, dict):
                 target_chat["updated_at"] = time.time()
@@ -4526,7 +4975,18 @@ class ChatFrame(wx.Frame):
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return False
-        item_type, turn_idx, _, _ = self.answer_meta[idx]
+        item_type, turn_idx, _, detail = self.answer_meta[idx]
+        if item_type == "attachment":
+            path = str(detail or "").strip()
+            if not path or not Path(path).is_file():
+                return False
+            try:
+                os.startfile(path)  # type: ignore[attr-defined]
+                self.SetStatusText("已打开附件")
+            except Exception:
+                wx.MessageBox("打开附件失败。", "提示", wx.OK | wx.ICON_WARNING)
+                return False
+            return True
         if item_type not in ("question", "answer"):
             return False
         turns = self._get_view_turns()
@@ -4815,7 +5275,7 @@ class ChatFrame(wx.Frame):
     def _notes_sync_view_visibility(self) -> None:
         controller = getattr(self, "notes_controller", None)
         view = str(getattr(controller, "notes_view", "notes_list") or "notes_list")
-        show_notes_list = True
+        show_notes_list = view != "note_detail"
         show_note_detail = view == "note_detail"
         show_note_edit = view == "note_edit"
         if hasattr(self, "notes_content_label"):
@@ -4838,8 +5298,74 @@ class ChatFrame(wx.Frame):
             self.notes_editor.Enable(show_note_edit)
         except Exception:
             pass
+        self._notes_rebuild_tab_order()
         try:
             self.Layout()
+        except Exception:
+            pass
+
+    def _notes_primary_tab_target(self):
+        view = str(getattr(getattr(self, "notes_controller", None), "notes_view", "notes_list") or "notes_list")
+        if view == "note_detail":
+            return self.notes_entry_list
+        return self.notes_notebook_list
+
+    def _notes_rebuild_tab_order(self) -> None:
+        if not all(
+            hasattr(self, attr)
+            for attr in (
+                "input_edit",
+                "send_button",
+                "new_chat_button",
+                "model_combo",
+                "history_list",
+                "notes_notebook_list",
+                "notes_entry_list",
+                "notes_editor",
+                "answer_list",
+            )
+        ):
+            return
+        primary_notes_ctrl = self._notes_primary_tab_target()
+        ordered_controls = [
+            self.input_edit,
+            self.send_button,
+            self.new_chat_button,
+            self.model_combo,
+            self.history_list,
+            primary_notes_ctrl,
+            self.answer_list,
+            self.notes_notebook_list,
+            self.notes_entry_list,
+            self.notes_editor,
+        ]
+        seen = set()
+        root_tab_order = []
+        for ctrl in ordered_controls:
+            marker = id(ctrl)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            root_tab_order.append(ctrl)
+        self.root_tab_order = root_tab_order
+        self.chat_tab_order = root_tab_order[:7]
+        self.notes_tab_order = [primary_notes_ctrl] + [
+            ctrl
+            for ctrl in (self.notes_notebook_list, self.notes_entry_list, self.notes_editor)
+            if ctrl is not primary_notes_ctrl
+        ]
+        primary_notes_panel = self.notes_detail_panel if primary_notes_ctrl is self.notes_entry_list else self.notes_list_panel
+        for previous, nxt in zip(self.root_tab_order, self.root_tab_order[1:]):
+            try:
+                nxt.MoveAfterInTabOrder(previous)
+            except Exception:
+                pass
+        try:
+            primary_notes_panel.MoveAfterInTabOrder(self.history_list)
+        except Exception:
+            pass
+        try:
+            self.answer_list.MoveAfterInTabOrder(primary_notes_panel)
         except Exception:
             pass
 

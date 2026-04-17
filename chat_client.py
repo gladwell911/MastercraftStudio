@@ -9,6 +9,7 @@ DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 DEFAULT_MODEL = "openai/gpt-5.2"
 TIMEOUT_SECONDS = 60
+TITLE_SYSTEM_PROMPT = "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"
 DOUBAO_API_KEY = "b977c688-3f5f-488f-b58f-933c8f042567"
 DOUBAO_MODEL_MAP = {
     "doubao-2.0-pro": "doubao-seed-2-0-pro-260215",
@@ -92,6 +93,13 @@ class ChatClient:
             return {}
         first = choices[0]
         return first if isinstance(first, dict) else {}
+
+    @staticmethod
+    def _extract_title_text(data: dict) -> str:
+        text = str(ChatClient._first_choice(data).get("message", {}).get("content", "")).strip()
+        if not text:
+            return ""
+        return text.splitlines()[0][:40]
 
     def _stream_request(self, model: str, messages: list[dict], on_delta: Callable[[str], None], plugins: list[dict] | None = None) -> str:
         url = f"{self.base_url}{CHAT_COMPLETIONS_PATH}"
@@ -218,7 +226,7 @@ class ChatClient:
             "model": self.model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"},
+                {"role": "system", "content": TITLE_SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
             "temperature": 0.2,
@@ -227,11 +235,7 @@ class ChatClient:
             resp = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout)
             if resp.status_code >= 400:
                 return ""
-            data = resp.json()
-            text = str(self._first_choice(data).get("message", {}).get("content", "")).strip()
-            if not text:
-                return ""
-            return text.splitlines()[0][:40]
+            return self._extract_title_text(resp.json())
         except Exception:
             return ""
 
@@ -244,7 +248,7 @@ class ChatClient:
             "model": resolved_model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"},
+                {"role": "system", "content": TITLE_SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
             "temperature": 0.2,
@@ -257,11 +261,7 @@ class ChatClient:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code >= 400:
                 return ""
-            data = resp.json()
-            text = str(self._first_choice(data).get("message", {}).get("content", "")).strip()
-            if not text:
-                return ""
-            return text.splitlines()[0][:40]
+            return self._extract_title_text(resp.json())
         except Exception:
             return ""
 

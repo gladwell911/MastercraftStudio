@@ -158,7 +158,7 @@ def test_e2e_notes_same_slot_navigation_and_backspace(frame, monkeypatch):
     })())
 
     assert frame.notes_detail_panel.IsShown()
-    assert frame.notes_list_panel.IsShown()
+    assert not frame.notes_list_panel.IsShown()
     assert frame.notes_entry_list.GetCount() >= 1
 
     frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))

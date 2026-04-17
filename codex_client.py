@@ -85,6 +85,29 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
     return env, codex_home
 
 
+def _windows_popen_kwargs() -> dict:
+    if os.name != "nt":
+        return {}
+    kwargs = {}
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    use_show_window = int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0) or 0)
+    hide_window = int(getattr(subprocess, "SW_HIDE", 0) or 0)
+    if startupinfo_cls is not None:
+        try:
+            startupinfo = startupinfo_cls()
+            if use_show_window:
+                startupinfo.dwFlags |= use_show_window
+            if hide_window:
+                startupinfo.wShowWindow = hide_window
+            kwargs["startupinfo"] = startupinfo
+        except Exception:
+            pass
+    return kwargs
+
+
 @dataclass
 class CodexEvent:
     type: str
@@ -193,22 +216,43 @@ class CodexAppServerClient:
         )
 
     def start_turn(self, thread_id: str, text: str, timeout: int | None = None) -> dict:
+        return self.start_turn_items(
+            thread_id,
+            [{"type": "text", "text": str(text or "")}],
+            timeout=timeout,
+        )
+
+    def start_turn_items(self, thread_id: str, items: list[dict], timeout: int | None = None) -> dict:
         return self.request(
             "turn/start",
             {
                 "threadId": str(thread_id or "").strip(),
-                "input": [{"type": "text", "text": str(text or "")}],
+                "input": list(items or []),
             },
             timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )
 
     def steer_turn(self, thread_id: str, expected_turn_id: str, text: str, timeout: int | None = None) -> dict:
+        return self.steer_turn_items(
+            thread_id,
+            expected_turn_id,
+            [{"type": "text", "text": str(text or "")}],
+            timeout=timeout,
+        )
+
+    def steer_turn_items(
+        self,
+        thread_id: str,
+        expected_turn_id: str,
+        items: list[dict],
+        timeout: int | None = None,
+    ) -> dict:
         return self.request(
             "turn/steer",
             {
                 "threadId": str(thread_id or "").strip(),
                 "expectedTurnId": str(expected_turn_id or "").strip(),
-                "input": [{"type": "text", "text": str(text or "")}],
+                "input": list(items or []),
             },
             timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )
@@ -265,6 +309,7 @@ class CodexAppServerClient:
             shell=False,
             bufsize=1,
             env=self._build_launch_env(),
+            **_windows_popen_kwargs(),
         )
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)

@@ -679,7 +679,7 @@ def test_notes_detail_view_reuses_list_slot_and_backspace_returns_to_notebook_li
     frame._notes_open_selected_notebook()
 
     assert frame.notes_controller.notes_view == "note_detail"
-    assert frame.notes_list_panel.IsShown()
+    assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()
     assert not frame.notes_edit_panel.IsShown()
     assert frame.notes_entry_list.GetCount() >= 1
@@ -714,7 +714,7 @@ def test_notes_edit_view_replaces_detail_list_and_disables_hidden_note_controls(
 
     frame._notes_select_notebook(notebook.id, view="note_detail")
     assert frame.notes_detail_panel.IsShown()
-    assert frame.notes_list_panel.IsShown()
+    assert not frame.notes_list_panel.IsShown()
 
     frame._notes_select_entry(entry.id, view="note_edit")
 
@@ -905,6 +905,41 @@ def test_notes_tab_order_links_chat_and_notes_controls(frame):
     assert frame.notes_tab_order[0] is frame.notes_notebook_list
     assert frame.notes_tab_order[1] is frame.notes_entry_list
     assert frame.notes_tab_order[-1] is frame.notes_editor
+
+
+def test_notes_detail_view_moves_history_tab_target_to_entry_list(frame):
+    notebook = frame.notes_store.create_notebook("tab target notebook")
+    frame.notes_store.create_entry(notebook.id, "tab target entry", source="manual")
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+
+    assert frame.root_tab_order[4] is frame.history_list
+    assert frame.root_tab_order[5] is frame.notes_entry_list
+    assert frame.chat_tab_order[5] is frame.notes_entry_list
+    assert frame.notes_tab_order[0] is frame.notes_entry_list
+    assert not frame.notes_list_panel.IsShown()
+    assert frame.notes_detail_panel.IsShown()
+
+
+def test_notes_detail_view_reorders_panel_tab_chain_after_history(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("panel tab notebook")
+    frame.notes_store.create_entry(notebook.id, "panel tab entry", source="manual")
+    calls = []
+    monkeypatch.setattr(
+        frame.notes_detail_panel,
+        "MoveAfterInTabOrder",
+        lambda previous: calls.append(("detail_panel", previous)),
+    )
+    monkeypatch.setattr(
+        frame.answer_list,
+        "MoveAfterInTabOrder",
+        lambda previous: calls.append(("answer_list", previous)),
+    )
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+
+    assert ("detail_panel", frame.history_list) in calls
+    assert ("answer_list", frame.notes_detail_panel) in calls
 
 
 def test_notes_list_and_detail_views_do_not_show_action_buttons(frame):

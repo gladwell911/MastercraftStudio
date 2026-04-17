@@ -3,6 +3,7 @@ import copy
 import time
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 import asyncio
 
 import wx
@@ -102,7 +103,7 @@ def test_remote_ws_server_supports_legacy_claudecode_env_names(frame, monkeypatc
 
     assert frame._build_remote_ws_url() == "ws://127.0.0.1:18080/ws?token=secret"
 
-    frame._start_remote_ws_server_if_configured()
+    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
     try:
         assert frame._remote_ws_server.host == "127.0.0.1"
         assert frame._remote_ws_server.bound_port > 0
@@ -188,10 +189,104 @@ def test_fixed_domain_server_uses_public_runtime_and_status(frame, monkeypatch):
     assert "wss://rc.tingyou.cc/ws?token=secret" in statuses[-1]
 
 
+def test_remote_ws_startup_runs_fixed_domain_connectivity_check(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
+
+    class _FakeServer:
+        def __init__(self, **kwargs):
+            self.host = kwargs["host"]
+            self.port = kwargs["port"]
+            self.bound_port = kwargs["port"]
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    seen = {}
+    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(
+        frame,
+        "_ensure_remote_ws_startup_connectivity",
+        lambda **kwargs: seen.update(kwargs),
+    )
+
+    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+
+    assert seen == {
+        "token": "secret",
+        "published_url": "wss://rc.tingyou.cc/ws?token=secret",
+    }
+
+
+def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_failure(frame, monkeypatch):
+    frame.remote_control_host = "0.0.0.0"
+    frame.remote_control_runtime_bind = "ws://0.0.0.0:18080/ws"
+    frame._remote_ws_server = SimpleNamespace(bound_port=18080)
+    monkeypatch.setattr(
+        frame,
+        "_remote_runtime_config",
+        lambda: {"fixed_domain_mode": True, "port": 18080},
+    )
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
+    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: True)
+    probe_results = iter([(False, "公网隧道握手失败"), (True, "")])
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda _url: next(probe_results))
+    restarted = {"calls": 0}
+    monkeypatch.setattr(
+        frame,
+        "_restart_cloudflared_service",
+        lambda: restarted.__setitem__("calls", restarted["calls"] + 1) or True,
+    )
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+
+    frame._ensure_remote_ws_startup_connectivity(
+        token="secret",
+        published_url="wss://rc.tingyou.cc/ws?token=secret",
+    )
+
+    assert restarted["calls"] == 1
+    assert statuses
+    assert "cloudflared 已重启并恢复 rc.tingyou.cc 连接" in statuses[-1]
+
+
+def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, monkeypatch):
+    states = [
+        {"exists": True, "running": True, "detail": "running"},
+        {"exists": True, "running": True, "detail": "running"},
+        {"exists": True, "running": True, "detail": "running"},
+        {"exists": True, "running": False, "detail": "stopped"},
+        {"exists": True, "running": False, "detail": "stopped"},
+    ]
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: states.pop(0) if len(states) > 1 else states[0],
+    )
+    commands = []
+    monkeypatch.setattr(
+        frame,
+        "_run_remote_check_command",
+        lambda args, timeout=10.0: commands.append(tuple(args)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: True)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+    assert frame._restart_cloudflared_service() is True
+    assert ("sc.exe", "stop", "cloudflared") in commands
+    assert ("taskkill", "/F", "/IM", "cloudflared.exe") in commands
+
+
 def test_remote_ws_server_autostarts_without_env_and_uses_default_token(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
+    monkeypatch.setattr(main.ChatFrame, "_ensure_remote_ws_startup_connectivity", lambda self, **_kwargs: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "1")
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
@@ -1365,6 +1460,353 @@ def test_detail_page_split_question_and_answer(frame):
     assert "问题详情" not in a_html
 
 
+def test_try_open_selected_answer_detail_opens_attachment_path(frame, monkeypatch, tmp_path):
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("attachment body", encoding="utf-8")
+    frame.answer_meta = [("attachment", 0, "report.txt", str(attachment))]
+    frame.answer_list.Append("report.txt")
+    frame.answer_list.SetSelection(0)
+    opened = {}
+    monkeypatch.setattr(main.os, "startfile", lambda path: opened.__setitem__("path", path), raising=False)
+
+    assert frame._try_open_selected_answer_detail()
+    assert opened["path"] == str(attachment)
+
+
+def test_render_answer_list_shows_uploaded_and_received_attachment_rows(frame, tmp_path):
+    uploaded = tmp_path / "uploaded.png"
+    uploaded.write_text("uploaded", encoding="utf-8")
+    received = tmp_path / "received.txt"
+    received.write_text("received", encoding="utf-8")
+    frame.active_session_turns = [
+        {
+            "question": "uploaded.png 图片已成功上传",
+            "answer_md": "",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "suppress_empty_answer_row": True,
+            "attachments": [
+                {
+                    "name": "uploaded.png",
+                    "path": str(uploaded),
+                    "kind": "image",
+                    "direction": "outgoing",
+                    "status": "success",
+                    "open_path": str(uploaded),
+                }
+            ],
+            "received_attachments": [
+                {
+                    "name": "received.txt",
+                    "path": str(received),
+                    "kind": "file",
+                    "direction": "incoming",
+                    "status": "success",
+                    "open_path": str(received),
+                }
+            ],
+        }
+    ]
+    frame.view_mode = "active"
+
+    frame._render_answer_list()
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    meta_types = [meta[0] for meta in frame.answer_meta]
+    assert "图片上传成功" in rows
+    assert "uploaded.png 图片已成功上传" not in rows
+    assert "已上传：uploaded.png" not in rows
+    assert "CLI 发来文件：received.txt" in rows
+    assert meta_types.count("attachment") == 2
+
+
+def test_render_answer_list_shows_each_uploaded_attachment_on_its_own_line(frame, tmp_path):
+    image_one = tmp_path / "one.png"
+    image_two = tmp_path / "two.png"
+    file_one = tmp_path / "alpha.txt"
+    file_two = tmp_path / "beta.txt"
+    for path in (image_one, image_two, file_one, file_two):
+        path.write_text(path.name, encoding="utf-8")
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": "",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "suppress_empty_answer_row": True,
+            "attachments": [
+                {"name": image_one.name, "path": str(image_one), "kind": "image", "direction": "outgoing", "status": "success", "open_path": str(image_one)},
+                {"name": image_two.name, "path": str(image_two), "kind": "image", "direction": "outgoing", "status": "success", "open_path": str(image_two)},
+                {"name": file_one.name, "path": str(file_one), "kind": "file", "direction": "outgoing", "status": "success", "open_path": str(file_one)},
+                {"name": file_two.name, "path": str(file_two), "kind": "file", "direction": "outgoing", "status": "success", "open_path": str(file_two)},
+            ],
+        }
+    ]
+
+    frame._render_answer_list()
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
+
+
+def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn(frame, tmp_path):
+    image_path = tmp_path / "only-image.png"
+    image_path.write_text("img", encoding="utf-8")
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": "cli 的回答",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "attachments": [
+                {
+                    "name": image_path.name,
+                    "path": str(image_path),
+                    "kind": "image",
+                    "direction": "outgoing",
+                    "status": "success",
+                    "open_path": str(image_path),
+                }
+            ],
+        }
+    ]
+
+    frame._render_answer_list()
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    meta_types = [meta[0] for meta in frame.answer_meta]
+    assert rows == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
+    assert meta_types == ["user", "attachment", "ai", "answer"]
+
+
+def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "done-image.png"
+    image_path.write_text("img", encoding="utf-8")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CLAUDECODE_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+            "attachments": [
+                {
+                    "name": image_path.name,
+                    "path": str(image_path),
+                    "kind": "image",
+                    "direction": "outgoing",
+                    "status": "success",
+                    "open_path": str(image_path),
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+
+    frame._on_done(0, "最终回答", "", main.DEFAULT_CLAUDECODE_MODEL, "", "chat-1")
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    meta_types = [meta[0] for meta in frame.answer_meta]
+    assert rows == ["我", "图片上传成功", "小诸葛", "最终回答"]
+    assert meta_types == ["user", "attachment", "ai", "answer"]
+
+
+def test_codex_image_item_event_records_received_attachment(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "from-cli.png"
+    image_path.write_text("image", encoding="utf-8")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "看图",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+        }
+    ]
+    seen = {"render": 0}
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
+
+    frame._on_codex_event_for_chat(
+        "chat-1",
+        main.CodexEvent(
+            type="item_completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            status="imageView",
+            data={"id": "image-1", "type": "imageView", "path": str(image_path)},
+        ),
+    )
+
+    attachments = frame.active_session_turns[0].get("received_attachments") or []
+    assert attachments == [
+        {
+            "name": "from-cli.png",
+            "path": str(image_path),
+            "kind": "image",
+            "direction": "incoming",
+            "status": "success",
+            "open_path": str(image_path),
+            "source": "codex",
+        }
+    ]
+    assert seen["render"] == 1
+
+
+def test_codex_final_answer_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "final-image.png"
+    image_path.write_text("img", encoding="utf-8")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+            "attachments": [
+                {
+                    "name": image_path.name,
+                    "path": str(image_path),
+                    "kind": "image",
+                    "direction": "outgoing",
+                    "status": "success",
+                    "open_path": str(image_path),
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-1",
+        main.CodexEvent(
+            type="item_completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+            status="agentMessage",
+            phase="final_answer",
+            text="codex 最终回答",
+        ),
+    )
+
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    meta_types = [meta[0] for meta in frame.answer_meta]
+    assert rows == ["我", "图片上传成功", "小诸葛", "codex 最终回答"]
+    assert meta_types == ["user", "attachment", "ai", "answer"]
+
+
+def test_on_done_extracts_received_file_attachment_from_cli_text(frame, monkeypatch, tmp_path):
+    file_path = tmp_path / "from-claudecode.txt"
+    file_path.write_text("received", encoding="utf-8")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_session_turns = [
+        {
+            "question": "请生成文件",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CLAUDECODE_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+        }
+    ]
+    frame.active_turn_idx = 0
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+
+    frame._on_done(0, f"已生成文件：{file_path}", "", main.DEFAULT_CLAUDECODE_MODEL, "", "chat-1")
+
+    attachments = frame.active_session_turns[0].get("received_attachments") or []
+    assert attachments == [
+        {
+            "name": "from-claudecode.txt",
+            "path": str(file_path),
+            "kind": "file",
+            "direction": "incoming",
+            "status": "success",
+            "open_path": str(file_path),
+            "source": main.DEFAULT_CLAUDECODE_MODEL,
+        }
+    ]
+
+
+def test_update_active_answer_row_skips_repaint_when_text_is_unchanged(frame, monkeypatch):
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+        }
+    ]
+    frame.answer_list.Append(main.REQUESTING_TEXT)
+    frame.answer_meta = [("answer", 0, main.REQUESTING_TEXT, main.REQUESTING_TEXT)]
+    frame._active_answer_row_index = 0
+    seen = {"repaint": 0}
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *_controls: seen.__setitem__("repaint", seen["repaint"] + 1))
+
+    assert frame._update_active_answer_row(0) is True
+    assert seen["repaint"] == 0
+
+
+def test_codex_non_final_delta_does_not_rerender_when_visible_text_is_unchanged(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+        }
+    ]
+    frame.answer_list.Append(main.REQUESTING_TEXT)
+    frame.answer_meta = [("answer", 0, main.REQUESTING_TEXT, main.REQUESTING_TEXT)]
+    frame._active_answer_row_index = 0
+    seen = {"render": 0, "repaint": 0}
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *_controls: seen.__setitem__("repaint", seen["repaint"] + 1))
+
+    frame._on_codex_event_for_chat(
+        "chat-1",
+        main.CodexEvent(
+            type="agent_message_delta",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            text="still streaming",
+            phase="draft",
+        ),
+    )
+
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+    assert seen["render"] == 0
+    assert seen["repaint"] == 0
+
+
 def test_openclaw_assistant_only_turn_hides_empty_user_rows(frame):
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
@@ -1845,6 +2287,83 @@ def test_input_key_up_alt_opens_tools_menu_when_armed(frame):
     assert seen["opened"] == 1
     assert frame._alt_menu_armed is False
     assert frame._alt_menu_suppressed is False
+
+
+def test_tools_menu_includes_load_image_or_file_action(frame, monkeypatch):
+    captured = {"items": []}
+
+    def _popup(menu, *_args):
+        captured["items"] = [
+            (item.GetItemLabelText(), item.GetId())
+            for item in menu.GetMenuItems()
+            if not item.IsSeparator()
+        ]
+
+    monkeypatch.setattr(frame, "PopupMenu", _popup)
+
+    frame._show_tools_menu()
+
+    labels = [label for label, _item_id in captured["items"]]
+    assert "载入图片或文件" in labels
+
+
+def test_input_key_down_ctrl_v_pastes_clipboard_attachments_when_input_has_focus(frame):
+    seen = {"pasted": 0}
+    frame.input_edit.SetFocus()
+    frame._try_paste_clipboard_attachments_to_input = lambda: seen.__setitem__("pasted", seen["pasted"] + 1) or True
+
+    class E:
+        def GetKeyCode(self):
+            return ord("V")
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            seen["skipped"] = True
+
+    frame._on_input_key_down(E())
+
+    assert seen["pasted"] == 1
+
+
+def test_submit_question_allows_attachment_only_send_for_codex(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "upload.png"
+    image_path.write_text("image", encoding="utf-8")
+    frame._pending_input_attachments = [
+        {
+            "name": "upload.png",
+            "path": str(image_path),
+            "kind": "image",
+            "direction": "outgoing",
+            "status": "queued",
+            "open_path": str(image_path),
+        }
+    ]
+    seen = {"render": 0, "worker": []}
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(
+        frame,
+        "_start_codex_worker_for_turn",
+        lambda chat_id, turn_idx, question, model: seen["worker"].append((chat_id, turn_idx, question, model)),
+    )
+
+    ok, message = frame._submit_question("", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert seen["render"] == 1
+    assert frame._pending_input_attachments == []
+    turn = frame.active_session_turns[0]
+    assert turn["question"] == ""
+    assert turn["attachments"][0]["status"] == "success"
+    assert seen["worker"] == [(frame.active_chat_id or frame.current_chat_id or "", 0, "", main.DEFAULT_CODEX_MODEL)]
 
 
 def test_char_hook_alt_c_suppresses_tools_menu_and_submits_continue(frame):
@@ -3479,6 +3998,55 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
     assert frame.active_codex_turn_id == "turn-new"
 
 
+def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "worker-image.png"
+    image_path.write_text("img", encoding="utf-8")
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.active_session_turns = [
+        {
+            "question": "worker-image.png 图片已成功上传",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "attachments": [
+                {
+                    "name": image_path.name,
+                    "path": str(image_path),
+                    "kind": "image",
+                    "direction": "outgoing",
+                    "status": "success",
+                    "open_path": str(image_path),
+                }
+            ],
+        }
+    ]
+    frame.active_turn_idx = 0
+    seen = {"items": []}
+
+    class _Client:
+        def start_thread(self, **_kwargs):
+            return {"thread": {"id": "thread-new"}}
+
+        def start_turn_items(self, thread_id, items):
+            seen["items"].append((thread_id, items))
+            return {"turn": {"id": "turn-new"}}
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker("chat-current", 0, "", "codex/main")
+
+    assert seen["items"] == [
+        (
+            "thread-new",
+            [{"type": "localImage", "path": str(image_path)}],
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("request_status", "request_error", "expected"),
     [
@@ -3866,6 +4434,50 @@ def test_resolve_app_data_dir_frozen_uses_executable_sibling_history(monkeypatch
     monkeypatch.setattr(main.sys, "executable", r"C:\code\cx\ms\ms.exe", raising=False)
     p = main.resolve_app_data_dir()
     assert p == Path(r"C:\code\cx\history")
+
+
+def test_wx_call_later_if_alive_skips_when_top_window_handle_is_invalid(monkeypatch):
+    class _TopWindow:
+        def IsBeingDeleted(self):
+            return False
+
+        def GetHandle(self):
+            return 0
+
+    class _App:
+        def GetTopWindow(self):
+            return _TopWindow()
+
+    called = {"later": False}
+    monkeypatch.setattr(main.wx, "GetApp", lambda: _App())
+    monkeypatch.setattr(main.wx, "CallLater", lambda *args, **kwargs: called.__setitem__("later", True))
+
+    result = main.wx_call_later_if_alive(120, lambda: None)
+
+    assert result is None
+    assert called["later"] is False
+
+
+def test_wx_call_after_if_alive_skips_when_top_window_handle_is_invalid(monkeypatch):
+    class _TopWindow:
+        def IsBeingDeleted(self):
+            return False
+
+        def GetHandle(self):
+            return 0
+
+    class _App:
+        def GetTopWindow(self):
+            return _TopWindow()
+
+    called = {"after": False}
+    monkeypatch.setattr(main.wx, "GetApp", lambda: _App())
+    monkeypatch.setattr(main.wx, "CallAfter", lambda *args, **kwargs: called.__setitem__("after", True))
+
+    result = main.wx_call_after_if_alive(lambda: None)
+
+    assert result is False
+    assert called["after"] is False
 
 
 def test_merge_legacy_archived_chats_adds_missing_and_prefers_richer(frame, tmp_path, monkeypatch):

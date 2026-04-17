@@ -35,6 +35,7 @@ class TestProgramRunner(unittest.TestCase):
     def test_console_program_success(self):
         """测试成功运行控制台程序"""
         script = self._create_test_script('test_success.py', '''
+import sys
 print("Hello, World!")
 print("Test output")
 sys.exit(0)
@@ -95,12 +96,23 @@ time.sleep(5)
 ''')
 
         # 启动第一个程序
-        result1 = self.runner.run_console_program(
-            sys.executable,
-            script,
-            self.temp_dir,
-            timeout=10.0
-        )
+        import threading
+
+        result_holder = []
+
+        def run():
+            result_holder.append(
+                self.runner.run_console_program(
+                    sys.executable,
+                    script,
+                    self.temp_dir,
+                    timeout=10.0
+                )
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        time.sleep(0.5)
 
         # 尝试启动第二个程序（应该失败）
         result2 = self.runner.run_console_program(
@@ -112,6 +124,9 @@ time.sleep(5)
 
         self.assertEqual(result2.state, RunState.FAILED)
         self.assertIn("已有程序在运行", result2.error_msg)
+
+        self.runner.stop()
+        thread.join(timeout=5.0)
 
     def test_state_callback(self):
         """测试状态回调"""

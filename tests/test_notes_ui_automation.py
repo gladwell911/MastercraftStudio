@@ -52,3 +52,16 @@ def test_notes_ui_automation_menu_key_exports_selected_entry_ranges(frame, monke
         "\n\n".join([second.content, third.content]),
         "\n\n".join([first.content, second.content]),
     ]
+
+
+def test_notes_ui_automation_detail_view_hides_notebook_list_and_keeps_tab_slot(frame):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("ui automation detail notebook")
+    frame.notes_store.create_entry(notebook.id, "ui detail entry", source="manual")
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+
+    assert not frame.notes_list_panel.IsShown()
+    assert frame.notes_detail_panel.IsShown()
+    assert frame.root_tab_order[4] is frame.history_list
+    assert frame.root_tab_order[5] is frame.notes_entry_list

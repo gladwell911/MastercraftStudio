@@ -391,7 +391,7 @@ def test_notes_acceptance_same_slot_navigation_and_edit_replacement(frame, monke
 
     frame._on_notes_key_down(_key_event(wx.WXK_RETURN))
 
-    assert frame.notes_list_panel.IsShown()
+    assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()
     assert not frame.notes_edit_panel.IsShown()
 
@@ -427,6 +427,19 @@ def test_notes_acceptance_tab_can_reach_notebook_list_while_editing(frame):
     assert frame.notes_edit_panel.IsShown()
     assert frame.notes_notebook_list.GetName() == "笔记"
     assert frame.notes_editor.GetName() == "笔记"
+
+
+def test_notes_acceptance_detail_view_keeps_history_tab_position(frame):
+    notebook = frame.notes_store.create_notebook("history tab notebook")
+    frame.notes_store.create_entry(notebook.id, "history tab entry", source="manual")
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+
+    assert not frame.notes_list_panel.IsShown()
+    assert frame.notes_detail_panel.IsShown()
+    assert frame.root_tab_order[4] is frame.history_list
+    assert frame.root_tab_order[5] is frame.notes_entry_list
+    assert frame.chat_tab_order[5] is frame.notes_entry_list
 
 
 def test_notes_acceptance_ctrl_enter_save_keeps_focus_on_saved_entry(frame, monkeypatch):
