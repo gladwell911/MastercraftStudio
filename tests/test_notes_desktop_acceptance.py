@@ -31,6 +31,93 @@ def _select_row_by_id(control, ids, row_id):
     control.SetSelection(ids.index(row_id))
 
 
+def _raise_legacy_projection_access(*_args, **_kwargs):
+    raise AssertionError("desktop UI should read notes through the document-cache projection")
+
+
+def test_notes_acceptance_projection_maps_document_cache_to_existing_ui_shape(frame):
+    notebook = frame.notes_store.create_notebook("projection notebook")
+    deleted_notebook = frame.notes_store.create_notebook("deleted notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first projected entry", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second projected entry", source="voice")
+    deleted_entry = frame.notes_store.create_entry(notebook.id, "deleted projected entry", source="manual")
+    frame.notes_store.delete_entry(deleted_entry.id)
+    frame.notes_store.delete_notebook(deleted_notebook.id)
+
+    projection = main.DesktopNotesProjection(frame.notes_store)
+
+    notebooks = projection.list_notebooks()
+    entries = projection.list_entries(notebook.id)
+    projected_notebook = projection.get_notebook(notebook.id)
+    projected_entry = projection.get_entry(second.id)
+    deleted_notebook_projection = projection.get_notebook(deleted_notebook.id, include_deleted=True)
+    deleted_entry_projection = projection.get_entry(deleted_entry.id, include_deleted=True)
+
+    assert [item.id for item in notebooks] == [notebook.id]
+    assert [item.id for item in entries] == [first.id, second.id]
+    assert projected_notebook is not None
+    assert projected_notebook.title == "projection notebook"
+    assert projected_notebook.pinned is False
+    assert projected_notebook.sort_order == 0
+    assert projected_entry is not None
+    assert projected_entry.content == "second projected entry"
+    assert projected_entry.source == "voice"
+    assert projected_entry.pinned is False
+    assert projection.get_notebook(deleted_notebook.id) is None
+    assert projection.get_entry(deleted_entry.id) is None
+    assert deleted_notebook_projection is not None
+    assert deleted_notebook_projection.deleted_at is not None
+    assert deleted_entry_projection is not None
+    assert deleted_entry_projection.deleted_at is not None
+
+
+def test_notes_acceptance_refresh_and_selection_use_projection_instead_of_legacy_store_reads(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("projection refresh notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "projection refresh entry", source="manual")
+    frame.notes_controller.active_notebook_id = notebook.id
+    frame.notes_controller.active_entry_id = entry.id
+    frame.notes_controller.notes_view = "note_detail"
+
+    monkeypatch.setattr(frame.notes_store, "list_notebooks", _raise_legacy_projection_access)
+    monkeypatch.setattr(frame.notes_store, "search_notebooks", _raise_legacy_projection_access)
+    monkeypatch.setattr(frame.notes_store, "list_entries", _raise_legacy_projection_access)
+    monkeypatch.setattr(frame.notes_store, "get_notebook", _raise_legacy_projection_access)
+    monkeypatch.setattr(frame.notes_store, "get_entry", _raise_legacy_projection_access)
+
+    frame._notes_refresh_ui()
+
+    assert frame.notes_notebook_list.GetString(0) == "projection refresh notebook"
+    assert frame.notes_entry_list.GetString(0) == "projection refresh entry"
+    assert frame._notes_current_notebook().id == notebook.id
+    assert frame._notes_current_entry().id == entry.id
+
+
+def test_notes_acceptance_copy_and_export_paths_use_projection_reads(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("projection export notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first export entry", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second export entry", source="manual")
+    third = frame.notes_store.create_entry(notebook.id, "third export entry", source="manual")
+    copied = {"texts": []}
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, second.id)
+
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied["texts"].append(text) or True)
+    monkeypatch.setattr(frame.notes_store, "list_entries", _raise_legacy_projection_access)
+
+    assert frame._notes_copy_notebook_to_clipboard() is True
+    assert frame._notes_export_notebook_to_clipboard() is True
+    assert frame._notes_export_selected_range_to_clipboard("down") is True
+    assert frame._notes_export_selected_range_to_clipboard("up") is True
+
+    assert copied["texts"] == [
+        "\n\n".join([first.content, second.content, third.content]),
+        "\n\n".join([first.content, second.content, third.content]),
+        "\n\n".join([second.content, third.content]),
+        "\n\n".join([first.content, second.content]),
+    ]
+
+
 @pytest.mark.parametrize(
     ("exit_choice", "trigger", "expected_view", "expected_dirty"),
     [

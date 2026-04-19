@@ -37,6 +37,7 @@ from codex_client import (
     is_codex_model,
 )
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
+from notes_projection import DesktopNotesProjection
 from notes_store import NotesStore
 from notes_sync import NotesSyncService
 from notes_ui import DesktopNotesController
@@ -743,6 +744,7 @@ class ChatFrame(wx.Frame):
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
+        self.notes_projection = DesktopNotesProjection(self.notes_store)
         self.notes_sync = NotesSyncService(
             self.notes_store,
             broadcaster=self._on_notes_sync_push_result,
@@ -5246,6 +5248,9 @@ class ChatFrame(wx.Frame):
         notebook_id = str(self.notes_controller.active_notebook_id or self._notes_selected_notebook_id() or "").strip()
         if not notebook_id:
             return None
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            return projection.get_notebook(notebook_id, include_deleted=True)
         return self.notes_store.get_notebook(notebook_id, include_deleted=True)
 
     def _notes_current_entry(self):
@@ -5258,6 +5263,9 @@ class ChatFrame(wx.Frame):
             entry_id = str(self._notes_selected_entry_id() or "").strip()
         if not entry_id:
             return None
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            return projection.get_entry(entry_id, include_deleted=True)
         return self.notes_store.get_entry(entry_id, include_deleted=True)
 
     def _notes_selected_notebook_id(self) -> str:
@@ -5371,7 +5379,11 @@ class ChatFrame(wx.Frame):
 
     def _notes_refresh_notebooks(self, select_id: str | None = None) -> None:
         query = str(getattr(self, "_notes_search_query", "") or "").strip()
-        notebooks = self.notes_store.search_notebooks(query) if query else self.notes_store.list_notebooks()
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            notebooks = projection.search_notebooks(query) if query else projection.list_notebooks()
+        else:
+            notebooks = self.notes_store.search_notebooks(query) if query else self.notes_store.list_notebooks()
         self._notes_notebook_ids = [nb.id for nb in notebooks]
         self.notes_notebook_list.Clear()
         if not notebooks:
@@ -5396,7 +5408,11 @@ class ChatFrame(wx.Frame):
             self.notes_entry_list.Append("请选择笔记本")
             self.notes_entry_list.Enable(False)
             return
-        entries = self.notes_store.list_entries(notebook_id)
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            entries = projection.list_entries(notebook_id)
+        else:
+            entries = self.notes_store.list_entries(notebook_id)
         self.notes_entry_list.Enable(True)
         self._notes_entry_ids = [entry.id for entry in entries]
         if not entries:
@@ -5450,7 +5466,8 @@ class ChatFrame(wx.Frame):
             return
         self.notes_controller.root_tab = "notes"
         if not self.notes_controller.active_notebook_id:
-            first = self.notes_store.list_notebooks()
+            projection = getattr(self, "notes_projection", None)
+            first = projection.list_notebooks() if projection is not None else self.notes_store.list_notebooks()
             if first:
                 self.notes_controller.active_notebook_id = first[0].id
         self.notes_controller.notes_view = "notes_list"
@@ -5736,7 +5753,8 @@ class ChatFrame(wx.Frame):
         self.notes_controller.active_entry_id = str(entry_id or "")
         self.notes_controller.notes_view = str(view or "note_edit")
         self.notes_controller.entry_editor_dirty = False
-        entry = self.notes_store.get_entry(entry_id, include_deleted=True)
+        projection = getattr(self, "notes_projection", None)
+        entry = projection.get_entry(entry_id, include_deleted=True) if projection is not None else self.notes_store.get_entry(entry_id, include_deleted=True)
         self.notes_controller.entry_editor_base_version = int(entry.version if entry is not None else 0)
         self._current_notes_state = self.notes_controller.to_state_dict()
         self._notes_refresh_ui()
@@ -5978,7 +5996,11 @@ class ChatFrame(wx.Frame):
         selected_entry_id = str(self._notes_selected_entry_id() or "").strip()
         if not selected_entry_id:
             return False
-        entries = self.notes_store.list_entries(notebook.id)
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            entries = projection.list_entries(notebook.id)
+        else:
+            entries = self.notes_store.list_entries(notebook.id)
         entry_ids = [str(entry.id) for entry in entries]
         if selected_entry_id not in entry_ids:
             return False
@@ -5995,14 +6017,22 @@ class ChatFrame(wx.Frame):
         notebook = self._notes_current_notebook()
         if notebook is None:
             return False
-        entries = self.notes_store.list_entries(notebook.id)
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            entries = projection.list_entries(notebook.id)
+        else:
+            entries = self.notes_store.list_entries(notebook.id)
         return self._notes_export_entries_to_clipboard(entries, status_text="已导出笔记到剪贴板")
 
     def _notes_copy_notebook_to_clipboard(self) -> bool:
         notebook = self._notes_current_notebook()
         if notebook is None:
             return False
-        entries = self.notes_store.list_entries(notebook.id)
+        projection = getattr(self, "notes_projection", None)
+        if projection is not None:
+            entries = projection.list_entries(notebook.id)
+        else:
+            entries = self.notes_store.list_entries(notebook.id)
         text = "\n\n".join(str(entry.content or "") for entry in entries if str(entry.content or "").strip())
         if not text:
             return False
