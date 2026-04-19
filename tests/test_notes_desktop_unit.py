@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -6,6 +7,423 @@ import wx
 import pytest
 
 import main
+from notes_store import NotesStore
+
+
+def test_notes_store_creates_document_cache_schema(tmp_path):
+    db_path = tmp_path / "notes.db"
+    store = NotesStore(db_path, device_id="desktop-test")
+
+    store.initialize()
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        notebook_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(notebooks)").fetchall()
+        }
+        entry_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(entries)").fetchall()
+        }
+        sync_state_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sync_state)").fetchall()
+        }
+
+    assert {"notebooks", "entries", "sync_state"}.issubset(tables)
+    assert "sync_outbox" not in tables
+    assert "notes_change_log" not in tables
+    assert notebook_columns == {
+        "id",
+        "title",
+        "created_at",
+        "updated_at",
+        "version",
+        "device_id",
+        "last_modified_by",
+        "is_conflict_copy",
+        "origin_notebook_id",
+        "rev",
+        "deleted",
+        "dirty",
+    }
+    assert entry_columns == {
+        "id",
+        "notebook_id",
+        "content",
+        "created_at",
+        "updated_at",
+        "sort_order",
+        "version",
+        "device_id",
+        "last_modified_by",
+        "is_conflict_copy",
+        "origin_entry_id",
+        "source",
+        "rev",
+        "deleted",
+        "dirty",
+    }
+    assert sync_state_columns == {"key", "value"}
+
+
+def test_notes_store_migrates_legacy_tables_to_document_cache(tmp_path):
+    db_path = tmp_path / "notes.db"
+    long_text = "第二条" * 200
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE notebooks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL,
+                last_modified_by TEXT NOT NULL,
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_notebook_id TEXT
+            );
+            CREATE TABLE note_entries (
+                id TEXT PRIMARY KEY,
+                notebook_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL,
+                last_modified_by TEXT NOT NULL,
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_entry_id TEXT,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE sync_outbox (
+                op_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                base_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE notes_change_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                base_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                source_device TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO notebooks (
+                id, title, created_at, updated_at, deleted_at, pinned,
+                sort_order, version, device_id, last_modified_by,
+                is_conflict_copy, origin_notebook_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-notebook",
+                "灵感",
+                "2026-04-19T08:00:00Z",
+                "2026-04-19T08:01:00Z",
+                None,
+                0,
+                7,
+                3,
+                "desktop-legacy",
+                "desktop",
+                0,
+                None,
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO note_entries (
+                id, notebook_id, content, created_at, updated_at, deleted_at,
+                pinned, sort_order, version, device_id, last_modified_by,
+                is_conflict_copy, origin_entry_id, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "legacy-entry-1",
+                    "legacy-notebook",
+                    "第一条",
+                    "2026-04-19T08:00:00Z",
+                    "2026-04-19T08:00:00Z",
+                    None,
+                    0,
+                    1,
+                    1,
+                    "desktop-legacy",
+                    "desktop",
+                    0,
+                    None,
+                    "manual",
+                ),
+                (
+                    "legacy-entry-2",
+                    "legacy-notebook",
+                    long_text,
+                    "2026-04-19T08:00:01Z",
+                    "2026-04-19T08:00:01Z",
+                    None,
+                    0,
+                    2,
+                    1,
+                    "desktop-legacy",
+                    "desktop",
+                    0,
+                    None,
+                    "manual",
+                ),
+            ],
+        )
+        conn.commit()
+
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    migrated = store.snapshot_documents()
+
+    assert any(doc["_id"] == "notebook:legacy-notebook" for doc in migrated)
+    assert any(doc["_id"] == "entry:legacy-entry-1" for doc in migrated)
+    assert any(doc.get("content") == long_text for doc in migrated)
+    assert store.sync_state_value("legacy_notes_migration_complete") == "complete"
+
+
+def test_notes_store_persists_long_entry_text_in_document_cache(tmp_path):
+    db_path = tmp_path / "notes.db"
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("长文本缓存")
+    long_text = "长文本-" * 1000
+
+    entry = store.create_entry(notebook.id, long_text, source="manual")
+
+    reopened = NotesStore(db_path, device_id="desktop-test")
+    reopened.initialize()
+    snapshot = reopened.load_documents()
+
+    assert reopened.get_entry(entry.id) is not None
+    assert reopened.get_entry(entry.id).content == long_text
+    assert any(doc.id == notebook.id for doc in snapshot.notebooks)
+    assert any(doc.id == entry.id and doc.content == long_text for doc in snapshot.entries)
+
+
+def test_notes_store_preserves_document_metadata_across_reopen(tmp_path):
+    db_path = tmp_path / "notes.db"
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+
+    notebook = store.create_notebook(
+        "metadata notebook",
+        notebook_id="nb-meta",
+        device_id="desktop-origin",
+        last_modified_by="desktop",
+    )
+    entry = store.create_entry(
+        notebook.id,
+        "metadata entry",
+        source="voice",
+        entry_id="entry-meta",
+        device_id="mobile-origin",
+        last_modified_by="mobile",
+        created_at="2026-04-19T08:00:00Z",
+        updated_at="2026-04-19T08:05:00Z",
+        sort_order=11,
+        version=9,
+        is_conflict_copy=True,
+        origin_entry_id="origin-entry",
+    )
+
+    store.update_notebook(
+        notebook.id,
+        "metadata notebook v2",
+    )
+
+    reopened = NotesStore(db_path, device_id="desktop-test")
+    reopened.initialize()
+    snapshot = reopened.load_documents()
+    notebook_doc = next(doc for doc in snapshot.notebooks if doc.id == notebook.id)
+    entry_doc = next(doc for doc in snapshot.entries if doc.id == entry.id)
+    reopened_notebook = reopened.get_notebook(notebook.id, include_deleted=True)
+    reopened_entry = reopened.get_entry(entry.id, include_deleted=True)
+
+    assert notebook_doc.version == 2
+    assert notebook_doc.device_id == "desktop-test"
+    assert notebook_doc.last_modified_by == "desktop"
+    assert notebook_doc.is_conflict_copy is False
+    assert notebook_doc.origin_notebook_id is None
+    assert entry_doc.version == 9
+    assert entry_doc.device_id == "mobile-origin"
+    assert entry_doc.last_modified_by == "mobile"
+    assert entry_doc.is_conflict_copy is True
+    assert entry_doc.origin_entry_id == "origin-entry"
+    assert entry_doc.source == "voice"
+    assert reopened_notebook is not None
+    assert reopened_notebook.version == notebook_doc.version
+    assert reopened_notebook.device_id == notebook_doc.device_id
+    assert reopened_notebook.last_modified_by == notebook_doc.last_modified_by
+    assert reopened_entry is not None
+    assert reopened_entry.version == entry_doc.version
+    assert reopened_entry.device_id == entry_doc.device_id
+    assert reopened_entry.last_modified_by == entry_doc.last_modified_by
+    assert reopened_entry.is_conflict_copy is True
+    assert reopened_entry.origin_entry_id == "origin-entry"
+    assert reopened_entry.source == "voice"
+
+
+def test_notes_store_migrates_legacy_metadata_to_document_cache(tmp_path):
+    db_path = tmp_path / "notes.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE notebooks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL,
+                last_modified_by TEXT NOT NULL,
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_notebook_id TEXT
+            );
+            CREATE TABLE note_entries (
+                id TEXT PRIMARY KEY,
+                notebook_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL,
+                last_modified_by TEXT NOT NULL,
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_entry_id TEXT,
+                source TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO notebooks (
+                id, title, created_at, updated_at, deleted_at, pinned,
+                sort_order, version, device_id, last_modified_by,
+                is_conflict_copy, origin_notebook_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-notebook-meta",
+                "legacy metadata notebook",
+                "2026-04-19T08:00:00Z",
+                "2026-04-19T08:01:00Z",
+                None,
+                0,
+                0,
+                7,
+                "desktop-legacy",
+                "desktop",
+                1,
+                "origin-notebook",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO note_entries (
+                id, notebook_id, content, created_at, updated_at, deleted_at,
+                pinned, sort_order, version, device_id, last_modified_by,
+                is_conflict_copy, origin_entry_id, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-entry-meta",
+                "legacy-notebook-meta",
+                "legacy entry",
+                "2026-04-19T08:00:02Z",
+                "2026-04-19T08:00:03Z",
+                None,
+                0,
+                5,
+                6,
+                "mobile-legacy",
+                "mobile",
+                1,
+                "origin-entry",
+                "voice",
+            ),
+        )
+        conn.commit()
+
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    snapshot = store.load_documents()
+    notebook_doc = next(doc for doc in snapshot.notebooks if doc.id == "legacy-notebook-meta")
+    entry_doc = next(doc for doc in snapshot.entries if doc.id == "legacy-entry-meta")
+
+    assert notebook_doc.version == 7
+    assert notebook_doc.device_id == "desktop-legacy"
+    assert notebook_doc.last_modified_by == "desktop"
+    assert notebook_doc.is_conflict_copy is True
+    assert notebook_doc.origin_notebook_id == "origin-notebook"
+    assert entry_doc.version == 6
+    assert entry_doc.device_id == "mobile-legacy"
+    assert entry_doc.last_modified_by == "mobile"
+    assert entry_doc.is_conflict_copy is True
+    assert entry_doc.origin_entry_id == "origin-entry"
+    assert entry_doc.source == "voice"
+
+
+def test_notes_store_compat_outbox_tracks_local_changes_and_status_transitions(tmp_path):
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("compat outbox")
+    store.create_entry(notebook.id, "entry one", source="manual")
+
+    pending = store.list_pending_ops(limit=10)
+    assert len(pending) == 2
+    assert [item.status for item in pending] == ["pending", "pending"]
+    assert [item.action for item in pending] == ["create", "create"]
+
+    sending = store.claim_outbox_ops(limit=10)
+    assert len(sending) == 2
+    assert all(item.status == "sending" for item in sending)
+    assert all(item.retry_count == 1 for item in sending)
+
+    failed = store.mark_outbox_failed([item.op_id for item in sending])
+    assert len(failed) == 2
+    assert all(item.status == "failed" for item in failed)
+
+    retried = store.claim_outbox_ops(limit=10)
+    assert len(retried) == 2
+    assert all(item.status == "sending" for item in retried)
+    assert all(item.retry_count == 2 for item in retried)
+
+    acked = store.mark_outbox_acked([item.op_id for item in retried])
+    assert len(acked) == 2
+    assert all(item.status == "acked" for item in acked)
 
 
 def test_notes_store_tracks_notebooks_entries_and_pending_ops(tmp_path):
