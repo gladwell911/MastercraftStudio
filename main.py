@@ -745,12 +745,16 @@ class ChatFrame(wx.Frame):
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
         self.notes_projection = DesktopNotesProjection(self.notes_store)
+        self._notes_ui_thread_id = threading.get_ident()
         self.notes_sync = NotesSyncService(
             self.notes_store,
             broadcaster=self._on_notes_sync_push_result,
-            on_remote_ops_applied=self._on_notes_remote_ops_applied,
-            on_status_changed=self._on_notes_sync_status_changed,
+            on_remote_ops_applied=self._on_notes_remote_ops_applied_safe,
+            on_status_changed=self._on_notes_sync_status_changed_safe,
         )
+        self._notes_sync_worker_lock = threading.Lock()
+        self._notes_sync_worker_scheduled = False
+        self._configure_notes_couchdb_sync_from_env()
         self._current_notes_state = {}
         self.notes_sync_hint = ""
         self.send_sound = self._resolve_sound_path("send")
@@ -5593,6 +5597,7 @@ class ChatFrame(wx.Frame):
         cursor = self.notes_store.current_cursor()
         self._push_remote_notes_changed(cursor)
         self._on_notes_sync_status_changed("pending", message=message, cursor=cursor)
+        self._schedule_notes_couchdb_sync()
 
     def _show_notes_sync_hint(self, message: str) -> None:
         self.notes_sync_hint = str(message or "")
@@ -5600,6 +5605,45 @@ class ChatFrame(wx.Frame):
             self.SetStatusText(self.notes_sync_hint)
         except Exception:
             pass
+
+    def _on_notes_sync_status_changed_safe(self, status: str | dict, *, message: str | None = None, cursor: str | None = None) -> None:
+        if threading.get_ident() == getattr(self, "_notes_ui_thread_id", 0):
+            self._on_notes_sync_status_changed(status, message=message, cursor=cursor)
+            return
+        self._call_after_if_alive(self._on_notes_sync_status_changed, status, message=message, cursor=cursor)
+
+    def _on_notes_remote_ops_applied_safe(self, result: dict | None) -> None:
+        if threading.get_ident() == getattr(self, "_notes_ui_thread_id", 0):
+            self._on_notes_remote_ops_applied(result)
+            return
+        self._call_after_if_alive(self._on_notes_remote_ops_applied, result)
+
+    def _configure_notes_couchdb_sync_from_env(self) -> None:
+        base_url = str(os.environ.get("NOTES_COUCHDB_URL") or "").strip()
+        if not base_url:
+            return
+        database = str(os.environ.get("NOTES_COUCHDB_DATABASE") or "zhuge_notes").strip() or "zhuge_notes"
+        self.notes_sync.configure(base_url, database)
+        self._schedule_notes_couchdb_sync()
+
+    def _schedule_notes_couchdb_sync(self) -> None:
+        if not getattr(self, "notes_sync", None) or not self.notes_sync.is_configured():
+            return
+        with self._notes_sync_worker_lock:
+            if self._notes_sync_worker_scheduled:
+                return
+            self._notes_sync_worker_scheduled = True
+        worker = threading.Thread(target=self._run_notes_couchdb_sync, daemon=True)
+        worker.start()
+
+    def _run_notes_couchdb_sync(self) -> None:
+        try:
+            self.notes_sync.sync_once()
+        except Exception:
+            self._on_notes_sync_status_changed_safe("failed", message="同步失败", cursor=self.notes_sync.get_checkpoint())
+        finally:
+            with self._notes_sync_worker_lock:
+                self._notes_sync_worker_scheduled = False
 
     def _on_notes_remote_ops_applied(self, result: dict | None) -> None:
         result = dict(result or {})
@@ -6259,6 +6303,10 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
             self._remote_ws_server = None
+        try:
+            self.notes_sync.close()
+        except Exception:
+            pass
         self._save_state()
         self._global_ctrl_hook.stop()
         self._unregister_global_hotkey()
