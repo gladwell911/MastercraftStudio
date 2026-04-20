@@ -3304,29 +3304,29 @@ class ChatFrame(wx.Frame):
         return 200, {"accepted": True, **chat}
 
     def _remote_api_notes_snapshot(self, _payload: dict | None = None) -> tuple[int, dict]:
-        return 200, self.notes_sync.snapshot()
+        return self._remote_api_notes_retired()
 
     def _remote_api_notes_pull_since(self, payload: dict | None = None) -> tuple[int, dict]:
-        payload = payload or {}
-        cursor = str(payload.get("cursor") or "0").strip() or "0"
-        return 200, self.notes_sync.pull_since(cursor)
+        return self._remote_api_notes_retired()
 
     def _remote_api_notes_push_ops(self, payload: dict | None = None) -> tuple[int, dict]:
-        payload = payload or {}
-        result = self.notes_sync.push_ops(list(payload.get("ops") or []))
-        return 200, result
+        return self._remote_api_notes_retired()
 
     def _remote_api_notes_subscribe(self, payload: dict | None = None) -> tuple[int, dict]:
-        payload = payload or {}
-        return 200, self.notes_sync.subscribe(payload)
+        return self._remote_api_notes_retired()
 
     def _remote_api_notes_ack(self, payload: dict | None = None) -> tuple[int, dict]:
-        payload = payload or {}
-        return 200, self.notes_sync.ack(payload)
+        return self._remote_api_notes_retired()
 
     def _remote_api_notes_ping(self, payload: dict | None = None) -> tuple[int, dict]:
-        payload = payload or {}
-        return 200, self.notes_sync.ping(payload)
+        return self._remote_api_notes_retired()
+
+    def _remote_api_notes_retired(self) -> tuple[int, dict]:
+        return 410, {
+            "accepted": False,
+            "error": "retired",
+            "message": "旧 notes 同步协议已退役，请使用 CouchDB 同步",
+        }
 
     def _remote_api_rename_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
@@ -3753,6 +3753,26 @@ class ChatFrame(wx.Frame):
             f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
         )
 
+    def _start_remote_http_server_if_configured(self, *, token: str, host: str, port: int) -> None:
+        if getattr(self, "_remote_http_server", None) is not None:
+            return
+        self._remote_http_server = RemoteControlHttpServer(
+            host=host,
+            port=port,
+            token=token,
+            on_message=self._remote_api_message_ui,
+            on_new_chat=self._remote_api_new_chat_ui,
+            on_reply_request=self._remote_api_reply_request_ui,
+            on_state=self._remote_api_state_ui,
+            on_notes_snapshot=self._remote_api_notes_snapshot,
+            on_notes_pull_since=self._remote_api_notes_pull_since,
+            on_notes_push_ops=self._remote_api_notes_push_ops,
+            on_notes_subscribe=self._remote_api_notes_subscribe,
+            on_notes_ack=self._remote_api_notes_ack,
+            on_notes_ping=self._remote_api_notes_ping,
+        )
+        self._remote_http_server.start()
+
     def _start_remote_ws_server_if_configured(self, *, ensure_connectivity: bool = False) -> None:
         token = self._read_remote_control_token() or self.remote_control_token
         if not token or getattr(self, "_remote_ws_server", None) is not None:
@@ -3760,6 +3780,7 @@ class ChatFrame(wx.Frame):
         runtime = self._remote_runtime_config()
         host = runtime["host"]
         port = runtime["port"]
+        self._start_remote_http_server_if_configured(token=token, host=host, port=port + 1)
         self._remote_ws_server = RemoteWebSocketServer(
             host=host,
             port=port,
@@ -3778,6 +3799,8 @@ class ChatFrame(wx.Frame):
             on_notes_subscribe=self._remote_api_notes_subscribe,
             on_notes_ack=self._remote_api_notes_ack,
             on_notes_ping=self._remote_api_notes_ping,
+            on_notes_couchdb_changes=self._remote_api_notes_couchdb_changes,
+            on_notes_couchdb_bulk_docs=self._remote_api_notes_couchdb_bulk_docs,
         )
         self._remote_ws_server.start()
         published_url = f"{runtime['published_base']}?token={token}"
@@ -5626,6 +5649,111 @@ class ChatFrame(wx.Frame):
         self.notes_sync.configure(base_url, database)
         self._schedule_notes_couchdb_sync()
 
+    def _next_notes_couchdb_rev(self, current_rev: str) -> str:
+        try:
+            generation = int(str(current_rev or "0").split("-", 1)[0]) + 1
+        except Exception:
+            generation = 1
+        return f"{generation}-{uuid.uuid4().hex[:8]}"
+
+    def _remote_api_notes_couchdb_changes(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = dict(payload or {})
+        database = str(payload.get("database") or "").strip() or "zhuge_notes"
+        if database != "zhuge_notes":
+            return 404, {"error": "not_found", "reason": "unknown_database"}
+        current_cursor = str(self.notes_store.current_cursor() or "0")
+        try:
+            requested_cursor = int(str(payload.get("since") or "0").strip() or "0")
+        except Exception:
+            requested_cursor = 0
+        try:
+            current_cursor_value = int(current_cursor)
+        except Exception:
+            current_cursor_value = 0
+        if requested_cursor >= current_cursor_value:
+            return 200, {"results": [], "last_seq": current_cursor}
+        snapshot = self.notes_store.load_documents()
+        results: list[dict] = []
+        for notebook in snapshot.notebooks:
+            doc = self.notes_sync._notebook_to_couch_document(notebook)
+            row = {"seq": current_cursor, "id": doc["_id"], "doc": doc}
+            if doc.get("_deleted"):
+                row["deleted"] = True
+            results.append(row)
+        for entry in snapshot.entries:
+            doc = self.notes_sync._entry_to_couch_document(entry)
+            row = {"seq": current_cursor, "id": doc["_id"], "doc": doc}
+            if doc.get("_deleted"):
+                row["deleted"] = True
+            results.append(row)
+        return 200, {"results": results, "last_seq": current_cursor}
+
+    def _remote_api_notes_couchdb_bulk_docs(self, payload: dict | None = None) -> tuple[int, list]:
+        payload = dict(payload or {})
+        database = str(payload.get("database") or "").strip() or "zhuge_notes"
+        if database != "zhuge_notes":
+            return 404, [{"error": "not_found", "reason": "unknown_database"}]
+        docs = [dict(item) for item in list(payload.get("docs") or []) if isinstance(item, dict)]
+        if not docs:
+            return 201, []
+        results: list[dict] = []
+        applied: list[dict] = []
+        touched = False
+        with self.notes_store._connect() as conn:
+            for doc in docs:
+                remote_id = str(doc.get("_id") or "").strip()
+                if not remote_id:
+                    results.append({"id": "", "error": "bad_request", "reason": "missing_id"})
+                    continue
+                if remote_id.startswith("notebook:"):
+                    row = conn.execute(
+                        "SELECT rev FROM notebooks WHERE id = ?",
+                        (remote_id.split(":", 1)[1],),
+                    ).fetchone()
+                    current_rev = str(row["rev"] or "") if row is not None else ""
+                    supplied_rev = str(doc.get("_rev") or "")
+                    if row is not None and current_rev and supplied_rev != current_rev:
+                        results.append({"id": remote_id, "error": "conflict", "reason": "document update conflict"})
+                        continue
+                    normalized = dict(doc)
+                    normalized["_rev"] = self._next_notes_couchdb_rev(current_rev)
+                    applied_result = self.notes_sync._upsert_remote_notebook(conn, normalized)
+                    if applied_result:
+                        applied.append(applied_result)
+                    results.append({"id": remote_id, "ok": True, "rev": normalized["_rev"]})
+                    touched = True
+                    continue
+                if remote_id.startswith("entry:"):
+                    row = conn.execute(
+                        "SELECT rev FROM entries WHERE id = ?",
+                        (remote_id.split(":", 1)[1],),
+                    ).fetchone()
+                    current_rev = str(row["rev"] or "") if row is not None else ""
+                    supplied_rev = str(doc.get("_rev") or "")
+                    if row is not None and current_rev and supplied_rev != current_rev:
+                        results.append({"id": remote_id, "error": "conflict", "reason": "document update conflict"})
+                        continue
+                    normalized = dict(doc)
+                    normalized["_rev"] = self._next_notes_couchdb_rev(current_rev)
+                    applied_result = self.notes_sync._upsert_remote_entry(conn, normalized)
+                    if applied_result:
+                        applied.append(applied_result)
+                    results.append({"id": remote_id, "ok": True, "rev": normalized["_rev"]})
+                    touched = True
+                    continue
+                results.append({"id": remote_id, "error": "bad_request", "reason": "unsupported_document"})
+            if touched:
+                self.notes_store._next_cursor(conn)
+        if touched:
+            self._on_notes_remote_ops_applied_safe(
+                {
+                    "cursor": self.notes_store.current_cursor(),
+                    "applied": applied,
+                    "conflicts": [],
+                }
+            )
+        return 201, results
+
     def _schedule_notes_couchdb_sync(self) -> None:
         if not getattr(self, "notes_sync", None) or not self.notes_sync.is_configured():
             return
@@ -6303,6 +6431,12 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
             self._remote_ws_server = None
+        if self._remote_http_server:
+            try:
+                self._remote_http_server.stop()
+            except Exception:
+                pass
+            self._remote_http_server = None
         try:
             self.notes_sync.close()
         except Exception:

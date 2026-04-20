@@ -27,6 +27,8 @@ class RemoteWebSocketServer:
         on_notes_subscribe: Callable[[dict], tuple[int, dict]] | None = None,
         on_notes_ack: Callable[[dict], tuple[int, dict]] | None = None,
         on_notes_ping: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_couchdb_changes: Callable[[dict], tuple[int, dict]] | None = None,
+        on_notes_couchdb_bulk_docs: Callable[[dict], tuple[int, list | dict]] | None = None,
     ) -> None:
         self.host = str(host or "127.0.0.1").strip() or "127.0.0.1"
         self.port = max(int(port or 0), 0)
@@ -45,6 +47,8 @@ class RemoteWebSocketServer:
         self.on_notes_subscribe = on_notes_subscribe
         self.on_notes_ack = on_notes_ack
         self.on_notes_ping = on_notes_ping
+        self.on_notes_couchdb_changes = on_notes_couchdb_changes
+        self.on_notes_couchdb_bulk_docs = on_notes_couchdb_bulk_docs
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._app: web.Application | None = None
@@ -134,6 +138,8 @@ class RemoteWebSocketServer:
         self._app = web.Application()
         self._app.router.add_get("/ws", self._handle_ws)
         self._app.router.add_get("/healthz", self._handle_health)
+        self._app.router.add_get("/notes_couchdb/{database}/_changes", self._handle_notes_couchdb_changes)
+        self._app.router.add_post("/notes_couchdb/{database}/_bulk_docs", self._handle_notes_couchdb_bulk_docs)
         self._runner = web.AppRunner(self._app)
         try:
             await self._runner.setup()
@@ -181,6 +187,35 @@ class RemoteWebSocketServer:
             return web.json_response({"accepted": False, "error": "unauthorized"}, status=401)
         status, payload = await asyncio.to_thread(self._call_on_state, None)
         return web.json_response(payload, status=status)
+
+    async def _handle_notes_couchdb_changes(self, request: web.Request) -> web.StreamResponse:
+        if not self._authorized(request):
+            return web.json_response({"accepted": False, "error": "unauthorized"}, status=401)
+        if not callable(self.on_notes_couchdb_changes):
+            return web.json_response({"accepted": False, "error": "not_found"}, status=404)
+        payload = {
+            "database": request.match_info.get("database") or "",
+            "since": request.query.get("since") or "0",
+            "include_docs": str(request.query.get("include_docs") or "").strip().lower() == "true",
+        }
+        status, body = await asyncio.to_thread(self.on_notes_couchdb_changes, payload)
+        return web.json_response(body, status=status)
+
+    async def _handle_notes_couchdb_bulk_docs(self, request: web.Request) -> web.StreamResponse:
+        if not self._authorized(request):
+            return web.json_response({"accepted": False, "error": "unauthorized"}, status=401)
+        if not callable(self.on_notes_couchdb_bulk_docs):
+            return web.json_response({"accepted": False, "error": "not_found"}, status=404)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"accepted": False, "error": "invalid_json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"accepted": False, "error": "invalid_payload"}, status=400)
+        request_payload = dict(payload)
+        request_payload["database"] = request.match_info.get("database") or ""
+        status, body = await asyncio.to_thread(self.on_notes_couchdb_bulk_docs, request_payload)
+        return web.json_response(body, status=status)
 
     async def _handle_ws(self, request: web.Request) -> web.StreamResponse:
         if not self._authorized(request):
@@ -262,50 +297,17 @@ class RemoteWebSocketServer:
                 return
             status, body = await asyncio.to_thread(self.on_history_read, payload)
         elif message_type == "notes_snapshot":
-            if not callable(self.on_notes_snapshot):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            try:
-                status, body = await asyncio.to_thread(self.on_notes_snapshot, payload)
-            except TypeError:
-                status, body = await asyncio.to_thread(self.on_notes_snapshot)
+            status, body = self._retired_notes_response()
         elif message_type == "notes_pull_since":
-            if not callable(self.on_notes_pull_since):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            status, body = await asyncio.to_thread(self.on_notes_pull_since, payload)
+            status, body = self._retired_notes_response()
         elif message_type == "notes_push_ops":
-            if not callable(self.on_notes_push_ops):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            status, body = await asyncio.to_thread(self.on_notes_push_ops, payload)
+            status, body = self._retired_notes_response()
         elif message_type == "notes_subscribe":
-            if not callable(self.on_notes_subscribe):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            status, body = await asyncio.to_thread(self.on_notes_subscribe, payload)
+            status, body = self._retired_notes_response()
         elif message_type == "notes_ack":
-            if not callable(self.on_notes_ack):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            status, body = await asyncio.to_thread(self.on_notes_ack, payload)
+            status, body = self._retired_notes_response()
         elif message_type == "notes_ping":
-            if not callable(self.on_notes_ping):
-                await ws.send_json(
-                    {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
-                )
-                return
-            status, body = await asyncio.to_thread(self.on_notes_ping, payload)
+            status, body = self._retired_notes_response()
         else:
             await ws.send_json(
                 {"type": "response", "id": request_id, "ok": False, "status": 400, "error": "unsupported_type"}
@@ -328,3 +330,11 @@ class RemoteWebSocketServer:
                 for client_id, ws in list(self._clients.items()):
                     if ws in stale:
                         self._clients.pop(client_id, None)
+
+    @staticmethod
+    def _retired_notes_response() -> tuple[int, dict]:
+        return 410, {
+            "accepted": False,
+            "error": "retired",
+            "message": "旧 notes 同步协议已退役，请使用 CouchDB 同步",
+        }

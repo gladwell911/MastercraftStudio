@@ -9,7 +9,12 @@ DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 DEFAULT_MODEL = "openai/gpt-5.2"
 TIMEOUT_SECONDS = 60
-TITLE_SYSTEM_PROMPT = "你是标题助手。请把对话压缩成更简洁精炼的中文主题短语，优先使用4-8个字的名词短语，例如把“用户需要介绍好吃的”压缩成“美食推荐”。不要引号，不要句子。"
+TITLE_SYSTEM_PROMPT = (
+    "你是标题助手。请把输入内容压缩成简洁精炼的中文主题短语，优先使用4-8个字的名词短语，"
+    "例如把“用户需要介绍好吃的”压缩成“美食推荐”。"
+    "只输出标题本身，不要引号，不要标点，不要句子。"
+    "绝对不要回答问题，不要解释，不要续写，不要输出“X是……”这类回答句。"
+)
 DOUBAO_API_KEY = "b977c688-3f5f-488f-b58f-933c8f042567"
 DOUBAO_MODEL_MAP = {
     "doubao-2.0-pro": "doubao-seed-2-0-pro-260215",

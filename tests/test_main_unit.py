@@ -124,6 +124,26 @@ def test_remote_ws_server_supports_legacy_claudecode_env_names(frame, monkeypatc
     finally:
         frame._remote_ws_server.stop()
         frame._remote_ws_server = None
+        if frame._remote_http_server is not None:
+            frame._remote_http_server.stop()
+            frame._remote_http_server = None
+
+
+def test_remote_ws_start_also_starts_remote_http_server(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
+
+    frame._start_remote_ws_server_if_configured()
+    try:
+        assert frame._remote_http_server is not None
+        assert frame._remote_http_server.bound_port > 0
+    finally:
+        if frame._remote_ws_server is not None:
+            frame._remote_ws_server.stop()
+            frame._remote_ws_server = None
+        if frame._remote_http_server is not None:
+            frame._remote_http_server.stop()
+            frame._remote_http_server = None
 
 
 def test_remote_ws_url_strips_invalid_port_zero_from_domain(frame, monkeypatch):
@@ -480,6 +500,44 @@ def test_adjacent_history_chat_id_keeps_advancing_after_switch(frame):
     assert frame._adjacent_history_chat_id(1) == "chat-b"
 
 
+def test_refresh_history_keeps_switched_chat_in_sorted_position(frame):
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答"}]
+    frame._current_chat_state["updated_at"] = 6.0
+    frame.archived_chats = [
+        {"id": "chat-b", "title": "聊天B", "turns": [{"question": "B", "answer_md": "B"}], "created_at": 4.0, "updated_at": 4.0},
+        {"id": "chat-f", "title": "置顶F", "turns": [{"question": "F", "answer_md": "F"}], "created_at": 5.0, "updated_at": 5.0, "pinned": True},
+        {"id": "chat-c", "title": "置顶C", "turns": [{"question": "C", "answer_md": "C"}], "created_at": 3.0, "updated_at": 3.0, "pinned": True},
+        {"id": "chat-a", "title": "聊天A", "turns": [{"question": "A", "answer_md": "A"}], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-g", "title": "聊天G", "turns": [{"question": "G", "answer_md": "G"}], "created_at": 9.0, "updated_at": 9.0},
+    ]
+
+    assert frame._switch_current_chat("chat-b") is True
+
+    assert frame.history_ids == ["chat-f", "chat-c", "chat-g", "chat-b", "chat-a"]
+    assert list(frame.history_list.GetStrings()) == ["[置顶] 置顶F", "[置顶] 置顶C", "聊天G", "聊天B", "聊天A"]
+    assert frame.history_list.GetSelection() == frame.history_ids.index("chat-b")
+
+
+def test_adjacent_history_chat_id_uses_selected_history_when_no_current_chat(frame):
+    frame.current_chat_id = None
+    frame.active_chat_id = ""
+    frame.archived_chats = [
+        {"id": "chat-b", "title": "聊天B", "turns": [], "created_at": 4.0, "updated_at": 4.0},
+        {"id": "chat-f", "title": "置顶F", "turns": [], "created_at": 5.0, "updated_at": 5.0, "pinned": True},
+        {"id": "chat-c", "title": "置顶C", "turns": [], "created_at": 3.0, "updated_at": 3.0, "pinned": True},
+        {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-g", "title": "聊天G", "turns": [], "created_at": 9.0, "updated_at": 9.0},
+    ]
+    frame._refresh_history()
+    frame.history_list.SetSelection(frame.history_ids.index("chat-g"))
+
+    assert frame._adjacent_history_chat_id(1) == "chat-f"
+
+
 def test_switch_current_chat_restores_archived_runtime_state(frame):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -608,6 +666,35 @@ def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
     assert seen["skipped"] == 1
 
 
+def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
+    frame.active_chat_id = "chat-b"
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
+    ]
+    frame._refresh_history()
+    seen = {"skipped": 0}
+    frame._switch_current_chat = lambda chat_id: seen.setdefault("chat_id", chat_id) or True
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RIGHT
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            seen["skipped"] += 1
+
+    frame._on_generic_key_down(E())
+
+    assert seen["chat_id"] == "chat-c"
+    assert seen["skipped"] == 1
+
+
 def test_render_answer_list_requests_listbox_repaint(frame, monkeypatch):
     frame.active_session_turns = [
         {"question": "问题", "answer_md": "回答", "model": "openai/gpt-5.2", "created_at": 1.0}
@@ -664,8 +751,7 @@ def test_google_chat_remains_visible_in_history_after_done(frame, monkeypatch):
 
     choices = list(frame.history_list.GetStrings())
     assert frame.history_ids[0] == "chat-google"
-    assert choices[0].startswith("[当前] ")
-    assert choices[0] == "[当前] 新聊天"
+    assert choices[0] == "新聊天"
     assert frame.archived_chats == []
 
 
@@ -881,7 +967,7 @@ def test_new_chat_immediately_appears_in_history_with_placeholder_title(frame):
 
     frame._on_new_chat_clicked(None)
 
-    assert list(frame.history_list.GetStrings()) == ["[当前] 心聊天"]
+    assert list(frame.history_list.GetStrings()) == ["心聊天"]
 
 
 def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
@@ -1859,6 +1945,56 @@ def test_global_ctrl_callback_forwarding(frame):
     assert seen == [(True, "right"), (False, "left")]
 
 
+def test_global_ctrl_arrow_navigates_history_when_app_is_foreground(frame, monkeypatch):
+    seen = []
+    monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (True, {"frame_hwnd": 1, "fg_hwnd": 1, "root_hwnd": 1}))
+    monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
+
+    frame._on_global_ctrl_arrow("right")
+    frame._on_global_ctrl_arrow("left")
+
+    assert seen == [1, -1]
+
+
+def test_global_ctrl_arrow_noops_when_app_is_not_foreground(frame, monkeypatch):
+    seen = []
+    monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (False, {"frame_hwnd": 1, "fg_hwnd": 2, "root_hwnd": 2}))
+    monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
+
+    frame._on_global_ctrl_arrow("right")
+
+    assert seen == []
+
+
+def test_global_ctrl_arrow_logs_reason_when_app_is_not_foreground(frame, monkeypatch):
+    statuses = []
+    monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (False, {"frame_hwnd": 1, "fg_hwnd": 2, "root_hwnd": 2}))
+    monkeypatch.setattr(frame, "SetStatusText", statuses.append)
+
+    frame._on_global_ctrl_arrow("right")
+
+    log_text = (frame.app_data_dir / "ctrl_navigation_debug.log").read_text(encoding="utf-8")
+    assert "direction=right" in log_text
+    assert "reason=inactive_target" in log_text
+    assert statuses[-1] == "Ctrl+左右未生效：当前前台焦点不属于本程序"
+
+
+def test_global_ctrl_arrow_logs_successful_navigation(frame, monkeypatch):
+    statuses = []
+    seen = []
+    monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (True, {"frame_hwnd": 1, "fg_hwnd": 1, "root_hwnd": 1}))
+    monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
+    monkeypatch.setattr(frame, "SetStatusText", statuses.append)
+
+    frame._on_global_ctrl_arrow("left")
+
+    log_text = (frame.app_data_dir / "ctrl_navigation_debug.log").read_text(encoding="utf-8")
+    assert seen == [-1]
+    assert "direction=left" in log_text
+    assert "result=navigated" in log_text
+    assert statuses == []
+
+
 def test_global_ctrl_combo_key_filter_ignores_ime_and_modifiers():
     hook = main.GlobalCtrlTapHook(lambda *_a, **_k: None)
     assert not hook._should_mark_combo_key(main.VK_PROCESSKEY)
@@ -1951,6 +2087,17 @@ def test_voice_result_writes_then_speaks_after_200ms(frame, monkeypatch):
 
     frame._on_voice_result("语音文本！！！", mode=main.MODE_DIRECT)
     assert order == [("insert", "语音文本！！！"), ("delay", 200), ("speak", "语音文本！！！")]
+
+
+def test_voice_result_speaks_immediately_when_delay_schedule_unavailable(frame, monkeypatch):
+    order = []
+    frame._insert_text_to_system_focus = lambda text: order.append(("insert", text)) or True
+    frame._speak_text_via_screen_reader = lambda text: order.append(("speak", text))
+    monkeypatch.setattr(main.wx, "CallLater", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("timer unavailable")))
+
+    frame._on_voice_result("语音文本！！！", mode=main.MODE_DIRECT)
+
+    assert order == [("insert", "语音文本！！！"), ("speak", "语音文本！！！")]
 
 
 def test_voice_result_prefers_local_editor_without_system_injection(frame, monkeypatch):
@@ -2665,14 +2812,14 @@ def test_submit_question_renames_placeholder_history_chat_immediately(frame, mon
     monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
 
     frame._on_new_chat_clicked(None)
-    assert list(frame.history_list.GetStrings()) == ["[当前] 心聊天"]
+    assert list(frame.history_list.GetStrings()) == ["心聊天"]
 
     ok, message = frame._submit_question("帮我整理安卓自动化测试方案", source="local", model="openai/gpt-5.2")
 
     assert ok is True
     assert message == ""
     items = list(frame.history_list.GetStrings())
-    assert items == ["[当前] 心聊天"]
+    assert items == ["心聊天"]
 
 
 def test_next_default_chat_title_uses_xinliaotian_sequence(frame):
@@ -2683,6 +2830,25 @@ def test_next_default_chat_title_uses_xinliaotian_sequence(frame):
     frame._current_chat_state["title"] = "别的标题"
 
     assert frame._next_default_chat_title() == "心聊天2"
+
+
+def test_next_default_chat_title_treats_legacy_placeholder_as_default(frame):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "新聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-b", "title": "心聊天1", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+    ]
+
+    assert frame._next_default_chat_title() == "心聊天2"
+
+
+def test_refresh_history_normalizes_legacy_placeholder_title(frame):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "新聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+    ]
+
+    frame._refresh_history()
+
+    assert list(frame.history_list.GetStrings()) == ["心聊天"]
 
 
 def test_generate_first_question_title_retries_three_times_then_keeps_default(frame, monkeypatch):
@@ -2697,8 +2863,35 @@ def test_generate_first_question_title_retries_three_times_then_keeps_default(fr
 
     title = frame._generate_first_question_title("帮我整理安卓自动化测试方案")
 
-    assert title == ""
+    assert title == "自动化测试"
     assert seen["calls"] == 3
+
+
+def test_apply_generated_first_question_title_accepts_legacy_default_title(frame, monkeypatch):
+    saved = []
+    pushed = []
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "新聊天",
+            "title_manual": False,
+            "title_source": "default",
+            "title_updated_at": 1.0,
+            "title_revision": 1,
+            "turns": [],
+        }
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: saved.append(True))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
+
+    frame._apply_generated_first_question_title("chat-current", "帮我整理安卓自动化测试方案", "自动化测试")
+
+    assert frame._current_chat_state["title"] == "自动化测试"
+    assert frame._current_chat_state["title_source"] == "auto"
+    assert saved == [True]
+    assert pushed == ["chat-current"]
 
 
 def test_schedule_first_question_auto_title_respects_manual_lock(frame, monkeypatch):
@@ -2735,6 +2928,66 @@ def test_schedule_first_question_auto_title_respects_manual_lock(frame, monkeypa
     assert pushed == []
 
 
+def test_enter_history_view_updates_view_state_and_focus(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "hist-1", "title": "聊天1", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+    ]
+    rendered = []
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: rendered.append(True))
+
+    assert frame._enter_history_view("hist-1") is True
+
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-1"
+    assert rendered == [True]
+    assert frame.answer_list.HasFocus()
+
+
+def test_enter_active_view_clears_history_view_state(frame, monkeypatch):
+    frame.view_mode = "history"
+    frame.view_history_id = "hist-1"
+    frame.archived_chats = [
+        {"id": "hist-1", "title": "聊天1", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+    ]
+    rendered = []
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: rendered.append(True))
+
+    frame._enter_active_view(focus_answer_list=True)
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert rendered == [True]
+    assert frame.answer_list.HasFocus()
+
+
+def test_resolve_chat_target_returns_current_chat_for_blank_id(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+
+    chat, is_current = frame._resolve_chat_target("")
+
+    assert chat is frame._current_chat_state
+    assert is_current is True
+
+
+def test_resolve_chat_target_returns_archived_chat_for_history_id(frame):
+    archived = {
+        "id": "hist-1",
+        "title": "历史聊天",
+        "turns": [],
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    frame.archived_chats = [archived]
+
+    chat, is_current = frame._resolve_chat_target("hist-1")
+
+    assert chat is archived
+    assert is_current is False
+
+
 def test_compact_first_question_title_removes_request_wrappers(frame):
     title = frame._compact_first_question_title("帮我梳理桌面端聊天命名规则怎么改")
 
@@ -2763,6 +3016,42 @@ def test_generate_first_question_title_compacts_verbose_model_output(frame, monk
     title = frame._generate_first_question_title("给我推荐一些好吃的")
 
     assert title == "美食推荐"
+
+
+def test_generate_first_question_title_ignores_answer_style_output_for_question(frame, monkeypatch):
+    class _AnsweringClient:
+        def generate_chat_title(self, _prompt):
+            return "MCP 是一种模型上下文协议"
+
+    monkeypatch.setattr(main, "ChatClient", lambda *args, **kwargs: _AnsweringClient())
+
+    title = frame._generate_first_question_title("什么是 MCP 协议？")
+
+    assert title == "MCP 协议"
+
+
+def test_summarize_recent_topic_uses_normalized_default_title(frame):
+    assert frame._summarize_recent_topic([], "") == main.EMPTY_CURRENT_CHAT_TITLE
+
+
+def test_apply_archived_title_normalizes_legacy_placeholder_fallback(frame, monkeypatch):
+    frame.archived_chats = [
+        {
+            "id": "chat-old",
+            "title": "新聊天",
+            "title_manual": False,
+            "turns": [],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+
+    frame._apply_archived_title("chat-old", "")
+
+    archived = frame._find_archived_chat("chat-old")
+    assert archived["title"] == main.EMPTY_CURRENT_CHAT_TITLE
 
 
 def test_load_chat_title_rules_reads_shared_json(tmp_path):
@@ -2945,71 +3234,30 @@ def test_notes_transport_broadcasts_conflict_and_sync_status(frame):
     assert "notes_sync_status" in types
 
 
-def test_remote_notes_apis_delegate_to_notes_sync(frame):
-    class _FakeNotesSync:
-        def __init__(self):
-            self.snapshot_calls = 0
-            self.pull_calls = []
-            self.push_calls = []
-            self.subscribe_calls = []
-            self.ack_calls = []
-            self.ping_calls = 0
-
-        def snapshot(self):
-            self.snapshot_calls += 1
-            return {"cursor": "10", "notebooks": [], "entries": []}
-
-        def pull_since(self, cursor):
-            self.pull_calls.append(cursor)
-            return {"cursor": f"{cursor}-next", "ops": []}
-
-        def push_ops(self, ops):
-            self.push_calls.append(list(ops))
-            return {"cursor": "11", "applied": [], "conflicts": []}
-
-        def subscribe(self, payload=None):
-            self.subscribe_calls.append(dict(payload or {}))
-            return {"cursor": "12", "subscribed": True}
-
-        def ack(self, payload=None):
-            self.ack_calls.append(dict(payload or {}))
-            return {"cursor": "13", "acked": True}
-
-        def ping(self, payload=None):
-            self.ping_calls += 1
-            return {"cursor": "14", "pong": True}
-
-    fake = _FakeNotesSync()
-    frame.notes_sync = fake
-
+def test_remote_notes_apis_return_retired(frame):
     status, body = frame._remote_api_notes_snapshot(None)
-    assert status == 200
-    assert body["cursor"] == "10"
+    assert status == 410
+    assert body["error"] == "retired"
 
     status, body = frame._remote_api_notes_pull_since({"cursor": "7"})
-    assert status == 200
-    assert body["cursor"] == "7-next"
-    assert fake.pull_calls == ["7"]
+    assert status == 410
+    assert body["error"] == "retired"
 
     status, body = frame._remote_api_notes_push_ops({"ops": [{"entity_type": "entry"}]})
-    assert status == 200
-    assert body["cursor"] == "11"
-    assert fake.push_calls == [[{"entity_type": "entry"}]]
+    assert status == 410
+    assert body["error"] == "retired"
 
     status, body = frame._remote_api_notes_subscribe({"cursor": "1"})
-    assert status == 200
-    assert body["cursor"] == "12"
-    assert fake.subscribe_calls == [{"cursor": "1"}]
+    assert status == 410
+    assert body["error"] == "retired"
 
     status, body = frame._remote_api_notes_ack({"op_ids": ["op-1"]})
-    assert status == 200
-    assert body["cursor"] == "13"
-    assert fake.ack_calls == [{"op_ids": ["op-1"]}]
+    assert status == 410
+    assert body["error"] == "retired"
 
     status, body = frame._remote_api_notes_ping({"cursor": "9"})
-    assert status == 200
-    assert body["cursor"] == "14"
-    assert fake.ping_calls == 1
+    assert status == 410
+    assert body["error"] == "retired"
 
 def test_title_source_turns_keeps_only_first_question(frame):
     turns = [

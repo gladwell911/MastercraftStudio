@@ -2,9 +2,12 @@ import asyncio
 import time
 
 from aiohttp import ClientSession
+import requests
 
 import main
 from codex_client import CodexEvent
+from remote_http import RemoteControlHttpServer
+from remote_ws import RemoteWebSocketServer
 
 
 async def _ws_connect(port: int, token: str):
@@ -394,6 +397,129 @@ def test_remote_api_state_includes_codex_answer_filter_setting(frame):
 
     assert status == 200
     assert body["settings"]["codex_answer_english_filter_enabled"] is True
+
+
+def test_remote_notes_helpers_return_retired(frame):
+    status, body = frame._remote_api_notes_pull_since({"cursor": "7"})
+
+    assert status == 410
+    assert body["error"] == "retired"
+    assert "CouchDB" in body["message"]
+
+
+def test_remote_notes_http_api_is_retired(frame, monkeypatch):
+    server = RemoteControlHttpServer(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        on_message=lambda payload: (200, {"accepted": True}),
+        on_new_chat=lambda payload: (200, {"accepted": True}),
+        on_reply_request=lambda payload: (200, {"accepted": True}),
+        on_state=lambda: (200, {"accepted": True, "status": "idle"}),
+        on_notes_snapshot=frame._remote_api_notes_snapshot,
+        on_notes_pull_since=frame._remote_api_notes_pull_since,
+        on_notes_push_ops=frame._remote_api_notes_push_ops,
+        on_notes_subscribe=frame._remote_api_notes_subscribe,
+        on_notes_ack=frame._remote_api_notes_ack,
+        on_notes_ping=frame._remote_api_notes_ping,
+    )
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+        headers = {"X-Remote-Token": "secret"}
+
+        response = requests.get(f"{base}/api/remote/notes_snapshot", headers=headers, timeout=5)
+        assert response.status_code == 410
+        assert response.json()["error"] == "retired"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_pull_since",
+            headers=headers,
+            json={"cursor": "7"},
+            timeout=5,
+        )
+        assert response.status_code == 410
+        assert response.json()["message"]
+
+        response = requests.post(
+            f"{base}/api/remote/notes_push_ops",
+            headers=headers,
+            json={"ops": [{"entity_type": "entry"}]},
+            timeout=5,
+        )
+        assert response.status_code == 410
+        assert response.json()["error"] == "retired"
+
+        response = requests.post(
+            f"{base}/api/remote/notes_ack",
+            headers=headers,
+            json={"op_ids": ["op-1"]},
+            timeout=5,
+        )
+        assert response.status_code == 410
+        assert response.json()["error"] == "retired"
+    finally:
+        server.stop()
+
+
+def test_remote_notes_ws_api_is_retired(frame, monkeypatch):
+    server = RemoteWebSocketServer(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        on_message=lambda payload: (200, {"accepted": True}),
+        on_new_chat=lambda payload: (200, {"accepted": True}),
+        on_reply_request=lambda payload: (200, {"accepted": True}),
+        on_state=lambda _payload=None: (200, {"accepted": True, "status": "idle"}),
+        on_rename_chat=frame._remote_api_rename_chat_ui,
+        on_update_settings=frame._remote_api_update_settings_ui,
+        on_history_list=frame._remote_api_history_list_ui,
+        on_history_read=frame._remote_api_history_read_ui,
+        on_notes_snapshot=frame._remote_api_notes_snapshot,
+        on_notes_pull_since=frame._remote_api_notes_pull_since,
+        on_notes_push_ops=frame._remote_api_notes_push_ops,
+        on_notes_subscribe=frame._remote_api_notes_subscribe,
+        on_notes_ack=frame._remote_api_notes_ack,
+        on_notes_ping=frame._remote_api_notes_ping,
+    )
+    server.start()
+    try:
+        async def _run():
+            session, ws = await _ws_connect(server.bound_port, "secret")
+            try:
+                await _wait_for_type(ws, "connected")
+
+                await ws.send_json({"id": "ns1", "type": "notes_snapshot"})
+                response = await _wait_for_type(ws, "response")
+                assert response["id"] == "ns1"
+                assert response["status"] == 410
+                assert response["ok"] is False
+                assert response["body"]["error"] == "retired"
+
+                await ws.send_json({"id": "np1", "type": "notes_pull_since", "cursor": "7"})
+                response = await _wait_for_type(ws, "response")
+                assert response["id"] == "np1"
+                assert response["status"] == 410
+                assert response["body"]["message"]
+
+                await ws.send_json({"id": "nps", "type": "notes_push_ops", "ops": []})
+                response = await _wait_for_type(ws, "response")
+                assert response["id"] == "nps"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
+
+                await ws.send_json({"id": "na", "type": "notes_ack", "op_ids": ["op-1"]})
+                response = await _wait_for_type(ws, "response")
+                assert response["id"] == "na"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
+            finally:
+                await ws.close()
+                await session.close()
+
+        asyncio.run(_run())
+    finally:
+        server.stop()
 
 
 def test_remote_ws_reply_request_handles_pending(frame, monkeypatch):

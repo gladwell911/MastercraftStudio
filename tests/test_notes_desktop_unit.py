@@ -1869,7 +1869,7 @@ def test_remote_refresh_preserves_intentionally_empty_edit_draft(frame):
     assert frame.notes_editor.GetValue() == ""
 
 
-def test_remote_notes_push_ops_broadcasts_changed_once(frame):
+def test_remote_notes_push_ops_returns_retired_without_broadcast(frame):
     seen = []
 
     class _FakeServer:
@@ -1897,10 +1897,13 @@ def test_remote_notes_push_ops_broadcasts_changed_once(frame):
         }
     )
 
-    assert [item.get("type") for item in seen].count("notes_changed") == 1
+    assert seen == []
+    status, body = frame._remote_api_notes_push_ops({"ops": []})
+    assert status == 410
+    assert body["error"] == "retired"
 
 
-def test_notes_push_ops_returns_acked_op_ids(tmp_path):
+def test_notes_push_ops_does_not_synthesize_acked_op_ids(tmp_path):
     store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
     store.initialize()
     sync = main.NotesSyncService(store)
@@ -1917,7 +1920,7 @@ def test_notes_push_ops_returns_acked_op_ids(tmp_path):
         ]
     )
 
-    assert result["acked"] == ["op-1"]
+    assert result["acked"] == []
 
 
 def test_notes_notebook_list_is_visible_in_main_view(frame):

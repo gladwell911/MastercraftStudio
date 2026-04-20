@@ -255,49 +255,24 @@ def test_legacy_push_ops_does_not_synthesize_acked_ids(frame):
     assert result["acked"] == []
 
 
-def test_legacy_notes_websocket_path_remains_active(frame, monkeypatch):
+def test_legacy_notes_websocket_path_is_retired(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
-
-    seen_pushes: list[list[dict]] = []
-
-    class _FakeNotesSync:
-        def snapshot(self):
-            return {"cursor": "10", "notebooks": [{"id": "nb-1"}], "entries": []}
-
-        def pull_since(self, cursor):
-            return {"cursor": f"{cursor}-next", "ops": [{"entity_type": "entry", "entity_id": "entry-1"}]}
-
-        def push_ops(self, ops):
-            seen_pushes.append(list(ops))
-            result = {"cursor": "11", "applied": [], "conflicts": [], "acked": []}
-            frame._on_notes_sync_push_result(result)
-            return result
-
-        def subscribe(self, payload=None):
-            return {"cursor": "12", "subscribed": True, "request": dict(payload or {})}
-
-        def ack(self, payload=None):
-            return {"cursor": "13", "acked": [], "request": dict(payload or {})}
-
-        def ping(self, payload=None):
-            return {"cursor": "14", "pong": True, "request": dict(payload or {})}
-
-    frame.notes_sync = _FakeNotesSync()
     frame._start_remote_ws_server_if_configured()
     try:
         async def _run():
             session_a, ws_a = await _connect_notes_client(frame._remote_ws_server.bound_port)
-            session_b, ws_b = await _connect_notes_client(frame._remote_ws_server.bound_port)
             try:
-                subscribe = await _request(ws_b, {"id": "sub-1", "type": "notes_subscribe", "cursor": "0"})
-                assert subscribe["ok"] is True
-                assert subscribe["body"]["cursor"] == "12"
+                subscribe = await _request(ws_a, {"id": "sub-1", "type": "notes_subscribe", "cursor": "0"})
+                assert subscribe["ok"] is False
+                assert subscribe["status"] == 410
+                assert subscribe["body"]["error"] == "retired"
 
-                pull = await _request(ws_b, {"id": "pull-1", "type": "notes_pull_since", "cursor": "7"})
-                assert pull["ok"] is True
-                assert pull["body"]["cursor"] == "7-next"
+                pull = await _request(ws_a, {"id": "pull-1", "type": "notes_pull_since", "cursor": "7"})
+                assert pull["ok"] is False
+                assert pull["status"] == 410
+                assert pull["body"]["error"] == "retired"
 
                 push = await _request(
                     ws_a,
@@ -307,20 +282,14 @@ def test_legacy_notes_websocket_path_remains_active(frame, monkeypatch):
                         "ops": [{"op_id": "op-1", "entity_type": "entry", "entity_id": "entry-1", "action": "create"}],
                     },
                 )
-                assert push["ok"] is True
-                assert push["body"]["cursor"] == "11"
-                assert push["body"]["acked"] == []
-
-                changed = await _wait_for_event(ws_b, "notes_changed")
-                assert changed["cursor"] == "11"
+                assert push["ok"] is False
+                assert push["status"] == 410
+                assert push["body"]["error"] == "retired"
             finally:
                 await ws_a.close()
-                await ws_b.close()
                 await session_a.close()
-                await session_b.close()
 
         asyncio.run(_run())
-        assert seen_pushes == [[{"op_id": "op-1", "entity_type": "entry", "entity_id": "entry-1", "action": "create"}]]
     finally:
         frame._remote_ws_server.stop()
         frame._remote_ws_server = None
@@ -378,3 +347,48 @@ def test_desktop_sync_pushes_dirty_documents_to_couchdb_and_clears_dirty_state(f
     assert entry_row.dirty is False
     assert notebook_row.rev
     assert entry_row.rev
+
+
+def test_desktop_remote_server_applies_mobile_bulk_docs_and_serves_changes(frame, monkeypatch):
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+
+    mobile_docs = [
+        {
+            "_id": "notebook:mobile-note",
+            "type": "notebook",
+            "title": "Mobile note",
+            "created_at": "2026-04-20T01:00:00+00:00",
+            "updated_at": "2026-04-20T01:00:00+00:00",
+        },
+        {
+            "_id": "entry:mobile-entry",
+            "type": "entry",
+            "notebook_id": "notebook:mobile-note",
+            "content": "mobile body " * 200,
+            "sort_order": 1,
+            "source": "manual",
+            "created_at": "2026-04-20T01:00:00+00:00",
+            "updated_at": "2026-04-20T01:00:00+00:00",
+        },
+    ]
+    status, response = frame._remote_api_notes_couchdb_bulk_docs({"database": "zhuge_notes", "docs": mobile_docs})
+    assert status == 201
+    assert response[0]["id"] == "notebook:mobile-note"
+
+    notebook = frame.notes_store.get_notebook("mobile-note")
+    entries = frame.notes_store.list_entries("mobile-note")
+    assert notebook is not None
+    assert notebook.title == "Mobile note"
+    assert any(item.id == "mobile-entry" and "mobile body" in item.content for item in entries)
+
+    desktop_notebook = frame.notes_store.create_notebook("Desktop e2e")
+    frame.notes_store.create_entry(desktop_notebook.id, "desktop entry", source="manual")
+
+    status, payload = frame._remote_api_notes_couchdb_changes(
+        {"database": "zhuge_notes", "since": "0", "include_docs": True}
+    )
+    assert status == 200
+    ids = {row["id"] for row in payload["results"]}
+    assert f"notebook:{desktop_notebook.id}" in ids
+    assert "notebook:mobile-note" in ids
+    assert payload["last_seq"] == frame.notes_store.current_cursor()

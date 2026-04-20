@@ -1,6 +1,7 @@
 import asyncio
 
 from aiohttp import ClientSession
+import requests
 
 from remote_ws import RemoteWebSocketServer
 
@@ -77,7 +78,7 @@ def test_remote_ws_server_routes_and_auth():
         server.stop()
 
 
-def test_remote_ws_server_routes_notes_apis():
+def test_remote_ws_server_retires_notes_apis():
     server = RemoteWebSocketServer(
         host="127.0.0.1",
         port=0,
@@ -86,12 +87,6 @@ def test_remote_ws_server_routes_notes_apis():
         on_new_chat=lambda payload: (200, {"accepted": True}),
         on_reply_request=lambda payload: (200, {"accepted": True}),
         on_state=lambda: (200, {"accepted": True, "status": "idle"}),
-        on_notes_snapshot=lambda _payload=None: (200, {"accepted": True, "cursor": "9", "notebooks": [], "entries": []}),
-        on_notes_pull_since=lambda payload: (200, {"accepted": True, "cursor": payload.get("cursor"), "ops": []}),
-        on_notes_push_ops=lambda payload: (200, {"accepted": True, "cursor": "10", "applied": payload.get("ops") or [], "conflicts": []}),
-        on_notes_subscribe=lambda payload: (200, {"accepted": True, "cursor": "11", "subscribed": True, "payload": payload}),
-        on_notes_ack=lambda payload: (200, {"accepted": True, "cursor": "12", "acked": payload.get("op_ids") or []}),
-        on_notes_ping=lambda payload: (200, {"accepted": True, "cursor": "13", "pong": True, "payload": payload}),
     )
     server.start()
     try:
@@ -101,31 +96,102 @@ def test_remote_ws_server_routes_notes_apis():
                 await ws.receive()
                 await ws.send_json({"id": "ns1", "type": "notes_snapshot"})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "9"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
 
                 await ws.send_json({"id": "np1", "type": "notes_pull_since", "cursor": "7"})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "7"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
 
                 await ws.send_json({"id": "nps", "type": "notes_push_ops", "ops": [{"entity_type": "entry"}]})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "10"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
 
                 await ws.send_json({"id": "nss", "type": "notes_subscribe", "cursor": "8"})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "11"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
 
                 await ws.send_json({"id": "na", "type": "notes_ack", "op_ids": ["op-1"]})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "12"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
 
                 await ws.send_json({"id": "np", "type": "notes_ping", "cursor": "9"})
                 response = (await ws.receive()).json()
-                assert response["body"]["cursor"] == "13"
+                assert response["status"] == 410
+                assert response["body"]["error"] == "retired"
             finally:
                 await ws.close()
                 await session.close()
 
         asyncio.run(_run())
+    finally:
+        server.stop()
+
+
+def test_remote_ws_server_exposes_couchdb_compatible_notes_routes():
+    server = RemoteWebSocketServer(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        on_message=lambda payload: (200, {"accepted": True}),
+        on_new_chat=lambda payload: (200, {"accepted": True}),
+        on_reply_request=lambda payload: (200, {"accepted": True}),
+        on_state=lambda: (200, {"accepted": True, "status": "idle"}),
+        on_notes_couchdb_changes=lambda payload: (
+            200,
+            {
+                "results": [
+                    {
+                        "seq": "3",
+                        "id": "notebook:shared-note",
+                        "doc": {
+                            "_id": "notebook:shared-note",
+                            "_rev": "2-rev",
+                            "type": "notebook",
+                            "title": "shared note",
+                        },
+                    }
+                ],
+                "last_seq": "3",
+            },
+        ),
+        on_notes_couchdb_bulk_docs=lambda payload: (
+            201,
+            [{"id": doc.get("_id"), "ok": True, "rev": "2-rev"} for doc in list(payload.get("docs") or [])],
+        ),
+    )
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.bound_port}"
+
+        response = requests.get(
+            f"{base}/notes_couchdb/zhuge_notes/_changes",
+            params={"since": "0", "include_docs": "true", "token": "secret"},
+            timeout=5,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["last_seq"] == "3"
+        assert body["results"][0]["doc"]["title"] == "shared note"
+
+        response = requests.post(
+            f"{base}/notes_couchdb/zhuge_notes/_bulk_docs?token=secret",
+            json={
+                "docs": [
+                    {
+                        "_id": "notebook:shared-note",
+                        "type": "notebook",
+                        "title": "shared note",
+                    }
+                ]
+            },
+            timeout=5,
+        )
+        assert response.status_code == 201
+        assert response.json()[0]["id"] == "notebook:shared-note"
     finally:
         server.stop()

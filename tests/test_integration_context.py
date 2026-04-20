@@ -126,8 +126,8 @@ def test_activate_history_enters_history_view_without_reordering_or_archiving(fr
     assert frame.current_chat_id == "chat-current"
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-2"
-    assert frame.history_ids == ["chat-current", "hist-2", "hist-1"]
-    assert frame.history_list.GetSelection() == 1
+    assert frame.history_ids == ["hist-2", "chat-current", "hist-1"]
+    assert frame.history_list.GetSelection() == 0
     assert frame.answer_list.GetString(1) == "历史问题"
 
 
@@ -168,6 +168,98 @@ def test_history_enter_switches_view_while_current_reply_is_pending(frame, monke
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
     assert frame.answer_list.GetString(1) == "历史问题"
+
+
+def test_history_activation_preserves_empty_new_chat_and_can_switch_back(frame):
+    frame.active_chat_id = "chat-new"
+    frame.current_chat_id = "chat-new"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-new",
+            "title": main.EMPTY_CURRENT_CHAT_TITLE,
+            "title_manual": False,
+            "turns": [],
+        }
+    )
+    frame.active_session_turns = []
+    frame.archived_chats = [
+        {
+            "id": "hist-1",
+            "title": "历史会话",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": 1.0}],
+        }
+    ]
+
+    frame._refresh_history("hist-1")
+    frame.history_list.SetSelection(frame.history_ids.index("hist-1"))
+
+    assert frame._activate_selected_history() is True
+    assert frame.current_chat_id == "chat-new"
+    assert frame.active_chat_id == "chat-new"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-1"
+    assert frame.answer_list.GetString(1) == "历史问题"
+
+    frame.history_list.SetSelection(frame.history_ids.index("chat-new"))
+
+    assert frame._activate_selected_history() is True
+    assert frame.current_chat_id == "chat-new"
+    assert frame.active_chat_id == "chat-new"
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert "历史问题" not in list(frame.answer_list.GetStrings())
+
+
+def test_pending_current_reply_does_not_rename_viewed_history_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-new"
+    frame.current_chat_id = "chat-new"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-new",
+            "title": main.EMPTY_CURRENT_CHAT_TITLE,
+            "title_manual": False,
+            "title_source": "default",
+            "title_revision": 1,
+            "turns": [
+                {
+                    "question": "帮我整理自动化测试方案",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": "openai/gpt-5.2",
+                    "created_at": 10.0,
+                    "request_status": "pending",
+                }
+            ],
+        }
+    )
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame.archived_chats = [
+        {
+            "id": "hist-1",
+            "title": "旧聊天标题",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [{"question": "历史问题", "answer_md": "历史回答", "model": "openai/gpt-5.2", "created_at": 1.0}],
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
+
+    frame._refresh_history("hist-1")
+    frame.history_list.SetSelection(frame.history_ids.index("hist-1"))
+    assert frame._activate_selected_history() is True
+
+    frame._on_done(0, "自动化方案如下", "", "openai/gpt-5.2", "", "chat-new")
+
+    assert frame.archived_chats[0]["title"] == "旧聊天标题"
+    assert frame.active_session_turns[0]["answer_md"] == "自动化方案如下"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-1"
 
 
 def test_ctrl_history_navigation_walks_through_all_chats_in_order(frame):
@@ -218,6 +310,60 @@ def test_ctrl_history_navigation_reaches_all_chats_with_pinned_history(frame):
     assert frame._adjacent_history_chat_id(1) is None
 
 
+def test_ctrl_history_navigation_does_not_ping_pong_between_two_recent_chats(frame):
+    frame.current_chat_id = "chat-e"
+    frame.active_chat_id = "chat-e"
+    frame._current_chat_state["id"] = "chat-e"
+    frame._current_chat_state["title"] = "聊天E"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答", "created_at": 6.0}]
+    frame._current_chat_state["updated_at"] = 6.0
+    frame.active_session_turns = list(frame._current_chat_state["turns"])
+    frame.archived_chats = [
+        {"id": "chat-b", "title": "聊天B", "turns": [{"question": "B", "answer_md": "B"}], "created_at": 4.0, "updated_at": 4.0},
+        {"id": "chat-f", "title": "置顶F", "turns": [{"question": "F", "answer_md": "F"}], "created_at": 5.0, "updated_at": 5.0, "pinned": True},
+        {"id": "chat-c", "title": "置顶C", "turns": [{"question": "C", "answer_md": "C"}], "created_at": 3.0, "updated_at": 3.0, "pinned": True},
+        {"id": "chat-a", "title": "聊天A", "turns": [{"question": "A", "answer_md": "A"}], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-d", "title": "聊天D", "turns": [{"question": "D", "answer_md": "D"}], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-g", "title": "聊天G", "turns": [{"question": "G", "answer_md": "G"}], "created_at": 9.0, "updated_at": 9.0},
+    ]
+    frame._refresh_history()
+
+    seen = [frame.current_chat_id]
+    for _ in range(6):
+        assert frame._navigate_history_chats(1) is True
+        seen.append(frame.current_chat_id)
+
+    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+
+
+def test_ctrl_history_navigation_from_new_chat_keeps_recency_order_while_viewing_history(frame):
+    frame.current_chat_id = "chat-new"
+    frame.active_chat_id = "chat-new"
+    frame._current_chat_state["id"] = "chat-new"
+    frame._current_chat_state["title"] = main.EMPTY_CURRENT_CHAT_TITLE
+    frame._current_chat_state["turns"] = []
+    frame._current_chat_state["updated_at"] = 6.0
+    frame.archived_chats = [
+        {"id": "chat-b", "title": "聊天B", "turns": [], "created_at": 4.0, "updated_at": 4.0},
+        {"id": "chat-f", "title": "置顶F", "turns": [], "created_at": 5.0, "updated_at": 5.0, "pinned": True},
+        {"id": "chat-c", "title": "置顶C", "turns": [], "created_at": 3.0, "updated_at": 3.0, "pinned": True},
+        {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-d", "title": "聊天D", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-g", "title": "聊天G", "turns": [], "created_at": 9.0, "updated_at": 9.0},
+    ]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-f"
+    frame._refresh_history("chat-f")
+
+    assert frame._navigation_chat_ids() == ["chat-new", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+    assert frame._adjacent_history_chat_id(1) == "chat-g"
+    assert frame._switch_current_chat("chat-g") is True
+    assert frame.current_chat_id == "chat-g"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-f"
+    assert frame._adjacent_history_chat_id(1) == "chat-f"
+
+
 def test_global_hotkey_switches_visible_chat_content(frame, monkeypatch):
     frame.current_chat_id = "chat-current"
     frame.active_chat_id = "chat-current"
@@ -250,8 +396,8 @@ def test_global_hotkey_switches_visible_chat_content(frame, monkeypatch):
     assert frame.current_chat_id == "chat-next"
     assert frame.view_mode == "active"
     assert frame.view_history_id is None
-    assert frame.history_ids[0] == "chat-next"
-    assert frame.history_list.GetSelection() == 0
+    assert frame.history_ids == ["chat-pinned", "chat-next", "chat-old"]
+    assert frame.history_list.GetSelection() == frame.history_ids.index("chat-next")
     assert frame.answer_list.GetCount() == 4
     assert frame.answer_list.GetString(0) == "我"
     assert frame.answer_list.GetString(1) == "历史问题"
@@ -306,7 +452,7 @@ def test_submit_question_from_history_view_continues_selected_chat_without_dupli
     assert frame.active_chat_id == "hist-2"
     assert frame.view_mode == "active"
     assert frame.view_history_id is None
-    assert len(frame.archived_chats) == 2
+    assert len(frame.archived_chats) == 1
     assert len(frame.active_session_turns) == 2
     assert frame.active_session_turns[-1]["question"] == "继续追问"
     archived = frame._archive_active_session(quick_title=True, schedule_async_rename=False, save_after_archive=False)

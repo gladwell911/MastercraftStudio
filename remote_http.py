@@ -60,13 +60,7 @@ class RemoteControlHttpServer:
                     return
                 if self.path != "/api/remote/state":
                     if self.path == "/api/remote/notes_snapshot":
-                        if not callable(outer.on_notes_snapshot):
-                            outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                            return
-                        try:
-                            status, body = outer.on_notes_snapshot()
-                        except TypeError:
-                            status, body = outer.on_notes_snapshot({})
+                        status, body = outer._retired_notes_response()
                         outer._write_json(self, status, body)
                         return
                     outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
@@ -95,48 +89,27 @@ class RemoteControlHttpServer:
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_snapshot":
-                    if not callable(outer.on_notes_snapshot):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    try:
-                        status, body = outer.on_notes_snapshot()
-                    except TypeError:
-                        status, body = outer.on_notes_snapshot(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_pull_since":
-                    if not callable(outer.on_notes_pull_since):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    status, body = outer.on_notes_pull_since(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_push_ops":
-                    if not callable(outer.on_notes_push_ops):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    status, body = outer.on_notes_push_ops(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_subscribe":
-                    if not callable(outer.on_notes_subscribe):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    status, body = outer.on_notes_subscribe(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_ack":
-                    if not callable(outer.on_notes_ack):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    status, body = outer.on_notes_ack(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 if self.path == "/api/remote/notes_ping":
-                    if not callable(outer.on_notes_ping):
-                        outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
-                        return
-                    status, body = outer.on_notes_ping(payload)
+                    status, body = outer._retired_notes_response()
                     outer._write_json(self, status, body)
                     return
                 outer._write_json(self, 404, {"accepted": False, "error": "not_found"})
@@ -214,3 +187,11 @@ class RemoteControlHttpServer:
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
+
+    @staticmethod
+    def _retired_notes_response() -> tuple[int, dict]:
+        return 410, {
+            "accepted": False,
+            "error": "retired",
+            "message": "旧 notes 同步协议已退役，请使用 CouchDB 同步",
+        }
