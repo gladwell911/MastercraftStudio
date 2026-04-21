@@ -885,13 +885,15 @@ def test_notes_notebook_list_is_visible_in_main_view(frame):
 
 
 def test_notes_root_tab_path_keeps_chat_and_notes_controls_linked(frame):
-    assert frame.chat_tab_order[-1] is frame.answer_list
-    assert frame.root_tab_order[0] is frame.input_edit
-    assert frame.root_tab_order[3] is frame.model_combo
-    assert frame.root_tab_order[4] is frame.history_list
-    assert frame.root_tab_order[5] is frame.notes_notebook_list
-    assert frame.root_tab_order[-2] is frame.notes_entry_list
-    assert frame.root_tab_order[-1] is frame.notes_editor
+    assert frame.root_tab_order[0] is frame.notes_notebook_list
+    assert frame.root_tab_order[1] is frame.history_list
+    assert frame.root_tab_order[2] is frame.answer_list
+    assert frame.root_tab_order[3] is frame.input_edit
+    assert frame.chat_tab_order[0] is frame.notes_notebook_list
+    assert frame.chat_tab_order[1] is frame.history_list
+    assert frame.chat_tab_order[2] is frame.answer_list
+    assert frame.chat_tab_order[3] is frame.input_edit
+    assert frame.notes_tab_order[0] is frame.notes_notebook_list
 
 
 def test_notes_notebook_selection_only_changes_selection_until_enter(frame, monkeypatch):
@@ -1317,9 +1319,10 @@ def test_notes_remote_ops_refresh_ui_and_hint_current_editing_entry(frame, monke
 
 
 def test_notes_tab_order_links_chat_and_notes_controls(frame):
-    assert frame.chat_tab_order[3] is frame.model_combo
-    assert frame.chat_tab_order[4] is frame.history_list
-    assert frame.chat_tab_order[5] is frame.notes_notebook_list
+    assert frame.chat_tab_order[0] is frame.notes_notebook_list
+    assert frame.chat_tab_order[1] is frame.history_list
+    assert frame.chat_tab_order[2] is frame.answer_list
+    assert frame.chat_tab_order[3] is frame.input_edit
     assert frame.notes_tab_order[0] is frame.notes_notebook_list
     assert frame.notes_tab_order[1] is frame.notes_entry_list
     assert frame.notes_tab_order[-1] is frame.notes_editor
@@ -1331,9 +1334,9 @@ def test_notes_detail_view_moves_history_tab_target_to_entry_list(frame):
 
     frame._notes_select_notebook(notebook.id, view="note_detail")
 
-    assert frame.root_tab_order[4] is frame.history_list
-    assert frame.root_tab_order[5] is frame.notes_entry_list
-    assert frame.chat_tab_order[5] is frame.notes_entry_list
+    assert frame.root_tab_order[0] is frame.notes_entry_list
+    assert frame.root_tab_order[1] is frame.history_list
+    assert frame.chat_tab_order[0] is frame.notes_entry_list
     assert frame.notes_tab_order[0] is frame.notes_entry_list
     assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()

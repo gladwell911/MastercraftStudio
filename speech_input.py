@@ -12,7 +12,7 @@ MODE_OPTIMIZE = "optimize"
 
 
 class CtrlTapDetector:
-    def __init__(self, double_tap_ms: int = 350) -> None:
+    def __init__(self, double_tap_ms: int = 200) -> None:
         self.double_tap_s = double_tap_ms / 1000.0
         self._last_tap_by_side: dict[str, float] = {"left": 0.0, "right": 0.0}
         self._last_any_tap = 0.0
