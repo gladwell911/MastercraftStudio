@@ -435,6 +435,9 @@ class GlobalCtrlTapHook:
         self._hook_stale_seconds = 0.45
         self._emit_lock = threading.Lock()
         self._last_emit_at_by_side: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self._poller_left_down = False
+        self._poller_right_down = False
+        self._backend_state = "hook+poller"
 
     @staticmethod
     def _should_mark_combo_key(vk: int) -> bool:
@@ -484,6 +487,8 @@ class GlobalCtrlTapHook:
         self._thread = None
         self._fallback_thread = None
         self._thread_id = 0
+        self._poller_left_down = False
+        self._poller_right_down = False
 
     def _thread_main(self) -> None:
         user32 = ctypes.windll.user32
@@ -533,6 +538,7 @@ class GlobalCtrlTapHook:
             if self.on_error:
                 wx_call_after_if_alive(self.on_error, f"全局语音热键不可用（Windows Hook 安装失败，错误码 {err}）")
             self._using_fallback = True
+            self._backend_state = "poller_only"
             return
         self._last_hook_event_at = time.monotonic()
 
@@ -561,8 +567,6 @@ class GlobalCtrlTapHook:
     def _run_fallback_poller(self) -> None:
         # Fallback for environments where low-level hook is blocked or unreliable.
         user32 = ctypes.windll.user32
-        was_left_down = False
-        was_right_down = False
         try:
             while self._running:
                 left_down = bool(user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000)
@@ -570,26 +574,26 @@ class GlobalCtrlTapHook:
                 if (not self._hook or self._using_fallback) and (not self._fallback_notice_sent) and self.on_error:
                     self._fallback_notice_sent = True
                     wx_call_after_if_alive(self.on_error, "全局语音热键进入兼容模式（轮询）")
-                should_emit = self._should_use_poller_release()
-                if should_emit and was_left_down and (not left_down):
-                    self._emit_ctrl_keyup(False, "left")
-                if should_emit and was_right_down and (not right_down):
-                    self._emit_ctrl_keyup(False, "right")
-                was_left_down = left_down
-                was_right_down = right_down
+                self._process_poller_state(left_down=left_down, right_down=right_down)
                 time.sleep(0.015)
         finally:
             self._using_fallback = False
 
     def _should_use_poller_release(self) -> bool:
-        if not self._running:
-            return False
-        if not self._hook or self._using_fallback:
-            return True
-        last = float(self._last_hook_event_at or 0.0)
-        if last <= 0.0:
-            return True
-        return (time.monotonic() - last) >= self._hook_stale_seconds
+        return bool(self._running)
+
+    def _process_poller_state(self, *, left_down: bool, right_down: bool) -> None:
+        should_emit = self._should_use_poller_release()
+        prev_left_down = bool(self._poller_left_down)
+        prev_right_down = bool(self._poller_right_down)
+        self._poller_left_down = bool(left_down)
+        self._poller_right_down = bool(right_down)
+        if not should_emit:
+            return
+        if prev_left_down and (not left_down):
+            self._emit_ctrl_keyup(False, "left")
+        if prev_right_down and (not right_down):
+            self._emit_ctrl_keyup(False, "right")
 
     def _emit_ctrl_keyup(self, combo_used: bool, side: str) -> None:
         side_key = "right" if side == "right" else "left"
@@ -601,6 +605,12 @@ class GlobalCtrlTapHook:
                 return
             self._last_emit_at_by_side[side_key] = now
         wx_call_after_if_alive(self.on_ctrl_keyup, combo_used, side_key)
+
+    @property
+    def backend_state(self) -> str:
+        if self._using_fallback or not self._hook:
+            return "poller_only"
+        return self._backend_state
 
 
 class RenameDialog(wx.Dialog):
@@ -810,6 +820,12 @@ class ChatFrame(wx.Frame):
         self.remote_control_runtime_mode = "local"
         self.remote_control_runtime_bind = ""
         self.remote_control_runtime_url = ""
+        self.remote_control_runtime_status = {
+            "local_listener_ready": False,
+            "public_ws_ready": False,
+            "last_remote_error": "",
+            "published_url": "",
+        }
 
         self.history_ids = []
         self.answer_meta = []
@@ -828,6 +844,12 @@ class ChatFrame(wx.Frame):
         self._tray_icon = None
         self._show_hotkey_registered = False
         self._realtime_call_hotkey_registered_ids = set()
+        self.global_ctrl_backend_status = "hook+poller"
+        self.voice_screen_reader_status = {
+            "last_text": "",
+            "last_success": None,
+            "last_error": "",
+        }
         self.realtime_call_role = DEFAULT_REALTIME_CALL_ROLE
         self.realtime_call_speech_rate = DEFAULT_REALTIME_CALL_SPEECH_RATE
         self._voice_input = VoiceInputController(
@@ -3590,6 +3612,8 @@ class ChatFrame(wx.Frame):
                 "request_kind": request_kind,
                 "settings": {"codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled},
                 "last_event_id": self.active_codex_turn_id or self.active_openclaw_last_event_id or "",
+                "remote_runtime": dict(getattr(self, "remote_control_runtime_status", {}) or {}),
+                "remote_runtime_url": str(getattr(self, "remote_control_runtime_url", "") or ""),
             }
         )
         return 200, {"accepted": True, **chat}
@@ -3907,6 +3931,94 @@ class ChatFrame(wx.Frame):
             default=DEFAULT_REMOTE_CONTROL_TOKEN,
         )
 
+    def _is_process_elevated(self) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _runtime_environment_summary(self) -> dict:
+        runtime = self._remote_runtime_config()
+        return {
+            "is_frozen": bool(getattr(sys, "frozen", False)),
+            "is_elevated": self._is_process_elevated(),
+            "is_fixed_domain_remote_mode": bool(runtime["fixed_domain_mode"]),
+        }
+
+    def _set_remote_runtime_status(
+        self,
+        *,
+        local_listener_ready: bool | None = None,
+        public_ws_ready: bool | None = None,
+        last_remote_error: str | None = None,
+        published_url: str | None = None,
+    ) -> None:
+        status = dict(getattr(self, "remote_control_runtime_status", {}) or {})
+        status.setdefault("local_listener_ready", False)
+        status.setdefault("public_ws_ready", False)
+        status.setdefault("last_remote_error", "")
+        status.setdefault("published_url", "")
+        if local_listener_ready is not None:
+            status["local_listener_ready"] = bool(local_listener_ready)
+        if public_ws_ready is not None:
+            status["public_ws_ready"] = bool(public_ws_ready)
+        if last_remote_error is not None:
+            status["last_remote_error"] = str(last_remote_error or "")
+        if published_url is not None:
+            status["published_url"] = str(published_url or "")
+        self.remote_control_runtime_status = status
+        self.remote_control_runtime_url = status["published_url"] if status["public_ws_ready"] else ""
+
+    def _format_remote_startup_error(self, message: str) -> str:
+        env = self._runtime_environment_summary()
+        return (
+            f"{message} "
+            f"(frozen={env['is_frozen']}, elevated={env['is_elevated']}, fixed_domain={env['is_fixed_domain_remote_mode']})"
+        )
+
+    def _stop_remote_servers(self) -> None:
+        server = getattr(self, "_remote_ws_server", None)
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                pass
+        self._remote_ws_server = None
+        http_server = getattr(self, "_remote_http_server", None)
+        if http_server is not None:
+            try:
+                http_server.stop()
+            except Exception:
+                pass
+        self._remote_http_server = None
+
+    def _start_remote_servers(self, *, token: str, host: str, port: int) -> None:
+        self._start_remote_http_server_if_configured(token=token, host=host, port=port + 1)
+        self._remote_ws_server = RemoteWebSocketServer(
+            host=host,
+            port=port,
+            token=token,
+            on_message=self._remote_api_message_ui,
+            on_new_chat=self._remote_api_new_chat_ui,
+            on_reply_request=self._remote_api_reply_request_ui,
+            on_state=self._remote_api_state_ui,
+            on_rename_chat=self._remote_api_rename_chat_ui,
+            on_update_settings=self._remote_api_update_settings_ui,
+            on_history_list=self._remote_api_history_list_ui,
+            on_history_read=self._remote_api_history_read_ui,
+            on_notes_snapshot=self._remote_api_notes_snapshot,
+            on_notes_pull_since=self._remote_api_notes_pull_since,
+            on_notes_push_ops=self._remote_api_notes_push_ops,
+            on_notes_subscribe=self._remote_api_notes_subscribe,
+            on_notes_ack=self._remote_api_notes_ack,
+            on_notes_ping=self._remote_api_notes_ping,
+            on_notes_couchdb_changes=self._remote_api_notes_couchdb_changes,
+            on_notes_couchdb_bulk_docs=self._remote_api_notes_couchdb_bulk_docs,
+        )
+        self._remote_ws_server.start()
+
     def _build_remote_ws_url(self) -> str:
         token = self._read_remote_control_token()
         if not token:
@@ -4044,27 +4156,46 @@ class ChatFrame(wx.Frame):
         runtime = self._remote_runtime_config()
         if not runtime["fixed_domain_mode"] or getattr(self, "_remote_ws_server", None) is None:
             return
+        self._set_remote_runtime_status(
+            local_listener_ready=False,
+            public_ws_ready=False,
+            last_remote_error="",
+            published_url=published_url,
+        )
         port = int(getattr(self._remote_ws_server, "bound_port", 0) or runtime["port"] or 0)
         if port <= 0:
-            raise RuntimeError("远程控制本地监听端口无效。")
+            raise RuntimeError(self._format_remote_startup_error("远程控制本地监听端口无效。"))
         if not self._remote_local_listener_ready(port):
-            raise RuntimeError(f"远程控制端口 {port} 未正常监听。")
+            raise RuntimeError(self._format_remote_startup_error(f"远程控制端口 {port} 未正常监听。"))
+        self._set_remote_runtime_status(local_listener_ready=True, published_url=published_url)
         local_ok, local_detail = self._verify_remote_local_health(token, port)
         if not local_ok:
-            raise RuntimeError(local_detail or "远程控制本地健康检查失败。")
+            raise RuntimeError(self._format_remote_startup_error(local_detail or "远程控制本地健康检查失败。"))
         if not self._start_cloudflared_service():
-            raise RuntimeError("cloudflared 服务未安装或无法启动。")
+            raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
         public_ok, public_detail = self._verify_remote_public_ws(published_url)
         if public_ok:
+            self._set_remote_runtime_status(
+                local_listener_ready=True,
+                public_ws_ready=True,
+                last_remote_error="",
+                published_url=published_url,
+            )
             self.SetStatusText(
                 f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
             )
             return
         if not self._restart_cloudflared_service():
-            raise RuntimeError(public_detail or "cloudflared 重启失败。")
+            raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 重启失败。"))
         public_ok, public_detail = self._verify_remote_public_ws(published_url)
         if not public_ok:
-            raise RuntimeError(public_detail or "rc.tingyou.cc 公网隧道验证失败。")
+            raise RuntimeError(self._format_remote_startup_error(public_detail or "rc.tingyou.cc 公网隧道验证失败。"))
+        self._set_remote_runtime_status(
+            local_listener_ready=True,
+            public_ws_ready=True,
+            last_remote_error="",
+            published_url=published_url,
+        )
         self.SetStatusText(
             f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
         )
@@ -4096,38 +4227,69 @@ class ChatFrame(wx.Frame):
         runtime = self._remote_runtime_config()
         host = runtime["host"]
         port = runtime["port"]
-        self._start_remote_http_server_if_configured(token=token, host=host, port=port + 1)
-        self._remote_ws_server = RemoteWebSocketServer(
-            host=host,
-            port=port,
-            token=token,
-            on_message=self._remote_api_message_ui,
-            on_new_chat=self._remote_api_new_chat_ui,
-            on_reply_request=self._remote_api_reply_request_ui,
-            on_state=self._remote_api_state_ui,
-            on_rename_chat=self._remote_api_rename_chat_ui,
-            on_update_settings=self._remote_api_update_settings_ui,
-            on_history_list=self._remote_api_history_list_ui,
-            on_history_read=self._remote_api_history_read_ui,
-            on_notes_snapshot=self._remote_api_notes_snapshot,
-            on_notes_pull_since=self._remote_api_notes_pull_since,
-            on_notes_push_ops=self._remote_api_notes_push_ops,
-            on_notes_subscribe=self._remote_api_notes_subscribe,
-            on_notes_ack=self._remote_api_notes_ack,
-            on_notes_ping=self._remote_api_notes_ping,
-            on_notes_couchdb_changes=self._remote_api_notes_couchdb_changes,
-            on_notes_couchdb_bulk_docs=self._remote_api_notes_couchdb_bulk_docs,
-        )
-        self._remote_ws_server.start()
         published_url = f"{runtime['published_base']}?token={token}"
-        self.remote_control_runtime_mode = "fixed_domain" if runtime["fixed_domain_mode"] else "local"
-        self.remote_control_runtime_bind = f"ws://{host}:{self._remote_ws_server.bound_port}/ws"
-        self.remote_control_runtime_url = published_url
-        self.SetStatusText(
-            f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
+        self._set_remote_runtime_status(
+            local_listener_ready=False,
+            public_ws_ready=False,
+            last_remote_error="",
+            published_url=published_url,
         )
-        if ensure_connectivity:
-            self._ensure_remote_ws_startup_connectivity(token=token, published_url=published_url)
+        attempts = 2 if (ensure_connectivity and runtime["fixed_domain_mode"]) else 1
+        last_error = ""
+        for attempt_idx in range(attempts):
+            self._stop_remote_servers()
+            self._start_remote_servers(token=token, host=host, port=port)
+            self.remote_control_runtime_mode = "fixed_domain" if runtime["fixed_domain_mode"] else "local"
+            self.remote_control_runtime_bind = f"ws://{host}:{self._remote_ws_server.bound_port}/ws"
+            self._set_remote_runtime_status(
+                local_listener_ready=True,
+                public_ws_ready=not runtime["fixed_domain_mode"],
+                last_remote_error="",
+                published_url=published_url,
+            )
+            if not ensure_connectivity:
+                if runtime["fixed_domain_mode"]:
+                    self.SetStatusText(
+                        f"远程 WebSocket 本地监听已启动：监听 {self.remote_control_runtime_bind}；等待公网验证 {published_url}"
+                    )
+                else:
+                    self.SetStatusText(
+                        f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
+                    )
+                return
+            try:
+                if runtime["fixed_domain_mode"]:
+                    self._ensure_remote_ws_startup_connectivity(token=token, published_url=published_url)
+                    if self.remote_control_runtime_status.get("public_ws_ready"):
+                        self._set_remote_runtime_status(
+                            local_listener_ready=True,
+                            public_ws_ready=True,
+                            last_remote_error="",
+                            published_url=published_url,
+                        )
+                else:
+                    self.SetStatusText(
+                        f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
+                    )
+                if not runtime["fixed_domain_mode"]:
+                    self._set_remote_runtime_status(
+                        local_listener_ready=True,
+                        public_ws_ready=True,
+                        last_remote_error="",
+                        published_url=published_url,
+                    )
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                self._set_remote_runtime_status(
+                    local_listener_ready=True,
+                    public_ws_ready=False,
+                    last_remote_error=last_error,
+                    published_url=published_url,
+                )
+                if attempt_idx + 1 >= attempts:
+                    self.SetStatusText(f"远程 WebSocket 启动失败：{last_error}")
+                    raise
 
     def _start_claudecode_remote_ws_server_if_configured(self) -> None:
         return
@@ -4313,7 +4475,65 @@ class ChatFrame(wx.Frame):
         self._voice_input.on_ctrl_keyup(combo_used=combo_used, side=side)
 
     def _on_global_ctrl_hook_error(self, message: str) -> None:
+        self.global_ctrl_backend_status = getattr(self._global_ctrl_hook, "backend_state", "unknown")
         self.SetStatusText(message)
+
+    def _global_chat_navigation_target_state(self) -> tuple[bool, dict]:
+        try:
+            frame_hwnd = int(self.GetHandle() or 0)
+        except Exception:
+            frame_hwnd = 0
+        fg_hwnd = 0
+        root_hwnd = 0
+        if frame_hwnd > 0:
+            try:
+                user32 = ctypes.windll.user32
+                fg_hwnd = int(user32.GetForegroundWindow() or 0)
+                ga_root = 2
+                root_hwnd = int(user32.GetAncestor(wintypes.HWND(fg_hwnd), ga_root) or 0) if fg_hwnd else 0
+            except Exception:
+                fg_hwnd = 0
+                root_hwnd = 0
+        details = {
+            "frame_hwnd": frame_hwnd,
+            "fg_hwnd": fg_hwnd,
+            "root_hwnd": root_hwnd,
+        }
+        return (frame_hwnd > 0 and fg_hwnd > 0 and root_hwnd == frame_hwnd), details
+
+    def _log_ctrl_navigation_debug(self, direction: str, *, reason: str = "", result: str = "", details: dict | None = None) -> None:
+        path = self.app_data_dir / "ctrl_navigation_debug.log"
+        detail_text = ""
+        if details:
+            detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        parts = [f"direction={direction}"]
+        if reason:
+            parts.append(f"reason={reason}")
+        if result:
+            parts.append(f"result={result}")
+        if detail_text:
+            parts.append(detail_text)
+        line = " ".join(parts).strip()
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            return
+
+    def _on_global_ctrl_arrow(self, direction: str) -> None:
+        direction_key = str(direction or "").strip().lower()
+        step = -1 if direction_key == "left" else 1
+        active, details = self._global_chat_navigation_target_state()
+        if not active:
+            self._log_ctrl_navigation_debug(direction_key, reason="inactive_target", details=details)
+            self.SetStatusText("Ctrl+左右未生效：当前前台焦点不属于本程序")
+            return
+        navigated = bool(self._navigate_history_chats(step))
+        self._log_ctrl_navigation_debug(
+            direction_key,
+            result="navigated" if navigated else "no_target",
+            details=details,
+        )
 
     def _is_ui_alive(self) -> bool:
         app = wx.GetApp()
@@ -4756,6 +4976,13 @@ class ChatFrame(wx.Frame):
             hwnd = int(window.GetHandle() or 0)
         except Exception:
             hwnd = 0
+        self._notify_accessible_value_change(hwnd)
+
+    def _notify_accessible_value_change(self, hwnd: int | None) -> None:
+        try:
+            hwnd = int(hwnd or 0)
+        except Exception:
+            hwnd = 0
         if hwnd <= 0:
             return
         try:
@@ -4803,6 +5030,8 @@ class ChatFrame(wx.Frame):
                     continue
                 if user32.PostMessageW(target_hwnd, WM_CHAR, unit, 0):
                     sent += 1
+            if sent > 0:
+                self._notify_accessible_value_change(target_hwnd)
             return sent > 0
         except Exception:
             return False
@@ -4925,11 +5154,31 @@ class ChatFrame(wx.Frame):
     def _speak_text_via_screen_reader(self, text: str):
         content = remove_trailing_punctuation(text)
         if not content:
+            self.voice_screen_reader_status = {
+                "last_text": "",
+                "last_success": False,
+                "last_error": "empty after normalization",
+            }
             return
+        self.voice_screen_reader_status = {
+            "last_text": content,
+            "last_success": None,
+            "last_error": "",
+        }
         try:
-            self._zdsr_tts.speak(content)
-        except Exception:
-            pass
+            ok = bool(self._zdsr_tts.speak(content))
+        except Exception as exc:
+            self.voice_screen_reader_status = {
+                "last_text": content,
+                "last_success": False,
+                "last_error": str(exc),
+            }
+            return
+        self.voice_screen_reader_status = {
+            "last_text": content,
+            "last_success": ok,
+            "last_error": "" if ok else "speak returned false",
+        }
 
     def _is_model_endpoint_unavailable_error(self, model: str, error_text: str) -> bool:
         checker = getattr(ChatClient, "is_no_endpoint_error", None)

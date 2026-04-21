@@ -1,5 +1,6 @@
 ﻿import json
 import copy
+import subprocess
 import time
 import threading
 from pathlib import Path
@@ -91,7 +92,9 @@ def test_remote_ws_server_binds_publicly_by_default(frame, monkeypatch):
 
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 18080
-    assert frame.remote_control_runtime_url == "wss://rc.tingyou.cc/ws?token=secret"
+    assert frame.remote_control_runtime_url == ""
+    assert frame.remote_control_runtime_status["published_url"] == "wss://rc.tingyou.cc/ws?token=secret"
+    assert frame.remote_control_runtime_status["public_ws_ready"] is False
 
 
 def test_remote_ws_server_supports_legacy_claudecode_env_names(frame, monkeypatch):
@@ -243,6 +246,90 @@ def test_remote_ws_startup_runs_fixed_domain_connectivity_check(frame, monkeypat
     }
 
 
+def test_fixed_domain_remote_runtime_url_stays_empty_until_connectivity_is_verified(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
+
+    class _FakeServer:
+        def __init__(self, **kwargs):
+            self.host = kwargs["host"]
+            self.port = kwargs["port"]
+            self.bound_port = kwargs["port"]
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(
+        frame,
+        "_ensure_remote_ws_startup_connectivity",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("public probe failed")),
+    )
+
+    with pytest.raises(RuntimeError):
+        frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+
+    assert frame.remote_control_runtime_url == ""
+    assert frame.remote_control_runtime_status["public_ws_ready"] is False
+
+
+def test_fixed_domain_remote_start_rebuilds_servers_after_connectivity_failure(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
+
+    created = []
+
+    class _FakeServer:
+        def __init__(self, **kwargs):
+            self.host = kwargs["host"]
+            self.port = kwargs["port"]
+            self.bound_port = kwargs["port"]
+            self.stopped = False
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    class _FakeHttpServer:
+        def __init__(self, **kwargs):
+            self.bound_port = kwargs["port"]
+            self.stopped = False
+
+        def start(self):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    attempts = {"n": 0}
+
+    def _fake_connectivity(**_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("public probe failed")
+        frame.remote_control_runtime_status["public_ws_ready"] = True
+
+    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(main, "RemoteControlHttpServer", _FakeHttpServer)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame, "_ensure_remote_ws_startup_connectivity", _fake_connectivity)
+
+    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+
+    assert attempts["n"] == 2
+    assert len(created) == 2
+    assert created[0].stopped is True
+    assert frame.remote_control_runtime_status["public_ws_ready"] is True
+    assert frame.remote_control_runtime_url == "wss://rc.tingyou.cc/ws?token=secret"
+
+
 def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
@@ -377,6 +464,24 @@ def test_remote_ws_server_autostarts_without_env_and_uses_default_token(tmp_path
             frame._remote_ws_server.stop()
             frame._remote_ws_server = None
         frame.Destroy()
+
+
+def test_remote_api_state_includes_remote_runtime_status(frame):
+    frame.remote_control_runtime_url = ""
+    frame.remote_control_runtime_status = {
+        "local_listener_ready": True,
+        "public_ws_ready": False,
+        "last_remote_error": "public probe failed",
+        "published_url": "wss://rc.tingyou.cc/ws?token=secret",
+    }
+
+    status, body = frame._remote_api_state_ui({})
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["remote_runtime"]["public_ws_ready"] is False
+    assert body["remote_runtime"]["last_remote_error"] == "public probe failed"
+    assert body["remote_runtime_url"] == ""
 
 
 def test_char_hook_alt_c_submits_continue_from_any_focus(frame):
@@ -3099,7 +3204,7 @@ def test_global_ctrl_poller_release_disabled_when_hook_recent(monkeypatch):
     hook._last_hook_event_at = 100.0
     hook._hook_stale_seconds = 0.45
     monkeypatch.setattr(main.time, "monotonic", lambda: 100.2)
-    assert not hook._should_use_poller_release()
+    assert hook._should_use_poller_release()
 
 
 def test_global_ctrl_poller_release_enabled_when_hook_stale(monkeypatch):
@@ -3111,6 +3216,30 @@ def test_global_ctrl_poller_release_enabled_when_hook_stale(monkeypatch):
     hook._hook_stale_seconds = 0.45
     monkeypatch.setattr(main.time, "monotonic", lambda: 101.0)
     assert hook._should_use_poller_release()
+
+
+def test_global_ctrl_poller_release_enabled_even_when_hook_is_recent():
+    hook = main.GlobalCtrlTapHook(lambda *_a, **_k: None)
+    hook._running = True
+    hook._hook = object()
+    hook._using_fallback = False
+    hook._last_hook_event_at = time.monotonic()
+    assert hook._should_use_poller_release()
+
+
+def test_global_ctrl_poller_detects_left_release_without_waiting_for_hook_staleness(monkeypatch):
+    seen = []
+    hook = main.GlobalCtrlTapHook(lambda combo_used, side: seen.append((combo_used, side)))
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+
+    hook._running = True
+    hook._hook = object()
+    hook._using_fallback = False
+
+    hook._process_poller_state(left_down=True, right_down=False)
+    hook._process_poller_state(left_down=False, right_down=False)
+
+    assert seen == [(False, "left")]
 
 
 def test_voice_ctrl_double_tap_window_defaults_to_200ms():
@@ -3236,6 +3365,65 @@ def test_accessible_text_update_notifies_value_change_without_focus_event(frame,
     assert calls == [
         (main.EVENT_OBJECT_VALUECHANGE, main.OBJID_CLIENT, main.CHILDID_SELF),
     ]
+
+
+def test_inject_text_to_foreground_window_notifies_accessibility_for_target_hwnd(frame, monkeypatch):
+    calls = []
+
+    class _User32:
+        def GetForegroundWindow(self):
+            return 300
+
+        def GetWindowThreadProcessId(self, hwnd, pid_ptr):
+            return 0
+
+        def GetGUIThreadInfo(self, tid, gti_ptr):
+            return 0
+
+        def PostMessageW(self, hwnd, msg, wparam, lparam):
+            calls.append(("post", hwnd, msg, wparam))
+            return 1
+
+        def NotifyWinEvent(self, event, hwnd, objid, childid):
+            calls.append(("notify", event, hwnd, objid, childid))
+
+    monkeypatch.setattr(main.ctypes, "windll", type("Windll", (), {"user32": _User32()})())
+
+    assert frame._inject_text_to_foreground_window("语音") is True
+    assert calls[-1][0] == "notify"
+    assert calls[-1][1] == main.EVENT_OBJECT_VALUECHANGE
+    assert int(calls[-1][2].value) == 300
+    assert calls[-1][3:] == (main.OBJID_CLIENT, main.CHILDID_SELF)
+
+
+def test_speak_text_via_screen_reader_records_success_status(frame):
+    calls = []
+    frame._zdsr_tts = type(
+        "FakeTTS",
+        (),
+        {"speak": lambda self, text: calls.append(text) or True},
+    )()
+
+    frame._speak_text_via_screen_reader("语音文本！！！")
+
+    assert calls == ["语音文本"]
+    assert frame.voice_screen_reader_status["last_text"] == "语音文本"
+    assert frame.voice_screen_reader_status["last_success"] is True
+    assert frame.voice_screen_reader_status["last_error"] == ""
+
+
+def test_speak_text_via_screen_reader_records_failure_status(frame):
+    frame._zdsr_tts = type(
+        "FakeTTS",
+        (),
+        {"speak": lambda self, text: False},
+    )()
+
+    frame._speak_text_via_screen_reader("语音文本")
+
+    assert frame.voice_screen_reader_status["last_text"] == "语音文本"
+    assert frame.voice_screen_reader_status["last_success"] is False
+    assert "speak returned false" in frame.voice_screen_reader_status["last_error"]
 
 
 def test_voice_result_keeps_repeated_transcript_verbatim(frame, monkeypatch):
@@ -5944,9 +6132,42 @@ def test_codex_ui_callbacks_skip_when_frame_is_being_deleted(frame, monkeypatch)
 
 def test_resolve_app_data_dir_frozen_uses_executable_sibling_history(monkeypatch):
     monkeypatch.setattr(main.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(main.sys, "executable", r"C:\code\cx\ms\ms.exe", raising=False)
+    monkeypatch.setattr(main.sys, "executable", r"C:\code\cx\mc\mc.exe", raising=False)
     p = main.resolve_app_data_dir()
     assert p == Path(r"C:\code\cx\history")
+
+
+def test_packaging_name_defaults_to_mc():
+    spec_text = Path("zgwd.spec").read_text(encoding="utf-8")
+    assert spec_text.count("name='mc'") == 2
+
+
+def test_packaging_spec_excludes_missing_realtime_dialog_hidden_imports():
+    spec_text = Path("zgwd.spec").read_text(encoding="utf-8")
+    assert "realtime_dialog" not in spec_text
+
+
+def test_package_script_rejects_admin_shell_before_running_pyinstaller():
+    script_text = Path("package_mc.ps1").read_text(encoding="utf-8")
+    assert "WindowsBuiltInRole" in script_text
+    assert "Administrator" in script_text
+    assert "pyinstaller" in script_text.lower()
+
+
+def test_package_script_has_valid_powershell_syntax():
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "[void][System.Management.Automation.Language.Parser]::ParseFile('package_mc.ps1',[ref]$null,[ref]$errors); $errors.Count",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "0"
 
 
 def test_wx_call_later_if_alive_skips_when_top_window_handle_is_invalid(monkeypatch):
