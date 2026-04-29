@@ -87,7 +87,7 @@ def test_openclaw_send_flow_updates_from_session_sync(frame, monkeypatch, tmp_pa
     monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
     monkeypatch.setattr(main.OpenClawClient, "stream_chat", fake_stream_chat)
 
-    frame.model_combo.SetSelection(frame.model_combo.FindString("openclaw/main"))
+    frame.model_combo.SetSelection(frame.model_combo.FindString("openclaw"))
     frame.input_edit.SetValue("打开控制台")
     frame._on_send_clicked(None)
     frame._sync_openclaw_once()

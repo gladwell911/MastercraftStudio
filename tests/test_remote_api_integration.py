@@ -616,6 +616,8 @@ def test_remote_api_first_message_sets_title_from_first_question(frame, monkeypa
     monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
     frame.active_session_turns = []
     frame._current_chat_state = {"id": "chat-current", "title": "新聊天", "title_manual": False, "turns": frame.active_session_turns}
     pushed = []
@@ -636,8 +638,8 @@ def test_remote_api_first_message_sets_title_from_first_question(frame, monkeypa
 
     assert status == 200
     assert body["accepted"] is True
-    assert frame._current_chat_state["title"] == "新聊天"
-    assert pushed == []
+    assert frame._current_chat_state["title"] == "桌面端聊天命名规则"
+    assert pushed == ["chat-current"]
 
 def test_remote_api_first_message_keeps_default_title_and_schedules_auto_rename_v2(frame, monkeypatch):
     monkeypatch.setattr(frame, "_save_state", lambda: None)

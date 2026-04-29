@@ -6,9 +6,9 @@ import main
 
 def test_model_combo_contains_openclaw(frame):
     choices = [frame.model_combo.GetString(i) for i in range(frame.model_combo.GetCount())]
-    assert "openclaw/main" in choices
-    assert "codex/main" in choices
-    assert "claudecode/default" in choices
+    assert "openclaw" in choices
+    assert "codex" in choices
+    assert "claudeCode" in choices
 
 
 def test_load_state_restores_openclaw_sync_state(monkeypatch, tmp_path):

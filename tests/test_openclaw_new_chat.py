@@ -19,7 +19,7 @@ def test_openclaw_new_chat_clears_list_and_sends_new(frame, monkeypatch, tmp_pat
     session_file = tmp_path / "main.jsonl"
     session_file.write_text("old history", encoding="utf-8")
     frame.selected_model = "openclaw/main"
-    frame.model_combo.SetValue("openclaw/main")
+    frame.model_combo.SetValue("openclaw")
     frame.active_session_turns = [
         {
             "question": "旧问题",
