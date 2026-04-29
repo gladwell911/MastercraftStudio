@@ -24,7 +24,7 @@ def test_openclaw_client_runs_through_cli_agent_manager(monkeypatch):
     assert out == "ok"
     request = manager.requests[0]
     assert request.agent_id == "openclaw"
-    assert request.prefer_pty is True
+    assert request.prefer_pty is False
     assert request.timeout == 42
     assert request.command[:6] == [
         "openclaw.cmd",

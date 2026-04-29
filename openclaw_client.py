@@ -255,7 +255,7 @@ class OpenClawClient:
                     agent_id="openclaw",
                     command=command,
                     timeout=self.timeout + 30,
-                    prefer_pty=True,
+                    prefer_pty=False,
                     check=False,
                 )
             )
