@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from cli_agent_manager import CliRunResult
 import claudecode_client
 
 
@@ -27,8 +28,22 @@ class _ImmediateThread:
         return None
 
 
+class _Manager:
+    def __init__(self, stdout: str, stderr: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.requests = []
+
+    def run(self, request, on_output=None):
+        self.requests.append(request)
+        if on_output:
+            for line in self.stdout.splitlines(True):
+                on_output(line)
+        return CliRunResult(returncode=self.returncode, stdout=self.stdout, stderr=self.stderr)
+
+
 def test_stream_chat_uses_plain_stdout_when_stream_json_is_not_emitted(monkeypatch):
-    popen_calls = []
     plain_stdout = [
         "completed changes:",
         "openclaw/main -> openclaw",
@@ -42,17 +57,12 @@ def test_stream_chat_uses_plain_stdout_when_stream_json_is_not_emitted(monkeypat
         "step 7 done",
         "step 8 done",
     ]
-
-    def _popen(command, **kwargs):
-        popen_calls.append(SimpleNamespace(command=command, kwargs=kwargs))
-        return _FakeProcess([f"{line}\n" for line in plain_stdout])
+    manager = _Manager("\n".join(plain_stdout) + "\n")
 
     monkeypatch.setattr(claudecode_client, "resolve_claudecode_command", lambda: ["claude.cmd"])
-    monkeypatch.setattr(claudecode_client.subprocess, "Popen", _popen)
-    monkeypatch.setattr(claudecode_client.threading, "Thread", _ImmediateThread)
 
     seen = []
-    text, session_id = claudecode_client.ClaudeCodeClient().stream_chat(
+    text, session_id = claudecode_client.ClaudeCodeClient(cli_manager=manager).stream_chat(
         "rename model display labels",
         on_delta=seen.append,
     )
@@ -60,7 +70,7 @@ def test_stream_chat_uses_plain_stdout_when_stream_json_is_not_emitted(monkeypat
     assert text == "\n".join(plain_stdout)
     assert seen == [text]
     assert session_id == ""
-    assert popen_calls[0].command == [
+    assert manager.requests[0].command == [
         "claude.cmd",
         "--print",
         "rename model display labels",

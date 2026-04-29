@@ -2,8 +2,19 @@ import json
 import subprocess
 import time
 
+from cli_agent_manager import CliRunResult
 import main
 import openclaw_client
+
+
+class _Manager:
+    def __init__(self, stdout: str):
+        self.stdout = stdout
+        self.requests = []
+
+    def run(self, request, on_output=None):
+        self.requests.append(request)
+        return CliRunResult(returncode=0, stdout=self.stdout, stderr="")
 
 
 def test_stream_chat_uses_node_entrypoint_for_multiline_message(monkeypatch, tmp_path):
@@ -17,28 +28,17 @@ def test_stream_chat_uses_node_entrypoint_for_multiline_message(monkeypatch, tmp
     node_path = tmp_path / "node.exe"
     node_path.write_text("", encoding="utf-8")
 
-    seen = {}
-
-    def fake_run(*args, **kwargs):
-        seen["command"] = args[0]
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout='{"payloads":[{"text":"ok"}]}',
-            stderr="",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
     monkeypatch.setattr(openclaw_client.shutil, "which", lambda name: str(node_path) if name == "node" else None)
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
+    manager = _Manager('{"payloads":[{"text":"ok"}]}')
+    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12, cli_manager=manager)
     monkeypatch.setattr(client, "_resolve_openclaw_command", lambda: str(cmd_path))
 
     multiline = "第一行\n第二行\n第三行"
     out = client.stream_chat(multiline, session_id="zgwd-1")
 
     assert out == "ok"
-    assert seen["command"][:2] == [str(node_path), str(script_path)]
-    assert seen["command"][9] == multiline
+    assert manager.requests[0].command[:2] == [str(node_path), str(script_path)]
+    assert manager.requests[0].command[9] == multiline
 
 
 def test_read_session_events_ignores_assistant_commentary_and_keeps_final_answer(tmp_path):

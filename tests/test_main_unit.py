@@ -6592,4 +6592,49 @@ def test_archive_active_session_preserves_detail_panel_fields(frame, monkeypatch
     assert archived["execution_steps"] == [{"step": "1"}]
 
 
+def test_claudecode_worker_passes_shared_cli_manager(frame, monkeypatch):
+    manager = object()
+    frame._cli_agent_manager = manager
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "claudecode/default"}]
+    seen = {}
+
+    class _Client:
+        def __init__(self, full_auto=False, cli_manager=None):
+            seen["full_auto"] = full_auto
+            seen["cli_manager"] = cli_manager
+
+        def stream_chat(self, question, session_id="", on_delta=None, on_user_input=None, on_approval=None):
+            return ("answer", "session-new")
+
+    monkeypatch.setattr(main, "ClaudeCodeClient", _Client)
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda *args, **kwargs: None)
+
+    frame._worker("", 0, "q", "claudecode/default")
+
+    assert seen == {"full_auto": True, "cli_manager": manager}
+
+
+def test_openclaw_worker_passes_shared_cli_manager(frame, monkeypatch):
+    manager = object()
+    frame._cli_agent_manager = manager
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "openclaw/main"}]
+    seen = {}
+
+    class _Client:
+        def __init__(self, model, cli_manager=None):
+            seen["model"] = model
+            seen["cli_manager"] = cli_manager
+
+        def stream_chat(self, question, session_id="", on_delta=None):
+            return "answer"
+
+    monkeypatch.setattr(main, "OpenClawClient", _Client)
+    monkeypatch.setattr(frame, "_ensure_active_openclaw_session_id", lambda: "zgwd-test")
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda *args, **kwargs: None)
+
+    frame._worker("", 0, "q", "openclaw/main")
+
+    assert seen == {"model": "openclaw/main", "cli_manager": manager}
+
+
 

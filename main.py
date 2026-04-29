@@ -30,6 +30,7 @@ from aiohttp import ClientSession, ClientTimeout, WSMsgType
 
 from chat_client import ChatClient, DEFAULT_MODEL
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
+from cli_agent_manager import get_default_cli_agent_manager
 from codex_client import (
     CodexAppServerClient,
     CodexEvent,
@@ -777,6 +778,7 @@ class ChatFrame(wx.Frame):
         self.voice_end_sound = self._resolve_sound_path("inputEnd")
         self.voice_wrong_sound = self._resolve_sound_path("inputWrong")
         self._zdsr_tts = ZDSRTTSClient()
+        self._cli_agent_manager = get_default_cli_agent_manager()
         self.selected_model = STARTUP_DEFAULT_MODEL_ID
 
         self.archived_chats = []
@@ -3175,7 +3177,7 @@ class ChatFrame(wx.Frame):
     def _start_claudecode_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, session_id: str) -> None:
         def _worker() -> None:
             try:
-                client = ClaudeCodeClient(full_auto=True)
+                client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
                 # 保存客户端引用，以便在用户发送消息时使用
                 self._active_claudecode_client = client
                 def on_delta(delta):
@@ -5315,7 +5317,7 @@ class ChatFrame(wx.Frame):
         try:
             if is_openclaw_model(model):
                 session_id = self._ensure_active_openclaw_session_id()
-                c = OpenClawClient(model=model)
+                c = OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
                 full = ""
             elif is_codex_model(model):
@@ -5340,7 +5342,7 @@ class ChatFrame(wx.Frame):
                     wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n")
                     return ""
 
-                client = ClaudeCodeClient(full_auto=True)
+                client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
                 full, new_session_id = client.stream_chat(
                     question,
                     session_id=str(self.active_claudecode_session_id or ""),

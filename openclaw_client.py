@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from cli_agent_manager import CliRunRequest, get_default_cli_agent_manager
+
 
 OPENCLAW_MODEL_PREFIX = "openclaw/"
 DEFAULT_OPENCLAW_AGENT = "main"
@@ -228,10 +230,11 @@ def _coerce_timestamp(value) -> float:
 
 
 class OpenClawClient:
-    def __init__(self, model: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> None:
+    def __init__(self, model: str, timeout: int = DEFAULT_TIMEOUT_SECONDS, cli_manager=None) -> None:
         self.model = str(model or "").strip()
         self.agent_id = model_to_agent_id(self.model)
         self.timeout = max(int(timeout or DEFAULT_TIMEOUT_SECONDS), 1)
+        self.cli_manager = cli_manager if cli_manager is not None else get_default_cli_agent_manager()
 
     def stream_chat(
         self,
@@ -247,15 +250,14 @@ class OpenClawClient:
 
         command = self._build_agent_command(user_text, sid)
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout + 30,
-                check=False,
-                shell=False,
+            completed = self.cli_manager.run(
+                CliRunRequest(
+                    agent_id="openclaw",
+                    command=command,
+                    timeout=self.timeout + 30,
+                    prefer_pty=True,
+                    check=False,
+                )
             )
         except FileNotFoundError as exc:
             raise RuntimeError(self._missing_command_message()) from exc

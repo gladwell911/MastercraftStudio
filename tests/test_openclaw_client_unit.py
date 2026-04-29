@@ -4,7 +4,22 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_manager import CliRunResult
 import openclaw_client
+
+
+class _Manager:
+    def __init__(self, stdout: str, stderr: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.requests = []
+
+    def run(self, request, on_output=None):
+        self.requests.append(request)
+        if on_output:
+            on_output(self.stdout)
+        return CliRunResult(returncode=self.returncode, stdout=self.stdout, stderr=self.stderr)
 
 
 def test_openclaw_model_helpers():
@@ -15,17 +30,11 @@ def test_openclaw_model_helpers():
 
 
 def test_openclaw_client_stream_chat_parses_payload_text(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout='{"payloads":[{"text":"第一段"},{"text":"第二段"}]}',
-            stderr="",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager('{"payloads":[{"text":"第一段"},{"text":"第二段"}]}'),
+    )
     seen = []
     out = client.stream_chat("你好", session_id="zgwd-1", on_delta=seen.append)
     assert out == "第一段\n\n第二段"
@@ -33,53 +42,38 @@ def test_openclaw_client_stream_chat_parses_payload_text(monkeypatch):
 
 
 def test_openclaw_client_stream_chat_parses_nested_result_payloads(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout='{"status":"ok","result":{"payloads":[{"text":"[[reply_to_current]] 你好"}]}}',
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(
+            '{"status":"ok","result":{"payloads":[{"text":"[[reply_to_current]] 你好"}]}}',
             stderr="[plugins] warning",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+        ),
+    )
     out = client.stream_chat("你好", session_id="zgwd-1")
     assert out == "你好"
 
 
 def test_openclaw_client_stream_chat_parses_json_after_plugin_logs(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout=(
-                "[plugins] feishu_doc: Registered feishu_doc\n"
-                "[plugins] feishu_chat: Registered feishu_chat tool\n"
-                '{"status":"ok","result":{"payloads":[{"text":"日志后面的正常回复"}]}}'
-            ),
-            stderr="",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(
+            "[plugins] feishu_doc: Registered feishu_doc\n"
+            "[plugins] feishu_chat: Registered feishu_chat tool\n"
+            '{"status":"ok","result":{"payloads":[{"text":"日志后面的正常回复"}]}}'
+        ),
+    )
     out = client.stream_chat("你好", session_id="zgwd-1")
     assert out == "日志后面的正常回复"
 
 
 def test_openclaw_client_stream_chat_uses_plain_stdout_when_json_is_not_emitted(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout="completed changes:\nopenclaw/main -> openclaw\ncodex/main -> codex\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager("completed changes:\nopenclaw/main -> openclaw\ncodex/main -> codex\n"),
+    )
     seen = []
     out = client.stream_chat("rename model display labels", session_id="zgwd-1", on_delta=seen.append)
     assert out == "completed changes:\nopenclaw/main -> openclaw\ncodex/main -> codex"
@@ -87,17 +81,11 @@ def test_openclaw_client_stream_chat_uses_plain_stdout_when_json_is_not_emitted(
 
 
 def test_openclaw_client_stream_chat_raises_with_payload_error(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=1,
-            stdout='{"payloads":[{"text":"OpenClaw 超时"}]}',
-            stderr="stderr detail",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager('{"payloads":[{"text":"OpenClaw 超时"}]}', stderr="stderr detail", returncode=1),
+    )
     with pytest.raises(RuntimeError, match="OpenClaw 超时"):
         client.stream_chat("你好", session_id="zgwd-1")
 
@@ -115,24 +103,12 @@ def test_resolve_openclaw_command_falls_back_to_appdata_npm(monkeypatch, tmp_pat
 
 
 def test_stream_chat_uses_resolved_openclaw_command(monkeypatch):
-    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12)
+    manager = _Manager('{"payloads":[{"text":"ok"}]}')
+    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12, cli_manager=manager)
     monkeypatch.setattr(client, "_resolve_openclaw_command", lambda: r"C:\Users\test\AppData\Roaming\npm\openclaw.cmd")
-
-    seen = {}
-
-    def fake_run(*args, **kwargs):
-        seen["command"] = args[0]
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout='{"payloads":[{"text":"ok"}]}',
-            stderr="",
-        )
-
-    monkeypatch.setattr(openclaw_client.subprocess, "run", fake_run)
     out = client.stream_chat("你好", session_id="zgwd-1")
     assert out == "ok"
-    assert seen["command"][0].endswith("openclaw.cmd")
+    assert manager.requests[0].command[0].endswith("openclaw.cmd")
 
 
 def test_load_session_pointer_reads_main_session(tmp_path):
