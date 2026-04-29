@@ -312,6 +312,54 @@ def test_build_codex_app_server_env_reuses_persistent_workspace_home(tmp_path, m
     assert (codex_home / "auth.json").read_text(encoding="utf-8") == "{\"token\": \"x\"}"
 
 
+def test_build_codex_app_server_env_links_missing_user_skills_into_workspace_home(tmp_path, monkeypatch):
+    source_home = tmp_path / ".codex"
+    source_home.mkdir()
+    source_skills = source_home / "skills"
+    source_skills.mkdir()
+    (source_skills / "using-superpowers").mkdir()
+    (source_skills / "using-superpowers" / "SKILL.md").write_text("skill", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = workspace / ".codex-home"
+    codex_home.mkdir()
+    target_skills = codex_home / "skills"
+    target_skills.mkdir()
+    (target_skills / ".system").mkdir()
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    env, reused_home = codex_client.build_codex_app_server_env(str(workspace))
+
+    linked_skill = reused_home / "skills" / "using-superpowers"
+    assert reused_home == codex_home
+    assert env["CODEX_HOME"] == str(codex_home)
+    assert linked_skill.exists()
+    assert (linked_skill / "SKILL.md").read_text(encoding="utf-8") == "skill"
+    assert (reused_home / "skills" / ".system").exists()
+
+
+def test_build_codex_app_server_env_keeps_existing_workspace_skill_entries(tmp_path, monkeypatch):
+    source_home = tmp_path / ".codex"
+    source_home.mkdir()
+    source_skills = source_home / "skills"
+    source_skills.mkdir()
+    (source_skills / "using-superpowers").mkdir()
+    (source_skills / "using-superpowers" / "SKILL.md").write_text("user-skill", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = workspace / ".codex-home"
+    codex_home.mkdir()
+    target_skills = codex_home / "skills"
+    target_skills.mkdir()
+    (target_skills / "using-superpowers").mkdir()
+    (target_skills / "using-superpowers" / "SKILL.md").write_text("workspace-skill", encoding="utf-8")
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    _, reused_home = codex_client.build_codex_app_server_env(str(workspace))
+
+    assert (reused_home / "skills" / "using-superpowers" / "SKILL.md").read_text(encoding="utf-8") == "workspace-skill"
+
+
 def test_close_keeps_persistent_codex_home(tmp_path):
     client = codex_client.CodexAppServerClient()
 

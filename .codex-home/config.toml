@@ -1,4 +1,4 @@
-model = "gpt-5.4"
+model = "gpt-5.5"
 model_reasoning_effort = "medium"
 personality = "pragmatic"
 
@@ -28,3 +28,18 @@ trust_level = "trusted"
 
 [projects.'\\?\UNC\wsl.localhost\Ubuntu\home\gladwell\discourse']
 trust_level = "trusted"
+
+[projects.'C:\code\sr\cx']
+trust_level = "trusted"
+
+[projects.'C:\code\sr\ym']
+trust_level = "trusted"
+
+[projects.'c:\code\mc']
+trust_level = "trusted"
+
+[projects.'c:\code\codex']
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4

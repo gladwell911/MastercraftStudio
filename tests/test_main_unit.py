@@ -1417,6 +1417,26 @@ def test_render_execution_list_shows_execution_steps(frame):
     assert rows == ["第一步", "第二步"]
 
 
+def test_render_execution_list_prefers_detailed_execution_step_message(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "message": "执行命令：pytest tests/test_main_unit.py -k codex",
+                "step": "开始执行：commandExecution",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["执行命令：pytest tests/test_main_unit.py -k codex"]
+
+
 def test_render_execution_list_sets_default_selection(frame):
     frame._current_chat_state = {
         "id": "chat-1",
@@ -2519,6 +2539,78 @@ def test_plan_updated_appends_execution_step(frame, monkeypatch):
     assert frame._current_chat_state["execution_steps"] == [{"step": "计划更新：先整理结构"}]
 
 
+def test_command_execution_started_appends_detailed_execution_step(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0}]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="item_started",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            status="commandExecution",
+            data={
+                "type": "commandExecution",
+                "title": "运行测试",
+                "command": "pytest tests/test_main_unit.py -k codex",
+            },
+        ),
+    )
+
+    assert frame._current_chat_state["execution_steps"] == [
+        {"step": "开始执行：运行测试 | 命令：pytest tests/test_main_unit.py -k codex"}
+    ]
+
+
+def test_file_change_completed_appends_changed_paths_to_execution_step(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0}]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="item_completed",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            status="fileChange",
+            data={
+                "type": "fileChange",
+                "changes": [
+                    {"path": "main.py"},
+                    {"path": "tests/test_main_unit.py"},
+                ],
+            },
+        ),
+    )
+
+    assert frame._current_chat_state["execution_steps"] == [
+        {"step": "完成执行：修改文件 main.py, tests/test_main_unit.py"}
+    ]
+
+
 def test_empty_text_mapped_event_appends_and_persists_execution_step(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -2627,6 +2719,138 @@ def test_background_non_current_chat_events_append_to_target_chat_execution_step
     archived = frame._find_archived_chat("chat-background")
     assert archived["execution_steps"] == [{"step": "计划更新：后台整理"}]
     assert frame._current_chat_state["execution_steps"] == []
+
+
+def test_shared_codex_event_resolves_original_chat_after_switching_current_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "聊天B",
+        "turns": [
+            {
+                "question": "B的问题",
+                "answer_md": main.REQUESTING_TEXT,
+                "model": main.DEFAULT_CODEX_MODEL,
+                "created_at": 2.0,
+                "codex_thread_id": "thread-b",
+                "codex_turn_id": "turn-b",
+            }
+        ],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+        "codex_thread_id": "thread-b",
+        "codex_turn_id": "turn-b",
+    }
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "聊天A",
+            "turns": [
+                {
+                    "question": "A的问题",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                    "request_status": "pending",
+                    "codex_thread_id": "thread-a",
+                    "codex_turn_id": "turn-a",
+                }
+            ],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "codex_thread_id": "thread-a",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+
+    frame._on_codex_event(
+        main.CodexEvent(
+            type="item_completed",
+            phase="final_answer",
+            thread_id="thread-a",
+            turn_id="turn-a",
+            text="A 的晚到回答",
+        )
+    )
+
+    archived = frame._find_archived_chat("chat-a")
+    assert archived["turns"][0]["answer_md"] == "A 的晚到回答"
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_shared_codex_turn_completed_marks_original_archived_chat_done_after_switch(frame, monkeypatch):
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "聊天B",
+        "turns": [
+            {
+                "question": "B的问题",
+                "answer_md": main.REQUESTING_TEXT,
+                "model": main.DEFAULT_CODEX_MODEL,
+                "created_at": 2.0,
+                "request_status": "pending",
+                "codex_thread_id": "thread-b",
+                "codex_turn_id": "turn-b",
+            }
+        ],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+        "codex_thread_id": "thread-b",
+        "codex_turn_id": "turn-b",
+    }
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "聊天A",
+            "turns": [
+                {
+                    "question": "A的问题",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                    "request_status": "pending",
+                    "request_error": "stale",
+                    "codex_thread_id": "thread-a",
+                    "codex_turn_id": "turn-a",
+                }
+            ],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "codex_thread_id": "thread-a",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: None)
+
+    frame._on_codex_event(
+        main.CodexEvent(
+            type="turn_completed",
+            thread_id="thread-a",
+            turn_id="turn-a",
+            text="A 的最终回答",
+        )
+    )
+
+    archived = frame._find_archived_chat("chat-a")
+    assert archived["turns"][0]["request_status"] == "done"
+    assert archived["turns"][0]["request_error"] == ""
+    assert archived["turns"][0]["answer_md"] == "A 的最终回答"
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
 
 
 def test_detail_page_split_question_and_answer(frame):

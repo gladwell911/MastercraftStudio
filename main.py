@@ -2229,6 +2229,10 @@ class ChatFrame(wx.Frame):
     def _event_turn_id(event: CodexEvent) -> str:
         return str(getattr(event, "turn_id", "") or "").strip()
 
+    @staticmethod
+    def _event_thread_id(event: CodexEvent) -> str:
+        return str(getattr(event, "thread_id", "") or "").strip()
+
     def _event_turn_index(self, turns: list, event: CodexEvent) -> int:
         turn_id = self._event_turn_id(event)
         if turn_id:
@@ -2240,6 +2244,44 @@ class ChatFrame(wx.Frame):
                         return idx
         return len(turns) - 1 if isinstance(turns, list) and turns else -1
 
+    def _resolve_codex_event_chat_id(self, event: CodexEvent) -> str:
+        turn_id = self._event_turn_id(event)
+        thread_id = self._event_thread_id(event)
+        candidates = []
+        if isinstance(getattr(self, "_current_chat_state", None), dict):
+            candidates.append(self._current_chat_state)
+        candidates.extend(chat for chat in (self.archived_chats or []) if isinstance(chat, dict))
+
+        if turn_id:
+            for chat in candidates:
+                chat_id = str(chat.get("id") or "").strip()
+                if not chat_id:
+                    continue
+                if str(chat.get("codex_turn_id") or "").strip() == turn_id:
+                    return chat_id
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                for turn in turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("codex_turn_id") or turn.get("turn_id") or turn.get("id") or "").strip() == turn_id:
+                        return chat_id
+
+        if thread_id:
+            for chat in candidates:
+                chat_id = str(chat.get("id") or "").strip()
+                if not chat_id:
+                    continue
+                if str(chat.get("codex_thread_id") or "").strip() == thread_id:
+                    return chat_id
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                for turn in turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("codex_thread_id") or "").strip() == thread_id:
+                        return chat_id
+
+        return str(self.active_chat_id or self.current_chat_id or "").strip()
+
     @staticmethod
     def _codex_execution_step_fallback(event: CodexEvent) -> str:
         for key in ("status", "phase", "text"):
@@ -2248,9 +2290,73 @@ class ChatFrame(wx.Frame):
                 return value
         return "步骤"
 
+    @staticmethod
+    def _codex_item_paths_text(item: dict) -> str:
+        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+        paths = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = str(change.get("path") or change.get("filePath") or change.get("targetPath") or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+        if paths:
+            return ", ".join(paths[:3]) + (" 等" if len(paths) > 3 else "")
+        for key in ("path", "filePath", "targetPath"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _codex_item_summary_text(self, event: CodexEvent) -> str:
+        item = event.data if isinstance(event.data, dict) else {}
+        item_type = str(item.get("type") or getattr(event, "status", "") or "").strip()
+        title = str(item.get("title") or item.get("name") or item.get("label") or "").strip()
+        command = str(item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
+        text = str(item.get("text") or getattr(event, "text", "") or "").strip()
+        phase = str(item.get("phase") or getattr(event, "phase", "") or "").strip()
+        exit_code = item.get("exitCode")
+        paths_text = self._codex_item_paths_text(item)
+
+        if item_type == "commandExecution":
+            parts = []
+            if title:
+                parts.append(title)
+            if command:
+                parts.append(f"命令：{command}")
+            if exit_code not in (None, ""):
+                parts.append(f"退出码：{exit_code}")
+            if text and text not in {title, command}:
+                parts.append(text)
+            return " | ".join(parts)
+
+        if item_type == "fileChange":
+            if paths_text:
+                return f"修改文件 {paths_text}"
+            if title:
+                return title
+
+        if item_type == "agentMessage":
+            if phase and text:
+                return f"{phase}：{text}"
+            if text:
+                return text
+
+        parts = []
+        if title:
+            parts.append(title)
+        if paths_text and paths_text not in title:
+            parts.append(paths_text)
+        if text and text not in {title, paths_text}:
+            parts.append(text)
+        if phase and phase not in text:
+            parts.append(f"阶段：{phase}")
+        return " | ".join([part for part in parts if part])
+
     def _codex_execution_step_text(self, event: CodexEvent) -> str:
         event_type = str(getattr(event, "type", "") or "").strip()
         text = str(getattr(event, "text", "") or "").strip()
+        detail = self._codex_item_summary_text(event)
         if event_type == "turn_started":
             return "开始处理本轮请求"
         if event_type == "plan_updated":
@@ -2264,11 +2370,11 @@ class ChatFrame(wx.Frame):
         if event_type == "stderr":
             return f"错误输出：{text}" if text else "错误输出"
         if event_type == "item_started":
-            return f"开始执行：{self._codex_execution_step_fallback(event)}"
+            return f"开始执行：{detail}" if detail else f"开始执行：{self._codex_execution_step_fallback(event)}"
         if event_type == "item_completed" and str(getattr(event, "phase", "") or "").strip() == "final_answer":
             return "已生成最终回答"
         if event_type == "item_completed":
-            return f"完成执行：{self._codex_execution_step_fallback(event)}"
+            return f"完成执行：{detail}" if detail else f"完成执行：{self._codex_execution_step_fallback(event)}"
         return ""
 
     def _append_execution_step_to_chat(self, chat_id: str, step_text: str, *, save_state: bool = True) -> bool:
@@ -2300,7 +2406,7 @@ class ChatFrame(wx.Frame):
     @staticmethod
     def _execution_step_text(step) -> str:
         if isinstance(step, dict):
-            for key in ("step", "title", "text", "content", "message", "description"):
+            for key in ("message", "step", "title", "text", "content", "description"):
                 value = str(step.get(key) or "").strip()
                 if value:
                     return value
@@ -3736,7 +3842,7 @@ class ChatFrame(wx.Frame):
         self._call_after_if_alive(self._on_codex_event_for_chat, chat_id, event)
 
     def _on_codex_event(self, event: CodexEvent) -> None:
-        self._on_codex_event_for_chat(self.active_chat_id or self.current_chat_id or "", event)
+        self._on_codex_event_for_chat(self._resolve_codex_event_chat_id(event), event)
 
     def _handle_codex_request_dialog(self, request: dict) -> None:
         params = request.get("params") if isinstance(request.get("params"), dict) else {}

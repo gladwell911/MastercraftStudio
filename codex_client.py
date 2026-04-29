@@ -71,6 +71,44 @@ def _copy_codex_home_seed(source_home: Path, target_home: Path) -> None:
             pass
 
 
+def _link_or_copy_path(source: Path, target: Path) -> None:
+    try:
+        if source.is_dir():
+            target.symlink_to(source, target_is_directory=True)
+        else:
+            target.symlink_to(source)
+        return
+    except Exception:
+        pass
+    try:
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+    except Exception:
+        pass
+
+
+def _merge_user_skills_into_codex_home(source_home: Path, target_home: Path) -> None:
+    source_skills = source_home / "skills"
+    if not source_skills.exists() or not source_skills.is_dir():
+        return
+    try:
+        target_skills = target_home / "skills"
+        target_skills.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    try:
+        entries = list(source_skills.iterdir())
+    except Exception:
+        return
+    for source_entry in entries:
+        target_entry = target_skills / source_entry.name
+        if target_entry.exists() or target_entry.is_symlink():
+            continue
+        _link_or_copy_path(source_entry, target_entry)
+
+
 def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], Path | None]:
     env = os.environ.copy()
     workspace = Path(str(cwd or "").strip() or Path.cwd())
@@ -81,6 +119,7 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
         codex_home = Path(tempfile.mkdtemp(prefix=".codex-home-"))
     source_home = Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex"
     _copy_codex_home_seed(source_home, codex_home)
+    _merge_user_skills_into_codex_home(source_home, codex_home)
     env["CODEX_HOME"] = str(codex_home)
     return env, codex_home
 
