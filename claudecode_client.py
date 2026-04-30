@@ -43,6 +43,40 @@ def resolve_claudecode_command() -> list[str]:
     )
 
 
+def _non_negative_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _context_usage_from_model_usage(model_usage: dict) -> dict | None:
+    for model_name, stats in model_usage.items():
+        if not isinstance(stats, dict):
+            continue
+        input_tokens = _non_negative_int(stats.get("inputTokens") or 0)
+        output_tokens = _non_negative_int(stats.get("outputTokens") or 0)
+        cache_read_tokens = _non_negative_int(stats.get("cacheReadInputTokens") or 0)
+        cache_creation_tokens = _non_negative_int(stats.get("cacheCreationInputTokens") or 0)
+        context_window = _non_negative_int(stats.get("contextWindow"))
+        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, context_window]
+        if any(value is None for value in values):
+            continue
+        used_tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
+        if used_tokens <= 0 or context_window <= 0:
+            continue
+        return normalize_context_usage(
+            used_tokens=used_tokens,
+            context_window=context_window,
+            source="claudecode",
+            exact=True,
+            fresh=True,
+            model=str(model_name or ""),
+        ).to_dict()
+    return None
+
+
 class ClaudeCodeClient:
     def __init__(
         self,
@@ -129,23 +163,9 @@ class ClaudeCodeClient:
                 if sid:
                     new_session_id = sid
                 model_usage = obj.get("modelUsage") if isinstance(obj.get("modelUsage"), dict) else {}
-                if model_usage:
-                    model_name, stats = next(iter(model_usage.items()))
-                    if isinstance(stats, dict):
-                        used_tokens = (
-                            int(stats.get("inputTokens") or 0)
-                            + int(stats.get("outputTokens") or 0)
-                            + int(stats.get("cacheReadInputTokens") or 0)
-                            + int(stats.get("cacheCreationInputTokens") or 0)
-                        )
-                        self.last_context_usage = normalize_context_usage(
-                            used_tokens=used_tokens,
-                            context_window=stats.get("contextWindow") or 0,
-                            source="claudecode",
-                            exact=True,
-                            fresh=True,
-                            model=str(model_name or ""),
-                        ).to_dict()
+                usage = _context_usage_from_model_usage(model_usage) if model_usage else None
+                if usage:
+                    self.last_context_usage = usage
                 if not full_text:
                     result_text = str(obj.get("result") or "").strip()
                     if result_text and result_text not in ("success", "error"):
