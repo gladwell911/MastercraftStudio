@@ -1886,6 +1886,39 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
     assert "/200K" in row
 
 
+def test_on_done_uses_worker_context_usage_for_regular_model(frame):
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame._pending_context_usage_by_turn = {
+        0: {
+            "used_tokens": 1500,
+            "context_window": 128000,
+            "source": "api",
+            "exact": True,
+            "fresh": True,
+            "model": "openai/gpt-5.2",
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._on_done(0, "answer", "", "openai/gpt-5.2", "", frame.active_chat_id)
+
+    assert frame._current_chat_state["context_usage"]["used_tokens"] == 1500
+    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+
+
+def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
+    frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+
+    frame._on_done(0, "你好，有什么可以帮你？", "", "openai/gpt-5.2", "", frame.active_chat_id)
+
+    usage = frame._current_chat_state["context_usage"]
+    assert usage["source"] == "estimated"
+    assert usage["exact"] is False
+    assert frame.answer_list.GetString(0).startswith("上下文：约 ")
+
+
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
     frame.active_session_turns = [
         {"question": "q", "answer_md": "a", "model": "openai/gpt-5.2", "created_at": 1.0}

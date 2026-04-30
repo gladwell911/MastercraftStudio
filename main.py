@@ -844,6 +844,7 @@ class ChatFrame(wx.Frame):
         self._answer_committed_buffer = ""
         self._answer_redirect_timer = None
         self._pending_input_attachments = []
+        self._pending_context_usage_by_turn = {}
         self._openclaw_sync_thread = None
         self._openclaw_sync_stop = threading.Event()
         self._openclaw_sync_lock = threading.Lock()
@@ -5394,6 +5395,8 @@ class ChatFrame(wx.Frame):
 
                 c = ChatClient(api_key=api_key, model=model)
                 full = c.stream_chat(question, on_delta, history_turns=history_turns)
+                if c.last_context_usage:
+                    self._pending_context_usage_by_turn[turn_idx] = c.last_context_usage
         except Exception as e:
             err = str(e)
             if (not is_openclaw_model(model)) and (not is_codex_model(model)) and self._is_model_endpoint_unavailable_error(model, err):
@@ -5401,6 +5404,8 @@ class ChatFrame(wx.Frame):
                     try:
                         c = ChatClient(api_key=api_key, model=fb_model)
                         full = c.stream_chat(question, on_delta, history_turns=history_turns)
+                        if c.last_context_usage:
+                            self._pending_context_usage_by_turn[turn_idx] = c.last_context_usage
                         used_model = fb_model
                         err = ""
                         fallback_msg = f"模型 {model} 当前不可用，已回退到 {fb_model}"
@@ -5474,6 +5479,7 @@ class ChatFrame(wx.Frame):
             if not err:
                 for attachment in self._extract_existing_file_attachments_from_text(str(target_turns[turn_idx].get("answer_md") or ""), str(used_model or "")):
                     self._record_received_attachment(target_turns[turn_idx], attachment)
+                self._refresh_context_usage_after_done(target_chat, target_turns, turn_idx, used_model)
             self._active_request_count = 0
             if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""} and isinstance(target_chat, dict):
                 target_chat["updated_at"] = time.time()
@@ -5506,6 +5512,23 @@ class ChatFrame(wx.Frame):
             self._call_later_if_alive(120, self._focus_latest_answer)
         if (not is_openclaw_model(used_model)) or err:
             self._play_finish_sound()
+
+    def _set_chat_context_usage(self, chat: dict, usage) -> None:
+        if not isinstance(chat, dict) or usage is None:
+            return
+        if hasattr(usage, "to_dict"):
+            usage = usage.to_dict()
+        if isinstance(usage, dict):
+            chat["context_usage"] = usage
+
+    def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
+        pending = self._pending_context_usage_by_turn.pop(turn_idx, None)
+        if pending:
+            self._set_chat_context_usage(target_chat, pending)
+            return
+        if is_openclaw_model(used_model) or is_codex_model(used_model) or is_claudecode_model(used_model):
+            return
+        self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
 
     def _focus_latest_answer(self):
         if not self._can_focus_completion_result():
