@@ -2059,8 +2059,32 @@ class ChatFrame(wx.Frame):
         turns = self._get_view_turns()
         model = self._resolve_current_model() if self.view_mode != "history" else self._history_context_fallback_model(chat, turns)
         if turns:
+            pending = self._pending_context_usage_for_chat(chat, len(turns) - 1)
+            if pending is not None:
+                return pending
+            if self._is_authoritative_context_usage_model(model) or self._turns_require_authoritative_context_usage(turns):
+                return None
             return estimate_turns_tokens(turns, model=model)
         return None
+
+    def _pending_context_usage_for_chat(self, chat: dict | None, turn_idx: int):
+        if not isinstance(chat, dict):
+            return None
+        pending = self._pending_context_usage_by_turn.get(self._context_usage_pending_key_from_chat(chat, turn_idx))
+        return context_usage_from_dict(pending) if isinstance(pending, dict) else None
+
+    def _is_authoritative_context_usage_model(self, model: str) -> bool:
+        text = str(model or "").strip()
+        return is_openclaw_model(text) or is_codex_model(text) or is_claudecode_model(text)
+
+    def _turns_require_authoritative_context_usage(self, turns: list[dict]) -> bool:
+        for turn in reversed(turns or []):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            if model:
+                return self._is_authoritative_context_usage_model(model)
+        return False
 
     def _history_context_fallback_model(self, chat, turns) -> str:
         if isinstance(chat, dict):

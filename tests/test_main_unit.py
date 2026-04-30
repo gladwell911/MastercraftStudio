@@ -1886,6 +1886,23 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
     assert "/200K" in row
 
 
+def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
+    frame.selected_model = "openclaw/main"
+    frame.active_session_turns = [
+        {"question": "你好", "answer_md": "同步回答", "model": "openclaw/main", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-openclaw",
+        "turns": frame.active_session_turns,
+        "context_usage": None,
+    }
+
+    frame._render_answer_list()
+
+    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+
+
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"

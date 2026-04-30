@@ -211,6 +211,32 @@ def test_openclaw_client_nonzero_result_leaves_last_context_usage_empty():
     assert client.last_context_usage is None
 
 
+def test_openclaw_client_callback_error_clears_last_context_usage():
+    payload = {
+        "payloads": [{"text": "ok"}],
+        "modelUsage": {
+            "gpt-5.4": {
+                "inputTokens": 620,
+                "outputTokens": 40,
+                "contextWindow": 272000,
+            }
+        },
+    }
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    def _raise(_delta):
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        client.stream_chat("hello", session_id="zgwd-1", on_delta=_raise)
+
+    assert client.last_context_usage is None
+
+
 def test_openclaw_client_stream_chat_ignores_malformed_usage_metadata():
     payload = {
         "payloads": [{"text": "ok"}],

@@ -417,7 +417,7 @@ class OpenClawClient:
         if completed.returncode != 0:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 请求失败：{detail}")
-        self._capture_usage(data)
+        captured_context_usage = self._capture_usage(data)
 
         reply = self._extract_text(data)
         if not reply and stdout and completed.returncode == 0:
@@ -429,12 +429,11 @@ class OpenClawClient:
         reply = normalize_openclaw_text(reply)
         if callable(on_delta) and reply:
             on_delta(reply)
+        self.last_context_usage = captured_context_usage
         return reply
 
-    def _capture_usage(self, data: dict) -> None:
-        usage = openclaw_context_usage_from_payload(data, self.model)
-        if usage:
-            self.last_context_usage = usage
+    def _capture_usage(self, data: dict) -> dict | None:
+        return openclaw_context_usage_from_payload(data, self.model)
 
     def _build_agent_command(self, user_text: str, session_id: str) -> list[str]:
         command = self._resolve_openclaw_invocation()
