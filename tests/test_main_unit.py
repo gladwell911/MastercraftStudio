@@ -1827,6 +1827,60 @@ def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
     assert "小诸葛" not in rows
 
 
+def test_render_answer_list_inserts_context_usage_row_first(frame):
+    frame._current_chat_state["context_usage"] = {
+        "used_tokens": 113260,
+        "context_window": 272000,
+        "source": "openclaw",
+        "exact": True,
+        "fresh": True,
+        "model": "gpt-5.4",
+        "updated_at": 1.0,
+    }
+    frame.active_session_turns = [
+        {"question": "你好", "answer_md": "你好，有什么可以帮你？", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+
+    frame._render_answer_list()
+
+    assert frame.answer_list.GetString(0) == "上下文：113K/272K，41.6%已用"
+    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：113K/272K，41.6%已用", "")
+    assert frame.answer_list.GetString(1) == "我"
+
+
+def test_render_answer_list_keeps_empty_state_below_context_row(frame):
+    frame._current_chat_state["context_usage"] = None
+    frame.active_session_turns = []
+
+    frame._render_answer_list()
+
+    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+    assert frame.answer_list.GetString(1) == "暂无对话内容"
+
+
+def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": "a", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state["context_usage"] = {
+        "used_tokens": 12000,
+        "context_window": 128000,
+        "source": "estimated",
+        "exact": False,
+        "fresh": True,
+        "model": "openai/gpt-5.2",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+
+    frame._render_answer_list()
+    frame._focus_latest_answer()
+
+    selected = frame.answer_list.GetSelection()
+    assert frame.answer_meta[selected][0] == "answer"
+
+
 def test_on_done_renders_final_answer_after_hidden_requesting_placeholder(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -2969,7 +3023,8 @@ def test_render_answer_list_shows_each_uploaded_attachment_on_its_own_line(frame
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
+    assert frame.answer_meta[0][0] == "context_usage"
+    assert rows[1:] == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
 
 
 def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn(frame, tmp_path):
@@ -2998,8 +3053,8 @@ def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
-    assert meta_types == ["user", "attachment", "ai", "answer"]
+    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
+    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
 
 
 def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):
@@ -5165,7 +5220,8 @@ def test_render_answer_list_hides_blank_user_for_assistant_only_turn(frame):
     frame._render_answer_list()
 
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert items == ["小诸葛", "只有回答"]
+    assert frame.answer_meta[0][0] == "context_usage"
+    assert items[1:] == ["小诸葛", "只有回答"]
 
 
 def test_codex_answer_filter_menu_label_changes_with_state(frame):

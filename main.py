@@ -37,6 +37,11 @@ from codex_client import (
     DEFAULT_CODEX_MODEL,
     is_codex_model,
 )
+from context_usage import (
+    context_usage_from_dict,
+    estimate_turns_tokens,
+    format_context_usage_label,
+)
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_projection import DesktopNotesProjection
 from notes_store import NotesStore
@@ -2044,11 +2049,29 @@ class ChatFrame(wx.Frame):
                     items.append({"type": "localImage", "path": path})
         return items or [{"type": "text", "text": ""}]
 
+    def _active_chat_context_usage(self):
+        chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
+        usage = (chat or {}).get("context_usage") if isinstance(chat, dict) else None
+        normalized = context_usage_from_dict(usage)
+        if normalized is not None:
+            return normalized
+        turns = self._get_view_turns()
+        model = self._resolve_current_model() if self.view_mode != "history" else str((chat or {}).get("model") or self.selected_model or DEFAULT_MODEL_ID)
+        if turns:
+            return estimate_turns_tokens(turns, model=model)
+        return None
+
+    def _append_context_usage_row(self) -> None:
+        label = format_context_usage_label(self._active_chat_context_usage())
+        self.answer_list.Append(label)
+        self.answer_meta.append(("context_usage", -1, label, ""))
+
     def _render_answer_list(self):
         mode = self._apply_detail_panel_mode()
         self.answer_list.Clear()
         self.answer_meta = []
         self._active_answer_row_index = -1
+        self._append_context_usage_row()
         turns = self._get_view_turns()
         if not turns:
             self.answer_list.Append("暂无对话内容")
