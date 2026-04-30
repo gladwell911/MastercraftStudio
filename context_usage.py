@@ -32,6 +32,13 @@ class ContextUsage:
     percent_used: float = 0.0
     error: str = ""
 
+    def __post_init__(self) -> None:
+        self.percent_used = (
+            round((self.used_tokens / self.context_window * 100.0), 1)
+            if self.context_window > 0
+            else 0.0
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "used_tokens": self.used_tokens,
@@ -106,7 +113,7 @@ def format_token_k(tokens: int) -> str:
     value = _int_value(tokens)
     if value < 1000:
         return "小于1K"
-    return f"{int(round(value / 1000.0))}K"
+    return f"{(value + 500) // 1000}K"
 
 
 def format_context_usage_label(usage: ContextUsage | dict | None) -> str:

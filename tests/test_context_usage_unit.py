@@ -1,5 +1,6 @@
 from context_usage import (
     ContextUsage,
+    context_usage_from_dict,
     format_context_usage_label,
     format_token_k,
     normalize_context_usage,
@@ -14,6 +15,7 @@ def test_format_token_k_uses_less_than_one_k_for_small_values():
 def test_format_token_k_rounds_to_integer_k():
     assert format_token_k(1000) == "1K"
     assert format_token_k(12400) == "12K"
+    assert format_token_k(12500) == "13K"
     assert format_token_k(12600) == "13K"
 
 
@@ -77,3 +79,43 @@ def test_normalize_context_usage_computes_percent_and_bounds_values():
     assert usage.used_tokens == 113260
     assert usage.context_window == 272000
     assert usage.percent_used == 41.6
+
+
+def test_context_usage_to_dict_computes_percent_for_direct_construction():
+    usage = ContextUsage(
+        used_tokens=113260,
+        context_window=272000,
+        source="openclaw",
+        exact=True,
+        fresh=True,
+        model="gpt-5.4",
+        updated_at=1.0,
+    )
+
+    assert usage.to_dict()["percent_used"] == 41.6
+
+
+def test_context_usage_dict_round_trip_preserves_values():
+    usage = ContextUsage(
+        used_tokens=113260,
+        context_window=272000,
+        source="openclaw",
+        exact=True,
+        fresh=True,
+        model="gpt-5.4",
+        updated_at=1.0,
+    )
+
+    restored = context_usage_from_dict(usage.to_dict())
+
+    assert restored == ContextUsage(
+        used_tokens=113260,
+        context_window=272000,
+        percent_used=41.6,
+        source="openclaw",
+        exact=True,
+        fresh=True,
+        model="gpt-5.4",
+        updated_at=1.0,
+        error="",
+    )
