@@ -3265,6 +3265,9 @@ class ChatFrame(wx.Frame):
                 )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
+                last_context_usage = getattr(client, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
                 wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", DEFAULT_CLAUDECODE_MODEL, "", chat_id)
             except Exception as exc:
                 error_msg = str(exc)
@@ -5389,6 +5392,9 @@ class ChatFrame(wx.Frame):
                 )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
+                last_context_usage = getattr(client, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
             else:
                 def on_delta(d):
                     wx_call_after_if_alive(self._on_delta, turn_idx, d, chat_id)
@@ -5522,11 +5528,13 @@ class ChatFrame(wx.Frame):
             chat["context_usage"] = usage
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
-        if is_openclaw_model(used_model) or is_codex_model(used_model) or is_claudecode_model(used_model):
+        if is_openclaw_model(used_model) or is_codex_model(used_model):
             return
         pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
         if pending:
             self._set_chat_context_usage(target_chat, pending)
+            return
+        if is_claudecode_model(used_model):
             return
         self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
 

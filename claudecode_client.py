@@ -6,6 +6,7 @@ import subprocess
 from typing import Callable
 
 from cli_agent_manager import CliRunRequest, get_default_cli_agent_manager
+from context_usage import normalize_context_usage
 
 
 CLAUDECODE_MODEL_PREFIX = "claudecode/"
@@ -56,6 +57,7 @@ class ClaudeCodeClient:
         self.cli_manager = cli_manager if cli_manager is not None else get_default_cli_agent_manager()
         self.stdin_queue = queue.Queue()
         self.stdin_writer_thread = None
+        self.last_context_usage = None
 
     def send_user_input(self, user_input: str) -> None:
         self.stdin_queue.put(str(user_input or "").strip())
@@ -71,6 +73,7 @@ class ClaudeCodeClient:
         if not str(user_text or "").strip():
             return ("", session_id)
 
+        self.last_context_usage = None
         command = self._build_command(user_text, str(session_id or "").strip())
         full_text = ""
         new_session_id = str(session_id or "").strip()
@@ -125,6 +128,24 @@ class ClaudeCodeClient:
                 sid = str(obj.get("session_id") or "").strip()
                 if sid:
                     new_session_id = sid
+                model_usage = obj.get("modelUsage") if isinstance(obj.get("modelUsage"), dict) else {}
+                if model_usage:
+                    model_name, stats = next(iter(model_usage.items()))
+                    if isinstance(stats, dict):
+                        used_tokens = (
+                            int(stats.get("inputTokens") or 0)
+                            + int(stats.get("outputTokens") or 0)
+                            + int(stats.get("cacheReadInputTokens") or 0)
+                            + int(stats.get("cacheCreationInputTokens") or 0)
+                        )
+                        self.last_context_usage = normalize_context_usage(
+                            used_tokens=used_tokens,
+                            context_window=stats.get("contextWindow") or 0,
+                            source="claudecode",
+                            exact=True,
+                            fresh=True,
+                            model=str(model_name or ""),
+                        ).to_dict()
                 if not full_text:
                     result_text = str(obj.get("result") or "").strip()
                     if result_text and result_text not in ("success", "error"):

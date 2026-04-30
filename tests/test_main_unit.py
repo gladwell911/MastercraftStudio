@@ -1910,6 +1910,28 @@ def test_on_done_uses_worker_context_usage_for_regular_model(frame):
     assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
 
 
+def test_on_done_uses_pending_claudecode_context_usage(frame):
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "claudecode/default", "created_at": 1.0}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    chat_id = frame.active_chat_id or frame.current_chat_id or ""
+    frame._pending_context_usage_by_turn = {
+        (chat_id, 0): {
+            "used_tokens": 30692,
+            "context_window": 200000,
+            "source": "claudecode",
+            "exact": True,
+            "fresh": True,
+            "model": "claude-haiku-4-5-20251001",
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._on_done(0, "完成", "", "claudecode/default", "", frame.active_chat_id)
+
+    assert frame._current_chat_state["context_usage"]["source"] == "claudecode"
+    assert frame.answer_list.GetString(0) == "上下文：31K/200K，15.3%已用"
+
+
 def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
     frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
     frame._current_chat_state["turns"] = frame.active_session_turns
