@@ -2056,10 +2056,23 @@ class ChatFrame(wx.Frame):
         if normalized is not None:
             return normalized
         turns = self._get_view_turns()
-        model = self._resolve_current_model() if self.view_mode != "history" else str((chat or {}).get("model") or self.selected_model or DEFAULT_MODEL_ID)
+        model = self._resolve_current_model() if self.view_mode != "history" else self._history_context_fallback_model(chat, turns)
         if turns:
             return estimate_turns_tokens(turns, model=model)
         return None
+
+    def _history_context_fallback_model(self, chat, turns) -> str:
+        if isinstance(chat, dict):
+            model = str(chat.get("model") or "").strip()
+            if model:
+                return model
+        for turn in reversed(turns or []):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            if model:
+                return model
+        return str(self.selected_model or "").strip() or DEFAULT_MODEL_ID
 
     def _append_context_usage_row(self) -> None:
         label = format_context_usage_label(self._active_chat_context_usage())

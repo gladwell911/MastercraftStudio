@@ -1859,6 +1859,33 @@ def test_render_answer_list_keeps_empty_state_below_context_row(frame):
     assert frame.answer_list.GetString(1) == "暂无对话内容"
 
 
+def test_render_answer_list_history_context_fallback_uses_latest_turn_model(frame):
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史聊天",
+            "context_usage": None,
+            "turns": [
+                {
+                    "question": "历史问题",
+                    "answer_md": "历史回答",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "created_at": 1.0,
+                }
+            ],
+        }
+    ]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.selected_model = "openai/gpt-5.2"
+
+    frame._render_answer_list()
+
+    row = frame.answer_list.GetString(0)
+    assert row.startswith("上下文：约 ")
+    assert "/200K" in row
+
+
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
     frame.active_session_turns = [
         {"question": "q", "answer_md": "a", "model": "openai/gpt-5.2", "created_at": 1.0}
