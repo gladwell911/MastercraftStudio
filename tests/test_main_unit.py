@@ -2547,7 +2547,8 @@ def test_current_chat_codex_delta_with_hidden_placeholder_does_not_rerender_ques
     frame.view_mode = "active"
     frame._render_answer_list()
     before_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert before_rows == ["我", "Codex 正在处理的问题"]
+    assert frame.answer_meta[0][0] == "context_usage"
+    assert before_rows[1:] == ["我", "Codex 正在处理的问题"]
 
     seen = {"render": 0, "save": 0}
     monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
@@ -3093,8 +3094,8 @@ def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch,
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows == ["我", "图片上传成功", "小诸葛", "最终回答"]
-    assert meta_types == ["user", "attachment", "ai", "answer"]
+    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "最终回答"]
+    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
 
 
 def test_codex_image_item_event_records_received_attachment(frame, monkeypatch, tmp_path):
@@ -3186,8 +3187,8 @@ def test_codex_final_answer_keeps_attachment_only_turn_answer_at_bottom(frame, m
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows == ["我", "图片上传成功", "小诸葛", "codex 最终回答"]
-    assert meta_types == ["user", "attachment", "ai", "answer"]
+    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "codex 最终回答"]
+    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
 
 
 def test_on_done_extracts_received_file_attachment_from_cli_text(frame, monkeypatch, tmp_path):
@@ -3301,8 +3302,8 @@ def test_openclaw_assistant_only_turn_hides_empty_user_rows(frame):
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
 
-    assert rows == ["小诸葛", "外部同步的回复"]
-    assert meta_types == ["ai", "answer"]
+    assert rows[1:] == ["小诸葛", "外部同步的回复"]
+    assert meta_types[1:] == ["ai", "answer"]
 
 
 def test_history_enter_handlers_call_activate(frame):
