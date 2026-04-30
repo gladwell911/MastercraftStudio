@@ -80,6 +80,31 @@ def test_stream_chat_records_provider_usage(monkeypatch):
     assert client.last_context_usage["source"] == "api"
 
 
+def test_capture_usage_ignores_empty_usage():
+    client = ChatClient(api_key="key", model="openai/gpt-5.2")
+
+    client._capture_usage({"usage": {}})
+
+    assert client.last_context_usage is None
+
+
+def test_capture_usage_falls_back_to_prompt_completion_when_total_malformed():
+    client = ChatClient(api_key="key", model="openai/gpt-5.2")
+
+    client._capture_usage(
+        {
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": "not-a-number",
+            }
+        }
+    )
+
+    assert client.last_context_usage["used_tokens"] == 1500
+    assert client.last_context_usage["source"] == "api"
+
+
 def test_model_404_no_endpoints_detected():
     err = "请求失败：HTTP 404。错误信息：No endpoints found for deepseek/deepseek-r1-0528-qwen3-8b."
     assert ChatClient.is_no_endpoint_error(err, model="deepseek/deepseek-r1-0528-qwen3-8b")

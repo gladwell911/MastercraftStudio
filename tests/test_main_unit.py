@@ -1887,10 +1887,13 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
 
 
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
     frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
+    frame._current_chat_state["id"] = "chat-current"
     frame._current_chat_state["turns"] = frame.active_session_turns
     frame._pending_context_usage_by_turn = {
-        0: {
+        ("chat-current", 0): {
             "used_tokens": 1500,
             "context_window": 128000,
             "source": "api",
@@ -1917,6 +1920,52 @@ def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
     assert usage["source"] == "estimated"
     assert usage["exact"] is False
     assert frame.answer_list.GetString(0).startswith("上下文：约 ")
+
+
+def test_on_done_does_not_apply_pending_context_usage_from_other_chat(frame):
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
+    frame._current_chat_state = {"id": "chat-b", "turns": frame.active_session_turns}
+    frame._pending_context_usage_by_turn = {
+        ("chat-a", 0): {
+            "used_tokens": 1500,
+            "context_window": 128000,
+            "source": "api",
+            "exact": True,
+            "fresh": True,
+            "model": "openai/gpt-5.2",
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._on_done(0, "你好，有什么可以帮你？", "", "openai/gpt-5.2", "", "chat-b")
+
+    usage = frame._current_chat_state["context_usage"]
+    assert usage["source"] == "estimated"
+    assert usage["exact"] is False
+
+
+def test_on_done_codex_does_not_consume_regular_model_pending_context_usage(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    pending = {
+        "used_tokens": 1500,
+        "context_window": 128000,
+        "source": "api",
+        "exact": True,
+        "fresh": True,
+        "model": "openai/gpt-5.2",
+        "updated_at": 1.0,
+    }
+    frame._pending_context_usage_by_turn = {("chat-current", 0): pending}
+
+    frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
+
+    assert "context_usage" not in frame._current_chat_state
+    assert frame._pending_context_usage_by_turn == {("chat-current", 0): pending}
 
 
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):

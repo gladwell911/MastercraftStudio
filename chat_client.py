@@ -206,9 +206,15 @@ class ChatClient:
         usage = obj.get("usage") if isinstance(obj, dict) else None
         if not isinstance(usage, dict):
             return
-        total = usage.get("total_tokens")
-        if total is None:
-            total = self._usage_int(usage.get("prompt_tokens")) + self._usage_int(usage.get("completion_tokens"))
+        total = self._usage_int_or_none(usage.get("total_tokens"))
+        if total is None or total <= 0:
+            prompt = self._usage_int_or_none(usage.get("prompt_tokens"))
+            completion = self._usage_int_or_none(usage.get("completion_tokens"))
+            if prompt is None or completion is None:
+                return
+            total = prompt + completion
+        if total <= 0:
+            return
         self.last_context_usage = normalize_context_usage(
             used_tokens=total,
             context_window=context_window_for_model(self.model),
@@ -219,11 +225,13 @@ class ChatClient:
         ).to_dict()
 
     @staticmethod
-    def _usage_int(value) -> int:
+    def _usage_int_or_none(value) -> int | None:
+        if value is None:
+            return None
         try:
-            return max(int(value or 0), 0)
+            return max(int(value), 0)
         except Exception:
-            return 0
+            return None
 
     def _should_use_web(self, user_text: str) -> bool:
         url = f"{self.base_url}{CHAT_COMPLETIONS_PATH}"

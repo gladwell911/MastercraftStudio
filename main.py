@@ -5396,7 +5396,7 @@ class ChatFrame(wx.Frame):
                 c = ChatClient(api_key=api_key, model=model)
                 full = c.stream_chat(question, on_delta, history_turns=history_turns)
                 if c.last_context_usage:
-                    self._pending_context_usage_by_turn[turn_idx] = c.last_context_usage
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
         except Exception as e:
             err = str(e)
             if (not is_openclaw_model(model)) and (not is_codex_model(model)) and self._is_model_endpoint_unavailable_error(model, err):
@@ -5405,7 +5405,7 @@ class ChatFrame(wx.Frame):
                         c = ChatClient(api_key=api_key, model=fb_model)
                         full = c.stream_chat(question, on_delta, history_turns=history_turns)
                         if c.last_context_usage:
-                            self._pending_context_usage_by_turn[turn_idx] = c.last_context_usage
+                            self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
                         used_model = fb_model
                         err = ""
                         fallback_msg = f"模型 {model} 当前不可用，已回退到 {fb_model}"
@@ -5522,13 +5522,21 @@ class ChatFrame(wx.Frame):
             chat["context_usage"] = usage
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
-        pending = self._pending_context_usage_by_turn.pop(turn_idx, None)
+        if is_openclaw_model(used_model) or is_codex_model(used_model) or is_claudecode_model(used_model):
+            return
+        pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
         if pending:
             self._set_chat_context_usage(target_chat, pending)
             return
-        if is_openclaw_model(used_model) or is_codex_model(used_model) or is_claudecode_model(used_model):
-            return
         self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
+
+    def _context_usage_pending_key(self, chat_id: str, turn_idx: int) -> tuple[str, int]:
+        key_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        return (key_chat_id, int(turn_idx))
+
+    def _context_usage_pending_key_from_chat(self, chat: dict, turn_idx: int) -> tuple[str, int]:
+        chat_id = str((chat or {}).get("id") or "").strip() if isinstance(chat, dict) else ""
+        return self._context_usage_pending_key(chat_id, turn_idx)
 
     def _focus_latest_answer(self):
         if not self._can_focus_completion_result():
