@@ -5359,6 +5359,9 @@ class ChatFrame(wx.Frame):
                 session_id = self._ensure_active_openclaw_session_id()
                 c = OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
+                last_context_usage = getattr(c, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
                 full = ""
             elif is_codex_model(model):
                 self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=from_recovery)
@@ -5528,11 +5531,13 @@ class ChatFrame(wx.Frame):
             chat["context_usage"] = usage
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
-        if is_openclaw_model(used_model) or is_codex_model(used_model):
+        if is_codex_model(used_model):
             return
         pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
         if pending:
             self._set_chat_context_usage(target_chat, pending)
+            return
+        if is_openclaw_model(used_model):
             return
         if is_claudecode_model(used_model):
             return

@@ -1932,6 +1932,39 @@ def test_on_done_uses_pending_claudecode_context_usage(frame):
     assert frame.answer_list.GetString(0) == "上下文：31K/200K，15.3%已用"
 
 
+def test_on_done_uses_pending_openclaw_context_usage(frame):
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "openclaw/main", "created_at": 1.0}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    chat_id = frame.active_chat_id or frame.current_chat_id or ""
+    frame._pending_context_usage_by_turn = {
+        (chat_id, 0): {
+            "used_tokens": 113260,
+            "context_window": 272000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": "gpt-5.4",
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._on_done(0, "", "", "openclaw/main", "", frame.active_chat_id)
+
+    assert frame._current_chat_state["context_usage"]["source"] == "openclaw"
+    assert frame._current_chat_state["context_usage"]["model"] == "gpt-5.4"
+    assert frame._pending_context_usage_by_turn == {}
+
+
+def test_on_done_openclaw_without_pending_usage_does_not_estimate(frame):
+    frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openclaw/main", "created_at": 1.0}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame._pending_context_usage_by_turn = {}
+
+    frame._on_done(0, "", "", "openclaw/main", "", frame.active_chat_id)
+
+    assert "context_usage" not in frame._current_chat_state
+
+
 def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
     frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
     frame._current_chat_state["turns"] = frame.active_session_turns
@@ -6824,5 +6857,37 @@ def test_openclaw_worker_passes_shared_cli_manager(frame, monkeypatch):
 
     assert seen == {"model": "openclaw/main", "cli_manager": manager}
 
+
+def test_openclaw_worker_stores_client_context_usage(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "openclaw/main"}]
+    usage = {
+        "used_tokens": 113260,
+        "context_window": 272000,
+        "source": "openclaw",
+        "exact": True,
+        "fresh": True,
+        "model": "gpt-5.4",
+        "updated_at": 1.0,
+    }
+
+    class _Client:
+        def __init__(self, model, cli_manager=None):
+            self.last_context_usage = None
+
+        def stream_chat(self, question, session_id="", on_delta=None):
+            self.last_context_usage = usage
+            return "answer"
+
+    calls = []
+    monkeypatch.setattr(main, "OpenClawClient", _Client)
+    monkeypatch.setattr(frame, "_ensure_active_openclaw_session_id", lambda: "zgwd-test")
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda *args, **kwargs: calls.append(args))
+
+    frame._worker("", 0, "q", "openclaw/main", chat_id="chat-current")
+
+    assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
 
 

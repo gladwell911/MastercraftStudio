@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from cli_agent_manager import CliRunRequest, get_default_cli_agent_manager
+from context_usage import context_window_for_model, normalize_context_usage
 
 
 OPENCLAW_MODEL_PREFIX = "openclaw/"
@@ -229,12 +230,119 @@ def _coerce_timestamp(value) -> float:
         return time.time()
 
 
+def _non_negative_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _usage_int_field(stats: dict, names: tuple[str, ...], default: int = 0) -> int | None:
+    for name in names:
+        if name in stats:
+            return _non_negative_int(stats.get(name))
+    return default
+
+
+def _context_usage_from_token_stats(
+    stats: dict,
+    *,
+    fallback_model: str,
+    actual_model: str = "",
+) -> dict | None:
+    if not isinstance(stats, dict):
+        return None
+    total = _usage_int_field(stats, ("totalTokens", "total_tokens", "totalTokenUsage", "total_token_usage"), default=None)
+    context_window = _usage_int_field(stats, ("contextWindow", "contextTokens", "context_window", "context_tokens"), default=0)
+    model_name = str(
+        actual_model
+        or stats.get("model")
+        or stats.get("modelId")
+        or stats.get("model_id")
+        or fallback_model
+        or ""
+    ).strip()
+
+    if total is None or total <= 0:
+        input_tokens = _usage_int_field(stats, ("inputTokens", "input_tokens", "promptTokens", "prompt_tokens"))
+        output_tokens = _usage_int_field(stats, ("outputTokens", "output_tokens", "completionTokens", "completion_tokens"))
+        cache_read_tokens = _usage_int_field(stats, ("cacheReadInputTokens", "cache_read_input_tokens", "cacheReadTokens", "cache_read_tokens"))
+        cache_creation_tokens = _usage_int_field(
+            stats,
+            ("cacheCreationInputTokens", "cache_creation_input_tokens", "cacheCreationTokens", "cache_creation_tokens"),
+        )
+        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens]
+        if any(value is None for value in values):
+            return None
+        total = sum(values)
+
+    if total <= 0:
+        return None
+
+    exact_window = context_window is not None and context_window > 0
+    if not exact_window:
+        context_window = context_window_for_model(fallback_model)
+    return normalize_context_usage(
+        used_tokens=total,
+        context_window=context_window,
+        source="openclaw",
+        exact=exact_window,
+        fresh=bool(stats.get("totalTokensFresh", stats.get("fresh", True))),
+        model=model_name,
+    ).to_dict()
+
+
+def _context_usage_from_model_usage(model_usage: dict, fallback_model: str) -> dict | None:
+    if not isinstance(model_usage, dict):
+        return None
+    for model_name, stats in model_usage.items():
+        usage = _context_usage_from_token_stats(
+            stats,
+            fallback_model=fallback_model,
+            actual_model=str(model_name or "").strip(),
+        )
+        if usage:
+            return usage
+    return None
+
+
+def _iter_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_dicts(child)
+
+
+def openclaw_context_usage_from_payload(payload: dict, fallback_model: str) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    for obj in _iter_dicts(payload):
+        model_usage = obj.get("modelUsage") if isinstance(obj.get("modelUsage"), dict) else None
+        usage = _context_usage_from_model_usage(model_usage, fallback_model) if model_usage else None
+        if usage:
+            return usage
+
+    candidates = []
+    for obj in _iter_dicts(payload):
+        stats = obj.get("usage") if isinstance(obj.get("usage"), dict) else obj
+        usage = _context_usage_from_token_stats(stats, fallback_model=fallback_model)
+        if usage:
+            candidates.append(usage)
+    return candidates[-1] if candidates else None
+
+
 class OpenClawClient:
     def __init__(self, model: str, timeout: int = DEFAULT_TIMEOUT_SECONDS, cli_manager=None) -> None:
         self.model = str(model or "").strip()
         self.agent_id = model_to_agent_id(self.model)
         self.timeout = max(int(timeout or DEFAULT_TIMEOUT_SECONDS), 1)
         self.cli_manager = cli_manager if cli_manager is not None else get_default_cli_agent_manager()
+        self.last_context_usage = None
 
     def stream_chat(
         self,
@@ -242,6 +350,7 @@ class OpenClawClient:
         session_id: str,
         on_delta: Callable[[str], None] | None = None,
     ) -> str:
+        self.last_context_usage = None
         if not str(user_text or "").strip():
             return ""
         sid = str(session_id or "").strip()
@@ -266,13 +375,17 @@ class OpenClawClient:
 
         stdout = str(completed.stdout or "").strip()
         stderr = str(completed.stderr or "").strip()
+        json_objects = self._extract_json_objects(stdout)
         try:
             data = self._parse_json(stdout)
         except RuntimeError:
             if completed.returncode == 0:
-                data = {}
+                data = {"events": json_objects} if json_objects else {}
             else:
                 raise
+        if len(json_objects) > 1:
+            data = {"events": json_objects}
+        self._capture_usage({"events": json_objects} if json_objects else data)
         if completed.returncode != 0:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 请求失败：{detail}")
@@ -288,6 +401,11 @@ class OpenClawClient:
         if callable(on_delta) and reply:
             on_delta(reply)
         return reply
+
+    def _capture_usage(self, data: dict) -> None:
+        usage = openclaw_context_usage_from_payload(data, self.model)
+        if usage:
+            self.last_context_usage = usage
 
     def _build_agent_command(self, user_text: str, session_id: str) -> list[str]:
         command = self._resolve_openclaw_invocation()
@@ -365,7 +483,39 @@ class OpenClawClient:
                 return obj
         return {}
 
+    def _extract_json_objects(self, stdout: str) -> list[dict]:
+        decoder = json.JSONDecoder()
+        source = str(stdout or "")
+        objects: list[dict] = []
+        idx = 0
+        while idx < len(source):
+            start = source.find("{", idx)
+            if start < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(source[start:])
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            if isinstance(obj, dict):
+                objects.append(obj)
+            idx = start + max(end, 1)
+        return objects
+
     def _extract_text(self, data: dict) -> str:
+        events = data.get("events")
+        if isinstance(events, list):
+            parts = []
+            for event in events:
+                text = self._extract_event_text(event)
+                if text:
+                    parts.append(text)
+            if parts:
+                return "\n\n".join(parts).strip()
+        event_text = self._extract_event_text(data)
+        if event_text:
+            return event_text
+
         payloads = data.get("payloads")
         if not isinstance(payloads, list):
             result = data.get("result")
@@ -381,6 +531,17 @@ class OpenClawClient:
             if text:
                 parts.append(text)
         return "\n\n".join(parts).strip()
+
+    def _extract_event_text(self, event: dict) -> str:
+        if not isinstance(event, dict):
+            return ""
+        msg = event.get("message")
+        if not isinstance(msg, dict):
+            return ""
+        role = str(msg.get("role") or "").strip()
+        if role != "assistant":
+            return ""
+        return normalize_openclaw_text(_extract_message_text(msg, role))
 
     def _extract_plain_stdout(self, stdout: str) -> str:
         lines = []
