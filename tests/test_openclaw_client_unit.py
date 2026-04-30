@@ -138,6 +138,79 @@ def test_openclaw_client_stream_chat_records_usage_from_json_event_stream():
     assert client.last_context_usage["model"] == "gpt-5.4"
 
 
+def test_openclaw_client_prefers_result_usage_over_nested_tool_usage():
+    events = [
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "result": {
+                            "modelUsage": {
+                                "tool-model": {
+                                    "inputTokens": 1,
+                                    "outputTokens": 2,
+                                    "contextWindow": 100,
+                                }
+                            }
+                        },
+                    },
+                    {"type": "text", "text": "ok"},
+                ],
+            },
+        },
+        {
+            "type": "result",
+            "modelUsage": {
+                "gpt-5.4": {
+                    "inputTokens": 620,
+                    "outputTokens": 40,
+                    "cacheReadInputTokens": 100000,
+                    "cacheCreationInputTokens": 12600,
+                    "contextWindow": 272000,
+                }
+            },
+        },
+    ]
+    stdout = "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(stdout),
+    )
+
+    out = client.stream_chat("hello", session_id="zgwd-1")
+
+    assert out == "ok"
+    assert client.last_context_usage["used_tokens"] == 113260
+    assert client.last_context_usage["model"] == "gpt-5.4"
+
+
+def test_openclaw_client_nonzero_result_leaves_last_context_usage_empty():
+    payload = {
+        "payloads": [{"text": "failed"}],
+        "modelUsage": {
+            "gpt-5.4": {
+                "inputTokens": 620,
+                "outputTokens": 40,
+                "contextWindow": 272000,
+            }
+        },
+    }
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(json.dumps(payload, ensure_ascii=False), returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="failed"):
+        client.stream_chat("hello", session_id="zgwd-1")
+
+    assert client.last_context_usage is None
+
+
 def test_openclaw_client_stream_chat_ignores_malformed_usage_metadata():
     payload = {
         "payloads": [{"text": "ok"}],

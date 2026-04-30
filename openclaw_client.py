@@ -307,33 +307,62 @@ def _context_usage_from_model_usage(model_usage: dict, fallback_model: str) -> d
     return None
 
 
-def _iter_dicts(value):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _iter_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _iter_dicts(child)
-
-
 def openclaw_context_usage_from_payload(payload: dict, fallback_model: str) -> dict | None:
     if not isinstance(payload, dict):
         return None
 
-    for obj in _iter_dicts(payload):
-        model_usage = obj.get("modelUsage") if isinstance(obj.get("modelUsage"), dict) else None
-        usage = _context_usage_from_model_usage(model_usage, fallback_model) if model_usage else None
-        if usage:
-            return usage
-
-    candidates = []
-    for obj in _iter_dicts(payload):
-        stats = obj.get("usage") if isinstance(obj.get("usage"), dict) else obj
+    for candidate in _openclaw_usage_candidate_payloads(payload):
+        model_usage = candidate.get("modelUsage") if isinstance(candidate.get("modelUsage"), dict) else None
+        if model_usage:
+            usage = _context_usage_from_model_usage(model_usage, fallback_model)
+            if usage:
+                return usage
+        stats = candidate.get("usage") if isinstance(candidate.get("usage"), dict) else candidate
         usage = _context_usage_from_token_stats(stats, fallback_model=fallback_model)
         if usage:
-            candidates.append(usage)
-    return candidates[-1] if candidates else None
+            return usage
+    return None
+
+
+def _openclaw_usage_candidate_payloads(payload: dict) -> list[dict]:
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    candidates: list[dict] = []
+
+    result_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and str(event.get("type") or "").strip() == "result"
+    ]
+    candidates.extend(reversed(result_events))
+    if result:
+        candidates.append(result)
+    candidates.append(payload)
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else None
+    if message and str(message.get("role") or "").strip() == "assistant":
+        candidates.append(message)
+
+    assistant_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and str(event.get("type") or "").strip() == "message"
+    ]
+    for event in reversed(assistant_events):
+        message = event.get("message") if isinstance(event.get("message"), dict) else None
+        if message and str(message.get("role") or "").strip() == "assistant":
+            candidates.append(message)
+
+    out: list[dict] = []
+    seen: set[int] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(candidate)
+    return out
 
 
 class OpenClawClient:
@@ -385,10 +414,10 @@ class OpenClawClient:
                 raise
         if len(json_objects) > 1:
             data = {"events": json_objects}
-        self._capture_usage({"events": json_objects} if json_objects else data)
         if completed.returncode != 0:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 请求失败：{detail}")
+        self._capture_usage(data)
 
         reply = self._extract_text(data)
         if not reply and stdout and completed.returncode == 0:
