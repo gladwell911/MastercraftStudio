@@ -70,10 +70,10 @@ class ClaudeCodeClient:
         on_user_input: Callable[[dict], str] | None = None,
         on_approval: Callable[[dict], str] | None = None,
     ) -> tuple[str, str]:
+        self.last_context_usage = None
         if not str(user_text or "").strip():
             return ("", session_id)
 
-        self.last_context_usage = None
         command = self._build_command(user_text, str(session_id or "").strip())
         full_text = ""
         new_session_id = str(session_id or "").strip()

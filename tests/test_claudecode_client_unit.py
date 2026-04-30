@@ -92,6 +92,17 @@ def test_claudecode_stream_chat_records_model_usage():
     assert client.last_context_usage["model"] == "claude-haiku-4-5-20251001"
 
 
+def test_claudecode_stream_chat_blank_input_clears_last_context_usage():
+    client = claudecode_client.ClaudeCodeClient(cli_manager=_UsageManager())
+    client.last_context_usage = {"used_tokens": 123}
+
+    full, session_id = client.stream_chat("   ", session_id="sid-old")
+
+    assert full == ""
+    assert session_id == "sid-old"
+    assert client.last_context_usage is None
+
+
 def test_stream_chat_uses_plain_stdout_when_stream_json_is_not_emitted(monkeypatch):
     plain_stdout = [
         "completed changes:",
