@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any
+
+
+DEFAULT_CONTEXT_WINDOW = 128000
+
+MODEL_CONTEXT_WINDOWS = {
+    "codex/main": 258400,
+    "claudecode/default": 200000,
+    "openclaw/main": 272000,
+    "openai/gpt-5.2": 128000,
+    "openai/gpt-5.2-chat": 128000,
+    "anthropic/claude-sonnet-4.6": 200000,
+    "anthropic/claude-opus-4.6": 200000,
+    "anthropic/claude-opus-4.5": 200000,
+    "google/gemini-3.1-pro-preview": 1000000,
+}
+
+
+@dataclass
+class ContextUsage:
+    used_tokens: int
+    context_window: int
+    source: str
+    exact: bool
+    fresh: bool
+    model: str
+    updated_at: float
+    percent_used: float = 0.0
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "used_tokens": self.used_tokens,
+            "context_window": self.context_window,
+            "percent_used": self.percent_used,
+            "source": self.source,
+            "exact": self.exact,
+            "fresh": self.fresh,
+            "model": self.model,
+            "updated_at": self.updated_at,
+            "error": self.error,
+        }
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except Exception:
+        return default
+
+
+def _float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return default
+
+
+def normalize_context_usage(
+    *,
+    used_tokens: Any,
+    context_window: Any = 0,
+    source: str,
+    exact: bool,
+    fresh: bool = True,
+    model: str = "",
+    updated_at: float | None = None,
+    error: str = "",
+) -> ContextUsage:
+    used = _int_value(used_tokens)
+    window = _int_value(context_window)
+    percent = round((used / window * 100.0), 1) if window > 0 else 0.0
+    return ContextUsage(
+        used_tokens=used,
+        context_window=window,
+        percent_used=percent,
+        source=str(source or "").strip(),
+        exact=bool(exact),
+        fresh=bool(fresh),
+        model=str(model or "").strip(),
+        updated_at=_float_value(updated_at, time.time()),
+        error=str(error or ""),
+    )
+
+
+def context_usage_from_dict(value: dict | None) -> ContextUsage | None:
+    if not isinstance(value, dict):
+        return None
+    return normalize_context_usage(
+        used_tokens=value.get("used_tokens"),
+        context_window=value.get("context_window"),
+        source=str(value.get("source") or ""),
+        exact=bool(value.get("exact")),
+        fresh=bool(value.get("fresh", True)),
+        model=str(value.get("model") or ""),
+        updated_at=_float_value(value.get("updated_at"), time.time()),
+        error=str(value.get("error") or ""),
+    )
+
+
+def format_token_k(tokens: int) -> str:
+    value = _int_value(tokens)
+    if value < 1000:
+        return "小于1K"
+    return f"{int(round(value / 1000.0))}K"
+
+
+def format_context_usage_label(usage: ContextUsage | dict | None) -> str:
+    if isinstance(usage, dict):
+        usage = context_usage_from_dict(usage)
+    if usage is None:
+        return "上下文：刷新中"
+    prefix = "约 " if not usage.exact else ""
+    used = format_token_k(usage.used_tokens)
+    if usage.context_window <= 0:
+        return f"上下文：{prefix}{used}，窗口未知"
+    window = format_token_k(usage.context_window)
+    percent = round((usage.used_tokens / usage.context_window * 100.0), 1)
+    return f"上下文：{prefix}{used}/{window}，{percent:.1f}%已用"
+
+
+def context_window_for_model(model: str) -> int:
+    return int(MODEL_CONTEXT_WINDOWS.get(str(model or "").strip(), DEFAULT_CONTEXT_WINDOW))
+
+
+def estimate_text_tokens(text: str) -> int:
+    content = str(text or "")
+    if not content:
+        return 0
+    ascii_chars = sum(1 for ch in content if ord(ch) < 128)
+    non_ascii_chars = len(content) - ascii_chars
+    return max(1, int(round(ascii_chars / 4.0 + non_ascii_chars / 1.6)))
+
+
+def estimate_turns_tokens(turns: list[dict], model: str = "") -> ContextUsage:
+    total = estimate_text_tokens("请使用 Markdown 格式回答，尽量使用标题、段落、列表等结构化格式。不要使用任何表情符号（emoji）。")
+    for turn in turns or []:
+        total += estimate_text_tokens(str((turn or {}).get("question") or ""))
+        answer = str((turn or {}).get("answer_md") or "")
+        if answer and answer != "正在请求...":
+            total += estimate_text_tokens(answer)
+    return normalize_context_usage(
+        used_tokens=total,
+        context_window=context_window_for_model(model),
+        source="estimated",
+        exact=False,
+        fresh=True,
+        model=model,
+    )
