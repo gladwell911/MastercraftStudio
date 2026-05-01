@@ -255,6 +255,40 @@ def test_codex_start_turn_failure_clears_last_context_usage(monkeypatch):
     assert client.last_context_usage is None
 
 
+def test_codex_start_thread_failure_clears_last_context_usage(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+
+    def _raise(_method, _params=None, timeout=None):
+        client.last_context_usage = {"used_tokens": 44176, "source": "codex"}
+        raise RuntimeError("thread failed")
+
+    monkeypatch.setattr(client, "request", _raise)
+
+    try:
+        client.start_thread(r"C:\code\mc")
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
+def test_codex_resume_thread_failure_clears_last_context_usage(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+
+    def _raise(_method, _params=None, timeout=None):
+        client.last_context_usage = {"used_tokens": 44176, "source": "codex"}
+        raise RuntimeError("resume failed")
+
+    monkeypatch.setattr(client, "request", _raise)
+
+    try:
+        client.resume_thread("thread-1")
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
 def test_resolve_codex_launch_command_uses_powershell_for_ps1(monkeypatch):
     def _which(name):
         mapping = {

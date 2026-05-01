@@ -229,7 +229,7 @@ class CodexAppServerClient:
             "personality": personality,
             "ephemeral": bool(ephemeral),
         }
-        return self.request("thread/start", params)
+        return self._request_clearing_context_usage("thread/start", params)
 
     def resume_thread(
         self,
@@ -247,7 +247,7 @@ class CodexAppServerClient:
         }
         if cwd:
             params["cwd"] = str(cwd).strip()
-        return self.request("thread/resume", params)
+        return self._request_clearing_context_usage("thread/resume", params)
 
     def read_thread(self, thread_id: str, include_turns: bool = True) -> dict:
         return self.request(
@@ -266,19 +266,14 @@ class CodexAppServerClient:
         )
 
     def start_turn_items(self, thread_id: str, items: list[dict], timeout: int | None = None) -> dict:
-        self.last_context_usage = None
-        try:
-            return self.request(
-                "turn/start",
-                {
-                    "threadId": str(thread_id or "").strip(),
-                    "input": list(items or []),
-                },
-                timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
-            )
-        except Exception:
-            self.last_context_usage = None
-            raise
+        return self._request_clearing_context_usage(
+            "turn/start",
+            {
+                "threadId": str(thread_id or "").strip(),
+                "input": list(items or []),
+            },
+            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
+        )
 
     def steer_turn(self, thread_id: str, expected_turn_id: str, text: str, timeout: int | None = None) -> dict:
         return self.steer_turn_items(
@@ -295,17 +290,20 @@ class CodexAppServerClient:
         items: list[dict],
         timeout: int | None = None,
     ) -> dict:
+        return self._request_clearing_context_usage(
+            "turn/steer",
+            {
+                "threadId": str(thread_id or "").strip(),
+                "expectedTurnId": str(expected_turn_id or "").strip(),
+                "input": list(items or []),
+            },
+            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
+        )
+
+    def _request_clearing_context_usage(self, method: str, params: dict | None = None, timeout: int | None = None) -> dict:
         self.last_context_usage = None
         try:
-            return self.request(
-                "turn/steer",
-                {
-                    "threadId": str(thread_id or "").strip(),
-                    "expectedTurnId": str(expected_turn_id or "").strip(),
-                    "input": list(items or []),
-                },
-                timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
-            )
+            return self.request(method, params, timeout=timeout)
         except Exception:
             self.last_context_usage = None
             raise
