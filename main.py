@@ -2123,6 +2123,19 @@ class ChatFrame(wx.Frame):
         self.answer_list.Append(label)
         self.answer_meta.append(("context_usage", -1, label, ""))
 
+    def _refresh_answer_list_preserving_selection(self) -> None:
+        selected_meta = None
+        idx = self.answer_list.GetSelection() if hasattr(self, "answer_list") else wx.NOT_FOUND
+        if idx != wx.NOT_FOUND and 0 <= idx < len(self.answer_meta):
+            selected_meta = self.answer_meta[idx]
+        self._render_answer_list()
+        if selected_meta is None:
+            return
+        for new_idx, meta in enumerate(self.answer_meta):
+            if meta == selected_meta:
+                self.answer_list.SetSelection(new_idx)
+                break
+
     def _render_answer_list(self):
         mode = self._apply_detail_panel_mode()
         self.answer_list.Clear()
@@ -4008,6 +4021,8 @@ class ChatFrame(wx.Frame):
                         self._render_answer_list()
                 else:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
+                    if self.view_mode == "active":
+                        self._refresh_answer_list_preserving_selection()
                 self._save_state()
             return
         if event_type == "server_request":
