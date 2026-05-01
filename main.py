@@ -2500,7 +2500,7 @@ class ChatFrame(wx.Frame):
         if str(self.view_history_id or "").strip() != str(chat_id or "").strip():
             return
         self._refresh_history(chat_id)
-        self._render_answer_list()
+        self._refresh_answer_list_preserving_selection()
 
     @staticmethod
     def _execution_step_text(step) -> str:
@@ -5609,7 +5609,7 @@ class ChatFrame(wx.Frame):
             self._refresh_history(chat_id or self.active_chat_id or self.current_chat_id or None)
 
         if should_render and self.view_mode == "active":
-            self._render_answer_list()
+            self._refresh_answer_list_preserving_selection()
             self._call_later_if_alive(120, self._focus_latest_answer)
         if (not is_openclaw_model(used_model)) or err:
             self._play_finish_sound()

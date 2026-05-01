@@ -1995,6 +1995,38 @@ def test_on_done_uses_worker_context_usage_for_regular_model(frame):
     assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
 
 
+def test_on_done_preserves_selected_context_usage_row_when_consuming_pending_usage(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._pending_context_usage_by_turn = {
+        ("chat-current", 0): {
+            "used_tokens": 1500,
+            "context_window": 128000,
+            "source": "api",
+            "exact": True,
+            "fresh": True,
+            "model": "openai/gpt-5.2",
+            "updated_at": 1.0,
+        }
+    }
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._render_answer_list()
+    frame.answer_list.SetSelection(0)
+
+    frame._on_done(0, "answer", "", "openai/gpt-5.2", "", "chat-current")
+
+    assert frame._current_chat_state["context_usage"]["used_tokens"] == 1500
+    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetSelection() == 0
+    assert frame.answer_meta[0][0] == "context_usage"
+
+
 def test_on_done_uses_pending_claudecode_context_usage(frame):
     frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "claudecode/default", "created_at": 1.0}]
     frame._current_chat_state["turns"] = frame.active_session_turns
@@ -2442,6 +2474,57 @@ def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(
     frame.view_history_id = "chat-inactive"
     frame._render_answer_list()
     assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+
+
+def test_late_codex_token_count_event_preserves_selected_context_usage_row_in_visible_history(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [
+        {"question": "active", "answer_md": "active", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-visible",
+            "title": "正在查看",
+            "turns": [
+                {
+                    "question": "q",
+                    "answer_md": "done",
+                    "model": "codex/main",
+                    "created_at": 1.0,
+                    "codex_turn_id": "turn-1",
+                    "request_status": "done",
+                }
+            ],
+        }
+    ]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-visible"
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
+
+    frame._render_answer_list()
+    frame.answer_list.SetSelection(0)
+    assert frame.answer_meta[0][0] == "context_usage"
+
+    frame._on_codex_event_for_chat(
+        "chat-visible",
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+    )
+
+    assert frame._find_archived_chat("chat-visible")["context_usage"] == usage
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetSelection() == 0
+    assert frame.answer_meta[0][0] == "context_usage"
 
 
 def test_codex_without_pending_usage_does_not_estimate(frame):
