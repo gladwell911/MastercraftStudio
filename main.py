@@ -4060,7 +4060,7 @@ class ChatFrame(wx.Frame):
                 self._play_finish_sound()
                 self._save_state()
                 if self.view_mode == "active":
-                    self._render_answer_list()
+                    self._refresh_answer_list_preserving_selection()
             return
         if appended_execution_step and not str(getattr(event, "text", "") or "").strip():
             self._save_state()
