@@ -4022,7 +4022,7 @@ class ChatFrame(wx.Frame):
                     self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
                     self._set_chat_context_usage(self._current_chat_state, event.usage)
                     if self.view_mode == "active":
-                        self._render_answer_list()
+                        self._refresh_answer_list_preserving_selection()
                 else:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
                     if self.view_mode == "active":
