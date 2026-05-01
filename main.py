@@ -2132,7 +2132,11 @@ class ChatFrame(wx.Frame):
         if selected_meta is None:
             return
         for new_idx, meta in enumerate(self.answer_meta):
-            if meta == selected_meta:
+            if selected_meta[0] == "context_usage":
+                matched = meta[0] == "context_usage"
+            else:
+                matched = meta == selected_meta
+            if matched:
                 self.answer_list.SetSelection(new_idx)
                 break
 

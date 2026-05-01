@@ -2216,6 +2216,48 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     assert frame.answer_meta[1][0] == "user"
 
 
+def test_active_pending_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._render_answer_list()
+    frame.answer_list.SetSelection(0)
+    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+    )
+
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetSelection() == 0
+    assert frame.answer_meta[0][0] == "context_usage"
+
+
 def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
