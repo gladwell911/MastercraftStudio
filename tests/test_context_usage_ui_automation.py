@@ -1,4 +1,31 @@
+import ctypes
+
 import main
+
+
+def _send_listbox_key(window, key_code):
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    wm_keydown = 0x0100
+    wm_keyup = 0x0101
+    scan_codes = {
+        main.wx.WXK_UP: 0x48,
+        main.wx.WXK_DOWN: 0x50,
+        main.wx.WXK_HOME: 0x47,
+        main.wx.WXK_END: 0x4F,
+    }
+    virtual_keys = {
+        main.wx.WXK_UP: 0x26,
+        main.wx.WXK_DOWN: 0x28,
+        main.wx.WXK_HOME: 0x24,
+        main.wx.WXK_END: 0x23,
+    }
+    scan = scan_codes.get(key_code, 0)
+    virtual_key = virtual_keys.get(key_code, int(key_code))
+    down_lparam = 1 | (scan << 16)
+    up_lparam = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    hwnd = int(window.GetHandle())
+    user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
+    user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
 
 
 def _usage(*, used=2048, window=128000, source="api", exact=True, model="openai/gpt-5.2"):
@@ -71,6 +98,38 @@ def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame
     down.SetKeyCode(main.wx.WXK_DOWN)
 
     assert frame.answer_list.ProcessEvent(down)
+    assert frame.answer_list.GetSelection() == 1
+    assert frame.answer_meta[1][0] == "user"
+
+
+def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame, wx_app):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "first question", "answer_md": "first answer", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "context_usage": _usage(used=1536),
+    }
+
+    frame._render_answer_list()
+    frame.answer_list.SetSelection(1)
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    _send_listbox_key(frame.answer_list, main.wx.WXK_UP)
+    wx_app.Yield()
+
+    assert frame.answer_list.GetSelection() == 0
+    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+
+    _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+
     assert frame.answer_list.GetSelection() == 1
     assert frame.answer_meta[1][0] == "user"
 
