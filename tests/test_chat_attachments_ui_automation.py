@@ -105,7 +105,7 @@ def test_ui_automation_uploaded_image_uses_single_success_row(frame, tmp_path):
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["我", "图片上传成功"]
+    assert rows == ["上下文：刷新中", "我", "图片上传成功"]
 
 
 def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, tmp_path):
@@ -134,4 +134,4 @@ def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, t
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["我", "图片上传成功", "小诸葛", "已收到图片"]
+    assert rows == ["上下文：刷新中", "我", "图片上传成功", "小诸葛", "已收到图片"]
