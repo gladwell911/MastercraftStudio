@@ -2071,7 +2071,26 @@ class ChatFrame(wx.Frame):
         if not isinstance(chat, dict):
             return None
         pending = self._pending_context_usage_by_turn.get(self._context_usage_pending_key_from_chat(chat, turn_idx))
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        model = ""
+        if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict):
+            model = str(turns[turn_idx].get("model") or "").strip()
+        if not self._pending_context_usage_matches_model(pending, model):
+            return None
         return context_usage_from_dict(pending) if isinstance(pending, dict) else None
+
+    def _pending_context_usage_matches_model(self, pending, model: str) -> bool:
+        if not isinstance(pending, dict):
+            return False
+        source = str(pending.get("source") or "").strip()
+        model_text = str(model or "").strip()
+        if is_codex_model(model_text):
+            return source == "codex"
+        if is_openclaw_model(model_text):
+            return source == "openclaw"
+        if is_claudecode_model(model_text):
+            return source == "claudecode"
+        return source not in {"codex", "openclaw", "claudecode"}
 
     def _is_authoritative_context_usage_model(self, model: str) -> bool:
         text = str(model or "").strip()
@@ -3936,6 +3955,13 @@ class ChatFrame(wx.Frame):
             target_chat = self._find_archived_chat(chat_id)
             target_turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
             target_idx = self._event_turn_index(target_turns, event)
+            if event_type == "token_count" and event.usage and target_idx >= 0 and isinstance(target_chat, dict):
+                self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
+                self._codex_background_flush_dirty = True
+                if not getattr(self, "_codex_background_flush_scheduled", False):
+                    self._codex_background_flush_scheduled = True
+                    self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
+                return
             if step_text:
                 self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
                 appended_execution_step = True
@@ -3953,6 +3979,7 @@ class ChatFrame(wx.Frame):
                     turn["request_error"] = ""
                     if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
                         turn["answer_md"] = str(event.text or "")
+                    self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     target_chat["updated_at"] = time.time()
                 self._refresh_visible_history_chat(chat_id)
             self._codex_background_flush_dirty = True
@@ -3962,6 +3989,14 @@ class ChatFrame(wx.Frame):
             return
         if step_text:
             appended_execution_step = self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
+        if event_type == "token_count" and event.usage:
+            target_idx = self._event_turn_index(self.active_session_turns, event)
+            if target_idx < 0:
+                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            if target_idx >= 0:
+                self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
+                self._save_state()
+            return
         if event_type == "server_request":
             self.active_codex_pending_request = None
             self._push_remote_status("waiting_user_input", "user_input")
@@ -3981,6 +4016,7 @@ class ChatFrame(wx.Frame):
                 turn["request_error"] = ""
                 if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
                     turn["answer_md"] = str(event.text or "")
+                self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._update_active_answer_row(target_idx)
             if is_current_chat:
                 self.is_running = False
@@ -5555,11 +5591,13 @@ class ChatFrame(wx.Frame):
             chat["context_usage"] = usage
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
-        if is_codex_model(used_model):
-            return
         pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
-        if pending:
+        if pending and self._pending_context_usage_matches_model(pending, used_model):
             self._set_chat_context_usage(target_chat, pending)
+            return
+        if pending:
+            self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, turn_idx)] = pending
+        if is_codex_model(used_model):
             return
         if is_openclaw_model(used_model):
             return

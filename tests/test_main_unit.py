@@ -2040,6 +2040,81 @@ def test_on_done_codex_does_not_consume_regular_model_pending_context_usage(fram
     assert frame._pending_context_usage_by_turn == {("chat-current", 0): pending}
 
 
+def test_on_done_uses_pending_codex_context_usage(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    frame._pending_context_usage_by_turn = {("chat-current", 0): usage}
+
+    frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
+
+    assert frame._current_chat_state["context_usage"] == usage
+    assert frame._pending_context_usage_by_turn == {}
+
+
+def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+    )
+
+    assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
+    assert "context_usage" not in frame._current_chat_state
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="turn_completed", thread_id="thread-1", turn_id="turn-1", status="completed"),
+    )
+
+    assert frame._current_chat_state["context_usage"] == usage
+    assert frame._pending_context_usage_by_turn == {}
+
+
+def test_codex_without_pending_usage_does_not_estimate(frame):
+    frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._pending_context_usage_by_turn = {}
+
+    frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
+
+    assert "context_usage" not in frame._current_chat_state
+
+
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
     frame.active_session_turns = [
         {"question": "q", "answer_md": "a", "model": "openai/gpt-5.2", "created_at": 1.0}
