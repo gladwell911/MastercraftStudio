@@ -112,7 +112,7 @@ def context_usage_from_dict(value: dict | None) -> ContextUsage | None:
 def format_token_k(tokens: int) -> str:
     value = _int_value(tokens)
     if value < 1000:
-        return "小于1K"
+        return "\u5c0f\u4e8e1K"
     return f"{(value + 500) // 1000}K"
 
 
@@ -120,14 +120,14 @@ def format_context_usage_label(usage: ContextUsage | dict | None) -> str:
     if isinstance(usage, dict):
         usage = context_usage_from_dict(usage)
     if usage is None:
-        return "上下文：刷新中"
-    prefix = "约 " if not usage.exact else ""
+        return "\u4e0a\u4e0b\u6587\uff1a\u5237\u65b0\u4e2d"
     used = format_token_k(usage.used_tokens)
     if usage.context_window <= 0:
-        return f"上下文：{prefix}{used}，窗口未知"
+        return f"\u4e0a\u4e0b\u6587\uff1a{used}/\u672a\u77e5"
+    prefix = "\u7ea6 " if not usage.exact else ""
     window = format_token_k(usage.context_window)
     percent = round((usage.used_tokens / usage.context_window * 100.0), 1)
-    return f"上下文：{prefix}{used}/{window}，{percent:.1f}%已用"
+    return f"\u4e0a\u4e0b\u6587\uff1a{prefix}{used}/{window}\uff0c{percent:.1f}%\u5df2\u7528"
 
 
 def context_window_for_model(model: str) -> int:
@@ -144,11 +144,13 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def estimate_turns_tokens(turns: list[dict], model: str = "") -> ContextUsage:
-    total = estimate_text_tokens("请使用 Markdown 格式回答，尽量使用标题、段落、列表等结构化格式。不要使用任何表情符号（emoji）。")
+    total = estimate_text_tokens(
+        "\u8bf7\u4f7f\u7528 Markdown \u683c\u5f0f\u56de\u7b54\uff0c\u5c3d\u91cf\u4f7f\u7528\u6807\u9898\u3001\u6bb5\u843d\u3001\u5217\u8868\u7b49\u7ed3\u6784\u5316\u683c\u5f0f\u3002\u4e0d\u8981\u4f7f\u7528\u4efb\u4f55\u8868\u60c5\u7b26\u53f7\uff08emoji\uff09\u3002"
+    )
     for turn in turns or []:
         total += estimate_text_tokens(str((turn or {}).get("question") or ""))
         answer = str((turn or {}).get("answer_md") or "")
-        if answer and answer != "正在请求...":
+        if answer and answer != "\u6b63\u5728\u8bf7\u6c42...":
             total += estimate_text_tokens(answer)
     return normalize_context_usage(
         used_tokens=total,

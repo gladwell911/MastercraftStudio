@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 import tempfile
 
-from context_usage import context_window_for_model, normalize_context_usage
+from context_usage import normalize_context_usage
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -706,9 +706,6 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
         default=0,
     )
-    exact_window = context_window is not None and context_window > 0
-    if not exact_window:
-        context_window = context_window_for_model(fallback_model)
     model_name = str(
         info.get("model")
         or info.get("model_id")
@@ -723,7 +720,7 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         used_tokens=total,
         context_window=context_window,
         source="codex",
-        exact=exact_window,
+        exact=True,
         fresh=True,
         model=model_name,
     ).to_dict()

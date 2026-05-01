@@ -164,9 +164,9 @@ def test_codex_protocol_token_count_event_normalizes_usage():
 
     assert seen[-1].type == "token_count"
     assert seen[-1].usage["used_tokens"] == 44176
-    assert seen[-1].usage["context_window"] == codex_client.context_window_for_model(codex_client.DEFAULT_CODEX_MODEL)
+    assert seen[-1].usage["context_window"] == 0
     assert seen[-1].usage["source"] == "codex"
-    assert seen[-1].usage["exact"] is False
+    assert seen[-1].usage["exact"] is True
     assert seen[-1].usage["fresh"] is True
     assert seen[-1].usage["model"] == "gpt-5-codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage

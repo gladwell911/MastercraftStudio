@@ -8,8 +8,8 @@ from context_usage import (
 
 
 def test_format_token_k_uses_less_than_one_k_for_small_values():
-    assert format_token_k(0) == "小于1K"
-    assert format_token_k(999) == "小于1K"
+    assert format_token_k(0) == "\u5c0f\u4e8e1K"
+    assert format_token_k(999) == "\u5c0f\u4e8e1K"
 
 
 def test_format_token_k_rounds_to_integer_k():
@@ -30,7 +30,7 @@ def test_exact_context_label_with_window_and_percent():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "上下文：113K/272K，41.6%已用"
+    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a113K/272K\uff0c41.6%\u5df2\u7528"
 
 
 def test_estimated_context_label_adds_approximate_prefix():
@@ -44,7 +44,7 @@ def test_estimated_context_label_adds_approximate_prefix():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "上下文：约 12K/128K，9.7%已用"
+    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a\u7ea6 12K/128K\uff0c9.7%\u5df2\u7528"
 
 
 def test_unknown_window_label_omits_percent():
@@ -58,11 +58,25 @@ def test_unknown_window_label_omits_percent():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "上下文：12K，窗口未知"
+    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a12K/\u672a\u77e5"
+
+
+def test_estimated_unknown_window_label_omits_approximate_prefix():
+    usage = ContextUsage(
+        used_tokens=44176,
+        context_window=0,
+        source="codex",
+        exact=False,
+        fresh=True,
+        model="gpt-5-codex",
+        updated_at=1.0,
+    )
+
+    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a44K/\u672a\u77e5"
 
 
 def test_missing_usage_label_is_refreshing():
-    assert format_context_usage_label(None) == "上下文：刷新中"
+    assert format_context_usage_label(None) == "\u4e0a\u4e0b\u6587\uff1a\u5237\u65b0\u4e2d"
 
 
 def test_normalize_context_usage_computes_percent_and_bounds_values():

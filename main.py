@@ -5610,11 +5610,9 @@ class ChatFrame(wx.Frame):
             return
         if pending:
             self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, turn_idx)] = pending
-        if is_codex_model(used_model):
-            return
-        if is_openclaw_model(used_model):
-            return
-        if is_claudecode_model(used_model):
+        if self._is_authoritative_context_usage_model(used_model):
+            if isinstance(target_chat, dict):
+                target_chat.pop("context_usage", None)
             return
         self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
 
