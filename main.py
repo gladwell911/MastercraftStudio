@@ -5741,6 +5741,8 @@ class ChatFrame(wx.Frame):
             if isinstance(self._current_chat_state.get("execution_steps"), list)
             else [],
         }
+        if "context_usage" in self._current_chat_state:
+            archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
         self.archived_chats.append(archived)
         self._sort_archived_chats()
 

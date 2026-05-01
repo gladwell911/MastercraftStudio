@@ -1596,6 +1596,74 @@ def test_save_load_preserves_active_chat_detail_panel_state(tmp_path, monkeypatc
         second.Destroy()
 
 
+def test_save_load_preserves_context_usage_for_active_and_archived_chats(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    active_usage = {
+        "used_tokens": 12000,
+        "context_window": 128000,
+        "source": "api",
+        "exact": True,
+        "fresh": True,
+        "model": "openai/gpt-5.2",
+        "updated_at": 1.0,
+    }
+    archived_usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 2.0,
+    }
+
+    first = main.ChatFrame()
+    try:
+        first.active_chat_id = "chat-active"
+        first.current_chat_id = "chat-active"
+        first.active_session_turns = [
+            {"question": "活动问题", "answer_md": "活动回答", "model": "openai/gpt-5.2", "created_at": 1.0}
+        ]
+        first._current_chat_state = {
+            "id": "chat-active",
+            "title": "活动聊天",
+            "turns": first.active_session_turns,
+            "context_usage": active_usage,
+            "updated_at": 1.0,
+        }
+        first.archived_chats = [
+            {
+                "id": "chat-archived",
+                "title": "归档聊天",
+                "turns": [
+                    {"question": "归档问题", "answer_md": "归档回答", "model": "codex/main", "created_at": 1.0}
+                ],
+                "context_usage": archived_usage,
+                "created_at": 1.0,
+                "updated_at": 2.0,
+            }
+        ]
+        first._save_state()
+    finally:
+        first.Destroy()
+
+    second = main.ChatFrame()
+    try:
+        assert second._current_chat_state["context_usage"] == active_usage
+        assert second._find_archived_chat("chat-archived")["context_usage"] == archived_usage
+
+        second._render_answer_list()
+        assert second.answer_list.GetString(0) == "上下文：12K/128K，9.4%已用"
+
+        second.view_mode = "history"
+        second.view_history_id = "chat-archived"
+        second._render_answer_list()
+        assert second.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    finally:
+        second.Destroy()
+
+
 def test_f1_moves_focus_to_execution_list_then_back(frame, monkeypatch):
     frame._current_chat_state = {
         "id": "chat-1",
@@ -2147,6 +2215,55 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
     assert frame.answer_list.GetString(0) == "上下文：44K/未知"
 
 
+def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [
+        {"question": "active", "answer_md": "active", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-inactive",
+            "title": "后台聊天",
+            "turns": [
+                {
+                    "question": "q",
+                    "answer_md": "done",
+                    "model": "codex/main",
+                    "created_at": 1.0,
+                    "codex_turn_id": "turn-1",
+                    "request_status": "done",
+                }
+            ],
+        }
+    ]
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-inactive",
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+    )
+
+    archived = frame._find_archived_chat("chat-inactive")
+    assert archived["context_usage"] == usage
+    assert frame._pending_context_usage_by_turn == {}
+
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-inactive"
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+
+
 def test_codex_without_pending_usage_does_not_estimate(frame):
     frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
     frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
@@ -2200,6 +2317,37 @@ def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
 
     selected = frame.answer_list.GetSelection()
     assert frame.answer_meta[selected][0] == "answer"
+
+
+def test_archive_active_session_preserves_context_usage_for_history_render(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": "a", "model": "codex/main", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "context_usage": {
+            "used_tokens": 44176,
+            "context_window": 258400,
+            "source": "codex",
+            "exact": False,
+            "fresh": True,
+            "model": "gpt-5-codex",
+            "updated_at": 1.0,
+        },
+    }
+
+    archived = frame._archive_active_session(quick_title=True, save_after_archive=False)
+    frame.view_mode = "history"
+    frame.view_history_id = archived["id"]
+    frame._render_answer_list()
+
+    assert archived["context_usage"]["source"] == "codex"
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
 
 
 def test_on_done_renders_final_answer_after_hidden_requesting_placeholder(frame, monkeypatch):
