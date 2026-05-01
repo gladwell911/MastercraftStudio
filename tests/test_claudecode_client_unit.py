@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from cli_agent_manager import CliRunResult
@@ -41,6 +42,151 @@ class _Manager:
             for line in self.stdout.splitlines(True):
                 on_output(line)
         return CliRunResult(returncode=self.returncode, stdout=self.stdout, stderr=self.stderr)
+
+
+class _UsageResult:
+    returncode = 0
+    stderr = ""
+
+
+class _UsageManager:
+    def run(self, request, on_output=None):
+        payloads = [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "完成"}],
+                    "usage": {"input_tokens": 31747, "output_tokens": 1},
+                },
+                "session_id": "sid-1",
+            },
+            {
+                "type": "result",
+                "session_id": "sid-1",
+                "modelUsage": {
+                    "claude-haiku-4-5-20251001": {
+                        "inputTokens": 795,
+                        "outputTokens": 99,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 29798,
+                        "contextWindow": 200000,
+                    }
+                },
+            },
+        ]
+        for payload in payloads:
+            on_output(json.dumps(payload, ensure_ascii=False) + "\n")
+        return _UsageResult()
+
+
+class _PayloadManager:
+    def __init__(self, payloads):
+        self.payloads = payloads
+
+    def run(self, request, on_output=None):
+        for payload in self.payloads:
+            on_output(json.dumps(payload, ensure_ascii=False) + "\n")
+        return _UsageResult()
+
+
+def test_claudecode_stream_chat_records_model_usage():
+    client = claudecode_client.ClaudeCodeClient(cli_manager=_UsageManager())
+
+    full, session_id = client.stream_chat("修复问题")
+
+    assert full == "完成"
+    assert session_id == "sid-1"
+    assert client.last_context_usage["used_tokens"] == 30692
+    assert client.last_context_usage["context_window"] == 200000
+    assert client.last_context_usage["source"] == "claudecode"
+    assert client.last_context_usage["model"] == "claude-haiku-4-5-20251001"
+
+
+def test_claudecode_stream_chat_blank_input_clears_last_context_usage():
+    client = claudecode_client.ClaudeCodeClient(cli_manager=_UsageManager())
+    client.last_context_usage = {"used_tokens": 123}
+
+    full, session_id = client.stream_chat("   ", session_id="sid-old")
+
+    assert full == ""
+    assert session_id == "sid-old"
+    assert client.last_context_usage is None
+
+
+def test_claudecode_stream_chat_ignores_malformed_model_usage():
+    client = claudecode_client.ClaudeCodeClient(
+        cli_manager=_PayloadManager(
+            [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "ok"}]},
+                    "session_id": "sid-1",
+                },
+                {
+                    "type": "result",
+                    "session_id": "sid-1",
+                    "modelUsage": {
+                        "bad-model": {
+                            "inputTokens": "bad",
+                            "outputTokens": 99,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 29798,
+                            "contextWindow": 200000,
+                        }
+                    },
+                },
+            ]
+        )
+    )
+
+    full, session_id = client.stream_chat("fix")
+
+    assert full == "ok"
+    assert session_id == "sid-1"
+    assert client.last_context_usage is None
+
+
+def test_claudecode_stream_chat_uses_first_valid_model_usage_entry():
+    client = claudecode_client.ClaudeCodeClient(
+        cli_manager=_PayloadManager(
+            [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "ok"}]},
+                    "session_id": "sid-1",
+                },
+                {
+                    "type": "result",
+                    "session_id": "sid-1",
+                    "modelUsage": {
+                        "not-dict": "bad",
+                        "invalid-model": {
+                            "inputTokens": 0,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "contextWindow": 200000,
+                        },
+                        "valid-model": {
+                            "inputTokens": 10,
+                            "outputTokens": 5,
+                            "cacheReadInputTokens": 20,
+                            "cacheCreationInputTokens": 30,
+                            "contextWindow": 1000,
+                        },
+                    },
+                },
+            ]
+        )
+    )
+
+    full, session_id = client.stream_chat("fix")
+
+    assert full == "ok"
+    assert session_id == "sid-1"
+    assert client.last_context_usage["used_tokens"] == 65
+    assert client.last_context_usage["context_window"] == 1000
+    assert client.last_context_usage["model"] == "valid-model"
 
 
 def test_stream_chat_uses_plain_stdout_when_stream_json_is_not_emitted(monkeypatch):

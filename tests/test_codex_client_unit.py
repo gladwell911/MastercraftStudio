@@ -143,6 +143,202 @@ def test_codex_client_maps_agent_message_delta_to_event():
     assert seen[0].text == "hello"
 
 
+def test_codex_protocol_token_count_event_normalizes_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "token_count",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "info": {
+                    "total_token_usage": {"total_tokens": 44176},
+                    "last_token_usage": {"total_tokens": 11891},
+                    "model": "gpt-5-codex",
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["context_window"] == 0
+    assert seen[-1].usage["source"] == "codex"
+    assert seen[-1].usage["exact"] is True
+    assert seen[-1].usage["fresh"] is True
+    assert seen[-1].usage["model"] == "gpt-5-codex"
+    assert seen[-1].data["context_usage"] == seen[-1].usage
+    assert client.last_context_usage == seen[-1].usage
+
+
+def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "codex/event/token_count",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "info": {
+                    "total_token_usage": {"total_tokens": 44176},
+                    "model": "gpt-5-codex",
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["source"] == "codex"
+    assert client.last_context_usage == seen[-1].usage
+
+
+def test_codex_protocol_token_count_sums_usage_fields_when_total_missing():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "token_count",
+            "params": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 40,
+                    "context_window": 1000,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].usage["used_tokens"] == 190
+    assert seen[-1].usage["context_window"] == 1000
+    assert seen[-1].usage["exact"] is True
+
+
+def test_codex_protocol_token_count_sums_nested_component_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "token_count",
+            "params": {
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_input_tokens": 30,
+                        "cache_creation_input_tokens": 40,
+                    },
+                    "context_window": 1000,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].usage["used_tokens"] == 190
+    assert seen[-1].usage["context_window"] == 1000
+    assert seen[-1].usage["exact"] is True
+
+
+def test_codex_protocol_token_count_ignores_malformed_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "token_count",
+            "params": {
+                "info": {
+                    "total_token_usage": {"total_tokens": "bad"},
+                    "context_window": 258400,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage == {}
+    assert "context_usage" not in seen[-1].data
+    assert client.last_context_usage is None
+
+
+def test_codex_callback_exception_clears_last_context_usage():
+    def _raise(_event):
+        raise RuntimeError("callback failed")
+
+    client = codex_client.CodexAppServerClient(on_event=_raise)
+
+    try:
+        client._handle_message(
+            {
+                "method": "token_count",
+                "params": {"info": {"total_token_usage": {"total_tokens": 44176}}},
+            }
+        )
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
+def test_codex_start_turn_failure_clears_last_context_usage(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+
+    def _raise(_method, _params=None, timeout=None):
+        client.last_context_usage = {"used_tokens": 44176, "source": "codex"}
+        raise RuntimeError("turn failed")
+
+    monkeypatch.setattr(client, "request", _raise)
+
+    try:
+        client.start_turn("thread-1", "hello")
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
+def test_codex_start_thread_failure_clears_last_context_usage(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+
+    def _raise(_method, _params=None, timeout=None):
+        client.last_context_usage = {"used_tokens": 44176, "source": "codex"}
+        raise RuntimeError("thread failed")
+
+    monkeypatch.setattr(client, "request", _raise)
+
+    try:
+        client.start_thread(r"C:\code\mc")
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
+def test_codex_resume_thread_failure_clears_last_context_usage(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+
+    def _raise(_method, _params=None, timeout=None):
+        client.last_context_usage = {"used_tokens": 44176, "source": "codex"}
+        raise RuntimeError("resume failed")
+
+    monkeypatch.setattr(client, "request", _raise)
+
+    try:
+        client.resume_thread("thread-1")
+    except RuntimeError:
+        pass
+
+    assert client.last_context_usage is None
+
+
 def test_resolve_codex_launch_command_uses_powershell_for_ps1(monkeypatch):
     def _which(name):
         mapping = {

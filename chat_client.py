@@ -4,6 +4,8 @@ from typing import Callable
 
 import requests
 
+from context_usage import context_window_for_model, normalize_context_usage
+
 BASE_URL = "https://openrouter.ai/api/v1"
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
@@ -37,6 +39,7 @@ class ChatClient:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.last_context_usage = None
 
     def _headers(self) -> dict:
         return {
@@ -64,6 +67,7 @@ class ChatClient:
         return messages
 
     def stream_chat(self, user_text: str, on_delta: Callable[[str], None], history_turns: list[dict] | None = None) -> str:
+        self.last_context_usage = None
         messages = self._build_messages(user_text, history_turns=history_turns)
         if is_doubao_model(self.model):
             return self._stream_doubao_request(messages, on_delta)
@@ -112,6 +116,7 @@ class ChatClient:
             "model": model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if plugins:
             payload["plugins"] = plugins
@@ -137,6 +142,7 @@ class ChatClient:
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    self._capture_usage(obj)
                     delta = self._first_choice(obj).get("delta", {}).get("content", "")
                     if delta:
                         parts.append(delta)
@@ -182,6 +188,7 @@ class ChatClient:
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    self._capture_usage(obj)
                     delta = self._first_choice(obj).get("delta", {}).get("content", "")
                     if delta:
                         parts.append(delta)
@@ -194,6 +201,37 @@ class ChatClient:
         if not parts:
             raise RuntimeError("豆包未返回任何内容。")
         return "".join(parts)
+
+    def _capture_usage(self, obj: dict) -> None:
+        usage = obj.get("usage") if isinstance(obj, dict) else None
+        if not isinstance(usage, dict):
+            return
+        total = self._usage_int_or_none(usage.get("total_tokens"))
+        if total is None or total <= 0:
+            prompt = self._usage_int_or_none(usage.get("prompt_tokens"))
+            completion = self._usage_int_or_none(usage.get("completion_tokens"))
+            if prompt is None or completion is None:
+                return
+            total = prompt + completion
+        if total <= 0:
+            return
+        self.last_context_usage = normalize_context_usage(
+            used_tokens=total,
+            context_window=context_window_for_model(self.model),
+            source="api",
+            exact=True,
+            fresh=True,
+            model=self.model,
+        ).to_dict()
+
+    @staticmethod
+    def _usage_int_or_none(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            return max(int(value), 0)
+        except Exception:
+            return None
 
     def _should_use_web(self, user_text: str) -> bool:
         url = f"{self.base_url}{CHAT_COMPLETIONS_PATH}"

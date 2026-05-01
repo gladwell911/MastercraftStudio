@@ -6,6 +6,7 @@ import subprocess
 from typing import Callable
 
 from cli_agent_manager import CliRunRequest, get_default_cli_agent_manager
+from context_usage import normalize_context_usage
 
 
 CLAUDECODE_MODEL_PREFIX = "claudecode/"
@@ -42,6 +43,40 @@ def resolve_claudecode_command() -> list[str]:
     )
 
 
+def _non_negative_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _context_usage_from_model_usage(model_usage: dict) -> dict | None:
+    for model_name, stats in model_usage.items():
+        if not isinstance(stats, dict):
+            continue
+        input_tokens = _non_negative_int(stats.get("inputTokens") or 0)
+        output_tokens = _non_negative_int(stats.get("outputTokens") or 0)
+        cache_read_tokens = _non_negative_int(stats.get("cacheReadInputTokens") or 0)
+        cache_creation_tokens = _non_negative_int(stats.get("cacheCreationInputTokens") or 0)
+        context_window = _non_negative_int(stats.get("contextWindow"))
+        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, context_window]
+        if any(value is None for value in values):
+            continue
+        used_tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
+        if used_tokens <= 0 or context_window <= 0:
+            continue
+        return normalize_context_usage(
+            used_tokens=used_tokens,
+            context_window=context_window,
+            source="claudecode",
+            exact=True,
+            fresh=True,
+            model=str(model_name or ""),
+        ).to_dict()
+    return None
+
+
 class ClaudeCodeClient:
     def __init__(
         self,
@@ -56,6 +91,7 @@ class ClaudeCodeClient:
         self.cli_manager = cli_manager if cli_manager is not None else get_default_cli_agent_manager()
         self.stdin_queue = queue.Queue()
         self.stdin_writer_thread = None
+        self.last_context_usage = None
 
     def send_user_input(self, user_input: str) -> None:
         self.stdin_queue.put(str(user_input or "").strip())
@@ -68,6 +104,7 @@ class ClaudeCodeClient:
         on_user_input: Callable[[dict], str] | None = None,
         on_approval: Callable[[dict], str] | None = None,
     ) -> tuple[str, str]:
+        self.last_context_usage = None
         if not str(user_text or "").strip():
             return ("", session_id)
 
@@ -125,6 +162,10 @@ class ClaudeCodeClient:
                 sid = str(obj.get("session_id") or "").strip()
                 if sid:
                     new_session_id = sid
+                model_usage = obj.get("modelUsage") if isinstance(obj.get("modelUsage"), dict) else {}
+                usage = _context_usage_from_model_usage(model_usage) if model_usage else None
+                if usage:
+                    self.last_context_usage = usage
                 if not full_text:
                     result_text = str(obj.get("result") or "").strip()
                     if result_text and result_text not in ("success", "error"):

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Callable
 import tempfile
 
+from context_usage import normalize_context_usage
+
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
@@ -161,6 +163,7 @@ class CodexEvent:
     method: str = ""
     params: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
+    usage: dict = field(default_factory=dict)
 
 
 class CodexAppServerClient:
@@ -178,6 +181,7 @@ class CodexAppServerClient:
         self._request_lock = threading.Lock()
         self._request_seq = 1
         self._pending_requests: dict[str | int, dict] = {}
+        self.last_context_usage = None
         self._initialized = False
         self._initializing = False
         self._closed = False
@@ -225,7 +229,7 @@ class CodexAppServerClient:
             "personality": personality,
             "ephemeral": bool(ephemeral),
         }
-        return self.request("thread/start", params)
+        return self._request_clearing_context_usage("thread/start", params)
 
     def resume_thread(
         self,
@@ -243,7 +247,7 @@ class CodexAppServerClient:
         }
         if cwd:
             params["cwd"] = str(cwd).strip()
-        return self.request("thread/resume", params)
+        return self._request_clearing_context_usage("thread/resume", params)
 
     def read_thread(self, thread_id: str, include_turns: bool = True) -> dict:
         return self.request(
@@ -262,7 +266,7 @@ class CodexAppServerClient:
         )
 
     def start_turn_items(self, thread_id: str, items: list[dict], timeout: int | None = None) -> dict:
-        return self.request(
+        return self._request_clearing_context_usage(
             "turn/start",
             {
                 "threadId": str(thread_id or "").strip(),
@@ -286,7 +290,7 @@ class CodexAppServerClient:
         items: list[dict],
         timeout: int | None = None,
     ) -> dict:
-        return self.request(
+        return self._request_clearing_context_usage(
             "turn/steer",
             {
                 "threadId": str(thread_id or "").strip(),
@@ -295,6 +299,14 @@ class CodexAppServerClient:
             },
             timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )
+
+    def _request_clearing_context_usage(self, method: str, params: dict | None = None, timeout: int | None = None) -> dict:
+        self.last_context_usage = None
+        try:
+            return self.request(method, params, timeout=timeout)
+        except Exception:
+            self.last_context_usage = None
+            raise
 
     def respond_tool_request_user_input(self, request_id: str | int, answers: dict[str, list[str]]) -> None:
         payload = {
@@ -488,6 +500,23 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
+        if method in {"token_count", "codex/event/token_count"} or str(params.get("type") or "").strip() == "token_count":
+            usage = codex_context_usage_from_payload(params)
+            data = dict(params)
+            if usage:
+                data["context_usage"] = usage
+            self._emit_event(
+                CodexEvent(
+                    type="token_count",
+                    thread_id=str(params.get("threadId") or params.get("thread_id") or ""),
+                    turn_id=str(params.get("turnId") or params.get("turn_id") or ""),
+                    method=method,
+                    params=params,
+                    data=data,
+                    usage=usage or {},
+                )
+            )
+            return
         if method == "thread/started":
             thread = params.get("thread") if isinstance(params.get("thread"), dict) else {}
             self._emit_event(
@@ -596,5 +625,102 @@ class CodexAppServerClient:
         self._emit_event(CodexEvent(type="notification", method=method, params=params, data=raw))
 
     def _emit_event(self, event: CodexEvent) -> None:
+        if event.type == "token_count" and event.usage:
+            self.last_context_usage = event.usage
         if callable(self.on_event):
-            self.on_event(event)
+            try:
+                self.on_event(event)
+            except Exception:
+                self.last_context_usage = None
+                raise
+
+
+def _non_negative_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _usage_int_field(stats: dict, names: tuple[str, ...], default: int | None = 0) -> int | None:
+    for name in names:
+        if name in stats:
+            return _non_negative_int(stats.get(name))
+    return default
+
+
+def _first_dict(*values) -> dict:
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAULT_CODEX_MODEL) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    info = _first_dict(payload.get("info"), payload.get("usage"), payload)
+    total_usage = _first_dict(
+        info.get("total_token_usage"),
+        info.get("totalTokenUsage"),
+        info.get("total_usage"),
+    )
+    total = _usage_int_field(
+        total_usage,
+        ("total_tokens", "totalTokens", "total", "tokens"),
+        default=None,
+    )
+    if total is None:
+        total = _usage_int_field(
+            info,
+            ("total_tokens", "totalTokens", "totalTokenUsage", "total_token_usage"),
+            default=None,
+        )
+    if total is None or total <= 0:
+        component_usage = total_usage if total_usage else info
+        input_tokens = _usage_int_field(component_usage, ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"))
+        output_tokens = _usage_int_field(component_usage, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
+        cache_read_tokens = _usage_int_field(
+            component_usage,
+            ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens", "cacheReadTokens"),
+        )
+        cache_creation_tokens = _usage_int_field(
+            component_usage,
+            (
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+                "cache_creation_tokens",
+                "cacheCreationTokens",
+            ),
+        )
+        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens]
+        if any(value is None for value in values):
+            return None
+        total = sum(values)
+    if total <= 0:
+        return None
+
+    context_window = _usage_int_field(
+        info,
+        ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
+        default=0,
+    )
+    model_name = str(
+        info.get("model")
+        or info.get("model_id")
+        or info.get("modelId")
+        or payload.get("model")
+        or payload.get("model_id")
+        or payload.get("modelId")
+        or fallback_model
+        or ""
+    ).strip()
+    return normalize_context_usage(
+        used_tokens=total,
+        context_window=context_window,
+        source="codex",
+        exact=True,
+        fresh=True,
+        model=model_name,
+    ).to_dict()

@@ -52,7 +52,8 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert shown["dialog"] == 0
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
-    assert frame.answer_list.GetString(1) == "鍘嗗彶闂"
+    assert frame.answer_list.GetString(0).startswith("上下文：")
+    assert frame.answer_list.GetString(2) == "鍘嗗彶闂"
     assert frame.answer_list.HasFocus()
 
 

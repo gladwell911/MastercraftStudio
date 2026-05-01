@@ -37,6 +37,11 @@ from codex_client import (
     DEFAULT_CODEX_MODEL,
     is_codex_model,
 )
+from context_usage import (
+    context_usage_from_dict,
+    estimate_turns_tokens,
+    format_context_usage_label,
+)
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_projection import DesktopNotesProjection
 from notes_store import NotesStore
@@ -839,6 +844,7 @@ class ChatFrame(wx.Frame):
         self._answer_committed_buffer = ""
         self._answer_redirect_timer = None
         self._pending_input_attachments = []
+        self._pending_context_usage_by_turn = {}
         self._openclaw_sync_thread = None
         self._openclaw_sync_stop = threading.Event()
         self._openclaw_sync_lock = threading.Lock()
@@ -2044,11 +2050,102 @@ class ChatFrame(wx.Frame):
                     items.append({"type": "localImage", "path": path})
         return items or [{"type": "text", "text": ""}]
 
+    def _active_chat_context_usage(self):
+        chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
+        usage = (chat or {}).get("context_usage") if isinstance(chat, dict) else None
+        normalized = context_usage_from_dict(usage)
+        if normalized is not None:
+            return normalized
+        turns = self._get_view_turns()
+        model = self._resolve_current_model() if self.view_mode != "history" else self._history_context_fallback_model(chat, turns)
+        if turns:
+            pending = self._pending_context_usage_for_chat(chat, len(turns) - 1)
+            if pending is not None:
+                return pending
+            if self._is_authoritative_context_usage_model(model) or self._turns_require_authoritative_context_usage(turns):
+                return None
+            return estimate_turns_tokens(turns, model=model)
+        return None
+
+    def _pending_context_usage_for_chat(self, chat: dict | None, turn_idx: int):
+        if not isinstance(chat, dict):
+            return None
+        pending = self._pending_context_usage_by_turn.get(self._context_usage_pending_key_from_chat(chat, turn_idx))
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        model = ""
+        if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict):
+            model = str(turns[turn_idx].get("model") or "").strip()
+        if not self._pending_context_usage_matches_model(pending, model):
+            return None
+        return context_usage_from_dict(pending) if isinstance(pending, dict) else None
+
+    def _pending_context_usage_matches_model(self, pending, model: str) -> bool:
+        if not isinstance(pending, dict):
+            return False
+        source = str(pending.get("source") or "").strip()
+        model_text = str(model or "").strip()
+        if is_codex_model(model_text):
+            return source == "codex"
+        if is_openclaw_model(model_text):
+            return source == "openclaw"
+        if is_claudecode_model(model_text):
+            return source == "claudecode"
+        return source not in {"codex", "openclaw", "claudecode"}
+
+    def _is_authoritative_context_usage_model(self, model: str) -> bool:
+        text = str(model or "").strip()
+        return is_openclaw_model(text) or is_codex_model(text) or is_claudecode_model(text)
+
+    def _turns_require_authoritative_context_usage(self, turns: list[dict]) -> bool:
+        for turn in reversed(turns or []):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            if model:
+                return self._is_authoritative_context_usage_model(model)
+        return False
+
+    def _history_context_fallback_model(self, chat, turns) -> str:
+        if isinstance(chat, dict):
+            model = str(chat.get("model") or "").strip()
+            if model:
+                return model
+        for turn in reversed(turns or []):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            if model:
+                return model
+        return str(self.selected_model or "").strip() or DEFAULT_MODEL_ID
+
+    def _append_context_usage_row(self) -> None:
+        label = format_context_usage_label(self._active_chat_context_usage())
+        self.answer_list.Append(label)
+        self.answer_meta.append(("context_usage", -1, label, ""))
+
+    def _refresh_answer_list_preserving_selection(self) -> None:
+        selected_meta = None
+        idx = self.answer_list.GetSelection() if hasattr(self, "answer_list") else wx.NOT_FOUND
+        if idx != wx.NOT_FOUND and 0 <= idx < len(self.answer_meta):
+            selected_meta = self.answer_meta[idx]
+        self._render_answer_list()
+        if selected_meta is None:
+            return
+        for new_idx, meta in enumerate(self.answer_meta):
+            if selected_meta[0] == "context_usage":
+                matched = meta[0] == "context_usage"
+            else:
+                matched = meta == selected_meta
+            if matched:
+                self.answer_list.SetSelection(new_idx)
+                break
+
     def _render_answer_list(self):
         mode = self._apply_detail_panel_mode()
         self.answer_list.Clear()
         self.answer_meta = []
         self._active_answer_row_index = -1
+        self._append_context_usage_row()
         turns = self._get_view_turns()
         if not turns:
             self.answer_list.Append("暂无对话内容")
@@ -2403,7 +2500,7 @@ class ChatFrame(wx.Frame):
         if str(self.view_history_id or "").strip() != str(chat_id or "").strip():
             return
         self._refresh_history(chat_id)
-        self._render_answer_list()
+        self._refresh_answer_list_preserving_selection()
 
     @staticmethod
     def _execution_step_text(step) -> str:
@@ -3228,6 +3325,9 @@ class ChatFrame(wx.Frame):
                 )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
+                last_context_usage = getattr(client, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
                 wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", DEFAULT_CLAUDECODE_MODEL, "", chat_id)
             except Exception as exc:
                 error_msg = str(exc)
@@ -3872,6 +3972,19 @@ class ChatFrame(wx.Frame):
             target_chat = self._find_archived_chat(chat_id)
             target_turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
             target_idx = self._event_turn_index(target_turns, event)
+            if event_type == "token_count" and event.usage and target_idx >= 0 and isinstance(target_chat, dict):
+                turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
+                if str(turn.get("request_status") or "").strip() == "done":
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, target_idx), None)
+                    self._set_chat_context_usage(target_chat, event.usage)
+                    self._refresh_visible_history_chat(chat_id)
+                else:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
+                self._codex_background_flush_dirty = True
+                if not getattr(self, "_codex_background_flush_scheduled", False):
+                    self._codex_background_flush_scheduled = True
+                    self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
+                return
             if step_text:
                 self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
                 appended_execution_step = True
@@ -3889,6 +4002,7 @@ class ChatFrame(wx.Frame):
                     turn["request_error"] = ""
                     if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
                         turn["answer_md"] = str(event.text or "")
+                    self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     target_chat["updated_at"] = time.time()
                 self._refresh_visible_history_chat(chat_id)
             self._codex_background_flush_dirty = True
@@ -3898,6 +4012,23 @@ class ChatFrame(wx.Frame):
             return
         if step_text:
             appended_execution_step = self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
+        if event_type == "token_count" and event.usage:
+            target_idx = self._event_turn_index(self.active_session_turns, event)
+            if target_idx < 0:
+                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            if target_idx >= 0:
+                turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
+                if str(turn.get("request_status") or "").strip() == "done":
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
+                    self._set_chat_context_usage(self._current_chat_state, event.usage)
+                    if self.view_mode == "active":
+                        self._refresh_answer_list_preserving_selection()
+                else:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
+                    if self.view_mode == "active":
+                        self._refresh_answer_list_preserving_selection()
+                self._save_state()
+            return
         if event_type == "server_request":
             self.active_codex_pending_request = None
             self._push_remote_status("waiting_user_input", "user_input")
@@ -3917,6 +4048,7 @@ class ChatFrame(wx.Frame):
                 turn["request_error"] = ""
                 if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
                     turn["answer_md"] = str(event.text or "")
+                self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._update_active_answer_row(target_idx)
             if is_current_chat:
                 self.is_running = False
@@ -3928,7 +4060,7 @@ class ChatFrame(wx.Frame):
                 self._play_finish_sound()
                 self._save_state()
                 if self.view_mode == "active":
-                    self._render_answer_list()
+                    self._refresh_answer_list_preserving_selection()
             return
         if appended_execution_step and not str(getattr(event, "text", "") or "").strip():
             self._save_state()
@@ -5319,6 +5451,9 @@ class ChatFrame(wx.Frame):
                 session_id = self._ensure_active_openclaw_session_id()
                 c = OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
+                last_context_usage = getattr(c, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
                 full = ""
             elif is_codex_model(model):
                 self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=from_recovery)
@@ -5352,12 +5487,17 @@ class ChatFrame(wx.Frame):
                 )
                 if new_session_id:
                     self.active_claudecode_session_id = new_session_id
+                last_context_usage = getattr(client, "last_context_usage", None)
+                if last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
             else:
                 def on_delta(d):
                     wx_call_after_if_alive(self._on_delta, turn_idx, d, chat_id)
 
                 c = ChatClient(api_key=api_key, model=model)
                 full = c.stream_chat(question, on_delta, history_turns=history_turns)
+                if c.last_context_usage:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
         except Exception as e:
             err = str(e)
             if (not is_openclaw_model(model)) and (not is_codex_model(model)) and self._is_model_endpoint_unavailable_error(model, err):
@@ -5365,6 +5505,8 @@ class ChatFrame(wx.Frame):
                     try:
                         c = ChatClient(api_key=api_key, model=fb_model)
                         full = c.stream_chat(question, on_delta, history_turns=history_turns)
+                        if c.last_context_usage:
+                            self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
                         used_model = fb_model
                         err = ""
                         fallback_msg = f"模型 {model} 当前不可用，已回退到 {fb_model}"
@@ -5438,6 +5580,7 @@ class ChatFrame(wx.Frame):
             if not err:
                 for attachment in self._extract_existing_file_attachments_from_text(str(target_turns[turn_idx].get("answer_md") or ""), str(used_model or "")):
                     self._record_received_attachment(target_turns[turn_idx], attachment)
+                self._refresh_context_usage_after_done(target_chat, target_turns, turn_idx, used_model)
             self._active_request_count = 0
             if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""} and isinstance(target_chat, dict):
                 target_chat["updated_at"] = time.time()
@@ -5466,10 +5609,39 @@ class ChatFrame(wx.Frame):
             self._refresh_history(chat_id or self.active_chat_id or self.current_chat_id or None)
 
         if should_render and self.view_mode == "active":
-            self._render_answer_list()
+            self._refresh_answer_list_preserving_selection()
             self._call_later_if_alive(120, self._focus_latest_answer)
         if (not is_openclaw_model(used_model)) or err:
             self._play_finish_sound()
+
+    def _set_chat_context_usage(self, chat: dict, usage) -> None:
+        if not isinstance(chat, dict) or usage is None:
+            return
+        if hasattr(usage, "to_dict"):
+            usage = usage.to_dict()
+        if isinstance(usage, dict):
+            chat["context_usage"] = usage
+
+    def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
+        pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
+        if pending and self._pending_context_usage_matches_model(pending, used_model):
+            self._set_chat_context_usage(target_chat, pending)
+            return
+        if pending:
+            self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, turn_idx)] = pending
+        if self._is_authoritative_context_usage_model(used_model):
+            if isinstance(target_chat, dict):
+                target_chat.pop("context_usage", None)
+            return
+        self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
+
+    def _context_usage_pending_key(self, chat_id: str, turn_idx: int) -> tuple[str, int]:
+        key_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        return (key_chat_id, int(turn_idx))
+
+    def _context_usage_pending_key_from_chat(self, chat: dict, turn_idx: int) -> tuple[str, int]:
+        chat_id = str((chat or {}).get("id") or "").strip() if isinstance(chat, dict) else ""
+        return self._context_usage_pending_key(chat_id, turn_idx)
 
     def _focus_latest_answer(self):
         if not self._can_focus_completion_result():
@@ -5588,6 +5760,8 @@ class ChatFrame(wx.Frame):
             if isinstance(self._current_chat_state.get("execution_steps"), list)
             else [],
         }
+        if "context_usage" in self._current_chat_state:
+            archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
         self.archived_chats.append(archived)
         self._sort_archived_chats()
 
@@ -5687,14 +5861,20 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
+        key = event.GetKeyCode()
+        ctrl_down = getattr(event, "ControlDown", None)
+        alt_down = getattr(event, "AltDown", None)
+        ctrl = bool(ctrl_down()) if callable(ctrl_down) else False
+        alt = bool(alt_down()) if callable(alt_down) else False
+        if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
+            if self._move_answer_list_selection_for_key(key):
+                return
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
             return
-        key = event.GetKeyCode()
-        ctrl = event.ControlDown()
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             event.Skip()
@@ -5715,6 +5895,30 @@ class ChatFrame(wx.Frame):
             if self._try_open_selected_answer_detail():
                 return
         event.Skip()
+
+    def _move_answer_list_selection_for_key(self, key: int) -> bool:
+        count = self.answer_list.GetCount()
+        if count <= 0:
+            return False
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND:
+            idx = 0
+        if key == wx.WXK_UP:
+            new_idx = max(0, idx - 1)
+        elif key == wx.WXK_DOWN:
+            new_idx = min(count - 1, idx + 1)
+        elif key == wx.WXK_HOME:
+            new_idx = 0
+        elif key == wx.WXK_END:
+            new_idx = count - 1
+        else:
+            return False
+        self.answer_list.SetSelection(new_idx)
+        try:
+            self.answer_list.SetFocus()
+        except Exception:
+            pass
+        return True
 
     def _on_answer_char(self, event):
         key = event.GetKeyCode()
