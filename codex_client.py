@@ -500,7 +500,7 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
-        if method == "token_count" or str(params.get("type") or "").strip() == "token_count":
+        if method in {"token_count", "codex/event/token_count"} or str(params.get("type") or "").strip() == "token_count":
             usage = codex_context_usage_from_payload(params)
             data = dict(params)
             if usage:
@@ -678,14 +678,15 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
             default=None,
         )
     if total is None or total <= 0:
-        input_tokens = _usage_int_field(info, ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"))
-        output_tokens = _usage_int_field(info, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
+        component_usage = total_usage if total_usage else info
+        input_tokens = _usage_int_field(component_usage, ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"))
+        output_tokens = _usage_int_field(component_usage, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
         cache_read_tokens = _usage_int_field(
-            info,
+            component_usage,
             ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens", "cacheReadTokens"),
         )
         cache_creation_tokens = _usage_int_field(
-            info,
+            component_usage,
             (
                 "cache_creation_input_tokens",
                 "cacheCreationInputTokens",

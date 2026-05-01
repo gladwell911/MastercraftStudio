@@ -173,6 +173,30 @@ def test_codex_protocol_token_count_event_normalizes_usage():
     assert client.last_context_usage == seen[-1].usage
 
 
+def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "codex/event/token_count",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "info": {
+                    "total_token_usage": {"total_tokens": 44176},
+                    "model": "gpt-5-codex",
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["source"] == "codex"
+    assert client.last_context_usage == seen[-1].usage
+
+
 def test_codex_protocol_token_count_sums_usage_fields_when_total_missing():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)
@@ -186,6 +210,32 @@ def test_codex_protocol_token_count_sums_usage_fields_when_total_missing():
                     "output_tokens": 20,
                     "cache_read_input_tokens": 30,
                     "cache_creation_input_tokens": 40,
+                    "context_window": 1000,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].usage["used_tokens"] == 190
+    assert seen[-1].usage["context_window"] == 1000
+    assert seen[-1].usage["exact"] is True
+
+
+def test_codex_protocol_token_count_sums_nested_component_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "token_count",
+            "params": {
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_input_tokens": 30,
+                        "cache_creation_input_tokens": 40,
+                    },
                     "context_window": 1000,
                 },
             },

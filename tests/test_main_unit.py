@@ -2105,6 +2105,48 @@ def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame
     assert frame._pending_context_usage_by_turn == {}
 
 
+def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": "done",
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+            "request_status": "done",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame.view_mode = "active"
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="turn_completed", thread_id="thread-1", turn_id="turn-1", status="completed"),
+    )
+    assert "context_usage" not in frame._current_chat_state
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+    )
+
+    assert frame._current_chat_state["context_usage"] == usage
+    assert frame._pending_context_usage_by_turn == {}
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+
+
 def test_codex_without_pending_usage_does_not_estimate(frame):
     frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "codex/main", "created_at": 1.0}]
     frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}

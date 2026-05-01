@@ -3956,7 +3956,13 @@ class ChatFrame(wx.Frame):
             target_turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
             target_idx = self._event_turn_index(target_turns, event)
             if event_type == "token_count" and event.usage and target_idx >= 0 and isinstance(target_chat, dict):
-                self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
+                turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
+                if str(turn.get("request_status") or "").strip() == "done":
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, target_idx), None)
+                    self._set_chat_context_usage(target_chat, event.usage)
+                    self._refresh_visible_history_chat(chat_id)
+                else:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
                 self._codex_background_flush_dirty = True
                 if not getattr(self, "_codex_background_flush_scheduled", False):
                     self._codex_background_flush_scheduled = True
@@ -3994,7 +4000,14 @@ class ChatFrame(wx.Frame):
             if target_idx < 0:
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
             if target_idx >= 0:
-                self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
+                turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
+                if str(turn.get("request_status") or "").strip() == "done":
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
+                    self._set_chat_context_usage(self._current_chat_state, event.usage)
+                    if self.view_mode == "active":
+                        self._render_answer_list()
+                else:
+                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
                 self._save_state()
             return
         if event_type == "server_request":
