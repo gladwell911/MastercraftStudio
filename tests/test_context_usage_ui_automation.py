@@ -42,6 +42,59 @@ def test_ui_automation_context_usage_row_is_fixed_above_answers(frame):
     assert frame.answer_meta[selected][0] == "answer"
 
 
+def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "first question", "answer_md": "first answer", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "context_usage": _usage(used=1536),
+    }
+
+    class _KeyEvent:
+        def __init__(self, key):
+            self.key = key
+            self.skipped = 0
+
+        def GetKeyCode(self):
+            return self.key
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            self.skipped += 1
+
+        def StopPropagation(self):
+            return None
+
+    frame._render_answer_list()
+    frame.answer_list.SetFocus()
+    frame.answer_list.SetSelection(1)
+
+    up = _KeyEvent(main.wx.WXK_UP)
+    frame._on_answer_key_down(up)
+
+    assert up.skipped == 0
+    assert frame.answer_list.GetSelection() == 0
+    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+
+    down = _KeyEvent(main.wx.WXK_DOWN)
+    frame._on_answer_key_down(down)
+
+    assert down.skipped == 0
+    assert frame.answer_list.GetSelection() == 1
+    assert frame.answer_meta[1][0] == "user"
+
+
 def test_ui_automation_history_switch_uses_stored_context_usage_then_cli_unknown(frame):
     frame.Show()
     frame.active_chat_id = "chat-active"

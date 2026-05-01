@@ -5861,14 +5861,20 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
+        key = event.GetKeyCode()
+        ctrl_down = getattr(event, "ControlDown", None)
+        alt_down = getattr(event, "AltDown", None)
+        ctrl = bool(ctrl_down()) if callable(ctrl_down) else False
+        alt = bool(alt_down()) if callable(alt_down) else False
+        if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
+            if self._move_answer_list_selection_for_key(key):
+                return
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
             return
-        key = event.GetKeyCode()
-        ctrl = event.ControlDown()
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             event.Skip()
@@ -5889,6 +5895,30 @@ class ChatFrame(wx.Frame):
             if self._try_open_selected_answer_detail():
                 return
         event.Skip()
+
+    def _move_answer_list_selection_for_key(self, key: int) -> bool:
+        count = self.answer_list.GetCount()
+        if count <= 0:
+            return False
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND:
+            idx = 0
+        if key == wx.WXK_UP:
+            new_idx = max(0, idx - 1)
+        elif key == wx.WXK_DOWN:
+            new_idx = min(count - 1, idx + 1)
+        elif key == wx.WXK_HOME:
+            new_idx = 0
+        elif key == wx.WXK_END:
+            new_idx = count - 1
+        else:
+            return False
+        self.answer_list.SetSelection(new_idx)
+        try:
+            self.answer_list.SetFocus()
+        except Exception:
+            pass
+        return True
 
     def _on_answer_char(self, event):
         key = event.GetKeyCode()
