@@ -1,5 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
+
+
+nats_server = Path("tools/nats-server/nats-server.exe")
+nats_datas = [(str(nats_server), "nats-server")] if nats_server.exists() else []
+nats_hiddenimports = collect_submodules("nats")
+
 
 a = Analysis(
     ['main.py'],
@@ -12,7 +20,7 @@ a = Analysis(
         ('sound', 'sound'),
         ('ZDSRAPI.ini', '.'),
         ('dist/history', 'history'),
-    ],
+    ] + nats_datas,
     hiddenimports=[
         'aiohttp',
         'aiosignal',
@@ -24,7 +32,7 @@ a = Analysis(
         'propcache',
         'websockets',
         'yarl',
-    ],
+    ] + nats_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

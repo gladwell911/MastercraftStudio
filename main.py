@@ -54,12 +54,13 @@ from openclaw_client import (
     OpenClawSyncEvent,
     is_openclaw_model,
     load_session_pointer,
+    load_session_pointer_by_session_id,
     normalize_openclaw_text,
     read_session_events,
     resolve_openclaw_sessions_dir,
 )
-from remote_http import RemoteControlHttpServer
-from remote_ws import RemoteWebSocketServer
+from nats_runtime import NatsRuntimeConfig, NatsServerProcess
+from remote_nats import RemoteNatsTransport
 from realtime_call import (
     DEFAULT_REALTIME_CALL_ROLE,
     DEFAULT_REALTIME_CALL_SPEECH_RATE,
@@ -99,7 +100,11 @@ VK_RMENU = 0xA5
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 DEFAULT_REMOTE_CONTROL_TOKEN = "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
-DEFAULT_REMOTE_CONTROL_DOMAIN = "wss://rc.tingyou.cc/ws"
+DEFAULT_REMOTE_CONTROL_DOMAIN = "wss://rc.tingyou.cc/nats"
+DEFAULT_REMOTE_NATS_PORT = 4222
+DEFAULT_REMOTE_NATS_WEBSOCKET_PORT = 10080
+DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT = 18080
+DEFAULT_REMOTE_NATS_CLOUDFLARED_URL = "wss://rc.tingyou.cc/nats"
 REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS = 5
 VK_PROCESSKEY = 0xE5
 VK_PACKET = 0xE7
@@ -276,7 +281,7 @@ def load_chat_title_rules(path: Path | None = None, *, refresh: bool = False) ->
     return rules
 
 
-def normalize_remote_ws_endpoint(value: str, *, default_scheme: str = "wss") -> str:
+def normalize_remote_nats_endpoint(value: str, *, default_scheme: str = "wss") -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
@@ -294,11 +299,17 @@ def normalize_remote_ws_endpoint(value: str, *, default_scheme: str = "wss") -> 
     port = parts.port if parts.port and parts.port > 0 else None
     netloc = hostname if port is None else f"{hostname}:{port}"
     path = (parts.path or "").rstrip("/")
-    if not path:
-        path = "/ws"
-    elif path != "/ws":
-        path = "/ws" if path.endswith("/ws") else f"{path}/ws"
+    if scheme == "nats":
+        path = ""
+    elif not path:
+        path = "/nats"
+    elif path != "/nats":
+        path = "/nats" if path.endswith("/nats") else f"{path}/nats"
     return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def normalize_remote_ws_endpoint(value: str, *, default_scheme: str = "wss") -> str:
+    return normalize_remote_nats_endpoint(value, default_scheme=default_scheme)
 
 
 def is_loopback_remote_host(value: str) -> bool:
@@ -807,9 +818,10 @@ class ChatFrame(wx.Frame):
         self.active_codex_latest_assistant_text = ""
         self.active_codex_latest_assistant_phase = ""
         self.active_claudecode_session_id = ""
+        self._active_claudecode_client = None
         self._codex_clients: dict[str, CodexAppServerClient] = {}
-        self._remote_ws_server = None
-        self._remote_http_server = None
+        self._remote_nats_process = None
+        self._remote_nats_transport = None
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
         self._alt_menu_armed = False
@@ -822,7 +834,7 @@ class ChatFrame(wx.Frame):
         self.remote_control_token = DEFAULT_REMOTE_CONTROL_TOKEN
         self.remote_control_domain = ""
         self.remote_control_host = "127.0.0.1"
-        self.remote_control_port = 18080
+        self.remote_control_port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         self.remote_control_autostart = True
         self.remote_control_runtime_mode = "local"
         self.remote_control_runtime_bind = ""
@@ -832,6 +844,14 @@ class ChatFrame(wx.Frame):
             "public_ws_ready": False,
             "last_remote_error": "",
             "published_url": "",
+        }
+        self.remote_nats_runtime_url = ""
+        self.remote_nats_runtime_status = {
+            "enabled": False,
+            "tcp_url": "",
+            "websocket_url": "",
+            "cloudflared_url": "",
+            "last_error": "",
         }
 
         self.history_ids = []
@@ -889,8 +909,8 @@ class ChatFrame(wx.Frame):
         self._initialize_remote_control_settings()
         wx_call_after_if_alive(self._realtime_call.prepare)
         self._merge_legacy_archived_chats()
-        self._schedule_remote_ws_autostart()
-        self._start_claudecode_remote_ws_server_if_configured()
+        self._schedule_remote_nats_autostart()
+        self._start_claudecode_remote_nats_runtime_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
         if self.active_session_turns:
             last_model = ""
@@ -1015,15 +1035,18 @@ class ChatFrame(wx.Frame):
         self._notes_rebuild_tab_order()
         self._sync_notes_ui()
 
-    def _schedule_remote_ws_autostart(self) -> None:
+    def _schedule_remote_nats_autostart(self) -> None:
         if not self.remote_control_autostart:
             return
 
         def _worker() -> None:
             try:
-                self._start_remote_ws_server_if_configured(ensure_connectivity=True)
+                token = self._read_remote_control_token() or self.remote_control_token
+                runtime = self._remote_runtime_config()
+                self._stop_remote_servers()
+                self._start_remote_servers(token=token, host=runtime["host"], port=runtime["port"])
             except Exception as exc:
-                wx_call_after_if_alive(self.SetStatusText, f"远程 WebSocket 启动失败：{exc}")
+                wx_call_after_if_alive(self.SetStatusText, f"远程 NATS 启动失败：{exc}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1353,9 +1376,13 @@ class ChatFrame(wx.Frame):
         self.remote_control_domain = str(data.get("remote_control_domain") or self.remote_control_domain or "").strip()
         self.remote_control_host = str(data.get("remote_control_host") or self.remote_control_host or "127.0.0.1").strip() or "127.0.0.1"
         try:
-            self.remote_control_port = int(data.get("remote_control_port") or self.remote_control_port or 18080)
+            self.remote_control_port = int(
+                data.get("remote_control_port")
+                or self.remote_control_port
+                or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
+            )
         except Exception:
-            self.remote_control_port = 18080
+            self.remote_control_port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         self.remote_control_autostart = bool(data.get("remote_control_autostart", self.remote_control_autostart))
         notes_state = data.get("notes_ui_state")
         if isinstance(notes_state, dict):
@@ -1482,7 +1509,7 @@ class ChatFrame(wx.Frame):
         if not has_domain_env and has_local_binding_env:
             domain = ""
         if domain:
-            domain = normalize_remote_ws_endpoint(domain, default_scheme="wss")
+            domain = normalize_remote_nats_endpoint(domain, default_scheme="wss")
         if (
             not domain
             and not has_local_binding_env
@@ -1512,19 +1539,19 @@ class ChatFrame(wx.Frame):
         port_text = self._read_remote_control_setting(
             "REMOTE_CONTROL_PORT",
             "CLAUDECODE_REMOTE_CONTROL_PORT",
-            default=str(self.remote_control_port or 18080),
-        ).strip() or "18080"
+            default=str(self.remote_control_port or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT),
+        ).strip() or str(DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
         try:
             port = int(port_text)
         except Exception:
-            port = 18080
+            port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         if fixed_domain_mode:
             if port <= 0:
-                port = 18080
+                port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         if port < 0:
-            port = 18080
+            port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         if port == 0 and port_text != "0":
-            port = 18080
+            port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         if port != self.remote_control_port:
             self.remote_control_port = port
             changed = True
@@ -1552,7 +1579,7 @@ class ChatFrame(wx.Frame):
             "REMOTE_CONTROL_PORT",
             "CLAUDECODE_REMOTE_CONTROL_PORT",
         )
-        domain = normalize_remote_ws_endpoint(
+        domain = normalize_remote_nats_endpoint(
             self._read_remote_control_setting(
                 "REMOTE_CONTROL_DOMAIN",
                 "CLAUDECODE_REMOTE_CONTROL_DOMAIN",
@@ -1581,26 +1608,26 @@ class ChatFrame(wx.Frame):
         port_text = self._read_remote_control_setting(
             "REMOTE_CONTROL_PORT",
             "CLAUDECODE_REMOTE_CONTROL_PORT",
-            default=str(self.remote_control_port or 18080),
-        ).strip() or "18080"
+            default=str(self.remote_control_port or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT),
+        ).strip() or str(DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
         try:
             port = int(port_text)
         except Exception:
-            port = 18080
+            port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         if fixed_domain_mode:
             if is_loopback_remote_host(host):
                 host = "0.0.0.0"
             if port <= 0:
-                port = 18080
+                port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
             published_base = domain
-            publish_port = 18080
+            publish_port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
         else:
             if port < 0:
-                port = 18080
-            publish_port = port if port > 0 else 18080
+                port = DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
+            publish_port = port if port > 0 else DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT
             published_host = "127.0.0.1" if host == "0.0.0.0" else host
-            published_base = normalize_remote_ws_endpoint(
-                f"ws://{published_host}:{publish_port}/ws",
+            published_base = normalize_remote_nats_endpoint(
+                f"ws://{published_host}:{DEFAULT_REMOTE_NATS_WEBSOCKET_PORT}/nats",
                 default_scheme="ws",
             )
         return {
@@ -1608,7 +1635,7 @@ class ChatFrame(wx.Frame):
             "host": host,
             "port": port,
             "published_base": published_base,
-            "published_bind": f"ws://{host}:{publish_port}/ws",
+            "published_bind": f"ws://{host}:{DEFAULT_REMOTE_NATS_WEBSOCKET_PORT}/nats",
         }
 
     def _is_timestamp_like_archive_title(self, title: str) -> bool:
@@ -2612,15 +2639,7 @@ class ChatFrame(wx.Frame):
 
     def _ensure_active_openclaw_session_id(self) -> str:
         if not self.active_openclaw_session_id:
-            pointer = load_session_pointer(
-                resolve_openclaw_sessions_dir(DEFAULT_OPENCLAW_AGENT) / "sessions.json",
-                session_key=self.active_openclaw_session_key or DEFAULT_OPENCLAW_SESSION_KEY,
-            )
-            if pointer and str(pointer.session_id or "").strip():
-                self.active_openclaw_session_id = str(pointer.session_id or "").strip()
-                self.active_openclaw_session_file = str(pointer.session_file or "").strip()
-            else:
-                self.active_openclaw_session_id = self._make_openclaw_session_id(self._ensure_active_chat_id())
+            self.active_openclaw_session_id = self._make_openclaw_session_id(self._ensure_active_chat_id())
         return self.active_openclaw_session_id
 
     def _has_openclaw_turns(self, turns: list[dict] | None = None) -> bool:
@@ -2643,7 +2662,7 @@ class ChatFrame(wx.Frame):
         session_file = str(self.active_openclaw_session_file or "").strip()
         if not session_file:
             sessions_json = resolve_openclaw_sessions_dir(DEFAULT_OPENCLAW_AGENT) / "sessions.json"
-            pointer = load_session_pointer(sessions_json, self.active_openclaw_session_key or DEFAULT_OPENCLAW_SESSION_KEY)
+            pointer = self._resolve_active_openclaw_session_pointer(sessions_json)
             if pointer is not None:
                 self.active_openclaw_session_id = str(pointer.session_id or self.active_openclaw_session_id).strip()
                 session_file = str(pointer.session_file or "").strip()
@@ -2657,6 +2676,16 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_sync_offset = offset
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = time.time()
+
+    def _resolve_active_openclaw_session_pointer(self, sessions_json: Path):
+        session_id = str(self.active_openclaw_session_id or "").strip()
+        if session_id:
+            pointer = load_session_pointer_by_session_id(sessions_json, session_id)
+            if pointer is not None:
+                return pointer
+        if not session_id:
+            return load_session_pointer(sessions_json, self.active_openclaw_session_key or DEFAULT_OPENCLAW_SESSION_KEY)
+        return None
 
     def _refresh_openclaw_sync_lifecycle(self, force_replay: bool = False) -> None:
         if not self._is_openclaw_sync_target_active():
@@ -2693,14 +2722,25 @@ class ChatFrame(wx.Frame):
     def _sync_openclaw_once(self) -> None:
         if not self._is_openclaw_sync_target_active():
             return
-        pointer = load_session_pointer(
-            resolve_openclaw_sessions_dir(DEFAULT_OPENCLAW_AGENT) / "sessions.json",
-            session_key=self.active_openclaw_session_key or DEFAULT_OPENCLAW_SESSION_KEY,
-        )
-        if pointer is None:
-            return
-
-        session_file = str(pointer.session_file or "").strip()
+        sessions_json = resolve_openclaw_sessions_dir(DEFAULT_OPENCLAW_AGENT) / "sessions.json"
+        pointer = None
+        stored_session_file = str(self.active_openclaw_session_file or "").strip()
+        session_file = stored_session_file
+        session_id = str(self.active_openclaw_session_id or "").strip()
+        updated_at = 0.0
+        if session_file and (not Path(session_file).exists()):
+            pointer = self._resolve_active_openclaw_session_pointer(sessions_json)
+            if pointer is not None:
+                session_file = str(pointer.session_file or "").strip()
+                session_id = str(pointer.session_id or session_id).strip()
+                updated_at = float(pointer.updated_at or 0.0)
+        if not session_file:
+            pointer = self._resolve_active_openclaw_session_pointer(sessions_json)
+            if pointer is None:
+                return
+            session_file = str(pointer.session_file or "").strip()
+            session_id = str(pointer.session_id or session_id).strip()
+            updated_at = float(pointer.updated_at or 0.0)
         if not session_file:
             return
 
@@ -2708,7 +2748,6 @@ class ChatFrame(wx.Frame):
             previous_file = self.active_openclaw_session_file
             previous_session_id = self.active_openclaw_session_id
             previous_offset = int(self.active_openclaw_sync_offset or 0)
-        session_id = str(pointer.session_id or "").strip()
         file_changed = previous_file != session_file
         session_changed = bool(session_id and previous_session_id and (previous_session_id != session_id))
         needs_replay = file_changed or session_changed
@@ -2720,7 +2759,7 @@ class ChatFrame(wx.Frame):
                 "session_id": session_id,
                 "session_file": session_file,
                 "offset": new_offset,
-                "updated_at": float(pointer.updated_at or 0.0),
+                "updated_at": updated_at,
                 "file_changed": file_changed,
                 "session_changed": session_changed,
             },
@@ -3338,10 +3377,21 @@ class ChatFrame(wx.Frame):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _push_remote_status(self, status: str, request_kind: str = "") -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
+    def _publish_remote_nats_event(self, payload: dict) -> None:
+        transport = getattr(self, "_remote_nats_transport", None)
+        if transport is None:
             return
+        try:
+            publish = getattr(transport, "publish_event_threadsafe", None)
+            if callable(publish):
+                publish(payload)
+        except Exception:
+            pass
+
+    def _broadcast_remote_event(self, payload: dict) -> None:
+        self._publish_remote_nats_event(payload)
+
+    def _push_remote_status(self, status: str, request_kind: str = "") -> None:
         payload = {
             "type": "status",
             "chat_id": self.active_chat_id or self.current_chat_id or "",
@@ -3351,34 +3401,23 @@ class ChatFrame(wx.Frame):
             "last_event_id": self.active_codex_turn_id or self.active_openclaw_last_event_id or "",
             "ts": time.time(),
         }
-        try:
-            server.broadcast_event(payload)
-        except Exception:
-            pass
+        self._broadcast_remote_event(payload)
 
     def _push_remote_state(self, chat_id: str | None = None) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
-        status, body = self._remote_api_state_ui({"chat_id": chat_id or self.active_chat_id or self.current_chat_id or ""})
+        resolved_chat_id = chat_id or self.active_chat_id or self.current_chat_id or ""
+        status, body = self._remote_api_state_ui({"chat_id": resolved_chat_id})
         if status >= 400:
             return
-        try:
-            server.broadcast_event(
-                {
-                    "type": "state",
-                    "chat_id": chat_id or self.active_chat_id or self.current_chat_id or "",
-                    "body": body,
-                    "ts": time.time(),
-                }
-            )
-        except Exception:
-            pass
+        self._broadcast_remote_event(
+            {
+                "type": "state",
+                "chat_id": resolved_chat_id,
+                "body": body,
+                "ts": time.time(),
+            }
+        )
 
     def _push_remote_final_answer(self, chat_id: str, text: str) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
         resolved_chat_id = chat_id if chat_id not in {"", None} else self.current_chat_id
         if resolved_chat_id in {"", None}:
             resolved_chat_id = self.active_chat_id if self.active_chat_id not in {"", None} else None
@@ -3389,45 +3428,27 @@ class ChatFrame(wx.Frame):
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": time.time(),
         }
-        try:
-            server.broadcast_event(payload)
-        except Exception:
-            pass
+        self._broadcast_remote_event(payload)
 
     def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
         payload = {
             "type": "history_changed",
             "chat_id": str(chat_id or ""),
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": time.time(),
         }
-        try:
-            server.broadcast_event(payload)
-        except Exception:
-            pass
+        self._broadcast_remote_event(payload)
 
     def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
         payload = {
             "type": "notes_changed",
             "cursor": str(cursor or self.notes_store.current_cursor() or "0"),
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": time.time(),
         }
-        try:
-            server.broadcast_event(payload)
-        except Exception:
-            pass
+        self._broadcast_remote_event(payload)
 
     def _push_remote_notes_conflict(self, payload: dict | None = None) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
         conflict = dict(payload or {})
         conflict.update(
             {
@@ -3436,25 +3457,16 @@ class ChatFrame(wx.Frame):
                 "ts": time.time(),
             }
         )
-        try:
-            server.broadcast_event(conflict)
-        except Exception:
-            pass
+        self._broadcast_remote_event(conflict)
 
     def _push_remote_notes_sync_status(self, status: str | dict, *, cursor: str | None = None, message: str | None = None) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is None:
-            return
         payload = dict(status) if isinstance(status, dict) else {"status": str(status or "")}
         if cursor is not None:
             payload["cursor"] = str(cursor or "")
         if message is not None:
             payload["message"] = str(message or "")
         payload.update({"type": "notes_sync_status", "event_id": f"evt-{uuid.uuid4().hex[:8]}", "ts": time.time()})
-        try:
-            server.broadcast_event(payload)
-        except Exception:
-            pass
+        self._broadcast_remote_event(payload)
 
     def _on_notes_sync_push_result(self, result: dict | None = None) -> None:
         result = dict(result or {})
@@ -3726,7 +3738,25 @@ class ChatFrame(wx.Frame):
         self.selected_model = model
         if threading.current_thread() is threading.main_thread():
             self.input_edit.SetValue(text)
+        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
+        title_revision_before = 0
+        if isinstance(target_chat, dict):
+            try:
+                title_revision_before = int(target_chat.get("title_revision") or 0)
+            except Exception:
+                title_revision_before = 0
         ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id)
+        if ok:
+            self._push_remote_state(chat_id)
+            target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
+            title_revision_after = title_revision_before
+            if isinstance(target_chat, dict):
+                try:
+                    title_revision_after = int(target_chat.get("title_revision") or 0)
+                except Exception:
+                    title_revision_after = title_revision_before
+            if title_revision_after == title_revision_before:
+                self._push_remote_history_changed(chat_id)
         return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
 
     def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
@@ -3736,6 +3766,10 @@ class ChatFrame(wx.Frame):
     def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
         previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+        self.view_mode = "active"
+        self.view_history_id = None
+        self._pending_context_usage_by_turn = {}
+        self._active_claudecode_client = None
         self.current_chat_id = ""
         self.active_chat_id = ""
         self.active_session_turns = []
@@ -3750,6 +3784,7 @@ class ChatFrame(wx.Frame):
             "title_updated_at": now,
             "title_revision": 1,
             "turns": self.active_session_turns,
+            "context_usage": None,
             "created_at": now,
             "updated_at": now,
             "detail_panel_mode": "answers",
@@ -3822,6 +3857,8 @@ class ChatFrame(wx.Frame):
                 "last_event_id": self.active_codex_turn_id or self.active_openclaw_last_event_id or "",
                 "remote_runtime": dict(getattr(self, "remote_control_runtime_status", {}) or {}),
                 "remote_runtime_url": str(getattr(self, "remote_control_runtime_url", "") or ""),
+                "remote_nats_runtime": dict(getattr(self, "remote_nats_runtime_status", {}) or {}),
+                "remote_nats_runtime_url": str(getattr(self, "remote_nats_runtime_url", "") or ""),
             }
         )
         return 200, {"accepted": True, **chat}
@@ -3963,6 +4000,12 @@ class ChatFrame(wx.Frame):
         if not isinstance(event, CodexEvent):
             return
         event_type = str(getattr(event, "type", "") or "").strip()
+        event_turn_id = self._event_turn_id(event)
+        event_thread_id = self._event_thread_id(event)
+        if event_turn_id or event_thread_id:
+            resolved_chat_id = self._resolve_codex_event_chat_id(event)
+            if resolved_chat_id and resolved_chat_id != str(chat_id or "").strip():
+                chat_id = resolved_chat_id
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         step_text = self._codex_execution_step_text(event)
         appended_execution_step = False
@@ -4218,57 +4261,89 @@ class ChatFrame(wx.Frame):
             f"(frozen={env['is_frozen']}, elevated={env['is_elevated']}, fixed_domain={env['is_fixed_domain_remote_mode']})"
         )
 
+    def _set_remote_nats_runtime_status(
+        self,
+        *,
+        enabled: bool | None = None,
+        tcp_url: str | None = None,
+        websocket_url: str | None = None,
+        cloudflared_url: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        status = dict(getattr(self, "remote_nats_runtime_status", {}) or {})
+        status.setdefault("enabled", False)
+        status.setdefault("tcp_url", "")
+        status.setdefault("websocket_url", "")
+        status.setdefault("cloudflared_url", "")
+        status.setdefault("last_error", "")
+        if enabled is not None:
+            status["enabled"] = bool(enabled)
+        if tcp_url is not None:
+            status["tcp_url"] = str(tcp_url or "")
+        if websocket_url is not None:
+            status["websocket_url"] = str(websocket_url or "")
+        if cloudflared_url is not None:
+            status["cloudflared_url"] = str(cloudflared_url or "")
+        if last_error is not None:
+            status["last_error"] = str(last_error or "")
+        self.remote_nats_runtime_status = status
+        self.remote_nats_runtime_url = status["websocket_url"] if status["enabled"] else ""
+
+    def _remote_nats_call_ui(self, callback: Callable[[], tuple[int, dict]]) -> tuple[int, dict]:
+        if threading.current_thread() is threading.main_thread():
+            return callback()
+
+        done = threading.Event()
+        result: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                result["value"] = callback()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        if not wx_call_after_if_alive(_run):
+            raise RuntimeError("UI is not available for NATS command handling")
+        if not done.wait(30):
+            raise TimeoutError("NATS command handling timed out on UI thread")
+        if "error" in result:
+            raise result["error"]  # type: ignore[misc]
+        value = result.get("value")
+        if isinstance(value, tuple):
+            return value
+        raise RuntimeError("NATS command handler returned invalid response")
+
     def _stop_remote_servers(self) -> None:
-        server = getattr(self, "_remote_ws_server", None)
-        if server is not None:
+        transport = getattr(self, "_remote_nats_transport", None)
+        if transport is not None:
             try:
-                server.stop()
+                transport.stop()
             except Exception:
                 pass
-        self._remote_ws_server = None
-        http_server = getattr(self, "_remote_http_server", None)
-        if http_server is not None:
+        self._remote_nats_transport = None
+        process = getattr(self, "_remote_nats_process", None)
+        if process is not None:
             try:
-                http_server.stop()
+                process.stop()
             except Exception:
                 pass
-        self._remote_http_server = None
+        self._remote_nats_process = None
+        self._set_remote_nats_runtime_status(enabled=False)
 
     def _start_remote_servers(self, *, token: str, host: str, port: int) -> None:
-        self._start_remote_http_server_if_configured(token=token, host=host, port=port + 1)
-        self._remote_ws_server = RemoteWebSocketServer(
-            host=host,
-            port=port,
-            token=token,
-            on_message=self._remote_api_message_ui,
-            on_new_chat=self._remote_api_new_chat_ui,
-            on_reply_request=self._remote_api_reply_request_ui,
-            on_state=self._remote_api_state_ui,
-            on_rename_chat=self._remote_api_rename_chat_ui,
-            on_update_settings=self._remote_api_update_settings_ui,
-            on_history_list=self._remote_api_history_list_ui,
-            on_history_read=self._remote_api_history_read_ui,
-            on_notes_snapshot=self._remote_api_notes_snapshot,
-            on_notes_pull_since=self._remote_api_notes_pull_since,
-            on_notes_push_ops=self._remote_api_notes_push_ops,
-            on_notes_subscribe=self._remote_api_notes_subscribe,
-            on_notes_ack=self._remote_api_notes_ack,
-            on_notes_ping=self._remote_api_notes_ping,
-            on_notes_couchdb_changes=self._remote_api_notes_couchdb_changes,
-            on_notes_couchdb_bulk_docs=self._remote_api_notes_couchdb_bulk_docs,
-        )
-        self._remote_ws_server.start()
+        self._start_remote_nats_server_if_configured(token=token, host=host)
 
-    def _build_remote_ws_url(self) -> str:
+    def _build_remote_nats_url(self) -> str:
         token = self._read_remote_control_token()
         if not token:
             return ""
-        runtime = self._remote_runtime_config()
-        base = runtime["published_base"]
+        base = getattr(self, "remote_nats_runtime_status", {}).get("cloudflared_url") or DEFAULT_REMOTE_NATS_CLOUDFLARED_URL
         return f"{base}?token={token}"
 
-    def _on_copy_remote_ws_url(self, _event) -> None:
-        url = self._build_remote_ws_url()
+    def _on_copy_remote_nats_url(self, _event) -> None:
+        url = self._build_remote_nats_url()
         if not url:
             wx.MessageBox("未配置远程控制令牌", "提示", wx.OK | wx.ICON_WARNING)
             return
@@ -4278,6 +4353,107 @@ class ChatFrame(wx.Frame):
             finally:
                 wx.TheClipboard.Close()
         self.SetStatusText("已复制远程控制地址")
+
+    def _start_remote_nats_server_if_configured(self, *, token: str, host: str) -> None:
+        if getattr(self, "_remote_nats_transport", None) is not None:
+            return
+        config = NatsRuntimeConfig(
+            app_data_dir=resolve_app_data_dir(),
+            token=token,
+            host=host,
+            port=DEFAULT_REMOTE_NATS_PORT,
+            websocket_host="127.0.0.1",
+            websocket_port=DEFAULT_REMOTE_NATS_WEBSOCKET_PORT,
+        )
+        tcp_url = f"nats://127.0.0.1:{config.port}"
+        websocket_url = f"ws://127.0.0.1:{config.websocket_port}/nats"
+        process = None
+        reused_existing_runtime = False
+        try:
+            process = NatsServerProcess(config)
+            try:
+                process.start()
+            except Exception as exc:
+                message = str(exc or "").lower()
+                if "already in use" not in message:
+                    raise
+                process = None
+                reused_existing_runtime = True
+            transport = RemoteNatsTransport(
+                pair_id="default",
+                token=token,
+                on_message=self._remote_api_message_ui,
+                on_new_chat=self._remote_api_new_chat_ui,
+                on_reply_request=self._remote_api_reply_request_ui,
+                on_state=self._remote_api_state_ui,
+                on_rename_chat=self._remote_api_rename_chat_ui,
+                on_update_settings=self._remote_api_update_settings_ui,
+                on_history_list=self._remote_api_history_list_ui,
+                on_history_read=self._remote_api_history_read_ui,
+                on_notes_changes=self._remote_api_notes_changes,
+                on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
+            )
+            transport.start_threaded(tcp_url)
+        except Exception as exc:
+            if process is not None:
+                try:
+                    process.stop()
+                except Exception:
+                    pass
+            self._set_remote_nats_runtime_status(
+                enabled=False,
+                tcp_url=tcp_url,
+                websocket_url=websocket_url,
+                cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+                last_error=str(exc),
+            )
+            return
+        self._remote_nats_process = process
+        self._remote_nats_transport = transport
+        self._ensure_cloudflared_origin_bridge()
+        self._set_remote_nats_runtime_status(
+            enabled=True,
+            tcp_url=tcp_url,
+            websocket_url=websocket_url,
+            cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+            last_error="",
+        )
+        if reused_existing_runtime:
+            self.SetStatusText("远程 NATS 已复用现有本地运行时")
+
+    def _ensure_cloudflared_origin_bridge(self) -> None:
+        listen_port = int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
+        target_port = int(DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
+        for args in (
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "add",
+                "v4tov4",
+                f"listenport={listen_port}",
+                "listenaddress=127.0.0.1",
+                f"connectport={target_port}",
+                "connectaddress=127.0.0.1",
+            ],
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "add",
+                "v6tov4",
+                f"listenport={listen_port}",
+                "listenaddress=::1",
+                f"connectport={target_port}",
+                "connectaddress=127.0.0.1",
+            ],
+        ):
+            result = self._run_remote_check_command(args, timeout=10.0)
+            if result is None:
+                continue
+            detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+            if result.returncode == 0 or "already exists" in detail:
+                continue
 
     def _run_remote_check_command(self, args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess | None:
         kwargs = {
@@ -4360,23 +4536,26 @@ class ChatFrame(wx.Frame):
             return False
 
     def _verify_remote_local_health(self, token: str, port: int) -> tuple[bool, str]:
-        probe_host = self._remote_runtime_probe_host()
-        url = f"http://{probe_host}:{int(port)}/healthz?token={token}"
-        try:
-            with urllib_request.urlopen(url, timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        except urllib_error.URLError as exc:
-            return False, f"本地监听检查失败：{exc}"
-        except Exception as exc:
-            return False, f"本地健康检查失败：{exc}"
-        accepted = bool(payload.get("accepted"))
-        return accepted, ("" if accepted else f"本地健康检查返回异常：{payload}")
+        runtime = getattr(self, "remote_nats_runtime_status", {}) or {}
+        websocket_url = str(runtime.get("websocket_url") or "").strip()
+        if not websocket_url:
+            return False, "本地 NATS websocket 地址未配置。"
+        parsed = urlsplit(websocket_url)
+        probe_host = parsed.hostname or self._remote_runtime_probe_host()
+        probe_port = int(parsed.port or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
+        probe_url = urlunsplit((parsed.scheme or "ws", f"{probe_host}:{probe_port}", parsed.path or "/nats", "", ""))
+        return self._verify_remote_public_ws(probe_url)
 
     async def _verify_remote_public_ws_async(self, url: str) -> tuple[bool, str]:
         timeout = ClientTimeout(total=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+        path = (urlsplit(str(url or "")).path or "").strip().lower()
         try:
             async with ClientSession(timeout=timeout) as session:
                 async with session.ws_connect(url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as ws:
+                    if path.endswith("/nats"):
+                        message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+                        ok = message.type == WSMsgType.TEXT and str(message.data or "").startswith("INFO ")
+                        return ok, ("" if ok else f"公网 NATS 隧道响应异常：{message.type} {message.data!r}")
                     message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
         except Exception as exc:
             return False, f"公网隧道握手失败：{exc}"
@@ -4392,9 +4571,9 @@ class ChatFrame(wx.Frame):
     def _verify_remote_public_ws(self, url: str) -> tuple[bool, str]:
         return asyncio.run(self._verify_remote_public_ws_async(url))
 
-    def _ensure_remote_ws_startup_connectivity(self, *, token: str, published_url: str) -> None:
+    def _ensure_remote_nats_startup_connectivity(self, *, token: str, published_url: str) -> None:
         runtime = self._remote_runtime_config()
-        if not runtime["fixed_domain_mode"] or getattr(self, "_remote_ws_server", None) is None:
+        if not runtime["fixed_domain_mode"] or getattr(self, "_remote_nats_transport", None) is None:
             return
         self._set_remote_runtime_status(
             local_listener_ready=False,
@@ -4402,7 +4581,9 @@ class ChatFrame(wx.Frame):
             last_remote_error="",
             published_url=published_url,
         )
-        port = int(getattr(self._remote_ws_server, "bound_port", 0) or runtime["port"] or 0)
+        websocket_url = str((getattr(self, "remote_nats_runtime_status", {}) or {}).get("websocket_url") or "").strip()
+        parsed = urlsplit(websocket_url)
+        port = int(parsed.port or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
         if port <= 0:
             raise RuntimeError(self._format_remote_startup_error("远程控制本地监听端口无效。"))
         if not self._remote_local_listener_ready(port):
@@ -4422,7 +4603,7 @@ class ChatFrame(wx.Frame):
                 published_url=published_url,
             )
             self.SetStatusText(
-                f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
+                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
             )
             return
         if not self._restart_cloudflared_service():
@@ -4437,32 +4618,12 @@ class ChatFrame(wx.Frame):
             published_url=published_url,
         )
         self.SetStatusText(
-            f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
+            f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
         )
 
-    def _start_remote_http_server_if_configured(self, *, token: str, host: str, port: int) -> None:
-        if getattr(self, "_remote_http_server", None) is not None:
-            return
-        self._remote_http_server = RemoteControlHttpServer(
-            host=host,
-            port=port,
-            token=token,
-            on_message=self._remote_api_message_ui,
-            on_new_chat=self._remote_api_new_chat_ui,
-            on_reply_request=self._remote_api_reply_request_ui,
-            on_state=self._remote_api_state_ui,
-            on_notes_snapshot=self._remote_api_notes_snapshot,
-            on_notes_pull_since=self._remote_api_notes_pull_since,
-            on_notes_push_ops=self._remote_api_notes_push_ops,
-            on_notes_subscribe=self._remote_api_notes_subscribe,
-            on_notes_ack=self._remote_api_notes_ack,
-            on_notes_ping=self._remote_api_notes_ping,
-        )
-        self._remote_http_server.start()
-
-    def _start_remote_ws_server_if_configured(self, *, ensure_connectivity: bool = False) -> None:
+    def _start_remote_nats_runtime_if_configured(self, *, ensure_connectivity: bool = False) -> None:
         token = self._read_remote_control_token() or self.remote_control_token
-        if not token or getattr(self, "_remote_ws_server", None) is not None:
+        if not token or getattr(self, "_remote_nats_transport", None) is not None:
             return
         runtime = self._remote_runtime_config()
         host = runtime["host"]
@@ -4480,7 +4641,10 @@ class ChatFrame(wx.Frame):
             self._stop_remote_servers()
             self._start_remote_servers(token=token, host=host, port=port)
             self.remote_control_runtime_mode = "fixed_domain" if runtime["fixed_domain_mode"] else "local"
-            self.remote_control_runtime_bind = f"ws://{host}:{self._remote_ws_server.bound_port}/ws"
+            self.remote_control_runtime_bind = (
+                getattr(self, "remote_nats_runtime_status", {}).get("websocket_url")
+                or f"ws://127.0.0.1:{DEFAULT_REMOTE_NATS_WEBSOCKET_PORT}/nats"
+            )
             self._set_remote_runtime_status(
                 local_listener_ready=True,
                 public_ws_ready=not runtime["fixed_domain_mode"],
@@ -4490,16 +4654,16 @@ class ChatFrame(wx.Frame):
             if not ensure_connectivity:
                 if runtime["fixed_domain_mode"]:
                     self.SetStatusText(
-                        f"远程 WebSocket 本地监听已启动：监听 {self.remote_control_runtime_bind}；等待公网验证 {published_url}"
+                        f"远程 NATS 本地监听已启动：监听 {self.remote_control_runtime_bind}；等待公网验证 {published_url}"
                     )
                 else:
                     self.SetStatusText(
-                        f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
+                        f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
                     )
                 return
             try:
                 if runtime["fixed_domain_mode"]:
-                    self._ensure_remote_ws_startup_connectivity(token=token, published_url=published_url)
+                    self._ensure_remote_nats_startup_connectivity(token=token, published_url=published_url)
                     if self.remote_control_runtime_status.get("public_ws_ready"):
                         self._set_remote_runtime_status(
                             local_listener_ready=True,
@@ -4509,7 +4673,7 @@ class ChatFrame(wx.Frame):
                         )
                 else:
                     self.SetStatusText(
-                        f"远程 WebSocket 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
+                        f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
                     )
                 if not runtime["fixed_domain_mode"]:
                     self._set_remote_runtime_status(
@@ -4528,10 +4692,10 @@ class ChatFrame(wx.Frame):
                     published_url=published_url,
                 )
                 if attempt_idx + 1 >= attempts:
-                    self.SetStatusText(f"远程 WebSocket 启动失败：{last_error}")
+                    self.SetStatusText(f"远程 NATS 启动失败：{last_error}")
                     raise
 
-    def _start_claudecode_remote_ws_server_if_configured(self) -> None:
+    def _start_claudecode_remote_nats_runtime_if_configured(self) -> None:
         return
 
     def _on_char_hook(self, event):
@@ -5386,7 +5550,8 @@ class ChatFrame(wx.Frame):
             self.SetStatusText("语音输入失败：无法写入当前焦点位置")
             self._play_voice_wrong_sound()
             return
-        wx_call_later_if_alive(200, self._speak_text_via_screen_reader, text)
+        if self._call_later_if_alive(200, self._speak_text_via_screen_reader, text) is None:
+            self._speak_text_via_screen_reader(text)
 
     def _on_voice_stop_recording(self):
         self._play_voice_end_sound()
@@ -5602,11 +5767,17 @@ class ChatFrame(wx.Frame):
                 self.SetStatusText("已发送，等待 OpenClaw 同步回复")
             else:
                 self.SetStatusText("答复完成")
-        if is_codex_model(used_model) or is_claudecode_model(used_model):
-            self._push_remote_state(chat_id or self.active_chat_id or self.current_chat_id or "")
+        resolved_chat_id = chat_id or self.active_chat_id or self.current_chat_id or ""
+        if (not is_openclaw_model(used_model)) and resolved_chat_id:
+            self._push_remote_state(resolved_chat_id)
+            if not err and 0 <= turn_idx < len(target_turns):
+                final_text = str(target_turns[turn_idx].get("answer_md") or "").strip()
+                if final_text and final_text != REQUESTING_TEXT:
+                    self._push_remote_final_answer(resolved_chat_id, final_text)
+            self._push_remote_history_changed(resolved_chat_id)
         self._save_state()
         if self._is_ui_alive():
-            self._refresh_history(chat_id or self.active_chat_id or self.current_chat_id or None)
+            self._refresh_history(resolved_chat_id or None)
 
         if should_render and self.view_mode == "active":
             self._refresh_answer_list_preserving_selection()
@@ -5786,6 +5957,7 @@ class ChatFrame(wx.Frame):
         self.active_codex_latest_assistant_text = ""
         self.active_codex_latest_assistant_phase = ""
         self.active_claudecode_session_id = ""
+        self._active_claudecode_client = None
         self.view_mode = "active"
         self.view_history_id = None
         if save_after_archive:
@@ -5818,22 +5990,10 @@ class ChatFrame(wx.Frame):
         self.SetStatusText(f"已载入项目：{folder_name}")
 
     def _on_new_chat_clicked(self, _):
-        if self._has_openclaw_turns() or ((not self.active_session_turns) and is_openclaw_model(self._resolve_current_model())):
-            self.active_session_turns = []
-            self._current_chat_state["turns"] = self.active_session_turns
-            self._current_chat_state["detail_panel_mode"] = "answers"
-            self._current_chat_state["execution_steps"] = []
-            self.active_turn_idx = -1
-            self.view_mode = "active"
-            self.view_history_id = None
-            self._active_answer_row_index = -1
-            self._seek_openclaw_sync_to_current_tail()
-            self._save_state()
-            self._render_answer_list()
-            self._send_openclaw_hidden_message("/new")
-            self.input_edit.SetFocus()
-            self.SetStatusText("已开始新的 OpenClaw 会话")
-            return
+        self.view_mode = "active"
+        self.view_history_id = None
+        self._pending_context_usage_by_turn = {}
+        self._active_claudecode_client = None
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
         self.current_chat_id = ""
         self.active_chat_id = ""
@@ -5846,6 +6006,7 @@ class ChatFrame(wx.Frame):
             "title_updated_at": now,
             "title_revision": 1,
             "turns": self.active_session_turns,
+            "context_usage": None,
             "created_at": now,
             "updated_at": now,
             "detail_panel_mode": "answers",
@@ -6710,6 +6871,9 @@ class ChatFrame(wx.Frame):
             results.append(row)
         return 200, {"results": results, "last_seq": current_cursor}
 
+    def _remote_api_notes_changes(self, payload: dict | None = None) -> tuple[int, dict]:
+        return self._remote_api_notes_couchdb_changes(payload)
+
     def _remote_api_notes_couchdb_bulk_docs(self, payload: dict | None = None) -> tuple[int, list]:
         payload = dict(payload or {})
         database = str(payload.get("database") or "").strip() or "zhuge_notes"
@@ -6775,6 +6939,10 @@ class ChatFrame(wx.Frame):
                 }
             )
         return 201, results
+
+    def _remote_api_notes_bulk_docs(self, payload: dict | None = None) -> tuple[int, dict]:
+        status, results = self._remote_api_notes_couchdb_bulk_docs(payload)
+        return status, {"results": results}
 
     def _schedule_notes_couchdb_sync(self) -> None:
         if not getattr(self, "notes_sync", None) or not self.notes_sync.is_configured():
@@ -7451,18 +7619,6 @@ class ChatFrame(wx.Frame):
                 self._codex_client.close()
             except Exception:
                 pass
-        if self._remote_ws_server:
-            try:
-                self._remote_ws_server.stop()
-            except Exception:
-                pass
-            self._remote_ws_server = None
-        if self._remote_http_server:
-            try:
-                self._remote_http_server.stop()
-            except Exception:
-                pass
-            self._remote_http_server = None
         try:
             self.notes_sync.close()
         except Exception:
