@@ -86,6 +86,11 @@ class ZDSRTTSClient:
                 continue
         return None
 
+    def _reset_state(self) -> None:
+        self._ready = False
+        self._init_tried = False
+        self._api = None
+
     def _ensure_ready(self) -> bool:
         if self._ready:
             return True
@@ -110,17 +115,13 @@ class ZDSRTTSClient:
             channel = self._channel_name or None
             ret = int(api.InitTTS(self._type, channel, 1 if self._keydown_interrupt else 0))
             if ret != 0:
+                self._reset_state()
                 return False
             self._api = api
             self._ready = True
             return True
 
-    def speak(self, text: str) -> bool:
-        content = str(text or "").strip()
-        if not content:
-            return False
-        if not self._ensure_ready():
-            return False
+    def _speak_once(self, content: str) -> bool:
         try:
             self._api.StopSpeak()
         except Exception:
@@ -130,3 +131,17 @@ class ZDSRTTSClient:
         except Exception:
             return False
         return ret == 0
+
+    def speak(self, text: str) -> bool:
+        content = str(text or "").strip()
+        if not content:
+            return False
+        if not self._ensure_ready():
+            return False
+        if self._speak_once(content):
+            return True
+        with self._lock:
+            self._reset_state()
+        if not self._ensure_ready():
+            return False
+        return self._speak_once(content)
