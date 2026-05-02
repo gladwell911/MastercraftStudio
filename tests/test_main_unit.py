@@ -5,11 +5,9 @@ import time
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-import asyncio
 
 import wx
 import pytest
-from aiohttp import ClientSession
 
 import main
 import speech_input
@@ -53,118 +51,35 @@ def test_continue_shortcut_mapping(frame):
     assert not frame._is_continue_shortcut(ord("C"), alt=False)
 
 
-def test_remote_ws_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
+def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_DOMAIN", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)
 
-    url = frame._build_remote_ws_url()
+    url = frame._build_remote_nats_url()
 
-    assert url == "wss://rc.tingyou.cc/ws?token=secret"
+    assert url == "wss://rc.tingyou.cc/nats?token=secret"
 
 
-def test_remote_ws_server_binds_publicly_by_default(frame, monkeypatch):
+def test_remote_nats_url_strips_invalid_port_zero_from_domain(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
-    monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
-    monkeypatch.delenv("REMOTE_CONTROL_DOMAIN", raising=False)
-    monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)
-
-    captured = {}
-
-    class _FakeServer:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-            self.host = kwargs["host"]
-            self.port = kwargs["port"]
-            self.bound_port = kwargs["port"]
-
-        def start(self):
-            return None
-
-        def stop(self):
-            return None
-
-    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
-    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
-
-    frame._start_remote_ws_server_if_configured()
-
-    assert captured["host"] == "0.0.0.0"
-    assert captured["port"] == 18080
-    assert frame.remote_control_runtime_url == ""
-    assert frame.remote_control_runtime_status["published_url"] == "wss://rc.tingyou.cc/ws?token=secret"
-    assert frame.remote_control_runtime_status["public_ws_ready"] is False
-
-
-def test_remote_ws_server_supports_legacy_claudecode_env_names(frame, monkeypatch):
-    monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
-    monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
-    monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)
-    monkeypatch.setenv("CLAUDECODE_REMOTE_CONTROL_TOKEN", "secret")
-    monkeypatch.setenv("CLAUDECODE_REMOTE_CONTROL_PORT", "0")
-    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
-
-    assert frame._build_remote_ws_url() == "ws://127.0.0.1:18080/ws?token=secret"
-
-    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
-    try:
-        assert frame._remote_ws_server.host == "127.0.0.1"
-        assert frame._remote_ws_server.bound_port > 0
-
-        async def _run():
-            session = ClientSession()
-            try:
-                ws = await session.ws_connect(f"http://127.0.0.1:{frame._remote_ws_server.bound_port}/ws?token=secret")
-                try:
-                    connected = (await ws.receive()).json()
-                    assert connected["type"] == "connected"
-                finally:
-                    await ws.close()
-            finally:
-                await session.close()
-
-        asyncio.run(_run())
-    finally:
-        frame._remote_ws_server.stop()
-        frame._remote_ws_server = None
-        if frame._remote_http_server is not None:
-            frame._remote_http_server.stop()
-            frame._remote_http_server = None
-
-
-def test_remote_ws_start_also_starts_remote_http_server(frame, monkeypatch):
-    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
-    monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
-
-    frame._start_remote_ws_server_if_configured()
-    try:
-        assert frame._remote_http_server is not None
-        assert frame._remote_http_server.bound_port > 0
-    finally:
-        if frame._remote_ws_server is not None:
-            frame._remote_ws_server.stop()
-            frame._remote_ws_server = None
-        if frame._remote_http_server is not None:
-            frame._remote_http_server.stop()
-            frame._remote_http_server = None
-
-
-def test_remote_ws_url_strips_invalid_port_zero_from_domain(frame, monkeypatch):
-    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
-    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "https://rc.tingyou.cc:0/ws#")
-
-    url = frame._build_remote_ws_url()
-
-    assert url == "wss://rc.tingyou.cc/ws?token=secret"
-
-
-def test_remote_control_settings_normalize_dirty_domain(frame):
-    frame.remote_control_domain = "https://rc.tingyou.cc:0/ws#"
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "https://rc.tingyou.cc:0/nats#")
 
     frame._initialize_remote_control_settings()
 
-    assert frame.remote_control_domain == "wss://rc.tingyou.cc/ws"
+    url = frame._build_remote_nats_url()
+
+    assert frame.remote_control_domain == "wss://rc.tingyou.cc/nats"
+    assert url == "wss://rc.tingyou.cc/nats?token=secret"
+
+
+def test_remote_control_settings_normalize_dirty_domain(frame):
+    frame.remote_control_domain = "https://rc.tingyou.cc:0/nats#"
+
+    frame._initialize_remote_control_settings()
+
+    assert frame.remote_control_domain == "wss://rc.tingyou.cc/nats"
 
 
 def test_fixed_domain_mode_forces_public_host_and_stable_port(frame):
@@ -174,75 +89,90 @@ def test_fixed_domain_mode_forces_public_host_and_stable_port(frame):
 
     frame._initialize_remote_control_settings()
 
-    assert frame.remote_control_domain == "wss://rc.tingyou.cc/ws"
+    assert frame.remote_control_domain == "wss://rc.tingyou.cc/nats"
     assert frame.remote_control_host == "0.0.0.0"
     assert frame.remote_control_port == 18080
 
 
-def test_fixed_domain_server_uses_public_runtime_and_status(frame, monkeypatch):
+def test_fixed_domain_nats_runtime_uses_public_runtime_and_status(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
     monkeypatch.setenv("REMOTE_CONTROL_HOST", "127.0.0.1")
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
 
-    captured = {}
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
 
-    class _FakeServer:
+        def start(self, timeout=10):
+            return SimpleNamespace()
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
         def __init__(self, **kwargs):
-            captured.update(kwargs)
-            self.host = kwargs["host"]
-            self.port = kwargs["port"]
-            self.bound_port = kwargs["port"]
+            self.kwargs = kwargs
 
-        def start(self):
+        def start_threaded(self, url, timeout=10):
             return None
 
         def stop(self):
             return None
 
-    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
     statuses = []
     monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
 
-    frame._start_remote_ws_server_if_configured()
+    frame._start_remote_nats_runtime_if_configured()
 
-    assert captured["host"] == "0.0.0.0"
-    assert captured["port"] == 18080
     assert statuses
-    assert "0.0.0.0:18080" in statuses[-1]
-    assert "wss://rc.tingyou.cc/ws?token=secret" in statuses[-1]
+    assert "ws://127.0.0.1:10080/nats" in statuses[-1]
+    assert "wss://rc.tingyou.cc/nats?token=secret" in statuses[-1]
 
 
-def test_remote_ws_startup_runs_fixed_domain_connectivity_check(frame, monkeypatch):
+def test_remote_nats_startup_runs_fixed_domain_connectivity_check(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
 
-    class _FakeServer:
-        def __init__(self, **kwargs):
-            self.host = kwargs["host"]
-            self.port = kwargs["port"]
-            self.bound_port = kwargs["port"]
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
 
-        def start(self):
+        def start(self, timeout=10):
+            return SimpleNamespace()
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start_threaded(self, url, timeout=10):
             return None
 
         def stop(self):
             return None
 
     seen = {}
-    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
     monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
     monkeypatch.setattr(
         frame,
-        "_ensure_remote_ws_startup_connectivity",
+        "_ensure_remote_nats_startup_connectivity",
         lambda **kwargs: seen.update(kwargs),
     )
 
-    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+    frame._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
 
     assert seen == {
         "token": "secret",
-        "published_url": "wss://rc.tingyou.cc/ws?token=secret",
+        "published_url": "wss://rc.tingyou.cc/nats?token=secret",
     }
 
 
@@ -250,59 +180,65 @@ def test_fixed_domain_remote_runtime_url_stays_empty_until_connectivity_is_verif
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
 
-    class _FakeServer:
-        def __init__(self, **kwargs):
-            self.host = kwargs["host"]
-            self.port = kwargs["port"]
-            self.bound_port = kwargs["port"]
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
 
-        def start(self):
+        def start(self, timeout=10):
+            return SimpleNamespace()
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start_threaded(self, url, timeout=10):
             return None
 
         def stop(self):
             return None
 
-    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
     monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
     monkeypatch.setattr(
         frame,
-        "_ensure_remote_ws_startup_connectivity",
+        "_ensure_remote_nats_startup_connectivity",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("public probe failed")),
     )
 
     with pytest.raises(RuntimeError):
-        frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+        frame._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
 
     assert frame.remote_control_runtime_url == ""
     assert frame.remote_control_runtime_status["public_ws_ready"] is False
 
 
-def test_fixed_domain_remote_start_rebuilds_servers_after_connectivity_failure(frame, monkeypatch):
+def test_fixed_domain_remote_start_rebuilds_runtime_after_connectivity_failure(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
 
     created = []
 
-    class _FakeServer:
-        def __init__(self, **kwargs):
-            self.host = kwargs["host"]
-            self.port = kwargs["port"]
-            self.bound_port = kwargs["port"]
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
             self.stopped = False
             created.append(self)
 
-        def start(self):
-            return None
+        def start(self, timeout=10):
+            return SimpleNamespace()
 
         def stop(self):
             self.stopped = True
 
-    class _FakeHttpServer:
+    class _FakeNatsTransport:
         def __init__(self, **kwargs):
-            self.bound_port = kwargs["port"]
             self.stopped = False
 
-        def start(self):
+        def start_threaded(self, url, timeout=10):
             return None
 
         def stop(self):
@@ -316,18 +252,19 @@ def test_fixed_domain_remote_start_rebuilds_servers_after_connectivity_failure(f
             raise RuntimeError("public probe failed")
         frame.remote_control_runtime_status["public_ws_ready"] = True
 
-    monkeypatch.setattr(main, "RemoteWebSocketServer", _FakeServer)
-    monkeypatch.setattr(main, "RemoteControlHttpServer", _FakeHttpServer)
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
     monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
-    monkeypatch.setattr(frame, "_ensure_remote_ws_startup_connectivity", _fake_connectivity)
+    monkeypatch.setattr(frame, "_ensure_remote_nats_startup_connectivity", _fake_connectivity)
 
-    frame._start_remote_ws_server_if_configured(ensure_connectivity=True)
+    frame._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
 
     assert attempts["n"] == 2
     assert len(created) == 2
     assert created[0].stopped is True
     assert frame.remote_control_runtime_status["public_ws_ready"] is True
-    assert frame.remote_control_runtime_url == "wss://rc.tingyou.cc/ws?token=secret"
+    assert frame.remote_control_runtime_url == "wss://rc.tingyou.cc/nats?token=secret"
 
 
 def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch):
@@ -335,7 +272,7 @@ def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
     monkeypatch.setattr(main.ChatFrame, "_refresh_openclaw_sync_lifecycle", lambda self, force_replay=False: None)
-    monkeypatch.setattr(main.ChatFrame, "_start_claudecode_remote_ws_server_if_configured", lambda self: None)
+    monkeypatch.setattr(main.ChatFrame, "_start_claudecode_remote_nats_runtime_if_configured", lambda self: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "1")
 
@@ -353,7 +290,7 @@ def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch
     monkeypatch.setattr(main.threading, "Thread", _NoRunThread)
     monkeypatch.setattr(
         main.ChatFrame,
-        "_start_remote_ws_server_if_configured",
+        "_start_remote_nats_runtime_if_configured",
         lambda self, **_kwargs: started.__setitem__("n", started["n"] + 1),
     )
 
@@ -361,15 +298,15 @@ def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch
     try:
         assert started["n"] == 0
         target_names = [getattr(target, "__qualname__", getattr(target, "__name__", "")) for target in scheduled]
-        assert any("ChatFrame._schedule_remote_ws_autostart" in name for name in target_names)
+        assert any("ChatFrame._schedule_remote_nats_autostart" in name for name in target_names)
     finally:
         frame.Destroy()
 
 
 def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_failure(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
-    frame.remote_control_runtime_bind = "ws://0.0.0.0:18080/ws"
-    frame._remote_ws_server = SimpleNamespace(bound_port=18080)
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:10080/nats"
+    frame._remote_nats_transport = object()
     monkeypatch.setattr(
         frame,
         "_remote_runtime_config",
@@ -389,9 +326,9 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
     statuses = []
     monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
 
-    frame._ensure_remote_ws_startup_connectivity(
+    frame._ensure_remote_nats_startup_connectivity(
         token="secret",
-        published_url="wss://rc.tingyou.cc/ws?token=secret",
+        published_url="wss://rc.tingyou.cc/nats?token=secret",
     )
 
     assert restarted["calls"] == 1
@@ -426,43 +363,46 @@ def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, m
     assert ("taskkill", "/F", "/IM", "cloudflared.exe") in commands
 
 
-def test_remote_ws_server_autostarts_without_env_and_uses_default_token(tmp_path, monkeypatch):
+def test_remote_nats_runtime_autostarts_without_env_and_uses_default_token(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
-    monkeypatch.setattr(main.ChatFrame, "_ensure_remote_ws_startup_connectivity", lambda self, **_kwargs: None)
+    monkeypatch.setattr(main.ChatFrame, "_ensure_remote_nats_startup_connectivity", lambda self, **_kwargs: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "1")
     monkeypatch.setenv("REMOTE_CONTROL_PORT", "0")
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
+
+        def start(self, timeout=10):
+            return SimpleNamespace()
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start_threaded(self, url, timeout=10):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(main.ChatFrame, "_ensure_cloudflared_origin_bridge", lambda self: None)
 
     frame = main.ChatFrame()
     try:
         assert frame.remote_control_token == main.DEFAULT_REMOTE_CONTROL_TOKEN
-        assert frame._remote_ws_server is not None
-        assert frame._remote_ws_server.bound_port > 0
-
-        async def _run():
-            session = ClientSession()
-            try:
-                ws = await session.ws_connect(
-                    f"http://127.0.0.1:{frame._remote_ws_server.bound_port}/ws?token={frame.remote_control_token}"
-                )
-                try:
-                    connected = (await ws.receive()).json()
-                    assert connected["type"] == "connected"
-                    assert connected["body"]["accepted"] is True
-                finally:
-                    await ws.close()
-            finally:
-                await session.close()
-
-        asyncio.run(_run())
+        assert frame._remote_nats_transport is not None
+        assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:10080/nats"
         saved_state = json.loads(frame.state_path.read_text(encoding="utf-8"))
         assert saved_state["remote_control_token"] == main.DEFAULT_REMOTE_CONTROL_TOKEN
     finally:
-        if frame._remote_ws_server is not None:
-            frame._remote_ws_server.stop()
-            frame._remote_ws_server = None
         frame.Destroy()
 
 
@@ -472,7 +412,7 @@ def test_remote_api_state_includes_remote_runtime_status(frame):
         "local_listener_ready": True,
         "public_ws_ready": False,
         "last_remote_error": "public probe failed",
-        "published_url": "wss://rc.tingyou.cc/ws?token=secret",
+        "published_url": "wss://rc.tingyou.cc/nats?token=secret",
     }
 
     status, body = frame._remote_api_state_ui({})
@@ -1882,6 +1822,280 @@ def test_openclaw_new_chat_resets_detail_panel_defaults(frame, monkeypatch):
     assert frame._current_chat_state["execution_steps"] == []
 
 
+def test_new_chat_clears_active_claudecode_client_before_next_submit(frame, monkeypatch):
+    class _ActiveClaudeClient:
+        def __init__(self):
+            self.inputs = []
+
+        def send_user_input(self, text):
+            self.inputs.append(text)
+
+    stale_client = _ActiveClaudeClient()
+    frame._active_claudecode_client = stale_client
+    frame.active_claudecode_session_id = "session-old"
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-old", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+    monkeypatch.setattr(frame.model_combo, "SetValue", lambda _value: None)
+    monkeypatch.setattr(frame, "_resolve_current_model", lambda: "claudecode/default")
+    seen = {"worker": []}
+    monkeypatch.setattr(
+        frame,
+        "_start_claudecode_worker_for_turn",
+        lambda chat_id, turn_idx, question, session_id: seen["worker"].append((chat_id, turn_idx, question, session_id)),
+    )
+
+    frame._on_new_chat_clicked(None)
+    ok, message = frame._submit_question("你好", source="local", model="claudecode/default")
+
+    assert ok is True
+    assert message == ""
+    assert stale_client.inputs == []
+    assert seen["worker"]
+    assert frame._active_claudecode_client is None
+
+
+def test_new_chat_from_history_clears_history_view_and_resets_context_usage(frame, monkeypatch):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史会话",
+            "context_usage": {
+                "used_tokens": 31000,
+                "context_window": 200000,
+                "source": "claudecode",
+                "exact": True,
+                "fresh": True,
+                "model": "claudecode/default",
+                "updated_at": 1.0,
+            },
+            "turns": [
+                {"question": "历史问题", "answer_md": "历史回答", "model": "claudecode/default", "created_at": 1.0},
+            ],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    frame.active_session_turns = []
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "turns": []}
+    frame._pending_context_usage_by_turn = {
+        ("chat-current", 0): {
+            "used_tokens": 123,
+            "context_window": 200000,
+            "source": "claudecode",
+            "exact": True,
+            "fresh": True,
+            "model": "claudecode/default",
+            "updated_at": 1.0,
+        }
+    }
+    frame._refresh_openclaw_sync_lifecycle = lambda *args, **kwargs: None
+    frame._seek_openclaw_sync_to_current_tail = lambda: None
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_new_chat_clicked(None)
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame._pending_context_usage_by_turn == {}
+    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-5.2", "claudecode/default", "codex/main", "openclaw/main"])
+def test_new_chat_clicked_resets_context_usage_for_model_variants(frame, monkeypatch, model):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史会话",
+            "context_usage": {
+                "used_tokens": 31000,
+                "context_window": 200000,
+                "source": "claudecode",
+                "exact": True,
+                "fresh": True,
+                "model": "claudecode/default",
+                "updated_at": 1.0,
+            },
+            "turns": [],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    frame.active_session_turns = []
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "context_usage": {
+            "used_tokens": 31000,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": model,
+            "updated_at": 1.0,
+        },
+    }
+    frame._pending_context_usage_by_turn = {
+        ("chat-current", 0): {
+            "used_tokens": 123,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": model,
+            "updated_at": 1.0,
+        }
+    }
+    frame._refresh_openclaw_sync_lifecycle = lambda *args, **kwargs: None
+    frame._seek_openclaw_sync_to_current_tail = lambda: None
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_new_chat_clicked(None)
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame._pending_context_usage_by_turn == {}
+    assert frame._current_chat_state.get("context_usage") is None
+    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-5.2", "claudecode/default", "codex/main", "openclaw/main"])
+def test_remote_new_chat_from_history_clears_context_usage_for_model_variants(frame, model):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史会话",
+            "context_usage": {
+                "used_tokens": 31000,
+                "context_window": 200000,
+                "source": "openclaw",
+                "exact": True,
+                "fresh": True,
+                "model": "claudecode/default",
+                "updated_at": 1.0,
+            },
+            "turns": [],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    frame.active_session_turns = []
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "context_usage": {
+            "used_tokens": 31000,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": model,
+            "updated_at": 1.0,
+        },
+    }
+    frame._pending_context_usage_by_turn = {
+        ("chat-current", 0): {
+            "used_tokens": 123,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": model,
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._start_remote_new_chat({"model": model})
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame._pending_context_usage_by_turn == {}
+    assert frame._current_chat_state.get("context_usage") is None
+    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+
+
+def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, monkeypatch):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史会话",
+            "context_usage": {
+                "used_tokens": 31000,
+                "context_window": 200000,
+                "source": "claudecode",
+                "exact": True,
+                "fresh": True,
+                "model": "claudecode/default",
+                "updated_at": 1.0,
+            },
+            "turns": [],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    frame.active_session_turns = []
+    frame.current_chat_id = "chat-current"
+    frame.active_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "context_usage": {
+            "used_tokens": 31000,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": "claudecode/default",
+            "updated_at": 1.0,
+        },
+    }
+    frame._pending_context_usage_by_turn = {
+        ("chat-current", 0): {
+            "used_tokens": 123,
+            "context_window": 200000,
+            "source": "openclaw",
+            "exact": True,
+            "fresh": True,
+            "model": "claudecode/default",
+            "updated_at": 1.0,
+        }
+    }
+
+    frame._start_remote_new_chat({"model": "openai/gpt-5.2"})
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame._pending_context_usage_by_turn == {}
+    assert frame._current_chat_state.get("context_usage") is None
+    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+
+
 def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
     frame.active_session_turns = [
         {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0}
@@ -2033,7 +2247,7 @@ def test_on_done_uses_pending_claudecode_context_usage(frame):
     chat_id = frame.active_chat_id or frame.current_chat_id or ""
     frame._pending_context_usage_by_turn = {
         (chat_id, 0): {
-            "used_tokens": 30692,
+            "used_tokens": 894,
             "context_window": 200000,
             "source": "claudecode",
             "exact": True,
@@ -2046,7 +2260,7 @@ def test_on_done_uses_pending_claudecode_context_usage(frame):
     frame._on_done(0, "完成", "", "claudecode/default", "", frame.active_chat_id)
 
     assert frame._current_chat_state["context_usage"]["source"] == "claudecode"
-    assert frame.answer_list.GetString(0) == "上下文：31K/200K，15.3%已用"
+    assert frame.answer_list.GetString(0) == "上下文：小于1K/200K，0.4%已用"
 
 
 def test_on_done_uses_pending_openclaw_context_usage(frame):
@@ -2246,6 +2460,52 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
     assert frame.answer_list.GetSelection() == 1
     assert frame.answer_meta[1][0] == "user"
+
+
+def test_active_pending_codex_token_count_event_without_turn_id_refreshes_context_usage_row(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q1",
+            "answer_md": "a1",
+            "model": "codex/main",
+            "created_at": 1.0,
+            "request_status": "done",
+        },
+        {
+            "question": "q2",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 2.0,
+            "request_status": "pending",
+        },
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", usage=usage),
+    )
+
+    assert frame._pending_context_usage_by_turn[("chat-current", 1)] == usage
+    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
 
 
 def test_active_pending_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
@@ -4299,7 +4559,7 @@ def test_voice_result_writes_then_speaks_after_200ms(frame, monkeypatch):
     monkeypatch.setattr(
         main.wx,
         "CallLater",
-        lambda ms, fn, *args: order.append(("delay", ms)) or fn(*args),
+        lambda ms, fn, *args: order.append(("delay", ms)) or fn(*args) or object(),
     )
 
     frame._on_voice_result("语音文本！！！", mode=main.MODE_DIRECT)
@@ -4316,7 +4576,7 @@ def test_voice_result_speaks_immediately_when_delay_schedule_unavailable(frame, 
 
     frame._on_voice_result("语音文本！！！", mode=main.MODE_DIRECT)
 
-    assert order == [("insert", "语音文本！！！")]
+    assert order == [("insert", "语音文本！！！"), ("speak", "语音文本！！！")]
 
 
 def test_voice_result_prefers_local_editor_without_system_injection(frame, monkeypatch):
@@ -5578,11 +5838,11 @@ def test_save_state_captures_notes_editor_cursor_and_scroll(frame):
 def test_notes_transport_broadcasts_conflict_and_sync_status(frame):
     seen = []
 
-    class _Server:
-        def broadcast_event(self, payload):
+    class _Transport:
+        def publish_event_threadsafe(self, payload):
             seen.append(payload)
 
-    frame._remote_ws_server = _Server()
+    frame._remote_nats_transport = _Transport()
 
     frame._push_remote_notes_conflict({"entry_id": "e1", "message": "conflict"})
     frame._push_remote_notes_sync_status("synced", cursor="44", message="ok")
@@ -5684,11 +5944,11 @@ def test_new_chat_broadcasts_remote_history_changed(frame, monkeypatch):
     monkeypatch.setattr(frame, "SetStatusText", lambda *_args, **_kwargs: None)
     seen = []
 
-    class _Server:
-        def broadcast_event(self, payload):
+    class _Transport:
+        def publish_event_threadsafe(self, payload):
             seen.append(payload)
 
-    frame._remote_ws_server = _Server()
+    frame._remote_nats_transport = _Transport()
 
     frame._on_new_chat_clicked(None)
 
@@ -6189,11 +6449,11 @@ def test_history_delete_broadcasts_remote_history_changed(frame, monkeypatch):
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     seen = []
 
-    class _Server:
-        def broadcast_event(self, payload):
+    class _Transport:
+        def publish_event_threadsafe(self, payload):
             seen.append(payload)
 
-    frame._remote_ws_server = _Server()
+    frame._remote_nats_transport = _Transport()
 
     frame._history_delete(None)
 
@@ -6210,8 +6470,8 @@ def test_history_rename_broadcasts_remote_history_changed(frame, monkeypatch):
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     seen = []
 
-    class _Server:
-        def broadcast_event(self, payload):
+    class _Transport:
+        def publish_event_threadsafe(self, payload):
             seen.append(payload)
 
     class _Dialog:
@@ -6227,7 +6487,7 @@ def test_history_rename_broadcasts_remote_history_changed(frame, monkeypatch):
         def Destroy(self):
             pass
 
-    frame._remote_ws_server = _Server()
+    frame._remote_nats_transport = _Transport()
     monkeypatch.setattr(main, "RenameDialog", _Dialog)
 
     frame._history_rename(None)

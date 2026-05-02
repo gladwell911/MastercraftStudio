@@ -469,6 +469,12 @@ class CodexAppServerClient:
     def _handle_message(self, message: dict) -> None:
         if not isinstance(message, dict):
             return
+        if str(message.get("type") or "").strip() == "event_msg":
+            payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+            event_type = str(payload.get("type") or payload.get("method") or "").strip()
+            if payload and event_type:
+                self._emit_protocol_event(event_type, payload, message)
+                return
         if "id" in message and ("result" in message or "error" in message) and "method" not in message:
             self._handle_response(message)
             return
@@ -500,7 +506,7 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
-        if method in {"token_count", "codex/event/token_count"} or str(params.get("type") or "").strip() == "token_count":
+        if method in {"token_count", "codex/event/token_count", "thread/tokenUsage/updated"} or str(params.get("type") or "").strip() == "token_count":
             usage = codex_context_usage_from_payload(params)
             data = dict(params)
             if usage:
@@ -683,7 +689,7 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         output_tokens = _usage_int_field(component_usage, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
         cache_read_tokens = _usage_int_field(
             component_usage,
-            ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens", "cacheReadTokens"),
+            ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens", "cacheReadTokens", "cached_input_tokens", "cachedInputTokens"),
         )
         cache_creation_tokens = _usage_int_field(
             component_usage,

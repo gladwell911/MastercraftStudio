@@ -51,6 +51,20 @@ def _non_negative_int(value) -> int | None:
     return max(parsed, 0)
 
 
+def _unwrap_event_msg(payload: dict) -> dict:
+    obj = payload
+    safety = 0
+    while isinstance(obj, dict) and str(obj.get("type") or "").strip() == "event_msg":
+        nested = obj.get("payload")
+        if not isinstance(nested, dict):
+            return {}
+        obj = nested
+        safety += 1
+        if safety > 5:
+            break
+    return obj if isinstance(obj, dict) else {}
+
+
 def _context_usage_from_model_usage(model_usage: dict) -> dict | None:
     for model_name, stats in model_usage.items():
         if not isinstance(stats, dict):
@@ -58,12 +72,11 @@ def _context_usage_from_model_usage(model_usage: dict) -> dict | None:
         input_tokens = _non_negative_int(stats.get("inputTokens") or 0)
         output_tokens = _non_negative_int(stats.get("outputTokens") or 0)
         cache_read_tokens = _non_negative_int(stats.get("cacheReadInputTokens") or 0)
-        cache_creation_tokens = _non_negative_int(stats.get("cacheCreationInputTokens") or 0)
         context_window = _non_negative_int(stats.get("contextWindow"))
-        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, context_window]
+        values = [input_tokens, output_tokens, cache_read_tokens, context_window]
         if any(value is None for value in values):
             continue
-        used_tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
+        used_tokens = input_tokens + output_tokens + cache_read_tokens
         if used_tokens <= 0 or context_window <= 0:
             continue
         return normalize_context_usage(
@@ -129,6 +142,7 @@ class ClaudeCodeClient:
                 return
             try:
                 obj = json.loads(line)
+                obj = _unwrap_event_msg(obj)
                 debug_info["json_lines_received"] += 1
             except json.JSONDecodeError:
                 debug_info["parse_errors"] += 1

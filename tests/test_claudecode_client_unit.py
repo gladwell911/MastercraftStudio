@@ -96,7 +96,49 @@ def test_claudecode_stream_chat_records_model_usage():
 
     assert full == "完成"
     assert session_id == "sid-1"
-    assert client.last_context_usage["used_tokens"] == 30692
+    assert client.last_context_usage["used_tokens"] == 894
+    assert client.last_context_usage["context_window"] == 200000
+    assert client.last_context_usage["source"] == "claudecode"
+    assert client.last_context_usage["model"] == "claude-haiku-4-5-20251001"
+
+
+def test_claudecode_stream_chat_parses_wrapped_event_msg():
+    wrapped_payloads = [
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "已完成"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 20},
+                },
+                "session_id": "sid-wrap",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "result",
+                "session_id": "sid-wrap",
+                "modelUsage": {
+                    "claude-haiku-4-5-20251001": {
+                        "inputTokens": 1,
+                        "outputTokens": 2,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 3,
+                        "contextWindow": 200000,
+                    }
+                },
+            },
+        },
+    ]
+    client = claudecode_client.ClaudeCodeClient(cli_manager=_PayloadManager(wrapped_payloads))
+
+    full, session_id = client.stream_chat("测试")
+
+    assert full == "已完成"
+    assert session_id == "sid-wrap"
+    assert client.last_context_usage["used_tokens"] == 3
     assert client.last_context_usage["context_window"] == 200000
     assert client.last_context_usage["source"] == "claudecode"
     assert client.last_context_usage["model"] == "claude-haiku-4-5-20251001"
@@ -184,7 +226,7 @@ def test_claudecode_stream_chat_uses_first_valid_model_usage_entry():
 
     assert full == "ok"
     assert session_id == "sid-1"
-    assert client.last_context_usage["used_tokens"] == 65
+    assert client.last_context_usage["used_tokens"] == 35
     assert client.last_context_usage["context_window"] == 1000
     assert client.last_context_usage["model"] == "valid-model"
 

@@ -1741,11 +1741,11 @@ def test_remote_conflict_copy_uses_semantic_last_modified_by(tmp_path):
 def test_local_notes_save_broadcasts_notes_changed(frame):
     seen = []
 
-    class _FakeServer:
-        def broadcast_event(self, payload):
+    class _FakeTransport:
+        def publish_event_threadsafe(self, payload):
             seen.append(dict(payload))
 
-    frame._remote_ws_server = _FakeServer()
+    frame._remote_nats_transport = _FakeTransport()
     notebook = frame.notes_store.create_notebook("broadcast notebook")
     entry = frame.notes_store.create_entry(notebook.id, "original", source="manual")
     frame._notes_select_entry(entry.id, view="note_edit")
@@ -1875,11 +1875,11 @@ def test_remote_refresh_preserves_intentionally_empty_edit_draft(frame):
 def test_remote_notes_push_ops_returns_retired_without_broadcast(frame):
     seen = []
 
-    class _FakeServer:
-        def broadcast_event(self, payload):
+    class _FakeTransport:
+        def publish_event_threadsafe(self, payload):
             seen.append(dict(payload))
 
-    frame._remote_ws_server = _FakeServer()
+    frame._remote_nats_transport = _FakeTransport()
     notebook = frame.notes_store.create_notebook("push once notebook")
 
     frame._remote_api_notes_push_ops(

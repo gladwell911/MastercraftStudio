@@ -88,6 +88,39 @@ def load_session_pointer(
     )
 
 
+def load_session_pointer_by_session_id(
+    sessions_json_path: str | Path,
+    session_id: str,
+) -> OpenClawSessionPointer | None:
+    target_id = str(session_id or "").strip()
+    if not target_id:
+        return None
+    path = Path(sessions_json_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for session_key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("sessionId") or "").strip() != target_id:
+            continue
+        session_file = str(entry.get("sessionFile") or "").strip()
+        if not session_file:
+            continue
+        return OpenClawSessionPointer(
+            session_key=str(session_key or "").strip(),
+            session_id=target_id,
+            session_file=session_file,
+            updated_at=_coerce_millis(entry.get("updatedAt")),
+        )
+    return None
+
+
 def read_session_events(
     session_file_path: str | Path,
     offset: int = 0,
@@ -230,6 +263,20 @@ def _coerce_timestamp(value) -> float:
         return time.time()
 
 
+def _unwrap_event_msg(payload: dict) -> dict:
+    current = payload
+    hops = 0
+    while isinstance(current, dict) and str(current.get("type") or "").strip() == "event_msg":
+        nested = current.get("payload")
+        if not isinstance(nested, dict):
+            return {}
+        current = nested
+        hops += 1
+        if hops > 5:
+            return {}
+    return current if isinstance(current, dict) else {}
+
+
 def _non_negative_int(value) -> int | None:
     try:
         parsed = int(value)
@@ -325,14 +372,17 @@ def openclaw_context_usage_from_payload(payload: dict, fallback_model: str) -> d
 
 
 def _openclaw_usage_candidate_payloads(payload: dict) -> list[dict]:
+    payload = _unwrap_event_msg(payload)
     result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    if isinstance(result, dict):
+        result = _unwrap_event_msg(result)
     events = payload.get("events") if isinstance(payload.get("events"), list) else []
     candidates: list[dict] = []
 
     result_events = [
-        event
+        _unwrap_event_msg(event)
         for event in events
-        if isinstance(event, dict) and str(event.get("type") or "").strip() == "result"
+        if isinstance(event, dict) and str(_unwrap_event_msg(event).get("type") or "").strip() == "result"
     ]
     candidates.extend(reversed(result_events))
     if result:
@@ -343,9 +393,10 @@ def _openclaw_usage_candidate_payloads(payload: dict) -> list[dict]:
         candidates.append(message)
 
     assistant_events = [
-        event
+        _unwrap_event_msg(event)
         for event in events
-        if isinstance(event, dict) and str(event.get("type") or "").strip() == "message"
+        if isinstance(event, dict)
+        and str(_unwrap_event_msg(event).get("type") or "").strip() == "message"
     ]
     for event in reversed(assistant_events):
         message = event.get("message") if isinstance(event.get("message"), dict) else None
@@ -404,24 +455,33 @@ class OpenClawClient:
 
         stdout = str(completed.stdout or "").strip()
         stderr = str(completed.stderr or "").strip()
-        json_objects = self._extract_json_objects(stdout)
+        json_objects = [_unwrap_event_msg(item) for item in self._extract_json_objects(stdout)]
+        accepted_without_payload = False
         try:
             data = self._parse_json(stdout)
         except RuntimeError:
-            if completed.returncode == 0:
+            if self._is_plugin_only_output(stdout):
+                data = {}
+                accepted_without_payload = True
+            elif completed.returncode == 0:
                 data = {"events": json_objects} if json_objects else {}
             else:
                 raise
         if len(json_objects) > 1:
             data = {"events": json_objects}
         if completed.returncode != 0:
+            if accepted_without_payload and not stderr:
+                return ""
             detail = self._extract_error_detail(data, stderr, stdout)
+            detail = self._format_request_failure_detail(detail)
             raise RuntimeError(f"OpenClaw 请求失败：{detail}")
         captured_context_usage = self._capture_usage(data)
 
         reply = self._extract_text(data)
         if not reply and stdout and completed.returncode == 0:
             reply = self._extract_plain_stdout(stdout)
+        if not reply and accepted_without_payload:
+            return ""
         if not reply:
             detail = self._extract_error_detail(data, stderr, stdout)
             raise RuntimeError(f"OpenClaw 未返回可显示内容：{detail}")
@@ -487,11 +547,11 @@ class OpenClawClient:
             return {}
         try:
             data = json.loads(stdout)
-            return data if isinstance(data, dict) else {}
+            return _unwrap_event_msg(data if isinstance(data, dict) else {})
         except json.JSONDecodeError:
             data = self._extract_json_object(stdout)
             if isinstance(data, dict) and data:
-                return data
+                return _unwrap_event_msg(data)
             raise RuntimeError(f"OpenClaw 返回了无法解析的 JSON：{stdout[:300]}")
 
     def _extract_json_object(self, stdout: str) -> dict:
@@ -508,7 +568,7 @@ class OpenClawClient:
                 continue
             tail = source[idx + end:].strip()
             if (not tail) or tail.startswith("[plugins]") or tail.startswith("[tool") or tail.startswith("[agent"):
-                return obj
+                return _unwrap_event_msg(obj)
         return {}
 
     def _extract_json_objects(self, stdout: str) -> list[dict]:
@@ -526,7 +586,7 @@ class OpenClawClient:
                 idx = start + 1
                 continue
             if isinstance(obj, dict):
-                objects.append(obj)
+                objects.append(_unwrap_event_msg(obj))
             idx = start + max(end, 1)
         return objects
 
@@ -563,6 +623,7 @@ class OpenClawClient:
     def _extract_event_text(self, event: dict) -> str:
         if not isinstance(event, dict):
             return ""
+        event = _unwrap_event_msg(event)
         msg = event.get("message")
         if not isinstance(msg, dict):
             return ""
@@ -581,6 +642,28 @@ class OpenClawClient:
                 continue
             lines.append(line)
         return "\n".join(lines).strip()
+
+    def _is_plugin_only_output(self, stdout: str) -> bool:
+        lines = [
+            line.strip()
+            for line in str(stdout or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        return bool(lines) and all(line.startswith("[plugins]") for line in lines)
+
+    def _format_request_failure_detail(self, detail: str) -> str:
+        text = str(detail or "").strip()
+        lowered = text.lower()
+        if "oauth token refresh failed" in lowered and "openai-codex" in lowered:
+            return (
+                "OpenClaw 的 openai-codex OAuth 已过期或刷新失败，需要重新登录。\n"
+                "请在一个新的 PowerShell/终端中执行：\n"
+                "1. codex login status\n"
+                "2. codex login\n"
+                "3. openclaw models auth login --provider openai-codex --set-default\n"
+                f"\n原始错误：{text}"
+            )
+        return text
 
     def _extract_error_detail(self, data: dict, stderr: str, stdout: str) -> str:
         text = normalize_openclaw_text(self._extract_text(data))

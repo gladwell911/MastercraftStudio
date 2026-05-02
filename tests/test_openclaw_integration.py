@@ -1,4 +1,4 @@
-import json
+﻿import json
 import time
 
 import main
@@ -17,8 +17,8 @@ def test_load_state_restores_openclaw_sync_state(monkeypatch, tmp_path):
         "archived_chats": [],
         "active_session_turns": [
             {
-                "question": "你好",
-                "answer_md": "世界",
+                "question": "浣犲ソ",
+                "answer_md": "涓栫晫",
                 "model": "openclaw/main",
                 "created_at": time.time(),
             }
@@ -52,7 +52,7 @@ def test_worker_routes_openclaw_without_overwriting_pending_answer(frame, monkey
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
         {
-            "question": "请执行",
+            "question": "\u8bf7\u6267\u884c",
             "answer_md": "",
             "model": "openclaw/main",
             "created_at": time.time(),
@@ -68,11 +68,11 @@ def test_worker_routes_openclaw_without_overwriting_pending_answer(frame, monkey
     def fake_stream_chat(self, user_text, session_id, on_delta=None):
         seen["question"] = user_text
         seen["session_id"] = session_id
-        return "OpenClaw 已执行"
+        return "OpenClaw done"
 
     monkeypatch.setattr(main.OpenClawClient, "stream_chat", fake_stream_chat)
-    frame._worker("", 0, "请执行", "openclaw/main")
-    assert seen == {"question": "请执行", "session_id": "zgwd-chat-001"}
+    frame._worker("", 0, "\u8bf7\u6267\u884c", "openclaw/main")
+    assert seen == {"question": "\u8bf7\u6267\u884c", "session_id": "zgwd-chat-001"}
     assert frame.active_session_turns[0]["answer_md"] == ""
 
 
@@ -80,7 +80,7 @@ def test_openclaw_done_does_not_render_placeholder_before_sync(frame, monkeypatc
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
         {
-            "question": "打开控制台",
+            "question": "\u6253\u5f00\u63a7\u5236\u53f0",
             "answer_md": "",
             "model": "openclaw/main",
             "created_at": time.time(),
@@ -98,7 +98,7 @@ def test_apply_openclaw_sync_batch_merges_local_user_and_fills_reply(frame):
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
         {
-            "question": "打开控制台",
+            "question": "\u6253\u5f00\u63a7\u5236\u53f0",
             "answer_md": main.REQUESTING_TEXT,
             "model": "openclaw/main",
             "created_at": 100.0,
@@ -107,8 +107,8 @@ def test_apply_openclaw_sync_batch_merges_local_user_and_fills_reply(frame):
         }
     ]
     events = [
-        main.OpenClawSyncEvent(event_id="u1", role="user", text="打开控制台", timestamp=101.0),
-        main.OpenClawSyncEvent(event_id="a1", role="assistant", text="已打开", timestamp=102.0),
+        main.OpenClawSyncEvent(event_id="u1", role="user", text="\u6253\u5f00\u63a7\u5236\u53f0", timestamp=101.0),
+        main.OpenClawSyncEvent(event_id="a1", role="assistant", text="opened", timestamp=102.0),
     ]
     frame._apply_openclaw_sync_batch(
         {
@@ -125,7 +125,7 @@ def test_apply_openclaw_sync_batch_merges_local_user_and_fills_reply(frame):
     turn = frame.active_session_turns[0]
     assert turn["question_external_event_id"] == "u1"
     assert turn["answer_external_event_id"] == "a1"
-    assert turn["answer_md"] == "已打开"
+    assert turn["answer_md"] == "opened"
     assert frame.active_openclaw_session_id == "zgwd-chat-001"
     assert frame.active_openclaw_session_file == r"C:\tmp\main.jsonl"
     assert frame.active_openclaw_sync_offset == 200
@@ -141,7 +141,7 @@ def test_sync_once_switches_to_new_session_file(frame, monkeypatch, tmp_path):
                 "type": "message",
                 "id": "a2",
                 "timestamp": "2026-03-16T02:37:04.505Z",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "同步成功"}]},
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "鍚屾鎴愬姛"}]},
             }
         ),
         encoding="utf-8",
@@ -167,7 +167,112 @@ def test_sync_once_switches_to_new_session_file(frame, monkeypatch, tmp_path):
     frame._sync_openclaw_once()
     assert frame.active_openclaw_session_id == "zgwd-new"
     assert frame.active_openclaw_session_file == str(session_file)
-    assert frame.active_session_turns[-1]["answer_md"] == "同步成功"
+    assert frame.active_session_turns[-1]["answer_md"] == "鍚屾鎴愬姛"
+
+
+def test_sync_once_uses_active_chat_session_file_over_global_pointer(frame, monkeypatch, tmp_path):
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    active_file = sessions_dir / "chat-a.jsonl"
+    active_file.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "a-chat-a",
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "chat a reply"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    global_file = sessions_dir / "chat-b.jsonl"
+    global_file.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "a-chat-b",
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "chat b reply"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "zgwd-chat-b",
+                    "sessionFile": str(global_file),
+                    "updatedAt": 1773672820158,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_session_turns = []
+    frame.active_openclaw_session_id = "zgwd-chat-a"
+    frame.active_openclaw_session_file = str(active_file)
+    frame.active_openclaw_sync_offset = 0
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._sync_openclaw_once()
+
+    assert frame.active_openclaw_session_id == "zgwd-chat-a"
+    assert frame.active_openclaw_session_file == str(active_file)
+    assert frame.active_session_turns[-1]["answer_md"] == "chat a reply"
+
+
+def test_sync_once_finds_session_file_by_active_session_id(frame, monkeypatch, tmp_path):
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    active_file = sessions_dir / "chat-c.jsonl"
+    active_file.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "a-chat-c",
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "chat c reply"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    global_file = sessions_dir / "main.jsonl"
+    global_file.write_text("", encoding="utf-8")
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "zgwd-main",
+                    "sessionFile": str(global_file),
+                    "updatedAt": 1773672820158,
+                },
+                "agent:main:webchat:c": {
+                    "sessionId": "zgwd-chat-c",
+                    "sessionFile": str(active_file),
+                    "updatedAt": 1773672821999,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_session_turns = []
+    frame.active_openclaw_session_id = "zgwd-chat-c"
+    frame.active_openclaw_session_file = ""
+    frame.active_openclaw_sync_offset = 0
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._sync_openclaw_once()
+
+    assert frame.active_openclaw_session_id == "zgwd-chat-c"
+    assert frame.active_openclaw_session_file == str(active_file)
+    assert frame.active_session_turns[-1]["answer_md"] == "chat c reply"
 
 
 def test_apply_openclaw_sync_batch_plays_sound_for_incoming_assistant_only(frame, monkeypatch):
@@ -185,17 +290,17 @@ def test_apply_openclaw_sync_batch_plays_sound_for_incoming_assistant_only(frame
             "file_changed": False,
             "session_changed": False,
         },
-        [main.OpenClawSyncEvent(event_id="a-only", role="assistant", text="新的外部回复", timestamp=time.time())],
+        [main.OpenClawSyncEvent(event_id="a-only", role="assistant", text="鏂扮殑澶栭儴鍥炲", timestamp=time.time())],
     )
     assert played["n"] == 1
-    assert frame.active_session_turns[-1]["answer_md"] == "新的外部回复"
+    assert frame.active_session_turns[-1]["answer_md"] == "鏂扮殑澶栭儴鍥炲"
 
 
 def test_openclaw_done_success_does_not_play_finish_sound(frame, monkeypatch):
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
         {
-            "question": "打开控制台",
+            "question": "\u6253\u5f00\u63a7\u5236\u53f0",
             "answer_md": "",
             "model": "openclaw/main",
             "created_at": time.time(),
@@ -208,7 +313,7 @@ def test_openclaw_done_success_does_not_play_finish_sound(frame, monkeypatch):
     assert played["n"] == 0
 
 
-def test_sync_once_replays_when_session_id_changes_on_same_file(frame, monkeypatch, tmp_path):
+def test_sync_once_does_not_let_global_pointer_replace_active_session_id(frame, monkeypatch, tmp_path):
     sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
     sessions_dir.mkdir(parents=True)
     session_file = sessions_dir / "main.jsonl"
@@ -218,7 +323,7 @@ def test_sync_once_replays_when_session_id_changes_on_same_file(frame, monkeypat
                 "type": "message",
                 "id": "a-restart",
                 "timestamp": time.time(),
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "重启后的最新回复"}]},
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "new global reply"}]},
             }
         ),
         encoding="utf-8",
@@ -244,5 +349,5 @@ def test_sync_once_replays_when_session_id_changes_on_same_file(frame, monkeypat
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
     frame._sync_openclaw_once()
-    assert frame.active_openclaw_session_id == "zgwd-restarted"
-    assert frame.active_session_turns[-1]["answer_md"] == "重启后的最新回复"
+    assert frame.active_openclaw_session_id == "zgwd-old"
+    assert frame.active_session_turns == []

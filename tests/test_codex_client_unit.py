@@ -173,6 +173,32 @@ def test_codex_protocol_token_count_event_normalizes_usage():
     assert client.last_context_usage == seen[-1].usage
 
 
+def test_codex_event_msg_token_count_payload_normalizes_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"total_tokens": 68292},
+                    "last_token_usage": {"total_tokens": 23096},
+                    "model_context_window": 258400,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage["used_tokens"] == 68292
+    assert seen[-1].usage["context_window"] == 258400
+    assert seen[-1].usage["source"] == "codex"
+    assert seen[-1].data["context_usage"] == seen[-1].usage
+    assert client.last_context_usage == seen[-1].usage
+
+
 def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)
@@ -193,6 +219,31 @@ def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
 
     assert seen[-1].type == "token_count"
     assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["source"] == "codex"
+    assert client.last_context_usage == seen[-1].usage
+
+
+def test_codex_thread_token_usage_updated_event_normalizes_usage():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "info": {
+                    "total_token_usage": {"total_tokens": 44176},
+                    "model_context_window": 258400,
+                    "model": "gpt-5-codex",
+                },
+            },
+        }
+    )
+
+    assert seen[-1].type == "token_count"
+    assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
     assert client.last_context_usage == seen[-1].usage
 

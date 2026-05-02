@@ -74,6 +74,87 @@ def test_openclaw_client_stream_chat_records_model_usage_metadata():
     assert client.last_context_usage["model"] == "gpt-5.4"
 
 
+def test_openclaw_client_stream_chat_parses_event_list_wrapped_events():
+    payload = {
+        "events": [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "第一段"}, {"type": "text", "text": "第二段"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "result",
+                    "modelUsage": {
+                        "gpt-5.4": {
+                            "inputTokens": 50,
+                            "outputTokens": 30,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "contextWindow": 4000,
+                        }
+                    },
+                },
+            },
+        ]
+    }
+
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    out = client.stream_chat("测试", session_id="zgwd-1")
+
+    assert out == "第一段\n\n第二段"
+    assert client.last_context_usage["used_tokens"] == 80
+    assert client.last_context_usage["context_window"] == 4000
+def test_openclaw_client_stream_chat_parses_wrapped_event_msg():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "result",
+                        "payloads": [{"text": "回复"}],
+                        "modelUsage": {
+                            "gpt-5.4": {
+                                "inputTokens": 10,
+                                "outputTokens": 20,
+                                "cacheReadInputTokens": 0,
+                                "cacheCreationInputTokens": 0,
+                                "contextWindow": 3000,
+                            }
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(stdout),
+    )
+
+    out = client.stream_chat("测试", session_id="zgwd-1")
+
+    assert out == "回复"
+    assert client.last_context_usage["used_tokens"] == 30
+    assert client.last_context_usage["context_window"] == 3000
+    assert client.last_context_usage["source"] == "openclaw"
+    assert client.last_context_usage["model"] == "gpt-5.4"
+
+
 def test_openclaw_client_stream_chat_uses_model_window_when_usage_lacks_context_window():
     payload = {
         "payloads": [{"text": "ok"}],
@@ -314,6 +395,24 @@ def test_openclaw_client_stream_chat_uses_plain_stdout_when_json_is_not_emitted(
     assert seen == [out]
 
 
+def test_openclaw_client_treats_plugin_only_output_as_accepted_no_reply(monkeypatch):
+    stdout = (
+        "[plugins] feishu_doc: Registered feishu_doc, feishu_app_scopes\n"
+        "[plugins] feishu_chat: Registered feishu_chat tool\n"
+        "[plugins] feishu_wiki: Registered feishu_wiki tool\n"
+        "[plugins] feishu_drive: Registered feishu_drive tool\n"
+        "[plugins] feishu_bitable: Registered bitable tools\n"
+    )
+    manager = _Manager(stdout, returncode=1)
+    client = openclaw_client.OpenClawClient("openclaw/main", timeout=12, cli_manager=manager)
+    seen = []
+
+    out = client.stream_chat("\u4f60\u597d", session_id="zgwd-1", on_delta=seen.append)
+
+    assert out == ""
+    assert seen == []
+
+
 def test_openclaw_client_stream_chat_raises_with_payload_error(monkeypatch):
     client = openclaw_client.OpenClawClient(
         "openclaw/main",
@@ -322,6 +421,25 @@ def test_openclaw_client_stream_chat_raises_with_payload_error(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="OpenClaw 超时"):
         client.stream_chat("你好", session_id="zgwd-1")
+
+def test_openclaw_client_explains_codex_oauth_refresh_failure(monkeypatch):
+    detail = (
+        "FailoverError: OAuth token refresh failed for openai-codex: "
+        "Failed to refresh OAuth token for openai-codex. Please try again or re-authenticate."
+    )
+    client = openclaw_client.OpenClawClient(
+        "openclaw/main",
+        timeout=12,
+        cli_manager=_Manager(f'{{"error":{json.dumps(detail)}}}', returncode=1),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client.stream_chat("\u4f60\u597d", session_id="zgwd-1")
+
+    message = str(excinfo.value)
+    assert "\u9700\u8981\u91cd\u65b0\u767b\u5f55" in message
+    assert "openclaw models auth login --provider openai-codex --set-default" in message
+    assert "codex login status" in message
 
 
 def test_resolve_openclaw_command_falls_back_to_appdata_npm(monkeypatch, tmp_path):
@@ -365,6 +483,35 @@ def test_load_session_pointer_reads_main_session(tmp_path):
     assert pointer.session_id == "zgwd-123"
     assert pointer.session_file.endswith("main.jsonl")
     assert pointer.updated_at > 0
+
+
+def test_load_session_pointer_by_session_id_reads_matching_entry(tmp_path):
+    sessions_path = tmp_path / "sessions.json"
+    sessions_path.write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "zgwd-main",
+                    "sessionFile": str(tmp_path / "main.jsonl"),
+                    "updatedAt": 1773672820158,
+                },
+                "agent:main:webchat:other": {
+                    "sessionId": "zgwd-chat-b",
+                    "sessionFile": str(tmp_path / "chat-b.jsonl"),
+                    "updatedAt": 1773672821999,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    pointer = openclaw_client.load_session_pointer_by_session_id(sessions_path, "zgwd-chat-b")
+
+    assert pointer is not None
+    assert pointer.session_key == "agent:main:webchat:other"
+    assert pointer.session_id == "zgwd-chat-b"
+    assert pointer.session_file == str(tmp_path / "chat-b.jsonl")
 
 
 def test_read_session_events_extracts_user_and_assistant_text(tmp_path):
