@@ -1,7 +1,7 @@
 {
-  "fetched_at": "2026-04-29T00:32:33.218230100Z",
-  "etag": "W/\"e34aa9ede4f5ec2135f895508ab5b7d3\"",
-  "client_version": "0.126.0",
+  "fetched_at": "2026-05-03T09:10:16.082962800Z",
+  "etag": "W/\"f5b591f5abf2e57bb89175828179feae\"",
+  "client_version": "0.125.0",
   "models": [
     {
       "slug": "gpt-5.5",
@@ -31,6 +31,7 @@
       "supported_in_api": true,
       "priority": 0,
       "additional_speed_tiers": [
+        "priority",
         "fast"
       ],
       "availability_nux": {
@@ -96,6 +97,7 @@
       "supported_in_api": true,
       "priority": 2,
       "additional_speed_tiers": [
+        "priority",
         "fast"
       ],
       "availability_nux": null,

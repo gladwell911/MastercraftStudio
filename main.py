@@ -15,7 +15,7 @@ import webbrowser
 import winsound
 import sys
 from ctypes import wintypes
-from html import unescape
+from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
@@ -856,6 +856,8 @@ class ChatFrame(wx.Frame):
 
         self.history_ids = []
         self.answer_meta = []
+        self.execution_meta = []
+        self._execution_delta_buffer = {}
         self.is_running = False
         self._active_request_count = 0
         self.active_turn_idx = -1
@@ -1190,6 +1192,63 @@ class ChatFrame(wx.Frame):
         html = self._build_answer_detail_html(str(turn.get("answer_md") or ""), str(turn.get("model") or ""))
         page_path.write_text(html, encoding="utf-8")
         turn["answer_detail_page_path"] = str(page_path)
+        return page_path
+
+    def _ensure_execution_detail_page(self, step: dict, step_idx: int) -> Path:
+        created = int(float(step.get("created_at") or time.time()))
+        existing_path_raw = str(step.get("detail_page_path") or "").strip()
+        page_path = None
+        if existing_path_raw:
+            try:
+                existing_path = Path(existing_path_raw)
+                if existing_path.resolve().is_relative_to(self.detail_pages_dir.resolve()):
+                    page_path = existing_path
+            except Exception:
+                page_path = None
+        if page_path is None:
+            file_name = f"execution_{created}_{step_idx}_{uuid.uuid4().hex[:8]}.html"
+            page_path = self.detail_pages_dir / file_name
+            if existing_path_raw:
+                try:
+                    old_path = Path(existing_path_raw)
+                    if old_path.exists() and old_path.resolve().is_relative_to(self.detail_pages_dir.resolve()):
+                        old_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        title = str(
+            step.get("list_text")
+            or step.get("title")
+            or step.get("step")
+            or step.get("message")
+            or step.get("event_type")
+            or f"执行步骤 {step_idx + 1}"
+        ).strip()
+        detail_text = str(
+            step.get("detail_text")
+            or step.get("message")
+            or step.get("step")
+            or step.get("title")
+            or step.get("text")
+            or step.get("content")
+            or step.get("description")
+            or ""
+        )
+        detail_html = escape(detail_text).replace("\r\n", "\n").replace("\r", "\n")
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'><title>执行过程详情</title>"
+            "<style>"
+            "body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:12px;line-height:1.6;}"
+            "h2{margin:8px 0;}"
+            ".meta{color:#475569;margin-bottom:12px;}"
+            "pre{background:#f1f5f9;padding:10px;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-word;}"
+            "</style></head><body>"
+            "<h2>执行过程详情</h2>"
+            f"<div class='meta'>{escape(title)}</div>"
+            f"<pre>{detail_html}</pre>"
+            "</body></html>"
+        )
+        page_path.write_text(html, encoding="utf-8")
+        step["detail_page_path"] = str(page_path)
         return page_path
 
     def _open_local_webpage(self, page_path: Path) -> None:
@@ -2150,12 +2209,12 @@ class ChatFrame(wx.Frame):
         self.answer_list.Append(label)
         self.answer_meta.append(("context_usage", -1, label, ""))
 
-    def _refresh_answer_list_preserving_selection(self) -> None:
+    def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
         idx = self.answer_list.GetSelection() if hasattr(self, "answer_list") else wx.NOT_FOUND
         if idx != wx.NOT_FOUND and 0 <= idx < len(self.answer_meta):
             selected_meta = self.answer_meta[idx]
-        self._render_answer_list()
+        self._render_answer_list_compat(refresh_execution=refresh_execution)
         if selected_meta is None:
             return
         for new_idx, meta in enumerate(self.answer_meta):
@@ -2167,7 +2226,13 @@ class ChatFrame(wx.Frame):
                 self.answer_list.SetSelection(new_idx)
                 break
 
-    def _render_answer_list(self):
+    def _render_answer_list_compat(self, refresh_execution: bool = True) -> None:
+        if refresh_execution:
+            self._render_answer_list()
+            return
+        self._render_answer_list(refresh_execution=False)
+
+    def _render_answer_list(self, refresh_execution: bool = True):
         mode = self._apply_detail_panel_mode()
         self.answer_list.Clear()
         self.answer_meta = []
@@ -2178,7 +2243,7 @@ class ChatFrame(wx.Frame):
             self.answer_list.Append("暂无对话内容")
             self.answer_meta.append(("info", -1, "", ""))
             self._request_listbox_repaint(self.answer_list)
-            if mode == "execution":
+            if mode == "execution" and refresh_execution:
                 self._render_execution_list()
             return
         for i, t in enumerate(turns):
@@ -2219,7 +2284,7 @@ class ChatFrame(wx.Frame):
             # 首次渲染时仅设置选中项，不主动把焦点移到回答列表。
             self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
         self._request_listbox_repaint(self.answer_list)
-        if mode == "execution":
+        if mode == "execution" and refresh_execution:
             self._render_execution_list()
 
     def _request_listbox_repaint(self, *controls) -> None:
@@ -2341,6 +2406,23 @@ class ChatFrame(wx.Frame):
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
         steps = state.get("execution_steps")
         return steps if isinstance(steps, list) else []
+
+    def _visible_execution_chat_id(self) -> str:
+        if self.view_mode == "history":
+            viewed_id = str(self.view_history_id or "").strip()
+            if viewed_id:
+                return viewed_id
+        return str(self.active_chat_id or self.current_chat_id or "").strip()
+
+    def _flush_relevant_execution_deltas_for_switch(self) -> bool:
+        flushed = False
+        visible_chat_id = self._visible_execution_chat_id()
+        if visible_chat_id:
+            flushed = self._flush_all_execution_deltas_for_chat(visible_chat_id) or flushed
+        active_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        if active_chat_id and active_chat_id != visible_chat_id:
+            flushed = self._flush_all_execution_deltas_for_chat(active_chat_id) or flushed
+        return flushed
 
     def _chat_state_for_execution_steps(self, chat_id: str) -> dict | None:
         resolved_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
@@ -2479,33 +2561,269 @@ class ChatFrame(wx.Frame):
             parts.append(f"阶段：{phase}")
         return " | ".join([part for part in parts if part])
 
-    def _codex_execution_step_text(self, event: CodexEvent) -> str:
+    def _execution_display_kind(self, event: CodexEvent) -> str:
+        display_kind = str(getattr(event, "display_kind", "") or "").strip()
+        if display_kind:
+            return display_kind
+        event_type = str(getattr(event, "type", "") or "").strip()
+        subtype = str(getattr(event, "subtype", "") or "").strip()
+        status = str(getattr(event, "status", "") or "").strip()
+        item = event.data if isinstance(event.data, dict) else {}
+        item_type = str(item.get("type") or "").strip()
+        if event_type == "plan_updated":
+            return "plan"
+        if event_type == "stderr":
+            return "error"
+        if event_type == "diff_updated":
+            return "diff"
+        if event_type == "server_request":
+            return "user_input"
+        if event_type in ("turn_started", "turn_completed"):
+            return "status"
+        if subtype == "commandExecution" or status == "commandExecution" or item_type == "commandExecution":
+            return "command"
+        if "command" in {subtype, status, item_type}:
+            return "command"
+        return ""
+
+    def _execution_detail_text_from_event(self, event: CodexEvent) -> str:
         event_type = str(getattr(event, "type", "") or "").strip()
         text = str(getattr(event, "text", "") or "").strip()
-        detail = self._codex_item_summary_text(event)
-        if event_type == "turn_started":
-            return "开始处理本轮请求"
-        if event_type == "plan_updated":
-            return f"计划更新：{text}" if text else "计划更新"
+        raw_text = str(getattr(event, "raw_text", "") or "").rstrip()
+        title = str(getattr(event, "title", "") or "").strip()
+        command = str(getattr(event, "command", "") or "").strip()
+        phase = str(getattr(event, "phase", "") or "").strip()
+        status = str(getattr(event, "status", "") or "").strip()
+        subtype = str(getattr(event, "subtype", "") or "").strip()
+        item = event.data if isinstance(event.data, dict) else {}
+        if not title:
+            title = str(item.get("title") or item.get("name") or item.get("label") or "").strip()
+        if not command:
+            command = str(item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
         if event_type == "diff_updated":
             return "已生成代码变更"
-        if event_type == "server_request":
-            return "等待用户输入"
+        if event_type == "turn_started":
+            return raw_text or text or "开始处理本轮请求"
         if event_type == "turn_completed":
-            return "本轮处理结束"
+            return raw_text or text or "本轮处理结束"
+        if event_type == "server_request":
+            return raw_text or text or "等待用户输入"
+        if event_type == "plan_updated":
+            return raw_text or text or "计划更新"
         if event_type == "stderr":
-            return f"错误输出：{text}" if text else "错误输出"
-        if event_type == "item_started":
-            return f"开始执行：{detail}" if detail else f"开始执行：{self._codex_execution_step_fallback(event)}"
-        if event_type == "item_completed" and str(getattr(event, "phase", "") or "").strip() == "final_answer":
-            return "已生成最终回答"
-        if event_type == "item_completed":
-            return f"完成执行：{detail}" if detail else f"完成执行：{self._codex_execution_step_fallback(event)}"
+            return raw_text or text or "错误输出"
+        if event_type == "item_completed" and phase == "final_answer":
+            return raw_text or text or "已生成最终回答"
+        if raw_text:
+            return raw_text
+        if event_type in ("item_started", "item_completed"):
+            prefix = "开始执行：" if event_type == "item_started" else "完成执行："
+            summary = self._codex_item_summary_text(event)
+            if command:
+                header = title or summary or self._codex_execution_step_fallback(event)
+                lines = [f"{prefix}{header}"]
+                lines.append(f"命令：{command}")
+                exit_code = getattr(event, "exit_code", None)
+                if exit_code in (None, ""):
+                    exit_code = item.get("exitCode")
+                if exit_code not in (None, "") and event_type == "item_completed":
+                    lines.append(f"退出码：{exit_code}")
+                if text and text not in {header, command}:
+                    lines.append(text)
+                return "\n".join(line for line in lines if str(line or "").strip())
+            if summary:
+                return f"{prefix}{summary}"
+            fallback = self._codex_execution_step_fallback(event)
+            return f"{prefix}{fallback}" if fallback else ""
+        if text:
+            return text
+        if title:
+            return title
+        if command:
+            return command
+        for fallback in (phase, status, subtype):
+            if fallback:
+                return fallback
         return ""
+
+    @staticmethod
+    def _execution_list_text_from_detail(detail: str, kind: str) -> str:
+        single_line = re.sub(r"\s+", " ", str(detail or "").strip())
+        if not single_line:
+            return ""
+        prefix_map = {
+            "command": "命令：",
+            "error": "错误：",
+            "plan": "计划：",
+        }
+        prefix = prefix_map.get(str(kind or "").strip(), "")
+        if prefix and not single_line.startswith(prefix):
+            return f"{prefix}{single_line}"
+        return single_line
+
+    @staticmethod
+    def _execution_command_list_text(event_type: str, title: str, command: str, exit_code, fallback_text: str = "") -> str:
+        parts = []
+        normalized_type = str(event_type or "").strip()
+        if normalized_type == "item_started":
+            parts.append("开始执行")
+        elif normalized_type == "item_completed":
+            parts.append("完成执行")
+        title_text = str(title or "").strip()
+        command_text = str(command or "").strip()
+        fallback = str(fallback_text or "").strip()
+        if title_text:
+            parts.append(title_text)
+        if command_text:
+            parts.append(command_text)
+        if not title_text and not command_text and fallback:
+            parts.append(fallback)
+        if normalized_type == "item_completed" and exit_code not in (None, ""):
+            parts.append(f"退出码：{exit_code}")
+        summary = " ".join(parts).strip()
+        return f"命令：{summary}" if summary else "命令：commandExecution"
+
+    def _build_execution_entry(self, event: CodexEvent) -> dict | None:
+        if not isinstance(event, CodexEvent):
+            return None
+        detail_text = self._execution_detail_text_from_event(event)
+        if not detail_text:
+            return None
+        display_kind = self._execution_display_kind(event)
+        item = event.data if isinstance(event.data, dict) else {}
+        title = str(getattr(event, "title", "") or item.get("title") or item.get("name") or item.get("label") or "").strip()
+        command = str(getattr(event, "command", "") or item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
+        exit_code = getattr(event, "exit_code", None)
+        if exit_code in (None, ""):
+            exit_code = item.get("exitCode")
+        try:
+            exit_code = int(exit_code) if exit_code not in (None, "") else None
+        except (TypeError, ValueError):
+            exit_code = None
+        subtype = str(getattr(event, "subtype", "") or item.get("type") or "").strip()
+        event_type = str(getattr(event, "type", "") or "").strip()
+        phase = str(getattr(event, "phase", "") or "").strip()
+        command_fallback = subtype or str(getattr(event, "status", "") or "").strip() or event_type
+        if event_type == "diff_updated":
+            list_text = "已生成代码变更"
+        elif event_type == "item_completed" and phase == "final_answer":
+            list_text = "已生成最终回答"
+        elif display_kind == "command":
+            list_text = self._execution_command_list_text(event_type, title, command, exit_code, command_fallback)
+        else:
+            list_text = self._execution_list_text_from_detail(detail_text, display_kind)
+        return {
+            "event_type": event_type,
+            "display_kind": display_kind,
+            "subtype": subtype,
+            "list_text": list_text,
+            "detail_text": detail_text,
+            "raw_text": str(getattr(event, "raw_text", "") or ""),
+            "text": str(getattr(event, "text", "") or ""),
+            "title": title,
+            "command": command,
+            "exit_code": exit_code,
+            "phase": phase,
+            "status": str(getattr(event, "status", "") or "").strip(),
+            "thread_id": self._event_thread_id(event),
+            "turn_id": self._event_turn_id(event),
+            "item_id": str(getattr(event, "item_id", "") or "").strip(),
+            "created_at": time.time(),
+        }
 
     def _append_execution_step_to_chat(self, chat_id: str, step_text: str, *, save_state: bool = True) -> bool:
         text = str(step_text or "").strip()
         if not text:
+            return False
+        return self._append_execution_entry_to_chat(chat_id, {"step": text}, save_state=save_state)
+
+    def _visible_execution_chat_state(self) -> dict | None:
+        if self._detail_panel_mode() != "execution":
+            return None
+        if self.view_mode == "history":
+            chat = self._find_archived_chat(self.view_history_id)
+            return chat if isinstance(chat, dict) else None
+        state = getattr(self, "_current_chat_state", None)
+        return state if isinstance(state, dict) else None
+
+    def _append_visible_execution_entry(self, target_chat: dict, step_idx: int, step) -> bool:
+        if not isinstance(target_chat, dict) or not hasattr(self, "execution_list"):
+            return False
+        if self._visible_execution_chat_state() is not target_chat:
+            return False
+        if not self._should_show_execution_step(step):
+            return False
+        meta = self._execution_meta_tuple(step_idx, step)
+        row_text = str(meta[2] or "").strip()
+        if not row_text:
+            return False
+        if (
+            self.execution_list.GetCount() == 1
+            and len(self.execution_meta) == 1
+            and self.execution_meta[0][0] == "info"
+        ):
+            try:
+                self.execution_list.Delete(0)
+            except Exception:
+                return False
+            self.execution_meta = []
+        self.execution_list.Append(row_text)
+        self.execution_meta.append(meta)
+        if self.execution_list.GetSelection() == wx.NOT_FOUND:
+            try:
+                self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+            except Exception:
+                pass
+        self._request_listbox_repaint(self.execution_list)
+        return True
+
+    @staticmethod
+    def _execution_step_detail_text(step) -> str:
+        if not isinstance(step, dict):
+            return str(step or "").strip()
+        return str(
+            step.get("detail_text")
+            or step.get("message")
+            or step.get("step")
+            or step.get("title")
+            or step.get("text")
+            or step.get("content")
+            or step.get("description")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _normalize_execution_text_for_compare(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip())
+
+    @staticmethod
+    def _execution_texts_are_near_duplicate(previous_text: str, next_text: str) -> bool:
+        left = str(previous_text or "").strip()
+        right = str(next_text or "").strip()
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+        if len(shorter) < 16:
+            return False
+        return longer.startswith(shorter) or longer.endswith(shorter)
+
+    def _execution_entries_should_dedupe(self, previous_step, next_step) -> bool:
+        if not isinstance(previous_step, dict) or not isinstance(next_step, dict):
+            return False
+        previous_kind = str(previous_step.get("display_kind") or "").strip()
+        next_kind = str(next_step.get("display_kind") or "").strip()
+        if previous_kind != "commentary" or next_kind != "commentary":
+            return False
+        previous_text = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
+        next_text = self._normalize_execution_text_for_compare(self._execution_step_detail_text(next_step))
+        if not previous_text or not next_text:
+            return False
+        return self._execution_texts_are_near_duplicate(previous_text, next_text)
+
+    def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True) -> bool:
+        if not isinstance(entry, dict):
             return False
         target_chat = self._chat_state_for_execution_steps(chat_id)
         if not isinstance(target_chat, dict):
@@ -2514,12 +2832,62 @@ class ChatFrame(wx.Frame):
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
-        steps.append({"step": text})
-        if target_chat is self._current_chat_state and self._detail_panel_mode() == "execution" and hasattr(self, "execution_list"):
-            self._render_execution_list()
+        if steps and self._execution_entries_should_dedupe(steps[-1], entry):
+            return False
+        steps.append(copy.deepcopy(entry))
+        self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if save_state:
             self._save_state()
         return True
+
+    def _buffer_execution_delta(self, chat_id: str, event: CodexEvent) -> None:
+        if not isinstance(event, CodexEvent):
+            return
+        key = (str(chat_id or ""), self._event_turn_id(event), str(getattr(event, "item_id", "") or "").strip())
+        state = self._execution_delta_buffer.setdefault(key, {"parts": [], "event": event, "last_event_at": 0.0})
+        state["parts"].append(str(getattr(event, "text", "") or getattr(event, "raw_text", "") or ""))
+        state["event"] = event
+        state["last_event_at"] = time.time()
+
+    def _flush_execution_delta(self, chat_id: str, turn_id: str | None = None, item_id: str | None = None) -> bool:
+        flushed = False
+        normalized_chat_id = str(chat_id or "")
+        normalized_turn_id = None if turn_id is None else str(turn_id or "").strip()
+        normalized_item_id = None if item_id is None else str(item_id or "").strip()
+        for key in list(self._execution_delta_buffer.keys()):
+            buf_chat_id, buf_turn_id, buf_item_id = key
+            if buf_chat_id != normalized_chat_id:
+                continue
+            if normalized_turn_id is not None and buf_turn_id != normalized_turn_id:
+                continue
+            if normalized_item_id is not None and buf_item_id != normalized_item_id:
+                continue
+            state = self._execution_delta_buffer.pop(key, None)
+            if not isinstance(state, dict):
+                continue
+            text = "".join(str(part or "") for part in (state.get("parts") or [])).strip()
+            base_event = state.get("event")
+            if not text or not isinstance(base_event, CodexEvent):
+                continue
+            merged_event = CodexEvent(
+                type="agent_message_delta",
+                thread_id=self._event_thread_id(base_event),
+                turn_id=self._event_turn_id(base_event),
+                item_id=str(getattr(base_event, "item_id", "") or "").strip(),
+                text=text,
+                raw_text=text,
+                phase=str(getattr(base_event, "phase", "") or "").strip(),
+                status=str(getattr(base_event, "status", "") or "").strip(),
+                subtype=str(getattr(base_event, "subtype", "") or "").strip() or "agentMessageDelta",
+                display_kind="commentary",
+            )
+            entry = self._build_execution_entry(merged_event)
+            if entry and self._append_execution_entry_to_chat(chat_id, entry, save_state=False):
+                flushed = True
+        return flushed
+
+    def _flush_all_execution_deltas_for_chat(self, chat_id: str) -> bool:
+        return self._flush_execution_delta(chat_id)
 
     def _refresh_visible_history_chat(self, chat_id: str) -> None:
         if self.view_mode != "history":
@@ -2527,40 +2895,114 @@ class ChatFrame(wx.Frame):
         if str(self.view_history_id or "").strip() != str(chat_id or "").strip():
             return
         self._refresh_history(chat_id)
-        self._refresh_answer_list_preserving_selection()
+        self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
 
-    @staticmethod
-    def _execution_step_text(step) -> str:
+    def _execution_meta_tuple(self, step_idx: int, step) -> tuple:
         if isinstance(step, dict):
-            for key in ("message", "step", "title", "text", "content", "description"):
-                value = str(step.get(key) or "").strip()
-                if value:
-                    return value
-            try:
-                return json.dumps(step, ensure_ascii=False, sort_keys=True)
-            except Exception:
-                return str(step)
-        return str(step or "").strip()
+            detail_text = str(
+                step.get("detail_text")
+                or step.get("message")
+                or step.get("step")
+                or step.get("title")
+                or step.get("text")
+                or step.get("content")
+                or step.get("description")
+                or ""
+            )
+            display_kind = str(step.get("display_kind") or "").strip()
+            list_text = str(step.get("list_text") or "").strip()
+            if not list_text:
+                if display_kind == "command":
+                    fallback_text = (
+                        str(step.get("subtype") or "").strip()
+                        or str(step.get("status") or "").strip()
+                        or str(step.get("event_type") or "").strip()
+                    )
+                    list_text = self._execution_command_list_text(
+                        str(step.get("event_type") or "").strip(),
+                        str(step.get("title") or "").strip(),
+                        str(step.get("command") or "").strip(),
+                        step.get("exit_code"),
+                        fallback_text,
+                    )
+                else:
+                    list_text = self._execution_list_text_from_detail(detail_text, display_kind)
+            return ("execution", step_idx, list_text, detail_text)
+        text = str(step or "").strip()
+        return ("execution", step_idx, text, text)
 
-    def _render_execution_list(self) -> None:
-        if not hasattr(self, "execution_list"):
-            return
+    def _execution_step_text(self, step) -> str:
+        return self._execution_meta_tuple(-1, step)[2]
+
+    def _should_show_execution_step(self, step) -> bool:
+        if not isinstance(step, dict):
+            return bool(str(step or "").strip())
+        display_kind = str(step.get("display_kind") or "").strip()
+        event_type = str(step.get("event_type") or "").strip()
+        phase = str(step.get("phase") or "").strip()
+        list_text = str(step.get("list_text") or "").strip()
+        detail_text = self._execution_step_detail_text(step)
+        hidden_status_texts = {"开始处理本轮请求", "本轮处理结束", "active", "idle"}
+        normalized_detail_text = self._normalize_execution_text_for_compare(detail_text)
+        normalized_list_text = self._normalize_execution_text_for_compare(list_text)
+        if normalized_detail_text in {
+            "开始执行：阶段：commentary",
+            "完成执行：阶段：commentary",
+            "开始执行：阶段：final_answer",
+            "完成执行：阶段：final_answer",
+        }:
+            return False
+        if normalized_list_text in {
+            "开始执行：阶段：commentary",
+            "完成执行：阶段：commentary",
+            "开始执行：阶段：final_answer",
+            "完成执行：阶段：final_answer",
+        }:
+            return False
+
+        if event_type in {"turn_started", "turn_completed"} and (detail_text in hidden_status_texts or list_text in hidden_status_texts):
+            return False
+        if event_type == "item_completed" and phase == "final_answer":
+            return False
+        if display_kind == "command":
+            return False
+        if display_kind == "status" and (detail_text in hidden_status_texts or list_text in hidden_status_texts):
+            return False
+        if list_text in {"active", "idle"} or detail_text in {"active", "idle"}:
+            return False
+        if display_kind in {"commentary", "plan", "error", "user_input"}:
+            return bool(list_text or detail_text)
+        if event_type in {"agent_message_delta", "plan_updated", "stderr", "server_request"}:
+            return bool(list_text or detail_text)
+        if display_kind:
+            return False
+        return bool(list_text or detail_text)
+
+    def _rebuild_execution_list_from_state(self) -> None:
         self.execution_list.Clear()
+        self.execution_meta = []
         steps = list(self._current_execution_steps())
         if not steps:
             self.execution_list.Append("暂无执行过程")
+            self.execution_meta.append(("info", -1, "", ""))
             try:
                 self.execution_list.SetSelection(0)
             except Exception:
                 pass
             self._request_listbox_repaint(self.execution_list)
             return
-        for step in steps:
-            text = self._execution_step_text(step)
-            if text:
-                self.execution_list.Append(text)
+        for idx, step in enumerate(steps):
+            if not self._should_show_execution_step(step):
+                continue
+            meta = self._execution_meta_tuple(idx, step)
+            row_text = str(meta[2] or "").strip()
+            if not row_text:
+                continue
+            self.execution_list.Append(row_text)
+            self.execution_meta.append(meta)
         if self.execution_list.GetCount() == 0:
             self.execution_list.Append("暂无执行过程")
+            self.execution_meta.append(("info", -1, "", ""))
         if self.execution_list.GetCount() > 0 and self.execution_list.GetSelection() == wx.NOT_FOUND:
             try:
                 self.execution_list.SetSelection(0)
@@ -2568,7 +3010,13 @@ class ChatFrame(wx.Frame):
                 pass
         self._request_listbox_repaint(self.execution_list)
 
+    def _render_execution_list(self) -> None:
+        if not hasattr(self, "execution_list"):
+            return
+        self._rebuild_execution_list_from_state()
+
     def _apply_detail_panel_mode(self, mode: str | None = None, refresh_execution: bool = False) -> str:
+        previous_mode = self._detail_panel_mode()
         normalized = "execution" if str(mode or self._detail_panel_mode()).strip() == "execution" else "answers"
         if not isinstance(getattr(self, "_current_chat_state", None), dict):
             self._current_chat_state = {}
@@ -2610,7 +3058,8 @@ class ChatFrame(wx.Frame):
                 self.answer_list.SetFocus()
             except Exception:
                 pass
-        if normalized == "execution" and (refresh_execution or hasattr(self, "execution_list")):
+        if normalized == "execution" and (refresh_execution or previous_mode != "execution"):
+            self._flush_all_execution_deltas_for_chat(self._visible_execution_chat_id())
             self._render_execution_list()
         try:
             self.Layout()
@@ -3968,9 +4417,6 @@ class ChatFrame(wx.Frame):
         return True, ""
 
     def _should_queue_codex_ui_event(self, chat_id: str, event: CodexEvent) -> bool:
-        event_type = str(getattr(event, "type", "") or "")
-        if chat_id not in {self.active_chat_id, self.current_chat_id, "", None} and event_type == "agent_message_delta":
-            return False
         return True
 
     def _dispatch_codex_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
@@ -3999,19 +4445,22 @@ class ChatFrame(wx.Frame):
     def _on_codex_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
+        chat_id = str(chat_id or "").strip()
         event_type = str(getattr(event, "type", "") or "").strip()
         event_turn_id = self._event_turn_id(event)
         event_thread_id = self._event_thread_id(event)
-        if event_turn_id or event_thread_id:
+        if not chat_id and (event_turn_id or event_thread_id):
             resolved_chat_id = self._resolve_codex_event_chat_id(event)
-            if resolved_chat_id and resolved_chat_id != str(chat_id or "").strip():
+            if resolved_chat_id and resolved_chat_id != chat_id:
                 chat_id = resolved_chat_id
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
-        step_text = self._codex_execution_step_text(event)
+        execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
         if not is_current_chat:
             if event_type == "agent_message_delta":
+                self._buffer_execution_delta(chat_id, event)
                 return
+            self._flush_execution_delta(chat_id, event_turn_id or None)
             target_chat = self._find_archived_chat(chat_id)
             target_turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
             target_idx = self._event_turn_index(target_turns, event)
@@ -4028,8 +4477,8 @@ class ChatFrame(wx.Frame):
                     self._codex_background_flush_scheduled = True
                     self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
                 return
-            if step_text:
-                self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
+            if execution_entry:
+                self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
                 appended_execution_step = True
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
@@ -4053,8 +4502,12 @@ class ChatFrame(wx.Frame):
                 self._codex_background_flush_scheduled = True
                 self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
             return
-        if step_text:
-            appended_execution_step = self._append_execution_step_to_chat(chat_id, step_text, save_state=False)
+        if event_type == "agent_message_delta":
+            self._buffer_execution_delta(chat_id, event)
+        else:
+            self._flush_execution_delta(chat_id, event_turn_id or None)
+        if execution_entry:
+            appended_execution_step = self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
         if event_type == "token_count" and event.usage:
             target_idx = self._event_turn_index(self.active_session_turns, event)
             if target_idx < 0:
@@ -4103,7 +4556,7 @@ class ChatFrame(wx.Frame):
                 self._play_finish_sound()
                 self._save_state()
                 if self.view_mode == "active":
-                    self._refresh_answer_list_preserving_selection()
+                    self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
             return
         if appended_execution_step and not str(getattr(event, "text", "") or "").strip():
             self._save_state()
@@ -4126,7 +4579,7 @@ class ChatFrame(wx.Frame):
                         }
                         if self._record_received_attachment(self.active_session_turns[target_idx], attachment):
                             self._save_state()
-                            self._render_answer_list()
+                            self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event_type == "item_completed" and str(event.phase or "") == "final_answer":
                 self.active_codex_pending_prompt = str(event.text or "")
@@ -4141,7 +4594,7 @@ class ChatFrame(wx.Frame):
                     self._update_active_answer_row(target_idx)
                 self._save_state()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
-                self._render_answer_list()
+                self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 self._call_later_if_alive(120, self._focus_latest_answer)
                 return
             if event.text:
@@ -6108,7 +6561,10 @@ class ChatFrame(wx.Frame):
             idx = self.execution_list.GetSelection()
             if idx != wx.NOT_FOUND and wx.TheClipboard.Open():
                 try:
-                    text = str(self.execution_list.GetString(idx) or "").strip()
+                    detail_text = ""
+                    if 0 <= idx < len(self.execution_meta):
+                        detail_text = str(self.execution_meta[idx][3] or "")
+                    text = detail_text.strip() or str(self.execution_list.GetString(idx) or "").strip()
                     if text:
                         wx.TheClipboard.SetData(wx.TextDataObject(text))
                         self.SetStatusText("已复制")
@@ -6131,13 +6587,46 @@ class ChatFrame(wx.Frame):
         event.Skip()
 
     def _on_execution_activate(self, _event):
+        self._try_open_selected_execution_detail()
+
+    def _try_open_selected_execution_detail(self) -> bool:
         if self._detail_panel_mode() != "execution":
-            return
-        self._render_execution_list()
+            return False
+        idx = self.execution_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.execution_meta):
+            return False
+        item_type, step_idx, _, detail_text = self.execution_meta[idx]
+        if item_type != "execution" or step_idx < 0:
+            return False
+        steps = self._current_execution_steps()
+        if not (0 <= step_idx < len(steps)):
+            return False
+        step = steps[step_idx]
+        if not isinstance(step, dict):
+            step = {"step": str(step or ""), "detail_text": str(detail_text or "")}
+            steps[step_idx] = step
+        detail_source = str(
+            step.get("detail_text")
+            or step.get("message")
+            or step.get("step")
+            or step.get("title")
+            or step.get("text")
+            or step.get("content")
+            or step.get("description")
+            or detail_text
+            or ""
+        ).strip()
+        if not detail_source:
+            return False
         try:
-            self.execution_list.SetFocus()
+            page_path = self._ensure_execution_detail_page(step, step_idx)
+            self._open_local_webpage(page_path)
+            self.SetStatusText("已打开执行过程详情网页")
+            self._save_state()
         except Exception:
-            pass
+            wx.MessageBox("打开详情网页失败。", "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        return True
 
     def _try_open_selected_answer_detail(self) -> bool:
         idx = self.answer_list.GetSelection()
@@ -6218,6 +6707,7 @@ class ChatFrame(wx.Frame):
         selected_id = str(chat_id or "").strip()
         if not selected_id:
             return False
+        self._flush_relevant_execution_deltas_for_switch()
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
         if selected_id in current_ids:
@@ -6308,6 +6798,7 @@ class ChatFrame(wx.Frame):
         """Switch to a different chat."""
         if chat_id == self.current_chat_id:
             return True
+        self._flush_relevant_execution_deltas_for_switch()
         chat = self._find_archived_chat(chat_id)
         if not chat:
             return False
@@ -7539,10 +8030,12 @@ class ChatFrame(wx.Frame):
         self._render_answer_list()
 
     def _cleanup_chat_detail_pages(self, chat: dict) -> None:
-        turns = chat.get("turns") or []
-        for turn in turns:
+        items = list(chat.get("turns") or []) + list(chat.get("execution_steps") or [])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             for k in ("question_detail_page_path", "answer_detail_page_path", "detail_page_path"):
-                raw = str(turn.get(k) or "").strip()
+                raw = str(item.get(k) or "").strip()
                 if not raw:
                     continue
                 try:

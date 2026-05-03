@@ -2103,7 +2103,7 @@
         "inputSchema": {
           "properties": {
             "url": {
-              "description": "GitHub URL to fetch or download content from.",
+              "description": "GitHub file URL to fetch. Supports github.com blob URLs, raw.githubusercontent.com URLs, and api.github.com repository contents URLs with a ref query parameter.",
               "title": "Url",
               "type": "string"
             }
@@ -2139,6 +2139,168 @@
           "resource_name": "GitHub_download_user_content",
           "_codex_apps": {
             "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/download_user_content",
+            "contains_mcp_source": false
+          },
+          "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+          "connector_name": "GitHub",
+          "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex",
+          "link_id": "link_697f55846a2481919de965ba95fa3a18"
+        }
+      },
+      "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+      "connector_name": "GitHub",
+      "plugin_display_names": [],
+      "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex"
+    },
+    {
+      "server_name": "codex_apps",
+      "tool_name": "_download_workflow_artifact",
+      "tool_namespace": "mcp__codex_apps__github",
+      "server_instructions": null,
+      "tool": {
+        "name": "github_download_workflow_artifact",
+        "title": "download_workflow_artifact",
+        "description": "Download a GitHub Actions workflow artifact ZIP archive. GitHub serves this endpoint through a temporary redirect; the underlying client follows that redirect before returning a reusable file reference for the ZIP bytes. Docs: https://docs.github.com/en/rest/actions/artifacts?apiVersion=2022-11-28#download-an-artifact",
+        "inputSchema": {
+          "properties": {
+            "repo_full_name": {
+              "description": "Repository in `owner/name` form, such as `openai/openai`.",
+              "title": "Repo Full Name",
+              "type": "string"
+            },
+            "artifact_id": {
+              "description": "GitHub Actions workflow artifact ID.",
+              "title": "Artifact Id",
+              "type": "integer"
+            },
+            "file_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional ZIP file name for the returned file reference.",
+              "title": "File Name"
+            }
+          },
+          "required": [
+            "repo_full_name",
+            "artifact_id"
+          ],
+          "title": "download_workflow_artifact_input",
+          "type": "object"
+        },
+        "outputSchema": {
+          "title": "download_workflow_artifact_output",
+          "default": {},
+          "type": "object",
+          "properties": {
+            "result": {
+              "title": "DownloadWorkflowArtifactResponse",
+              "default": {},
+              "type": "object",
+              "properties": {
+                "file_uri": {
+                  "description": "File reference for the downloaded GitHub Actions artifact ZIP.",
+                  "default": {},
+                  "type": "allOf",
+                  "allOf": [
+                    {
+                      "title": "ConnectorFileReference",
+                      "description": "Connector-local file reference payload used for upload/download handoff.",
+                      "default": {},
+                      "type": "object",
+                      "properties": {
+                        "download_url": {
+                          "title": "Download Url",
+                          "default": {},
+                          "type": "string"
+                        },
+                        "file_id": {
+                          "title": "File Id",
+                          "default": {},
+                          "type": "string"
+                        },
+                        "mime_type": {
+                          "title": "Mime Type",
+                          "type": "anyOf",
+                          "anyOf": [
+                            {
+                              "default": {},
+                              "type": "string"
+                            },
+                            {
+                              "default": {},
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "file_name": {
+                          "title": "File Name",
+                          "type": "anyOf",
+                          "anyOf": [
+                            {
+                              "default": {},
+                              "type": "string"
+                            },
+                            {
+                              "default": {},
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "download_url",
+                        "file_id"
+                      ]
+                    }
+                  ]
+                },
+                "artifact_id": {
+                  "title": "Artifact Id",
+                  "description": "GitHub Actions workflow artifact ID.",
+                  "default": {},
+                  "type": "integer"
+                },
+                "file_name": {
+                  "title": "File Name",
+                  "description": "Materialized artifact ZIP file name.",
+                  "default": {},
+                  "type": "string"
+                },
+                "mime_type": {
+                  "title": "Mime Type",
+                  "description": "MIME type for the materialized artifact ZIP.",
+                  "default": {},
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_uri",
+                "artifact_id",
+                "file_name",
+                "mime_type"
+              ]
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "resource_name": "GitHub_download_workflow_artifact",
+          "_codex_apps": {
+            "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/download_workflow_artifact",
             "contains_mcp_source": false
           },
           "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
@@ -2227,11 +2389,11 @@
       "tool": {
         "name": "github_fetch",
         "title": "fetch",
-        "description": "Fetch a file from GitHub by URL.",
+        "description": "Fetch a UTF-8 text file from GitHub by URL. Use a file URL such as ``https://github.com/owner/repo/blob/branch/path/to/file.py``. ``raw.githubusercontent.com`` file URLs and ``api.github.com/repos/.../contents/...`` URLs with a ``ref`` query parameter are also accepted.",
         "inputSchema": {
           "properties": {
             "url": {
-              "description": "GitHub URL to fetch or download content from.",
+              "description": "GitHub file URL to fetch. Supports github.com blob URLs, raw.githubusercontent.com URLs, and api.github.com repository contents URLs with a ref query parameter.",
               "title": "Url",
               "type": "string"
             }
@@ -3570,6 +3732,101 @@
           "resource_name": "GitHub_fetch_workflow_job_steps",
           "_codex_apps": {
             "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/fetch_workflow_job_steps",
+            "contains_mcp_source": false
+          },
+          "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+          "connector_name": "GitHub",
+          "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex",
+          "link_id": "link_697f55846a2481919de965ba95fa3a18"
+        }
+      },
+      "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+      "connector_name": "GitHub",
+      "plugin_display_names": [],
+      "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex"
+    },
+    {
+      "server_name": "codex_apps",
+      "tool_name": "_fetch_workflow_run_artifacts",
+      "tool_namespace": "mcp__codex_apps__github",
+      "server_instructions": null,
+      "tool": {
+        "name": "github_fetch_workflow_run_artifacts",
+        "title": "fetch_workflow_run_artifacts",
+        "description": "Fetch artifacts for a GitHub Actions workflow run. This wrapper returns the first page only. Docs: https://docs.github.com/en/rest/actions/artifacts?apiVersion=2022-11-28#list-workflow-run-artifacts",
+        "inputSchema": {
+          "properties": {
+            "repo_full_name": {
+              "description": "Repository in `owner/name` form, such as `openai/openai`.",
+              "title": "Repo Full Name",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "GitHub Actions workflow run ID.",
+              "title": "Run Id",
+              "type": "integer"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional artifact name to filter by.",
+              "title": "Name"
+            }
+          },
+          "required": [
+            "repo_full_name",
+            "run_id"
+          ],
+          "title": "fetch_workflow_run_artifacts_input",
+          "type": "object"
+        },
+        "outputSchema": {
+          "title": "fetch_workflow_run_artifacts_output",
+          "default": {},
+          "type": "object",
+          "properties": {
+            "result": {
+              "title": "FetchWorkflowRunArtifactsResponse",
+              "default": {},
+              "type": "object",
+              "properties": {
+                "artifacts": {
+                  "title": "Artifacts",
+                  "description": "Artifacts belonging to the selected GitHub workflow run.",
+                  "default": {},
+                  "type": "array",
+                  "items": {
+                    "default": {},
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "required": [
+                "artifacts"
+              ]
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "resource_name": "GitHub_fetch_workflow_run_artifacts",
+          "_codex_apps": {
+            "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/fetch_workflow_run_artifacts",
             "contains_mcp_source": false
           },
           "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
@@ -6919,6 +7176,160 @@
           "resource_name": "GitHub_request_pull_request_reviewers",
           "_codex_apps": {
             "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/request_pull_request_reviewers",
+            "contains_mcp_source": false
+          },
+          "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+          "connector_name": "GitHub",
+          "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex",
+          "link_id": "link_697f55846a2481919de965ba95fa3a18"
+        }
+      },
+      "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+      "connector_name": "GitHub",
+      "plugin_display_names": [],
+      "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex"
+    },
+    {
+      "server_name": "codex_apps",
+      "tool_name": "_rerun_failed_workflow_run_jobs",
+      "tool_namespace": "mcp__codex_apps__github",
+      "server_instructions": null,
+      "tool": {
+        "name": "github_rerun_failed_workflow_run_jobs",
+        "title": "rerun_failed_workflow_run_jobs",
+        "description": "Re-run all failed jobs in a GitHub Actions workflow run. Use this to retry only the failed jobs from a workflow run, instead of starting a full new attempt for successful jobs too. The linked GitHub app or token must have GitHub Actions write permission for the repository. Docs: https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#re-run-failed-jobs-from-a-workflow-run",
+        "inputSchema": {
+          "properties": {
+            "repo_full_name": {
+              "description": "Repository in `owner/name` form, such as `openai/openai`.",
+              "title": "Repo Full Name",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "GitHub Actions workflow run ID.",
+              "title": "Run Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "repo_full_name",
+            "run_id"
+          ],
+          "title": "rerun_failed_workflow_run_jobs_input",
+          "type": "object"
+        },
+        "outputSchema": {
+          "title": "rerun_failed_workflow_run_jobs_output",
+          "default": {},
+          "type": "object",
+          "properties": {
+            "result": {
+              "title": "GithubSuccessResponse",
+              "default": {},
+              "type": "object",
+              "properties": {
+                "success": {
+                  "title": "Success",
+                  "description": "Whether the GitHub action completed successfully.",
+                  "default": {},
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "success"
+              ]
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "openWorldHint": true
+        },
+        "_meta": {
+          "resource_name": "GitHub_rerun_failed_workflow_run_jobs",
+          "_codex_apps": {
+            "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/rerun_failed_workflow_run_jobs",
+            "contains_mcp_source": false
+          },
+          "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+          "connector_name": "GitHub",
+          "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex",
+          "link_id": "link_697f55846a2481919de965ba95fa3a18"
+        }
+      },
+      "connector_id": "connector_76869538009648d5b282a4bb21c3d157",
+      "connector_name": "GitHub",
+      "plugin_display_names": [],
+      "connector_description": "Access repositories, issues, and pull requests. Required for some features such as Codex"
+    },
+    {
+      "server_name": "codex_apps",
+      "tool_name": "_rerun_workflow_job",
+      "tool_namespace": "mcp__codex_apps__github",
+      "server_instructions": null,
+      "tool": {
+        "name": "github_rerun_workflow_job",
+        "title": "rerun_workflow_job",
+        "description": "Re-run one GitHub Actions workflow job. Use this when a specific failed or cancelled job should be retried without re-running every failed job in the workflow run. The linked GitHub app or token must have GitHub Actions write permission for the repository. Docs: https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#re-run-a-job-from-a-workflow-run",
+        "inputSchema": {
+          "properties": {
+            "repo_full_name": {
+              "description": "Repository in `owner/name` form, such as `openai/openai`.",
+              "title": "Repo Full Name",
+              "type": "string"
+            },
+            "job_id": {
+              "description": "GitHub Actions workflow job ID to re-run.",
+              "title": "Job Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "repo_full_name",
+            "job_id"
+          ],
+          "title": "rerun_workflow_job_input",
+          "type": "object"
+        },
+        "outputSchema": {
+          "title": "rerun_workflow_job_output",
+          "default": {},
+          "type": "object",
+          "properties": {
+            "result": {
+              "title": "GithubSuccessResponse",
+              "default": {},
+              "type": "object",
+              "properties": {
+                "success": {
+                  "title": "Success",
+                  "description": "Whether the GitHub action completed successfully.",
+                  "default": {},
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "success"
+              ]
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "openWorldHint": true
+        },
+        "_meta": {
+          "resource_name": "GitHub_rerun_workflow_job",
+          "_codex_apps": {
+            "resource_uri": "/connector_76869538009648d5b282a4bb21c3d157/link_697f55846a2481919de965ba95fa3a18/rerun_workflow_job",
             "contains_mcp_source": false
           },
           "connector_id": "connector_76869538009648d5b282a4bb21c3d157",

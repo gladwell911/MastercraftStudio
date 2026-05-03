@@ -143,6 +143,150 @@ def test_codex_client_maps_agent_message_delta_to_event():
     assert seen[0].text == "hello"
 
 
+def test_codex_item_command_execution_normalizes_display_fields():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "th",
+                "turnId": "tu",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "title": "Run tests",
+                    "command": "pytest -q",
+                    "exitCode": 1,
+                    "text": "pytest failed",
+                },
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0].type == "item_completed"
+    assert seen[0].status == "commandExecution"
+    assert seen[0].title == "Run tests"
+    assert seen[0].command == "pytest -q"
+    assert seen[0].exit_code == 1
+    assert seen[0].text == "pytest failed"
+    assert seen[0].raw_text == "pytest failed"
+    assert seen[0].display_kind == "command"
+    assert seen[0].subtype == "commandExecution"
+
+
+def test_codex_agent_message_delta_keeps_text_and_raw_text():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "th",
+                "turnId": "tu",
+                "itemId": "msg-1",
+                "delta": "hello",
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0].text == "hello"
+    assert seen[0].raw_text == "hello"
+    assert seen[0].display_kind == "commentary"
+    assert seen[0].subtype == "agentMessageDelta"
+
+
+def test_codex_file_change_generates_summary_when_text_missing():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "th",
+                "turnId": "tu",
+                "item": {
+                    "id": "file-1",
+                    "type": "fileChange",
+                    "path": "src/main.py",
+                },
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0].type == "item_completed"
+    assert seen[0].display_kind == "artifact"
+    assert seen[0].subtype == "fileChange"
+    assert seen[0].text == "Changed src/main.py"
+    assert seen[0].raw_text == ""
+
+
+def test_codex_plan_update_keeps_explanation_in_text_and_raw_text():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "th",
+                "turnId": "tu",
+                "explanation": "Implement tests first.",
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0].type == "plan_updated"
+    assert seen[0].text == "Implement tests first."
+    assert seen[0].raw_text == "Implement tests first."
+    assert seen[0].display_kind == "plan"
+    assert seen[0].subtype == "turnPlanUpdated"
+
+
+def test_codex_diff_update_keeps_diff_in_text_and_raw_text():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "method": "turn/diff/updated",
+            "params": {
+                "threadId": "th",
+                "turnId": "tu",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0].type == "diff_updated"
+    assert seen[0].text == "@@ -1 +1 @@\n-old\n+new\n"
+    assert seen[0].raw_text == "@@ -1 +1 @@\n-old\n+new\n"
+    assert seen[0].display_kind == "artifact"
+    assert seen[0].subtype == "turnDiffUpdated"
+
+
+def test_codex_stderr_event_keeps_full_line_and_marks_error():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._emit_protocol_event("stderr", {"line": "fatal: bad object"}, {"method": "stderr"})
+
+    assert len(seen) == 1
+    assert seen[0].type == "stderr"
+    assert seen[0].text == "fatal: bad object"
+    assert seen[0].raw_text == "fatal: bad object"
+    assert seen[0].display_kind == "error"
+    assert seen[0].subtype == "stderr"
+
+
 def test_codex_protocol_token_count_event_normalizes_usage():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)

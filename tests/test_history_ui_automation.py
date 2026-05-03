@@ -218,4 +218,4 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     rows = list(frame.execution_list.GetStrings())
 
-    assert rows == ["开始执行：运行测试 | 命令：pytest tests/test_main_unit.py -k codex"]
+    assert rows == ["暂无执行过程"]

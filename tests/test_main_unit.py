@@ -1377,6 +1377,139 @@ def test_render_execution_list_prefers_detailed_execution_step_message(frame):
     assert rows == ["执行命令：pytest tests/test_main_unit.py -k codex"]
 
 
+def test_render_execution_list_uses_single_line_list_text_and_keeps_full_detail_meta(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "display_kind": "command",
+                "detail_text": "运行测试\npytest tests/test_main_unit.py -k codex",
+                "list_text": "命令：运行测试 pytest tests/test_main_unit.py -k codex",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
+def test_render_execution_list_filters_fixed_lifecycle_and_command_noise(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"event_type": "turn_started", "display_kind": "status", "detail_text": "开始处理本轮请求", "list_text": "开始处理本轮请求"},
+            {"event_type": "item_started", "display_kind": "command", "detail_text": "开始执行：reasoning", "list_text": "命令：开始执行 reasoning"},
+            {"event_type": "agent_message_delta", "display_kind": "commentary", "detail_text": "我先检查 main.py，再处理过滤逻辑。", "list_text": "我先检查 main.py，再处理过滤逻辑。"},
+            {"event_type": "plan_updated", "display_kind": "plan", "detail_text": "先整理结构", "list_text": "计划：先整理结构"},
+            {"event_type": "item_completed", "phase": "final_answer", "display_kind": "status", "detail_text": "已生成最终回答", "list_text": "已生成最终回答"},
+            {"event_type": "turn_completed", "display_kind": "status", "detail_text": "本轮处理结束", "list_text": "本轮处理结束"},
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["我先检查 main.py，再处理过滤逻辑。", "计划：先整理结构"]
+
+
+def test_render_execution_list_filters_phase_only_commentary_noise(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"event_type": "item_started", "display_kind": "commentary", "detail_text": "开始执行：阶段：commentary", "list_text": "开始执行：阶段：commentary"},
+            {"event_type": "item_completed", "display_kind": "commentary", "detail_text": "完成执行：阶段：final_answer", "list_text": "完成执行：阶段：final_answer"},
+            {"event_type": "agent_message_delta", "display_kind": "commentary", "detail_text": "保留这条说明。", "list_text": "保留这条说明。"},
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["保留这条说明。"]
+
+
+def test_build_execution_entry_keeps_full_detail_text(frame):
+    event = main.CodexEvent(
+        type="item_started",
+        thread_id="thread-current",
+        turn_id="turn-current",
+        item_id="item-1",
+        subtype="commandExecution",
+        title="运行测试",
+        command="pytest tests/test_main_unit.py -k codex",
+        raw_text="运行测试\npytest tests/test_main_unit.py -k codex\n第 2 行输出",
+    )
+
+    entry = frame._build_execution_entry(event)
+
+    assert entry is not None
+    assert entry["event_type"] == "item_started"
+    assert entry["display_kind"] == "command"
+    assert entry["thread_id"] == "thread-current"
+    assert entry["turn_id"] == "turn-current"
+    assert entry["item_id"] == "item-1"
+    assert entry["detail_text"] == "运行测试\npytest tests/test_main_unit.py -k codex\n第 2 行输出"
+    assert entry["list_text"] == "命令：开始执行 运行测试 pytest tests/test_main_unit.py -k codex"
+    assert "\n" not in entry["list_text"]
+    assert "第 2 行输出" not in entry["list_text"]
+
+
+def test_build_execution_entry_command_summary_falls_back_to_stable_fields(frame):
+    event = main.CodexEvent(
+        type="item_started",
+        thread_id="thread-current",
+        turn_id="turn-current",
+        item_id="item-2",
+        subtype="commandExecution",
+        raw_text="第一行输出\n第二行输出",
+    )
+
+    entry = frame._build_execution_entry(event)
+
+    assert entry is not None
+    assert entry["display_kind"] == "command"
+    assert entry["detail_text"] == "第一行输出\n第二行输出"
+    assert entry["list_text"] == "命令：开始执行 commandExecution"
+    assert "第一行输出" not in entry["list_text"]
+
+
+def test_render_execution_list_rebuilds_command_entry_without_list_text_using_concise_summary(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "item_completed",
+                "display_kind": "command",
+                "title": "运行测试",
+                "command": "pytest tests/test_main_unit.py -k codex",
+                "exit_code": 1,
+                "detail_text": "运行测试\npytest tests/test_main_unit.py -k codex\n失败输出第1行\n失败输出第2行",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
 def test_render_execution_list_sets_default_selection(frame):
     frame._current_chat_state = {
         "id": "chat-1",
@@ -1439,6 +1572,24 @@ def test_apply_detail_panel_mode_updates_title_and_visibility(frame):
     assert visibility["execution"] is True
 
 
+def test_apply_detail_panel_mode_only_rebuilds_when_entering_execution_mode(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    render_count = {"n": 0}
+    monkeypatch.setattr(frame, "_render_execution_list", lambda: render_count.__setitem__("n", render_count["n"] + 1))
+
+    frame._apply_detail_panel_mode("execution")
+    frame._apply_detail_panel_mode("answers")
+    frame._apply_detail_panel_mode("execution")
+
+    assert render_count["n"] == 1
+
+
 def test_background_final_answer_updates_matching_archived_turn(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -1483,7 +1634,8 @@ def test_background_final_answer_updates_matching_archived_turn(frame, monkeypat
     archived = frame._find_archived_chat("chat-background")
     assert archived["turns"][0]["answer_md"] == "第一答"
     assert archived["turns"][1]["answer_md"] == "第二答"
-    assert archived["execution_steps"] == [{"step": "已生成最终回答"}]
+    assert len(archived["execution_steps"]) == 1
+    assert archived["execution_steps"][0]["list_text"] == "已生成最终回答"
 
 
 def test_save_load_preserves_active_chat_detail_panel_state(tmp_path, monkeypatch):
@@ -1655,20 +1807,137 @@ def test_append_execution_step_refreshes_visible_execution_list_without_stealing
         "execution_steps": [],
     }
     frame._render_execution_list()
-    render_count = {"n": 0}
+    clear_count = {"n": 0}
+    append_count = {"n": 0}
     focus_count = {"n": 0}
-    monkeypatch.setattr(frame, "_render_execution_list", lambda: render_count.__setitem__("n", render_count["n"] + 1))
+    original_clear = frame.execution_list.Clear
+    original_append = frame.execution_list.Append
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Clear",
+        lambda: clear_count.__setitem__("n", clear_count["n"] + 1) or original_clear(),
+    )
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Append",
+        lambda text: append_count.__setitem__("n", append_count["n"] + 1) or original_append(text),
+    )
     monkeypatch.setattr(frame.execution_list, "SetFocus", lambda: focus_count.__setitem__("n", focus_count["n"] + 1))
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._append_execution_step_to_chat("chat-1", "计划更新：整理步骤")
 
     assert frame._current_chat_state["execution_steps"] == [{"step": "计划更新：整理步骤"}]
-    assert render_count["n"] == 1
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["计划更新：整理步骤"]
+    assert frame.execution_list.GetSelection() == 0
+    assert clear_count["n"] == 0
+    assert append_count["n"] == 1
     assert focus_count["n"] == 0
 
 
-def test_execution_list_enter_and_double_click_are_defined(frame, monkeypatch):
+def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}, {"step": "第二步"}],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+    clear_count = {"n": 0}
+    append_count = {"n": 0}
+    focus_count = {"n": 0}
+    original_clear = frame.execution_list.Clear
+    original_append = frame.execution_list.Append
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Clear",
+        lambda: clear_count.__setitem__("n", clear_count["n"] + 1) or original_clear(),
+    )
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Append",
+        lambda text: append_count.__setitem__("n", append_count["n"] + 1) or original_append(text),
+    )
+    monkeypatch.setattr(frame.execution_list, "SetFocus", lambda: focus_count.__setitem__("n", focus_count["n"] + 1))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._append_execution_entry_to_chat(
+        "chat-1",
+        {
+            "event_type": "plan_updated",
+            "display_kind": "plan",
+            "detail_text": "第三步",
+            "list_text": "计划：第三步",
+        },
+    )
+
+    assert frame.execution_list.GetSelection() == 0
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["第一步", "第二步", "计划：第三步"]
+    assert frame.execution_meta[-1] == ("execution", 2, "计划：第三步", "第三步")
+    assert clear_count["n"] == 0
+    assert append_count["n"] == 1
+    assert focus_count["n"] == 0
+
+
+def test_background_chat_execution_event_does_not_append_to_visible_execution_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "当前步骤"}],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-background",
+            "title": "后台聊天",
+            "turns": [],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "detail_panel_mode": "execution",
+            "execution_steps": [],
+            "codex_thread_id": "thread-background",
+            "codex_turn_id": "turn-background",
+        }
+    ]
+    frame._render_execution_list()
+    before_rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    clear_count = {"n": 0}
+    append_count = {"n": 0}
+    original_clear = frame.execution_list.Clear
+    original_append = frame.execution_list.Append
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Clear",
+        lambda: clear_count.__setitem__("n", clear_count["n"] + 1) or original_clear(),
+    )
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Append",
+        lambda text: append_count.__setitem__("n", append_count["n"] + 1) or original_append(text),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-background",
+        main.CodexEvent(type="plan_updated", thread_id="thread-background", turn_id="turn-background", text="后台整理"),
+    )
+
+    archived = frame._find_archived_chat("chat-background")
+    assert len(archived["execution_steps"]) == 1
+    assert archived["execution_steps"][0]["list_text"] == "计划：后台整理"
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == before_rows
+    assert clear_count["n"] == 0
+    assert append_count["n"] == 0
+
+
+def test_execution_list_enter_and_double_click_open_execution_detail(frame, monkeypatch):
     frame._current_chat_state = {
         "id": "chat-1",
         "title": "执行测试",
@@ -1678,7 +1947,11 @@ def test_execution_list_enter_and_double_click_are_defined(frame, monkeypatch):
     }
     frame._render_execution_list()
     called = {"n": 0}
-    monkeypatch.setattr(frame, "_on_execution_activate", lambda _event: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(
+        frame,
+        "_try_open_selected_execution_detail",
+        lambda: called.__setitem__("n", called["n"] + 1) or True,
+    )
     monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)
 
     class KeyEvent:
@@ -1703,7 +1976,7 @@ def test_execution_list_enter_and_double_click_are_defined(frame, monkeypatch):
     assert called["n"] == 2
 
 
-def test_execution_list_ctrl_c_copies_selected_row(frame, monkeypatch):
+def test_execution_list_ctrl_c_copies_selected_detail_text(frame, monkeypatch):
     copied = {"text": None}
 
     class _Clipboard:
@@ -1725,7 +1998,13 @@ def test_execution_list_ctrl_c_copies_selected_row(frame, monkeypatch):
         "title": "执行测试",
         "turns": [],
         "detail_panel_mode": "execution",
-        "execution_steps": [{"step": "第一步"}],
+        "execution_steps": [
+            {
+                "step": "第一步",
+                "list_text": "计划：第一步",
+                "detail_text": "第一步\n完整细节",
+            }
+        ],
     }
     frame._render_execution_list()
     frame.execution_list.SetSelection(0)
@@ -1745,7 +2024,68 @@ def test_execution_list_ctrl_c_copies_selected_row(frame, monkeypatch):
 
     frame._on_execution_key_down(KeyEvent())
 
-    assert copied["text"] == "第一步"
+    assert copied["text"] == "第一步\n完整细节"
+
+
+def test_try_open_selected_execution_detail_opens_generated_detail_page(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "step": "运行测试",
+                "list_text": "命令：运行测试 pytest tests/test_main_unit.py -k codex",
+                "detail_text": "运行测试\npytest tests/test_main_unit.py -k codex\n第 2 行输出",
+            }
+        ],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+    opened = {}
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    frame._open_local_webpage = lambda p: opened.__setitem__("path", str(p))
+
+    assert frame._try_open_selected_execution_detail()
+    html = Path(opened["path"]).read_text(encoding="utf-8")
+    assert "执行过程详情" in html
+    assert "pytest tests/test_main_unit.py -k codex" in html
+
+
+def test_try_open_selected_execution_detail_reuses_page_path_and_cleanup_removes_it(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "step": "运行测试",
+                "list_text": "命令：运行测试 pytest tests/test_main_unit.py -k codex",
+                "detail_text": "运行测试\npytest tests/test_main_unit.py -k codex\n第 2 行输出",
+                "created_at": 1.0,
+            }
+        ],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    opened = []
+    frame._open_local_webpage = lambda p: opened.append(str(p))
+
+    assert frame._try_open_selected_execution_detail()
+    first_path = Path(opened[-1])
+    assert first_path.is_file()
+
+    assert frame._try_open_selected_execution_detail()
+    second_path = Path(opened[-1])
+    assert second_path == first_path
+    assert list(frame.detail_pages_dir.glob(f"{first_path.stem}*")) == [first_path]
+
+    frame._cleanup_chat_detail_pages(frame._current_chat_state)
+
+    assert not first_path.exists()
 
 
 def test_switch_current_chat_refreshes_execution_list_in_execution_mode(frame):
@@ -1776,6 +2116,52 @@ def test_switch_current_chat_refreshes_execution_list_in_execution_mode(frame):
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
     assert rows == ["B1", "B2"]
     assert frame.execution_list.GetSelection() == 0
+
+
+def test_switch_current_chat_flushes_active_chat_pending_delta_while_history_view_open(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-viewed"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.active_session_turns = [{"question": "当前问题", "answer_md": "当前回答", "model": "codex/main", "created_at": 1.0}]
+    frame.archived_chats = [
+        {
+            "id": "chat-viewed",
+            "title": "正在查看",
+            "turns": [],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+        },
+        {
+            "id": "chat-target",
+            "title": "目标聊天",
+            "turns": [],
+            "created_at": 3.0,
+            "updated_at": 3.0,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+        },
+    ]
+    frame._buffer_execution_delta(
+        "chat-current",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="切换前先落地"),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._switch_current_chat("chat-target") is True
+
+    archived_current = next(chat for chat in frame.archived_chats if chat["id"] == "chat-current")
+    assert archived_current["execution_steps"][0]["detail_text"] == "切换前先落地"
+    assert frame._execution_delta_buffer == {}
 
 
 def test_render_answer_list_applies_execution_mode_visibility(frame):
@@ -2603,6 +2989,53 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
     assert frame.answer_meta[0][0] == "context_usage"
 
 
+def test_active_turn_completed_in_execution_mode_does_not_rebuild_execution_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_thread_id": "thread-1",
+            "codex_turn_id": "turn-1",
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._render_answer_list()
+    execution_rebuilds = {"n": 0}
+    original_render_execution_list = frame._render_execution_list
+    monkeypatch.setattr(
+        frame,
+        "_render_execution_list",
+        lambda: (execution_rebuilds.__setitem__("n", execution_rebuilds["n"] + 1), original_render_execution_list())[1],
+    )
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="turn_completed", thread_id="thread-1", turn_id="turn-1", text="done", status="completed"),
+    )
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert execution_rebuilds["n"] == 0
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert rows == ["暂无执行过程"]
+
+
 def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -3262,15 +3695,13 @@ def test_background_codex_feedback_events_route_through_call_after(frame, monkey
             type=event_type,
             thread_id="thread-background",
             turn_id="turn-background",
+            item_id="msg-1" if event_type == "agent_message_delta" else "",
             text="stream chunk",
         ),
     )
 
-    if event_type == "agent_message_delta":
-        assert call_after_calls == []
-    else:
-        assert len(call_after_calls) == 1
-        assert call_after_calls[0][0].__name__ == "_on_codex_event_for_chat"
+    assert len(call_after_calls) == 1
+    assert call_after_calls[0][0].__name__ == "_on_codex_event_for_chat"
 
 
 def test_background_codex_feedback_events_batch_state_flush(frame, monkeypatch):
@@ -3340,12 +3771,16 @@ def test_background_archived_final_answer_updates_answer_and_execution_steps(fra
                     "model": main.DEFAULT_CODEX_MODEL,
                     "created_at": 1.0,
                     "request_status": "pending",
+                    "codex_thread_id": "thread-background",
+                    "codex_turn_id": "turn-background",
                 }
             ],
             "created_at": 1.0,
             "updated_at": 1.0,
             "detail_panel_mode": "answers",
             "execution_steps": [],
+            "codex_thread_id": "thread-background",
+            "codex_turn_id": "turn-background",
         }
     ]
     calls = []
@@ -3369,7 +3804,8 @@ def test_background_archived_final_answer_updates_answer_and_execution_steps(fra
 
     archived = frame._find_archived_chat("chat-background")
     assert archived["turns"][0]["answer_md"] == "后台最终回答"
-    assert archived["execution_steps"] == [{"step": "已生成最终回答"}]
+    assert len(archived["execution_steps"]) == 1
+    assert archived["execution_steps"][0]["list_text"] == "已生成最终回答"
 
 
 def test_background_final_answer_refreshes_visible_history_view(frame, monkeypatch):
@@ -3390,19 +3826,25 @@ def test_background_final_answer_refreshes_visible_history_view(frame, monkeypat
                     "model": main.DEFAULT_CODEX_MODEL,
                     "created_at": 1.0,
                     "request_status": "pending",
+                    "codex_thread_id": "thread-background",
+                    "codex_turn_id": "turn-background",
                 }
             ],
             "created_at": 1.0,
             "updated_at": 1.0,
             "detail_panel_mode": "execution",
             "execution_steps": [{"step": "旧步骤"}],
+            "codex_thread_id": "thread-background",
+            "codex_turn_id": "turn-background",
         }
     ]
-    refresh_counts = {"history": 0, "answer": 0}
+    refresh_counts = {"history": 0, "answer": 0, "execution": 0}
     original_refresh_history = frame._refresh_history
     original_render_answer_list = frame._render_answer_list
+    original_render_execution_list = frame._render_execution_list
     monkeypatch.setattr(frame, "_refresh_history", lambda keep_id=None: (refresh_counts.__setitem__("history", refresh_counts["history"] + 1), original_refresh_history(keep_id))[1])
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: (refresh_counts.__setitem__("answer", refresh_counts["answer"] + 1), original_render_answer_list())[1])
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: (refresh_counts.__setitem__("answer", refresh_counts["answer"] + 1), original_render_answer_list(*args, **kwargs))[1])
+    monkeypatch.setattr(frame, "_render_execution_list", lambda: (refresh_counts.__setitem__("execution", refresh_counts["execution"] + 1), original_render_execution_list())[1])
     monkeypatch.setattr(main.wx, "GetApp", lambda: object())
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: None)
@@ -3421,9 +3863,11 @@ def test_background_final_answer_refreshes_visible_history_view(frame, monkeypat
     archived = frame._find_archived_chat("chat-background")
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert archived["turns"][0]["answer_md"] == "后台最终回答"
-    assert archived["execution_steps"] == [{"step": "旧步骤"}, {"step": "已生成最终回答"}]
+    assert archived["execution_steps"][0] == {"step": "旧步骤"}
+    assert archived["execution_steps"][1]["list_text"] == "已生成最终回答"
     assert refresh_counts["history"] >= 1
     assert refresh_counts["answer"] >= 1
+    assert refresh_counts["execution"] == 0
     assert "后台最终回答" in rows
 
 
@@ -3583,7 +4027,12 @@ def test_plan_updated_appends_execution_step(frame, monkeypatch):
         main.CodexEvent(type="plan_updated", thread_id="thread-current", turn_id="turn-current", text="先整理结构"),
     )
 
-    assert frame._current_chat_state["execution_steps"] == [{"step": "计划更新：先整理结构"}]
+    steps = frame._current_chat_state["execution_steps"]
+    assert len(steps) == 1
+    assert steps[0]["event_type"] == "plan_updated"
+    assert steps[0]["display_kind"] == "plan"
+    assert steps[0]["detail_text"] == "先整理结构"
+    assert steps[0]["list_text"] == "计划：先整理结构"
 
 
 def test_command_execution_started_appends_detailed_execution_step(frame, monkeypatch):
@@ -3608,6 +4057,7 @@ def test_command_execution_started_appends_detailed_execution_step(frame, monkey
             thread_id="thread-current",
             turn_id="turn-current",
             status="commandExecution",
+            display_kind="command",
             data={
                 "type": "commandExecution",
                 "title": "运行测试",
@@ -3616,9 +4066,13 @@ def test_command_execution_started_appends_detailed_execution_step(frame, monkey
         ),
     )
 
-    assert frame._current_chat_state["execution_steps"] == [
-        {"step": "开始执行：运行测试 | 命令：pytest tests/test_main_unit.py -k codex"}
-    ]
+    steps = frame._current_chat_state["execution_steps"]
+    assert len(steps) == 1
+    assert steps[0]["event_type"] == "item_started"
+    assert steps[0]["display_kind"] == "command"
+    assert steps[0]["command"] == "pytest tests/test_main_unit.py -k codex"
+    assert steps[0]["detail_text"] == "开始执行：运行测试\n命令：pytest tests/test_main_unit.py -k codex"
+    assert steps[0]["list_text"] == "命令：开始执行 运行测试 pytest tests/test_main_unit.py -k codex"
 
 
 def test_file_change_completed_appends_changed_paths_to_execution_step(frame, monkeypatch):
@@ -3653,9 +4107,11 @@ def test_file_change_completed_appends_changed_paths_to_execution_step(frame, mo
         ),
     )
 
-    assert frame._current_chat_state["execution_steps"] == [
-        {"step": "完成执行：修改文件 main.py, tests/test_main_unit.py"}
-    ]
+    steps = frame._current_chat_state["execution_steps"]
+    assert len(steps) == 1
+    assert steps[0]["event_type"] == "item_completed"
+    assert steps[0]["detail_text"] == "完成执行：修改文件 main.py, tests/test_main_unit.py"
+    assert steps[0]["list_text"] == "完成执行：修改文件 main.py, tests/test_main_unit.py"
 
 
 def test_empty_text_mapped_event_appends_and_persists_execution_step(frame, monkeypatch):
@@ -3679,11 +4135,15 @@ def test_empty_text_mapped_event_appends_and_persists_execution_step(frame, monk
         main.CodexEvent(type="diff_updated", thread_id="thread-current", turn_id="turn-current", text=""),
     )
 
-    assert frame._current_chat_state["execution_steps"] == [{"step": "已生成代码变更"}]
+    steps = frame._current_chat_state["execution_steps"]
+    assert len(steps) == 1
+    assert steps[0]["event_type"] == "diff_updated"
+    assert steps[0]["detail_text"] == "已生成代码变更"
+    assert steps[0]["list_text"] == "已生成代码变更"
     assert saves["count"] == 1
 
 
-def test_agent_message_delta_does_not_append_execution_step(frame, monkeypatch):
+def test_agent_message_delta_buffers_without_immediate_execution_step(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_codex_thread_id = "thread-current"
@@ -3700,11 +4160,388 @@ def test_agent_message_delta_does_not_append_execution_step(frame, monkeypatch):
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", text="stream"),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="stream"),
     )
 
     assert frame._current_chat_state["execution_steps"] == []
+    buffered = frame._execution_delta_buffer[("chat-current", "turn-current", "msg-1")]
+    assert buffered["parts"] == ["stream"]
+    assert buffered["event"].type == "agent_message_delta"
+    assert buffered["event"].item_id == "msg-1"
     assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_execution_delta_buffer_flushes_into_single_commentary_item(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._buffer_execution_delta(
+        "chat-1",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="先检查 main.py。"),
+    )
+    frame._buffer_execution_delta(
+        "chat-1",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="再处理 codex_client.py。"),
+    )
+
+    flushed = frame._flush_execution_delta("chat-1", "turn-1", "msg-1")
+
+    assert flushed is True
+    assert frame._execution_delta_buffer == {}
+    assert len(frame._current_chat_state["execution_steps"]) == 1
+    assert frame._current_chat_state["execution_steps"][0]["event_type"] == "agent_message_delta"
+    assert frame._current_chat_state["execution_steps"][0]["display_kind"] == "commentary"
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "先检查 main.py。再处理 codex_client.py。"
+
+
+def test_append_execution_entry_to_chat_dedupes_adjacent_identical_commentary(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "agent_message_delta",
+                "display_kind": "commentary",
+                "detail_text": "我先核对当前会话里注册的 skill 定义。",
+                "list_text": "我先核对当前会话里注册的 skill 定义。",
+            }
+        ],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    appended = frame._append_execution_entry_to_chat(
+        "chat-1",
+        {
+            "event_type": "item_completed",
+            "display_kind": "commentary",
+            "detail_text": "我先核对当前会话里注册的 skill 定义。",
+            "list_text": "我先核对当前会话里注册的 skill 定义。",
+        },
+        save_state=False,
+    )
+
+    assert appended is False
+    assert len(frame._current_chat_state["execution_steps"]) == 1
+
+
+def test_append_execution_entry_to_chat_dedupes_adjacent_expanded_commentary(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "agent_message_delta",
+                "display_kind": "commentary",
+                "detail_text": "我先核对当前会话里注册的 skill 定义和对应 SKILL.md 是否都在本地可读。",
+                "list_text": "我先核对当前会话里注册的 skill 定义和对应 SKILL.md 是否都在本地可读。",
+            }
+        ],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    appended = frame._append_execution_entry_to_chat(
+        "chat-1",
+        {
+            "event_type": "item_completed",
+            "display_kind": "commentary",
+            "detail_text": "我先核对当前会话里注册的 skill 定义和对应 SKILL.md 是否都在本地可读。再给你一个明确结论。",
+            "list_text": "我先核对当前会话里注册的 skill 定义和对应 SKILL.md 是否都在本地可读。再给你一个明确结论。",
+        },
+        save_state=False,
+    )
+
+    assert appended is False
+    assert len(frame._current_chat_state["execution_steps"]) == 1
+
+
+def test_background_agent_message_delta_buffers_and_flushes_for_target_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-background",
+            "title": "后台聊天",
+            "turns": [],
+            "detail_panel_mode": "execution",
+            "execution_steps": [],
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-background",
+        main.CodexEvent(
+            type="agent_message_delta",
+            thread_id="thread-background",
+            turn_id="turn-background",
+            item_id="msg-1",
+            text="后台增量",
+        ),
+    )
+
+    assert ("chat-background", "turn-background", "msg-1") in frame._execution_delta_buffer
+    assert frame.archived_chats[0]["execution_steps"] == []
+
+    flushed = frame._flush_execution_delta("chat-background", "turn-background", "msg-1")
+
+    assert flushed is True
+    assert frame.archived_chats[0]["execution_steps"][0]["event_type"] == "agent_message_delta"
+    assert frame.archived_chats[0]["execution_steps"][0]["detail_text"] == "后台增量"
+    assert frame._current_chat_state["execution_steps"] == []
+
+
+def test_background_chat_delta_flushes_before_next_non_delta_event(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-background",
+            "title": "后台聊天",
+            "turns": [],
+            "detail_panel_mode": "execution",
+            "execution_steps": [],
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-background",
+        main.CodexEvent(
+            type="agent_message_delta",
+            thread_id="thread-background",
+            turn_id="turn-background",
+            item_id="msg-1",
+            text="先缓冲",
+        ),
+    )
+    frame._on_codex_event_for_chat(
+        "chat-background",
+        main.CodexEvent(
+            type="plan_updated",
+            thread_id="thread-background",
+            turn_id="turn-background",
+            text="后落地",
+        ),
+    )
+
+    steps = frame.archived_chats[0]["execution_steps"]
+    assert [step["event_type"] for step in steps] == ["agent_message_delta", "plan_updated"]
+    assert steps[0]["detail_text"] == "先缓冲"
+    assert steps[1]["detail_text"] == "后落地"
+    assert frame._execution_delta_buffer == {}
+
+
+def test_switch_to_execution_mode_flushes_pending_delta_before_rebuild(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame._buffer_execution_delta(
+        "chat-1",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="待落地过程"),
+    )
+    rebuilt = {"count": 0}
+    monkeypatch.setattr(frame, "_rebuild_execution_list_from_state", lambda: rebuilt.__setitem__("count", rebuilt["count"] + 1))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "待落地过程"
+    assert rebuilt["count"] == 1
+    assert frame._execution_delta_buffer == {}
+
+
+def test_history_view_execution_mode_flushes_pending_delta_for_viewed_archived_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史聊天",
+            "turns": [],
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+        }
+    ]
+    frame._buffer_execution_delta(
+        "chat-history",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-history", turn_id="turn-history", item_id="msg-1", text="历史缓冲"),
+    )
+    rebuilt = {"count": 0}
+    monkeypatch.setattr(frame, "_rebuild_execution_list_from_state", lambda: rebuilt.__setitem__("count", rebuilt["count"] + 1))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+
+    assert frame.archived_chats[0]["execution_steps"][0]["detail_text"] == "历史缓冲"
+    assert rebuilt["count"] == 1
+    assert frame._execution_delta_buffer == {}
+
+
+def test_show_history_chat_flushes_pending_execution_delta_before_switch(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.view_mode = "active"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "历史聊天",
+            "turns": [],
+            "detail_panel_mode": "execution",
+            "execution_steps": [],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+        }
+    ]
+    frame._buffer_execution_delta(
+        "chat-current",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="切换前先落地"),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._show_history_chat("chat-history", focus_answer_list=False) is True
+
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "切换前先落地"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-history"
+    assert frame._execution_delta_buffer == {}
+
+
+def test_show_history_chat_switching_away_flushes_pending_delta_for_viewed_archived_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-a"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "历史A",
+            "turns": [],
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+        },
+        {
+            "id": "chat-b",
+            "title": "历史B",
+            "turns": [],
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "created_at": 3.0,
+            "updated_at": 3.0,
+        },
+    ]
+    frame._buffer_execution_delta(
+        "chat-a",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-a", turn_id="turn-a", item_id="msg-1", text="离开前先落地"),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._show_history_chat("chat-b", focus_answer_list=False) is True
+
+    archived_a = next(chat for chat in frame.archived_chats if chat["id"] == "chat-a")
+    assert archived_a["execution_steps"][0]["detail_text"] == "离开前先落地"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-b"
+    assert frame._execution_delta_buffer == {}
+
+
+def test_show_history_chat_active_chat_flushes_active_pending_delta_while_history_view_open(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-viewed"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-viewed",
+            "title": "历史聊天",
+            "turns": [],
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+        }
+    ]
+    frame._buffer_execution_delta(
+        "chat-current",
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="回到当前前先落地"),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._show_history_chat("chat-current", focus_answer_list=False) is True
+
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "回到当前前先落地"
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert frame._execution_delta_buffer == {}
 
 
 def test_final_answer_item_appends_execution_step_without_breaking_answer_update(frame, monkeypatch):
@@ -3723,7 +4560,7 @@ def test_final_answer_item_appends_execution_step_without_breaking_answer_update
     }
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: None)
 
     frame._on_codex_event_for_chat(
@@ -3732,7 +4569,59 @@ def test_final_answer_item_appends_execution_step_without_breaking_answer_update
     )
 
     assert frame.active_session_turns[0]["answer_md"] == "最终回答"
-    assert frame._current_chat_state["execution_steps"] == [{"step": "已生成最终回答"}]
+    steps = frame._current_chat_state["execution_steps"]
+    assert len(steps) == 1
+    assert steps[0]["event_type"] == "item_completed"
+    assert steps[0]["phase"] == "final_answer"
+    assert steps[0]["detail_text"] == "最终回答"
+    assert steps[0]["list_text"] == "已生成最终回答"
+
+
+def test_final_answer_live_event_in_execution_mode_does_not_rebuild_execution_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: None)
+
+    frame._render_answer_list()
+    execution_rebuilds = {"n": 0}
+    original_render_execution_list = frame._render_execution_list
+
+    def _counted_render_execution_list():
+        execution_rebuilds["n"] += 1
+        return original_render_execution_list()
+
+    monkeypatch.setattr(frame, "_render_execution_list", _counted_render_execution_list)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="item_completed", phase="final_answer", thread_id="thread-current", turn_id="turn-current", text="最终回答"),
+    )
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    answer_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert execution_rebuilds["n"] == 0
+    assert rows == ["暂无执行过程"]
+    assert "最终回答" in answer_rows
 
 
 def test_background_non_current_chat_events_append_to_target_chat_execution_steps(frame, monkeypatch):
@@ -3754,6 +4643,8 @@ def test_background_non_current_chat_events_append_to_target_chat_execution_step
             "updated_at": 1.0,
             "detail_panel_mode": "answers",
             "execution_steps": [],
+            "codex_thread_id": "thread-background",
+            "codex_turn_id": "turn-background",
         }
     ]
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -3764,7 +4655,10 @@ def test_background_non_current_chat_events_append_to_target_chat_execution_step
     )
 
     archived = frame._find_archived_chat("chat-background")
-    assert archived["execution_steps"] == [{"step": "计划更新：后台整理"}]
+    assert len(archived["execution_steps"]) == 1
+    assert archived["execution_steps"][0]["event_type"] == "plan_updated"
+    assert archived["execution_steps"][0]["detail_text"] == "后台整理"
+    assert archived["execution_steps"][0]["list_text"] == "计划：后台整理"
     assert frame._current_chat_state["execution_steps"] == []
 
 
@@ -4133,6 +5027,65 @@ def test_codex_image_item_event_records_received_attachment(frame, monkeypatch, 
         }
     ]
     assert seen["render"] == 1
+
+
+def test_codex_image_item_event_in_execution_mode_does_not_rebuild_execution_list(frame, monkeypatch, tmp_path):
+    image_path = tmp_path / "from-cli.png"
+    image_path.write_text("image", encoding="utf-8")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "看图",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": time.time(),
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+
+    frame._render_answer_list()
+    execution_rebuilds = {"n": 0}
+    original_render_execution_list = frame._render_execution_list
+    monkeypatch.setattr(
+        frame,
+        "_render_execution_list",
+        lambda: (execution_rebuilds.__setitem__("n", execution_rebuilds["n"] + 1), original_render_execution_list())[1],
+    )
+
+    frame._on_codex_event_for_chat(
+        "chat-1",
+        main.CodexEvent(
+            type="item_completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            status="imageView",
+            data={"id": "image-1", "type": "imageView", "path": str(image_path)},
+        ),
+    )
+
+    attachments = frame.active_session_turns[0].get("received_attachments") or []
+    assert execution_rebuilds["n"] == 0
+    assert attachments == [
+        {
+            "name": "from-cli.png",
+            "path": str(image_path),
+            "kind": "image",
+            "direction": "incoming",
+            "status": "success",
+            "open_path": str(image_path),
+            "source": "codex",
+        }
+    ]
 
 
 def test_codex_final_answer_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):

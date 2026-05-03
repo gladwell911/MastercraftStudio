@@ -156,6 +156,12 @@ class CodexEvent:
     turn_id: str = ""
     item_id: str = ""
     text: str = ""
+    raw_text: str = ""
+    title: str = ""
+    command: str = ""
+    exit_code: int | None = None
+    subtype: str = ""
+    display_kind: str = ""
     phase: str = ""
     status: str = ""
     flags: list[str] = field(default_factory=list)
@@ -164,6 +170,108 @@ class CodexEvent:
     params: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
+
+
+def _first_non_empty(*values) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _item_title(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return _first_non_empty(item.get("title"), item.get("name"), item.get("label"))
+
+
+def _item_command(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return _first_non_empty(item.get("command"), item.get("commandLine"), item.get("cmd"))
+
+
+def _item_exit_code(item: dict) -> int | None:
+    if not isinstance(item, dict):
+        return None
+    value = item.get("exitCode")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_file_change_summary(item: dict) -> str:
+    if not isinstance(item, dict):
+        return "File change"
+    path = _first_non_empty(item.get("path"), item.get("filePath"), item.get("file"), item.get("uri"))
+    if path:
+        return f"Changed {path}"
+    files = item.get("files")
+    if isinstance(files, list) and files:
+        first_file = files[0] if isinstance(files[0], dict) else {}
+        first_path = _first_non_empty(
+            first_file.get("path"),
+            first_file.get("filePath"),
+            first_file.get("file"),
+            first_file.get("uri"),
+        )
+        if first_path:
+            remaining = max(len(files) - 1, 0)
+            if remaining:
+                return f"Changed {first_path} and {remaining} more"
+            return f"Changed {first_path}"
+    return _first_non_empty(item.get("summary"), item.get("description"), "File change")
+
+
+def _event_from_item(method: str, params: dict) -> CodexEvent:
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    item_type = str(item.get("type") or "").strip()
+    raw_text = str(item.get("text") or "")
+    title = _item_title(item)
+    command = _item_command(item)
+    exit_code = _item_exit_code(item)
+    display_kind = "status"
+    text = _first_non_empty(raw_text, title)
+
+    if item_type == "commandExecution":
+        display_kind = "command"
+        text = _first_non_empty(raw_text, command, title)
+    elif item_type == "agentMessage":
+        display_kind = "commentary"
+        text = raw_text
+    elif item_type == "fileChange":
+        display_kind = "artifact"
+        text = _first_non_empty(raw_text, title, _item_file_change_summary(item))
+    else:
+        if command:
+            display_kind = "command"
+            text = _first_non_empty(raw_text, command, title)
+        elif raw_text:
+            display_kind = "commentary"
+        elif title:
+            display_kind = "status"
+        elif any(item.get(key) for key in ("path", "filePath", "file", "uri", "files")):
+            display_kind = "artifact"
+            text = _item_file_change_summary(item)
+
+    return CodexEvent(
+        type="item_completed" if method.endswith("completed") else "item_started",
+        thread_id=str(params.get("threadId") or ""),
+        turn_id=str(params.get("turnId") or ""),
+        item_id=str(item.get("id") or ""),
+        text=text,
+        raw_text=raw_text,
+        title=title,
+        command=command,
+        exit_code=exit_code,
+        subtype=item_type,
+        display_kind=display_kind,
+        phase=str(item.get("phase") or ""),
+        status=item_type,
+        data=item,
+    )
 
 
 class CodexAppServerClient:
@@ -454,7 +562,15 @@ class CodexAppServerClient:
         for raw_line in proc.stderr:
             line = str(raw_line or "").strip()
             if line:
-                self._emit_event(CodexEvent(type="stderr", text=line))
+                self._emit_event(
+                    CodexEvent(
+                        type="stderr",
+                        text=line,
+                        raw_text=line,
+                        subtype="stderr",
+                        display_kind="error",
+                    )
+                )
 
     def _fail_pending_requests(self, message: str) -> None:
         with self._request_lock:
@@ -553,6 +669,8 @@ class CodexAppServerClient:
                     thread_id=str(params.get("threadId") or ""),
                     turn_id=str(turn.get("id") or ""),
                     status=str(turn.get("status") or ""),
+                    subtype="turnStarted",
+                    display_kind="status",
                     data=turn,
                 )
             )
@@ -566,6 +684,9 @@ class CodexAppServerClient:
                     turn_id=str(turn.get("id") or ""),
                     status=str(turn.get("status") or ""),
                     text=str((turn.get("error") or {}).get("message") or ""),
+                    raw_text=str((turn.get("error") or {}).get("message") or ""),
+                    subtype="turnCompleted",
+                    display_kind="status",
                     data=turn,
                 )
             )
@@ -577,17 +698,24 @@ class CodexAppServerClient:
                     thread_id=str(params.get("threadId") or ""),
                     turn_id=str(params.get("turnId") or ""),
                     text=str(params.get("explanation") or ""),
+                    raw_text=str(params.get("explanation") or ""),
+                    subtype="turnPlanUpdated",
+                    display_kind="plan",
                     data=params,
                 )
             )
             return
         if method == "turn/diff/updated":
+            diff_text = str(params.get("diff") or "")
             self._emit_event(
                 CodexEvent(
                     type="diff_updated",
                     thread_id=str(params.get("threadId") or ""),
                     turn_id=str(params.get("turnId") or ""),
-                    text=str(params.get("diff") or ""),
+                    text=diff_text,
+                    raw_text=diff_text,
+                    subtype="turnDiffUpdated",
+                    display_kind="artifact",
                     data=params,
                 )
             )
@@ -600,22 +728,26 @@ class CodexAppServerClient:
                     turn_id=str(params.get("turnId") or ""),
                     item_id=str(params.get("itemId") or ""),
                     text=str(params.get("delta") or ""),
+                    raw_text=str(params.get("delta") or ""),
+                    subtype="agentMessageDelta",
+                    display_kind="commentary",
                     data=params,
                 )
             )
             return
         if method in {"item/started", "item/completed"}:
-            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            self._emit_event(_event_from_item(method, params))
+            return
+        if method == "stderr":
+            line = str(params.get("line") or "")
             self._emit_event(
                 CodexEvent(
-                    type="item_completed" if method.endswith("completed") else "item_started",
-                    thread_id=str(params.get("threadId") or ""),
-                    turn_id=str(params.get("turnId") or ""),
-                    item_id=str(item.get("id") or ""),
-                    text=str(item.get("text") or ""),
-                    phase=str(item.get("phase") or ""),
-                    status=str(item.get("type") or ""),
-                    data=item,
+                    type="stderr",
+                    text=line,
+                    raw_text=line,
+                    subtype="stderr",
+                    display_kind="error",
+                    data=params,
                 )
             )
             return

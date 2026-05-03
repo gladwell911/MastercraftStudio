@@ -1,4 +1,4 @@
-model = "gpt-5.5"
+model = "gpt-5.4"
 model_reasoning_effort = "medium"
 personality = "pragmatic"
 
@@ -38,7 +38,7 @@ trust_level = "trusted"
 [projects.'c:\code\mc']
 trust_level = "trusted"
 
-[projects.'c:\code\codex']
+[projects.'c:\code\tp\ym']
 trust_level = "trusted"
 
 [tui.model_availability_nux]
