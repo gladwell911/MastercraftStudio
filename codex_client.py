@@ -111,6 +111,34 @@ def _merge_user_skills_into_codex_home(source_home: Path, target_home: Path) -> 
         _link_or_copy_path(source_entry, target_entry)
 
 
+def _strip_utf8_bom_from_skill_markdown(skills_root: Path) -> None:
+    if not skills_root.exists() or not skills_root.is_dir():
+        return
+    try:
+        entries = list(skills_root.iterdir())
+    except Exception:
+        return
+    skill_files = []
+    direct_skill = skills_root / "SKILL.md"
+    if direct_skill.exists() and direct_skill.is_file():
+        skill_files.append(direct_skill)
+    for entry in entries:
+        candidate = entry / "SKILL.md"
+        if candidate.exists() and candidate.is_file():
+            skill_files.append(candidate)
+    for skill_file in skill_files:
+        try:
+            data = skill_file.read_bytes()
+        except Exception:
+            continue
+        if not data.startswith(b"\xef\xbb\xbf"):
+            continue
+        try:
+            skill_file.write_bytes(data[3:])
+        except Exception:
+            continue
+
+
 def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], Path | None]:
     env = os.environ.copy()
     workspace = Path(str(cwd or "").strip() or Path.cwd())
@@ -122,6 +150,7 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
     source_home = Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex"
     _copy_codex_home_seed(source_home, codex_home)
     _merge_user_skills_into_codex_home(source_home, codex_home)
+    _strip_utf8_bom_from_skill_markdown(codex_home / "skills")
     env["CODEX_HOME"] = str(codex_home)
     return env, codex_home
 

@@ -729,6 +729,24 @@ def test_build_codex_app_server_env_links_missing_user_skills_into_workspace_hom
     assert (reused_home / "skills" / ".system").exists()
 
 
+def test_build_codex_app_server_env_strips_utf8_bom_from_merged_skill_markdown(tmp_path, monkeypatch):
+    source_home = tmp_path / ".codex"
+    source_home.mkdir()
+    source_skills = source_home / "skills"
+    source_skills.mkdir()
+    planning_skill = source_skills / "planning-with-files-zh"
+    planning_skill.mkdir()
+    (planning_skill / "SKILL.md").write_bytes(b"\xef\xbb\xbf---\nname: planning-with-files-zh\n---\nbody\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    _, reused_home = codex_client.build_codex_app_server_env(str(workspace))
+
+    merged_skill = reused_home / "skills" / "planning-with-files-zh" / "SKILL.md"
+    assert merged_skill.read_bytes().startswith(b"---\n")
+
+
 def test_build_codex_app_server_env_keeps_existing_workspace_skill_entries(tmp_path, monkeypatch):
     source_home = tmp_path / ".codex"
     source_home.mkdir()

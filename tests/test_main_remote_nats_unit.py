@@ -3,6 +3,19 @@ from types import SimpleNamespace
 import main
 
 
+def test_can_bind_loopback_tcp_port_returns_false_when_port_accepts_connections(frame, monkeypatch):
+    class _ConnectedSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(main.socket, "create_connection", lambda *args, **kwargs: _ConnectedSocket())
+
+    assert frame._can_bind_loopback_tcp_port(4222) is False
+
+
 def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
@@ -116,6 +129,12 @@ def test_remote_nats_server_reuses_existing_nats_when_port_is_already_in_use(fra
 
     monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
     monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(
+        frame,
+        "_probe_existing_remote_nats_websocket_port",
+        lambda: 18080,
+        raising=False,
+    )
 
     frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
 
@@ -126,12 +145,187 @@ def test_remote_nats_server_reuses_existing_nats_when_port_is_already_in_use(fra
     assert frame.remote_nats_runtime_status["last_error"] == ""
 
 
+def test_remote_nats_server_reuses_existing_nats_and_detects_live_websocket_port(frame, monkeypatch):
+    started = {}
+
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            started["config"] = config
+
+        def start(self, timeout=10):
+            raise RuntimeError("NATS port 4222 is already in use")
+
+        def stop(self):
+            started["process_stopped"] = True
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            started["transport_kwargs"] = kwargs
+
+        def start_threaded(self, url, timeout=10):
+            started["transport_url"] = url
+
+        def stop(self):
+            started["transport_stopped"] = True
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(
+        frame,
+        "_probe_existing_remote_nats_websocket_port",
+        lambda: 18081,
+        raising=False,
+    )
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: started.setdefault("bridge", True))
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
+
+    assert started["transport_url"] == "nats://127.0.0.1:4222"
+    assert frame._remote_nats_process is None
+    assert frame._remote_nats_transport is not None
+    assert frame.remote_nats_runtime_status["enabled"] is True
+    assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18081/nats"
+    assert frame._remote_nats_websocket_port == 18081
+    assert started["bridge"] is True
+
+
+def test_remote_nats_server_reuse_fails_when_existing_websocket_port_cannot_be_determined(frame, monkeypatch):
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
+
+        def start(self, timeout=10):
+            raise RuntimeError("NATS port 4222 is already in use")
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            raise AssertionError("transport should not start when websocket port is unknown")
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(
+        frame,
+        "_probe_existing_remote_nats_websocket_port",
+        lambda: None,
+        raising=False,
+    )
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
+
+    assert frame._remote_nats_process is None
+    assert frame._remote_nats_transport is None
+    assert frame.remote_nats_runtime_status["enabled"] is False
+    assert "websocket" in frame.remote_nats_runtime_status["last_error"].lower()
+
+
+def test_remote_nats_server_falls_back_when_default_websocket_port_is_unavailable(frame, monkeypatch):
+    started = {}
+
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            started["config"] = config
+
+        def start(self, timeout=10):
+            started["process"] = True
+            return SimpleNamespace()
+
+        def stop(self):
+            started["process_stopped"] = True
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            started["transport_kwargs"] = kwargs
+
+        def start_threaded(self, url, timeout=10):
+            started["transport_url"] = url
+
+        def stop(self):
+            started["transport_stopped"] = True
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(
+        frame,
+        "_can_bind_loopback_tcp_port",
+        lambda port: port != 18080,
+    )
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: started.setdefault("bridge", True))
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
+
+    assert started["process"] is True
+    assert started["config"].websocket_port == 18081
+    assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18081/nats"
+    assert frame._remote_nats_websocket_port == 18081
+
+
+def test_remote_nats_server_starts_fresh_runtime_on_fallback_tcp_port_when_reused_runtime_auth_fails(frame, monkeypatch):
+    started = {"ports": [], "transport_urls": []}
+
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
+            started["ports"].append((config.port, config.websocket_port))
+
+        def start(self, timeout=10):
+            if self.config.port == 4222:
+                raise RuntimeError("NATS port 4222 is already in use")
+            started["started_port"] = self.config.port
+            return SimpleNamespace()
+
+        def stop(self):
+            started.setdefault("stopped_ports", []).append(self.config.port)
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            started.setdefault("transport_kwargs", []).append(kwargs)
+
+        def start_threaded(self, url, timeout=10):
+            started["transport_urls"].append(url)
+            if url == "nats://127.0.0.1:4222":
+                raise RuntimeError("nats: 'Authorization Violation'")
+
+        def stop(self):
+            started["transport_stopped"] = True
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(frame, "_probe_existing_remote_nats_websocket_port", lambda: 18080, raising=False)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: started.setdefault("bridge", True))
+    monkeypatch.setattr(
+        frame,
+        "_can_bind_loopback_tcp_port",
+        lambda port: port not in {4222, 18080},
+    )
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
+
+    assert started["transport_urls"] == [
+        "nats://127.0.0.1:4222",
+        "nats://127.0.0.1:4223",
+    ]
+    assert started["started_port"] == 4223
+    assert started["ports"] == [
+        (4222, 18081),
+        (4223, 18081),
+    ]
+    assert frame._remote_nats_process is not None
+    assert frame._remote_nats_transport is not None
+    assert frame.remote_nats_runtime_status["enabled"] is True
+    assert frame.remote_nats_runtime_status["tcp_url"] == "nats://127.0.0.1:4223"
+    assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18081/nats"
+    assert started["bridge"] is True
+
+
 def test_remote_state_includes_nats_runtime_status(frame):
-    frame.remote_nats_runtime_url = "ws://127.0.0.1:10080/nats"
+    frame.remote_nats_runtime_url = "ws://127.0.0.1:18080/nats"
     frame.remote_nats_runtime_status = {
         "enabled": True,
         "tcp_url": "nats://127.0.0.1:4222",
-        "websocket_url": "ws://127.0.0.1:10080/nats",
+        "websocket_url": "ws://127.0.0.1:18080/nats",
         "cloudflared_url": "wss://rc.tingyou.cc/nats",
         "last_error": "",
     }
@@ -140,7 +334,7 @@ def test_remote_state_includes_nats_runtime_status(frame):
 
     assert status == 200
     assert body["remote_nats_runtime"]["enabled"] is True
-    assert body["remote_nats_runtime_url"] == "ws://127.0.0.1:10080/nats"
+    assert body["remote_nats_runtime_url"] == "ws://127.0.0.1:18080/nats"
 
 
 def test_remote_notes_changes_uses_couchdb_shape(frame):

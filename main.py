@@ -102,7 +102,19 @@ VK_RWIN = 0x5C
 DEFAULT_REMOTE_CONTROL_TOKEN = "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
 DEFAULT_REMOTE_CONTROL_DOMAIN = "wss://rc.tingyou.cc/nats"
 DEFAULT_REMOTE_NATS_PORT = 4222
-DEFAULT_REMOTE_NATS_WEBSOCKET_PORT = 10080
+REMOTE_NATS_PORT_FALLBACKS = (
+    4223,
+    4224,
+    4522,
+)
+DEFAULT_REMOTE_NATS_WEBSOCKET_PORT = 18080
+REMOTE_NATS_WEBSOCKET_PORT_FALLBACKS = (
+    18081,
+    18082,
+    10080,
+    28080,
+    28081,
+)
 DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT = 18080
 DEFAULT_REMOTE_NATS_CLOUDFLARED_URL = "wss://rc.tingyou.cc/nats"
 REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS = 5
@@ -822,6 +834,7 @@ class ChatFrame(wx.Frame):
         self._codex_clients: dict[str, CodexAppServerClient] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
+        self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
         self._alt_menu_armed = False
@@ -1043,10 +1056,7 @@ class ChatFrame(wx.Frame):
 
         def _worker() -> None:
             try:
-                token = self._read_remote_control_token() or self.remote_control_token
-                runtime = self._remote_runtime_config()
-                self._stop_remote_servers()
-                self._start_remote_servers(token=token, host=runtime["host"], port=runtime["port"])
+                self._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
             except Exception as exc:
                 wx_call_after_if_alive(self.SetStatusText, f"远程 NATS 启动失败：{exc}")
 
@@ -2396,6 +2406,11 @@ class ChatFrame(wx.Frame):
         mode = str((state or {}).get("detail_panel_mode") or "").strip()
         return "execution" if mode == "execution" else "answers"
 
+    def _current_detail_tab_target(self):
+        if self._detail_panel_mode() == "execution" and hasattr(self, "execution_list"):
+            return self.execution_list
+        return self.answer_list if hasattr(self, "answer_list") else None
+
     def _current_execution_steps(self) -> list:
         if self.view_mode == "history":
             chat = self._find_archived_chat(self.view_history_id)
@@ -2899,18 +2914,13 @@ class ChatFrame(wx.Frame):
 
     def _execution_meta_tuple(self, step_idx: int, step) -> tuple:
         if isinstance(step, dict):
-            detail_text = str(
-                step.get("detail_text")
-                or step.get("message")
-                or step.get("step")
-                or step.get("title")
-                or step.get("text")
-                or step.get("content")
-                or step.get("description")
-                or ""
-            )
+            detail_text = self._execution_step_detail_text(step)
             display_kind = str(step.get("display_kind") or "").strip()
+            if display_kind == "error":
+                detail_text = self._sanitize_execution_error_text(detail_text)
             list_text = str(step.get("list_text") or "").strip()
+            if display_kind == "error":
+                list_text = self._execution_list_text_from_detail(detail_text, display_kind)
             if not list_text:
                 if display_kind == "command":
                     fallback_text = (
@@ -2934,6 +2944,39 @@ class ChatFrame(wx.Frame):
     def _execution_step_text(self, step) -> str:
         return self._execution_meta_tuple(-1, step)[2]
 
+    @staticmethod
+    def _sanitize_execution_error_text(detail_text: str) -> str:
+        lines = [str(line or "").strip() for line in str(detail_text or "").replace("\r", "").split("\n")]
+        kept = []
+        noise_prefixes = (
+            "Output:",
+            "At line:",
+            "+ ",
+            "+ ~",
+            "CategoryInfo:",
+            "FullyQualifiedErrorId:",
+        )
+        noise_exact = {"错误：Output:", "Output:"}
+        noise_sentence_prefixes = (
+            "deprecation:",
+            "warning:",
+            "runtimewarning:",
+        )
+        for line in lines:
+            if not line:
+                continue
+            normalized_line = line.removeprefix("错误：").strip()
+            if line in noise_exact or normalized_line in noise_exact:
+                continue
+            if any(line.startswith(prefix) for prefix in noise_prefixes):
+                continue
+            if any(normalized_line.startswith(prefix) for prefix in noise_prefixes):
+                continue
+            if any(normalized_line.lower().startswith(prefix) for prefix in noise_sentence_prefixes):
+                continue
+            kept.append(line)
+        return "\n".join(kept).strip()
+
     def _should_show_execution_step(self, step) -> bool:
         if not isinstance(step, dict):
             return bool(str(step or "").strip())
@@ -2942,6 +2985,9 @@ class ChatFrame(wx.Frame):
         phase = str(step.get("phase") or "").strip()
         list_text = str(step.get("list_text") or "").strip()
         detail_text = self._execution_step_detail_text(step)
+        if display_kind == "error":
+            detail_text = self._sanitize_execution_error_text(detail_text)
+            list_text = self._sanitize_execution_error_text(list_text)
         hidden_status_texts = {"开始处理本轮请求", "本轮处理结束", "active", "idle"}
         normalized_detail_text = self._normalize_execution_text_for_compare(detail_text)
         normalized_list_text = self._normalize_execution_text_for_compare(list_text)
@@ -3061,6 +3107,7 @@ class ChatFrame(wx.Frame):
         if normalized == "execution" and (refresh_execution or previous_mode != "execution"):
             self._flush_all_execution_deltas_for_chat(self._visible_execution_chat_id())
             self._render_execution_list()
+        self._notes_rebuild_tab_order()
         try:
             self.Layout()
         except Exception:
@@ -4810,98 +4857,219 @@ class ChatFrame(wx.Frame):
     def _start_remote_nats_server_if_configured(self, *, token: str, host: str) -> None:
         if getattr(self, "_remote_nats_transport", None) is not None:
             return
-        config = NatsRuntimeConfig(
-            app_data_dir=resolve_app_data_dir(),
-            token=token,
-            host=host,
-            port=DEFAULT_REMOTE_NATS_PORT,
-            websocket_host="127.0.0.1",
-            websocket_port=DEFAULT_REMOTE_NATS_WEBSOCKET_PORT,
+        preferred_websocket_port = self._resolve_remote_nats_websocket_port(
+            DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         )
-        tcp_url = f"nats://127.0.0.1:{config.port}"
-        websocket_url = f"ws://127.0.0.1:{config.websocket_port}/nats"
-        process = None
-        reused_existing_runtime = False
-        try:
-            process = NatsServerProcess(config)
-            try:
-                process.start()
-            except Exception as exc:
-                message = str(exc or "").lower()
-                if "already in use" not in message:
-                    raise
-                process = None
-                reused_existing_runtime = True
-            transport = RemoteNatsTransport(
-                pair_id="default",
+        websocket_port = preferred_websocket_port
+        self._remote_nats_websocket_port = websocket_port
+        preferred_ports = [DEFAULT_REMOTE_NATS_PORT, *REMOTE_NATS_PORT_FALLBACKS]
+        seen_ports = set()
+        last_error = ""
+        for attempt_idx, tcp_port in enumerate(preferred_ports):
+            if tcp_port in seen_ports or tcp_port <= 0:
+                continue
+            seen_ports.add(tcp_port)
+            config = NatsRuntimeConfig(
+                app_data_dir=resolve_app_data_dir(),
                 token=token,
-                on_message=self._remote_api_message_ui,
-                on_new_chat=self._remote_api_new_chat_ui,
-                on_reply_request=self._remote_api_reply_request_ui,
-                on_state=self._remote_api_state_ui,
-                on_rename_chat=self._remote_api_rename_chat_ui,
-                on_update_settings=self._remote_api_update_settings_ui,
-                on_history_list=self._remote_api_history_list_ui,
-                on_history_read=self._remote_api_history_read_ui,
-                on_notes_changes=self._remote_api_notes_changes,
-                on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
+                host=host,
+                port=tcp_port,
+                websocket_host="127.0.0.1",
+                websocket_port=websocket_port,
             )
-            transport.start_threaded(tcp_url)
-        except Exception as exc:
-            if process is not None:
+            tcp_url = f"nats://127.0.0.1:{config.port}"
+            websocket_url = f"ws://127.0.0.1:{config.websocket_port}/nats"
+            process = None
+            reused_existing_runtime = False
+            try:
+                process = NatsServerProcess(config)
                 try:
-                    process.stop()
-                except Exception:
-                    pass
+                    process.start()
+                except Exception as exc:
+                    message = str(exc or "").lower()
+                    if "already in use" not in message:
+                        raise
+                    process = None
+                    if attempt_idx > 0:
+                        continue
+                    reused_existing_runtime = True
+                    websocket_port = self._probe_existing_remote_nats_websocket_port()
+                    if websocket_port is None:
+                        raise RuntimeError("Could not determine websocket port for existing NATS runtime")
+                    self._remote_nats_websocket_port = websocket_port
+                    websocket_url = f"ws://127.0.0.1:{websocket_port}/nats"
+                transport = RemoteNatsTransport(
+                    pair_id="default",
+                    token=token,
+                    on_message=self._remote_api_message_ui,
+                    on_new_chat=self._remote_api_new_chat_ui,
+                    on_reply_request=self._remote_api_reply_request_ui,
+                    on_state=self._remote_api_state_ui,
+                    on_rename_chat=self._remote_api_rename_chat_ui,
+                    on_update_settings=self._remote_api_update_settings_ui,
+                    on_history_list=self._remote_api_history_list_ui,
+                    on_history_read=self._remote_api_history_read_ui,
+                    on_notes_changes=self._remote_api_notes_changes,
+                    on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
+                )
+                transport.start_threaded(tcp_url)
+            except Exception as exc:
+                last_error = str(exc)
+                if process is not None:
+                    try:
+                        process.stop()
+                    except Exception:
+                        pass
+                if reused_existing_runtime or "already in use" in str(exc or "").lower():
+                    websocket_port = preferred_websocket_port
+                    self._remote_nats_websocket_port = websocket_port
+                    continue
+                self._set_remote_nats_runtime_status(
+                    enabled=False,
+                    tcp_url=tcp_url,
+                    websocket_url=websocket_url,
+                    cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+                    last_error=last_error,
+                )
+                return
+            self._remote_nats_process = process
+            self._remote_nats_transport = transport
+            self._ensure_cloudflared_origin_bridge()
             self._set_remote_nats_runtime_status(
-                enabled=False,
+                enabled=True,
                 tcp_url=tcp_url,
                 websocket_url=websocket_url,
                 cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
-                last_error=str(exc),
+                last_error="",
             )
+            if reused_existing_runtime:
+                self.SetStatusText("远程 NATS 已复用现有本地运行时")
             return
-        self._remote_nats_process = process
-        self._remote_nats_transport = transport
-        self._ensure_cloudflared_origin_bridge()
         self._set_remote_nats_runtime_status(
-            enabled=True,
-            tcp_url=tcp_url,
-            websocket_url=websocket_url,
+            enabled=False,
+            tcp_url=f"nats://127.0.0.1:{DEFAULT_REMOTE_NATS_PORT}",
+            websocket_url=f"ws://127.0.0.1:{self._remote_nats_websocket_port}/nats",
             cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
-            last_error="",
+            last_error=last_error or "远程 NATS 运行时未成功启动。",
         )
-        if reused_existing_runtime:
-            self.SetStatusText("远程 NATS 已复用现有本地运行时")
+        return
+
+    def _resolve_remote_nats_websocket_port(self, preferred_port: int) -> int:
+        candidates = [preferred_port, *REMOTE_NATS_WEBSOCKET_PORT_FALLBACKS]
+        seen = set()
+        for port in candidates:
+            if port in seen or port <= 0:
+                continue
+            seen.add(port)
+            if self._can_bind_loopback_tcp_port(port):
+                return port
+        return preferred_port
+
+    def _can_bind_loopback_tcp_port(self, port: int) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+                return False
+        except Exception:
+            pass
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                sock.bind(("127.0.0.1", int(port)))
+                return True
+        except Exception:
+            return False
+
+    def _probe_existing_remote_nats_websocket_port(self) -> int | None:
+        candidates = []
+        runtime_url = str((getattr(self, "remote_nats_runtime_status", {}) or {}).get("websocket_url") or "").strip()
+        if runtime_url:
+            try:
+                parsed = urlsplit(runtime_url)
+                if parsed.port:
+                    candidates.append(int(parsed.port))
+            except Exception:
+                pass
+        candidates.extend(
+            [
+                getattr(self, "_remote_nats_websocket_port", DEFAULT_REMOTE_NATS_WEBSOCKET_PORT),
+                DEFAULT_REMOTE_NATS_WEBSOCKET_PORT,
+                *REMOTE_NATS_WEBSOCKET_PORT_FALLBACKS,
+            ]
+        )
+        seen = set()
+        for port in candidates:
+            try:
+                port = int(port)
+            except Exception:
+                continue
+            if port in seen or port <= 0:
+                continue
+            seen.add(port)
+            if self._probe_remote_nats_websocket_port(port):
+                return port
+        return None
+
+    def _probe_remote_nats_websocket_port(self, port: int) -> bool:
+        if port <= 0 or not self._remote_local_listener_ready(port):
+            return False
+        url = f"ws://127.0.0.1:{int(port)}/nats"
+        ok, _detail = self._verify_remote_public_ws(url)
+        return ok
 
     def _ensure_cloudflared_origin_bridge(self) -> None:
         listen_port = int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
-        target_port = int(DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
-        for args in (
-            [
-                "netsh",
-                "interface",
-                "portproxy",
-                "add",
-                "v4tov4",
-                f"listenport={listen_port}",
-                "listenaddress=127.0.0.1",
-                f"connectport={target_port}",
-                "connectaddress=127.0.0.1",
-            ],
-            [
-                "netsh",
-                "interface",
-                "portproxy",
-                "add",
-                "v6tov4",
-                f"listenport={listen_port}",
-                "listenaddress=::1",
-                f"connectport={target_port}",
-                "connectaddress=127.0.0.1",
-            ],
+        target_port = int(
+            getattr(self, "_remote_nats_websocket_port", DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
+            or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
+        )
+        for delete_args, add_args in (
+            (
+                [
+                    "netsh",
+                    "interface",
+                    "portproxy",
+                    "delete",
+                    "v4tov4",
+                    f"listenport={listen_port}",
+                    "listenaddress=127.0.0.1",
+                ],
+                [
+                    "netsh",
+                    "interface",
+                    "portproxy",
+                    "add",
+                    "v4tov4",
+                    f"listenport={listen_port}",
+                    "listenaddress=127.0.0.1",
+                    f"connectport={target_port}",
+                    "connectaddress=127.0.0.1",
+                ],
+            ),
+            (
+                [
+                    "netsh",
+                    "interface",
+                    "portproxy",
+                    "delete",
+                    "v6tov4",
+                    f"listenport={listen_port}",
+                    "listenaddress=::1",
+                ],
+                [
+                    "netsh",
+                    "interface",
+                    "portproxy",
+                    "add",
+                    "v6tov4",
+                    f"listenport={listen_port}",
+                    "listenaddress=::1",
+                    f"connectport={target_port}",
+                    "connectaddress=127.0.0.1",
+                ],
+            ),
         ):
-            result = self._run_remote_check_command(args, timeout=10.0)
+            self._run_remote_check_command(delete_args, timeout=10.0)
+            result = self._run_remote_check_command(add_args, timeout=10.0)
             if result is None:
                 continue
             detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
@@ -4925,13 +5093,96 @@ class ChatFrame(wx.Frame):
 
     def _query_cloudflared_service(self) -> dict:
         result = self._run_remote_check_command(["sc.exe", "query", "cloudflared"])
+        config_result = self._run_remote_check_command(["sc.exe", "qc", "cloudflared"])
         text = ""
         if result is not None:
             text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        config_text = ""
+        if config_result is not None:
+            config_text = f"{config_result.stdout or ''}\n{config_result.stderr or ''}".strip()
         normalized = text.lower()
-        exists = bool(result and (result.returncode == 0 or "state" in normalized))
+        binary_path = ""
+        for line in config_text.splitlines():
+            match = re.match(r"\s*BINARY_PATH_NAME\s*:\s*(.+)", line, flags=re.IGNORECASE)
+            if match:
+                binary_path = match.group(1).strip()
+                break
+        exists = bool(
+            (result and (result.returncode == 0 or "state" in normalized))
+            or (config_result and config_result.returncode == 0 and bool(binary_path))
+        )
         running = "running" in normalized
-        return {"exists": exists, "running": running, "detail": text}
+        detail = "\n".join(part for part in (text, config_text) if part)
+        return {"exists": exists, "running": running, "detail": detail, "binary_path": binary_path}
+
+    def _query_cloudflared_process_command_lines(self) -> list[str]:
+        if os.name != "nt":
+            return []
+        result = self._run_remote_check_command(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='cloudflared.exe'\" | Select-Object -ExpandProperty CommandLine",
+            ],
+            timeout=10.0,
+        )
+        if result is None or result.returncode != 0:
+            return []
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+    def _cloudflared_process_targets_port(self, websocket_port: int) -> bool:
+        desired_url = f"http://127.0.0.1:{int(websocket_port)}"
+        for command_line in self._query_cloudflared_process_command_lines():
+            rewritten, changed = self._replace_cloudflared_service_url(command_line, websocket_port)
+            if rewritten is not None and not changed:
+                return True
+            if desired_url in command_line:
+                return True
+        return False
+
+    @staticmethod
+    def _replace_cloudflared_service_url(bin_path: str, websocket_port: int) -> tuple[str, bool] | tuple[None, bool]:
+        match = re.search(r"--url\s+(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))", bin_path, flags=re.IGNORECASE)
+        if not match:
+            return None, False
+        current_url = match.group(1) or match.group(2) or match.group(3)
+        desired_url = f"http://127.0.0.1:{int(websocket_port)}"
+        same_target = False
+        try:
+            parsed = urlsplit(current_url)
+            same_target = parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == int(websocket_port)
+        except Exception:
+            try:
+                same_target = current_url.strip() == desired_url
+            except Exception:
+                same_target = False
+        if same_target:
+            return bin_path, False
+        quote = "\"" if match.group(1) is not None else ("'" if match.group(2) is not None else "")
+        replacement = f"--url {quote}{desired_url}{quote}"
+        return f"{bin_path[:match.start()]}{replacement}{bin_path[match.end():]}", True
+
+    def _set_cloudflared_service_bin_path(self, bin_path: str) -> bool:
+        if not bin_path:
+            return False
+        command = f"binPath= {bin_path}"
+        result = self._run_remote_check_command(["sc.exe", "config", "cloudflared", command], timeout=15.0)
+        return bool(result and result.returncode == 0)
+
+    def _ensure_cloudflared_service_url(self, websocket_port: int) -> tuple[bool, bool]:
+        state = self._query_cloudflared_service()
+        if not state.get("exists"):
+            return self._cloudflared_process_targets_port(websocket_port), False
+        current_bin_path = str(state.get("binary_path") or "").strip()
+        if not current_bin_path:
+            return self._cloudflared_process_targets_port(websocket_port), False
+        rewritten, changed = self._replace_cloudflared_service_url(current_bin_path, websocket_port)
+        if rewritten is None:
+            return self._cloudflared_process_targets_port(websocket_port), False
+        if not changed:
+            return True, False
+        return self._set_cloudflared_service_bin_path(rewritten), True
 
     def _start_cloudflared_service(self) -> bool:
         state = self._query_cloudflared_service()
@@ -5007,7 +5258,15 @@ class ChatFrame(wx.Frame):
                 async with session.ws_connect(url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as ws:
                     if path.endswith("/nats"):
                         message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
-                        ok = message.type == WSMsgType.TEXT and str(message.data or "").startswith("INFO ")
+                        info_text = ""
+                        if message.type == WSMsgType.TEXT:
+                            info_text = str(message.data or "")
+                        elif message.type == WSMsgType.BINARY:
+                            try:
+                                info_text = bytes(message.data or b"").decode("utf-8", errors="replace")
+                            except Exception:
+                                info_text = ""
+                        ok = info_text.startswith("INFO ")
                         return ok, ("" if ok else f"公网 NATS 隧道响应异常：{message.type} {message.data!r}")
                     message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
         except Exception as exc:
@@ -5045,7 +5304,13 @@ class ChatFrame(wx.Frame):
         local_ok, local_detail = self._verify_remote_local_health(token, port)
         if not local_ok:
             raise RuntimeError(self._format_remote_startup_error(local_detail or "远程控制本地健康检查失败。"))
-        if not self._start_cloudflared_service():
+        service_configured, service_reconfigured = self._ensure_cloudflared_service_url(port)
+        if not service_configured:
+            raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或配置缺失。"))
+        if service_reconfigured:
+            if not self._restart_cloudflared_service():
+                raise RuntimeError(self._format_remote_startup_error("cloudflared 已更新映射但重启失败。"))
+        elif not self._start_cloudflared_service():
             raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
         public_ok, public_detail = self._verify_remote_public_ws(published_url)
         if public_ok:
@@ -5093,6 +5358,12 @@ class ChatFrame(wx.Frame):
         for attempt_idx in range(attempts):
             self._stop_remote_servers()
             self._start_remote_servers(token=token, host=host, port=port)
+            runtime_status = dict(getattr(self, "remote_nats_runtime_status", {}) or {})
+            if getattr(self, "_remote_nats_transport", None) is None or not runtime_status.get("enabled"):
+                last_error = str(runtime_status.get("last_error") or "").strip()
+                if not last_error:
+                    last_error = "远程 NATS 运行时未成功启动。"
+                raise RuntimeError(last_error)
             self.remote_control_runtime_mode = "fixed_domain" if runtime["fixed_domain_mode"] else "local"
             self.remote_control_runtime_bind = (
                 getattr(self, "remote_nats_runtime_status", {}).get("websocket_url")
@@ -6548,12 +6819,17 @@ class ChatFrame(wx.Frame):
         self._try_open_selected_answer_detail()
 
     def _on_execution_key_down(self, event):
+        key = event.GetKeyCode()
+        ctrl = event.ControlDown()
+        if key == wx.WXK_TAB and not ctrl and not event.AltDown():
+            self.input_edit.SetFocus()
+            return
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
             return
-        key = event.GetKeyCode()
-        ctrl = event.ControlDown()
+        if self._handle_primary_tab_navigation(event):
+            return
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._on_execution_activate(event)
             return
@@ -6971,15 +7247,17 @@ class ChatFrame(wx.Frame):
         ):
             return
         primary_notes_ctrl = self._notes_primary_tab_target()
+        detail_target = self._current_detail_tab_target()
+        secondary_detail_target = self.execution_list if detail_target is self.answer_list else self.answer_list
         ordered_controls = [
             primary_notes_ctrl,
             self.history_list,
-            self.answer_list,
+            detail_target,
             self.input_edit,
             self.send_button,
             self.new_chat_button,
             self.model_combo,
-            self.execution_list,
+            secondary_detail_target,
             self.notes_notebook_list,
             self.notes_entry_list,
             self.notes_editor,
@@ -7006,15 +7284,15 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
         try:
-            self.history_list.MoveAfterInTabOrder(primary_notes_panel)
+            primary_notes_panel.MoveAfterInTabOrder(self.history_list)
         except Exception:
             pass
         try:
-            self.answer_list.MoveAfterInTabOrder(self.history_list)
+            detail_target.MoveAfterInTabOrder(primary_notes_panel)
         except Exception:
             pass
         try:
-            self.input_edit.MoveAfterInTabOrder(self.answer_list)
+            self.input_edit.MoveAfterInTabOrder(detail_target)
         except Exception:
             pass
 
@@ -7046,11 +7324,14 @@ class ChatFrame(wx.Frame):
         backwards = bool(shift_down()) if callable(shift_down) else False
 
         focus = wx.Window.FindFocus()
+        detail_target = self._current_detail_tab_target()
+        detail_controls = {ctrl for ctrl in (getattr(self, "answer_list", None), getattr(self, "execution_list", None)) if ctrl is not None}
         if backwards:
             if focus is self.input_edit:
-                self.answer_list.SetFocus()
+                if detail_target is not None:
+                    detail_target.SetFocus()
                 return True
-            if focus is self.answer_list:
+            if focus is detail_target or focus in detail_controls:
                 self.history_list.SetFocus()
                 return True
             if focus is self.history_list:
@@ -7062,9 +7343,10 @@ class ChatFrame(wx.Frame):
             self.history_list.SetFocus()
             return True
         if focus is self.history_list:
-            self.answer_list.SetFocus()
+            if detail_target is not None:
+                detail_target.SetFocus()
             return True
-        if focus is self.answer_list:
+        if focus is detail_target or focus in detail_controls:
             self.input_edit.SetFocus()
             return True
         return False

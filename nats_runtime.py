@@ -20,7 +20,7 @@ class NatsRuntimeConfig:
     host: str = "0.0.0.0"
     port: int = 4222
     websocket_host: str = "127.0.0.1"
-    websocket_port: int = 10080
+    websocket_port: int = 18080
 
     @property
     def runtime_dir(self) -> Path:

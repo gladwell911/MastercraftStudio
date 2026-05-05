@@ -1,5 +1,6 @@
 ﻿import json
 import copy
+import asyncio
 import subprocess
 import time
 import threading
@@ -129,7 +130,7 @@ def test_fixed_domain_nats_runtime_uses_public_runtime_and_status(frame, monkeyp
     frame._start_remote_nats_runtime_if_configured()
 
     assert statuses
-    assert "ws://127.0.0.1:10080/nats" in statuses[-1]
+    assert "ws://127.0.0.1:18080/nats" in statuses[-1]
     assert "wss://rc.tingyou.cc/nats?token=secret" in statuses[-1]
 
 
@@ -174,6 +175,31 @@ def test_remote_nats_startup_runs_fixed_domain_connectivity_check(frame, monkeyp
         "token": "secret",
         "published_url": "wss://rc.tingyou.cc/nats?token=secret",
     }
+
+
+def test_remote_nats_startup_raises_when_runtime_did_not_start(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "rc.tingyou.cc")
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+
+    def _fake_start_remote_servers(*, token, host, port):
+        frame._set_remote_nats_runtime_status(
+            enabled=False,
+            tcp_url="nats://127.0.0.1:4222",
+            websocket_url="ws://127.0.0.1:18080/nats",
+            cloudflared_url="wss://rc.tingyou.cc/nats",
+            last_error="Could not find nats-server.exe",
+        )
+        frame._remote_nats_process = None
+        frame._remote_nats_transport = None
+
+    monkeypatch.setattr(frame, "_start_remote_servers", _fake_start_remote_servers)
+
+    with pytest.raises(RuntimeError, match="Could not find nats-server\\.exe"):
+        frame._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
+
+    assert frame.remote_nats_runtime_status["enabled"] is False
+    assert frame.remote_control_runtime_status["public_ws_ready"] is False
 
 
 def test_fixed_domain_remote_runtime_url_stays_empty_until_connectivity_is_verified(frame, monkeypatch):
@@ -303,9 +329,34 @@ def test_remote_ws_autostart_is_scheduled_off_startup_path(tmp_path, monkeypatch
         frame.Destroy()
 
 
+def test_remote_nats_autostart_worker_runs_connectivity_checked_runtime_start(frame, monkeypatch):
+    frame.remote_control_autostart = True
+    seen = {}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        frame,
+        "_start_remote_nats_runtime_if_configured",
+        lambda **kwargs: seen.setdefault("kwargs", kwargs),
+    )
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+
+    frame._schedule_remote_nats_autostart()
+
+    assert seen["kwargs"] == {"ensure_connectivity": True}
+
+
 def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_failure(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
-    frame.remote_control_runtime_bind = "ws://127.0.0.1:10080/nats"
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
     frame._remote_nats_transport = object()
     monkeypatch.setattr(
         frame,
@@ -336,6 +387,38 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
     assert "cloudflared 已重启并恢复 rc.tingyou.cc 连接" in statuses[-1]
 
 
+def test_verify_remote_public_ws_accepts_binary_nats_info_frame(frame, monkeypatch):
+    class _FakeWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            return SimpleNamespace(type=main.WSMsgType.BINARY, data=b'INFO {"server_id":"abc"} \r\n')
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def ws_connect(self, url, heartbeat=None):
+            return _FakeWs()
+
+    monkeypatch.setattr(main, "ClientSession", _FakeSession)
+
+    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats"))
+
+    assert ok is True
+    assert detail == ""
+
+
 def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, monkeypatch):
     states = [
         {"exists": True, "running": True, "detail": "running"},
@@ -361,6 +444,109 @@ def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, m
     assert frame._restart_cloudflared_service() is True
     assert ("sc.exe", "stop", "cloudflared") in commands
     assert ("taskkill", "/F", "/IM", "cloudflared.exe") in commands
+
+
+def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
+    qc_output = (
+        "SERVICE_NAME: cloudflared\r\n"
+        "        TYPE              : 10  WIN32_OWN_PROCESS\r\n"
+        '        BINARY_PATH_NAME  : "C:\\Program Files\\cloudflared\\cloudflared.exe" tunnel run --url http://127.0.0.1:10080 --token dummy\r\n'
+        "        START_TYPE        : 2   AUTO_START\r\n"
+        "        STATE             : 4  RUNNING"
+    )
+    commands = []
+
+    def fake_run(args, timeout=10.0):
+        commands.append(tuple(args))
+        if args[:3] == ["sc.exe", "qc", "cloudflared"]:
+            return SimpleNamespace(returncode=0, stdout=qc_output, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(frame, "_run_remote_check_command", fake_run)
+
+    configured, changed = frame._ensure_cloudflared_service_url(18080)
+
+    assert configured is True
+    assert changed is True
+    assert any(
+        cmd[0] == "sc.exe" and cmd[1] == "config" and cmd[2] == "cloudflared" and "--url http://127.0.0.1:18080" in cmd[3]
+        for cmd in commands
+    )
+
+
+def test_cloudflared_process_can_satisfy_origin_when_service_is_missing(frame, monkeypatch):
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": False, "running": False, "detail": "", "binary_path": ""},
+    )
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_process_command_lines",
+        lambda: [
+            '"C:\\Program Files (x86)\\cloudflared\\cloudflared.exe" tunnel run --url http://127.0.0.1:18080 --token dummy'
+        ],
+    )
+
+    configured, changed = frame._ensure_cloudflared_service_url(18080)
+
+    assert configured is True
+    assert changed is False
+
+
+def test_cloudflared_origin_bridge_rebuilds_portproxy_for_current_websocket_port(frame, monkeypatch):
+    frame.remote_control_port = 18080
+    frame._remote_nats_websocket_port = 18081
+    commands = []
+
+    monkeypatch.setattr(
+        frame,
+        "_run_remote_check_command",
+        lambda args, timeout=10.0: commands.append(tuple(args)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    frame._ensure_cloudflared_origin_bridge()
+
+    assert (
+        "netsh",
+        "interface",
+        "portproxy",
+        "delete",
+        "v4tov4",
+        "listenport=18080",
+        "listenaddress=127.0.0.1",
+    ) in commands
+    assert (
+        "netsh",
+        "interface",
+        "portproxy",
+        "add",
+        "v4tov4",
+        "listenport=18080",
+        "listenaddress=127.0.0.1",
+        "connectport=18081",
+        "connectaddress=127.0.0.1",
+    ) in commands
+    assert (
+        "netsh",
+        "interface",
+        "portproxy",
+        "delete",
+        "v6tov4",
+        "listenport=18080",
+        "listenaddress=::1",
+    ) in commands
+    assert (
+        "netsh",
+        "interface",
+        "portproxy",
+        "add",
+        "v6tov4",
+        "listenport=18080",
+        "listenaddress=::1",
+        "connectport=18081",
+        "connectaddress=127.0.0.1",
+    ) in commands
 
 
 def test_remote_nats_runtime_autostarts_without_env_and_uses_default_token(tmp_path, monkeypatch):
@@ -394,12 +580,13 @@ def test_remote_nats_runtime_autostarts_without_env_and_uses_default_token(tmp_p
     monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
     monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
     monkeypatch.setattr(main.ChatFrame, "_ensure_cloudflared_origin_bridge", lambda self: None)
+    monkeypatch.setattr(main.ChatFrame, "_can_bind_loopback_tcp_port", lambda self, _port: True)
 
     frame = main.ChatFrame()
     try:
         assert frame.remote_control_token == main.DEFAULT_REMOTE_CONTROL_TOKEN
         assert frame._remote_nats_transport is not None
-        assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:10080/nats"
+        assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18080/nats"
         saved_state = json.loads(frame.state_path.read_text(encoding="utf-8"))
         assert saved_state["remote_control_token"] == main.DEFAULT_REMOTE_CONTROL_TOKEN
     finally:
@@ -1438,6 +1625,102 @@ def test_render_execution_list_filters_phase_only_commentary_noise(frame):
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
     assert rows == ["保留这条说明。"]
+
+
+def test_render_execution_list_keeps_only_meaningful_error_summary(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": "Output:\nAt line:2 char:916\n+ ... lue) } }; $items = $items | Sort-Object installs -Descending\n+ ~\nMissing argument in parameter list.\nCategoryInfo: ParserError: (:) [], ParentContainsErrorRecordException\nFullyQualifiedErrorId: MissingArgument",
+                "list_text": "错误：Output: At line:2 char:916 Missing argument in parameter list. CategoryInfo: ParserError: (:) [], ParentContainsErrorRecordException FullyQualifiedErrorId: MissingArgument",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["错误：Missing argument in parameter list."]
+    assert frame.execution_meta == [
+        ("execution", 0, "错误：Missing argument in parameter list.", "Missing argument in parameter list.")
+    ]
+
+
+def test_render_execution_list_hides_error_when_only_stack_noise_remains(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": "Output:\nAt line:2 char:916\n+ ~\nCategoryInfo: ParserError: (:) [], ParentContainsErrorRecordException\nFullyQualifiedErrorId: MissingArgument",
+                "list_text": "错误：Output: At line:2 char:916 CategoryInfo: ParserError: (:) [], ParentContainsErrorRecordException FullyQualifiedErrorId: MissingArgument",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
+def test_render_execution_list_hides_single_line_environment_warning_noise(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": "DEPRECATION: Running PyInstaller as admin is not necessary nor sensible. Run PyInstaller from a non-administrator terminal. PyInstaller 7.0 will block this.",
+                "list_text": "错误：DEPRECATION: Running PyInstaller as admin is not necessary nor sensible. Run PyInstaller from a non-administrator terminal. PyInstaller 7.0 will block this.",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
+def test_render_execution_list_keeps_single_line_meaningful_error(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": "Permission denied while opening C:/tmp/config.toml.",
+                "list_text": "错误：Permission denied while opening C:/tmp/config.toml.",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["错误：Permission denied while opening C:/tmp/config.toml."]
+    assert frame.execution_meta == [
+        ("execution", 0, "错误：Permission denied while opening C:/tmp/config.toml.", "Permission denied while opening C:/tmp/config.toml.")
+    ]
 
 
 def test_build_execution_entry_keeps_full_detail_text(frame):
@@ -5392,6 +5675,105 @@ def test_tab_moves_from_notes_to_history_then_answer_then_input(frame):
     frame._on_answer_key_down(answer_event)
     assert frame.input_edit.HasFocus()
     assert answer_event.skipped >= 1
+
+
+def test_f1_execution_mode_keeps_detail_slot_in_primary_tab_order(frame, monkeypatch):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("execution tab notebook")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "切换测试",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    frame.history_list.SetFocus()
+
+    class F1Event:
+        def GetKeyCode(self):
+            return wx.WXK_F1
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("should not skip")
+
+    class TabEvent:
+        def __init__(self):
+            self.skipped = 0
+
+        def GetKeyCode(self):
+            return wx.WXK_TAB
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            self.skipped += 1
+
+    frame._on_char_hook(F1Event())
+    assert frame._current_chat_state["detail_panel_mode"] == "execution"
+
+    event = TabEvent()
+    frame._on_history_key_down(event)
+
+    assert frame.execution_list.HasFocus()
+    assert event.skipped >= 1
+
+
+def test_execution_list_tab_uses_primary_tab_navigation(frame, monkeypatch):
+    frame.current_chat_id = "chat-1"
+    frame.active_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行列表 Tab",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    frame._apply_detail_panel_mode("execution", refresh_execution=False)
+    frame.execution_list.SetFocus()
+
+    class TabEvent:
+        def __init__(self):
+            self.skipped = 0
+
+        def GetKeyCode(self):
+            return wx.WXK_TAB
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            self.skipped += 1
+
+    event = TabEvent()
+    frame._on_execution_key_down(event)
+
+    assert frame.input_edit.HasFocus()
+    assert event.skipped == 0
 
 
 def test_global_ctrl_combo_key_filter_ignores_ime_and_modifiers():

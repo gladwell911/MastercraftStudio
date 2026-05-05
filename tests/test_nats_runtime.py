@@ -38,7 +38,7 @@ def test_write_creates_nats_server_config(tmp_path: Path) -> None:
         host="0.0.0.0",
         port=4222,
         websocket_host="127.0.0.1",
-        websocket_port=10080,
+        websocket_port=18080,
     )
 
     config_path = config.write()
@@ -54,7 +54,7 @@ def test_write_creates_nats_server_config(tmp_path: Path) -> None:
     assert f'store_dir: "{expected_store}"' in contents
     assert 'token: "secret"' in contents
     assert "websocket" in contents
-    assert "port: 10080" in contents
+    assert "port: 18080" in contents
     assert "no_tls: true" in contents
 
 
