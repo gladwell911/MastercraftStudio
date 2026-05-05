@@ -10,6 +10,8 @@ DEFAULT_CONTEXT_WINDOW = 128000
 MODEL_CONTEXT_WINDOWS = {
     "codex/main": 258400,
     "gpt-5-codex": 258400,
+    "gpt-5.3-codex-spark": 121600,
+    "GPT-5.3-Codex-Spark": 121600,
     "claudecode/default": 200000,
     "openclaw/main": 272000,
     "openai/gpt-5.2": 128000,

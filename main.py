@@ -36,6 +36,7 @@ from codex_client import (
     CodexEvent,
     DEFAULT_CODEX_MODEL,
     is_codex_model,
+    read_codex_cli_model_label,
 )
 from context_usage import (
     context_usage_from_dict,
@@ -2215,10 +2216,52 @@ class ChatFrame(wx.Frame):
                 return model
         return str(self.selected_model or "").strip() or DEFAULT_MODEL_ID
 
+    def _active_chat_current_model(self) -> str:
+        chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
+        turns = self._get_view_turns()
+        if turns and isinstance(chat, dict):
+            pending = self._pending_context_usage_for_chat(chat, len(turns) - 1)
+            if pending is not None and str(pending.model or "").strip():
+                return str(pending.model or "").strip()
+        usage = (chat or {}).get("context_usage") if isinstance(chat, dict) else None
+        normalized = context_usage_from_dict(usage)
+        if normalized is not None and str(normalized.model or "").strip():
+            return str(normalized.model or "").strip()
+        for turn in reversed(turns or []):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            if model:
+                if is_codex_model(model):
+                    configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
+                    if configured:
+                        return configured
+                return model
+        if isinstance(chat, dict):
+            model = str(chat.get("model") or "").strip()
+            if model:
+                if is_codex_model(model):
+                    configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
+                    if configured:
+                        return configured
+                return model
+        selected = str(self.selected_model or "").strip() or DEFAULT_MODEL_ID
+        if is_codex_model(selected):
+            configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
+            if configured:
+                return configured
+        return selected
+
     def _append_context_usage_row(self) -> None:
         label = format_context_usage_label(self._active_chat_context_usage())
         self.answer_list.Append(label)
         self.answer_meta.append(("context_usage", -1, label, ""))
+
+    def _append_current_model_row(self) -> None:
+        model = self._active_chat_current_model()
+        label = f"当前模型：{model or DEFAULT_MODEL_ID}"
+        self.answer_list.Append(label)
+        self.answer_meta.append(("current_model", -1, label, ""))
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
@@ -2229,8 +2272,10 @@ class ChatFrame(wx.Frame):
         if selected_meta is None:
             return
         for new_idx, meta in enumerate(self.answer_meta):
-            if selected_meta[0] == "context_usage":
+            if selected_meta[0] in {"context_usage", "current_model"}:
                 matched = meta[0] == "context_usage"
+                if selected_meta[0] == "current_model":
+                    matched = meta[0] == "current_model"
             else:
                 matched = meta == selected_meta
             if matched:
@@ -2249,6 +2294,7 @@ class ChatFrame(wx.Frame):
         self.answer_meta = []
         self._active_answer_row_index = -1
         self._append_context_usage_row()
+        self._append_current_model_row()
         turns = self._get_view_turns()
         if not turns:
             self.answer_list.Append("暂无对话内容")

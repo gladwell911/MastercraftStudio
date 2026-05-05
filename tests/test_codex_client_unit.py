@@ -11,6 +11,22 @@ def test_codex_model_helper():
     assert not codex_client.is_codex_model("openai/gpt-5.2")
 
 
+def test_read_codex_cli_model_label_reads_model_and_effort(tmp_path):
+    codex_home = tmp_path / ".codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n', encoding="utf-8")
+
+    assert codex_client.read_codex_cli_model_label(str(tmp_path)) == "gpt-5.5 medium"
+
+
+def test_read_codex_cli_model_label_without_effort_returns_model(tmp_path):
+    codex_home = tmp_path / ".codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.4"\n', encoding="utf-8")
+
+    assert codex_client.read_codex_cli_model_label(str(tmp_path)) == "gpt-5.4"
+
+
 def test_codex_client_start_turn_sends_request_and_returns_result(monkeypatch):
     client = codex_client.CodexAppServerClient()
     sent = []
@@ -341,6 +357,55 @@ def test_codex_event_msg_token_count_payload_normalizes_usage():
     assert seen[-1].usage["source"] == "codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage
     assert client.last_context_usage == seen[-1].usage
+
+
+def test_codex_token_count_uses_rate_limit_name_as_actual_model():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"total_tokens": 10503},
+                    "model_context_window": 258400,
+                },
+                "rate_limits": {
+                    "limit_id": "codex_bengalfox",
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                },
+            },
+        }
+    )
+
+    assert seen[-1].usage["model"] == "GPT-5.3-Codex-Spark"
+
+
+def test_codex_token_count_infers_actual_model_from_context_window_when_name_missing():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"total_tokens": 21673},
+                    "model_context_window": 121600,
+                },
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "limit_name": None,
+                },
+            },
+        }
+    )
+
+    assert seen[-1].usage["context_window"] == 121600
+    assert seen[-1].usage["model"] == "gpt-5.3-codex-spark"
 
 
 def test_codex_protocol_namespaced_token_count_event_normalizes_usage():

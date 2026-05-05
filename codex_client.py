@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import threading
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -13,6 +14,10 @@ from context_usage import context_window_for_model, normalize_context_usage
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
+CODEX_MODEL_BY_CONTEXT_WINDOW = {
+    121600: "gpt-5.3-codex-spark",
+    258400: "gpt-5-codex",
+}
 DEFAULT_INITIALIZE_TIMEOUT = 45
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_CODEX_TURN_TIMEOUT = 300
@@ -153,6 +158,43 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
     _strip_utf8_bom_from_skill_markdown(codex_home / "skills")
     env["CODEX_HOME"] = str(codex_home)
     return env, codex_home
+
+
+def _candidate_codex_home_dirs(cwd: str | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    if cwd:
+        candidates.append(Path(str(cwd)).expanduser() / ".codex-home")
+    env_home = str(os.environ.get("CODEX_HOME") or "").strip()
+    if env_home:
+        candidates.append(Path(env_home).expanduser())
+    candidates.append(Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def read_codex_cli_model_label(cwd: str | None = None) -> str:
+    for codex_home in _candidate_codex_home_dirs(cwd):
+        config_path = codex_home / "config.toml"
+        if not config_path.is_file():
+            continue
+        try:
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        model = str(data.get("model") or "").strip()
+        effort = str(data.get("model_reasoning_effort") or data.get("reasoning_effort") or "").strip()
+        if model and effort:
+            return f"{model} {effort}"
+        if model:
+            return model
+    return ""
 
 
 def _windows_popen_kwargs() -> dict:
@@ -824,6 +866,19 @@ def _first_dict(*values) -> dict:
     return {}
 
 
+def _codex_model_from_rate_limits(payload: dict) -> str:
+    rate_limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+    return str(rate_limits.get("limit_name") or "").strip()
+
+
+def _codex_model_from_context_window(context_window: int) -> str:
+    try:
+        window = int(context_window or 0)
+    except Exception:
+        window = 0
+    return CODEX_MODEL_BY_CONTEXT_WINDOW.get(window, "")
+
+
 def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAULT_CODEX_MODEL) -> dict | None:
     if not isinstance(payload, dict):
         return None
@@ -868,14 +923,13 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
     if total <= 0:
         return None
 
-    model_name = str(
+    explicit_model_name = str(
         info.get("model")
         or info.get("model_id")
         or info.get("modelId")
         or payload.get("model")
         or payload.get("model_id")
         or payload.get("modelId")
-        or fallback_model
         or ""
     ).strip()
     context_window = _usage_int_field(
@@ -883,6 +937,7 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
         default=0,
     )
+    model_name = explicit_model_name or _codex_model_from_rate_limits(payload) or _codex_model_from_context_window(context_window) or str(fallback_model or "").strip()
     if context_window <= 0:
         context_window = context_window_for_model(model_name or fallback_model)
     return normalize_context_usage(

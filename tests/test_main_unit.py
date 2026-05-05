@@ -2943,7 +2943,9 @@ def test_render_answer_list_inserts_context_usage_row_first(frame):
 
     assert frame.answer_list.GetString(0) == "113k / 272k"
     assert frame.answer_meta[0] == ("context_usage", -1, "113k / 272k", "")
-    assert frame.answer_list.GetString(1) == "我"
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.4"
+    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5.4", "")
+    assert frame.answer_list.GetString(2) == "我"
 
 
 def test_render_answer_list_keeps_empty_state_below_context_row(frame):
@@ -2954,7 +2956,9 @@ def test_render_answer_list_keeps_empty_state_below_context_row(frame):
 
     assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
-    assert frame.answer_list.GetString(1) == "暂无对话内容"
+    assert frame.answer_list.GetString(1).startswith("当前模型：")
+    assert frame.answer_meta[1][0] == "current_model"
+    assert frame.answer_list.GetString(2) == "暂无对话内容"
 
 
 def test_render_answer_list_history_context_fallback_uses_latest_turn_model(frame):
@@ -2998,6 +3002,62 @@ def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
 
     assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
+
+
+def test_codex_submit_updates_current_model_row_to_requested_model(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "read_codex_cli_model_label", lambda _cwd=None: "gpt-5.5 medium")
+
+    ok, message = frame._submit_question("q", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5.5 medium", "")
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.5 medium"
+
+
+def test_codex_token_count_updates_current_model_row_to_actual_model(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    monkeypatch.setattr(main, "read_codex_cli_model_label", lambda _cwd=None: "gpt-5.5 medium")
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.5 medium"
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="token_count",
+            turn_id="turn-1",
+            usage={
+                "used_tokens": 44176,
+                "context_window": 258400,
+                "source": "codex",
+                "exact": True,
+                "fresh": True,
+                "model": "gpt-5-codex",
+                "updated_at": 1.0,
+            },
+        ),
+    )
+
+    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5-codex", "")
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
 
 
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
@@ -3263,7 +3323,7 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
-    frame.answer_list.SetSelection(1)
+    frame.answer_list.SetSelection(2)
     assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
@@ -3273,8 +3333,9 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
     assert frame.answer_list.GetString(0) == "44k / 258k"
-    assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "user"
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
+    assert frame.answer_list.GetSelection() == 2
+    assert frame.answer_meta[2][0] == "user"
 
 
 def test_active_pending_codex_token_count_event_without_turn_id_refreshes_context_usage_row(frame, monkeypatch):
