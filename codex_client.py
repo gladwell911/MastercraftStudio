@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 import tempfile
 
-from context_usage import normalize_context_usage
+from context_usage import context_window_for_model, normalize_context_usage
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -868,11 +868,6 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
     if total <= 0:
         return None
 
-    context_window = _usage_int_field(
-        info,
-        ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
-        default=0,
-    )
     model_name = str(
         info.get("model")
         or info.get("model_id")
@@ -883,6 +878,13 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         or fallback_model
         or ""
     ).strip()
+    context_window = _usage_int_field(
+        info,
+        ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
+        default=0,
+    )
+    if context_window <= 0:
+        context_window = context_window_for_model(model_name or fallback_model)
     return normalize_context_usage(
         used_tokens=total,
         context_window=context_window,

@@ -57,7 +57,7 @@ def test_ui_automation_context_usage_row_is_fixed_above_answers(frame):
     frame._render_answer_list()
 
     rows = list(frame.answer_list.GetStrings())
-    assert rows[:5] == ["上下文：2K/128K，1.2%已用", "我", "first question", "小诸葛", "first answer"]
+    assert rows[:5] == ["2k / 128k", "我", "first question", "小诸葛", "first answer"]
     assert frame.answer_meta[0][0] == "context_usage"
     assert frame.answer_meta[1][0] == "user"
     assert frame.answer_meta[3][0] == "ai"
@@ -92,7 +92,7 @@ def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame
     assert frame.answer_list.ProcessEvent(up)
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
-    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetString(0) == "2k / 128k"
 
     down = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
     down.SetKeyCode(main.wx.WXK_DOWN)
@@ -125,7 +125,7 @@ def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame,
 
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
-    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetString(0) == "2k / 128k"
 
     _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
     wx_app.Yield()
@@ -163,16 +163,16 @@ def test_ui_automation_history_switch_uses_stored_context_usage_then_cli_unknown
 
     frame.view_mode = "active"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "上下文：4K/128K，3.2%已用"
+    assert frame.answer_list.GetString(0) == "4k / 128k"
 
     frame.view_mode = "history"
     frame.view_history_id = "chat-codex"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
     frame.view_history_id = "chat-stored"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "上下文：44K/未知"
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_ui_automation_context_row_selection_survives_visible_history_usage_refresh(frame, monkeypatch):
@@ -205,13 +205,13 @@ def test_ui_automation_context_row_selection_survives_visible_history_usage_refr
 
     frame._render_answer_list()
     frame.answer_list.SetSelection(0)
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
         "chat-visible",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=0, source="codex", exact=True, model="gpt-5-codex")),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
-    assert frame.answer_list.GetString(0) == "上下文：44K/未知"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"

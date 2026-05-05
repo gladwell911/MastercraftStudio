@@ -308,7 +308,7 @@ def test_codex_protocol_token_count_event_normalizes_usage():
 
     assert seen[-1].type == "token_count"
     assert seen[-1].usage["used_tokens"] == 44176
-    assert seen[-1].usage["context_window"] == 0
+    assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
     assert seen[-1].usage["exact"] is True
     assert seen[-1].usage["fresh"] is True

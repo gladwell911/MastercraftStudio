@@ -2706,6 +2706,10 @@ class ChatFrame(wx.Frame):
         if not detail_text:
             return None
         display_kind = self._execution_display_kind(event)
+        if display_kind == "error":
+            detail_text = self._sanitize_execution_error_text(detail_text)
+            if not detail_text:
+                return None
         item = event.data if isinstance(event.data, dict) else {}
         title = str(getattr(event, "title", "") or item.get("title") or item.get("name") or item.get("label") or "").strip()
         command = str(getattr(event, "command", "") or item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
@@ -2785,11 +2789,14 @@ class ChatFrame(wx.Frame):
             self.execution_meta = []
         self.execution_list.Append(row_text)
         self.execution_meta.append(meta)
-        if self.execution_list.GetSelection() == wx.NOT_FOUND:
-            try:
-                self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
-            except Exception:
-                pass
+        try:
+            self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+        except Exception:
+            pass
+        try:
+            self.execution_list.SetFocus()
+        except Exception:
+            pass
         self._request_listbox_repaint(self.execution_list)
         return True
 
@@ -2946,8 +2953,26 @@ class ChatFrame(wx.Frame):
         return self._execution_meta_tuple(-1, step)[2]
 
     @staticmethod
+    def _strip_ansi_control_sequences(text: str) -> str:
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text or ""))
+
+    @staticmethod
+    def _is_noisy_execution_error_line(line: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(line or "").strip()).lower()
+        if not normalized:
+            return True
+        if (
+            " warn " in f" {normalized} "
+            and "codex_core_" in normalized
+            and "ignoring interface" in normalized
+        ):
+            return True
+        return False
+
+    @staticmethod
     def _sanitize_execution_error_text(detail_text: str) -> str:
-        lines = [str(line or "").strip() for line in str(detail_text or "").replace("\r", "").split("\n")]
+        cleaned_text = ChatFrame._strip_ansi_control_sequences(detail_text)
+        lines = [str(line or "").strip() for line in str(cleaned_text or "").replace("\r", "").split("\n")]
         kept = []
         noise_prefixes = (
             "Output:",
@@ -2967,6 +2992,8 @@ class ChatFrame(wx.Frame):
             if not line:
                 continue
             normalized_line = line.removeprefix("错误：").strip()
+            if ChatFrame._is_noisy_execution_error_line(normalized_line):
+                continue
             if line in noise_exact or normalized_line in noise_exact:
                 continue
             if any(line.startswith(prefix) for prefix in noise_prefixes):
@@ -6067,7 +6094,10 @@ class ChatFrame(wx.Frame):
             self.view_mode = "active"
             self.view_history_id = None
             self._active_answer_row_index = -1
-            self._render_answer_list()
+            if self._detail_panel_mode() == "execution":
+                self._render_answer_list_compat(refresh_execution=False)
+            else:
+                self._render_answer_list()
             return True, ""
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
@@ -6131,7 +6161,10 @@ class ChatFrame(wx.Frame):
         self.view_history_id = None
         self._active_answer_row_index = -1
         self._refresh_openclaw_sync_lifecycle()
-        self._render_answer_list()
+        if self._detail_panel_mode() == "execution":
+            self._render_answer_list_compat(refresh_execution=False)
+        else:
+            self._render_answer_list()
         if is_codex_model(resolved_model) and source == "local":
             self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
         elif is_claudecode_model(resolved_model) and source == "local":

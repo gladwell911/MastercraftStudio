@@ -57,7 +57,7 @@ def test_e2e_regular_model_send_updates_context_usage_row_from_provider_usage(fr
 
     assert frame._current_chat_state["context_usage"]["used_tokens"] == 1536
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetString(0) == "2k / 128k"
     assert "final answer" in list(frame.answer_list.GetStrings())
 
 
@@ -84,14 +84,14 @@ def test_e2e_codex_token_count_lifecycle_updates_top_row_and_preserves_selection
 
     frame._render_answer_list()
     frame.answer_list.SetSelection(0)
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=0, source="codex", exact=True, model="gpt-5-codex")),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
-    assert frame.answer_list.GetString(0) == "上下文：44K/未知"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert ("chat-current", 0) in frame._pending_context_usage_by_turn
 
@@ -102,7 +102,7 @@ def test_e2e_codex_token_count_lifecycle_updates_top_row_and_preserves_selection
 
     assert frame._current_chat_state["context_usage"]["used_tokens"] == 44176
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "上下文：44K/未知"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
 
 
@@ -134,11 +134,11 @@ def test_e2e_context_usage_persists_after_restart_and_history_switch(tmp_path, m
         restarted.Hide()
         restarted.view_mode = "active"
         restarted._render_answer_list()
-        assert restarted.answer_list.GetString(0) == "上下文：4K/128K，3.2%已用"
+        assert restarted.answer_list.GetString(0) == "4k / 128k"
 
         restarted.view_mode = "history"
         restarted.view_history_id = "chat-archived"
         restarted._render_answer_list()
-        assert restarted.answer_list.GetString(0) == "上下文：44K/未知"
+        assert restarted.answer_list.GetString(0) == "暂无"
     finally:
         restarted.Destroy()

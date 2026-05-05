@@ -5,6 +5,7 @@ from context_usage import (
     format_token_k,
     normalize_context_usage,
 )
+from codex_client import codex_context_usage_from_payload
 
 
 def test_format_token_k_uses_less_than_one_k_for_small_values():
@@ -19,7 +20,7 @@ def test_format_token_k_rounds_to_integer_k():
     assert format_token_k(12600) == "13K"
 
 
-def test_exact_context_label_with_window_and_percent():
+def test_exact_context_label_shows_used_and_total_only():
     usage = ContextUsage(
         used_tokens=113260,
         context_window=272000,
@@ -30,10 +31,10 @@ def test_exact_context_label_with_window_and_percent():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a113K/272K\uff0c41.6%\u5df2\u7528"
+    assert format_context_usage_label(usage) == "113k / 272k"
 
 
-def test_estimated_context_label_adds_approximate_prefix():
+def test_estimated_context_label_still_shows_used_and_total_only():
     usage = ContextUsage(
         used_tokens=12400,
         context_window=128000,
@@ -44,10 +45,10 @@ def test_estimated_context_label_adds_approximate_prefix():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a\u7ea6 12K/128K\uff0c9.7%\u5df2\u7528"
+    assert format_context_usage_label(usage) == "12k / 128k"
 
 
-def test_unknown_window_label_omits_percent():
+def test_unknown_window_label_is_missing():
     usage = ContextUsage(
         used_tokens=12400,
         context_window=0,
@@ -58,10 +59,10 @@ def test_unknown_window_label_omits_percent():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a12K/\u672a\u77e5"
+    assert format_context_usage_label(usage) == "\u6682\u65e0"
 
 
-def test_estimated_unknown_window_label_omits_approximate_prefix():
+def test_estimated_unknown_window_label_is_missing():
     usage = ContextUsage(
         used_tokens=44176,
         context_window=0,
@@ -72,11 +73,29 @@ def test_estimated_unknown_window_label_omits_approximate_prefix():
         updated_at=1.0,
     )
 
-    assert format_context_usage_label(usage) == "\u4e0a\u4e0b\u6587\uff1a44K/\u672a\u77e5"
+    assert format_context_usage_label(usage) == "\u6682\u65e0"
 
 
-def test_missing_usage_label_is_refreshing():
-    assert format_context_usage_label(None) == "\u4e0a\u4e0b\u6587\uff1a\u5237\u65b0\u4e2d"
+def test_missing_usage_label_is_missing():
+    assert format_context_usage_label(None) == "\u6682\u65e0"
+
+
+def test_codex_usage_payload_falls_back_to_model_context_window():
+    usage = codex_context_usage_from_payload(
+        {
+            "usage": {
+                "inputTokens": 40000,
+                "outputTokens": 4176,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "model": "codex/main",
+            }
+        }
+    )
+
+    assert usage["used_tokens"] == 44176
+    assert usage["context_window"] == 258400
+    assert format_context_usage_label(usage) == "44k / 258k"
 
 
 def test_normalize_context_usage_computes_percent_and_bounds_values():

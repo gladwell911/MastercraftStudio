@@ -1477,6 +1477,33 @@ def test_submit_question_renders_question_immediately_without_stealing_focus(fra
     assert focused["n"] == 0
 
 
+def test_submit_question_in_execution_mode_keeps_input_focus_and_current_execution_selection(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行中发送",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}, {"step": "第二步"}],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(1)
+    frame.input_edit.SetFocus()
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args, **_kwargs: None)
+
+    ok, message = frame._submit_question("继续观察执行过程", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert frame.input_edit.HasFocus()
+    assert frame.execution_list.GetSelection() == 1
+
+
 def test_submit_question_keeps_new_chat_button_enabled_while_waiting(frame, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
@@ -1766,6 +1793,30 @@ def test_render_execution_list_hides_single_line_environment_warning_noise(frame
     assert frame.execution_meta == [("info", -1, "", "")]
 
 
+def test_render_execution_list_hides_codex_loader_warning_noise_with_ansi(frame):
+    noisy_warning = "\x1b[2m2026-05-05T03:13:03.752275Z\x1b[0m \x1b[33mWARN\x1b[0m \x1b[2mcodex_core_skills::loader\x1b[0m\x1b[2m:\x1b[0m ignoring interface metadata for skill"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": noisy_warning,
+                "list_text": f"错误：{noisy_warning}",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
 def test_render_execution_list_keeps_single_line_meaningful_error(frame):
     frame._current_chat_state = {
         "id": "chat-1",
@@ -1789,6 +1840,34 @@ def test_render_execution_list_keeps_single_line_meaningful_error(frame):
     assert frame.execution_meta == [
         ("execution", 0, "错误：Permission denied while opening C:/tmp/config.toml.", "Permission denied while opening C:/tmp/config.toml.")
     ]
+
+
+def test_codex_loader_warning_stderr_event_does_not_append_execution_step(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0}]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="stderr",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            text="\x1b[2m2026-05-05T03:13:03.752275Z\x1b[0m \x1b[33mWARN\x1b[0m \x1b[2mcodex_core_plugins::manifest\x1b[0m\x1b[2m:\x1b[0m ignoring interface metadata",
+        ),
+    )
+
+    assert frame._current_chat_state["execution_steps"] == []
 
 
 def test_build_execution_entry_keeps_full_detail_text(frame):
@@ -2097,12 +2176,12 @@ def test_save_load_preserves_context_usage_for_active_and_archived_chats(tmp_pat
         assert second._find_archived_chat("chat-archived")["context_usage"] == archived_usage
 
         second._render_answer_list()
-        assert second.answer_list.GetString(0) == "上下文：12K/128K，9.4%已用"
+        assert second.answer_list.GetString(0) == "12k / 128k"
 
         second.view_mode = "history"
         second.view_history_id = "chat-archived"
         second._render_answer_list()
-        assert second.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+        assert second.answer_list.GetString(0) == "44k / 258k"
     finally:
         second.Destroy()
 
@@ -2147,7 +2226,7 @@ def test_f1_moves_focus_to_execution_list_then_back(frame, monkeypatch):
     assert counts["execution"] == 1
 
 
-def test_append_execution_step_refreshes_visible_execution_list_without_stealing_focus(frame, monkeypatch):
+def test_append_execution_step_refreshes_visible_execution_list_and_focuses_latest(frame, monkeypatch):
     frame.active_chat_id = "chat-1"
     frame.current_chat_id = "chat-1"
     frame._current_chat_state = {
@@ -2183,7 +2262,7 @@ def test_append_execution_step_refreshes_visible_execution_list_without_stealing
     assert frame.execution_list.GetSelection() == 0
     assert clear_count["n"] == 0
     assert append_count["n"] == 1
-    assert focus_count["n"] == 0
+    assert focus_count["n"] == 1
 
 
 def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, monkeypatch):
@@ -2226,12 +2305,12 @@ def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, mo
         },
     )
 
-    assert frame.execution_list.GetSelection() == 0
+    assert frame.execution_list.GetSelection() == 2
     assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["第一步", "第二步", "计划：第三步"]
     assert frame.execution_meta[-1] == ("execution", 2, "计划：第三步", "第三步")
     assert clear_count["n"] == 0
     assert append_count["n"] == 1
-    assert focus_count["n"] == 0
+    assert focus_count["n"] == 1
 
 
 def test_background_chat_execution_event_does_not_append_to_visible_execution_list(frame, monkeypatch):
@@ -2648,7 +2727,7 @@ def test_new_chat_from_history_clears_history_view_and_resets_context_usage(fram
     assert frame.view_mode == "active"
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 @pytest.mark.parametrize("model", ["openai/gpt-5.2", "claudecode/default", "codex/main", "openclaw/main"])
@@ -2711,7 +2790,7 @@ def test_new_chat_clicked_resets_context_usage_for_model_variants(frame, monkeyp
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
-    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 @pytest.mark.parametrize("model", ["openai/gpt-5.2", "claudecode/default", "codex/main", "openclaw/main"])
@@ -2771,7 +2850,7 @@ def test_remote_new_chat_from_history_clears_context_usage_for_model_variants(fr
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
-    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, monkeypatch):
@@ -2830,7 +2909,7 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
-    assert frame.answer_list.GetString(0).startswith("上下文：刷新中")
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
@@ -2862,8 +2941,8 @@ def test_render_answer_list_inserts_context_usage_row_first(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "上下文：113K/272K，41.6%已用"
-    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：113K/272K，41.6%已用", "")
+    assert frame.answer_list.GetString(0) == "113k / 272k"
+    assert frame.answer_meta[0] == ("context_usage", -1, "113k / 272k", "")
     assert frame.answer_list.GetString(1) == "我"
 
 
@@ -2873,8 +2952,8 @@ def test_render_answer_list_keeps_empty_state_below_context_row(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
-    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
     assert frame.answer_list.GetString(1) == "暂无对话内容"
 
 
@@ -2901,8 +2980,7 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
     frame._render_answer_list()
 
     row = frame.answer_list.GetString(0)
-    assert row.startswith("上下文：约 ")
-    assert "/200K" in row
+    assert row.endswith(" / 200k")
 
 
 def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
@@ -2918,8 +2996,8 @@ def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
-    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
 
 
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
@@ -2943,7 +3021,7 @@ def test_on_done_uses_worker_context_usage_for_regular_model(frame):
     frame._on_done(0, "answer", "", "openai/gpt-5.2", "", frame.active_chat_id)
 
     assert frame._current_chat_state["context_usage"]["used_tokens"] == 1500
-    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetString(0) == "2k / 128k"
 
 
 def test_on_done_preserves_selected_context_usage_row_when_consuming_pending_usage(frame, monkeypatch):
@@ -2973,7 +3051,7 @@ def test_on_done_preserves_selected_context_usage_row_when_consuming_pending_usa
     frame._on_done(0, "answer", "", "openai/gpt-5.2", "", "chat-current")
 
     assert frame._current_chat_state["context_usage"]["used_tokens"] == 1500
-    assert frame.answer_list.GetString(0) == "上下文：2K/128K，1.2%已用"
+    assert frame.answer_list.GetString(0) == "2k / 128k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -2997,7 +3075,7 @@ def test_on_done_uses_pending_claudecode_context_usage(frame):
     frame._on_done(0, "完成", "", "claudecode/default", "", frame.active_chat_id)
 
     assert frame._current_chat_state["context_usage"]["source"] == "claudecode"
-    assert frame.answer_list.GetString(0) == "上下文：小于1K/200K，0.4%已用"
+    assert frame.answer_list.GetString(0) == "小于1k / 200k"
 
 
 def test_on_done_uses_pending_openclaw_context_usage(frame):
@@ -3042,7 +3120,7 @@ def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
     usage = frame._current_chat_state["context_usage"]
     assert usage["source"] == "estimated"
     assert usage["exact"] is False
-    assert frame.answer_list.GetString(0).startswith("上下文：约 ")
+    assert frame.answer_list.GetString(0).endswith(" / 128k")
 
 
 def test_on_done_does_not_apply_pending_context_usage_from_other_chat(frame):
@@ -3186,7 +3264,7 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
 
     frame._render_answer_list()
     frame.answer_list.SetSelection(1)
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -3194,7 +3272,7 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 1
     assert frame.answer_meta[1][0] == "user"
 
@@ -3234,7 +3312,7 @@ def test_active_pending_codex_token_count_event_without_turn_id_refreshes_contex
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -3242,7 +3320,7 @@ def test_active_pending_codex_token_count_event_without_turn_id_refreshes_contex
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 1)] == usage
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
 
 
 def test_active_pending_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
@@ -3275,14 +3353,14 @@ def test_active_pending_codex_token_count_event_preserves_selected_context_usage
 
     frame._render_answer_list()
     frame.answer_list.SetSelection(0)
-    assert frame.answer_meta[0] == ("context_usage", -1, "上下文：刷新中", "")
+    assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
 
     frame._on_codex_event_for_chat(
         "chat-current",
         main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
     )
 
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -3325,7 +3403,7 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
         main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
     )
 
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
 
     frame._on_codex_event_for_chat(
@@ -3335,7 +3413,7 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
 
     assert frame._current_chat_state["context_usage"] == usage
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -3426,7 +3504,7 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
 
     assert frame._current_chat_state["context_usage"] == usage
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "上下文：44K/未知"
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_late_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
@@ -3466,7 +3544,7 @@ def test_late_codex_token_count_event_preserves_selected_context_usage_row(frame
     )
 
     assert frame._current_chat_state["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -3517,7 +3595,7 @@ def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(
     frame.view_mode = "history"
     frame.view_history_id = "chat-inactive"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
 
 
 def test_late_codex_token_count_event_preserves_selected_context_usage_row_in_visible_history(frame, monkeypatch):
@@ -3566,7 +3644,7 @@ def test_late_codex_token_count_event_preserves_selected_context_usage_row_in_vi
     )
 
     assert frame._find_archived_chat("chat-visible")["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -3601,7 +3679,7 @@ def test_codex_without_pending_usage_clears_stale_context_usage(frame):
     frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
 
     assert "context_usage" not in frame._current_chat_state
-    assert frame.answer_list.GetString(0) == "上下文：刷新中"
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
@@ -3654,7 +3732,7 @@ def test_archive_active_session_preserves_context_usage_for_history_render(frame
     frame._render_answer_list()
 
     assert archived["context_usage"]["source"] == "codex"
-    assert frame.answer_list.GetString(0) == "上下文：约 44K/258K，17.1%已用"
+    assert frame.answer_list.GetString(0) == "44k / 258k"
 
 
 def test_on_done_renders_final_answer_after_hidden_requesting_placeholder(frame, monkeypatch):

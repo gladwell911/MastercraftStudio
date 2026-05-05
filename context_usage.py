@@ -9,6 +9,7 @@ DEFAULT_CONTEXT_WINDOW = 128000
 
 MODEL_CONTEXT_WINDOWS = {
     "codex/main": 258400,
+    "gpt-5-codex": 258400,
     "claudecode/default": 200000,
     "openclaw/main": 272000,
     "openai/gpt-5.2": 128000,
@@ -120,14 +121,12 @@ def format_context_usage_label(usage: ContextUsage | dict | None) -> str:
     if isinstance(usage, dict):
         usage = context_usage_from_dict(usage)
     if usage is None:
-        return "\u4e0a\u4e0b\u6587\uff1a\u5237\u65b0\u4e2d"
-    used = format_token_k(usage.used_tokens)
-    if usage.context_window <= 0:
-        return f"\u4e0a\u4e0b\u6587\uff1a{used}/\u672a\u77e5"
-    prefix = "\u7ea6 " if not usage.exact else ""
-    window = format_token_k(usage.context_window)
-    percent = round((usage.used_tokens / usage.context_window * 100.0), 1)
-    return f"\u4e0a\u4e0b\u6587\uff1a{prefix}{used}/{window}\uff0c{percent:.1f}%\u5df2\u7528"
+        return "\u6682\u65e0"
+    if usage.used_tokens <= 0 or usage.context_window <= 0:
+        return "\u6682\u65e0"
+    used = format_token_k(usage.used_tokens).lower()
+    window = format_token_k(usage.context_window).lower()
+    return f"{used} / {window}"
 
 
 def context_window_for_model(model: str) -> int:
