@@ -4474,7 +4474,7 @@ def test_current_chat_codex_delta_with_hidden_placeholder_does_not_rerender_ques
     frame._render_answer_list()
     before_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert frame.answer_meta[0][0] == "context_usage"
-    assert before_rows[1:] == ["我", "Codex 正在处理的问题"]
+    assert before_rows[2:] == ["我", "Codex 正在处理的问题"]
 
     seen = {"render": 0, "save": 0}
     monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
@@ -5622,8 +5622,8 @@ def test_codex_final_answer_keeps_attachment_only_turn_answer_at_bottom(frame, m
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "codex 最终回答"]
-    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
+    assert rows[2:] == ["我", "图片上传成功", "小诸葛", "codex 最终回答"]
+    assert meta_types[2:] == ["user", "attachment", "ai", "answer"]
 
 
 def test_on_done_extracts_received_file_attachment_from_cli_text(frame, monkeypatch, tmp_path):
@@ -8816,9 +8816,13 @@ def test_on_done_marks_pending_turn_failed_and_sets_request_error(frame):
 def test_model_display_name_maps_codex_and_claudecode():
     assert main.model_display_name("openclaw/main") == "openclaw"
     assert main.model_display_name("codex/main") == "codex"
+    assert main.model_display_name("codex/gpt-5.4-medium") == "codex gpt5.4 medium"
+    assert main.model_display_name("codex/gpt-5.3-codex-spark-high") == "codex gpt5.3spark high"
     assert main.model_display_name("claudecode/default") == "claudeCode"
     assert main.model_id_from_display_name("openclaw") == "openclaw/main"
     assert main.model_id_from_display_name("codex") == "codex/main"
+    assert main.model_id_from_display_name("codex gpt5.4 medium") == "codex/gpt-5.4-medium"
+    assert main.model_id_from_display_name("codex gpt5.3spark high") == "codex/gpt-5.3-codex-spark-high"
     assert main.model_id_from_display_name("claudeCode") == "claudecode/default"
 
 
@@ -8826,10 +8830,22 @@ def test_model_combo_shows_display_names(frame):
     choices = list(frame.model_combo.GetItems())
     assert "openclaw" in choices
     assert "codex" in choices
+    assert "codex gpt5.4 medium" in choices
+    assert "codex gpt5.3spark high" in choices
     assert "claudeCode" in choices
     assert "openclaw/main" not in choices
     assert "codex/main" not in choices
+    assert "codex/gpt-5.4-medium" not in choices
+    assert "codex/gpt-5.3-codex-spark-high" not in choices
     assert "claudecode/default" not in choices
+
+
+def test_get_or_create_codex_client_uses_selected_codex_model(frame):
+    frame.selected_model = "codex/gpt-5.4-medium"
+
+    client = frame._get_or_create_codex_client("chat-codex")
+
+    assert client.codex_model == "codex/gpt-5.4-medium"
 
 
 def test_resolve_current_model_uses_cached_value_off_main_thread(frame, monkeypatch):
@@ -9416,5 +9432,191 @@ def test_openclaw_worker_stores_client_context_usage(frame, monkeypatch):
     frame._worker("", 0, "q", "openclaw/main", chat_id="chat-current")
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
+
+
+def test_answer_list_defaults_to_latest_100_rows_and_shows_more(frame):
+    frame.active_session_turns = [
+        {"question": f"q {idx}", "answer_md": f"a {idx}", "model": "openai/gpt-5.2", "created_at": float(idx)}
+        for idx in range(60)
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+    }
+
+    frame._render_answer_list()
+
+    visible = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert frame.answer_more_button.IsShown()
+    assert "q 0" not in visible
+    assert "q 59" in visible
+    assert frame.answer_total_content_rows > 100
+
+
+def test_answer_more_button_expands_upward_and_hides_when_all_rows_visible(frame):
+    frame.active_session_turns = [
+        {"question": f"q {idx}", "answer_md": f"a {idx}", "model": "openai/gpt-5.2", "created_at": float(idx)}
+        for idx in range(60)
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+    }
+    frame._render_answer_list()
+
+    frame._show_more_answer_rows()
+    visible_after_one = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert "q 10" in visible_after_one
+    assert "q 0" not in visible_after_one
+    assert frame.answer_more_button.IsShown()
+
+    frame._show_more_answer_rows()
+    visible_after_two = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert "q 0" in visible_after_two
+    assert not frame.answer_more_button.IsShown()
+
+
+def test_submit_question_resets_answer_list_visible_limit(frame, monkeypatch):
+    frame.answer_visible_row_limit = 300
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    ok, message = frame._submit_question("new question", source="local", model="codex/main")
+
+    assert ok is True
+    assert message == ""
+    assert frame.answer_visible_row_limit == 100
+
+
+def test_active_execution_list_shows_only_current_turn_steps(frame):
+    frame.active_session_turns = [
+        {"question": "old", "answer_md": "old answer", "model": "codex/main"},
+        {"question": "new", "answer_md": main.REQUESTING_TEXT, "model": "codex/main"},
+    ]
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": "old process", "list_text": "old process", "display_kind": "commentary", "turn_idx": 0},
+            {"step": "new process", "list_text": "new process", "display_kind": "commentary", "turn_idx": 1},
+        ],
+    }
+
+    frame._render_execution_list()
+
+    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible == ["new process"]
+
+
+def test_submit_question_clears_visible_execution_process_for_new_turn(frame, monkeypatch):
+    frame.active_session_turns = [
+        {"question": "old", "answer_md": "old answer", "model": "codex/main"},
+    ]
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": "old process", "list_text": "old process", "display_kind": "commentary", "turn_idx": 0},
+        ],
+    }
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    ok, message = frame._submit_question("new question", source="local", model="codex/main")
+
+    assert ok is True
+    assert message == ""
+    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible == ["暂无执行过程"]
+
+
+def test_window_focus_shortcuts_route_to_expected_controls(frame, monkeypatch):
+    focused = []
+    for name in ("answer_list", "execution_list", "input_edit", "history_list", "notes_notebook_list", "notes_entry_list"):
+        control = getattr(frame, name)
+        monkeypatch.setattr(control, "SetFocus", lambda n=name: focused.append(n))
+
+    class AltEvent:
+        def __init__(self, key):
+            self.key = key
+            self.skipped = 0
+
+        def GetKeyCode(self):
+            return self.key
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return True
+
+        def Skip(self):
+            self.skipped += 1
+
+    frame._current_chat_state["detail_panel_mode"] = "answers"
+    frame._on_char_hook(AltEvent(ord("F")))
+    frame._on_char_hook(AltEvent(ord("D")))
+    frame._on_char_hook(AltEvent(ord("G")))
+    shortcut_focuses = focused[:]
+
+    frame._notes_select_notebook("", view="notes_list")
+    focused[:] = shortcut_focuses
+    frame._on_char_hook(AltEvent(ord("B")))
+
+    notebook = frame.notes_store.create_notebook("shortcut notebook")
+    frame.notes_store.create_entry(notebook.id, "shortcut entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    focused[:] = shortcut_focuses + ["notes_notebook_list"]
+    frame._on_char_hook(AltEvent(ord("B")))
+
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame._on_char_hook(AltEvent(ord("F")))
+
+    assert focused == [
+        "answer_list",
+        "input_edit",
+        "history_list",
+        "notes_notebook_list",
+        "notes_entry_list",
+        "execution_list",
+    ]
+
+
+def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):
+    focused = []
+    monkeypatch.setattr(frame.notes_notebook_list, "SetFocus", lambda: focused.append("notes_notebook_list"))
+
+    class AltBEvent:
+        def GetKeyCode(self):
+            return ord("B")
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return True
+
+        def Skip(self):
+            raise AssertionError("Alt+B should focus the notes list even when it is empty")
+
+    frame._notes_select_notebook("", view="notes_list")
+    frame.input_edit.SetFocus()
+    focused.clear()
+
+    frame._on_char_hook(AltBEvent())
+
+    assert frame.notes_notebook_list.GetString(0) == "暂无笔记本"
+    assert frame.notes_notebook_list.IsEnabled()
+    assert focused == ["notes_notebook_list"]
 
 

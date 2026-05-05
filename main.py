@@ -35,6 +35,7 @@ from codex_client import (
     CodexAppServerClient,
     CodexEvent,
     DEFAULT_CODEX_MODEL,
+    codex_model_label_for_model,
     is_codex_model,
     read_codex_cli_model_label,
 )
@@ -77,6 +78,8 @@ APP_STATE_FILE = "app_state.json"
 APP_WINDOW_TITLE = "神匠工坊"
 MAX_RECOVERY_ATTEMPTS = 3
 CODEX_BACKGROUND_FLUSH_DELAY_MS = 250
+ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
+ANSWER_LIST_EXPAND_ROWS = 100
 HOTKEY_ID_SHOW = 0xA112
 HOTKEY_ID_REALTIME_CALL = 0xA113
 HOTKEY_ID_REALTIME_CALL_ALT = 0xA114
@@ -135,6 +138,8 @@ CHILDID_SELF = 0
 MODEL_IDS = [
     "openclaw/main",
     "codex/main",
+    "codex/gpt-5.4-medium",
+    "codex/gpt-5.3-codex-spark-high",
     "claudecode/default",
     "stepfun/step-3.5-flash",
     "meta-llama/llama-3.1-8b-instruct",
@@ -334,6 +339,10 @@ def model_display_name(model_id: str) -> str:
     """Convert model ID to display name."""
     if not model_id:
         return ""
+    if model_id == "codex/gpt-5.4-medium":
+        return "codex gpt5.4 medium"
+    if model_id == "codex/gpt-5.3-codex-spark-high":
+        return "codex gpt5.3spark high"
     if model_id.startswith("codex/"):
         return "codex"
     if model_id.startswith("claudecode/"):
@@ -349,6 +358,10 @@ def model_id_from_display_name(display_name: str) -> str:
         return ""
     if display_name == "codex":
         return "codex/main"
+    if display_name == "codex gpt5.4 medium":
+        return "codex/gpt-5.4-medium"
+    if display_name in {"codex gpt5.3spark high", "codex gpt5.3spark heigh"}:
+        return "codex/gpt-5.3-codex-spark-high"
     if display_name == "claudeCode":
         return "claudecode/default"
     if display_name == "openclaw":
@@ -873,6 +886,8 @@ class ChatFrame(wx.Frame):
         self.answer_meta = []
         self.execution_meta = []
         self._execution_delta_buffer = {}
+        self.answer_visible_row_limit = ANSWER_LIST_DEFAULT_VISIBLE_ROWS
+        self.answer_total_content_rows = 0
         self.is_running = False
         self._active_request_count = 0
         self.active_turn_idx = -1
@@ -990,6 +1005,10 @@ class ChatFrame(wx.Frame):
 
         self.detail_title_label = wx.StaticText(panel, label="回答：")
         right.Add(self.detail_title_label, 0, wx.LEFT, 10)
+        self.answer_more_button = wx.Button(panel, label="更多")
+        self.answer_more_button.SetName("更多回答")
+        self.answer_more_button.Hide()
+        right.Add(self.answer_more_button, 0, wx.LEFT | wx.TOP, 10)
         self.answer_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.answer_list.SetName("回答列表")
         right.Add(self.answer_list, 1, wx.EXPAND | wx.ALL, 10)
@@ -1068,6 +1087,7 @@ class ChatFrame(wx.Frame):
         self.send_button.Bind(wx.EVT_BUTTON, self._on_send_clicked)
         self.new_chat_button.Bind(wx.EVT_BUTTON, self._on_new_chat_clicked)
         self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_model_changed)
+        self.answer_more_button.Bind(wx.EVT_BUTTON, lambda _evt: self._show_more_answer_rows())
         self.input_edit.Bind(wx.EVT_KEY_DOWN, self._on_input_key_down)
         self.input_edit.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.send_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
@@ -2232,6 +2252,9 @@ class ChatFrame(wx.Frame):
                 continue
             model = str(turn.get("model") or "").strip()
             if model:
+                configured_model = codex_model_label_for_model(model)
+                if configured_model:
+                    return configured_model
                 if is_codex_model(model):
                     configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
                     if configured:
@@ -2240,12 +2263,18 @@ class ChatFrame(wx.Frame):
         if isinstance(chat, dict):
             model = str(chat.get("model") or "").strip()
             if model:
+                configured_model = codex_model_label_for_model(model)
+                if configured_model:
+                    return configured_model
                 if is_codex_model(model):
                     configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
                     if configured:
                         return configured
                 return model
         selected = str(self.selected_model or "").strip() or DEFAULT_MODEL_ID
+        configured_model = codex_model_label_for_model(selected)
+        if configured_model:
+            return configured_model
         if is_codex_model(selected):
             configured = read_codex_cli_model_label(self._workspace_dir_for_codex())
             if configured:
@@ -2262,6 +2291,57 @@ class ChatFrame(wx.Frame):
         label = f"当前模型：{model or DEFAULT_MODEL_ID}"
         self.answer_list.Append(label)
         self.answer_meta.append(("current_model", -1, label, ""))
+
+    def _reset_answer_visible_row_limit(self) -> None:
+        self.answer_visible_row_limit = ANSWER_LIST_DEFAULT_VISIBLE_ROWS
+
+    def _show_more_answer_rows(self) -> None:
+        current_limit = int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0)
+        self.answer_visible_row_limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, current_limit) + ANSWER_LIST_EXPAND_ROWS
+        self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+
+    def _sync_answer_more_button(self) -> None:
+        if not hasattr(self, "answer_more_button"):
+            return
+        should_show = (
+            self._detail_panel_mode() != "execution"
+            and int(getattr(self, "answer_total_content_rows", 0) or 0)
+            > int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0)
+        )
+        try:
+            self.answer_more_button.Show(bool(should_show))
+        except Exception:
+            pass
+
+    def _apply_answer_row_limit(self, header_count: int) -> None:
+        rows = [self.answer_list.GetString(idx) for idx in range(self.answer_list.GetCount())]
+        metas = list(self.answer_meta)
+        header_count = max(0, min(int(header_count or 0), len(rows), len(metas)))
+        header_rows = rows[:header_count]
+        header_metas = metas[:header_count]
+        content_rows = rows[header_count:]
+        content_metas = metas[header_count:]
+        self.answer_total_content_rows = len(content_rows)
+        limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0))
+        self.answer_visible_row_limit = limit
+        if len(content_rows) > limit:
+            content_rows = content_rows[-limit:]
+            content_metas = content_metas[-limit:]
+        active_meta = None
+        if 0 <= self._active_answer_row_index < len(metas):
+            active_meta = metas[self._active_answer_row_index]
+        self.answer_list.Clear()
+        self.answer_meta = []
+        self._active_answer_row_index = -1
+        for row_text, meta in zip(header_rows + content_rows, header_metas + content_metas):
+            self.answer_list.Append(row_text)
+            self.answer_meta.append(meta)
+        if active_meta is not None:
+            for idx, meta in enumerate(self.answer_meta):
+                if meta == active_meta:
+                    self._active_answer_row_index = idx
+                    break
+        self._sync_answer_more_button()
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
@@ -2295,10 +2375,13 @@ class ChatFrame(wx.Frame):
         self._active_answer_row_index = -1
         self._append_context_usage_row()
         self._append_current_model_row()
+        header_count = len(self.answer_meta)
         turns = self._get_view_turns()
         if not turns:
+            self.answer_total_content_rows = 1
             self.answer_list.Append("暂无对话内容")
             self.answer_meta.append(("info", -1, "", ""))
+            self._sync_answer_more_button()
             self._request_listbox_repaint(self.answer_list)
             if mode == "execution" and refresh_execution:
                 self._render_execution_list()
@@ -2337,6 +2420,7 @@ class ChatFrame(wx.Frame):
                     self._active_answer_row_index = self.answer_list.GetCount() - 1
             elif received_attachments:
                 self._append_turn_attachment_rows(i, received_attachments, incoming=True)
+        self._apply_answer_row_limit(header_count)
         if self.answer_list.GetCount() > 0 and self.answer_list.GetSelection() == wx.NOT_FOUND:
             # 首次渲染时仅设置选中项，不主动把焦点移到回答列表。
             self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
@@ -2467,7 +2551,25 @@ class ChatFrame(wx.Frame):
                     return steps
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
         steps = state.get("execution_steps")
-        return steps if isinstance(steps, list) else []
+        if not isinstance(steps, list):
+            return []
+        if self.view_mode == "active" and any(isinstance(step, dict) and "turn_idx" in step for step in steps):
+            active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+            return [
+                step
+                for step in steps
+                if not isinstance(step, dict)
+                or ("turn_idx" not in step)
+                or self._safe_int(step.get("turn_idx"), -1) == active_idx
+            ]
+        return steps
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
 
     def _visible_execution_chat_id(self) -> str:
         if self.view_mode == "history":
@@ -2817,6 +2919,9 @@ class ChatFrame(wx.Frame):
             return False
         if self._visible_execution_chat_state() is not target_chat:
             return False
+        if self.view_mode == "active" and isinstance(step, dict) and "turn_idx" in step:
+            if self._safe_int(step.get("turn_idx"), -1) != int(getattr(self, "active_turn_idx", -1) or -1):
+                return False
         if not self._should_show_execution_step(step):
             return False
         meta = self._execution_meta_tuple(step_idx, step)
@@ -2897,6 +3002,11 @@ class ChatFrame(wx.Frame):
         target_chat = self._chat_state_for_execution_steps(chat_id)
         if not isinstance(target_chat, dict):
             return False
+        if "turn_idx" not in entry and target_chat is getattr(self, "_current_chat_state", None):
+            active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+            if active_idx >= 0:
+                entry = dict(entry)
+                entry["turn_idx"] = active_idx
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
             steps = []
@@ -3135,6 +3245,18 @@ class ChatFrame(wx.Frame):
             return
         self._rebuild_execution_list_from_state()
 
+    def _reset_current_turn_execution_view(self) -> None:
+        if hasattr(self, "execution_list"):
+            self.execution_list.Clear()
+            self.execution_meta = []
+            self.execution_list.Append("暂无执行过程")
+            self.execution_meta.append(("info", -1, "", ""))
+            try:
+                self.execution_list.SetSelection(0)
+            except Exception:
+                pass
+            self._request_listbox_repaint(self.execution_list)
+
     def _apply_detail_panel_mode(self, mode: str | None = None, refresh_execution: bool = False) -> str:
         previous_mode = self._detail_panel_mode()
         normalized = "execution" if str(mode or self._detail_panel_mode()).strip() == "execution" else "answers"
@@ -3163,6 +3285,8 @@ class ChatFrame(wx.Frame):
                 self.answer_list.Show(show_answers)
             except Exception:
                 pass
+        if hasattr(self, "answer_more_button"):
+            self._sync_answer_more_button()
         if hasattr(self, "execution_list"):
             try:
                 self.execution_list.Show(show_execution)
@@ -3752,7 +3876,11 @@ class ChatFrame(wx.Frame):
         turn_id = str(target_chat.get("codex_turn_id") or self.active_codex_turn_id or "").strip()
         recovery_context = bool(getattr(self, "_codex_recovery_context", False))
         use_shared_client = (not from_recovery) and (not recovery_context) and chat_id in {self.active_chat_id, self.current_chat_id, ""}
-        client = self._ensure_codex_client() if use_shared_client else self._get_or_create_codex_client(chat_id or self.active_chat_id or self.current_chat_id or "")
+        if use_shared_client:
+            client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
+        else:
+            client_chat_id = chat_id or self.active_chat_id or self.current_chat_id or ""
+            client = self._get_or_create_codex_client(client_chat_id, model) if model != DEFAULT_CODEX_MODEL else self._get_or_create_codex_client(client_chat_id)
 
         def _sync_codex_thread_state(new_thread_id: str = "", new_turn_id: str = "", active: bool | None = None) -> None:
             if not isinstance(target_chat, dict):
@@ -4318,6 +4446,56 @@ class ChatFrame(wx.Frame):
             return True
         return False
 
+    def _focus_control_safely(self, control) -> bool:
+        if control is None:
+            return False
+        try:
+            if hasattr(control, "IsEnabled") and not control.IsEnabled():
+                return False
+        except Exception:
+            pass
+        try:
+            control.SetFocus()
+            return True
+        except Exception:
+            return False
+
+    def _focus_current_detail_list(self) -> bool:
+        return self._focus_control_safely(self._current_detail_tab_target())
+
+    def _focus_input_box(self) -> bool:
+        return self._focus_control_safely(getattr(self, "input_edit", None))
+
+    def _focus_history_list(self) -> bool:
+        return self._focus_control_safely(getattr(self, "history_list", None))
+
+    def _focus_visible_notes_list(self) -> bool:
+        entry_list = getattr(self, "notes_entry_list", None)
+        notebook_list = getattr(self, "notes_notebook_list", None)
+        view = str(getattr(getattr(self, "notes_controller", None), "notes_view", "notes_list") or "notes_list")
+        if view == "note_detail":
+            return self._focus_control_safely(entry_list)
+        return self._focus_control_safely(notebook_list)
+
+    def _handle_window_focus_shortcut(self, key: int, alt_down: bool, ctrl_down: bool) -> bool:
+        if not alt_down or ctrl_down:
+            return False
+        try:
+            letter = chr(int(key)).upper()
+        except Exception:
+            return False
+        handlers = {
+            "F": self._focus_current_detail_list,
+            "D": self._focus_input_box,
+            "G": self._focus_history_list,
+            "B": self._focus_visible_notes_list,
+        }
+        handler = handlers.get(letter)
+        if handler is None:
+            return False
+        self._suppress_tools_menu_open()
+        return bool(handler())
+
     def _update_busy_state(self) -> None:
         busy = bool(self._active_request_count or self.is_running)
         self.is_running = busy
@@ -4431,6 +4609,8 @@ class ChatFrame(wx.Frame):
         self.active_chat_id = str(uuid.uuid4())
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
+        self._reset_answer_visible_row_limit()
+        self._reset_current_turn_execution_view()
         model = str((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID).strip()
         resolved = model_id_from_display_name(model)
         if resolved in MODEL_IDS:
@@ -4823,19 +5003,25 @@ class ChatFrame(wx.Frame):
         self._codex_background_flush_dirty = False
         self._save_state()
 
-    def _get_or_create_codex_client(self, chat_id: str) -> CodexAppServerClient:
+    def _get_or_create_codex_client(self, chat_id: str, model: str = "") -> CodexAppServerClient:
         key = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip() or self._ensure_active_chat_id()
+        codex_model = str(model or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = self._codex_clients.get(key)
-        if client is not None:
+        if client is not None and getattr(client, "codex_model", DEFAULT_CODEX_MODEL) == codex_model:
             return client
-        client = CodexAppServerClient(on_event=lambda event, cid=key: self._dispatch_codex_event_to_ui(cid, event))
+        if client is not None:
+            client.close()
+        client = CodexAppServerClient(on_event=lambda event, cid=key: self._dispatch_codex_event_to_ui(cid, event), codex_model=codex_model)
         self._codex_clients[key] = client
         return client
 
-    def _ensure_codex_client(self) -> CodexAppServerClient:
+    def _ensure_codex_client(self, model: str = "") -> CodexAppServerClient:
+        codex_model = str(model or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = getattr(self, "_codex_client", None)
-        if client is None:
-            client = CodexAppServerClient(on_event=self._on_codex_event)
+        if client is None or getattr(client, "codex_model", DEFAULT_CODEX_MODEL) != codex_model:
+            if client is not None:
+                client.close()
+            client = CodexAppServerClient(on_event=self._on_codex_event, codex_model=codex_model)
             self._codex_client = client
         return client
 
@@ -4865,6 +5051,7 @@ class ChatFrame(wx.Frame):
         self.active_codex_thread_flags = []
         self.active_codex_latest_assistant_text = ""
         self.active_codex_latest_assistant_phase = ""
+        self._reset_answer_visible_row_limit()
         self._save_state()
 
     def _read_remote_control_token(self) -> str:
@@ -5684,6 +5871,8 @@ class ChatFrame(wx.Frame):
             self._arm_tools_menu_open()
             return
         self._suppress_tools_menu_open()
+        if self._handle_window_focus_shortcut(key, event.AltDown(), event.ControlDown()):
+            return
         if (
             key == wx.WXK_MENU
             and notes_has_focus
@@ -6132,6 +6321,8 @@ class ChatFrame(wx.Frame):
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
+            self._reset_answer_visible_row_limit()
+            self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
             self._pending_input_attachments = []
             self.input_edit.SetValue("")
@@ -6160,6 +6351,8 @@ class ChatFrame(wx.Frame):
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
+            self._reset_answer_visible_row_limit()
+            self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
             if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
                 self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
@@ -6189,6 +6382,8 @@ class ChatFrame(wx.Frame):
         }
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
+        self._reset_answer_visible_row_limit()
+        self._reset_current_turn_execution_view()
         self._current_chat_state["updated_at"] = now
         if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
             self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
@@ -7383,6 +7578,7 @@ class ChatFrame(wx.Frame):
             self.model_combo.SetValue(self.selected_model)
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
+        self._reset_answer_visible_row_limit()
         self._render_answer_list()
         return True
 
@@ -7460,7 +7656,7 @@ class ChatFrame(wx.Frame):
         if hasattr(self, "notes_edit_panel"):
             self.notes_edit_panel.Show(show_note_edit)
         try:
-            self.notes_notebook_list.Enable(self.notes_notebook_list.GetCount() > 0)
+            self.notes_notebook_list.Enable(True)
         except Exception:
             pass
         try:
@@ -7625,7 +7821,8 @@ class ChatFrame(wx.Frame):
         self.notes_notebook_list.Clear()
         if not notebooks:
             self.notes_notebook_list.Append("暂无笔记本")
-            self.notes_notebook_list.Enable(False)
+            self.notes_notebook_list.Enable(True)
+            self.notes_notebook_list.SetSelection(0)
             return
         self.notes_notebook_list.Enable(True)
         for notebook in notebooks:
