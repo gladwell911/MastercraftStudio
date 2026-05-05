@@ -387,6 +387,74 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
     assert "cloudflared 已重启并恢复 rc.tingyou.cc 连接" in statuses[-1]
 
 
+def test_remote_startup_connectivity_falls_back_to_managed_cloudflared_process_when_service_start_fails(frame, monkeypatch):
+    frame.remote_control_host = "0.0.0.0"
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
+    frame._remote_nats_transport = object()
+    monkeypatch.setattr(
+        frame,
+        "_remote_runtime_config",
+        lambda: {"fixed_domain_mode": True, "port": 18080},
+    )
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
+    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, False))
+    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: False)
+    started = []
+    monkeypatch.setattr(
+        frame,
+        "_start_managed_cloudflared_process",
+        lambda websocket_port: started.append(websocket_port) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda _url: (True, ""))
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+
+    frame._ensure_remote_nats_startup_connectivity(
+        token="secret",
+        published_url="wss://rc.tingyou.cc/nats?token=secret",
+    )
+
+    assert started == [18080]
+    assert statuses
+    assert "cloudflared 进程" in statuses[-1]
+
+
+def test_remote_startup_connectivity_waits_for_managed_cloudflared_process_public_probe(frame, monkeypatch):
+    frame.remote_control_host = "0.0.0.0"
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
+    frame._remote_nats_transport = object()
+    monkeypatch.setattr(
+        frame,
+        "_remote_runtime_config",
+        lambda: {"fixed_domain_mode": True, "port": 18080},
+    )
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
+    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, False))
+    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: False)
+    monkeypatch.setattr(frame, "_start_managed_cloudflared_process", lambda _port: True, raising=False)
+    monkeypatch.setattr(
+        frame,
+        "_restart_cloudflared_service",
+        lambda: (_ for _ in ()).throw(AssertionError("should wait for managed process, not restart service")),
+    )
+    probe_results = iter([(False, "公网隧道握手失败：502"), (True, "")])
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda _url: next(probe_results))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    statuses = []
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+
+    frame._ensure_remote_nats_startup_connectivity(
+        token="secret",
+        published_url="wss://rc.tingyou.cc/nats?token=secret",
+    )
+
+    assert statuses
+    assert "cloudflared 进程" in statuses[-1]
+
+
 def test_verify_remote_public_ws_accepts_binary_nats_info_frame(frame, monkeypatch):
     class _FakeWs:
         async def __aenter__(self):
@@ -7323,9 +7391,11 @@ def test_remote_history_and_state_payloads_round_trip_detail_panel_fields(frame)
     current = next(chat for chat in history["chats"] if chat["chat_id"] == "chat-current")
     archived = next(chat for chat in history["chats"] if chat["chat_id"] == "chat-archived")
     assert current["detail_panel_mode"] == "execution"
-    assert current["execution_steps"] == [{"step": "当前步骤"}]
     assert archived["detail_panel_mode"] == "execution"
-    assert archived["execution_steps"] == [{"step": "归档步骤"}]
+    assert "turns" not in current
+    assert "turns" not in archived
+    assert "execution_steps" not in current
+    assert "execution_steps" not in archived
 
     status, read = frame._remote_api_history_read_ui({"chat_id": "chat-archived"})
     assert status == 200
@@ -7336,6 +7406,161 @@ def test_remote_history_and_state_payloads_round_trip_detail_panel_fields(frame)
     assert status == 200
     assert state["detail_panel_mode"] == "execution"
     assert state["execution_steps"] == [{"step": "当前步骤"}]
+
+
+def test_remote_history_list_is_lightweight_without_turns_or_execution_steps(frame, monkeypatch):
+    def fail_if_called(_turn):
+        raise AssertionError("history_list should not render remote turn payloads")
+
+    monkeypatch.setattr(frame, "_remote_turn_payload", fail_if_called)
+    frame.archived_chats = [
+        {
+            "id": f"chat-{idx}",
+            "title": f"聊天 {idx}",
+            "turns": [
+                {
+                    "question": f"问题 {idx}",
+                    "answer_md": "很长的 **Markdown** 回答",
+                    "model": main.DEFAULT_MODEL_ID,
+                    "created_at": float(idx),
+                }
+            ],
+            "execution_steps": [{"step": "heavy"}],
+            "created_at": float(idx),
+            "updated_at": float(idx),
+        }
+        for idx in range(50)
+    ]
+
+    status, body = frame._remote_api_history_list_ui()
+
+    assert status == 200
+    assert len(body["chats"]) == 50
+    assert all("turns" not in chat for chat in body["chats"])
+    assert all("execution_steps" not in chat for chat in body["chats"])
+    assert body["chats"][0]["turn_count"] == 1
+
+
+def test_remote_history_read_supports_tail_paging(frame):
+    frame.archived_chats = [
+        {
+            "id": "chat-paged",
+            "title": "分页聊天",
+            "created_at": 1.0,
+            "updated_at": 6.0,
+            "turns": [
+                {"question": f"问题 {idx}", "answer_md": f"回答 {idx}", "model": main.DEFAULT_MODEL_ID, "created_at": float(idx)}
+                for idx in range(6)
+            ],
+        }
+    ]
+
+    status, body = frame._remote_api_history_read_ui({"chat_id": "chat-paged", "limit": 2})
+
+    assert status == 200
+    assert body["chat"]["turn_count"] == 6
+    assert [turn["question"] for turn in body["chat"]["turns"]] == ["问题 4", "问题 5"]
+    assert body["has_more"] is True
+    assert body["oldest_cursor"] == "4"
+
+    status, older = frame._remote_api_history_read_ui(
+        {"chat_id": "chat-paged", "limit": 2, "before_turn_index": 4}
+    )
+
+    assert status == 200
+    assert [turn["question"] for turn in older["chat"]["turns"]] == ["问题 2", "问题 3"]
+    assert older["has_more"] is True
+    assert older["oldest_cursor"] == "2"
+
+
+def test_remote_history_read_paging_only_renders_requested_turns(frame, monkeypatch):
+    frame.archived_chats = [
+        {
+            "id": "chat-paged",
+            "title": "分页聊天",
+            "turns": [
+                {"question": f"问题 {idx}", "answer_md": f"回答 {idx}", "model": main.DEFAULT_MODEL_ID, "created_at": float(idx)}
+                for idx in range(6)
+            ],
+        }
+    ]
+    rendered = []
+
+    def fake_turn_payload(turn):
+        rendered.append(turn["question"])
+        return {"question": turn["question"], "answer": "", "model": "", "created_at": 0.0}
+
+    monkeypatch.setattr(frame, "_remote_turn_payload", fake_turn_payload)
+
+    status, body = frame._remote_api_history_read_ui({"chat_id": "chat-paged", "limit": 2})
+
+    assert status == 200
+    assert [turn["question"] for turn in body["chat"]["turns"]] == ["问题 4", "问题 5"]
+    assert rendered == ["问题 4", "问题 5"]
+
+
+def test_remote_history_read_current_chat_uses_latest_active_session_turns(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [
+            {"question": "旧问题", "answer_md": "旧回答", "model": main.DEFAULT_MODEL_ID, "created_at": 1.0}
+        ],
+    }
+    frame.active_session_turns = [
+        {"question": "新问题", "answer_md": "新回答", "model": main.DEFAULT_MODEL_ID, "created_at": 2.0}
+    ]
+
+    status, body = frame._remote_api_history_read_ui({"chat_id": "chat-current", "limit": 10})
+
+    assert status == 200
+    assert [turn["question"] for turn in body["chat"]["turns"]] == ["新问题"]
+
+
+def test_remote_history_list_marks_current_chat_running_and_waiting_request_kind(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.is_running = True
+    frame.active_codex_pending_request = {"kind": "user_input"}
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": [],
+    }
+
+    status, body = frame._remote_api_history_list_ui()
+
+    assert status == 200
+    current = next(chat for chat in body["chats"] if chat["chat_id"] == "chat-current")
+    assert current["running"] is True
+    assert current["request_kind"] == "user_input"
+
+
+def test_on_close_stops_remote_servers(frame, monkeypatch):
+    called = []
+    monkeypatch.setattr(frame, "_stop_remote_servers", lambda: called.append("stop"))
+    monkeypatch.setattr(frame._voice_input, "cancel", lambda: None)
+    monkeypatch.setattr(frame._realtime_call, "shutdown", lambda: None)
+    monkeypatch.setattr(frame.notes_sync, "close", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame._global_ctrl_hook, "stop", lambda: None)
+    monkeypatch.setattr(frame, "_unregister_global_hotkey", lambda: None)
+
+    class _Event:
+        def __init__(self):
+            self.skipped = False
+
+        def Skip(self):
+            self.skipped = True
+
+    event = _Event()
+
+    frame._on_close(event)
+
+    assert called == ["stop"]
+    assert event.skipped is True
 
 
 def test_busy_state_keeps_new_chat_enabled_while_request_running(frame):

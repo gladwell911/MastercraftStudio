@@ -834,6 +834,7 @@ class ChatFrame(wx.Frame):
         self._codex_clients: dict[str, CodexAppServerClient] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
+        self._managed_cloudflared_process = None
         self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
@@ -3990,6 +3991,49 @@ class ChatFrame(wx.Frame):
             "request_error": str(turn.get("request_error") or ""),
         }
 
+    def _remote_chat_summary(self, chat: dict) -> dict:
+        if not isinstance(chat, dict):
+            return {
+                "chat_id": "",
+                "title": "新聊天",
+                "model": DEFAULT_MODEL_ID,
+                "created_at": 0.0,
+                "updated_at": 0.0,
+                "turn_count": 0,
+                "running": False,
+                "request_kind": "",
+                "current": False,
+                "active": False,
+                "pinned": False,
+                "detail_panel_mode": "answers",
+            }
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        chat_id = str(chat.get("id") or "")
+        title = str(chat.get("title") or "新聊天")
+        model = str(chat.get("model") or DEFAULT_MODEL_ID)
+        created_at = float(chat.get("created_at") or 0.0)
+        updated_at = float(chat.get("updated_at") or created_at or time.time())
+        pending_request = chat.get("codex_pending_request")
+        request_kind = "user_input" if isinstance(pending_request, dict) and pending_request else ""
+        current_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        return {
+            "chat_id": chat_id,
+            "title": title,
+            "model": model,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
+            "title_updated_at": float(chat.get("title_updated_at") or updated_at),
+            "title_revision": int(chat.get("title_revision") or 1),
+            "turn_count": len(turns),
+            "running": False,
+            "request_kind": request_kind,
+            "current": bool(chat_id) and chat_id == current_id,
+            "active": bool(chat_id) and chat_id == current_id,
+            "pinned": bool(chat.get("pinned")),
+            "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
+        }
+
     def _remote_chat_snapshot(self, chat: dict) -> dict:
         if not isinstance(chat, dict):
             return {
@@ -4036,6 +4080,31 @@ class ChatFrame(wx.Frame):
             "execution_steps": copy.deepcopy(chat.get("execution_steps")) if isinstance(chat.get("execution_steps"), list) else [],
             "turns": [self._remote_turn_payload(turn) for turn in turns if isinstance(turn, dict)],
         }
+
+    def _remote_chat_snapshot_page(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
+        payload = payload or {}
+        raw_limit = payload.get("limit")
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 0
+        if limit <= 0:
+            return self._remote_chat_snapshot(chat), False, ""
+        raw_turns = chat.get("turns") if isinstance(chat, dict) and isinstance(chat.get("turns"), list) else []
+        turns = [turn for turn in raw_turns if isinstance(turn, dict)]
+        total = len(turns)
+        before_raw = payload.get("before_turn_index")
+        try:
+            end = int(before_raw)
+        except Exception:
+            end = total
+        end = max(0, min(end, total))
+        start = max(0, end - limit)
+        paged_chat = dict(chat) if isinstance(chat, dict) else {}
+        paged_chat["turns"] = turns[start:end]
+        snapshot = self._remote_chat_snapshot(paged_chat)
+        snapshot["turn_count"] = total
+        return snapshot, start > 0, (str(start) if start > 0 else "")
 
     def _current_chat_snapshot(self) -> dict:
         chat = dict(self._current_chat_state or {})
@@ -4323,18 +4392,36 @@ class ChatFrame(wx.Frame):
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
         chats = []
         if self.active_chat_id or self.active_session_turns:
-            chats.append(self._current_chat_snapshot())
+            current = dict(self._current_chat_state or {})
+            if not current:
+                current = {"id": self.active_chat_id or self.current_chat_id or "", "title": "新聊天", "turns": self.active_session_turns}
+            current["id"] = str(current.get("id") or self.active_chat_id or self.current_chat_id or "")
+            current["title"] = str(current.get("title") or "新聊天")
+            current["model"] = str(current.get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
+            current["created_at"] = float(current.get("created_at") or self.active_session_started_at or time.time())
+            current["updated_at"] = float(current.get("updated_at") or time.time())
+            current["turns"] = self.active_session_turns
+            current_summary = self._remote_chat_summary(current)
+            current_summary["running"] = bool(self.is_running)
+            current_summary["request_kind"] = "user_input" if self.active_codex_pending_request else ""
+            chats.append(current_summary)
         for chat in self.archived_chats:
-            chats.append(self._remote_chat_snapshot(chat))
+            chats.append(self._remote_chat_summary(chat))
         return 200, {"accepted": True, "chats": chats}
 
     def _remote_api_history_read_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
-            chat = self._current_chat_snapshot()
+            source_chat = dict(self._current_chat_state or {
+                "id": self.active_chat_id or self.current_chat_id or "",
+                "title": "新聊天",
+                "turns": self.active_session_turns,
+            })
+            source_chat["turns"] = self.active_session_turns
+            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         else:
-            chat = self._remote_chat_snapshot(self._find_archived_chat(chat_id) or {})
-        return 200, {"accepted": True, "chat": chat}
+            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(self._find_archived_chat(chat_id) or {}, payload)
+        return 200, {"accepted": True, "chat": chat, "has_more": has_more, "oldest_cursor": oldest_cursor}
 
     def _remote_api_state_ui(self, payload: dict | None = None) -> tuple[int, dict]:
         chat_id = str((payload or {}).get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
@@ -4816,6 +4903,7 @@ class ChatFrame(wx.Frame):
         raise RuntimeError("NATS command handler returned invalid response")
 
     def _stop_remote_servers(self) -> None:
+        self._stop_managed_cloudflared_process()
         transport = getattr(self, "_remote_nats_transport", None)
         if transport is not None:
             try:
@@ -5228,6 +5316,61 @@ class ChatFrame(wx.Frame):
                 time.sleep(0.2)
         return self._start_cloudflared_service()
 
+    def _managed_cloudflared_command_line(self, websocket_port: int) -> str:
+        state = self._query_cloudflared_service()
+        command_line = str(state.get("binary_path") or "").strip()
+        if not command_line:
+            for candidate in self._query_cloudflared_process_command_lines():
+                if " tunnel run " in f" {candidate} ".lower():
+                    command_line = candidate
+                    break
+        if not command_line:
+            return ""
+        rewritten, _changed = self._replace_cloudflared_service_url(command_line, websocket_port)
+        if rewritten is not None:
+            return rewritten
+        return f'{command_line} --url http://127.0.0.1:{int(websocket_port)}'
+
+    def _start_managed_cloudflared_process(self, websocket_port: int) -> bool:
+        existing = getattr(self, "_managed_cloudflared_process", None)
+        if existing is not None and existing.poll() is None:
+            return True
+        command_line = self._managed_cloudflared_command_line(websocket_port)
+        if not command_line:
+            return False
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            popen_kwargs["startupinfo"] = startupinfo
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self._managed_cloudflared_process = subprocess.Popen(command_line, **popen_kwargs)
+            return True
+        except Exception:
+            self._managed_cloudflared_process = None
+            return False
+
+    def _stop_managed_cloudflared_process(self) -> None:
+        process = getattr(self, "_managed_cloudflared_process", None)
+        self._managed_cloudflared_process = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+
     def _remote_runtime_probe_host(self) -> str:
         host = str(self.remote_control_host or "127.0.0.1").strip() or "127.0.0.1"
         return "127.0.0.1" if host in {"0.0.0.0", "::", "::0"} else host
@@ -5283,6 +5426,18 @@ class ChatFrame(wx.Frame):
     def _verify_remote_public_ws(self, url: str) -> tuple[bool, str]:
         return asyncio.run(self._verify_remote_public_ws_async(url))
 
+    def _verify_remote_public_ws_with_retries(self, url: str) -> tuple[bool, str]:
+        last_detail = ""
+        attempts = max(1, int(REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS * 2))
+        for attempt_idx in range(attempts):
+            ok, detail = self._verify_remote_public_ws(url)
+            if ok:
+                return True, ""
+            last_detail = detail
+            if attempt_idx + 1 < attempts:
+                time.sleep(0.5)
+        return False, last_detail
+
     def _ensure_remote_nats_startup_connectivity(self, *, token: str, published_url: str) -> None:
         runtime = self._remote_runtime_config()
         if not runtime["fixed_domain_mode"] or getattr(self, "_remote_nats_transport", None) is None:
@@ -5305,14 +5460,22 @@ class ChatFrame(wx.Frame):
         if not local_ok:
             raise RuntimeError(self._format_remote_startup_error(local_detail or "远程控制本地健康检查失败。"))
         service_configured, service_reconfigured = self._ensure_cloudflared_service_url(port)
+        managed_cloudflared_started = False
         if not service_configured:
             raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或配置缺失。"))
         if service_reconfigured:
             if not self._restart_cloudflared_service():
-                raise RuntimeError(self._format_remote_startup_error("cloudflared 已更新映射但重启失败。"))
+                if not self._start_managed_cloudflared_process(port):
+                    raise RuntimeError(self._format_remote_startup_error("cloudflared 已更新映射但重启失败。"))
+                managed_cloudflared_started = True
         elif not self._start_cloudflared_service():
-            raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
-        public_ok, public_detail = self._verify_remote_public_ws(published_url)
+            if not self._start_managed_cloudflared_process(port):
+                raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
+            managed_cloudflared_started = True
+        if managed_cloudflared_started:
+            public_ok, public_detail = self._verify_remote_public_ws_with_retries(published_url)
+        else:
+            public_ok, public_detail = self._verify_remote_public_ws(published_url)
         if public_ok:
             self._set_remote_runtime_status(
                 local_listener_ready=True,
@@ -5320,12 +5483,19 @@ class ChatFrame(wx.Frame):
                 last_remote_error="",
                 published_url=published_url,
             )
-            self.SetStatusText(
-                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
-            )
+            if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
+                self.SetStatusText(
+                    f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程与 rc.tingyou.cc 已验证"
+                )
+            else:
+                self.SetStatusText(
+                    f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
+                )
             return
         if not self._restart_cloudflared_service():
-            raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 重启失败。"))
+            if not self._start_managed_cloudflared_process(port):
+                raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 重启失败。"))
+            managed_cloudflared_started = True
         public_ok, public_detail = self._verify_remote_public_ws(published_url)
         if not public_ok:
             raise RuntimeError(self._format_remote_startup_error(public_detail or "rc.tingyou.cc 公网隧道验证失败。"))
@@ -5335,9 +5505,14 @@ class ChatFrame(wx.Frame):
             last_remote_error="",
             published_url=published_url,
         )
-        self.SetStatusText(
-            f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
-        )
+        if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
+            self.SetStatusText(
+                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程已恢复 rc.tingyou.cc 连接"
+            )
+        else:
+            self.SetStatusText(
+                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
+            )
 
     def _start_remote_nats_runtime_if_configured(self, *, ensure_connectivity: bool = False) -> None:
         token = self._read_remote_control_token() or self.remote_control_token
@@ -8396,6 +8571,10 @@ class ChatFrame(wx.Frame):
                 pass
         try:
             self.notes_sync.close()
+        except Exception:
+            pass
+        try:
+            self._stop_remote_servers()
         except Exception:
             pass
         self._save_state()
