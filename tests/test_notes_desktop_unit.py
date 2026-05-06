@@ -885,14 +885,16 @@ def test_notes_notebook_list_is_visible_in_main_view(frame):
 
 
 def test_notes_root_tab_path_keeps_chat_and_notes_controls_linked(frame):
-    assert frame.root_tab_order[0] is frame.notes_notebook_list
-    assert frame.root_tab_order[1] is frame.history_list
-    assert frame.root_tab_order[2] is frame.answer_list
-    assert frame.root_tab_order[3] is frame.input_edit
-    assert frame.chat_tab_order[0] is frame.notes_notebook_list
-    assert frame.chat_tab_order[1] is frame.history_list
-    assert frame.chat_tab_order[2] is frame.answer_list
-    assert frame.chat_tab_order[3] is frame.input_edit
+    assert frame.root_tab_order[:7] == [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.send_button,
+        frame.notes_notebook_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
+    assert frame.chat_tab_order == frame.root_tab_order[:7]
     assert frame.notes_tab_order[0] is frame.notes_notebook_list
 
 
@@ -1319,10 +1321,15 @@ def test_notes_remote_ops_refresh_ui_and_hint_current_editing_entry(frame, monke
 
 
 def test_notes_tab_order_links_chat_and_notes_controls(frame):
-    assert frame.chat_tab_order[0] is frame.notes_notebook_list
-    assert frame.chat_tab_order[1] is frame.history_list
-    assert frame.chat_tab_order[2] is frame.answer_list
-    assert frame.chat_tab_order[3] is frame.input_edit
+    assert frame.chat_tab_order == [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.send_button,
+        frame.notes_notebook_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
     assert frame.notes_tab_order[0] is frame.notes_notebook_list
     assert frame.notes_tab_order[1] is frame.notes_entry_list
     assert frame.notes_tab_order[-1] is frame.notes_editor
@@ -1334,15 +1341,22 @@ def test_notes_detail_view_moves_history_tab_target_to_entry_list(frame):
 
     frame._notes_select_notebook(notebook.id, view="note_detail")
 
-    assert frame.root_tab_order[0] is frame.notes_entry_list
-    assert frame.root_tab_order[1] is frame.history_list
-    assert frame.chat_tab_order[0] is frame.notes_entry_list
+    assert frame.root_tab_order[:7] == [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.send_button,
+        frame.notes_entry_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
+    assert frame.chat_tab_order == frame.root_tab_order[:7]
     assert frame.notes_tab_order[0] is frame.notes_entry_list
     assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()
 
 
-def test_notes_detail_view_reorders_panel_tab_chain_after_history(frame, monkeypatch):
+def test_notes_detail_view_reorders_panel_tab_chain_after_send(frame, monkeypatch):
     notebook = frame.notes_store.create_notebook("panel tab notebook")
     frame.notes_store.create_entry(notebook.id, "panel tab entry", source="manual")
     calls = []
@@ -1359,8 +1373,8 @@ def test_notes_detail_view_reorders_panel_tab_chain_after_history(frame, monkeyp
 
     frame._notes_select_notebook(notebook.id, view="note_detail")
 
-    assert ("detail_panel", frame.history_list) in calls
-    assert ("answer_list", frame.notes_detail_panel) in calls
+    assert ("detail_panel", frame.send_button) in calls
+    assert ("answer_list", frame.history_list) in calls
 
 
 def test_notes_list_and_detail_views_do_not_show_action_buttons(frame):

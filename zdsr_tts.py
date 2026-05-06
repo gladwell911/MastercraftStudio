@@ -75,10 +75,23 @@ class ZDSRTTSClient:
                 p = base / name
                 if not p.exists():
                     continue
+                dll_cookie = None
+                try:
+                    add_dll_directory = getattr(os, "add_dll_directory", None)
+                    if callable(add_dll_directory):
+                        dll_cookie = add_dll_directory(str(base))
+                except Exception:
+                    dll_cookie = None
                 try:
                     return ctypes.WinDLL(str(p))
                 except Exception:
                     continue
+                finally:
+                    if dll_cookie is not None:
+                        try:
+                            dll_cookie.close()
+                        except Exception:
+                            pass
         for name in self._candidate_names():
             try:
                 return ctypes.WinDLL(name)

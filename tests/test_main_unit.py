@@ -52,6 +52,30 @@ def test_continue_shortcut_mapping(frame):
     assert not frame._is_continue_shortcut(ord("C"), alt=False)
 
 
+def test_visible_model_order_prioritizes_codex_then_claudecode_then_openclaw():
+    visible = list(main.VISIBLE_MODEL_IDS)
+
+    assert visible[:5] == [
+        "codex/main",
+        "codex/gpt-5.4-medium",
+        "codex/gpt-5.3-codex-spark-high",
+        "claudecode/default",
+        "openclaw/main",
+    ]
+
+
+def test_model_combo_order_prioritizes_cli_models(frame):
+    choices = [frame.model_combo.GetString(idx) for idx in range(frame.model_combo.GetCount())]
+
+    assert choices[:5] == [
+        "codex",
+        "codex gpt5.4 medium",
+        "codex gpt5.3spark high",
+        "claudeCode",
+        "openclaw",
+    ]
+
+
 def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
@@ -661,6 +685,50 @@ def test_remote_nats_runtime_autostarts_without_env_and_uses_default_token(tmp_p
         frame.Destroy()
 
 
+def test_remote_nats_runtime_falls_back_when_default_port_is_excluded(frame, monkeypatch):
+    monkeypatch.setattr(main, "REMOTE_NATS_PORT_FALLBACKS", (4622,))
+    monkeypatch.setattr(frame, "_resolve_remote_nats_websocket_port", lambda _port: 18081)
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    attempts = []
+    transport_urls = []
+
+    class _FakeNatsProcess:
+        def __init__(self, config, bundled_dir=None):
+            self.config = config
+            attempts.append(config.port)
+
+        def start(self, timeout=10):
+            if self.config.port == 4222:
+                raise RuntimeError(
+                    "listen tcp 0.0.0.0:4222: bind: An attempt was made to access a socket in a way forbidden by its access permissions."
+                )
+            return SimpleNamespace()
+
+        def stop(self):
+            return None
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start_threaded(self, url, timeout=10):
+            transport_urls.append(url)
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="0.0.0.0")
+
+    assert attempts == [4222, 4622]
+    assert transport_urls == ["nats://127.0.0.1:4622"]
+    assert frame.remote_nats_runtime_status["enabled"] is True
+    assert frame.remote_nats_runtime_status["tcp_url"] == "nats://127.0.0.1:4622"
+
+
 def test_remote_api_state_includes_remote_runtime_status(frame):
     frame.remote_control_runtime_url = ""
     frame.remote_control_runtime_status = {
@@ -744,6 +812,87 @@ def test_answer_list_ctrl_c_still_copies_answer_text(frame, monkeypatch):
 
     assert copied["text"] == "rich answer"
     assert statuses[-1] == "已复制"
+
+
+def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, monkeypatch):
+    copied = {"text": None}
+
+    class _Clipboard:
+        def Open(self):
+            return True
+
+        def SetData(self, data):
+            copied["text"] = data.GetText()
+            return True
+
+        def Close(self):
+            return True
+
+    monkeypatch.setattr(main.wx, "TheClipboard", _Clipboard())
+    monkeypatch.setattr(frame.answer_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_editor, "HasFocus", lambda: False)
+
+    frame.answer_meta = [
+        ("question", 0, "first question", ""),
+        ("answer", 0, "plain answer", "rich answer"),
+    ]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("first question")
+    frame.answer_list.Append("answer row")
+    frame.answer_list.SetSelection(1)
+
+    class E:
+        def GetKeyCode(self):
+            return ord("C")
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Ctrl+C in the answer list should be consumed before native list handling")
+
+    frame._on_char_hook(E())
+
+    assert copied["text"] == "rich answer"
+    assert frame.answer_list.GetSelection() == 1
+
+
+def test_answer_list_down_at_last_row_does_not_reset_selection(frame, monkeypatch):
+    frame.answer_meta = [
+        ("question", 0, "q", ""),
+        ("answer", 0, "a", "a"),
+    ]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("q")
+    frame.answer_list.Append("a")
+    frame.answer_list.SetSelection(1)
+    monkeypatch.setattr(
+        frame.answer_list,
+        "SetSelection",
+        lambda _idx: (_ for _ in ()).throw(AssertionError("unchanged Down should not reset selection")),
+    )
+
+    class E:
+        def GetKeyCode(self):
+            return main.wx.WXK_DOWN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Down at the last row should be consumed without native re-announcement")
+
+    frame._on_answer_key_down(E())
+
+    assert frame.answer_list.GetSelection() == 1
 
 
 def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
@@ -1722,7 +1871,7 @@ def test_render_execution_list_filters_phase_only_commentary_noise(frame):
     assert rows == ["保留这条说明。"]
 
 
-def test_render_execution_list_keeps_only_meaningful_error_summary(frame):
+def test_render_execution_list_hides_error_summary_even_after_stack_noise_is_removed(frame):
     frame._current_chat_state = {
         "id": "chat-1",
         "title": "执行测试",
@@ -1741,10 +1890,8 @@ def test_render_execution_list_keeps_only_meaningful_error_summary(frame):
     frame._render_execution_list()
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
-    assert rows == ["错误：Missing argument in parameter list."]
-    assert frame.execution_meta == [
-        ("execution", 0, "错误：Missing argument in parameter list.", "Missing argument in parameter list.")
-    ]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
 
 
 def test_render_execution_list_hides_error_when_only_stack_noise_remains(frame):
@@ -1817,7 +1964,7 @@ def test_render_execution_list_hides_codex_loader_warning_noise_with_ansi(frame)
     assert frame.execution_meta == [("info", -1, "", "")]
 
 
-def test_render_execution_list_keeps_single_line_meaningful_error(frame):
+def test_render_execution_list_hides_single_line_error_prefix_entry(frame):
     frame._current_chat_state = {
         "id": "chat-1",
         "title": "执行测试",
@@ -1836,10 +1983,31 @@ def test_render_execution_list_keeps_single_line_meaningful_error(frame):
     frame._render_execution_list()
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
-    assert rows == ["错误：Permission denied while opening C:/tmp/config.toml."]
-    assert frame.execution_meta == [
-        ("execution", 0, "错误：Permission denied while opening C:/tmp/config.toml.", "Permission denied while opening C:/tmp/config.toml.")
-    ]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
+
+
+def test_render_execution_list_hides_error_detail_even_without_stored_list_text(frame):
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "stderr",
+                "display_kind": "error",
+                "detail_text": "This was caught by the test expectation on the following line:",
+                "list_text": "",
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["暂无执行过程"]
+    assert frame.execution_meta == [("info", -1, "", "")]
 
 
 def test_codex_loader_warning_stderr_event_does_not_append_execution_step(frame, monkeypatch):
@@ -2226,7 +2394,7 @@ def test_f1_moves_focus_to_execution_list_then_back(frame, monkeypatch):
     assert counts["execution"] == 1
 
 
-def test_append_execution_step_refreshes_visible_execution_list_and_focuses_latest(frame, monkeypatch):
+def test_append_execution_step_refreshes_visible_execution_list_without_stealing_focus(frame, monkeypatch):
     frame.active_chat_id = "chat-1"
     frame.current_chat_id = "chat-1"
     frame._current_chat_state = {
@@ -2262,7 +2430,39 @@ def test_append_execution_step_refreshes_visible_execution_list_and_focuses_late
     assert frame.execution_list.GetSelection() == 0
     assert clear_count["n"] == 0
     assert append_count["n"] == 1
-    assert focus_count["n"] == 1
+    assert focus_count["n"] == 0
+
+
+def test_append_execution_entry_does_not_steal_focus_from_foreground_control(frame, monkeypatch):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame._render_execution_list()
+    focus_count = {"execution": 0}
+    monkeypatch.setattr(frame.input_edit, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.execution_list, "SetFocus", lambda: focus_count.__setitem__("execution", focus_count["execution"] + 1))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._append_execution_entry_to_chat(
+        "chat-1",
+        {
+            "event_type": "plan_updated",
+            "display_kind": "plan",
+            "detail_text": "后台计划更新",
+            "list_text": "计划：后台计划更新",
+        },
+    )
+
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["计划：后台计划更新"]
+    assert frame.execution_list.GetSelection() == 0
+    assert focus_count["execution"] == 0
 
 
 def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, monkeypatch):
@@ -2310,7 +2510,7 @@ def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, mo
     assert frame.execution_meta[-1] == ("execution", 2, "计划：第三步", "第三步")
     assert clear_count["n"] == 0
     assert append_count["n"] == 1
-    assert focus_count["n"] == 1
+    assert focus_count["n"] == 0
 
 
 def test_background_chat_execution_event_does_not_append_to_visible_execution_list(frame, monkeypatch):
@@ -4191,7 +4391,8 @@ def test_background_codex_feedback_events_route_through_call_after(frame, monkey
     )
 
     assert len(call_after_calls) == 1
-    assert call_after_calls[0][0].__name__ == "_on_codex_event_for_chat"
+    assert call_after_calls[0][0].__name__ == "_drain_codex_ui_events"
+    assert len(frame._pending_codex_ui_events) == 1
 
 
 def test_background_codex_feedback_events_batch_state_flush(frame, monkeypatch):
@@ -4451,7 +4652,8 @@ def test_current_chat_codex_delta_updates_row_without_full_rerender(frame, monke
     original_update(0)
 
     assert seen["render"] == 0
-    assert seen["save"] == 1
+    assert seen["save"] == 0
+    assert frame._codex_background_flush_scheduled is True
     assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
     answer_row = next(i for i, meta in enumerate(frame.answer_meta) if meta[0] == "answer")
     assert frame.answer_list.GetString(answer_row) == main.REQUESTING_TEXT
@@ -4492,7 +4694,8 @@ def test_current_chat_codex_delta_with_hidden_placeholder_does_not_rerender_ques
 
     after_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert seen["render"] == 0
-    assert seen["save"] == 1
+    assert seen["save"] == 0
+    assert frame._codex_background_flush_scheduled is True
     assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
     assert after_rows == before_rows
 
@@ -4630,7 +4833,8 @@ def test_empty_text_mapped_event_appends_and_persists_execution_step(frame, monk
     assert steps[0]["event_type"] == "diff_updated"
     assert steps[0]["detail_text"] == "已生成代码变更"
     assert steps[0]["list_text"] == "已生成代码变更"
-    assert saves["count"] == 1
+    assert saves["count"] == 0
+    assert frame._codex_background_flush_scheduled is True
 
 
 def test_agent_message_delta_buffers_without_immediate_execution_step(frame, monkeypatch):
@@ -5842,6 +6046,25 @@ def test_global_ctrl_arrow_logs_successful_navigation(frame, monkeypatch):
     assert statuses == []
 
 
+def test_screen_reader_primary_tab_order_matches_requested_chat_flow(frame):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("tab order notebook")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame._current_chat_state["detail_panel_mode"] = "answers"
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+
+    assert frame.root_tab_order[:7] == [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.send_button,
+        frame.notes_notebook_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
+    assert frame.chat_tab_order == frame.root_tab_order[:7]
+
+
 def test_tab_moves_from_notes_to_history_then_answer_then_input(frame):
     frame.Show()
     notebook = frame.notes_store.create_notebook("tab notebook")
@@ -6226,18 +6449,43 @@ def test_speak_text_via_screen_reader_records_success_status(frame):
     assert frame.voice_screen_reader_status["last_error"] == ""
 
 
-def test_speak_text_via_screen_reader_records_failure_status(frame):
-    frame._zdsr_tts = type(
+def test_speak_text_via_screen_reader_records_failure_status(frame, monkeypatch):
+    failing_tts = type(
         "FakeTTS",
         (),
         {"speak": lambda self, text: False},
     )()
+    frame._zdsr_tts = failing_tts
+    monkeypatch.setattr(main, "ZDSRTTSClient", lambda: failing_tts)
 
     frame._speak_text_via_screen_reader("语音文本")
 
     assert frame.voice_screen_reader_status["last_text"] == "语音文本"
     assert frame.voice_screen_reader_status["last_success"] is False
     assert "speak returned false" in frame.voice_screen_reader_status["last_error"]
+
+
+def test_speak_text_via_screen_reader_recreates_tts_client_after_false(frame, monkeypatch):
+    calls = []
+
+    class _FailingTTS:
+        def speak(self, text):
+            calls.append(("old", text))
+            return False
+
+    class _WorkingTTS:
+        def speak(self, text):
+            calls.append(("new", text))
+            return True
+
+    frame._zdsr_tts = _FailingTTS()
+    monkeypatch.setattr(main, "ZDSRTTSClient", lambda: _WorkingTTS())
+
+    frame._speak_text_via_screen_reader("语音文本")
+
+    assert calls == [("old", "语音文本"), ("new", "语音文本")]
+    assert frame.voice_screen_reader_status["last_success"] is True
+    assert frame.voice_screen_reader_status["last_error"] == ""
 
 
 def test_voice_result_keeps_repeated_transcript_verbatim(frame, monkeypatch):
@@ -7845,6 +8093,253 @@ def test_focus_latest_answer_only_focuses_when_completion_window_is_foreground(f
 
     assert calls["selection"] == 1
     assert calls["focus"] == 1
+
+
+def test_codex_ui_dispatch_coalesces_bursty_events(frame, monkeypatch):
+    scheduled = []
+    handled = []
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: scheduled.append((fn, args)) or True)
+    monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda chat_id, event: handled.append((chat_id, event.type)))
+
+    for idx in range(10):
+        frame._dispatch_codex_event_to_ui("chat-active", main.CodexEvent(type="plan_updated", text=f"step {idx}"))
+
+    assert len(scheduled) == 1
+    assert handled == []
+
+    scheduled[0][0](*scheduled[0][1])
+
+    assert handled == [("chat-active", "plan_updated")] * 10
+
+
+def test_codex_ui_event_drain_yields_after_batch_budget(frame, monkeypatch):
+    handled = []
+    call_after_scheduled = []
+    delayed = []
+
+    monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda chat_id, event: handled.append((chat_id, event.type)))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: call_after_scheduled.append((fn, args)) or True)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    for idx in range(main.CODEX_UI_EVENT_BATCH_SIZE + 5):
+        frame._pending_codex_ui_events.append(("chat-active", main.CodexEvent(type="plan_updated", text=f"step {idx}")))
+
+    frame._codex_ui_event_flush_scheduled = True
+    frame._drain_codex_ui_events()
+
+    assert len(handled) == main.CODEX_UI_EVENT_BATCH_SIZE
+    assert len(frame._pending_codex_ui_events) == 5
+    assert call_after_scheduled == []
+    assert delayed == [(main.CODEX_UI_EVENT_BATCH_DELAY_MS, frame._drain_codex_ui_events, ())]
+
+
+def test_codex_ui_event_drain_uses_smaller_batch_while_primary_control_has_focus(frame, monkeypatch):
+    handled = []
+    delayed = []
+
+    monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda chat_id, event: handled.append((chat_id, event.type)))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+    monkeypatch.setattr(frame.input_edit, "HasFocus", lambda: True)
+
+    for idx in range(main.CODEX_UI_EVENT_BATCH_SIZE):
+        frame._pending_codex_ui_events.append(("chat-active", main.CodexEvent(type="plan_updated", text=f"step {idx}")))
+
+    frame._codex_ui_event_flush_scheduled = True
+    frame._drain_codex_ui_events()
+
+    assert len(handled) == main.CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE
+    assert len(frame._pending_codex_ui_events) == main.CODEX_UI_EVENT_BATCH_SIZE - main.CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE
+    assert delayed == [(main.CODEX_UI_EVENT_BATCH_DELAY_MS, frame._drain_codex_ui_events, ())]
+
+
+def test_generated_title_does_not_change_history_recency_order(frame, monkeypatch):
+    frame.archived_chats = [
+        {
+            "id": "old-chat",
+            "title": "新聊天",
+            "title_source": "default",
+            "title_manual": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [{"question": "old question", "answer_md": "old answer", "model": "openclaw/main", "created_at": 1.0}],
+        },
+        {
+            "id": "new-chat-1",
+            "title": "new one",
+            "created_at": 10.0,
+            "updated_at": 10.0,
+            "turns": [{"question": "new one", "answer_md": "answer", "model": "openclaw/main", "created_at": 10.0}],
+        },
+        {
+            "id": "new-chat-2",
+            "title": "new two",
+            "created_at": 9.0,
+            "updated_at": 9.0,
+            "turns": [{"question": "new two", "answer_md": "answer", "model": "openclaw/main", "created_at": 9.0}],
+        },
+    ]
+    monkeypatch.setattr(main.time, "time", lambda: 100.0)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    frame._apply_generated_first_question_title("old-chat", "old question", "old renamed")
+    frame._sort_archived_chats()
+
+    assert [chat["id"] for chat in frame.archived_chats] == ["new-chat-1", "new-chat-2", "old-chat"]
+    assert frame._find_archived_chat("old-chat")["updated_at"] == 1.0
+    assert frame._find_archived_chat("old-chat")["title_updated_at"] == 100.0
+
+
+def test_remote_title_update_does_not_change_history_recency_order(frame, monkeypatch):
+    frame.archived_chats = [
+        {
+            "id": "old-chat",
+            "title": "old",
+            "title_source": "default",
+            "title_manual": False,
+            "title_updated_at": 1.0,
+            "title_revision": 1,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [],
+        },
+        {"id": "new-chat", "title": "new", "created_at": 10.0, "updated_at": 10.0, "turns": []},
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_rename_chat_ui(
+        {
+            "chat_id": "old-chat",
+            "title": "renamed remotely",
+            "title_source": "manual",
+            "title_updated_at": 100.0,
+            "title_revision": 2,
+        }
+    )
+    frame._sort_archived_chats()
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert [chat["id"] for chat in frame.archived_chats] == ["new-chat", "old-chat"]
+    assert frame._find_archived_chat("old-chat")["updated_at"] == 1.0
+    assert frame._find_archived_chat("old-chat")["title_updated_at"] == 100.0
+
+
+def test_codex_ui_event_drain_coalesces_execution_list_repaints(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame._render_execution_list()
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    repaint_calls = []
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: repaint_calls.append(controls))
+
+    for idx in range(5):
+        frame._pending_codex_ui_events.append(
+            (
+                "chat-active",
+                main.CodexEvent(
+                    type="plan_updated",
+                    thread_id="thread-active",
+                    turn_id="turn-active",
+                    text=f"step {idx}",
+                ),
+            )
+        )
+
+    frame._codex_ui_event_flush_scheduled = True
+    frame._drain_codex_ui_events()
+
+    assert frame.execution_list.GetCount() == 5
+    assert repaint_calls == [(frame.execution_list,)]
+
+
+def test_codex_ui_event_drain_preserves_execution_selection_when_list_has_focus(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "existing 0", "detail_text": "existing 0"},
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "existing 1", "detail_text": "existing 1"},
+        ],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._pending_codex_ui_events.append(
+        (
+            "chat-active",
+            main.CodexEvent(
+                type="plan_updated",
+                thread_id="thread-active",
+                turn_id="turn-active",
+                text="new step",
+            ),
+        )
+    )
+
+    frame._codex_ui_event_flush_scheduled = True
+    frame._drain_codex_ui_events()
+
+    assert frame.execution_list.GetCount() == 3
+    assert frame.execution_list.GetSelection() == 0
+
+
+def test_codex_streaming_events_defer_state_save_off_ui_hot_path(frame, monkeypatch):
+    saved = {"count": 0}
+    delayed = []
+
+    monkeypatch.setattr(frame, "_save_state", lambda: saved.__setitem__("count", saved["count"] + 1))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+    monkeypatch.setattr(frame, "_update_active_answer_row", lambda _idx: True)
+
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": "",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+
+    frame._on_codex_event_for_chat("chat-active", main.CodexEvent(type="plan_updated", text="thinking"))
+
+    assert saved["count"] == 0
+    assert delayed
 
 
 def test_background_delta_updates_archived_chat_without_switching_current(frame, monkeypatch):

@@ -111,6 +111,19 @@ def test_start_raises_when_nats_port_is_already_in_use(
         process.start(timeout=1)
 
 
+def test_start_raises_before_spawn_when_nats_port_cannot_bind(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token="secret", port=4222))
+    monkeypatch.setattr(process, "_port_accepts_connections", lambda: False)
+    monkeypatch.setattr(process, "_port_can_bind", lambda: False)
+    monkeypatch.setattr("nats_runtime.subprocess.Popen", lambda *args, **kwargs: pytest.fail("should not spawn"))
+
+    with pytest.raises(RuntimeError, match="NATS port 4222 is unavailable for binding"):
+        process.start(timeout=1)
+
+
 def test_read_nats_info_ready_requires_info_banner() -> None:
     assert _read_nats_info_ready(_FakeConnection(b"INFO {\"server_id\":\"test\"}\r\n")) is True
     assert _read_nats_info_ready(_FakeConnection(b"HELLO\r\n")) is False

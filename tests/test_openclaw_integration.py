@@ -76,6 +76,48 @@ def test_worker_routes_openclaw_without_overwriting_pending_answer(frame, monkey
     assert frame.active_session_turns[0]["answer_md"] == ""
 
 
+def test_openclaw_worker_uses_submitted_chat_session_after_switch(frame, monkeypatch):
+    frame._stop_openclaw_sync()
+    frame.selected_model = "openclaw/main"
+    frame.model_combo.SetValue("openclaw")
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_openclaw_session_id = "zgwd-chat-a"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-a", "title": "chat a", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+
+    seen = []
+
+    def fake_stream_chat(self, user_text, session_id, on_delta=None):
+        seen.append((user_text, session_id))
+        return ""
+
+    class _SwitchBeforeWorkerThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            frame.active_chat_id = "chat-b"
+            frame.current_chat_id = "chat-b"
+            frame.active_openclaw_session_id = "zgwd-chat-b"
+            if self._target:
+                self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(main.threading, "Thread", _SwitchBeforeWorkerThread)
+    monkeypatch.setattr(main.OpenClawClient, "stream_chat", fake_stream_chat)
+
+    ok, message = frame._submit_question("draw a", model="openclaw/main")
+
+    assert ok is True
+    assert message == ""
+    assert seen == [("draw a", "zgwd-chat-a")]
+
+
 def test_openclaw_done_does_not_render_placeholder_before_sync(frame, monkeypatch):
     frame._stop_openclaw_sync()
     frame.active_session_turns = [
@@ -273,6 +315,391 @@ def test_sync_once_finds_session_file_by_active_session_id(frame, monkeypatch, t
     assert frame.active_openclaw_session_id == "zgwd-chat-c"
     assert frame.active_openclaw_session_file == str(active_file)
     assert frame.active_session_turns[-1]["answer_md"] == "chat c reply"
+
+
+def test_new_openclaw_chat_sync_ignores_stale_events_before_local_turn(frame, monkeypatch, tmp_path):
+    frame._stop_openclaw_sync()
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    session_file = sessions_dir / "mixed.jsonl"
+    local_created = time.time()
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "old-u",
+                        "timestamp": local_created - 120,
+                        "message": {"role": "user", "content": [{"type": "text", "text": "old question"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "old-a",
+                        "timestamp": local_created - 119,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "old answer"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "new-u",
+                        "timestamp": local_created + 1,
+                        "message": {"role": "user", "content": [{"type": "text", "text": "new question"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "new-a",
+                        "timestamp": local_created + 2,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "new answer"}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_chat_id = "chat-new"
+    frame.current_chat_id = "chat-new"
+    frame.active_session_turns = [
+        {
+            "question": "new question",
+            "answer_md": "",
+            "model": "openclaw/main",
+            "created_at": local_created,
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-new", "title": "new", "turns": frame.active_session_turns}
+    frame.active_openclaw_session_id = "zgwd-chat-new"
+    frame.active_openclaw_session_file = ""
+    frame.active_openclaw_sync_offset = 0
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:webchat:new": {
+                    "sessionId": "zgwd-chat-new",
+                    "sessionFile": str(session_file),
+                    "updatedAt": 1773672821999,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._sync_openclaw_once()
+
+    assert len(frame.active_session_turns) == 1
+    assert frame.active_session_turns[0]["question"] == "new question"
+    assert frame.active_session_turns[0]["answer_md"] == "new answer"
+
+
+def test_shared_openclaw_session_file_routes_only_matching_local_turns(frame, monkeypatch, tmp_path):
+    frame._stop_openclaw_sync()
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    session_file = sessions_dir / "shared.jsonl"
+    base_time = time.time()
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-c",
+                        "timestamp": base_time + 1,
+                        "message": {"role": "user", "content": [{"type": "text", "text": "question c"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "answer-c",
+                        "timestamp": base_time + 2,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "answer c"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-d",
+                        "timestamp": base_time + 3,
+                        "message": {"role": "user", "content": [{"type": "text", "text": "question d"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "answer-d",
+                        "timestamp": base_time + 4,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "answer d"}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:webchat:a": {
+                    "sessionId": "zgwd-chat-a",
+                    "sessionFile": str(session_file),
+                    "updatedAt": 1773672821999,
+                },
+                "agent:main:webchat:b": {
+                    "sessionId": "zgwd-chat-b",
+                    "sessionFile": str(session_file),
+                    "updatedAt": 1773672822999,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_openclaw_session_id = "zgwd-chat-b"
+    frame.active_openclaw_session_file = ""
+    frame.active_openclaw_sync_offset = 0
+    frame.active_session_turns = [
+        {
+            "question": "question d",
+            "answer_md": "",
+            "model": "openclaw/main",
+            "created_at": base_time,
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-b", "title": "chat b", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "chat a",
+            "turns": [
+                {
+                    "question": "question c",
+                    "answer_md": "",
+                    "model": "openclaw/main",
+                    "created_at": base_time,
+                    "request_status": "pending",
+                }
+            ],
+            "created_at": base_time,
+            "updated_at": base_time,
+            "openclaw_session_id": "zgwd-chat-a",
+            "openclaw_session_file": "",
+            "openclaw_sync_offset": 0,
+        }
+    ]
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._sync_openclaw_once()
+
+    archived = frame._find_archived_chat("chat-a")
+    assert [(turn["question"], turn["answer_md"]) for turn in archived["turns"]] == [("question c", "answer c")]
+    assert [(turn["question"], turn["answer_md"]) for turn in frame.active_session_turns] == [("question d", "answer d")]
+
+
+def test_sync_once_updates_archived_openclaw_chat_by_session_id(frame, monkeypatch, tmp_path):
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    archived_file = sessions_dir / "chat-a.jsonl"
+    archived_file.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "a-chat-a",
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "archived reply"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:webchat:a": {
+                    "sessionId": "zgwd-chat-a",
+                    "sessionFile": str(archived_file),
+                    "updatedAt": 1773672821999,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_openclaw_session_id = "zgwd-chat-b"
+    frame.active_openclaw_session_file = ""
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-b", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "chat a",
+            "turns": [
+                {
+                    "question": "draw a",
+                    "answer_md": "",
+                    "model": "openclaw/main",
+                    "created_at": time.time(),
+                    "request_status": "pending",
+                }
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "openclaw_session_id": "zgwd-chat-a",
+            "openclaw_session_file": "",
+            "openclaw_sync_offset": 0,
+        }
+    ]
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+
+    frame._sync_openclaw_once()
+
+    archived = frame._find_archived_chat("chat-a")
+    assert archived["turns"][0]["answer_md"] == "archived reply"
+    assert archived["openclaw_session_file"] == str(archived_file)
+    assert frame.active_session_turns == []
+
+
+def test_openclaw_sync_once_does_not_schedule_ui_work_when_no_events(frame, monkeypatch, tmp_path):
+    frame._stop_openclaw_sync()
+    sessions_dir = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    active_file = sessions_dir / "active.jsonl"
+    archived_file = sessions_dir / "archived.jsonl"
+    active_file.write_text("", encoding="utf-8")
+    archived_file.write_text("", encoding="utf-8")
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:webchat:active": {
+                    "sessionId": "zgwd-active",
+                    "sessionFile": str(active_file),
+                    "updatedAt": 1773672821999,
+                },
+                "agent:main:webchat:archived": {
+                    "sessionId": "zgwd-archived",
+                    "sessionFile": str(archived_file),
+                    "updatedAt": 1773672822999,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    frame.selected_model = "openclaw/main"
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_openclaw_session_id = "zgwd-active"
+    frame.active_openclaw_session_file = str(active_file)
+    frame.active_openclaw_sync_offset = 0
+    frame.active_session_turns = [
+        {"question": "active", "answer_md": "", "model": "openclaw/main", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-archived",
+            "turns": [{"question": "archived", "answer_md": "", "model": "openclaw/main", "created_at": time.time()}],
+            "openclaw_session_id": "zgwd-archived",
+            "openclaw_session_file": str(archived_file),
+            "openclaw_sync_offset": 0,
+        }
+    ]
+    scheduled = []
+    monkeypatch.setattr(main, "resolve_openclaw_sessions_dir", lambda _agent="main": sessions_dir)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: scheduled.append((fn, a, k)))
+
+    frame._sync_openclaw_once()
+
+    assert scheduled == []
+
+
+def test_openclaw_sync_batch_no_events_does_not_save_or_refresh_ui(frame, monkeypatch):
+    frame._stop_openclaw_sync()
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_openclaw_session_id = "zgwd-active"
+    frame.active_openclaw_session_file = r"C:\tmp\active.jsonl"
+    frame.active_openclaw_sync_offset = 10
+    frame.active_session_turns = [
+        {"question": "active", "answer_md": "", "model": "openclaw/main", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    saved = {"n": 0}
+    rendered = {"n": 0}
+    histories = {"n": 0}
+    monkeypatch.setattr(frame, "_save_state", lambda: saved.__setitem__("n", saved["n"] + 1))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: rendered.__setitem__("n", rendered["n"] + 1))
+    monkeypatch.setattr(frame, "_refresh_history", lambda *a, **k: histories.__setitem__("n", histories["n"] + 1))
+
+    frame._apply_openclaw_sync_batch(
+        {
+            "session_id": "zgwd-active",
+            "session_file": r"C:\tmp\active.jsonl",
+            "offset": 10,
+            "updated_at": time.time(),
+            "previous_file": r"C:\tmp\active.jsonl",
+            "file_changed": False,
+            "session_changed": False,
+        },
+        [],
+    )
+
+    assert saved["n"] == 0
+    assert rendered["n"] == 0
+    assert histories["n"] == 0
+
+
+def test_switch_current_chat_persists_restored_openclaw_runtime(frame, monkeypatch):
+    frame._stop_openclaw_sync()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "current", "answer_md": "answer", "model": "openclaw/main", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-archived",
+            "source_chat_id": "chat-archived",
+            "title": "archived",
+            "turns": [
+                {"question": "archived q", "answer_md": "archived a", "model": "openclaw/main", "created_at": time.time()}
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "openclaw_session_key": "agent:main:main",
+            "openclaw_session_id": "zgwd-archived",
+            "openclaw_session_file": r"C:\tmp\archived.jsonl",
+            "openclaw_sync_offset": 77,
+            "openclaw_last_event_id": "evt-archived",
+            "openclaw_last_synced_at": 123.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+
+    assert frame._switch_current_chat("chat-archived") is True
+
+    data = main.json.loads(frame.state_path.read_text(encoding="utf-8"))
+    assert data["active_chat_id"] == "chat-archived"
+    assert data["active_openclaw_session_id"] == "zgwd-archived"
+    assert data["active_openclaw_session_file"] == r"C:\tmp\archived.jsonl"
+    assert data["active_openclaw_sync_offset"] == 77
 
 
 def test_apply_openclaw_sync_batch_plays_sound_for_incoming_assistant_only(frame, monkeypatch):

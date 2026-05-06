@@ -78,6 +78,9 @@ APP_STATE_FILE = "app_state.json"
 APP_WINDOW_TITLE = "神匠工坊"
 MAX_RECOVERY_ATTEMPTS = 3
 CODEX_BACKGROUND_FLUSH_DELAY_MS = 250
+CODEX_UI_EVENT_BATCH_SIZE = 25
+CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE = 5
+CODEX_UI_EVENT_BATCH_DELAY_MS = 10
 ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
 ANSWER_LIST_EXPAND_ROWS = 100
 HOTKEY_ID_SHOW = 0xA112
@@ -107,6 +110,8 @@ DEFAULT_REMOTE_CONTROL_TOKEN = "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
 DEFAULT_REMOTE_CONTROL_DOMAIN = "wss://rc.tingyou.cc/nats"
 DEFAULT_REMOTE_NATS_PORT = 4222
 REMOTE_NATS_PORT_FALLBACKS = (
+    4622,
+    4822,
     4223,
     4224,
     4522,
@@ -136,11 +141,11 @@ OBJID_CLIENT = -4
 CHILDID_SELF = 0
 
 MODEL_IDS = [
-    "openclaw/main",
     "codex/main",
     "codex/gpt-5.4-medium",
     "codex/gpt-5.3-codex-spark-high",
     "claudecode/default",
+    "openclaw/main",
     "stepfun/step-3.5-flash",
     "meta-llama/llama-3.1-8b-instruct",
     "google/gemini-3.1-pro-preview",
@@ -852,6 +857,13 @@ class ChatFrame(wx.Frame):
         self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
+        self._pending_codex_ui_events: list[tuple[str, CodexEvent]] = []
+        self._codex_ui_event_lock = threading.Lock()
+        self._codex_ui_event_flush_scheduled = False
+        self._codex_ui_event_drain_timer = None
+        self._codex_ui_batch_depth = 0
+        self._execution_list_deferred_repaint = False
+        self._execution_list_deferred_select_latest = False
         self._alt_menu_armed = False
         self._alt_menu_suppressed = False
         self.active_project_folder = ""
@@ -1056,13 +1068,13 @@ class ChatFrame(wx.Frame):
         right.Add(self.notes_content_label, 0, wx.LEFT, 10)
         right.Add(self.notes_detail_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         right.Add(self.notes_edit_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.new_chat_button.MoveAfterInTabOrder(self.input_edit)
+        self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
+        self.send_button.MoveAfterInTabOrder(self.model_combo)
+        self.notes_list_panel.MoveAfterInTabOrder(self.send_button)
         self.history_list.MoveAfterInTabOrder(self.notes_list_panel)
         self.answer_list.MoveAfterInTabOrder(self.history_list)
-        self.input_edit.MoveAfterInTabOrder(self.answer_list)
-        self.send_button.MoveAfterInTabOrder(self.input_edit)
-        self.new_chat_button.MoveAfterInTabOrder(self.send_button)
-        self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
-        self.execution_list.MoveAfterInTabOrder(self.model_combo)
+        self.execution_list.MoveAfterInTabOrder(self.answer_list)
         self.chat_root_panel.SetSizer(root)
 
         self.root_tab_order = []
@@ -1876,7 +1888,6 @@ class ChatFrame(wx.Frame):
         chat["title_source"] = source
         chat["title_updated_at"] = timestamp
         chat["title_revision"] = int(chat.get("title_revision") or 0) + 1
-        chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), timestamp)
 
     @staticmethod
     def _title_source_priority(source: str) -> int:
@@ -2940,16 +2951,34 @@ class ChatFrame(wx.Frame):
             self.execution_meta = []
         self.execution_list.Append(row_text)
         self.execution_meta.append(meta)
+        if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
+            self._execution_list_deferred_repaint = True
+            self._execution_list_deferred_select_latest = True
+            return True
         try:
             self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
         except Exception:
             pass
-        try:
-            self.execution_list.SetFocus()
-        except Exception:
-            pass
         self._request_listbox_repaint(self.execution_list)
         return True
+
+    def _flush_deferred_execution_list_updates(self) -> None:
+        if not bool(getattr(self, "_execution_list_deferred_repaint", False)):
+            return
+        self._execution_list_deferred_repaint = False
+        should_select_latest = bool(getattr(self, "_execution_list_deferred_select_latest", False))
+        self._execution_list_deferred_select_latest = False
+        if should_select_latest and hasattr(self, "execution_list") and self.execution_list.GetCount() > 0:
+            try:
+                should_select_latest = not self.execution_list.HasFocus()
+            except Exception:
+                should_select_latest = True
+        if should_select_latest and hasattr(self, "execution_list") and self.execution_list.GetCount() > 0:
+            try:
+                self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+            except Exception:
+                pass
+        self._request_listbox_repaint(self.execution_list)
 
     @staticmethod
     def _execution_step_detail_text(step) -> str:
@@ -3170,8 +3199,7 @@ class ChatFrame(wx.Frame):
         list_text = str(step.get("list_text") or "").strip()
         detail_text = self._execution_step_detail_text(step)
         if display_kind == "error":
-            detail_text = self._sanitize_execution_error_text(detail_text)
-            list_text = self._sanitize_execution_error_text(list_text)
+            return False
         hidden_status_texts = {"开始处理本轮请求", "本轮处理结束", "active", "idle"}
         normalized_detail_text = self._normalize_execution_text_for_compare(detail_text)
         normalized_list_text = self._normalize_execution_text_for_compare(list_text)
@@ -3336,6 +3364,13 @@ class ChatFrame(wx.Frame):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self._ensure_active_chat_id())
         return self.active_openclaw_session_id
 
+    def _openclaw_session_id_for_active_chat(self) -> str:
+        session_id = self._ensure_active_openclaw_session_id()
+        if isinstance(self._current_chat_state, dict):
+            self._current_chat_state["openclaw_session_key"] = self.active_openclaw_session_key
+            self._current_chat_state["openclaw_session_id"] = session_id
+        return session_id
+
     def _has_openclaw_turns(self, turns: list[dict] | None = None) -> bool:
         for turn in turns or self.active_session_turns:
             if is_openclaw_model(str(turn.get("model") or "")):
@@ -3343,7 +3378,22 @@ class ChatFrame(wx.Frame):
         return False
 
     def _is_openclaw_sync_target_active(self) -> bool:
-        return is_openclaw_model(self.selected_model) or self._has_openclaw_turns()
+        return bool(
+            self.active_openclaw_session_id
+            or self.active_openclaw_session_file
+            or self._has_openclaw_turns()
+        )
+
+    def _has_archived_openclaw_sync_targets(self) -> bool:
+        for chat in self.archived_chats:
+            if not isinstance(chat, dict):
+                continue
+            if str(chat.get("openclaw_session_id") or chat.get("openclaw_session_file") or "").strip():
+                return True
+            turns = chat.get("turns")
+            if isinstance(turns, list) and self._has_openclaw_turns(turns):
+                return True
+        return False
 
     def _reset_openclaw_sync_progress(self, clear_session_file: bool = False) -> None:
         self.active_openclaw_sync_offset = 0
@@ -3382,7 +3432,7 @@ class ChatFrame(wx.Frame):
         return None
 
     def _refresh_openclaw_sync_lifecycle(self, force_replay: bool = False) -> None:
-        if not self._is_openclaw_sync_target_active():
+        if not self._is_openclaw_sync_target_active() and not self._has_archived_openclaw_sync_targets():
             self._stop_openclaw_sync()
             return
         if force_replay:
@@ -3414,9 +3464,12 @@ class ChatFrame(wx.Frame):
                 break
 
     def _sync_openclaw_once(self) -> None:
-        if not self._is_openclaw_sync_target_active():
-            return
         sessions_json = resolve_openclaw_sessions_dir(DEFAULT_OPENCLAW_AGENT) / "sessions.json"
+        if self._is_openclaw_sync_target_active():
+            self._sync_active_openclaw_once(sessions_json)
+        self._sync_archived_openclaw_targets_once(sessions_json)
+
+    def _sync_active_openclaw_once(self, sessions_json: Path) -> None:
         pointer = None
         stored_session_file = str(self.active_openclaw_session_file or "").strip()
         session_file = stored_session_file
@@ -3447,64 +3500,322 @@ class ChatFrame(wx.Frame):
         needs_replay = file_changed or session_changed
         offset = 0 if needs_replay else previous_offset
         new_offset, events = read_session_events(session_file, offset=offset)
+        if not events and not needs_replay and new_offset == previous_offset:
+            return
         wx_call_after_if_alive(
             self._apply_openclaw_sync_batch,
-            {
-                "session_id": session_id,
-                "session_file": session_file,
-                "offset": new_offset,
-                "updated_at": updated_at,
-                "file_changed": file_changed,
-                "session_changed": session_changed,
-            },
-            events,
+                {
+                    "session_id": session_id,
+                    "session_file": session_file,
+                    "offset": new_offset,
+                    "updated_at": updated_at,
+                    "previous_file": previous_file,
+                    "file_changed": file_changed,
+                    "session_changed": session_changed,
+                },
+                events,
         )
+
+    def _sync_archived_openclaw_targets_once(self, sessions_json: Path) -> None:
+        for chat in list(self.archived_chats):
+            if not isinstance(chat, dict):
+                continue
+            turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+            session_id = str(chat.get("openclaw_session_id") or "").strip()
+            session_file = str(chat.get("openclaw_session_file") or "").strip()
+            if not session_id and not session_file and not self._has_openclaw_turns(turns):
+                continue
+            if not session_id:
+                chat_id = str(chat.get("source_chat_id") or chat.get("id") or "").strip()
+                session_id = self._make_openclaw_session_id(chat_id)
+                chat["openclaw_session_id"] = session_id
+            updated_at = 0.0
+            if session_file and not Path(session_file).exists():
+                session_file = ""
+            if not session_file:
+                pointer = load_session_pointer_by_session_id(sessions_json, session_id)
+                if pointer is None:
+                    continue
+                session_file = str(pointer.session_file or "").strip()
+                session_id = str(pointer.session_id or session_id).strip()
+                updated_at = float(pointer.updated_at or 0.0)
+            if not session_file:
+                continue
+            try:
+                previous_offset = max(int(chat.get("openclaw_sync_offset") or 0), 0)
+            except Exception:
+                previous_offset = 0
+            previous_file = str(chat.get("openclaw_session_file") or "").strip()
+            previous_session_id = str(chat.get("openclaw_session_id") or "").strip()
+            file_changed = previous_file != session_file
+            session_changed = bool(session_id and previous_session_id and previous_session_id != session_id)
+            offset = 0 if (file_changed or session_changed) else previous_offset
+            new_offset, events = read_session_events(session_file, offset=offset)
+            if not events and not file_changed and not session_changed and new_offset == previous_offset:
+                continue
+            wx_call_after_if_alive(
+                self._apply_openclaw_sync_batch,
+                {
+                    "chat_id": str(chat.get("id") or "").strip(),
+                    "session_id": session_id,
+                    "session_file": session_file,
+                    "offset": new_offset,
+                    "updated_at": updated_at,
+                    "previous_file": previous_file,
+                    "file_changed": file_changed,
+                    "session_changed": session_changed,
+                },
+                events,
+            )
 
     def _apply_openclaw_sync_batch(self, sync_state: dict, events: list[OpenClawSyncEvent]) -> None:
         changed = False
+        had_input_events = bool(events)
+        chat_id = str(sync_state.get("chat_id") or "").strip()
+        active_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip(), ""}
+        is_active_target = chat_id in active_ids
+        target_chat = self._current_chat_state if is_active_target else self._find_archived_chat(chat_id)
+        if not isinstance(target_chat, dict):
+            return
+        target_turns = self.active_session_turns if is_active_target else target_chat.get("turns")
+        if not isinstance(target_turns, list):
+            target_turns = []
+            target_chat["turns"] = target_turns
+        events = self._filter_openclaw_initial_sync_events(sync_state, events, target_turns)
+        events = self._filter_openclaw_events_for_local_turns(events, target_turns)
         file_changed = bool(sync_state.get("file_changed"))
         session_changed = bool(sync_state.get("session_changed"))
-        had_prior_sync = bool(self.active_openclaw_last_synced_at or self.active_openclaw_session_file)
+        current_offset = int(self.active_openclaw_sync_offset or 0) if is_active_target else int(target_chat.get("openclaw_sync_offset") or 0)
+        next_offset = int(sync_state.get("offset") or current_offset or 0)
+        if not had_input_events and not file_changed and not session_changed and next_offset == current_offset:
+            return
+        had_prior_sync = bool(
+            self.active_openclaw_last_synced_at or self.active_openclaw_session_file
+        ) if is_active_target else bool(target_chat.get("openclaw_last_synced_at") or target_chat.get("openclaw_session_file"))
         assistant_changed = False
         if file_changed or session_changed:
-            self.active_openclaw_session_file = str(sync_state.get("session_file") or "").strip()
-            self.active_openclaw_sync_offset = 0
-            self.active_openclaw_last_event_id = ""
+            if is_active_target:
+                self.active_openclaw_session_file = str(sync_state.get("session_file") or "").strip()
+                self.active_openclaw_sync_offset = 0
+                self.active_openclaw_last_event_id = ""
+            target_chat["openclaw_session_file"] = str(sync_state.get("session_file") or "").strip()
+            target_chat["openclaw_sync_offset"] = 0
+            target_chat["openclaw_last_event_id"] = ""
         session_id = str(sync_state.get("session_id") or "").strip()
         if session_id:
-            self.active_openclaw_session_id = session_id
-        self.active_openclaw_session_file = str(sync_state.get("session_file") or self.active_openclaw_session_file).strip()
+            target_chat["openclaw_session_id"] = session_id
+            if is_active_target:
+                self.active_openclaw_session_id = session_id
+        session_file = str(sync_state.get("session_file") or target_chat.get("openclaw_session_file") or "").strip()
+        target_chat["openclaw_session_file"] = session_file
+        if is_active_target:
+            self.active_openclaw_session_file = session_file
         for event in events:
-            result = self._apply_openclaw_sync_event(event)
+            result = self._apply_openclaw_sync_event(event, target_turns, chat_id if chat_id else self.active_chat_id, is_active_target)
             if result == "visible":
                 changed = True
                 if event.role == "assistant":
                     assistant_changed = True
-        self.active_openclaw_sync_offset = int(sync_state.get("offset") or self.active_openclaw_sync_offset or 0)
-        self.active_openclaw_last_synced_at = time.time()
+        sync_offset = next_offset
+        target_chat["openclaw_sync_offset"] = sync_offset
+        target_chat["openclaw_last_synced_at"] = time.time()
+        if is_active_target:
+            self.active_openclaw_sync_offset = sync_offset
+            self.active_openclaw_last_synced_at = target_chat["openclaw_last_synced_at"]
         if events:
-            self.active_openclaw_last_event_id = str(events[-1].event_id or self.active_openclaw_last_event_id)
+            last_event_id = str(events[-1].event_id or target_chat.get("openclaw_last_event_id") or "")
+            target_chat["openclaw_last_event_id"] = last_event_id
+            if is_active_target:
+                self.active_openclaw_last_event_id = last_event_id
         if changed:
             should_render = assistant_changed
-            if self.view_mode == "active" and should_render:
+            target_chat["updated_at"] = time.time()
+            if is_active_target and self.view_mode == "active" and should_render:
                 self._render_answer_list()
             self.SetStatusText("已同步 OpenClaw 主会话")
-            if assistant_changed and had_prior_sync:
+            if is_active_target and assistant_changed and had_prior_sync:
                 self._play_finish_sound()
         self._save_state()
 
-    def _apply_openclaw_sync_event(self, event: OpenClawSyncEvent) -> str:
+    def _filter_openclaw_initial_sync_events(
+        self,
+        sync_state: dict,
+        events: list[OpenClawSyncEvent],
+        target_turns: list[dict],
+    ) -> list[OpenClawSyncEvent]:
+        if not events or not bool(sync_state.get("file_changed")):
+            return events
+        previous_file = str(sync_state.get("previous_file") or "").strip()
+        if previous_file:
+            return events
+        local_created_times = []
+        for turn in target_turns:
+            if not isinstance(turn, dict):
+                continue
+            if not is_openclaw_model(str(turn.get("model") or "")):
+                continue
+            if str(turn.get("origin") or turn.get("question_origin") or "").strip() == "openclaw-sync":
+                continue
+            try:
+                created_at = float(turn.get("created_at") or 0.0)
+            except Exception:
+                created_at = 0.0
+            if created_at > 0:
+                local_created_times.append(created_at)
+        if not local_created_times:
+            return events
+        cutoff = min(local_created_times) - 30.0
+        return [event for event in events if float(event.timestamp or 0.0) >= cutoff]
+
+    def _filter_openclaw_events_for_local_turns(
+        self,
+        events: list[OpenClawSyncEvent],
+        target_turns: list[dict],
+    ) -> list[OpenClawSyncEvent]:
+        if not events:
+            return events
+        local_turn_indexes = [
+            idx
+            for idx, turn in enumerate(target_turns)
+            if self._is_local_openclaw_turn(turn)
+        ]
+        if not local_turn_indexes:
+            return events
+        has_user_events = any(event.role == "user" for event in events)
+        filtered: list[OpenClawSyncEvent] = []
+        awaiting_answer_idx: int | None = None
+        for event in events:
+            if event.role == "user":
+                match_idx = self._matching_local_openclaw_user_turn(event, target_turns, local_turn_indexes)
+                if match_idx is None:
+                    awaiting_answer_idx = None
+                    continue
+                filtered.append(event)
+                awaiting_answer_idx = match_idx
+                continue
+            if event.role != "assistant":
+                continue
+            metadata_idx = self._matching_local_openclaw_assistant_metadata_turn(event, target_turns, local_turn_indexes)
+            if metadata_idx is not None:
+                filtered.append(event)
+                continue
+            if awaiting_answer_idx is not None and self._can_openclaw_turn_accept_assistant(target_turns[awaiting_answer_idx], event):
+                filtered.append(event)
+                awaiting_answer_idx = None
+                continue
+            if not has_user_events:
+                match_idx = self._pending_local_openclaw_answer_turn(event, target_turns, local_turn_indexes)
+                if match_idx is not None:
+                    filtered.append(event)
+        return filtered
+
+    def _is_local_openclaw_turn(self, turn: dict) -> bool:
+        if not isinstance(turn, dict):
+            return False
+        if not is_openclaw_model(str(turn.get("model") or "")):
+            return False
+        if not str(turn.get("question") or "").strip():
+            return False
+        origin = str(turn.get("origin") or turn.get("question_origin") or "").strip()
+        return origin != "openclaw-sync"
+
+    def _matching_local_openclaw_user_turn(
+        self,
+        event: OpenClawSyncEvent,
+        target_turns: list[dict],
+        local_turn_indexes: list[int],
+    ) -> int | None:
+        normalized = self._normalized_turn_text(event.text)
+        event_ts = float(event.timestamp or time.time())
+        for idx in local_turn_indexes:
+            turn = target_turns[idx]
+            if self._normalized_turn_text(str(turn.get("question") or "")) != normalized:
+                continue
+            existing_id = str(turn.get("question_external_event_id") or "").strip()
+            if existing_id and existing_id != str(event.event_id or "").strip():
+                continue
+            try:
+                created_at = float(turn.get("created_at") or 0.0)
+            except Exception:
+                created_at = 0.0
+            if created_at and abs(created_at - event_ts) > 120:
+                continue
+            return idx
+        return None
+
+    def _matching_local_openclaw_assistant_metadata_turn(
+        self,
+        event: OpenClawSyncEvent,
+        target_turns: list[dict],
+        local_turn_indexes: list[int],
+    ) -> int | None:
+        normalized = self._normalized_turn_text(event.text)
+        event_ts = float(event.timestamp or time.time())
+        for idx in reversed(local_turn_indexes):
+            turn = target_turns[idx]
+            existing_id = str(turn.get("answer_external_event_id") or "").strip()
+            if existing_id and existing_id != str(event.event_id or "").strip():
+                continue
+            answer = self._normalized_turn_text(str(turn.get("answer_md") or ""))
+            if answer != normalized:
+                continue
+            try:
+                created_at = float(turn.get("created_at") or 0.0)
+            except Exception:
+                created_at = 0.0
+            if created_at and abs(created_at - event_ts) > 120:
+                continue
+            return idx
+        return None
+
+    def _pending_local_openclaw_answer_turn(
+        self,
+        event: OpenClawSyncEvent,
+        target_turns: list[dict],
+        local_turn_indexes: list[int],
+    ) -> int | None:
+        event_ts = float(event.timestamp or time.time())
+        for idx in reversed(local_turn_indexes):
+            turn = target_turns[idx]
+            if not self._can_openclaw_turn_accept_assistant(turn, event):
+                continue
+            try:
+                created_at = float(turn.get("created_at") or 0.0)
+            except Exception:
+                created_at = 0.0
+            if created_at and event_ts < created_at - 30:
+                continue
+            return idx
+        return None
+
+    def _can_openclaw_turn_accept_assistant(self, turn: dict, event: OpenClawSyncEvent) -> bool:
+        if not isinstance(turn, dict):
+            return False
+        existing_id = str(turn.get("answer_external_event_id") or "").strip()
+        if existing_id and existing_id != str(event.event_id or "").strip():
+            return False
+        answer_md = str(turn.get("answer_md") or "")
+        return answer_md in {"", REQUESTING_TEXT} or ((not existing_id) and answer_md.startswith("OpenClaw "))
+
+    def _apply_openclaw_sync_event(
+        self,
+        event: OpenClawSyncEvent,
+        target_turns: list[dict] | None = None,
+        chat_id: str = "",
+        is_active_target: bool = True,
+    ) -> str:
+        turns = target_turns if isinstance(target_turns, list) else self.active_session_turns
         event_id = str(event.event_id or "").strip()
-        if event_id and self._has_openclaw_event_id(event_id):
+        if event_id and self._has_openclaw_event_id(event_id, turns):
             return ""
         text = remove_emojis(normalize_openclaw_text(event.text))
         if not text:
             return ""
         if event.role == "user":
-            merged = self._merge_openclaw_user_event(text, event)
+            merged = self._merge_openclaw_user_event(text, event, turns)
             if merged:
                 return merged
-            self.active_session_turns.append(
+            turns.append(
                 {
                     "question": text,
                     "answer_md": "",
@@ -3519,16 +3830,17 @@ class ChatFrame(wx.Frame):
                     "question_external_timestamp": float(event.timestamp or time.time()),
                 }
             )
-            self._apply_nonrecoverable_turn_metadata(self.active_session_turns[-1], "openclaw/main", text)
-            self.active_turn_idx = len(self.active_session_turns) - 1
-            if len([turn for turn in self.active_session_turns if str((turn or {}).get("question") or "").strip()]) == 1:
-                self._schedule_first_question_auto_title(self.active_chat_id or self.current_chat_id, text)
+            self._apply_nonrecoverable_turn_metadata(turns[-1], "openclaw/main", text)
+            if is_active_target:
+                self.active_turn_idx = len(turns) - 1
+            if len([turn for turn in turns if str((turn or {}).get("question") or "").strip()]) == 1:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id or self.current_chat_id, text)
             return "visible"
 
-        merged = self._merge_openclaw_assistant_event(text, event)
+        merged = self._merge_openclaw_assistant_event(text, event, turns, is_active_target)
         if merged:
             return merged
-        self.active_session_turns.append(
+        turns.append(
             {
                 "question": "",
                 "answer_md": text,
@@ -3543,15 +3855,16 @@ class ChatFrame(wx.Frame):
                 "answer_external_timestamp": float(event.timestamp or time.time()),
             }
         )
-        self._apply_nonrecoverable_turn_metadata(self.active_session_turns[-1], "openclaw/main", "")
-        self.active_turn_idx = len(self.active_session_turns) - 1
+        self._apply_nonrecoverable_turn_metadata(turns[-1], "openclaw/main", "")
+        if is_active_target:
+            self.active_turn_idx = len(turns) - 1
         return "visible"
 
-    def _has_openclaw_event_id(self, event_id: str) -> bool:
+    def _has_openclaw_event_id(self, event_id: str, turns: list[dict] | None = None) -> bool:
         eid = str(event_id or "").strip()
         if not eid:
             return False
-        for turn in self.active_session_turns:
+        for turn in turns if isinstance(turns, list) else self.active_session_turns:
             if eid in {
                 str(turn.get("external_event_id") or "").strip(),
                 str(turn.get("question_external_event_id") or "").strip(),
@@ -3577,11 +3890,12 @@ class ChatFrame(wx.Frame):
         turn["request_error"] = ""
         turn["request_recovered_after_restart"] = False
 
-    def _merge_openclaw_user_event(self, text: str, event: OpenClawSyncEvent) -> str:
+    def _merge_openclaw_user_event(self, text: str, event: OpenClawSyncEvent, turns: list[dict] | None = None) -> str:
+        target_turns = turns if isinstance(turns, list) else self.active_session_turns
         normalized = self._normalized_turn_text(text)
         event_ts = float(event.timestamp or time.time())
-        for idx in range(len(self.active_session_turns) - 1, -1, -1):
-            turn = self.active_session_turns[idx]
+        for idx in range(len(target_turns) - 1, -1, -1):
+            turn = target_turns[idx]
             question = self._normalized_turn_text(str(turn.get("question") or ""))
             if not question:
                 continue
@@ -3607,12 +3921,19 @@ class ChatFrame(wx.Frame):
             return "metadata"
         return ""
 
-    def _merge_openclaw_assistant_event(self, text: str, event: OpenClawSyncEvent) -> str:
+    def _merge_openclaw_assistant_event(
+        self,
+        text: str,
+        event: OpenClawSyncEvent,
+        turns: list[dict] | None = None,
+        is_active_target: bool = True,
+    ) -> str:
+        target_turns = turns if isinstance(turns, list) else self.active_session_turns
         normalized = self._normalized_turn_text(text)
         event_ts = float(event.timestamp or time.time())
         event_id = str(event.event_id or "").strip()
-        for idx in range(len(self.active_session_turns) - 1, -1, -1):
-            turn = self.active_session_turns[idx]
+        for idx in range(len(target_turns) - 1, -1, -1):
+            turn = target_turns[idx]
             answer_md = str(turn.get("answer_md") or "")
             answer = self._normalized_turn_text("" if answer_md == REQUESTING_TEXT else answer_md)
             existing_id = str(turn.get("answer_external_event_id") or "").strip()
@@ -3631,7 +3952,8 @@ class ChatFrame(wx.Frame):
                     turn["created_at"] = event_ts
                 if "request_status" not in turn:
                     self._apply_nonrecoverable_turn_metadata(turn, "openclaw/main", "")
-                self.active_turn_idx = idx
+                if is_active_target:
+                    self.active_turn_idx = idx
                 return "visible"
             if answer == normalized and (not existing_id) and abs(created_at - event_ts) <= 60:
                 turn["answer_external_event_id"] = event_id
@@ -3641,7 +3963,8 @@ class ChatFrame(wx.Frame):
                 turn["external_timestamp"] = event_ts
                 if "request_status" not in turn:
                     self._apply_nonrecoverable_turn_metadata(turn, "openclaw/main", str(turn.get("question") or ""))
-                self.active_turn_idx = idx
+                if is_active_target:
+                    self.active_turn_idx = idx
                 return "metadata"
         return ""
 
@@ -4768,7 +5091,6 @@ class ChatFrame(wx.Frame):
         chat["title_source"] = incoming_source
         chat["title_updated_at"] = incoming_updated_at
         chat["title_revision"] = resolved_revision
-        chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), incoming_updated_at)
         self._save_state()
         self._refresh_history(chat_id)
         self._push_remote_history_changed(chat_id)
@@ -4811,7 +5133,63 @@ class ChatFrame(wx.Frame):
             return
         if not self._is_ui_alive():
             return
-        self._call_after_if_alive(self._on_codex_event_for_chat, chat_id, event)
+        should_schedule = False
+        with self._codex_ui_event_lock:
+            self._pending_codex_ui_events.append((str(chat_id or "").strip(), event))
+            if not self._codex_ui_event_flush_scheduled:
+                self._codex_ui_event_flush_scheduled = True
+                should_schedule = True
+        if should_schedule and not self._call_after_if_alive(self._drain_codex_ui_events):
+            with self._codex_ui_event_lock:
+                self._codex_ui_event_flush_scheduled = False
+
+    def _drain_codex_ui_events(self) -> None:
+        batch_size = self._codex_ui_event_batch_size()
+        with self._codex_ui_event_lock:
+            batch = self._pending_codex_ui_events[:batch_size]
+            del self._pending_codex_ui_events[: len(batch)]
+            has_more = bool(self._pending_codex_ui_events)
+            self._codex_ui_event_flush_scheduled = has_more
+        self._codex_ui_batch_depth += 1
+        try:
+            for queued_chat_id, queued_event in batch:
+                self._on_codex_event_for_chat(queued_chat_id, queued_event)
+        finally:
+            self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
+            self._flush_deferred_execution_list_updates()
+        if has_more:
+            self._codex_ui_event_drain_timer = self._call_later_if_alive(
+                CODEX_UI_EVENT_BATCH_DELAY_MS,
+                self._drain_codex_ui_events,
+            )
+            if self._codex_ui_event_drain_timer is None and not self._call_after_if_alive(self._drain_codex_ui_events):
+                with self._codex_ui_event_lock:
+                    self._codex_ui_event_flush_scheduled = False
+        else:
+            self._codex_ui_event_drain_timer = None
+
+    def _codex_ui_event_batch_size(self) -> int:
+        if self._primary_navigation_control_has_focus():
+            return max(1, min(CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE, CODEX_UI_EVENT_BATCH_SIZE))
+        return CODEX_UI_EVENT_BATCH_SIZE
+
+    def _primary_navigation_control_has_focus(self) -> bool:
+        controls = [
+            getattr(self, "execution_list", None),
+            getattr(self, "answer_list", None),
+            getattr(self, "history_list", None),
+            getattr(self, "input_edit", None),
+            getattr(self, "model_combo", None),
+        ]
+        for control in controls:
+            if control is None:
+                continue
+            try:
+                if control.HasFocus():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _on_codex_event(self, event: CodexEvent) -> None:
         self._on_codex_event_for_chat(self._resolve_codex_event_chat_id(event), event)
@@ -4840,6 +5218,13 @@ class ChatFrame(wx.Frame):
             resolved_chat_id = self._resolve_codex_event_chat_id(event)
             if resolved_chat_id and resolved_chat_id != chat_id:
                 chat_id = resolved_chat_id
+        if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id}:
+            active_event_matches = (
+                (event_turn_id and event_turn_id == str(getattr(self, "active_codex_turn_id", "") or "").strip())
+                or (event_thread_id and event_thread_id == str(getattr(self, "active_codex_thread_id", "") or "").strip())
+            )
+            if active_event_matches:
+                chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
@@ -4859,10 +5244,7 @@ class ChatFrame(wx.Frame):
                     self._refresh_visible_history_chat(chat_id)
                 else:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
-                self._codex_background_flush_dirty = True
-                if not getattr(self, "_codex_background_flush_scheduled", False):
-                    self._codex_background_flush_scheduled = True
-                    self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
+                self._defer_codex_state_save()
                 return
             if execution_entry:
                 self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
@@ -4884,10 +5266,7 @@ class ChatFrame(wx.Frame):
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     target_chat["updated_at"] = time.time()
                 self._refresh_visible_history_chat(chat_id)
-            self._codex_background_flush_dirty = True
-            if not getattr(self, "_codex_background_flush_scheduled", False):
-                self._codex_background_flush_scheduled = True
-                self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
+            self._defer_codex_state_save()
             return
         if event_type == "agent_message_delta":
             self._buffer_execution_delta(chat_id, event)
@@ -4910,7 +5289,7 @@ class ChatFrame(wx.Frame):
                     self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
                     if self.view_mode == "active":
                         self._refresh_answer_list_preserving_selection()
-                self._save_state()
+                self._defer_codex_state_save()
             return
         if event_type == "server_request":
             self.active_codex_pending_request = None
@@ -4946,7 +5325,7 @@ class ChatFrame(wx.Frame):
                     self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
             return
         if appended_execution_step and not str(getattr(event, "text", "") or "").strip():
-            self._save_state()
+            self._defer_codex_state_save()
         if event_type in {"item_completed", "agent_message_delta", "plan_updated", "diff_updated", "stderr", "turn_started", "item_started"}:
             self.active_codex_latest_assistant_text = str(event.text or "")
             self.active_codex_latest_assistant_phase = str(event.phase or "")
@@ -4965,7 +5344,7 @@ class ChatFrame(wx.Frame):
                             "source": "codex",
                         }
                         if self._record_received_attachment(self.active_session_turns[target_idx], attachment):
-                            self._save_state()
+                            self._defer_codex_state_save()
                             self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event_type == "item_completed" and str(event.phase or "") == "final_answer":
@@ -4993,8 +5372,17 @@ class ChatFrame(wx.Frame):
                     elif not str(turn.get("answer_md") or "").strip():
                         turn["answer_md"] = REQUESTING_TEXT
                     self._update_active_answer_row(target_idx)
-                self._save_state()
+                self._defer_codex_state_save()
             return
+
+    def _defer_codex_state_save(self) -> None:
+        self._codex_background_flush_dirty = True
+        if getattr(self, "_codex_background_flush_scheduled", False):
+            return
+        self._codex_background_flush_scheduled = True
+        timer = self._call_later_if_alive(CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates)
+        if timer is None and not self._call_after_if_alive(self._flush_codex_background_updates):
+            self._flush_codex_background_updates()
 
     def _flush_codex_background_updates(self) -> None:
         self._codex_background_flush_scheduled = False
@@ -5235,7 +5623,12 @@ class ChatFrame(wx.Frame):
                     process.start()
                 except Exception as exc:
                     message = str(exc or "").lower()
-                    if "already in use" not in message:
+                    if (
+                        "already in use" not in message
+                        and "access permissions" not in message
+                        and "forbidden by its access permissions" not in message
+                        and "unavailable for binding" not in message
+                    ):
                         raise
                     process = None
                     if attempt_idx > 0:
@@ -5268,7 +5661,14 @@ class ChatFrame(wx.Frame):
                         process.stop()
                     except Exception:
                         pass
-                if reused_existing_runtime or "already in use" in str(exc or "").lower():
+                message = str(exc or "").lower()
+                if (
+                    reused_existing_runtime
+                    or "already in use" in message
+                    or "access permissions" in message
+                    or "forbidden by its access permissions" in message
+                    or "unavailable for binding" in message
+                ):
                     websocket_port = preferred_websocket_port
                     self._remote_nats_websocket_port = websocket_port
                     continue
@@ -5859,6 +6259,8 @@ class ChatFrame(wx.Frame):
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
+        ctrl_down = self._event_control_down(event)
+        alt_down = self._event_alt_down(event)
         notes_has_focus = bool(
             getattr(self, "notes_notebook_list", None)
             and (
@@ -5867,11 +6269,20 @@ class ChatFrame(wx.Frame):
                 or self.notes_editor.HasFocus()
             )
         )
-        if key == wx.WXK_ALT and event.AltDown() and not event.ControlDown():
+        if key == wx.WXK_ALT and alt_down and not ctrl_down:
             self._arm_tools_menu_open()
             return
         self._suppress_tools_menu_open()
-        if self._handle_window_focus_shortcut(key, event.AltDown(), event.ControlDown()):
+        if (
+            ctrl_down
+            and not alt_down
+            and key in (ord("C"), ord("c"))
+            and hasattr(self, "answer_list")
+            and self.answer_list.HasFocus()
+            and self._copy_selected_answer_to_clipboard()
+        ):
+            return
+        if self._handle_window_focus_shortcut(key, alt_down, ctrl_down):
             return
         if (
             key == wx.WXK_MENU
@@ -5882,47 +6293,65 @@ class ChatFrame(wx.Frame):
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             and notes_has_focus
-            and not event.ControlDown()
-            and not event.AltDown()
+            and not ctrl_down
+            and not alt_down
         ):
             self._on_notes_key_down(event)
             return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             and self.history_list.HasFocus()
-            and not event.ControlDown()
-            and not event.AltDown()
+            and not ctrl_down
+            and not alt_down
         ):
             if self._activate_selected_history():
                 return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             and self.answer_list.HasFocus()
-            and not event.ControlDown()
-            and not event.AltDown()
+            and not ctrl_down
+            and not alt_down
         ):
             if self._try_open_selected_answer_detail():
                 return
-        if key == wx.WXK_F1 and not notes_has_focus and not event.ControlDown() and not event.AltDown():
+        if key == wx.WXK_F1 and not notes_has_focus and not ctrl_down and not alt_down:
             self._toggle_detail_panel_mode()
             return
-        if self._is_continue_shortcut(key, event.AltDown()):
+        if self._is_continue_shortcut(key, alt_down):
             self._submit_question("继续", source="local")
             return
-        if event.ControlDown() and key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+        if ctrl_down and key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             direction = -1 if key == wx.WXK_LEFT else 1
             if self._navigate_history_chats(direction):
                 return
-        if self._is_send_shortcut(key, event.ControlDown(), event.AltDown()):
+        if self._is_send_shortcut(key, ctrl_down, alt_down):
             if self.input_edit.HasFocus():
                 event.Skip()
                 return
             self._trigger_send()
             return
-        if self._is_new_chat_shortcut(key, event.AltDown()):
+        if self._is_new_chat_shortcut(key, alt_down):
             self._trigger_new_chat()
             return
         event.Skip()
+
+    def _event_control_down(self, event) -> bool:
+        ctrl_down = getattr(event, "ControlDown", None)
+        if callable(ctrl_down) and bool(ctrl_down()):
+            return True
+        try:
+            return bool(wx.GetKeyState(wx.WXK_CONTROL))
+        except Exception:
+            return False
+
+    def _event_alt_down(self, event) -> bool:
+        alt_down = getattr(event, "AltDown", None)
+        if callable(alt_down) and bool(alt_down()):
+            return True
+        try:
+            return bool(wx.GetKeyState(wx.WXK_ALT))
+        except Exception:
+            return False
 
     def _is_real_escape_keydown(self, event) -> bool:
         ctrl_down = getattr(event, "ControlDown", None)
@@ -6338,7 +6767,7 @@ class ChatFrame(wx.Frame):
             return True, ""
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
-            self._ensure_active_openclaw_session_id()
+            openclaw_session_id = self._openclaw_session_id_for_active_chat()
             now = time.time()
             turn = {
                 "question": display_question,
@@ -6348,6 +6777,7 @@ class ChatFrame(wx.Frame):
                 "origin": "local" if source == "local" else source,
                 "question_origin": "local" if source == "local" else source,
                 "attachments": outgoing_attachments,
+                "openclaw_session_id": openclaw_session_id,
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
@@ -6368,7 +6798,11 @@ class ChatFrame(wx.Frame):
             self.view_history_id = None
             self._active_answer_row_index = -1
             self._refresh_openclaw_sync_lifecycle()
-            threading.Thread(target=self._worker, args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id), daemon=True).start()
+            threading.Thread(
+                target=self._worker,
+                args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id, openclaw_session_id),
+                daemon=True,
+            ).start()
             return True, ""
 
         turn_idx = len(self.active_session_turns)
@@ -6743,19 +7177,23 @@ class ChatFrame(wx.Frame):
             "last_success": None,
             "last_error": "",
         }
+        errors = []
         try:
             ok = bool(self._zdsr_tts.speak(content))
         except Exception as exc:
-            self.voice_screen_reader_status = {
-                "last_text": content,
-                "last_success": False,
-                "last_error": str(exc),
-            }
-            return
+            ok = False
+            errors.append(str(exc))
+        if not ok:
+            try:
+                self._zdsr_tts = ZDSRTTSClient()
+                ok = bool(self._zdsr_tts.speak(content))
+            except Exception as exc:
+                ok = False
+                errors.append(str(exc))
         self.voice_screen_reader_status = {
             "last_text": content,
             "last_success": ok,
-            "last_error": "" if ok else "speak returned false",
+            "last_error": "" if ok else ("; ".join(err for err in errors if err) or "speak returned false"),
         }
 
     def _is_model_endpoint_unavailable_error(self, model: str, error_text: str) -> bool:
@@ -6777,7 +7215,16 @@ class ChatFrame(wx.Frame):
                 out.append(m)
         return out
 
-    def _worker(self, api_key: str, turn_idx: int, question: str, model: str, from_recovery: bool = False, chat_id: str = ""):
+    def _worker(
+        self,
+        api_key: str,
+        turn_idx: int,
+        question: str,
+        model: str,
+        from_recovery: bool = False,
+        chat_id: str = "",
+        openclaw_session_id: str = "",
+    ):
         full = ""
         err = ""
         used_model = model
@@ -6786,7 +7233,7 @@ class ChatFrame(wx.Frame):
         skip_done = False
         try:
             if is_openclaw_model(model):
-                session_id = self._ensure_active_openclaw_session_id()
+                session_id = str(openclaw_session_id or "").strip() or self._ensure_active_openclaw_session_id()
                 c = OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
                 last_context_usage = getattr(c, "last_context_usage", None)
@@ -7188,18 +7635,20 @@ class ChatFrame(wx.Frame):
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
+        if is_openclaw_model(self.selected_model):
+            self._openclaw_session_id_for_active_chat()
         self._refresh_history(archived["id"] if archived else None)
         self._render_answer_list()
         self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
+        self._save_state()
+        self._refresh_openclaw_sync_lifecycle()
         self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
         key = event.GetKeyCode()
-        ctrl_down = getattr(event, "ControlDown", None)
-        alt_down = getattr(event, "AltDown", None)
-        ctrl = bool(ctrl_down()) if callable(ctrl_down) else False
-        alt = bool(alt_down()) if callable(alt_down) else False
+        ctrl = self._event_control_down(event)
+        alt = self._event_alt_down(event)
         if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
             if self._move_answer_list_selection_for_key(key):
                 return
@@ -7213,22 +7662,33 @@ class ChatFrame(wx.Frame):
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             event.Skip()
             return
-        item_type, turn_idx, plain, _ = self.answer_meta[idx]
         if ctrl and key in (ord("C"), ord("c")):
-            if item_type in ("question", "answer") and wx.TheClipboard.Open():
-                # 去除多余空行：将连续的空行替换为单个空行
-                source_text = _ if item_type == "answer" and _ else plain
-                cleaned_text = "\n".join(line for line in str(source_text).split("\n") if line.strip())
-                wx.TheClipboard.SetData(wx.TextDataObject(cleaned_text))
-                wx.TheClipboard.Close()
-                self.SetStatusText("已复制")
-            # 阻止事件传播，保持焦点不变
-            event.StopPropagation()
+            self._copy_selected_answer_to_clipboard()
+            stop_propagation = getattr(event, "StopPropagation", None)
+            if callable(stop_propagation):
+                stop_propagation()
             return
+        item_type, turn_idx, plain, _ = self.answer_meta[idx]
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             if self._try_open_selected_answer_detail():
                 return
         event.Skip()
+
+    def _copy_selected_answer_to_clipboard(self) -> bool:
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
+            return False
+        item_type, _turn_idx, plain, detail = self.answer_meta[idx]
+        if item_type not in ("question", "answer"):
+            return False
+        source_text = detail if item_type == "answer" and detail else plain
+        cleaned_text = "\n".join(line for line in str(source_text).split("\n") if line.strip())
+        if not cleaned_text:
+            return False
+        if not self._set_clipboard_text(cleaned_text):
+            return False
+        self.SetStatusText("已复制")
+        return True
 
     def _move_answer_list_selection_for_key(self, key: int) -> bool:
         count = self.answer_list.GetCount()
@@ -7247,6 +7707,8 @@ class ChatFrame(wx.Frame):
             new_idx = count - 1
         else:
             return False
+        if new_idx == idx:
+            return True
         self.answer_list.SetSelection(new_idx)
         try:
             self.answer_list.SetFocus()
@@ -7580,6 +8042,9 @@ class ChatFrame(wx.Frame):
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         self._reset_answer_visible_row_limit()
         self._render_answer_list()
+        self._refresh_openclaw_sync_lifecycle()
+        self._refresh_history(chat_id)
+        self._save_state()
         return True
 
     def _show_history_menu(self):
@@ -7700,13 +8165,13 @@ class ChatFrame(wx.Frame):
         detail_target = self._current_detail_tab_target()
         secondary_detail_target = self.execution_list if detail_target is self.answer_list else self.answer_list
         ordered_controls = [
+            self.input_edit,
+            self.new_chat_button,
+            self.model_combo,
+            self.send_button,
             primary_notes_ctrl,
             self.history_list,
             detail_target,
-            self.input_edit,
-            self.send_button,
-            self.new_chat_button,
-            self.model_combo,
             secondary_detail_target,
             self.notes_notebook_list,
             self.notes_entry_list,
@@ -7721,7 +8186,7 @@ class ChatFrame(wx.Frame):
             seen.add(marker)
             root_tab_order.append(ctrl)
         self.root_tab_order = root_tab_order
-        self.chat_tab_order = root_tab_order[:8]
+        self.chat_tab_order = root_tab_order[:7]
         self.notes_tab_order = [primary_notes_ctrl] + [
             ctrl
             for ctrl in (self.notes_notebook_list, self.notes_entry_list, self.notes_editor)
@@ -7734,15 +8199,19 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
         try:
-            primary_notes_panel.MoveAfterInTabOrder(self.history_list)
+            primary_notes_panel.MoveAfterInTabOrder(self.send_button)
         except Exception:
             pass
         try:
-            detail_target.MoveAfterInTabOrder(primary_notes_panel)
+            primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
         except Exception:
             pass
         try:
-            self.input_edit.MoveAfterInTabOrder(detail_target)
+            self.history_list.MoveAfterInTabOrder(primary_notes_ctrl)
+        except Exception:
+            pass
+        try:
+            detail_target.MoveAfterInTabOrder(self.history_list)
         except Exception:
             pass
 

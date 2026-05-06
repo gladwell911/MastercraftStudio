@@ -97,6 +97,8 @@ class NatsServerProcess:
 
         if self._port_accepts_connections():
             raise RuntimeError(f"NATS port {self.config.port} is already in use")
+        if not self._port_can_bind():
+            raise RuntimeError(f"NATS port {self.config.port} is unavailable for binding")
 
         popen_kwargs: dict[str, object] = {
             "stdin": subprocess.DEVNULL,
@@ -158,6 +160,18 @@ class NatsServerProcess:
     def _port_accepts_connections(self) -> bool:
         try:
             with socket.create_connection(("127.0.0.1", self.config.port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+    def _port_can_bind(self) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if os.name == "nt":
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                else:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.config.host, self.config.port))
                 return True
         except OSError:
             return False

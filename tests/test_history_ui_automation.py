@@ -1,12 +1,42 @@
 import main
 
 
+def _focused_control():
+    return main.wx.Window.FindFocus()
+
+
 class _EnterEvent:
     def GetKeyCode(self):
         return main.wx.WXK_RETURN
 
     def Skip(self):
         return None
+
+
+def test_ui_automation_primary_tab_sequence_matches_screen_reader_order(frame, wx_app):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("tab order")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame._current_chat_state["detail_panel_mode"] = "answers"
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    wx_app.Yield()
+
+    expected = [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.send_button,
+        frame.notes_notebook_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
+
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    for control in expected:
+        assert _focused_control() is control
+        assert _focused_control().Navigate(main.wx.NavigationKeyEvent.IsForward)
+        wx_app.Yield()
 
 
 def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, monkeypatch):
@@ -17,10 +47,10 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     frame._current_chat_state.update(
         {
             "id": "chat-current",
-            "title": "褰撳墠鑱婂ぉ",
+            "title": "current chat",
             "turns": [
                 {
-                    "question": "褰撳墠闂",
+                    "question": "current pending question",
                     "answer_md": main.REQUESTING_TEXT,
                     "model": "openai/gpt-5.2",
                     "created_at": 4.0,
@@ -33,11 +63,18 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     frame.archived_chats = [
         {
             "id": "hist-1",
-            "title": "鍘嗗彶浼氳瘽",
+            "title": "history chat",
             "pinned": False,
             "created_at": 1.0,
             "updated_at": 1.0,
-            "turns": [{"question": "鍘嗗彶闂", "answer_md": "鍘嗗彶鍥炵瓟", "model": "openai/gpt-5.2", "created_at": 1.0}],
+            "turns": [
+                {
+                    "question": "history question",
+                    "answer_md": "history answer",
+                    "model": "openai/gpt-5.2",
+                    "created_at": 1.0,
+                }
+            ],
         }
     ]
     shown = {"dialog": 0}
@@ -53,7 +90,9 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
     assert frame.answer_meta[0][0] == "context_usage"
-    assert frame.answer_list.GetString(2) == "鍘嗗彶闂"
+    question_rows = [idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "question"]
+    assert question_rows
+    assert frame.answer_list.GetString(question_rows[0]) == "history question"
     assert frame.answer_list.HasFocus()
 
 
@@ -73,11 +112,18 @@ def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):
     frame.archived_chats = [
         {
             "id": "hist-1",
-            "title": "鍘嗗彶浼氳瘽",
+            "title": "history chat",
             "pinned": False,
             "created_at": 1.0,
             "updated_at": 1.0,
-            "turns": [{"question": "鍘嗗彶闂", "answer_md": "鍘嗗彶鍥炵瓟", "model": "openai/gpt-5.2", "created_at": 1.0}],
+            "turns": [
+                {
+                    "question": "history question",
+                    "answer_md": "history answer",
+                    "model": "openai/gpt-5.2",
+                    "created_at": 1.0,
+                }
+            ],
         }
     ]
 
@@ -99,7 +145,7 @@ def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):
     assert frame.view_history_id is None
     assert frame.current_chat_id == "chat-new"
     assert frame.active_chat_id == "chat-new"
-    assert "鍘嗗彶闂" not in list(frame.answer_list.GetStrings())
+    assert "history question" not in list(frame.answer_list.GetStrings())
     assert frame.answer_list.HasFocus()
 
 
@@ -110,10 +156,10 @@ def test_ui_automation_switched_visible_chat_does_not_receive_late_codex_answer_
     frame._current_chat_state.update(
         {
             "id": "chat-b",
-            "title": "聊天B",
+            "title": "chat b",
             "turns": [
                 {
-                    "question": "B的问题",
+                    "question": "question b",
                     "answer_md": main.REQUESTING_TEXT,
                     "model": main.DEFAULT_CODEX_MODEL,
                     "created_at": 2.0,
@@ -132,13 +178,13 @@ def test_ui_automation_switched_visible_chat_does_not_receive_late_codex_answer_
     frame.archived_chats = [
         {
             "id": "chat-a",
-            "title": "聊天A",
+            "title": "chat a",
             "pinned": False,
             "created_at": 1.0,
             "updated_at": 1.0,
             "turns": [
                 {
-                    "question": "A的问题",
+                    "question": "question a",
                     "answer_md": main.REQUESTING_TEXT,
                     "model": main.DEFAULT_CODEX_MODEL,
                     "created_at": 1.0,
@@ -166,13 +212,13 @@ def test_ui_automation_switched_visible_chat_does_not_receive_late_codex_answer_
             phase="final_answer",
             thread_id="thread-a",
             turn_id="turn-a",
-            text="A 的晚到回答",
+            text="late answer a",
         )
     )
 
     after_rows = list(frame.answer_list.GetStrings())
     archived = frame._find_archived_chat("chat-a")
-    assert archived["turns"][0]["answer_md"] == "A 的晚到回答"
+    assert archived["turns"][0]["answer_md"] == "late answer a"
     assert frame._current_chat_state["turns"][0]["answer_md"] == main.REQUESTING_TEXT
     assert after_rows == before_rows
 
@@ -184,10 +230,10 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
     frame._current_chat_state.update(
         {
             "id": "chat-current",
-            "title": "当前聊天",
+            "title": "current chat",
             "turns": [
                 {
-                    "question": "帮我修测试",
+                    "question": "please fix tests",
                     "answer_md": main.REQUESTING_TEXT,
                     "model": main.DEFAULT_CODEX_MODEL,
                     "created_at": 1.0,
@@ -209,7 +255,7 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
             status="commandExecution",
             data={
                 "type": "commandExecution",
-                "title": "运行测试",
+                "title": "run tests",
                 "command": "pytest tests/test_main_unit.py -k codex",
             },
         ),

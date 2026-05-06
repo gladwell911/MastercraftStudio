@@ -8,7 +8,21 @@ import codex_client
 
 def test_codex_model_helper():
     assert codex_client.is_codex_model("codex/main")
+    assert codex_client.is_codex_model("codex/gpt-5.4-medium")
     assert not codex_client.is_codex_model("openai/gpt-5.2")
+
+
+def test_codex_model_config_helpers():
+    assert codex_client.codex_cli_config_for_model("codex/gpt-5.4-medium") == {
+        "model": "gpt-5.4",
+        "model_reasoning_effort": "medium",
+    }
+    assert codex_client.codex_cli_config_for_model("codex/gpt-5.3-codex-spark-high") == {
+        "model": "gpt-5.3-codex-spark",
+        "model_reasoning_effort": "high",
+    }
+    assert codex_client.codex_model_label_for_model("codex/gpt-5.4-medium") == "gpt-5.4 medium"
+    assert codex_client.codex_model_label_for_model("codex/main") == ""
 
 
 def test_read_codex_cli_model_label_reads_model_and_effort(tmp_path):
@@ -726,6 +740,27 @@ def test_build_codex_app_server_command_uses_app_server_defaults(monkeypatch):
         "--listen",
         "stdio://",
         "--analytics-default-enabled",
+    ]
+
+
+def test_build_codex_app_server_command_adds_model_config(monkeypatch):
+    monkeypatch.setattr(codex_client, "resolve_codex_launch_command", lambda: ["codex.cmd"])
+
+    command = codex_client.build_codex_app_server_command(
+        r"C:\code\codex",
+        codex_model="codex/gpt-5.3-codex-spark-high",
+    )
+
+    assert command == [
+        "codex.cmd",
+        "app-server",
+        "--listen",
+        "stdio://",
+        "--analytics-default-enabled",
+        "-c",
+        'model="gpt-5.3-codex-spark"',
+        "-c",
+        'model_reasoning_effort="high"',
     ]
 
 

@@ -65,6 +65,6 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=['ZDSRAPI.dll', 'ZDSRAPI_x64.dll'],
     name='mc',
 )

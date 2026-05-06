@@ -14,6 +14,31 @@ def test_voice_input_ui_automation_inserts_verbatim_when_editor_focused(frame, m
     assert frame.input_edit.GetValue() == "浠婂ぉ澶╂皵涓嶉敊浠婂ぉ澶╂皵涓嶉敊"
 
 
+def test_ui_automation_model_combo_prioritizes_cli_models(frame):
+    choices = [frame.model_combo.GetString(idx) for idx in range(frame.model_combo.GetCount())]
+
+    assert choices[:5] == [
+        "codex",
+        "codex gpt5.4 medium",
+        "codex gpt5.3spark high",
+        "claudeCode",
+        "openclaw",
+    ]
+
+
+def test_voice_input_ui_automation_speaks_result_after_insert(frame, wx_app, monkeypatch):
+    spoken = []
+    frame.input_edit.SetFocus()
+    monkeypatch.setattr(frame, "_speak_text_via_screen_reader", lambda text: spoken.append(text))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: fn(*args) or object())
+
+    frame._voice_input.on_result("语音输入结果", main.MODE_DIRECT)
+    wx_app.Yield()
+
+    assert frame.input_edit.GetValue() == "语音输入结果"
+    assert spoken == ["语音输入结果"]
+
+
 def test_voice_input_ui_automation_duplicate_callbacks_repeat(frame, monkeypatch):
     frame.Show()
     frame.input_edit.SetValue("")

@@ -14,6 +14,16 @@ from context_usage import context_window_for_model, normalize_context_usage
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
+CODEX_MODEL_CONFIGS = {
+    "codex/gpt-5.4-medium": {
+        "model": "gpt-5.4",
+        "model_reasoning_effort": "medium",
+    },
+    "codex/gpt-5.3-codex-spark-high": {
+        "model": "gpt-5.3-codex-spark",
+        "model_reasoning_effort": "high",
+    },
+}
 CODEX_MODEL_BY_CONTEXT_WINDOW = {
     121600: "gpt-5.3-codex-spark",
     258400: "gpt-5-codex",
@@ -27,6 +37,19 @@ DEFAULT_CODEX_SANDBOX = "danger-full-access"
 
 def is_codex_model(model: str) -> bool:
     return str(model or "").strip().startswith(CODEX_MODEL_PREFIX)
+
+
+def codex_cli_config_for_model(model: str) -> dict[str, str]:
+    return dict(CODEX_MODEL_CONFIGS.get(str(model or "").strip(), {}))
+
+
+def codex_model_label_for_model(model: str) -> str:
+    config = codex_cli_config_for_model(model)
+    model_name = str(config.get("model") or "").strip()
+    effort = str(config.get("model_reasoning_effort") or "").strip()
+    if model_name and effort:
+        return f"{model_name} {effort}"
+    return model_name
 
 
 def resolve_codex_launch_command() -> list[str]:
@@ -53,14 +76,17 @@ def resolve_codex_launch_command() -> list[str]:
     raise FileNotFoundError("Codex CLI was not found. Install `codex` or set CODEX_BIN.")
 
 
-def build_codex_app_server_command(cwd: str | None = None) -> list[str]:
-    return [
+def build_codex_app_server_command(cwd: str | None = None, codex_model: str = DEFAULT_CODEX_MODEL) -> list[str]:
+    command = [
         *resolve_codex_launch_command(),
         "app-server",
         "--listen",
         "stdio://",
         "--analytics-default-enabled",
     ]
+    for key, value in codex_cli_config_for_model(codex_model).items():
+        command.extend(["-c", f'{key}="{value}"'])
+    return command
 
 
 def _codex_home_seed_files() -> tuple[str, ...]:
@@ -350,9 +376,11 @@ class CodexAppServerClient:
         self,
         on_event: Callable[[CodexEvent], None] | None = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT,
+        codex_model: str = DEFAULT_CODEX_MODEL,
     ) -> None:
         self.on_event = on_event
         self.timeout = max(int(timeout or DEFAULT_REQUEST_TIMEOUT), 1)
+        self.codex_model = str(codex_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -529,7 +557,7 @@ class CodexAppServerClient:
             return
 
         self._proc = subprocess.Popen(
-            build_codex_app_server_command(),
+            build_codex_app_server_command(codex_model=self.codex_model),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
