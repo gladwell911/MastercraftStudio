@@ -27,7 +27,6 @@ a = Analysis(
         'imageio_ffmpeg',
         'multidict',
         'pyaudio',
-        'pydub',
         'propcache',
         'websockets',
         'yarl',

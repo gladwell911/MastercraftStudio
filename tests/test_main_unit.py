@@ -378,6 +378,20 @@ def test_remote_nats_autostart_worker_runs_connectivity_checked_runtime_start(fr
     assert seen["kwargs"] == {"ensure_connectivity": True}
 
 
+def test_fixed_domain_remote_reenables_autostart_after_stale_disabled_state(frame, monkeypatch):
+    monkeypatch.delenv("REMOTE_CONTROL_AUTOSTART", raising=False)
+    monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_AUTOSTART", raising=False)
+    frame.remote_control_autostart = False
+    frame.remote_control_domain = "wss://rc.tingyou.cc/nats"
+    saves = {"count": 0}
+    monkeypatch.setattr(frame, "_save_state", lambda: saves.__setitem__("count", saves["count"] + 1))
+
+    frame._initialize_remote_control_settings()
+
+    assert frame.remote_control_autostart is True
+    assert saves["count"] == 1
+
+
 def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_failure(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
@@ -2188,6 +2202,24 @@ def test_apply_detail_panel_mode_only_rebuilds_when_entering_execution_mode(fram
     assert render_count["n"] == 1
 
 
+def test_apply_detail_panel_mode_noop_does_not_layout_or_toggle_lists(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    calls = []
+    monkeypatch.setattr(frame.answer_list, "Show", lambda shown: calls.append(("answer", shown)))
+    monkeypatch.setattr(frame.execution_list, "Show", lambda shown: calls.append(("execution", shown)))
+    monkeypatch.setattr(frame, "Layout", lambda: calls.append(("layout",)))
+
+    mode = frame._apply_detail_panel_mode()
+
+    assert mode == "answers"
+    assert calls == []
+
+
 def test_background_final_answer_updates_matching_archived_turn(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -3536,6 +3568,112 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
     assert frame.answer_list.GetSelection() == 2
     assert frame.answer_meta[2][0] == "user"
+
+
+def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    saves = {"count": 0}
+    refreshes = {"count": 0}
+    repaints = {"count": 0}
+    monkeypatch.setattr(frame, "_save_state", lambda: saves.__setitem__("count", saves["count"] + 1))
+    monkeypatch.setattr(
+        frame,
+        "_refresh_answer_list_preserving_selection",
+        lambda *args, **kwargs: refreshes.__setitem__("count", refreshes["count"] + 1),
+    )
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: repaints.__setitem__("count", repaints["count"] + 1))
+
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "暂无"
+    repaints["count"] = 0
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+    )
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(type="token_count", turn_id="turn-1", usage=dict(usage)),
+    )
+
+    assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
+    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
+    assert refreshes["count"] == 0
+    assert repaints["count"] == 1
+    assert saves["count"] == 0
+
+
+def test_codex_token_count_same_visible_label_does_not_rebuild_answer_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_turn_id": "turn-1",
+            "request_status": "pending",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    first_usage = {
+        "used_tokens": 44176,
+        "context_window": 258400,
+        "source": "codex",
+        "exact": False,
+        "fresh": True,
+        "model": "gpt-5-codex",
+        "updated_at": 1.0,
+    }
+    second_usage = dict(first_usage, used_tokens=44177, updated_at=2.0)
+    refreshes = {"count": 0}
+    repaints = {"count": 0}
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(
+        frame,
+        "_refresh_answer_list_preserving_selection",
+        lambda *args, **kwargs: refreshes.__setitem__("count", refreshes["count"] + 1),
+    )
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: repaints.__setitem__("count", repaints["count"] + 1))
+
+    frame._render_answer_list()
+    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", turn_id="turn-1", usage=first_usage))
+    repaints["count"] = 0
+
+    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", turn_id="turn-1", usage=second_usage))
+
+    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert refreshes["count"] == 0
+    assert repaints["count"] == 0
 
 
 def test_active_pending_codex_token_count_event_without_turn_id_refreshes_context_usage_row(frame, monkeypatch):

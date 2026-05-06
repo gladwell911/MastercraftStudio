@@ -1592,6 +1592,10 @@ class ChatFrame(wx.Frame):
             "REMOTE_CONTROL_PORT",
             "CLAUDECODE_REMOTE_CONTROL_PORT",
         )
+        has_autostart_env = self._has_remote_control_env(
+            "REMOTE_CONTROL_AUTOSTART",
+            "CLAUDECODE_REMOTE_CONTROL_AUTOSTART",
+        )
 
         token = self._read_remote_control_setting(
             "REMOTE_CONTROL_TOKEN",
@@ -1664,6 +1668,8 @@ class ChatFrame(wx.Frame):
             "CLAUDECODE_REMOTE_CONTROL_AUTOSTART",
             default=self.remote_control_autostart,
         )
+        if fixed_domain_mode and not has_autostart_env:
+            autostart = True
         if autostart != self.remote_control_autostart:
             self.remote_control_autostart = autostart
             changed = True
@@ -2302,6 +2308,52 @@ class ChatFrame(wx.Frame):
         label = f"当前模型：{model or DEFAULT_MODEL_ID}"
         self.answer_list.Append(label)
         self.answer_meta.append(("current_model", -1, label, ""))
+
+    def _refresh_context_usage_header_rows(self) -> bool:
+        if not hasattr(self, "answer_list"):
+            return False
+        handled = False
+        changed = False
+        labels = {
+            "context_usage": format_context_usage_label(self._active_chat_context_usage()),
+            "current_model": f"当前模型：{self._active_chat_current_model() or DEFAULT_MODEL_ID}",
+        }
+        for row, meta in enumerate(list(self.answer_meta)):
+            if row >= self.answer_list.GetCount():
+                break
+            kind = meta[0] if meta else ""
+            if kind not in labels:
+                continue
+            handled = True
+            label = labels[kind]
+            current = ""
+            try:
+                current = self.answer_list.GetString(row)
+            except Exception:
+                current = ""
+            if current == label and len(meta) >= 3 and meta[2] == label:
+                continue
+            try:
+                self.answer_list.SetString(row, label)
+            except Exception:
+                continue
+            self.answer_meta[row] = (kind, -1, label, "")
+            changed = True
+        if changed:
+            self._request_listbox_repaint(self.answer_list)
+        return handled
+
+    @staticmethod
+    def _context_usage_payload_changed(previous, current) -> bool:
+        return context_usage_from_dict(previous) != context_usage_from_dict(current)
+
+    def _set_pending_context_usage_for_turn(self, chat: dict, turn_idx: int, usage) -> bool:
+        key = self._context_usage_pending_key_from_chat(chat, turn_idx)
+        previous = self._pending_context_usage_by_turn.get(key)
+        if not self._context_usage_payload_changed(previous, usage):
+            return False
+        self._pending_context_usage_by_turn[key] = usage
+        return True
 
     def _reset_answer_visible_row_limit(self) -> None:
         self.answer_visible_row_limit = ANSWER_LIST_DEFAULT_VISIBLE_ROWS
@@ -3294,10 +3346,33 @@ class ChatFrame(wx.Frame):
             self._current_chat_state["detail_panel_mode"] = normalized
             if not isinstance(self._current_chat_state.get("execution_steps"), list):
                 self._current_chat_state["execution_steps"] = []
-        if hasattr(self, "detail_title_label"):
-            self.detail_title_label.SetLabel("执行过程：" if normalized == "execution" else "回答：")
         show_answers = normalized != "execution"
         show_execution = normalized == "execution"
+        if mode is None and not refresh_execution and previous_mode == normalized:
+            visible_matches = True
+            if hasattr(self, "answer_list"):
+                try:
+                    visible_matches = visible_matches and bool(self.answer_list.IsShown()) == show_answers
+                except Exception:
+                    visible_matches = False
+            if hasattr(self, "execution_list"):
+                try:
+                    visible_matches = visible_matches and bool(self.execution_list.IsShown()) == show_execution
+                except Exception:
+                    visible_matches = False
+            label_matches = True
+            if hasattr(self, "detail_title_label"):
+                try:
+                    label_matches = self.detail_title_label.GetLabel() == ("执行过程：" if normalized == "execution" else "回答：")
+                except Exception:
+                    label_matches = False
+            if visible_matches and label_matches:
+                return normalized
+        if hasattr(self, "detail_title_label"):
+            try:
+                self.detail_title_label.SetLabel("执行过程：" if normalized == "execution" else "回答：")
+            except Exception:
+                pass
         answer_has_focus = False
         execution_has_focus = False
         try:
@@ -5240,11 +5315,13 @@ class ChatFrame(wx.Frame):
                 turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
                 if str(turn.get("request_status") or "").strip() == "done":
                     self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, target_idx), None)
-                    self._set_chat_context_usage(target_chat, event.usage)
-                    self._refresh_visible_history_chat(chat_id)
+                    changed = self._set_chat_context_usage(target_chat, event.usage)
+                    if changed:
+                        self._refresh_visible_history_chat(chat_id)
                 else:
-                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, target_idx)] = event.usage
-                self._defer_codex_state_save()
+                    changed = self._set_pending_context_usage_for_turn(target_chat, target_idx, event.usage)
+                if changed:
+                    self._defer_codex_state_save()
                 return
             if execution_entry:
                 self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
@@ -5282,14 +5359,14 @@ class ChatFrame(wx.Frame):
                 turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
                 if str(turn.get("request_status") or "").strip() == "done":
                     self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
-                    self._set_chat_context_usage(self._current_chat_state, event.usage)
-                    if self.view_mode == "active":
-                        self._refresh_answer_list_preserving_selection()
+                    changed = self._set_chat_context_usage(self._current_chat_state, event.usage)
                 else:
-                    self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx)] = event.usage
+                    changed = self._set_pending_context_usage_for_turn(self._current_chat_state, target_idx, event.usage)
+                if changed:
                     if self.view_mode == "active":
-                        self._refresh_answer_list_preserving_selection()
-                self._defer_codex_state_save()
+                        if not self._refresh_context_usage_header_rows():
+                            self._refresh_answer_list_preserving_selection()
+                    self._defer_codex_state_save()
             return
         if event_type == "server_request":
             self.active_codex_pending_request = None
@@ -5623,15 +5700,18 @@ class ChatFrame(wx.Frame):
                     process.start()
                 except Exception as exc:
                     message = str(exc or "").lower()
-                    if (
-                        "already in use" not in message
-                        and "access permissions" not in message
-                        and "forbidden by its access permissions" not in message
-                        and "unavailable for binding" not in message
-                    ):
+                    port_in_use = "already in use" in message
+                    port_unavailable = (
+                        "access permissions" in message
+                        or "forbidden by its access permissions" in message
+                        or "unavailable for binding" in message
+                    )
+                    if not port_in_use and not port_unavailable:
                         raise
                     process = None
                     if attempt_idx > 0:
+                        continue
+                    if port_unavailable:
                         continue
                     reused_existing_runtime = True
                     websocket_port = self._probe_existing_remote_nats_websocket_port()
@@ -7405,13 +7485,17 @@ class ChatFrame(wx.Frame):
         if (not is_openclaw_model(used_model)) or err:
             self._play_finish_sound()
 
-    def _set_chat_context_usage(self, chat: dict, usage) -> None:
+    def _set_chat_context_usage(self, chat: dict, usage) -> bool:
         if not isinstance(chat, dict) or usage is None:
-            return
+            return False
         if hasattr(usage, "to_dict"):
             usage = usage.to_dict()
         if isinstance(usage, dict):
+            if not self._context_usage_payload_changed(chat.get("context_usage"), usage):
+                return False
             chat["context_usage"] = usage
+            return True
+        return False
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
         pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)

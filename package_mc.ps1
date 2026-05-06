@@ -14,6 +14,58 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Clear-PackageOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistPath,
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName
+    )
+
+    $resolvedDistPath = Resolve-Path -LiteralPath $DistPath -ErrorAction SilentlyContinue
+    if ($null -eq $resolvedDistPath) {
+        return
+    }
+
+    $targetPath = Join-Path $resolvedDistPath.Path $PackageName
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        return
+    }
+
+    $resolvedTargetPath = Resolve-Path -LiteralPath $targetPath
+    $distRoot = $resolvedDistPath.Path.TrimEnd('\')
+    $targetRoot = $resolvedTargetPath.Path.TrimEnd('\')
+    if ($targetRoot -eq $distRoot -or -not $targetRoot.StartsWith($distRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Error "Refusing to clean package output outside dist path: $targetRoot"
+        exit 1
+    }
+
+    $running = Get-Process -Name $PackageName -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Error "mc.exe is still running. Close it before packaging."
+        exit 1
+    }
+
+    @(
+        Get-Item -LiteralPath $targetPath -Force
+        Get-ChildItem -LiteralPath $targetPath -Recurse -Force
+    ) | ForEach-Object {
+        try {
+            $_.Attributes = [System.IO.FileAttributes]::Normal
+        } catch {
+            Write-Error "Failed to reset attributes for $($_.FullName): $_"
+            exit 1
+        }
+    }
+
+    try {
+        Remove-Item -LiteralPath $targetPath -Recurse -Force
+    } catch {
+        Write-Error "Failed to clean package output '$targetPath'. Close any program using files under that directory and retry. $_"
+        exit 1
+    }
+}
+
 if (Test-IsAdministrator) {
     Write-Error "Run package_mc.ps1 from a non-admin PowerShell session. The current admin shell triggers the PyInstaller deprecation warning."
     exit 1
@@ -48,6 +100,7 @@ if (-not (Test-Path $resolvedSpecPath)) {
 
 Push-Location $repoRoot
 try {
+    Clear-PackageOutput -DistPath $DistPath -PackageName "mc"
     & $resolvedPythonExe -m PyInstaller -y --clean --distpath $DistPath --workpath $resolvedWorkPath $resolvedSpecPath
     exit $LASTEXITCODE
 }
