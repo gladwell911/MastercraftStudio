@@ -28,6 +28,7 @@ import wx
 import wx.adv
 from aiohttp import ClientSession, ClientTimeout, WSMsgType
 
+from chat_store import ChatStore
 from chat_client import ChatClient, DEFAULT_MODEL
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
 from cli_agent_manager import get_default_cli_agent_manager
@@ -806,6 +807,10 @@ class ChatFrame(wx.Frame):
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
+        self.chat_db_path = self.app_data_dir / "chat_history.db"
+        self.chat_store = ChatStore(self.chat_db_path)
+        self.chat_store.initialize()
+        self._chat_store_enabled = True
         self.notes_projection = DesktopNotesProjection(self.notes_store)
         self._notes_ui_thread_id = threading.get_ident()
         self.notes_sync = NotesSyncService(
@@ -946,13 +951,15 @@ class ChatFrame(wx.Frame):
         self._register_global_hotkey()
         self._global_ctrl_hook.start()
         self._migrate_legacy_state_if_needed()
+        self._migrate_legacy_chat_json_if_needed()
         self._load_state()
         self._realtime_call.update_settings(
             RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate)
         )
         self._initialize_remote_control_settings()
         wx_call_after_if_alive(self._realtime_call.prepare)
-        self._merge_legacy_archived_chats()
+        if not getattr(self, "_chat_store_enabled", False):
+            self._merge_legacy_archived_chats()
         self._schedule_remote_nats_autostart()
         self._start_claudecode_remote_nats_runtime_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
@@ -1333,6 +1340,69 @@ class ChatFrame(wx.Frame):
             except Exception:
                 continue
 
+    def _migrate_legacy_chat_json_if_needed(self) -> None:
+        store = getattr(self, "chat_store", None)
+        if store is None or store.get_meta("legacy_json_migration_complete") == "1":
+            return
+        if not self.state_path.exists():
+            store.set_meta("legacy_json_migration_complete", "1")
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        chats: list[dict] = []
+        active_chat = data.get("active_chat") if isinstance(data.get("active_chat"), dict) else {}
+        active_id = str(data.get("active_chat_id") or active_chat.get("id") or "").strip()
+        active_turns = data.get("active_session_turns")
+        if not isinstance(active_turns, list):
+            active_turns = active_chat.get("turns") if isinstance(active_chat.get("turns"), list) else []
+        if active_id and active_turns:
+            active = copy.deepcopy(active_chat)
+            active["id"] = active_id
+            active["turns"] = active_turns
+            chats.append(active)
+
+        archived = data.get("archived_chats")
+        if not isinstance(archived, list):
+            archived = data.get("chats")
+        if isinstance(archived, list):
+            chats.extend(copy.deepcopy(chat) for chat in archived if isinstance(chat, dict))
+
+        if not chats:
+            store.set_meta("legacy_json_migration_complete", "1")
+            return
+
+        for chat in chats:
+            if not isinstance(chat, dict):
+                continue
+            self._normalize_archived_chat(chat)
+            chat_id = str(chat.get("id") or "").strip()
+            if not chat_id:
+                continue
+            store.upsert_chat(chat)
+            if isinstance(chat.get("turns"), list):
+                store.replace_turns(chat_id, chat.get("turns") or [])
+            if isinstance(chat.get("execution_steps"), list):
+                store.replace_execution_steps(chat_id, chat.get("execution_steps") or [])
+
+        backup = self.state_path.with_name(f"{self.state_path.name}.bak.{int(time.time())}")
+        try:
+            shutil.copy2(self.state_path, backup)
+        except Exception:
+            pass
+        for key in ("archived_chats", "chats", "active_session_turns"):
+            data.pop(key, None)
+        if isinstance(data.get("active_chat"), dict):
+            data["active_chat"].pop("turns", None)
+            data["active_chat"].pop("execution_steps", None)
+        try:
+            self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return
+        store.set_meta("legacy_json_migration_complete", "1")
+
     def _legacy_state_paths(self) -> list[Path]:
         appdata = os.getenv("APPDATA", "").strip()
         runtime_dir = Path(__file__).resolve().parent
@@ -1406,6 +1476,84 @@ class ChatFrame(wx.Frame):
             self._sort_archived_chats()
             self._save_state()
 
+    def _slim_active_chat_state(self) -> dict:
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        now = time.time()
+        title_manual = state.get("title_manual")
+        if isinstance(title_manual, str):
+            title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            title_manual = bool(title_manual)
+        return {
+            "id": str(state.get("id") or self.active_chat_id or self.current_chat_id or "").strip(),
+            "title": str(state.get("title") or EMPTY_CURRENT_CHAT_TITLE),
+            "title_manual": title_manual,
+            "title_source": str(state.get("title_source") or ("manual" if title_manual else "default")),
+            "title_updated_at": float(state.get("title_updated_at") or state.get("updated_at") or now),
+            "title_revision": int(state.get("title_revision") or 1),
+            "model": str(state.get("model") or self.selected_model or DEFAULT_MODEL_ID),
+            "created_at": float(state.get("created_at") or self.active_session_started_at or now),
+            "updated_at": float(state.get("updated_at") or now),
+            "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
+        }
+
+    def _persist_chat_history_to_store(self) -> None:
+        store = getattr(self, "chat_store", None)
+        if store is None:
+            return
+        if self.active_chat_id or self.current_chat_id or self.active_session_turns:
+            active = self._slim_active_chat_state()
+            active_id = str(active.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+            if active_id:
+                active["id"] = active_id
+                active["turns"] = self.active_session_turns if isinstance(self.active_session_turns, list) else []
+                state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+                active_steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
+                active["execution_steps"] = active_steps
+                store.upsert_chat(active)
+                store.replace_turns(active_id, active["turns"])
+                store.replace_execution_steps(active_id, active_steps)
+        for chat in self.archived_chats:
+            if not isinstance(chat, dict):
+                continue
+            chat_id = str(chat.get("id") or "").strip()
+            if not chat_id:
+                continue
+            store.upsert_chat(chat)
+            if isinstance(chat.get("turns"), list):
+                store.replace_turns(chat_id, chat.get("turns") or [])
+            if isinstance(chat.get("execution_steps"), list):
+                store.replace_execution_steps(chat_id, chat.get("execution_steps") or [])
+
+    def _chat_summary_by_id(self, chat_id: str) -> dict | None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return None
+        for chat in self.archived_chats:
+            if isinstance(chat, dict) and str(chat.get("id") or "").strip() == normalized:
+                return chat
+        return None
+
+    def _hydrate_chat_from_store(self, chat: dict | None) -> dict | None:
+        if not isinstance(chat, dict):
+            return None
+        if not getattr(self, "_chat_store_enabled", False):
+            return chat
+        if isinstance(chat.get("turns"), list) and isinstance(chat.get("execution_steps"), list):
+            return chat
+        chat_id = str(chat.get("id") or "").strip()
+        store = getattr(self, "chat_store", None)
+        if not chat_id or store is None:
+            return chat
+        loaded = store.load_chat(chat_id)
+        if not isinstance(loaded, dict):
+            return chat
+        for idx, existing in enumerate(self.archived_chats):
+            if isinstance(existing, dict) and str(existing.get("id") or "").strip() == chat_id:
+                self.archived_chats[idx] = loaded
+                break
+        return loaded
+
     def _load_state(self):
         if not self.state_path.exists():
             return
@@ -1418,20 +1566,25 @@ class ChatFrame(wx.Frame):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
 
-        archived = data.get("archived_chats")
-        if isinstance(archived, list):
-            self.archived_chats = archived
+        use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
+        if use_chat_store and getattr(self, "chat_store", None) is not None:
+            self.archived_chats = self.chat_store.list_chat_summaries()
         else:
-            legacy = data.get("chats")
-            if isinstance(legacy, list):
-                self.archived_chats = legacy
+            archived = data.get("archived_chats")
+            if isinstance(archived, list):
+                self.archived_chats = archived
+            else:
+                legacy = data.get("chats")
+                if isinstance(legacy, list):
+                    self.archived_chats = legacy
         changed = False
-        for chat in self.archived_chats:
-            if isinstance(chat, dict) and self._normalize_archived_chat(chat):
-                changed = True
+        if not use_chat_store:
+            for chat in self.archived_chats:
+                if isinstance(chat, dict) and self._normalize_archived_chat(chat):
+                    changed = True
 
         active_turns = data.get("active_session_turns")
-        if isinstance(active_turns, list):
+        if isinstance(active_turns, list) and not use_chat_store:
             self.active_session_turns = active_turns
         active_chat = data.get("active_chat")
         if isinstance(active_chat, dict):
@@ -1444,6 +1597,18 @@ class ChatFrame(wx.Frame):
                     self.active_session_turns = chat_turns
             self.active_chat_id = str(active_chat.get("id") or self.active_chat_id or "").strip()
         self.active_chat_id = str(data.get("active_chat_id") or self.active_chat_id or "").strip()
+        if use_chat_store and getattr(self, "chat_store", None) is not None:
+            if self.active_chat_id:
+                self.active_session_turns = self.chat_store.load_turns(self.active_chat_id)
+                summary = self._chat_summary_by_id(self.active_chat_id) or {}
+                current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
+                merged = copy.deepcopy(summary)
+                merged.update(current)
+                merged["id"] = self.active_chat_id
+                merged["turns"] = self.active_session_turns
+                self._current_chat_state = merged
+            else:
+                self.active_session_turns = []
         self.active_openclaw_session_key = str(data.get("active_openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
         self.active_openclaw_session_id = str(data.get("active_openclaw_session_id") or "").strip()
         self.active_openclaw_session_file = str(data.get("active_openclaw_session_file") or "").strip()
@@ -1512,22 +1677,30 @@ class ChatFrame(wx.Frame):
         if changed:
             self._save_state()
 
-    def _save_state(self):
+    def _save_state(self, *, persist_chat_history: bool = True):
         if hasattr(self, "notes_controller"):
             capture = getattr(self.notes_controller, "capture_editor_state", None)
             if callable(capture):
                 capture()
             self._current_notes_state = self.notes_controller.to_state_dict()
+        use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
+        if use_chat_store and persist_chat_history:
+            self._persist_chat_history_to_store()
+        active_chat = (
+            self._slim_active_chat_state()
+            if use_chat_store
+            else (
+                copy.deepcopy(self._current_chat_state)
+                if isinstance(getattr(self, "_current_chat_state", None), dict)
+                else {
+                    "id": self.active_chat_id or self.current_chat_id or "",
+                    "turns": copy.deepcopy(self.active_session_turns),
+                }
+            )
+        )
         data = {
             "selected_model_id": self.selected_model,
-            "archived_chats": self.archived_chats,
-            "active_session_turns": self.active_session_turns,
-            "active_chat": copy.deepcopy(self._current_chat_state)
-            if isinstance(getattr(self, "_current_chat_state", None), dict)
-            else {
-                "id": self.active_chat_id or self.current_chat_id or "",
-                "turns": copy.deepcopy(self.active_session_turns),
-            },
+            "active_chat": active_chat,
             "active_chat_id": self.active_chat_id,
             "active_openclaw_session_key": self.active_openclaw_session_key,
             "active_openclaw_session_id": self.active_openclaw_session_id,
@@ -1556,6 +1729,9 @@ class ChatFrame(wx.Frame):
             "remote_control_autostart": self.remote_control_autostart,
             "notes_ui_state": self._current_notes_state,
         }
+        if not use_chat_store:
+            data["archived_chats"] = self.archived_chats
+            data["active_session_turns"] = self.active_session_turns
         try:
             self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -2038,7 +2214,7 @@ class ChatFrame(wx.Frame):
 
     def _get_view_turns(self):
         if self.view_mode == "history":
-            chat = self._find_archived_chat(self.view_history_id)
+            chat = self._hydrate_chat_from_store(self._find_archived_chat(self.view_history_id))
             if chat:
                 return chat.get("turns") or []
             return []
@@ -2545,9 +2721,12 @@ class ChatFrame(wx.Frame):
         v = self.model_combo.GetValue().strip()
         if v:
             resolved = model_id_from_display_name(v)
-            self.selected_model = resolved if resolved in MODEL_IDS else v
+            next_model = resolved if resolved in MODEL_IDS else v
+            if next_model == self.selected_model:
+                return
+            self.selected_model = next_model
             self._refresh_openclaw_sync_lifecycle()
-            self._save_state()
+            self._save_state(persist_chat_history=False)
 
     def _resolve_current_model(self) -> str:
         # Always honor the model currently shown in combobox for each send.
@@ -2607,7 +2786,7 @@ class ChatFrame(wx.Frame):
 
     def _current_execution_steps(self) -> list:
         if self.view_mode == "history":
-            chat = self._find_archived_chat(self.view_history_id)
+            chat = self._hydrate_chat_from_store(self._find_archived_chat(self.view_history_id))
             if isinstance(chat, dict):
                 steps = chat.get("execution_steps")
                 if isinstance(steps, list):
@@ -2657,7 +2836,7 @@ class ChatFrame(wx.Frame):
             if not isinstance(getattr(self, "_current_chat_state", None), dict):
                 self._current_chat_state = {}
             return self._current_chat_state
-        chat = self._find_archived_chat(resolved_chat_id)
+        chat = self._hydrate_chat_from_store(self._find_archived_chat(resolved_chat_id))
         return chat if isinstance(chat, dict) else None
 
     @staticmethod
@@ -3095,6 +3274,10 @@ class ChatFrame(wx.Frame):
         if steps and self._execution_entries_should_dedupe(steps[-1], entry):
             return False
         steps.append(copy.deepcopy(entry))
+        if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
+            resolved_chat_id = str(chat_id or target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+            if resolved_chat_id:
+                self.chat_store.append_execution_step(resolved_chat_id, steps[-1])
         self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if save_state:
             self._save_state()
@@ -4607,6 +4790,7 @@ class ChatFrame(wx.Frame):
                 "detail_panel_mode": "answers",
             }
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        turn_count = len(turns) if turns else int(chat.get("turn_count") or 0)
         chat_id = str(chat.get("id") or "")
         title = str(chat.get("title") or "新聊天")
         model = str(chat.get("model") or DEFAULT_MODEL_ID)
@@ -4624,7 +4808,7 @@ class ChatFrame(wx.Frame):
             "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
             "title_updated_at": float(chat.get("title_updated_at") or updated_at),
             "title_revision": int(chat.get("title_revision") or 1),
-            "turn_count": len(turns),
+            "turn_count": turn_count,
             "running": False,
             "request_kind": request_kind,
             "current": bool(chat_id) and chat_id == current_id,
@@ -5071,7 +5255,8 @@ class ChatFrame(wx.Frame):
             source_chat["turns"] = self.active_session_turns
             chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         else:
-            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(self._find_archived_chat(chat_id) or {}, payload)
+            source_chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id)) or {}
+            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         return 200, {"accepted": True, "chat": chat, "has_more": has_more, "oldest_cursor": oldest_cursor}
 
     def _remote_api_state_ui(self, payload: dict | None = None) -> tuple[int, dict]:
@@ -5079,7 +5264,7 @@ class ChatFrame(wx.Frame):
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
             chat = self._current_chat_snapshot()
         else:
-            chat = self._remote_chat_snapshot(self._find_archived_chat(chat_id) or {})
+            chat = self._remote_chat_snapshot(self._hydrate_chat_from_store(self._find_archived_chat(chat_id)) or {})
         status = "waiting_user_input" if self.active_codex_pending_request else "idle"
         request_kind = "user_input" if self.active_codex_pending_request else ""
         chat.update(
@@ -5255,6 +5440,8 @@ class ChatFrame(wx.Frame):
             getattr(self, "history_list", None),
             getattr(self, "input_edit", None),
             getattr(self, "model_combo", None),
+            getattr(self, "notes_notebook_list", None),
+            getattr(self, "notes_entry_list", None),
         ]
         for control in controls:
             if control is None:
@@ -5267,7 +5454,11 @@ class ChatFrame(wx.Frame):
         return False
 
     def _on_codex_event(self, event: CodexEvent) -> None:
-        self._on_codex_event_for_chat(self._resolve_codex_event_chat_id(event), event)
+        chat_id = self._resolve_codex_event_chat_id(event)
+        if threading.current_thread() is not threading.main_thread():
+            self._dispatch_codex_event_to_ui(chat_id, event)
+            return
+        self._on_codex_event_for_chat(chat_id, event)
 
     def _handle_codex_request_dialog(self, request: dict) -> None:
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
@@ -7990,7 +8181,7 @@ class ChatFrame(wx.Frame):
             if focus_answer_list:
                 self.answer_list.SetFocus()
             return True
-        chat = self._find_archived_chat(selected_id)
+        chat = self._hydrate_chat_from_store(self._find_archived_chat(selected_id))
         if not chat:
             return False
         self.view_mode = "history"
@@ -8070,7 +8261,7 @@ class ChatFrame(wx.Frame):
         if chat_id == self.current_chat_id:
             return True
         self._flush_relevant_execution_deltas_for_switch()
-        chat = self._find_archived_chat(chat_id)
+        chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id))
         if not chat:
             return False
         # Archive current session if it has turns
@@ -8248,19 +8439,32 @@ class ChatFrame(wx.Frame):
         primary_notes_ctrl = self._notes_primary_tab_target()
         detail_target = self._current_detail_tab_target()
         secondary_detail_target = self.execution_list if detail_target is self.answer_list else self.answer_list
-        ordered_controls = [
-            self.input_edit,
-            self.new_chat_button,
-            self.model_combo,
-            self.send_button,
-            primary_notes_ctrl,
-            self.history_list,
-            detail_target,
-            secondary_detail_target,
-            self.notes_notebook_list,
-            self.notes_entry_list,
-            self.notes_editor,
-        ]
+        if primary_notes_ctrl is self.notes_entry_list:
+            ordered_controls = [
+                self.input_edit,
+                self.new_chat_button,
+                self.model_combo,
+                self.send_button,
+                self.history_list,
+                primary_notes_ctrl,
+                detail_target,
+                secondary_detail_target,
+                self.notes_notebook_list,
+                self.notes_editor,
+            ]
+        else:
+            ordered_controls = [
+                self.input_edit,
+                self.new_chat_button,
+                self.model_combo,
+                self.send_button,
+                primary_notes_ctrl,
+                self.history_list,
+                detail_target,
+                secondary_detail_target,
+                self.notes_entry_list,
+                self.notes_editor,
+            ]
         seen = set()
         root_tab_order = []
         for ctrl in ordered_controls:
@@ -8282,22 +8486,40 @@ class ChatFrame(wx.Frame):
                 nxt.MoveAfterInTabOrder(previous)
             except Exception:
                 pass
-        try:
-            primary_notes_panel.MoveAfterInTabOrder(self.send_button)
-        except Exception:
-            pass
-        try:
-            primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
-        except Exception:
-            pass
-        try:
-            self.history_list.MoveAfterInTabOrder(primary_notes_ctrl)
-        except Exception:
-            pass
-        try:
-            detail_target.MoveAfterInTabOrder(self.history_list)
-        except Exception:
-            pass
+        if primary_notes_ctrl is self.notes_entry_list:
+            try:
+                self.history_list.MoveAfterInTabOrder(self.send_button)
+            except Exception:
+                pass
+            try:
+                primary_notes_panel.MoveAfterInTabOrder(self.history_list)
+            except Exception:
+                pass
+            try:
+                primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
+            except Exception:
+                pass
+            try:
+                detail_target.MoveAfterInTabOrder(primary_notes_ctrl)
+            except Exception:
+                pass
+        else:
+            try:
+                primary_notes_panel.MoveAfterInTabOrder(self.send_button)
+            except Exception:
+                pass
+            try:
+                primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
+            except Exception:
+                pass
+            try:
+                self.history_list.MoveAfterInTabOrder(primary_notes_ctrl)
+            except Exception:
+                pass
+            try:
+                detail_target.MoveAfterInTabOrder(self.history_list)
+            except Exception:
+                pass
 
     def _handle_ctrl_history_navigation(self, event) -> bool:
         key = event.GetKeyCode()

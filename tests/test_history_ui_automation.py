@@ -1,4 +1,32 @@
+import ctypes
+import time
+
 import main
+
+
+def _send_listbox_key(window, key_code):
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    wm_keydown = 0x0100
+    wm_keyup = 0x0101
+    scan_codes = {
+        main.wx.WXK_UP: 0x48,
+        main.wx.WXK_DOWN: 0x50,
+        main.wx.WXK_HOME: 0x47,
+        main.wx.WXK_END: 0x4F,
+    }
+    virtual_keys = {
+        main.wx.WXK_UP: 0x26,
+        main.wx.WXK_DOWN: 0x28,
+        main.wx.WXK_HOME: 0x24,
+        main.wx.WXK_END: 0x23,
+    }
+    scan = scan_codes.get(key_code, 0)
+    virtual_key = virtual_keys.get(key_code, int(key_code))
+    down_lparam = 1 | (scan << 16)
+    up_lparam = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    hwnd = int(window.GetHandle())
+    user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
+    user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
 
 
 def _focused_control():
@@ -94,6 +122,50 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert question_rows
     assert frame.answer_list.GetString(question_rows[0]) == "history question"
     assert frame.answer_list.HasFocus()
+
+
+def test_ui_automation_large_sqlite_history_keeps_history_list_responsive(frame, wx_app):
+    frame.Show()
+    frame.active_chat_id = ""
+    frame.current_chat_id = ""
+    frame.active_session_turns = []
+    frame._current_chat_state = {}
+    frame.archived_chats = []
+    for chat_idx in range(1000):
+        chat_id = f"chat-{chat_idx}"
+        frame.chat_store.upsert_chat(
+            {
+                "id": chat_id,
+                "title": f"chat {chat_idx}",
+                "created_at": float(chat_idx),
+                "updated_at": float(chat_idx),
+            }
+        )
+        frame.chat_store.replace_turns(
+            chat_id,
+            [
+                {
+                    "question": "q",
+                    "answer_md": "long answer " * 200,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": float(chat_idx),
+                }
+            ],
+        )
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame._refresh_history()
+
+    assert "turns" not in frame.archived_chats[0]
+    frame.history_list.SetFocusFromKbd()
+    frame.history_list.SetSelection(0)
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.history_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+    assert frame.history_list.GetSelection() == 1
 
 
 def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):

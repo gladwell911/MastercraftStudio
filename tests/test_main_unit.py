@@ -6757,6 +6757,108 @@ def test_load_state_restores_realtime_call_settings(frame, tmp_path):
     assert frame.realtime_call_speech_rate == 18
 
 
+def test_save_state_excludes_large_chat_history_after_store_migration(frame, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.archived_chats = [
+        {
+            "id": "chat-old",
+            "title": "old",
+            "turns": [{"question": "q", "answer_md": "a" * 10000, "model": "codex/main"}],
+            "execution_steps": [{"detail_text": "x" * 10000}],
+        }
+    ]
+    frame.active_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active", "answer_md": "answer", "model": "codex/main"}]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "title": "active",
+        "turns": frame.active_session_turns,
+        "execution_steps": [{"detail_text": "active step"}],
+    }
+    frame._chat_store_enabled = True
+
+    frame._save_state()
+
+    data = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    assert "archived_chats" not in data
+    assert "chats" not in data
+    assert "active_session_turns" not in data
+    assert "turns" not in data.get("active_chat", {})
+    assert "execution_steps" not in data.get("active_chat", {})
+    assert frame.state_path.stat().st_size < 200_000
+
+
+def test_save_state_persists_chats_to_chat_store(frame, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active q", "answer_md": "active a", "model": "codex/main"}]
+    frame._current_chat_state = {"id": "chat-active", "title": "active", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "old", "turns": [{"question": "old q", "answer_md": "old a"}]},
+    ]
+
+    frame._save_state()
+
+    summaries = frame.chat_store.list_chat_summaries()
+    assert {item["id"] for item in summaries} == {"chat-active", "chat-old"}
+    assert frame.chat_store.load_turns("chat-active") == frame.active_session_turns
+    assert frame.chat_store.load_turns("chat-old") == frame.archived_chats[0]["turns"]
+
+
+def test_load_state_uses_chat_store_summaries_without_full_turns(frame, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-old", "title": "old", "updated_at": 10.0})
+    frame.chat_store.replace_turns("chat-old", [{"question": "q", "answer_md": "a" * 10000}])
+    frame.state_path.write_text(
+        json.dumps(
+            {
+                "selected_model_id": "codex/main",
+                "active_chat_id": "chat-old",
+                "active_chat": {"id": "chat-old"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    frame._load_state()
+
+    assert frame.archived_chats == [frame.chat_store.list_chat_summaries()[0]]
+    assert "turns" not in frame.archived_chats[0]
+    assert frame.active_session_turns == [{"question": "q", "answer_md": "a" * 10000}]
+
+
+def test_large_legacy_app_state_migrates_to_chat_store_and_slims_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    legacy = {
+        "selected_model_id": "codex/main",
+        "active_chat_id": "chat-active",
+        "active_session_turns": [{"question": "active", "answer_md": "answer"}],
+        "archived_chats": [
+            {"id": "chat-old", "title": "old", "turns": [{"question": "q", "answer_md": "a" * 10000}]}
+        ],
+    }
+    (tmp_path / "app_state.json").write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    f = main.ChatFrame()
+    try:
+        assert f.chat_store.load_turns("chat-old")[0]["question"] == "q"
+        data = json.loads((tmp_path / "app_state.json").read_text(encoding="utf-8"))
+        assert "archived_chats" not in data
+        assert "active_session_turns" not in data
+        assert (tmp_path / "app_state.json").stat().st_size < 200_000
+        assert list(tmp_path.glob("app_state.json.bak.*"))
+    finally:
+        f.Destroy()
+
+
 def test_realtime_call_hotkey_toggles_call_and_plays_sound(frame):
     calls = []
     frame._realtime_call.toggle = lambda: calls.append("toggle") or "start"
@@ -8249,6 +8351,35 @@ def test_codex_ui_dispatch_coalesces_bursty_events(frame, monkeypatch):
     scheduled[0][0](*scheduled[0][1])
 
     assert handled == [("chat-active", "plan_updated")] * 10
+
+
+def test_codex_event_from_background_thread_queues_instead_of_touching_ui(frame, monkeypatch):
+    dispatched = []
+    handled = []
+
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_codex_thread_id = "thread-active"
+    frame.active_codex_turn_id = "turn-active"
+    monkeypatch.setattr(
+        main.threading,
+        "current_thread",
+        lambda: SimpleNamespace(name="codex-stdout-thread"),
+    )
+    monkeypatch.setattr(frame, "_dispatch_codex_event_to_ui", lambda chat_id, event: dispatched.append((chat_id, event.type)))
+    monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda chat_id, event: handled.append((chat_id, event.type)))
+
+    frame._on_codex_event(
+        main.CodexEvent(
+            type="plan_updated",
+            thread_id="thread-active",
+            turn_id="turn-active",
+            text="background progress",
+        )
+    )
+
+    assert dispatched == [("chat-active", "plan_updated")]
+    assert handled == []
 
 
 def test_codex_ui_event_drain_yields_after_batch_budget(frame, monkeypatch):
@@ -10251,5 +10382,75 @@ def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):
     assert frame.notes_notebook_list.GetString(0) == "暂无笔记本"
     assert frame.notes_notebook_list.IsEnabled()
     assert focused == ["notes_notebook_list"]
+
+
+def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
+    for control_name in (
+        "execution_list",
+        "answer_list",
+        "history_list",
+        "input_edit",
+        "model_combo",
+        "notes_notebook_list",
+        "notes_entry_list",
+    ):
+        control = getattr(frame, control_name)
+        monkeypatch.setattr(control, "HasFocus", lambda c=control: c is frame.notes_notebook_list)
+
+    assert frame._primary_navigation_control_has_focus() is True
+
+    for control_name in (
+        "execution_list",
+        "answer_list",
+        "history_list",
+        "input_edit",
+        "model_combo",
+        "notes_notebook_list",
+        "notes_entry_list",
+    ):
+        control = getattr(frame, control_name)
+        monkeypatch.setattr(control, "HasFocus", lambda c=control: c is frame.notes_entry_list)
+
+    assert frame._primary_navigation_control_has_focus() is True
+
+
+def test_model_changed_noops_without_state_save_when_selection_is_unchanged(frame, monkeypatch):
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue("codex")
+    saves = []
+    lifecycle = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(kwargs))
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: lifecycle.append(True))
+
+    frame._on_model_changed(None)
+
+    assert saves == []
+    assert lifecycle == []
+
+
+def test_model_changed_saves_small_state_without_rewriting_chat_history(frame, monkeypatch):
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue("openai gpt5.2")
+    calls = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    frame._on_model_changed(None)
+
+    assert frame.selected_model == "openai/gpt-5.2"
+    assert calls == [{"persist_chat_history": False}]
+
+
+def test_save_state_can_skip_chat_history_persistence_for_small_config_changes(frame, monkeypatch, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame._chat_store_enabled = True
+    persists = []
+    monkeypatch.setattr(frame, "_persist_chat_history_to_store", lambda: persists.append(True))
+
+    frame._save_state(persist_chat_history=False)
+
+    assert persists == []
+    data = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    assert data["selected_model_id"] == frame.selected_model
 
 

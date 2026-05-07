@@ -66,6 +66,32 @@ function Clear-PackageOutput {
     }
 }
 
+function Remove-BundledRuntimeHistory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistPath,
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName
+    )
+
+    $targetPath = Join-Path $DistPath $PackageName
+    $historyPath = Join-Path $targetPath "_internal\history"
+    if (-not (Test-Path -LiteralPath $historyPath)) {
+        return
+    }
+
+    $resolvedTargetPath = Resolve-Path -LiteralPath $targetPath
+    $resolvedHistoryPath = Resolve-Path -LiteralPath $historyPath
+    $targetRoot = $resolvedTargetPath.Path.TrimEnd('\')
+    $historyRoot = $resolvedHistoryPath.Path.TrimEnd('\')
+    if ($historyRoot -eq $targetRoot -or -not $historyRoot.StartsWith($targetRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Error "Refusing to clean bundled runtime history outside package output: $historyRoot"
+        exit 1
+    }
+
+    Remove-Item -LiteralPath $historyPath -Recurse -Force
+}
+
 if (Test-IsAdministrator) {
     Write-Error "Run package_mc.ps1 from a non-admin PowerShell session. The current admin shell triggers the PyInstaller deprecation warning."
     exit 1
@@ -102,7 +128,11 @@ Push-Location $repoRoot
 try {
     Clear-PackageOutput -DistPath $DistPath -PackageName "mc"
     & $resolvedPythonExe -m PyInstaller -y --clean --distpath $DistPath --workpath $resolvedWorkPath $resolvedSpecPath
-    exit $LASTEXITCODE
+    $buildExitCode = $LASTEXITCODE
+    if ($buildExitCode -eq 0) {
+        Remove-BundledRuntimeHistory -DistPath $DistPath -PackageName "mc"
+    }
+    exit $buildExitCode
 }
 finally {
     Pop-Location

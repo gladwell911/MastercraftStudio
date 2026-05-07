@@ -19,7 +19,6 @@ a = Analysis(
     datas=[
         ('sound', 'sound'),
         ('ZDSRAPI.ini', '.'),
-        ('dist/history', 'history'),
     ] + nats_datas,
     hiddenimports=[
         'aiohttp',

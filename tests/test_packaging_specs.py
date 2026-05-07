@@ -23,6 +23,14 @@ def test_pyinstaller_specs_do_not_import_unused_pydub():
     assert "pydub" not in requirements.lower()
 
 
+def test_default_pyinstaller_spec_does_not_bundle_runtime_history():
+    root = Path(__file__).resolve().parents[1]
+    spec_text = (root / "zgwd.spec").read_text(encoding="utf-8")
+
+    assert "dist/history" not in spec_text
+    assert "('dist/history', 'history')" not in spec_text
+
+
 def test_package_script_safely_cleans_packaged_output_before_build():
     root = Path(__file__).resolve().parents[1]
     script_text = (root / "package_mc.ps1").read_text(encoding="utf-8")
@@ -32,3 +40,5 @@ def test_package_script_safely_cleans_packaged_output_before_build():
     assert "Get-Process" in script_text
     assert "mc.exe is still running" in script_text
     assert "Remove-Item -LiteralPath $targetPath -Recurse -Force" in script_text
+    assert "Remove-BundledRuntimeHistory" in script_text
+    assert "_internal" in script_text

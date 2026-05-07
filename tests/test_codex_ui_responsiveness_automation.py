@@ -310,5 +310,23 @@ def test_real_ui_primary_controls_stay_responsive_while_codex_events_are_pending
     wx_app.Yield()
     assert time.perf_counter() - started < 0.5
 
+    notebook = frame.notes_store.create_notebook("responsive notebook")
+    frame.notes_store.create_entry(notebook.id, "responsive entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.notes_notebook_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.notes_entry_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+
     assert frame._pending_codex_ui_events
     assert frame._codex_ui_event_drain_timer is not None
