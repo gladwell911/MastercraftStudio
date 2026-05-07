@@ -465,6 +465,24 @@ class CodexAppServerClient:
             },
         )
 
+    def read_account(self, refresh_token: bool = False) -> dict:
+        return self.request("account/read", {"refreshToken": bool(refresh_token)})
+
+    def read_rate_limits(self) -> dict:
+        return self.request("account/rateLimits/read")
+
+    def compact_thread(self, thread_id: str) -> dict:
+        return self.request("thread/compact/start", {"threadId": str(thread_id or "").strip()})
+
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> dict:
+        return self.request(
+            "turn/interrupt",
+            {
+                "threadId": str(thread_id or "").strip(),
+                "turnId": str(turn_id or "").strip(),
+            },
+        )
+
     def start_turn(self, thread_id: str, text: str, timeout: int | None = None) -> dict:
         return self.start_turn_items(
             thread_id,

@@ -134,6 +134,78 @@ def test_codex_client_start_turn_items_sends_structured_input(monkeypatch):
     ]
 
 
+def test_codex_client_read_account_sends_refresh_token_flag(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    seen = {}
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
+
+    def _request(method, params=None, timeout=None):
+        seen["method"] = method
+        seen["params"] = params
+        seen["timeout"] = timeout
+        return {"account": {"type": "chatgpt"}}
+
+    monkeypatch.setattr(client, "_request_internal", _request)
+
+    assert client.read_account(refresh_token=True)["account"]["type"] == "chatgpt"
+    assert seen == {"method": "account/read", "params": {"refreshToken": True}, "timeout": None}
+
+
+def test_codex_client_read_rate_limits_sends_request(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    seen = {}
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
+
+    def _request(method, params=None, timeout=None):
+        seen["method"] = method
+        seen["params"] = params
+        seen["timeout"] = timeout
+        return {"rateLimits": {}}
+
+    monkeypatch.setattr(client, "_request_internal", _request)
+
+    assert client.read_rate_limits() == {"rateLimits": {}}
+    assert seen == {"method": "account/rateLimits/read", "params": None, "timeout": None}
+
+
+def test_codex_client_compact_thread_sends_request(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    seen = {}
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
+
+    def _request(method, params=None, timeout=None):
+        seen["method"] = method
+        seen["params"] = params
+        seen["timeout"] = timeout
+        return {}
+
+    monkeypatch.setattr(client, "_request_internal", _request)
+
+    assert client.compact_thread("thread-1") == {}
+    assert seen == {"method": "thread/compact/start", "params": {"threadId": "thread-1"}, "timeout": None}
+
+
+def test_codex_client_interrupt_turn_sends_request(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    seen = {}
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
+
+    def _request(method, params=None, timeout=None):
+        seen["method"] = method
+        seen["params"] = params
+        seen["timeout"] = timeout
+        return {}
+
+    monkeypatch.setattr(client, "_request_internal", _request)
+
+    assert client.interrupt_turn("thread-1", "turn-1") == {}
+    assert seen == {
+        "method": "turn/interrupt",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        "timeout": None,
+    }
+
+
 def test_codex_client_maps_server_request_to_event():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)

@@ -6296,12 +6296,8 @@ def test_f1_execution_mode_keeps_detail_slot_in_primary_tab_order(frame, monkeyp
 
     frame._on_char_hook(F1Event())
     assert frame._current_chat_state["detail_panel_mode"] == "execution"
-
-    event = TabEvent()
-    frame._on_history_key_down(event)
-
     assert frame.execution_list.HasFocus()
-    assert event.skipped >= 1
+    assert frame.execution_list.GetSelection() == frame.execution_list.GetCount() - 1
 
 
 def test_execution_list_tab_uses_primary_tab_navigation(frame, monkeypatch):
@@ -6342,6 +6338,133 @@ def test_execution_list_tab_uses_primary_tab_navigation(frame, monkeypatch):
 
     assert frame.input_edit.HasFocus()
     assert event.skipped == 0
+
+
+def test_f1_focuses_latest_execution_item(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行焦点",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "第一步", "detail_text": "第一步详情"},
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "第二步", "detail_text": "第二步详情"},
+        ],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    class F1Event:
+        def GetKeyCode(self):
+            return wx.WXK_F1
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("F1 should be handled")
+
+    frame.input_edit.SetFocus()
+    frame._on_char_hook(F1Event())
+
+    assert frame.execution_list.HasFocus()
+    assert frame.execution_list.GetSelection() == frame.execution_list.GetCount() - 1
+    assert frame.execution_list.GetStringSelection() == "第二步"
+
+
+def test_f1_focuses_empty_execution_placeholder(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-empty"
+    frame.current_chat_id = "chat-empty"
+    frame._current_chat_state = {
+        "id": "chat-empty",
+        "title": "空执行列表",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    class F1Event:
+        def GetKeyCode(self):
+            return wx.WXK_F1
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("F1 should be handled")
+
+    frame.input_edit.SetFocus()
+    frame._on_char_hook(F1Event())
+
+    assert frame.execution_list.HasFocus()
+    assert frame.execution_list.GetSelection() == 0
+    assert frame.execution_list.GetString(0) == "暂无执行过程"
+
+
+def test_char_hook_enter_on_execution_list_opens_detail_without_sending(frame, monkeypatch):
+    frame.Show()
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame.execution_list.Set(["执行步骤"])
+    frame.execution_meta = [("execution", 0, "执行步骤", "详情")]
+    frame.execution_list.SetSelection(0)
+    frame.execution_list.SetFocus()
+    opened = []
+    sends = []
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened.append(True) or True)
+    monkeypatch.setattr(frame, "_trigger_send", lambda: sends.append(True))
+
+    class EnterEvent:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Enter should be handled by execution list")
+
+    frame._on_char_hook(EnterEvent())
+
+    assert opened == [True]
+    assert sends == []
+
+
+def test_on_done_focuses_latest_answer_item(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-answer-focus"
+    frame.current_chat_id = "chat-answer-focus"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": time.time()}
+    ]
+    frame._current_chat_state.update({"id": "chat-answer-focus", "turns": frame.active_session_turns})
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+    monkeypatch.setattr(main.wx, "CallLater", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
+
+    frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-answer-focus")
+
+    assert frame.answer_list.HasFocus()
+    assert frame.answer_list.GetSelection() == frame.answer_list.GetCount() - 1
+    assert frame.answer_list.GetStringSelection() == "最终回答"
 
 
 def test_global_ctrl_combo_key_filter_ignores_ime_and_modifiers():
@@ -9482,6 +9605,175 @@ def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, 
             [{"type": "localImage", "path": str(image_path)}],
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_name", "expected_args"),
+    [
+        ("/status", "status", ""),
+        ("  /HELP  ", "help", ""),
+        ("/compact now", "compact", "now"),
+        ("/prompts:speckit.specify build it", "prompts:speckit.specify", "build it"),
+    ],
+)
+def test_codex_slash_command_parser_accepts_leading_slash_commands(frame, text, expected_name, expected_args):
+    command = frame._parse_codex_local_command(text)
+
+    assert command == {"raw": text.strip(), "name": expected_name, "args": expected_args}
+
+
+@pytest.mark.parametrize("text", ["please run /status", "look at path /tmp/file", "status", "/"])
+def test_codex_slash_command_parser_ignores_non_command_text(frame, text):
+    assert frame._parse_codex_local_command(text) is None
+
+
+@pytest.mark.parametrize(
+    ("prompt", "command"),
+    [
+        ("/status", "status"),
+        ("/help", "help"),
+        ("/compact now", "compact"),
+        ("/not-a-real-command arg", "not-a-real-command"),
+    ],
+)
+def test_codex_slash_command_is_handled_locally_without_starting_turn(frame, monkeypatch, prompt, command):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue(main.model_display_name("codex/main"))
+    started = []
+    monkeypatch.setattr(frame, "_start_codex_local_command_worker_for_turn", lambda *args: started.append(args))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+
+    ok, message = frame._submit_question(prompt, source="local")
+
+    assert ok
+    assert message == ""
+    assert started == [("chat-current", 0, command, main.ChatFrame._parse_codex_local_command(prompt)["args"], "codex/main")]
+    assert frame.active_session_turns[0]["question"] == prompt
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+
+
+def test_codex_status_command_worker_reports_status_without_codex_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "codex_thread_id": "thread-1",
+            "codex_turn_id": "turn-1",
+            "codex_thread_flags": ["waitingOnUserInput"],
+            "context_usage": {
+                "source": "codex",
+                "used_tokens": 1000,
+                "total_tokens": 200000,
+                "model": "gpt-5.5",
+            },
+        }
+    )
+    frame.active_session_turns = [
+        {
+            "question": "/status",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+        }
+    ]
+    done = []
+
+    class _Client:
+        def read_account(self, refresh_token=False):
+            return {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "plus"}}
+
+        def read_rate_limits(self):
+            return {
+                "rateLimits": {
+                    "limitName": "Codex",
+                    "primary": {"percentUsed": 25.0},
+                }
+            }
+
+        def read_thread(self, thread_id, include_turns=True):
+            return {"thread": {"id": thread_id, "status": {"type": "active", "activeFlags": ["waitingOnUserInput"]}}}
+
+        def start_turn(self, *_args, **_kwargs):
+            raise AssertionError("/status must not start a Codex turn")
+
+        def start_turn_items(self, *_args, **_kwargs):
+            raise AssertionError("/status must not start a Codex turn")
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda _model="": _Client())
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "status", "", "codex/main")
+
+    assert len(done) == 1
+    turn_idx, answer, error, model, _extra, chat_id = done[0]
+    assert (turn_idx, error, model, chat_id) == (0, "", "codex/main", "chat-current")
+    assert "Codex 状态" in answer
+    assert "thread-1" in answer
+    assert "waitingOnUserInput" in answer
+    assert "user@example.com" in answer
+
+
+def test_codex_help_command_worker_lists_supported_commands(frame, monkeypatch):
+    done = []
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "help", "", "codex/main")
+
+    assert len(done) == 1
+    assert "/status" in done[0][1]
+    assert "/compact" in done[0][1]
+    assert done[0][2] == ""
+
+
+def test_codex_unknown_slash_command_worker_reports_unsupported_without_starting_turn(frame, monkeypatch):
+    done = []
+
+    class _Client:
+        def start_turn(self, *_args, **_kwargs):
+            raise AssertionError("unknown slash command must not start a Codex turn")
+
+        def start_turn_items(self, *_args, **_kwargs):
+            raise AssertionError("unknown slash command must not start a Codex turn")
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda _model="": _Client())
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "not-a-real-command", "arg", "codex/main")
+
+    assert len(done) == 1
+    assert "暂不支持" in done[0][1]
+    assert "/not-a-real-command" in done[0][1]
+    assert done[0][2] == ""
+
+
+def test_codex_compact_command_worker_calls_app_server_compact(frame, monkeypatch):
+    frame._current_chat_state.update({"id": "chat-current", "codex_thread_id": "thread-1"})
+    calls = []
+    done = []
+
+    class _Client:
+        def compact_thread(self, thread_id):
+            calls.append(thread_id)
+            return {}
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda _model="": _Client())
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "compact", "now", "codex/main")
+
+    assert calls == ["thread-1"]
+    assert "已开始压缩" in done[0][1]
+    assert done[0][2] == ""
 
 
 @pytest.mark.parametrize(

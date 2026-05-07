@@ -2361,6 +2361,140 @@ class ChatFrame(wx.Frame):
                     items.append({"type": "localImage", "path": path})
         return items or [{"type": "text", "text": ""}]
 
+    @staticmethod
+    def _parse_codex_local_command(question: str) -> dict | None:
+        text = str(question or "").strip()
+        if not text.startswith("/") or text == "/":
+            return None
+        body = text[1:]
+        parts = body.split(None, 1)
+        name = parts[0].strip().lower()
+        if not name:
+            return None
+        if not re.fullmatch(r"[a-z0-9][a-z0-9:_\.-]*", name):
+            return None
+        args = parts[1].strip() if len(parts) > 1 else ""
+        return {"raw": text, "name": name, "args": args}
+
+    @staticmethod
+    def _codex_local_command_name(question: str) -> str:
+        command = ChatFrame._parse_codex_local_command(question)
+        return str(command.get("name") or "") if command else ""
+
+    @staticmethod
+    def _codex_supported_local_commands() -> tuple[tuple[str, str], ...]:
+        return (
+            ("status", "显示账号、模型、沙箱、线程、上下文和额度状态"),
+            ("help", "列出本程序支持的 Codex 斜杠命令"),
+            ("compact", "请求 Codex 压缩当前线程上下文"),
+            ("model", "不带参数显示当前模型；带 Codex 模型名时切换模型"),
+            ("new", "开始一个新的本地聊天"),
+            ("clear", "清除当前聊天关联的 Codex 线程状态"),
+            ("stop", "中断当前活跃 Codex turn"),
+        )
+
+    def _build_codex_help_markdown(self) -> str:
+        lines = [
+            "## Codex 斜杠命令",
+            "",
+            "本程序会识别所有以 `/` 开头的 Codex 输入。以下命令已在桌面端实现：",
+            "",
+        ]
+        lines.extend(f"- `/{name}`：{description}" for name, description in self._codex_supported_local_commands())
+        lines.extend(
+            [
+                "",
+                "其他 `/...` 命令会被识别为 Codex 斜杠命令，但当前桌面端暂不支持，不会被当成普通聊天发送。",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_codex_unsupported_command_markdown(command: str, args: str = "") -> str:
+        suffix = f" {args}" if str(args or "").strip() else ""
+        return (
+            "## Codex 斜杠命令暂不支持\n\n"
+            f"`/{command}{suffix}` 已被识别为 Codex 斜杠命令，但当前桌面端还没有对应实现。\n\n"
+            "为避免误操作，这条输入不会作为普通聊天内容发送给 Codex。"
+        )
+
+    @staticmethod
+    def _format_codex_account_status(account_resp: dict) -> str:
+        account = account_resp.get("account") if isinstance(account_resp, dict) else None
+        if not isinstance(account, dict):
+            return "未登录或账号不可用"
+        account_type = str(account.get("type") or "").strip()
+        if account_type == "chatgpt":
+            email = str(account.get("email") or "").strip()
+            plan = str(account.get("planType") or "").strip()
+            suffix = f"，{plan}" if plan else ""
+            return f"ChatGPT：{email or '未知账号'}{suffix}"
+        if account_type:
+            return account_type
+        return "未知"
+
+    @staticmethod
+    def _format_codex_rate_limit_status(rate_limits_resp: dict) -> str:
+        if not isinstance(rate_limits_resp, dict):
+            return "未知"
+        limits = rate_limits_resp.get("rateLimits")
+        if not isinstance(limits, dict):
+            return "未知"
+        name = str(limits.get("limitName") or limits.get("limitId") or "Codex").strip()
+        primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
+        percent = primary.get("percentUsed") if isinstance(primary, dict) else None
+        if isinstance(percent, (int, float)):
+            return f"{name}：{percent:.0f}% 已用"
+        return name or "未知"
+
+    @staticmethod
+    def _codex_thread_status_from_response(thread_resp: dict) -> tuple[str, list[str]]:
+        thread = thread_resp.get("thread") if isinstance(thread_resp, dict) else {}
+        status = thread.get("status") if isinstance(thread, dict) and isinstance(thread.get("status"), dict) else {}
+        return str(status.get("type") or "").strip(), list(status.get("activeFlags") or [])
+
+    def _build_codex_status_markdown(self, client, chat: dict, model: str) -> str:
+        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
+        turn_id = str((chat or {}).get("codex_turn_id") or self.active_codex_turn_id or "").strip()
+        flags = list((chat or {}).get("codex_thread_flags") or self.active_codex_thread_flags or [])
+        thread_status = "active" if flags else ("idle" if thread_id else "notLoaded")
+        account_status = "未查询"
+        rate_limit_status = "未查询"
+        if client is not None:
+            try:
+                if hasattr(client, "read_thread") and thread_id:
+                    thread_status, flags = self._codex_thread_status_from_response(client.read_thread(thread_id, include_turns=False))
+            except Exception as exc:
+                thread_status = f"查询失败：{exc}"
+            try:
+                if hasattr(client, "read_account"):
+                    account_status = self._format_codex_account_status(client.read_account(refresh_token=False))
+            except Exception as exc:
+                account_status = f"查询失败：{exc}"
+            try:
+                if hasattr(client, "read_rate_limits"):
+                    rate_limit_status = self._format_codex_rate_limit_status(client.read_rate_limits())
+            except Exception as exc:
+                rate_limit_status = f"查询失败：{exc}"
+        usage = format_context_usage_label(context_usage_from_dict((chat or {}).get("context_usage")))
+        flags_text = "、".join(str(item) for item in flags) if flags else "无"
+        lines = [
+            "## Codex 状态",
+            "",
+            f"- 模型：{model_display_name(model) or model or DEFAULT_CODEX_MODEL}",
+            f"- 工作目录：{self._workspace_dir_for_codex()}",
+            "- 审批策略：never",
+            "- 沙箱：danger-full-access",
+            f"- 线程：{thread_id or '未创建'}",
+            f"- 当前轮次：{turn_id or '无'}",
+            f"- 运行状态：{thread_status or '未知'}",
+            f"- 活跃标记：{flags_text}",
+            f"- 上下文：{usage}",
+            f"- 账号：{account_status}",
+            f"- 额度：{rate_limit_status}",
+        ]
+        return "\n".join(lines)
+
     def _active_chat_context_usage(self):
         chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
         usage = (chat or {}).get("context_usage") if isinstance(chat, dict) else None
@@ -3598,9 +3732,27 @@ class ChatFrame(wx.Frame):
             pass
         return normalized
 
-    def _toggle_detail_panel_mode(self) -> str:
+    def _focus_latest_execution_item(self) -> bool:
+        if not hasattr(self, "execution_list"):
+            return False
+        count = self.execution_list.GetCount()
+        if count <= 0:
+            return False
+        try:
+            self.execution_list.SetSelection(count - 1)
+            self.execution_list.SetFocus()
+        except Exception:
+            return False
+        return True
+
+    def _toggle_detail_panel_mode(self, *, focus_detail: bool = False) -> str:
         next_mode = "answers" if self._detail_panel_mode() == "execution" else "execution"
         self._apply_detail_panel_mode(next_mode, refresh_execution=True)
+        if focus_detail:
+            if next_mode == "execution":
+                self._focus_latest_execution_item()
+            elif hasattr(self, "answer_list"):
+                self._focus_latest_answer()
         self._save_state()
         return next_mode
 
@@ -4410,6 +4562,96 @@ class ChatFrame(wx.Frame):
             self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_codex_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
+        threading.Thread(
+            target=self._run_codex_local_command_worker,
+            args=(chat_id, turn_idx, command, args, model),
+            daemon=True,
+        ).start()
+
+    def _run_codex_local_command_worker(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
+        try:
+            target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
+            if not isinstance(target_chat, dict):
+                target_chat = self._current_chat_state
+            normalized_command = str(command or "").strip().lower()
+            client = None
+            if normalized_command in {"status", "compact", "stop"}:
+                client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
+            if normalized_command == "status":
+                answer = self._build_codex_status_markdown(client, target_chat, model)
+            elif normalized_command == "help":
+                answer = self._build_codex_help_markdown()
+            elif normalized_command == "compact":
+                answer = self._handle_codex_compact_command(client, target_chat)
+            elif normalized_command == "model":
+                answer = self._handle_codex_model_command(str(args or ""), target_chat)
+            elif normalized_command == "new":
+                answer = "## Codex 新聊天\n\n已请求开始新聊天。"
+                self._call_after_if_alive(self._on_new_chat_clicked, None)
+            elif normalized_command == "clear":
+                answer = self._handle_codex_clear_command(target_chat)
+            elif normalized_command == "stop":
+                answer = self._handle_codex_stop_command(client, target_chat)
+            else:
+                answer = self._build_codex_unsupported_command_markdown(normalized_command or command, args)
+            self._call_after_if_alive(self._on_done, turn_idx, answer, "", model, "", chat_id)
+        except Exception as exc:
+            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+
+    def _handle_codex_compact_command(self, client, chat: dict) -> str:
+        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
+        if not thread_id:
+            return "## Codex 压缩\n\n当前聊天还没有 Codex 线程，无法执行 `/compact`。"
+        if client is None or not hasattr(client, "compact_thread"):
+            return "## Codex 压缩\n\n当前 Codex 客户端不支持 `thread/compact/start`。"
+        client.compact_thread(thread_id)
+        return f"## Codex 压缩\n\n已开始压缩当前 Codex 线程：`{thread_id}`。"
+
+    def _handle_codex_model_command(self, args: str, chat: dict) -> str:
+        requested = str(args or "").strip()
+        if not requested:
+            model = str((chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL)
+            return f"## Codex 模型\n\n当前模型：`{model_display_name(model) or model}`。"
+        model_id = model_id_from_display_name(requested)
+        if not is_codex_model(model_id):
+            return f"## Codex 模型\n\n`{requested}` 不是本程序可用的 Codex 模型。"
+        self.selected_model = model_id
+        if isinstance(chat, dict):
+            chat["model"] = model_id
+        self._call_after_if_alive(self.model_combo.SetValue, model_display_name(model_id))
+        self._save_state()
+        return f"## Codex 模型\n\n已切换到：`{model_display_name(model_id) or model_id}`。"
+
+    def _handle_codex_clear_command(self, chat: dict) -> str:
+        if isinstance(chat, dict):
+            chat["codex_thread_id"] = ""
+            chat["codex_turn_id"] = ""
+            chat["codex_turn_active"] = False
+            chat["codex_pending_prompt"] = ""
+            chat["codex_pending_request"] = None
+            chat["codex_request_queue"] = []
+            chat["codex_thread_flags"] = []
+        if chat is self._current_chat_state:
+            self.active_codex_thread_id = ""
+            self.active_codex_turn_id = ""
+            self.active_codex_turn_active = False
+            self.active_codex_pending_prompt = ""
+            self.active_codex_pending_request = None
+            self.active_codex_thread_flags = []
+        self._save_state()
+        return "## Codex 清理\n\n已清除当前聊天关联的 Codex 线程状态。聊天记录不会被删除。"
+
+    def _handle_codex_stop_command(self, client, chat: dict) -> str:
+        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
+        turn_id = str((chat or {}).get("codex_turn_id") or self.active_codex_turn_id or "").strip()
+        if not thread_id or not turn_id:
+            return "## Codex 中断\n\n当前没有可中断的 Codex turn。"
+        if client is None or not hasattr(client, "interrupt_turn"):
+            return "## Codex 中断\n\n当前 Codex 客户端不支持 `turn/interrupt`。"
+        client.interrupt_turn(thread_id, turn_id)
+        return f"## Codex 中断\n\n已请求中断 turn：`{turn_id}`。"
 
     def _ensure_codex_thread_resumed(self, client, thread_id: str) -> None:
         thread_value = str(thread_id or "").strip()
@@ -6585,8 +6827,17 @@ class ChatFrame(wx.Frame):
         ):
             if self._try_open_selected_answer_detail():
                 return
-        if key == wx.WXK_F1 and not notes_has_focus and not ctrl_down and not alt_down:
-            self._toggle_detail_panel_mode()
+        if (
+            key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+            and hasattr(self, "execution_list")
+            and self.execution_list.HasFocus()
+            and not ctrl_down
+            and not alt_down
+        ):
+            self._try_open_selected_execution_detail()
+            return
+        if key == wx.WXK_F1 and not ctrl_down and not alt_down:
+            self._toggle_detail_panel_mode(focus_detail=True)
             return
         if self._is_continue_shortcut(key, alt_down):
             self._submit_question("继续", source="local")
@@ -7009,6 +7260,52 @@ class ChatFrame(wx.Frame):
         if success_attachments and not is_codex_model(resolved_model):
             attachment_context = self._build_cli_attachment_context(success_attachments)
             worker_question = f"{q}\n\n{attachment_context}".strip() if q else attachment_context
+        codex_local_command = self._parse_codex_local_command(q) if is_codex_model(resolved_model) and not outgoing_attachments else None
+        if codex_local_command:
+            command_name = str(codex_local_command.get("name") or "").strip()
+            command_args = str(codex_local_command.get("args") or "").strip()
+            now = time.time()
+            turn_idx = len(self.active_session_turns)
+            turn = {
+                "question": display_question,
+                "answer_md": REQUESTING_TEXT,
+                "model": resolved_model,
+                "created_at": now,
+                "local_command": command_name,
+                "local_command_args": command_args,
+            }
+            self.active_session_turns.append(turn)
+            self.active_turn_idx = turn_idx
+            self._reset_answer_visible_row_limit()
+            self._reset_current_turn_execution_view()
+            self._current_chat_state["updated_at"] = now
+            if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._mark_turn_request_pending(turn, resolved_model, command_name)
+            self.is_running = True
+            self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
+            self.input_edit.SetValue("")
+            self.input_edit.SetFocus()
+            self._pending_input_attachments = []
+            self._save_state()
+            self._play_send_sound()
+            self.SetStatusText(f"正在执行 Codex 命令：/{command_name}")
+            self.view_mode = "active"
+            self.view_history_id = None
+            self._active_answer_row_index = -1
+            if self._detail_panel_mode() == "execution":
+                self._render_answer_list_compat(refresh_execution=False)
+            else:
+                self._render_answer_list()
+            if source == "local":
+                self._start_codex_local_command_worker_for_turn(
+                    chat_id or self.active_chat_id or self.current_chat_id or "",
+                    turn_idx,
+                    command_name,
+                    command_args,
+                    resolved_model,
+                )
+            return True, ""
         if (not success_attachments) and (not q):
             now = time.time()
             turn = {
