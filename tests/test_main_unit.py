@@ -5113,6 +5113,57 @@ def test_append_execution_entry_to_chat_dedupes_adjacent_expanded_commentary(fra
     assert len(frame._current_chat_state["execution_steps"]) == 1
 
 
+def test_append_execution_entry_broadcasts_remote_execution_entry(frame, monkeypatch):
+    events = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: events.append(payload))
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "turns": [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL}],
+        "execution_steps": [],
+    }
+
+    appended = frame._append_execution_entry_to_chat(
+        "chat-1",
+        {"event_type": "plan_updated", "list_text": "计划：整理", "detail_text": "整理步骤"},
+        save_state=False,
+    )
+
+    assert appended is True
+    assert len(events) == 1
+    assert events[0]["type"] == "execution_entry"
+    assert events[0]["chat_id"] == "chat-1"
+    assert events[0]["kind"] == "plan_updated"
+    assert events[0]["title"] == "计划：整理"
+    assert events[0]["detail"] == "整理步骤"
+    assert events[0]["ts"]
+    assert events[0]["event_id"]
+
+
+def test_deduped_execution_entry_does_not_broadcast_remote_event(frame, monkeypatch):
+    events = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: events.append(payload))
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "turns": [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL}],
+        "execution_steps": [{"list_text": "计划：整理", "detail_text": "整理步骤"}],
+    }
+
+    appended = frame._append_execution_entry_to_chat(
+        "chat-1",
+        {"list_text": "计划：整理", "detail_text": "整理步骤"},
+        save_state=False,
+    )
+
+    assert appended is False
+    assert events == []
+
+
 def test_background_agent_message_delta_buffers_and_flushes_for_target_chat(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"

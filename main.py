@@ -3421,15 +3421,44 @@ class ChatFrame(wx.Frame):
     def _execution_entries_should_dedupe(self, previous_step, next_step) -> bool:
         if not isinstance(previous_step, dict) or not isinstance(next_step, dict):
             return False
+        previous_title = self._normalize_execution_text_for_compare(
+            previous_step.get("list_text") or previous_step.get("step") or previous_step.get("text") or ""
+        )
+        next_title = self._normalize_execution_text_for_compare(
+            next_step.get("list_text") or next_step.get("step") or next_step.get("text") or ""
+        )
+        previous_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
+        next_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(next_step))
+        if previous_title and previous_title == next_title and previous_detail and previous_detail == next_detail:
+            return True
         previous_kind = str(previous_step.get("display_kind") or "").strip()
         next_kind = str(next_step.get("display_kind") or "").strip()
         if previous_kind != "commentary" or next_kind != "commentary":
             return False
-        previous_text = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
-        next_text = self._normalize_execution_text_for_compare(self._execution_step_detail_text(next_step))
-        if not previous_text or not next_text:
+        if not previous_detail or not next_detail:
             return False
-        return self._execution_texts_are_near_duplicate(previous_text, next_text)
+        return self._execution_texts_are_near_duplicate(previous_detail, next_detail)
+
+    def _remote_execution_entry_payload(self, chat_id: str, entry: dict) -> dict:
+        if not isinstance(entry, dict):
+            entry = {}
+        title = str(entry.get("list_text") or entry.get("step") or entry.get("text") or "").strip()
+        detail = str(entry.get("detail_text") or entry.get("detail") or title).strip()
+        kind = str(entry.get("display_kind") or entry.get("event_type") or "info").strip() or "info"
+        event_id = str(entry.get("event_id") or "").strip() or f"evt-{uuid.uuid4().hex[:8]}"
+        try:
+            ts = float(entry.get("ts") or entry.get("created_at") or time.time())
+        except (TypeError, ValueError):
+            ts = time.time()
+        return {
+            "type": "execution_entry",
+            "chat_id": str(chat_id or ""),
+            "event_id": event_id,
+            "kind": kind,
+            "title": title,
+            "detail": detail,
+            "ts": ts,
+        }
 
     def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True) -> bool:
         if not isinstance(entry, dict):
@@ -3449,10 +3478,12 @@ class ChatFrame(wx.Frame):
         if steps and self._execution_entries_should_dedupe(steps[-1], entry):
             return False
         steps.append(copy.deepcopy(entry))
+        resolved_chat_id = str(chat_id or target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
         if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
-            resolved_chat_id = str(chat_id or target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
             if resolved_chat_id:
                 self.chat_store.append_execution_step(resolved_chat_id, steps[-1])
+        if resolved_chat_id:
+            self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[-1]))
         self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if save_state:
             self._save_state()
