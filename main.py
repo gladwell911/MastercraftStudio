@@ -5518,6 +5518,15 @@ class ChatFrame(wx.Frame):
         ok, message = self._handle_remote_pending_request_reply(text)
         return 200 if ok else 400, {"accepted": ok, "message": message}
 
+    def _remote_api_model_list_ui(self) -> tuple[int, dict]:
+        return 200, {
+            "accepted": True,
+            "models": [
+                {"id": model_id, "label": model_display_name(model_id)}
+                for model_id in VISIBLE_MODEL_IDS
+            ],
+        }
+
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
         chats = []
         if self.active_chat_id or self.active_session_turns:
@@ -6213,6 +6222,7 @@ class ChatFrame(wx.Frame):
                     on_state=self._remote_api_state_ui,
                     on_rename_chat=self._remote_api_rename_chat_ui,
                     on_update_settings=self._remote_api_update_settings_ui,
+                    on_model_list=self._remote_api_model_list_ui,
                     on_history_list=self._remote_api_history_list_ui,
                     on_history_read=self._remote_api_history_read_ui,
                     on_notes_changes=self._remote_api_notes_changes,

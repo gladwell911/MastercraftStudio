@@ -76,6 +76,17 @@ def test_model_combo_order_prioritizes_cli_models(frame):
     ]
 
 
+def test_remote_model_list_returns_visible_combo_order(frame):
+    status, body = frame._remote_api_model_list_ui()
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["models"] == [
+        {"id": model_id, "label": main.model_display_name(model_id)}
+        for model_id in main.VISIBLE_MODEL_IDS
+    ]
+
+
 def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)

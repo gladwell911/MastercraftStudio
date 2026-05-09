@@ -93,6 +93,25 @@ def test_transport_routes_state_command_and_publishes_response():
     asyncio.run(run())
 
 
+def test_routes_model_list_command():
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_model_list=lambda: (
+            200,
+            {"accepted": True, "models": [{"id": "codex/main", "label": "codex"}]},
+        ),
+    )
+
+    status, body = transport._route_command({"type": "model_list"})
+
+    assert status == 200
+    assert body == {
+        "accepted": True,
+        "models": [{"id": "codex/main", "label": "codex"}],
+    }
+
+
 def test_transport_routes_notes_changes_command_and_publishes_response():
     async def run():
         jetstream = FakeJetStream()

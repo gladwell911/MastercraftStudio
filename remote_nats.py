@@ -33,6 +33,7 @@ class RemoteNatsTransport:
         on_state: Callback | None = None,
         on_rename_chat: Callback | None = None,
         on_update_settings: Callback | None = None,
+        on_model_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
         on_notes_changes: Callback | None = None,
@@ -50,6 +51,7 @@ class RemoteNatsTransport:
         self.on_state = on_state
         self.on_rename_chat = on_rename_chat
         self.on_update_settings = on_update_settings
+        self.on_model_list = on_model_list
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
         self.on_notes_changes = on_notes_changes
@@ -252,6 +254,8 @@ class RemoteNatsTransport:
             return self.on_reply_request(payload)
         if command_type == "state" and callable(self.on_state):
             return self.on_state(payload)
+        if command_type == "model_list" and callable(self.on_model_list):
+            return self.on_model_list()
         if command_type == "rename_chat" and callable(self.on_rename_chat):
             return self.on_rename_chat(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):
