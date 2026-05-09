@@ -190,6 +190,7 @@ class ChatStore:
             return
         turn_value = self._optional_int(step.get("turn_idx"))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COALESCE(MAX(step_index), -1) + 1 AS next_idx FROM execution_steps WHERE chat_id = ?",
                 (normalized,),

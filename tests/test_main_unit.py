@@ -6932,6 +6932,35 @@ def test_save_state_persists_chats_to_chat_store(frame, tmp_path):
     assert frame.chat_store.load_turns("chat-old") == frame.archived_chats[0]["turns"]
 
 
+def test_save_state_does_not_rewrite_incrementally_persisted_execution_steps(frame, tmp_path, monkeypatch):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active q", "answer_md": "active a", "model": "codex/main"}]
+    step = {"turn_idx": 0, "display_kind": "plan", "list_text": "already persisted", "detail_text": "already persisted"}
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "title": "active",
+        "turns": frame.active_session_turns,
+        "execution_steps": [step],
+    }
+    frame.chat_store.upsert_chat(frame._current_chat_state)
+    frame.chat_store.replace_turns("chat-active", frame.active_session_turns)
+    frame.chat_store.append_execution_step("chat-active", step)
+    calls = []
+    monkeypatch.setattr(frame.chat_store, "replace_execution_steps", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    frame._save_state()
+
+    assert calls == []
+    assert [item["list_text"] for item in frame.chat_store.load_execution_steps("chat-active")] == ["already persisted"]
+    assert frame.chat_store.load_turns("chat-active") == frame.active_session_turns
+
+
 def test_load_state_uses_chat_store_summaries_without_full_turns(frame, tmp_path):
     frame.state_path = tmp_path / "app_state.json"
     frame.chat_db_path = tmp_path / "chat_history.db"
@@ -10504,13 +10533,14 @@ def test_answer_list_defaults_to_latest_100_rows_and_shows_more(frame):
     frame._render_answer_list()
 
     visible = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
-    assert frame.answer_more_button.IsShown()
+    assert visible[0] == "更多"
+    assert frame.answer_meta[0] == ("more", -1, "更多", "")
     assert "q 0" not in visible
     assert "q 59" in visible
     assert frame.answer_total_content_rows > 100
 
 
-def test_answer_more_button_expands_upward_and_hides_when_all_rows_visible(frame):
+def test_answer_list_more_item_expands_upward_and_hides_when_all_rows_visible(frame):
     frame.active_session_turns = [
         {"question": f"q {idx}", "answer_md": f"a {idx}", "model": "openai/gpt-5.2", "created_at": float(idx)}
         for idx in range(60)
@@ -10521,17 +10551,19 @@ def test_answer_more_button_expands_upward_and_hides_when_all_rows_visible(frame
         "detail_panel_mode": "answers",
     }
     frame._render_answer_list()
+    frame.answer_list.SetSelection(0)
 
-    frame._show_more_answer_rows()
+    assert frame._try_open_selected_answer_detail() is True
     visible_after_one = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
     assert "q 10" in visible_after_one
     assert "q 0" not in visible_after_one
-    assert frame.answer_more_button.IsShown()
+    assert visible_after_one[0] == "更多"
 
-    frame._show_more_answer_rows()
+    frame.answer_list.SetSelection(0)
+    assert frame._try_open_selected_answer_detail() is True
     visible_after_two = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
     assert "q 0" in visible_after_two
-    assert not frame.answer_more_button.IsShown()
+    assert "更多" not in visible_after_two
 
 
 def test_submit_question_resets_answer_list_visible_limit(frame, monkeypatch):
@@ -10568,6 +10600,109 @@ def test_active_execution_list_shows_only_current_turn_steps(frame):
 
     visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert visible == ["new process"]
+
+
+def test_execution_list_defaults_to_latest_100_rows_and_shows_more_at_top(frame):
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [
+            {"question": "old", "answer_md": "old", "model": "codex/main"},
+            {"question": "q", "answer_md": "a", "model": "codex/main"},
+        ],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": f"process {idx}", "list_text": f"process {idx}", "display_kind": "commentary", "turn_idx": 1}
+            for idx in range(120)
+        ],
+    }
+
+    frame._render_execution_list()
+
+    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible[0] == "更多"
+    assert "process 0" not in visible
+    assert "process 20" in visible
+    assert "process 119" in visible
+    assert frame.execution_meta[0] == ("more", -1, "更多", "")
+    assert frame.execution_list.GetCount() == 101
+
+
+def test_execution_list_more_item_expands_upward_and_hides_when_all_visible(frame):
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [
+            {"question": "old", "answer_md": "old", "model": "codex/main"},
+            {"question": "q", "answer_md": "a", "model": "codex/main"},
+        ],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": f"process {idx}", "list_text": f"process {idx}", "display_kind": "commentary", "turn_idx": 1}
+            for idx in range(220)
+        ],
+    }
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+
+    assert frame._try_open_selected_execution_detail() is True
+    visible_after_one = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible_after_one[0] == "更多"
+    assert "process 20" in visible_after_one
+    assert "process 0" not in visible_after_one
+    assert frame.execution_list.GetCount() == 201
+
+    assert frame._try_open_selected_execution_detail() is True
+    visible_after_two = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible_after_two[0] == "process 0"
+    assert "更多" not in visible_after_two
+    assert frame.execution_list.GetCount() == 220
+
+
+def test_appending_execution_entry_keeps_latest_100_rows_with_more_at_top(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [
+            {"question": "old", "answer_md": "old", "model": "codex/main"},
+            {"question": "q", "answer_md": "a", "model": "codex/main"},
+        ],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": f"process {idx}", "list_text": f"process {idx}", "display_kind": "commentary", "turn_idx": 1}
+            for idx in range(100)
+        ],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    frame._render_execution_list()
+
+    frame._append_execution_entry_to_chat(
+        "chat-current",
+        {"step": "process 100", "list_text": "process 100", "display_kind": "commentary", "turn_idx": 1},
+    )
+
+    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert visible[0] == "更多"
+    assert "process 0" not in visible
+    assert "process 1" in visible
+    assert visible[-1] == "process 100"
+    assert frame.execution_list.GetCount() == 101
+
+
+def test_submit_question_resets_execution_list_visible_limit(frame, monkeypatch):
+    frame.execution_visible_row_limit = 300
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    ok, message = frame._submit_question("new question", source="local", model="codex/main")
+
+    assert ok is True
+    assert message == ""
+    assert frame.execution_visible_row_limit == 100
 
 
 def test_submit_question_clears_visible_execution_process_for_new_turn(frame, monkeypatch):

@@ -84,6 +84,8 @@ CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE = 5
 CODEX_UI_EVENT_BATCH_DELAY_MS = 10
 ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
 ANSWER_LIST_EXPAND_ROWS = 100
+EXECUTION_LIST_DEFAULT_VISIBLE_ROWS = 100
+EXECUTION_LIST_EXPAND_ROWS = 100
 HOTKEY_ID_SHOW = 0xA112
 HOTKEY_ID_REALTIME_CALL = 0xA113
 HOTKEY_ID_REALTIME_CALL_ALT = 0xA114
@@ -905,6 +907,8 @@ class ChatFrame(wx.Frame):
         self._execution_delta_buffer = {}
         self.answer_visible_row_limit = ANSWER_LIST_DEFAULT_VISIBLE_ROWS
         self.answer_total_content_rows = 0
+        self.execution_visible_row_limit = EXECUTION_LIST_DEFAULT_VISIBLE_ROWS
+        self.execution_total_content_rows = 0
         self.is_running = False
         self._active_request_count = 0
         self.active_turn_idx = -1
@@ -1024,10 +1028,6 @@ class ChatFrame(wx.Frame):
 
         self.detail_title_label = wx.StaticText(panel, label="回答：")
         right.Add(self.detail_title_label, 0, wx.LEFT, 10)
-        self.answer_more_button = wx.Button(panel, label="更多")
-        self.answer_more_button.SetName("更多回答")
-        self.answer_more_button.Hide()
-        right.Add(self.answer_more_button, 0, wx.LEFT | wx.TOP, 10)
         self.answer_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.answer_list.SetName("回答列表")
         right.Add(self.answer_list, 1, wx.EXPAND | wx.ALL, 10)
@@ -1106,7 +1106,6 @@ class ChatFrame(wx.Frame):
         self.send_button.Bind(wx.EVT_BUTTON, self._on_send_clicked)
         self.new_chat_button.Bind(wx.EVT_BUTTON, self._on_new_chat_clicked)
         self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_model_changed)
-        self.answer_more_button.Bind(wx.EVT_BUTTON, lambda _evt: self._show_more_answer_rows())
         self.input_edit.Bind(wx.EVT_KEY_DOWN, self._on_input_key_down)
         self.input_edit.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.send_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
@@ -1501,6 +1500,9 @@ class ChatFrame(wx.Frame):
         store = getattr(self, "chat_store", None)
         if store is None:
             return
+        # Execution steps are persisted incrementally as Codex events arrive.
+        # Rewriting them on every UI-thread state save stalls keyboard response
+        # once a command-heavy turn has hundreds of steps.
         if self.active_chat_id or self.current_chat_id or self.active_session_turns:
             active = self._slim_active_chat_state()
             active_id = str(active.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
@@ -1512,7 +1514,6 @@ class ChatFrame(wx.Frame):
                 active["execution_steps"] = active_steps
                 store.upsert_chat(active)
                 store.replace_turns(active_id, active["turns"])
-                store.replace_execution_steps(active_id, active_steps)
         for chat in self.archived_chats:
             if not isinstance(chat, dict):
                 continue
@@ -1522,8 +1523,6 @@ class ChatFrame(wx.Frame):
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
                 store.replace_turns(chat_id, chat.get("turns") or [])
-            if isinstance(chat.get("execution_steps"), list):
-                store.replace_execution_steps(chat_id, chat.get("execution_steps") or [])
 
     def _chat_summary_by_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()
@@ -2668,23 +2667,18 @@ class ChatFrame(wx.Frame):
     def _reset_answer_visible_row_limit(self) -> None:
         self.answer_visible_row_limit = ANSWER_LIST_DEFAULT_VISIBLE_ROWS
 
+    def _reset_execution_visible_row_limit(self) -> None:
+        self.execution_visible_row_limit = EXECUTION_LIST_DEFAULT_VISIBLE_ROWS
+
     def _show_more_answer_rows(self) -> None:
         current_limit = int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0)
         self.answer_visible_row_limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, current_limit) + ANSWER_LIST_EXPAND_ROWS
         self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
 
-    def _sync_answer_more_button(self) -> None:
-        if not hasattr(self, "answer_more_button"):
-            return
-        should_show = (
-            self._detail_panel_mode() != "execution"
-            and int(getattr(self, "answer_total_content_rows", 0) or 0)
-            > int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0)
-        )
-        try:
-            self.answer_more_button.Show(bool(should_show))
-        except Exception:
-            pass
+    def _show_more_execution_rows(self) -> None:
+        current_limit = int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0)
+        self.execution_visible_row_limit = max(EXECUTION_LIST_DEFAULT_VISIBLE_ROWS, current_limit) + EXECUTION_LIST_EXPAND_ROWS
+        self._render_execution_list()
 
     def _apply_answer_row_limit(self, header_count: int) -> None:
         rows = [self.answer_list.GetString(idx) for idx in range(self.answer_list.GetCount())]
@@ -2697,6 +2691,7 @@ class ChatFrame(wx.Frame):
         self.answer_total_content_rows = len(content_rows)
         limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0))
         self.answer_visible_row_limit = limit
+        has_more = len(content_rows) > limit
         if len(content_rows) > limit:
             content_rows = content_rows[-limit:]
             content_metas = content_metas[-limit:]
@@ -2706,6 +2701,9 @@ class ChatFrame(wx.Frame):
         self.answer_list.Clear()
         self.answer_meta = []
         self._active_answer_row_index = -1
+        if has_more:
+            self.answer_list.Append("更多")
+            self.answer_meta.append(("more", -1, "更多", ""))
         for row_text, meta in zip(header_rows + content_rows, header_metas + content_metas):
             self.answer_list.Append(row_text)
             self.answer_meta.append(meta)
@@ -2714,7 +2712,6 @@ class ChatFrame(wx.Frame):
                 if meta == active_meta:
                     self._active_answer_row_index = idx
                     break
-        self._sync_answer_more_button()
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
@@ -2754,7 +2751,6 @@ class ChatFrame(wx.Frame):
             self.answer_total_content_rows = 1
             self.answer_list.Append("暂无对话内容")
             self.answer_meta.append(("info", -1, "", ""))
-            self._sync_answer_more_button()
             self._request_listbox_repaint(self.answer_list)
             if mode == "execution" and refresh_execution:
                 self._render_execution_list()
@@ -3314,6 +3310,51 @@ class ChatFrame(wx.Frame):
             except Exception:
                 return False
             self.execution_meta = []
+        limit = max(
+            EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
+            int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
+        )
+        visible_execution_rows = sum(1 for item in self.execution_meta if item[0] == "execution")
+        has_more_row = bool(self.execution_meta and self.execution_meta[0][0] == "more")
+        if has_more_row:
+            self.execution_list.Append(row_text)
+            self.execution_meta.append(meta)
+            if visible_execution_rows >= limit:
+                try:
+                    self.execution_list.Delete(1)
+                    del self.execution_meta[1]
+                except Exception:
+                    self._rebuild_execution_list_from_state()
+            if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
+                self._execution_list_deferred_repaint = True
+                self._execution_list_deferred_select_latest = True
+            else:
+                try:
+                    self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+                except Exception:
+                    pass
+                self._request_listbox_repaint(self.execution_list)
+            return True
+        if visible_execution_rows >= limit:
+            try:
+                self.execution_list.Insert("更多", 0)
+                self.execution_meta.insert(0, ("more", -1, "更多", ""))
+                self.execution_list.Append(row_text)
+                self.execution_meta.append(meta)
+                self.execution_list.Delete(1)
+                del self.execution_meta[1]
+            except Exception:
+                self._rebuild_execution_list_from_state()
+            if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
+                self._execution_list_deferred_repaint = True
+                self._execution_list_deferred_select_latest = True
+            else:
+                try:
+                    self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+                except Exception:
+                    pass
+                self._request_listbox_repaint(self.execution_list)
+            return True
         self.execution_list.Append(row_text)
         self.execution_meta.append(meta)
         if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
@@ -3609,7 +3650,27 @@ class ChatFrame(wx.Frame):
         self.execution_list.Clear()
         self.execution_meta = []
         steps = list(self._current_execution_steps())
-        if not steps:
+        visible_items = []
+        for idx, step in enumerate(steps):
+            if not self._should_show_execution_step(step):
+                continue
+            meta = self._execution_meta_tuple(idx, step)
+            row_text = str(meta[2] or "").strip()
+            if not row_text:
+                continue
+            visible_items.append((row_text, meta))
+        self.execution_total_content_rows = len(visible_items)
+        limit = max(
+            EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
+            int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
+        )
+        self.execution_visible_row_limit = limit
+        has_more = len(visible_items) > limit
+        if has_more:
+            visible_items = visible_items[-limit:]
+            self.execution_list.Append("更多")
+            self.execution_meta.append(("more", -1, "更多", ""))
+        if not visible_items:
             self.execution_list.Append("暂无执行过程")
             self.execution_meta.append(("info", -1, "", ""))
             try:
@@ -3618,18 +3679,9 @@ class ChatFrame(wx.Frame):
                 pass
             self._request_listbox_repaint(self.execution_list)
             return
-        for idx, step in enumerate(steps):
-            if not self._should_show_execution_step(step):
-                continue
-            meta = self._execution_meta_tuple(idx, step)
-            row_text = str(meta[2] or "").strip()
-            if not row_text:
-                continue
+        for row_text, meta in visible_items:
             self.execution_list.Append(row_text)
             self.execution_meta.append(meta)
-        if self.execution_list.GetCount() == 0:
-            self.execution_list.Append("暂无执行过程")
-            self.execution_meta.append(("info", -1, "", ""))
         if self.execution_list.GetCount() > 0 and self.execution_list.GetSelection() == wx.NOT_FOUND:
             try:
                 self.execution_list.SetSelection(0)
@@ -3643,6 +3695,7 @@ class ChatFrame(wx.Frame):
         self._rebuild_execution_list_from_state()
 
     def _reset_current_turn_execution_view(self) -> None:
+        self._reset_execution_visible_row_limit()
         if hasattr(self, "execution_list"):
             self.execution_list.Clear()
             self.execution_meta = []
@@ -3705,8 +3758,6 @@ class ChatFrame(wx.Frame):
                 self.answer_list.Show(show_answers)
             except Exception:
                 pass
-        if hasattr(self, "answer_more_button"):
-            self._sync_answer_more_button()
         if hasattr(self, "execution_list"):
             try:
                 self.execution_list.Show(show_execution)
@@ -3740,7 +3791,8 @@ class ChatFrame(wx.Frame):
             return False
         try:
             self.execution_list.SetSelection(count - 1)
-            self.execution_list.SetFocus()
+            if not self.execution_list.HasFocus():
+                self.execution_list.SetFocus()
         except Exception:
             return False
         return True
@@ -8355,6 +8407,14 @@ class ChatFrame(wx.Frame):
         if idx == wx.NOT_FOUND or idx >= len(self.execution_meta):
             return False
         item_type, step_idx, _, detail_text = self.execution_meta[idx]
+        if item_type == "more":
+            self._show_more_execution_rows()
+            try:
+                if self.execution_list.GetCount() > 0:
+                    self.execution_list.SetSelection(0)
+            except Exception:
+                pass
+            return True
         if item_type != "execution" or step_idx < 0:
             return False
         steps = self._current_execution_steps()
@@ -8392,6 +8452,14 @@ class ChatFrame(wx.Frame):
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return False
         item_type, turn_idx, _, detail = self.answer_meta[idx]
+        if item_type == "more":
+            self._show_more_answer_rows()
+            try:
+                if self.answer_list.GetCount() > 0:
+                    self.answer_list.SetSelection(0)
+            except Exception:
+                pass
+            return True
         if item_type == "attachment":
             path = str(detail or "").strip()
             if not path or not Path(path).is_file():
@@ -8613,6 +8681,7 @@ class ChatFrame(wx.Frame):
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         self._reset_answer_visible_row_limit()
+        self._reset_execution_visible_row_limit()
         self._render_answer_list()
         self._refresh_openclaw_sync_lifecycle()
         self._refresh_history(chat_id)

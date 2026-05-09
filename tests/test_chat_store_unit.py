@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from chat_store import ChatStore
 
 
@@ -91,6 +93,27 @@ def test_chat_store_prunes_execution_steps_per_turn(tmp_path):
         "step 3",
         "step 4",
     ]
+
+
+def test_chat_store_concurrent_execution_step_appends_get_unique_indexes(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+
+    def append_steps(worker_idx):
+        for step_idx in range(25):
+            store.append_execution_step(
+                "chat-1",
+                {"turn_idx": 0, "list_text": f"{worker_idx}-{step_idx}"},
+            )
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(append_steps, idx) for idx in range(20)]
+        for future in as_completed(futures):
+            future.result()
+
+    steps = store.load_execution_steps("chat-1", turn_idx=0)
+    assert len(steps) == 500
 
 
 def test_chat_store_replace_execution_steps_and_meta_round_trip(tmp_path):
