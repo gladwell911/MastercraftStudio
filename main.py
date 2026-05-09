@@ -3421,20 +3421,12 @@ class ChatFrame(wx.Frame):
     def _execution_entries_should_dedupe(self, previous_step, next_step) -> bool:
         if not isinstance(previous_step, dict) or not isinstance(next_step, dict):
             return False
-        previous_title = self._normalize_execution_text_for_compare(
-            previous_step.get("list_text") or previous_step.get("step") or previous_step.get("text") or ""
-        )
-        next_title = self._normalize_execution_text_for_compare(
-            next_step.get("list_text") or next_step.get("step") or next_step.get("text") or ""
-        )
-        previous_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
-        next_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(next_step))
-        if previous_title and previous_title == next_title and previous_detail and previous_detail == next_detail:
-            return True
         previous_kind = str(previous_step.get("display_kind") or "").strip()
         next_kind = str(next_step.get("display_kind") or "").strip()
         if previous_kind != "commentary" or next_kind != "commentary":
             return False
+        previous_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
+        next_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(next_step))
         if not previous_detail or not next_detail:
             return False
         return self._execution_texts_are_near_duplicate(previous_detail, next_detail)
