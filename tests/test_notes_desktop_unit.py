@@ -564,6 +564,55 @@ def test_remote_create_preserves_full_incoming_metadata(tmp_path):
     assert entry.last_modified_by == "mobile"
 
 
+def test_notes_backup_export_writes_all_notebooks_and_entries(tmp_path):
+    from notes_backup import export_notes_backup
+
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("backup notebook")
+    store.create_entry(notebook.id, "first backup entry", source="manual")
+    store.create_entry(notebook.id, "second backup entry", source="manual")
+    backup_path = tmp_path / "notes-backup.json"
+
+    result = export_notes_backup(store, backup_path)
+
+    data = json.loads(backup_path.read_text(encoding="utf-8"))
+    assert result["notebooks"] == 1
+    assert result["entries"] == 2
+    assert data["format"] == "mc-notes-backup"
+    assert data["version"] == 1
+    assert [item["title"] for item in data["notebooks"]] == ["backup notebook"]
+    assert [item["content"] for item in data["entries"]] == ["first backup entry", "second backup entry"]
+
+
+def test_notes_backup_restore_merges_same_title_notebook_and_skips_duplicate_entries(tmp_path):
+    from notes_backup import export_notes_backup, restore_notes_backup
+
+    source = main.NotesStore(tmp_path / "source.db", device_id="desktop-source")
+    source.initialize()
+    source_notebook = source.create_notebook("shared notebook")
+    source.create_entry(source_notebook.id, "duplicate entry", source="manual")
+    source.create_entry(source_notebook.id, "missing entry", source="manual")
+    backup_path = tmp_path / "notes-backup.json"
+    export_notes_backup(source, backup_path)
+
+    target = main.NotesStore(tmp_path / "target.db", device_id="desktop-target")
+    target.initialize()
+    target_notebook = target.create_notebook("shared notebook")
+    target.create_entry(target_notebook.id, "duplicate entry", source="manual")
+
+    result = restore_notes_backup(target, backup_path)
+
+    notebooks = target.list_notebooks()
+    assert result["created_notebooks"] == 0
+    assert result["created_entries"] == 1
+    assert [item.title for item in notebooks] == ["shared notebook"]
+    assert [item.content for item in target.list_entries(target_notebook.id)] == [
+        "duplicate entry",
+        "missing entry",
+    ]
+
+
 def test_entries_are_listed_in_chronological_order_by_default(tmp_path):
     store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
     store.initialize()

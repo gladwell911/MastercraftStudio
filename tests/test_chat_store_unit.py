@@ -80,6 +80,20 @@ def test_chat_store_appends_and_loads_execution_steps(tmp_path):
     ]
 
 
+def test_chat_store_can_load_chat_without_execution_steps(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+    store.replace_turns("chat-1", [{"question": "q", "answer_md": "a"}])
+    store.append_execution_step("chat-1", {"turn_idx": 0, "list_text": "heavy step"})
+
+    chat = store.load_chat("chat-1", include_execution_steps=False)
+
+    assert chat is not None
+    assert chat["turns"] == [{"question": "q", "answer_md": "a"}]
+    assert "execution_steps" not in chat
+
+
 def test_chat_store_prunes_execution_steps_per_turn(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db", max_execution_steps_per_turn=3)
     store.initialize()
@@ -93,6 +107,19 @@ def test_chat_store_prunes_execution_steps_per_turn(tmp_path):
         "step 3",
         "step 4",
     ]
+
+
+def test_chat_store_loads_recent_execution_steps_with_total_count(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db", max_execution_steps_per_turn=1000)
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+    for idx in range(150):
+        store.append_execution_step("chat-1", {"turn_idx": 2, "list_text": f"step {idx}"})
+
+    total, rows = store.load_recent_execution_steps("chat-1", turn_idx=2, limit=10)
+
+    assert total == 150
+    assert [row["list_text"] for row in rows] == [f"step {idx}" for idx in range(140, 150)]
 
 
 def test_chat_store_concurrent_execution_step_appends_get_unique_indexes(tmp_path):

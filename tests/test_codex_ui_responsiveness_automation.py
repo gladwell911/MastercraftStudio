@@ -70,20 +70,18 @@ def _dispatch_frame_key(frame, key_code):
 
 def _send_listbox_ctrl_c(window, wx_app):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    wm_keydown = 0x0100
-    wm_keyup = 0x0101
     keyeventf_keyup = 0x0002
     vk_control = 0x11
-    vk_c = ord("C")
-    c_scan = 0x2E
-    down_lparam = 1 | (c_scan << 16)
-    up_lparam = 1 | (c_scan << 16) | (1 << 30) | (1 << 31)
-    hwnd = int(window.GetHandle())
     user32.keybd_event(vk_control, 0x1D, 0, 0)
     wx_app.Yield()
     try:
-        user32.SendMessageW(hwnd, wm_keydown, vk_c, down_lparam)
-        user32.SendMessageW(hwnd, wm_keyup, vk_c, up_lparam)
+        event = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
+        event.SetKeyCode(ord("C"))
+        set_control_down = getattr(event, "SetControlDown", None)
+        if callable(set_control_down):
+            set_control_down(True)
+        window.ProcessEvent(event)
+        wx_app.Yield()
     finally:
         user32.keybd_event(vk_control, 0x1D, keyeventf_keyup, 0)
         wx_app.Yield()
@@ -140,7 +138,7 @@ def test_real_ui_answer_list_navigation_stays_responsive_during_codex_event_burs
 
 
 def test_real_ui_answer_list_ctrl_c_keeps_selection_and_focus(frame, wx_app, monkeypatch):
-    frame.Show()
+    _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"
     frame.active_session_turns = [
@@ -355,6 +353,204 @@ def test_real_ui_execution_updates_do_not_steal_input_focus_during_event_burst(f
 
     frame.input_edit.WriteText("x")
     assert frame.input_edit.GetValue().endswith("x")
+
+
+def test_real_ui_subagent_result_appears_in_answer_list_without_stealing_input_focus(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-subagent"
+    frame.current_chat_id = "chat-subagent"
+    frame.active_codex_thread_id = "thread-subagent"
+    frame.active_codex_turn_id = "turn-subagent"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "codex_thread_id": "thread-subagent",
+            "codex_turn_id": "turn-subagent",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-subagent",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+
+    frame._render_answer_list()
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+
+    frame._dispatch_codex_event_to_ui(
+        "chat-subagent",
+        main.CodexEvent(
+            type="subagent_result",
+            thread_id="thread-subagent",
+            turn_id="turn-subagent",
+            text="Ada (worker)\nDONE\n\nsubagent result",
+            subtype="collab_waiting_end",
+            display_kind="commentary",
+        ),
+    )
+
+    assert _yield_until(
+        wx_app,
+        lambda: any("subagent result" in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
+        and frame.input_edit.HasFocus(),
+        timeout=2.0,
+    )
+
+
+def test_real_ui_history_answer_navigation_does_not_load_execution_history(frame, wx_app, tmp_path, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-heavy", "title": "heavy", "updated_at": 10.0})
+    frame.chat_store.replace_turns(
+        "chat-heavy",
+        [
+            {"question": f"question {idx}", "answer_md": f"answer {idx}", "model": main.DEFAULT_CODEX_MODEL}
+            for idx in range(30)
+        ],
+    )
+    for idx in range(500):
+        frame.chat_store.append_execution_step(
+            "chat-heavy",
+            {"turn_idx": idx % 30, "display_kind": "commentary", "list_text": f"background step {idx}"},
+        )
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        frame.chat_store,
+        "load_execution_steps",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("history answer view loaded execution steps")),
+    )
+
+    assert frame._show_history_chat("chat-heavy", focus_answer_list=False) is True
+    frame.answer_list.SetSelection(0)
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    started = time.perf_counter()
+    _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert frame.answer_list.GetSelection() == 1
+
+
+def test_real_ui_long_session_primary_controls_remain_responsive(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = "chat-long"
+    frame.current_chat_id = "chat-long"
+    frame.active_turn_idx = 19
+    frame.active_session_turns = [
+        {
+            "question": f"question {idx}",
+            "answer_md": f"answer {idx}",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": float(idx),
+        }
+        for idx in range(20)
+    ]
+    frame._current_chat_state = {
+        "id": "chat-long",
+        "title": "long",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [
+            {
+                "turn_idx": step_idx % 20,
+                "display_kind": "commentary",
+                "list_text": f"step {step_idx}",
+                "detail_text": f"step {step_idx}",
+            }
+            for step_idx in range(2000)
+        ],
+    }
+    frame.archived_chats = [
+        {"id": f"chat-{idx}", "title": f"chat {idx}", "turns": [], "created_at": float(idx), "updated_at": float(idx)}
+        for idx in range(20)
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    frame._refresh_history("chat-long")
+    frame._render_answer_list(refresh_execution=False)
+    frame.answer_list.SetSelection(0)
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert frame.answer_list.GetSelection() == 1
+
+    frame.history_list.SetSelection(0)
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.history_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert frame.history_list.GetSelection() == 1
+
+    frame.model_combo.SetFocus()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_window_key(frame.model_combo, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    started = time.perf_counter()
+    frame.input_edit.WriteText("x")
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert frame.input_edit.GetValue().endswith("x")
+
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    frame.input_edit.SetValue("long session send")
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    before_turns = len(frame.active_session_turns)
+    started = time.perf_counter()
+    frame._trigger_send()
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert len(frame.active_session_turns) == before_turns + 1
+
+    started = time.perf_counter()
+    frame._on_new_chat_clicked(None)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    assert frame.input_edit.HasFocus()
+
+    notebook = frame.notes_store.create_notebook("long notebook")
+    for idx in range(30):
+        frame.notes_store.create_entry(notebook.id, f"entry {idx}", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.notes_notebook_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetFocusFromKbd()
+    wx_app.Yield()
+    started = time.perf_counter()
+    _send_listbox_key(frame.notes_entry_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
 
 
 def test_real_ui_primary_controls_stay_responsive_while_codex_events_are_pending(frame, wx_app, monkeypatch):

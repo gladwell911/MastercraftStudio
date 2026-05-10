@@ -222,6 +222,8 @@ def test_codex_client_maps_server_request_to_event():
     assert seen[0].type == "server_request"
     assert seen[0].request_id == 9
     assert seen[0].method == "item/tool/requestUserInput"
+    assert seen[0].thread_id == "th"
+    assert seen[0].turn_id == "tu"
 
 
 def test_codex_client_maps_agent_message_delta_to_event():
@@ -277,6 +279,38 @@ def test_codex_item_command_execution_normalizes_display_fields():
     assert seen[0].raw_text == "pytest failed"
     assert seen[0].display_kind == "command"
     assert seen[0].subtype == "commandExecution"
+
+
+def test_codex_client_maps_collab_waiting_end_to_subagent_result_event():
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+
+    client._handle_message(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "collab_waiting_end",
+                "sender_thread_id": "thread-1",
+                "agent_statuses": [
+                    {
+                        "thread_id": "agent-1",
+                        "agent_nickname": "Ada",
+                        "agent_role": "worker",
+                        "status": {"completed": "DONE\n\nsubagent result"},
+                    }
+                ],
+            },
+        }
+    )
+
+    assert len(seen) == 1
+    event = seen[0]
+    assert event.type == "subagent_result"
+    assert event.thread_id == "thread-1"
+    assert event.subtype == "collab_waiting_end"
+    assert event.display_kind == "commentary"
+    assert "Ada" in event.text
+    assert "DONE\n\nsubagent result" in event.text
 
 
 def test_codex_agent_message_delta_keeps_text_and_raw_text():

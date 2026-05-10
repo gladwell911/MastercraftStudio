@@ -295,6 +295,169 @@ def test_ui_automation_switched_visible_chat_does_not_receive_late_codex_answer_
     assert after_rows == before_rows
 
 
+def test_ui_automation_background_codex_worker_does_not_reuse_visible_chat_thread(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_codex_thread_id = "thread-c"
+    frame.active_codex_turn_id = "turn-c"
+    frame.active_session_turns = [
+        {
+            "question": "question d",
+            "answer_md": "answer d",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+            "request_status": "pending",
+            "codex_thread_id": "thread-c",
+            "codex_turn_id": "turn-c",
+        }
+    ]
+    frame._current_chat_state.update(
+        {
+            "id": "chat-c",
+            "title": "rclone上传R2",
+            "turns": frame.active_session_turns,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+            "codex_thread_id": "thread-c",
+            "codex_turn_id": "turn-c",
+        }
+    )
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "切换代码目录",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [
+                {
+                    "question": "question b",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                    "request_status": "pending",
+                }
+            ],
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+        }
+    ]
+    calls = []
+
+    class _Client:
+        def start_thread(self, **kwargs):
+            calls.append(("start_thread", kwargs))
+            return {"thread": {"id": "thread-a-new"}}
+
+        def start_turn_items(self, thread_id, items):
+            calls.append(("start_turn_items", thread_id, items))
+            return {"turn": {"id": "turn-a-new"}}
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._render_answer_list()
+    frame.answer_list.SetFocusFromKbd()
+    before_rows = list(frame.answer_list.GetStrings())
+
+    frame._run_codex_turn_worker("chat-a", 0, "question b", main.DEFAULT_CODEX_MODEL)
+
+    after_rows = list(frame.answer_list.GetStrings())
+    archived = frame._find_archived_chat("chat-a")
+    assert calls[0][0] == "start_thread"
+    assert calls[1][1] == "thread-a-new"
+    assert archived["codex_thread_id"] == "thread-a-new"
+    assert archived["turns"][0]["codex_thread_id"] == "thread-a-new"
+    assert frame.active_codex_thread_id == "thread-c"
+    assert frame.active_session_turns[0]["answer_md"] == "answer d"
+    assert after_rows == before_rows
+    assert frame.answer_list.HasFocus()
+
+
+def test_ui_automation_visible_chat_does_not_receive_late_claudecode_delta_from_previous_chat(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_claudecode_session_id = "session-c"
+    frame.active_session_turns = [
+        {
+            "question": "question d",
+            "answer_md": "answer d",
+            "model": "claudecode/default",
+            "created_at": 2.0,
+        }
+    ]
+    frame._current_chat_state.update(
+        {
+            "id": "chat-c",
+            "title": "rclone上传R2",
+            "turns": frame.active_session_turns,
+            "detail_panel_mode": "answers",
+            "execution_steps": [],
+        }
+    )
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "切换代码目录",
+            "turns": [
+                {
+                    "question": "question b",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": "claudecode/default",
+                    "created_at": 1.0,
+                    "request_status": "pending",
+                }
+            ],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "claudecode_session_id": "session-a-old",
+        }
+    ]
+
+    class _ImmediateThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _FakeClaudeCodeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream_chat(self, question, session_id="", on_delta=None, on_user_input=None, on_approval=None):
+            on_delta("late answer b delta")
+            return "late answer b final", "session-a"
+
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main, "ClaudeCodeClient", _FakeClaudeCodeClient)
+    monkeypatch.setattr(main, "wx_call_after_if_alive", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+
+    frame._render_answer_list()
+    frame.answer_list.SetFocusFromKbd()
+    before_rows = list(frame.answer_list.GetStrings())
+
+    frame._start_claudecode_worker_for_turn("chat-a", 0, "question b", "session-a-old")
+
+    after_rows = list(frame.answer_list.GetStrings())
+    archived = frame._find_archived_chat("chat-a")
+    assert archived["turns"][0]["answer_md"] == "late answer b final"
+    assert archived["claudecode_session_id"] == "session-a"
+    assert frame.active_session_turns[0]["answer_md"] == "answer d"
+    assert after_rows == before_rows
+    assert frame.answer_list.HasFocus()
+
+
 def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-current"

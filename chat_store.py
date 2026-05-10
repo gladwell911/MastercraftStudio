@@ -138,7 +138,7 @@ class ChatStore:
             ).fetchall()
         return [self._summary_from_row(row) for row in rows]
 
-    def load_chat(self, chat_id: str) -> dict[str, Any] | None:
+    def load_chat(self, chat_id: str, *, include_execution_steps: bool = True) -> dict[str, Any] | None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return None
@@ -158,7 +158,8 @@ class ChatStore:
         chat = self._metadata_from_row(row)
         chat.update(self._summary_from_row(row))
         chat["turns"] = self.load_turns(normalized)
-        chat["execution_steps"] = self.load_execution_steps(normalized)
+        if include_execution_steps:
+            chat["execution_steps"] = self.load_execution_steps(normalized)
         return chat
 
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
@@ -269,6 +270,48 @@ class ChatStore:
             payload.setdefault("detail_text", str(row["detail_text"] or ""))
             out.append(payload)
         return out
+
+    def load_recent_execution_steps(
+        self,
+        chat_id: str,
+        *,
+        turn_idx: int | None = None,
+        limit: int = 100,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return 0, []
+        params: list[Any] = [normalized]
+        where = "chat_id = ?"
+        if turn_idx is not None:
+            where += " AND turn_idx = ?"
+            params.append(int(turn_idx))
+        row_limit = max(1, int(limit or 1))
+        with self._connect() as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM execution_steps WHERE {where}",
+                tuple(params),
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT payload_json, turn_idx, event_type, display_kind, list_text, detail_text
+                FROM execution_steps
+                WHERE {where}
+                ORDER BY step_index DESC
+                LIMIT ?
+                """,
+                tuple(params + [row_limit]),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            payload = self._json_dict(row["payload_json"])
+            payload.setdefault("turn_idx", row["turn_idx"])
+            payload.setdefault("event_type", str(row["event_type"] or ""))
+            payload.setdefault("display_kind", str(row["display_kind"] or ""))
+            payload.setdefault("list_text", str(row["list_text"] or ""))
+            payload.setdefault("detail_text", str(row["detail_text"] or ""))
+            out.append(payload)
+        return int(total_row["total"] if total_row is not None else 0), out
 
     def get_meta(self, key: str) -> str:
         with self._connect() as conn:

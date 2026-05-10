@@ -371,6 +371,51 @@ def _event_from_item(method: str, params: dict) -> CodexEvent:
     )
 
 
+def _subagent_completed_text(status) -> str:
+    if isinstance(status, dict):
+        for key in ("completed", "failed", "error", "message"):
+            text = str(status.get(key) or "").strip()
+            if text:
+                return text
+    return str(status or "").strip()
+
+
+def _subagent_result_heading(agent: dict, fallback_id: str = "") -> str:
+    nickname = _first_non_empty(agent.get("agent_nickname"), agent.get("nickname"), agent.get("name"))
+    role = _first_non_empty(agent.get("agent_role"), agent.get("role"))
+    thread_id = _first_non_empty(agent.get("thread_id"), fallback_id)
+    if nickname and role:
+        return f"{nickname} ({role})"
+    return _first_non_empty(nickname, role, thread_id, "subagent")
+
+
+def _collab_waiting_end_text(params: dict) -> str:
+    if not isinstance(params, dict):
+        return ""
+    parts: list[str] = []
+    agent_statuses = params.get("agent_statuses")
+    if isinstance(agent_statuses, list):
+        for agent in agent_statuses:
+            if not isinstance(agent, dict):
+                continue
+            text = _subagent_completed_text(agent.get("status"))
+            if not text:
+                continue
+            heading = _subagent_result_heading(agent)
+            parts.append(f"{heading}\n{text}".strip())
+    statuses = params.get("statuses")
+    if isinstance(statuses, dict):
+        for agent_id, status in statuses.items():
+            text = _subagent_completed_text(status)
+            if not text:
+                continue
+            heading = _subagent_result_heading({}, str(agent_id or ""))
+            item = f"{heading}\n{text}".strip()
+            if item not in parts:
+                parts.append(item)
+    return "\n\n".join(parts).strip()
+
+
 class CodexAppServerClient:
     def __init__(
         self,
@@ -712,12 +757,15 @@ class CodexAppServerClient:
             self._handle_response(message)
             return
         if "id" in message and "method" in message:
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
             self._emit_event(
                 CodexEvent(
                     type="server_request",
+                    thread_id=str(params.get("threadId") or params.get("thread_id") or ""),
+                    turn_id=str(params.get("turnId") or params.get("turn_id") or ""),
                     request_id=message.get("id"),
                     method=str(message.get("method") or ""),
-                    params=message.get("params") if isinstance(message.get("params"), dict) else {},
+                    params=params,
                     data=message,
                 )
             )
@@ -739,6 +787,23 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
+        if method == "collab_waiting_end" or str(params.get("type") or "").strip() == "collab_waiting_end":
+            text = _collab_waiting_end_text(params)
+            if text:
+                self._emit_event(
+                    CodexEvent(
+                        type="subagent_result",
+                        thread_id=str(params.get("sender_thread_id") or params.get("threadId") or params.get("thread_id") or ""),
+                        method=method,
+                        text=text,
+                        raw_text=text,
+                        subtype="collab_waiting_end",
+                        display_kind="commentary",
+                        params=params,
+                        data=raw,
+                    )
+                )
+                return
         if method in {"token_count", "codex/event/token_count", "thread/tokenUsage/updated"} or str(params.get("type") or "").strip() == "token_count":
             usage = codex_context_usage_from_payload(params)
             data = dict(params)

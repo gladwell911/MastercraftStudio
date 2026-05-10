@@ -1,6 +1,65 @@
 import wx
 
 
+def test_notes_ui_automation_application_menu_exports_and_restores_all_notes(frame, monkeypatch, tmp_path):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("ui backup notebook")
+    frame.notes_store.create_entry(notebook.id, "ui backup entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list")
+    frame.notes_notebook_list.SetFocus()
+
+    captured = {"items": [], "dialog_paths": [], "status": []}
+    backup_path = tmp_path / "ui-notes-backup.json"
+
+    class _FileDialog:
+        def __init__(self, _parent, _message, *_args, **kwargs):
+            self._style = kwargs.get("style", 0)
+            if self._style & wx.FD_SAVE:
+                self._path = str(backup_path)
+            else:
+                self._path = str(backup_path)
+            captured["dialog_paths"].append(self._path)
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def GetPath(self):
+            return self._path
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(wx, "FileDialog", _FileDialog)
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: captured["status"].append(text))
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+
+    frame._show_notes_menu()
+
+    export_id = next(item_id for label, item_id in captured["items"] if label == "导出所有笔记")
+    restore_id = next(item_id for label, item_id in captured["items"] if label == "恢复笔记")
+
+    export_event = wx.CommandEvent(wx.wxEVT_MENU, export_id)
+    export_event.SetEventObject(frame)
+    frame.ProcessEvent(export_event)
+    assert backup_path.exists()
+
+    restored_notebook = frame.notes_store.create_notebook("restore target")
+    frame.notes_store.create_entry(restored_notebook.id, "before restore", source="manual")
+
+    restore_event = wx.CommandEvent(wx.wxEVT_MENU, restore_id)
+    restore_event.SetEventObject(frame)
+    frame.ProcessEvent(restore_event)
+
+    restored = frame.notes_store.search_notebooks("ui backup notebook")
+    assert restored
+    assert any(entry.content == "ui backup entry" for entry in frame.notes_store.list_entries(restored[0].id))
+    assert any("导出" in text for text in captured["status"])
+    assert any("恢复" in text for text in captured["status"])
+
+
 def test_notes_ui_automation_menu_key_exports_selected_entry_ranges(frame, monkeypatch):
     frame.Show()
     notebook = frame.notes_store.create_notebook("ui automation export notebook")

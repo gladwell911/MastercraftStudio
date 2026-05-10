@@ -46,6 +46,7 @@ from context_usage import (
     format_context_usage_label,
 )
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
+from notes_backup import export_notes_backup, restore_notes_backup
 from notes_projection import DesktopNotesProjection
 from notes_store import NotesStore
 from notes_sync import NotesSyncService
@@ -185,7 +186,7 @@ HIDDEN_MODEL_IDS = {
     "deepseek/deepseek-r1-0528-qwen3-8b",
 }
 VISIBLE_MODEL_IDS = [m for m in MODEL_IDS if m not in HIDDEN_MODEL_IDS]
-DEFAULT_MODEL_ID = "openai/gpt-5.2"
+DEFAULT_MODEL_ID = DEFAULT_CODEX_MODEL
 STARTUP_DEFAULT_MODEL_ID = DEFAULT_MODEL_ID
 APP_DIR_NAME = "神匠工坊"
 VOICE_OPTIMIZE_MODEL = "openai/gpt-5.2-chat"
@@ -1533,18 +1534,20 @@ class ChatFrame(wx.Frame):
                 return chat
         return None
 
-    def _hydrate_chat_from_store(self, chat: dict | None) -> dict | None:
+    def _hydrate_chat_from_store(self, chat: dict | None, *, include_execution_steps: bool = True) -> dict | None:
         if not isinstance(chat, dict):
             return None
         if not getattr(self, "_chat_store_enabled", False):
             return chat
-        if isinstance(chat.get("turns"), list) and isinstance(chat.get("execution_steps"), list):
+        if isinstance(chat.get("turns"), list) and (
+            not include_execution_steps or isinstance(chat.get("execution_steps"), list)
+        ):
             return chat
         chat_id = str(chat.get("id") or "").strip()
         store = getattr(self, "chat_store", None)
         if not chat_id or store is None:
             return chat
-        loaded = store.load_chat(chat_id)
+        loaded = store.load_chat(chat_id, include_execution_steps=include_execution_steps)
         if not isinstance(loaded, dict):
             return chat
         for idx, existing in enumerate(self.archived_chats):
@@ -2213,7 +2216,10 @@ class ChatFrame(wx.Frame):
 
     def _get_view_turns(self):
         if self.view_mode == "history":
-            chat = self._hydrate_chat_from_store(self._find_archived_chat(self.view_history_id))
+            chat = self._hydrate_chat_from_store(
+                self._find_archived_chat(self.view_history_id),
+                include_execution_steps=False,
+            )
             if chat:
                 return chat.get("turns") or []
             return []
@@ -2452,9 +2458,25 @@ class ChatFrame(wx.Frame):
         status = thread.get("status") if isinstance(thread, dict) and isinstance(thread.get("status"), dict) else {}
         return str(status.get("type") or "").strip(), list(status.get("activeFlags") or [])
 
+    def _codex_thread_id_for_chat(self, chat: dict | None) -> str:
+        thread_id = str((chat or {}).get("codex_thread_id") or "").strip()
+        if thread_id:
+            return thread_id
+        if chat is self._current_chat_state:
+            return str(self.active_codex_thread_id or "").strip()
+        return ""
+
+    def _codex_turn_id_for_chat(self, chat: dict | None) -> str:
+        turn_id = str((chat or {}).get("codex_turn_id") or "").strip()
+        if turn_id:
+            return turn_id
+        if chat is self._current_chat_state:
+            return str(self.active_codex_turn_id or "").strip()
+        return ""
+
     def _build_codex_status_markdown(self, client, chat: dict, model: str) -> str:
-        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
-        turn_id = str((chat or {}).get("codex_turn_id") or self.active_codex_turn_id or "").strip()
+        thread_id = self._codex_thread_id_for_chat(chat)
+        turn_id = self._codex_turn_id_for_chat(chat)
         flags = list((chat or {}).get("codex_thread_flags") or self.active_codex_thread_flags or [])
         thread_status = "active" if flags else ("idle" if thread_id else "notLoaded")
         account_status = "未查询"
@@ -2936,6 +2958,32 @@ class ChatFrame(wx.Frame):
             ]
         return steps
 
+    def _current_execution_steps_for_render(self) -> tuple[int, list]:
+        limit = max(
+            EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
+            int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
+        )
+        chat_id = self._visible_execution_chat_id()
+        store = getattr(self, "chat_store", None)
+        if (
+            getattr(self, "_chat_store_enabled", False)
+            and store is not None
+            and chat_id
+            and hasattr(store, "load_recent_execution_steps")
+        ):
+            turn_idx = None
+            if self.view_mode == "active":
+                active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+                turn_idx = active_idx if active_idx >= 0 else None
+            try:
+                total, rows = store.load_recent_execution_steps(chat_id, turn_idx=turn_idx, limit=limit)
+                if total > 0 or rows:
+                    return total, rows
+            except Exception:
+                pass
+        rows = list(self._current_execution_steps())
+        return len(rows), rows[-limit:]
+
     @staticmethod
     def _safe_int(value, default: int = 0) -> int:
         try:
@@ -2988,7 +3036,48 @@ class ChatFrame(wx.Frame):
                         return idx
         return len(turns) - 1 if isinstance(turns, list) and turns else -1
 
-    def _resolve_codex_event_chat_id(self, event: CodexEvent) -> str:
+    def _known_codex_turn_ids_for_chat(self, chat: dict | None) -> set[str]:
+        ids: set[str] = set()
+        if isinstance(chat, dict):
+            for key in ("codex_turn_id", "turn_id"):
+                value = str(chat.get(key) or "").strip()
+                if value:
+                    ids.add(value)
+            turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+            for turn in turns:
+                if not isinstance(turn, dict):
+                    continue
+                for key in ("codex_turn_id", "turn_id", "id"):
+                    value = str(turn.get(key) or "").strip()
+                    if value:
+                        ids.add(value)
+        if chat is getattr(self, "_current_chat_state", None):
+            value = str(getattr(self, "active_codex_turn_id", "") or "").strip()
+            if value:
+                ids.add(value)
+        return ids
+
+    def _codex_event_turn_is_compatible_with_chat(self, chat: dict | None, event: CodexEvent) -> bool:
+        turn_id = self._event_turn_id(event)
+        known_turn_ids = self._known_codex_turn_ids_for_chat(chat)
+        if not known_turn_ids:
+            return True
+        if not turn_id:
+            return not self._codex_event_requires_known_turn(event)
+        return turn_id in known_turn_ids
+
+    @staticmethod
+    def _codex_event_requires_known_turn(event: CodexEvent) -> bool:
+        event_type = str(getattr(event, "type", "") or "").strip()
+        phase = str(getattr(event, "phase", "") or "").strip()
+        status = str(getattr(event, "status", "") or "").strip()
+        if event_type in {"subagent_result", "turn_completed"}:
+            return True
+        if event_type == "item_completed" and (phase == "final_answer" or status == "imageView"):
+            return True
+        return False
+
+    def _known_codex_event_chat_id(self, event: CodexEvent) -> str:
         turn_id = self._event_turn_id(event)
         thread_id = self._event_thread_id(event)
         candidates = []
@@ -3024,6 +3113,12 @@ class ChatFrame(wx.Frame):
                     if str(turn.get("codex_thread_id") or "").strip() == thread_id:
                         return chat_id
 
+        return ""
+
+    def _resolve_codex_event_chat_id(self, event: CodexEvent) -> str:
+        known_chat_id = self._known_codex_event_chat_id(event)
+        if known_chat_id:
+            return known_chat_id
         return str(self.active_chat_id or self.current_chat_id or "").strip()
 
     @staticmethod
@@ -3296,6 +3391,13 @@ class ChatFrame(wx.Frame):
                 return False
         if not self._should_show_execution_step(step):
             return False
+        if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
+            self._execution_list_pending_turn_reset = False
+            try:
+                self.execution_list.Clear()
+            except Exception:
+                return False
+            self.execution_meta = []
         meta = self._execution_meta_tuple(step_idx, step)
         row_text = str(meta[2] or "").strip()
         if not row_text:
@@ -3474,12 +3576,45 @@ class ChatFrame(wx.Frame):
         if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
             if resolved_chat_id:
                 self.chat_store.append_execution_step(resolved_chat_id, steps[-1])
+        self._prune_cached_execution_steps_for_turn(target_chat, steps[-1])
+        steps = target_chat.get("execution_steps")
+        if not isinstance(steps, list):
+            steps = []
+            target_chat["execution_steps"] = steps
         if resolved_chat_id:
             self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[-1]))
         self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if save_state:
             self._save_state()
         return True
+
+    def _prune_cached_execution_steps_for_turn(self, chat: dict, latest_step: dict) -> None:
+        if not isinstance(chat, dict) or not isinstance(latest_step, dict):
+            return
+        turn_idx = latest_step.get("turn_idx")
+        if turn_idx is None:
+            return
+        steps = chat.get("execution_steps")
+        if not isinstance(steps, list):
+            return
+        store = getattr(self, "chat_store", None)
+        limit = getattr(store, "max_execution_steps_per_turn", 500)
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 500
+        if limit <= 0:
+            return
+        matching_indexes = [
+            idx
+            for idx, step in enumerate(steps)
+            if isinstance(step, dict) and self._safe_int(step.get("turn_idx"), -1) == self._safe_int(turn_idx, -2)
+        ]
+        overflow = len(matching_indexes) - limit
+        if overflow <= 0:
+            return
+        remove = set(matching_indexes[:overflow])
+        chat["execution_steps"] = [step for idx, step in enumerate(steps) if idx not in remove]
 
     def _buffer_execution_delta(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
@@ -3670,9 +3805,10 @@ class ChatFrame(wx.Frame):
         return bool(list_text or detail_text)
 
     def _rebuild_execution_list_from_state(self) -> None:
+        self._execution_list_pending_turn_reset = False
         self.execution_list.Clear()
         self.execution_meta = []
-        steps = list(self._current_execution_steps())
+        total_steps, steps = self._current_execution_steps_for_render()
         visible_items = []
         for idx, step in enumerate(steps):
             if not self._should_show_execution_step(step):
@@ -3688,7 +3824,7 @@ class ChatFrame(wx.Frame):
             int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
         )
         self.execution_visible_row_limit = limit
-        has_more = len(visible_items) > limit
+        has_more = total_steps > len(steps) or len(visible_items) > limit
         if has_more:
             visible_items = visible_items[-limit:]
             self.execution_list.Append("更多")
@@ -3720,6 +3856,9 @@ class ChatFrame(wx.Frame):
     def _reset_current_turn_execution_view(self) -> None:
         self._reset_execution_visible_row_limit()
         if hasattr(self, "execution_list"):
+            if self._detail_panel_mode() == "execution" and self.execution_list.GetCount() > 0:
+                self._execution_list_pending_turn_reset = True
+                return
             self.execution_list.Clear()
             self.execution_meta = []
             self.execution_list.Append("暂无执行过程")
@@ -4569,6 +4708,42 @@ class ChatFrame(wx.Frame):
         return True
 
     @staticmethod
+    def _is_codex_subagent_result_answer(turn: dict) -> bool:
+        return isinstance(turn, dict) and str(turn.get("answer_origin") or "").strip() == "codex-subagent-result"
+
+    def _apply_codex_subagent_result_to_turn(self, turn: dict, text: str) -> bool:
+        if not isinstance(turn, dict):
+            return False
+        result = str(text or "").strip()
+        if not result:
+            return False
+        current = str(turn.get("answer_md") or "")
+        if not current.strip() or current == REQUESTING_TEXT:
+            turn["answer_md"] = result
+        elif self._is_codex_subagent_result_answer(turn):
+            if result in current:
+                return False
+            turn["answer_md"] = f"{current.rstrip()}\n\n{result}"
+        else:
+            return False
+        turn["answer_origin"] = "codex-subagent-result"
+        return True
+
+    def _apply_codex_final_answer_to_turn(self, turn: dict, text: str) -> bool:
+        if not isinstance(turn, dict):
+            return False
+        answer = str(text or "")
+        current = str(turn.get("answer_md") or "")
+        if not answer.strip() and self._is_codex_subagent_result_answer(turn) and current.strip():
+            return False
+        if current.strip() and current != REQUESTING_TEXT and not self._is_codex_subagent_result_answer(turn):
+            return False
+        turn["answer_md"] = answer
+        if self._is_codex_subagent_result_answer(turn):
+            turn.pop("answer_origin", None)
+        return True
+
+    @staticmethod
     def _codex_error_text(exc: Exception | str) -> str:
         return str(exc or "").strip().lower()
 
@@ -4647,13 +4822,24 @@ class ChatFrame(wx.Frame):
 
     def _run_codex_local_command_worker(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
         try:
-            target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
+            chat_id = str(chat_id or "").strip()
+            current_ids = {
+                str(self.active_chat_id or "").strip(),
+                str(self.current_chat_id or "").strip(),
+                str((self._current_chat_state or {}).get("id") or "").strip() if isinstance(getattr(self, "_current_chat_state", None), dict) else "",
+                "",
+            }
+            is_current_target = chat_id in current_ids
+            target_chat = self._current_chat_state if is_current_target else self._find_archived_chat(chat_id)
             if not isinstance(target_chat, dict):
-                target_chat = self._current_chat_state
+                target_chat = self._current_chat_state if is_current_target else {}
             normalized_command = str(command or "").strip().lower()
             client = None
             if normalized_command in {"status", "compact", "stop"}:
-                client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
+                if is_current_target:
+                    client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
+                else:
+                    client = self._get_or_create_codex_client(chat_id, model) if model != DEFAULT_CODEX_MODEL else self._get_or_create_codex_client(chat_id)
             if normalized_command == "status":
                 answer = self._build_codex_status_markdown(client, target_chat, model)
             elif normalized_command == "help":
@@ -4676,7 +4862,7 @@ class ChatFrame(wx.Frame):
             self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
 
     def _handle_codex_compact_command(self, client, chat: dict) -> str:
-        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
+        thread_id = self._codex_thread_id_for_chat(chat)
         if not thread_id:
             return "## Codex 压缩\n\n当前聊天还没有 Codex 线程，无法执行 `/compact`。"
         if client is None or not hasattr(client, "compact_thread"):
@@ -4719,8 +4905,8 @@ class ChatFrame(wx.Frame):
         return "## Codex 清理\n\n已清除当前聊天关联的 Codex 线程状态。聊天记录不会被删除。"
 
     def _handle_codex_stop_command(self, client, chat: dict) -> str:
-        thread_id = str((chat or {}).get("codex_thread_id") or self.active_codex_thread_id or "").strip()
-        turn_id = str((chat or {}).get("codex_turn_id") or self.active_codex_turn_id or "").strip()
+        thread_id = self._codex_thread_id_for_chat(chat)
+        turn_id = self._codex_turn_id_for_chat(chat)
         if not thread_id or not turn_id:
             return "## Codex 中断\n\n当前没有可中断的 Codex turn。"
         if client is None or not hasattr(client, "interrupt_turn"):
@@ -4766,12 +4952,14 @@ class ChatFrame(wx.Frame):
         resumed.discard(str(thread_id or "").strip())
 
     def _run_codex_turn_worker(self, chat_id: str, turn_idx: int, question: str, model: str, from_recovery: bool = False) -> None:
+        is_current_target = chat_id in {self.active_chat_id, self.current_chat_id, ""}
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
         if not isinstance(target_chat, dict):
+            if not is_current_target:
+                return
             target_chat = self._current_chat_state
-        is_current_target = chat_id in {self.active_chat_id, self.current_chat_id, ""}
-        thread_id = str(target_chat.get("codex_thread_id") or self.active_codex_thread_id or "").strip()
-        turn_id = str(target_chat.get("codex_turn_id") or self.active_codex_turn_id or "").strip()
+        thread_id = str(target_chat.get("codex_thread_id") or (self.active_codex_thread_id if is_current_target else "") or "").strip()
+        turn_id = str(target_chat.get("codex_turn_id") or (self.active_codex_turn_id if is_current_target else "") or "").strip()
         recovery_context = bool(getattr(self, "_codex_recovery_context", False))
         use_shared_client = (not from_recovery) and (not recovery_context) and chat_id in {self.active_chat_id, self.current_chat_id, ""}
         if use_shared_client:
@@ -4842,6 +5030,8 @@ class ChatFrame(wx.Frame):
         try:
             target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
             if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
+                if not is_current_target:
+                    return
                 target_turns = self.active_session_turns
             turn_attachments = []
             if 0 <= turn_idx < len(target_turns):
@@ -4910,10 +5100,32 @@ class ChatFrame(wx.Frame):
         def _worker() -> None:
             try:
                 client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
-                # 保存客户端引用，以便在用户发送消息时使用
-                self._active_claudecode_client = client
+
+                def is_current_target() -> bool:
+                    return str(chat_id or "").strip() in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip(), ""}
+
+                def target_chat_state() -> dict | None:
+                    if is_current_target():
+                        return self._current_chat_state
+                    chat = self._find_archived_chat(chat_id)
+                    return chat if isinstance(chat, dict) else None
+
+                def sync_session_id(new_session_id: str) -> None:
+                    value = str(new_session_id or "").strip()
+                    if not value:
+                        return
+                    chat = target_chat_state()
+                    if isinstance(chat, dict):
+                        chat["claudecode_session_id"] = value
+                    if is_current_target():
+                        self.active_claudecode_session_id = value
+
+                if is_current_target():
+                    # 保存客户端引用，以便在用户发送消息时使用
+                    self._active_claudecode_client = client
+
                 def on_delta(delta):
-                    wx_call_after_if_alive(self._on_delta, turn_idx, delta)
+                    wx_call_after_if_alive(self._on_delta, turn_idx, delta, chat_id)
 
                 def on_user_input(params: dict) -> str:
                     """处理用户输入请求"""
@@ -4923,10 +5135,10 @@ class ChatFrame(wx.Frame):
                     request_msg = format_remote_user_input_request(params)
 
                     # 显示请求消息
-                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n")
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", chat_id)
 
                     # 显示交互式界面（如果有回调）
-                    if hasattr(self, '_show_claudecode_user_input'):
+                    if is_current_target() and hasattr(self, '_show_claudecode_user_input'):
                         wx_call_after_if_alive(self._show_claudecode_user_input, turn_idx, params, client)
 
                     # 返回空字符串，让 Claude Code 等待 stdin
@@ -4941,10 +5153,10 @@ class ChatFrame(wx.Frame):
                     request_msg = format_remote_approval_request(params)
 
                     # 显示请求消息
-                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n")
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", chat_id)
 
                     # 显示交互式界面（如果有回调）
-                    if hasattr(self, '_show_claudecode_approval'):
+                    if is_current_target() and hasattr(self, '_show_claudecode_approval'):
                         wx_call_after_if_alive(self._show_claudecode_approval, turn_idx, params, client)
 
                     # 返回空字符串，让 Claude Code 等待 stdin
@@ -4959,7 +5171,7 @@ class ChatFrame(wx.Frame):
                     on_approval=on_approval
                 )
                 if new_session_id:
-                    self.active_claudecode_session_id = new_session_id
+                    sync_session_id(new_session_id)
                 last_context_usage = getattr(client, "last_context_usage", None)
                 if last_context_usage:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
@@ -4969,7 +5181,8 @@ class ChatFrame(wx.Frame):
                 wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, DEFAULT_CLAUDECODE_MODEL, "", chat_id)
             finally:
                 # 清除客户端引用
-                self._active_claudecode_client = None
+                if self._active_claudecode_client is client:
+                    self._active_claudecode_client = None
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -5810,14 +6023,14 @@ class ChatFrame(wx.Frame):
             resolved_chat_id = self._resolve_codex_event_chat_id(event)
             if resolved_chat_id and resolved_chat_id != chat_id:
                 chat_id = resolved_chat_id
-        if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id}:
-            active_event_matches = (
-                (event_turn_id and event_turn_id == str(getattr(self, "active_codex_turn_id", "") or "").strip())
-                or (event_thread_id and event_thread_id == str(getattr(self, "active_codex_thread_id", "") or "").strip())
-            )
-            if active_event_matches:
-                chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        elif chat_id and (event_turn_id or event_thread_id):
+            known_chat_id = self._known_codex_event_chat_id(event)
+            if known_chat_id and known_chat_id != chat_id:
+                return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
+        identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        if isinstance(identity_chat, dict) and not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
+            return
         execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
         if not is_current_chat:
@@ -5846,19 +6059,21 @@ class ChatFrame(wx.Frame):
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
                 if event_type == "item_completed" and str(event.phase or "") == "final_answer":
-                    if (
-                        not str(turn.get("answer_md") or "").strip()
-                        or str(turn.get("answer_md") or "") == REQUESTING_TEXT
-                    ):
-                        turn["answer_md"] = str(event.text or "")
+                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
+                elif event_type == "subagent_result":
+                    if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
+                        target_chat["updated_at"] = time.time()
                 elif event_type == "turn_completed":
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
-                    if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
-                        turn["answer_md"] = str(event.text or "")
-                    self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                    if (
+                        (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
+                        and str(event.text or "").strip()
+                    ):
+                        self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
+                    self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
             return
@@ -5893,6 +6108,17 @@ class ChatFrame(wx.Frame):
                 self._handle_codex_request_dialog({"request_id": event.request_id, "method": event.method, "params": event.params})
             self._save_state()
             return
+        if event_type == "subagent_result":
+            target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            if target_idx >= 0 and target_idx < len(self.active_session_turns):
+                turn = self.active_session_turns[target_idx]
+                if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
+                    self._update_active_answer_row(target_idx)
+                    if self._find_answer_row_index(target_idx) < 0 and self.view_mode == "active":
+                        self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+                    self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(turn.get("answer_md") or ""))
+                    self._defer_codex_state_save()
+            return
         if event_type == "turn_completed":
             if is_current_chat:
                 self.active_codex_turn_active = False
@@ -5902,8 +6128,11 @@ class ChatFrame(wx.Frame):
                 turn = self.active_session_turns[target_idx]
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
-                if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT and str(event.text or "").strip():
-                    turn["answer_md"] = str(event.text or "")
+                if (
+                    (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
+                    and str(event.text or "").strip()
+                ):
+                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._update_active_answer_row(target_idx)
             if is_current_chat:
@@ -5946,11 +6175,7 @@ class ChatFrame(wx.Frame):
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
-                    if (
-                        not str(turn.get("answer_md") or "").strip()
-                        or str(turn.get("answer_md") or "") == REQUESTING_TEXT
-                    ):
-                        turn["answer_md"] = str(event.text or "")
+                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     self._update_active_answer_row(target_idx)
                 self._save_state()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
@@ -5983,6 +6208,22 @@ class ChatFrame(wx.Frame):
         if not getattr(self, "_codex_background_flush_dirty", False):
             return
         self._codex_background_flush_dirty = False
+        self._save_state()
+
+    def _defer_chat_state_save(self) -> None:
+        self._chat_state_flush_dirty = True
+        if getattr(self, "_chat_state_flush_scheduled", False):
+            return
+        self._chat_state_flush_scheduled = True
+        timer = self._call_later_if_alive(300, self._flush_chat_state_save)
+        if timer is None and not self._call_after_if_alive(self._flush_chat_state_save):
+            self._flush_chat_state_save()
+
+    def _flush_chat_state_save(self) -> None:
+        self._chat_state_flush_scheduled = False
+        if not getattr(self, "_chat_state_flush_dirty", False):
+            return
+        self._chat_state_flush_dirty = False
         self._save_state()
 
     def _get_or_create_codex_client(self, chat_id: str, model: str = "") -> CodexAppServerClient:
@@ -6082,6 +6323,12 @@ class ChatFrame(wx.Frame):
             status["published_url"] = str(published_url or "")
         self.remote_control_runtime_status = status
         self.remote_control_runtime_url = status["published_url"] if status["public_ws_ready"] else ""
+
+    def _set_status_text_safe(self, text: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.SetStatusText(str(text or ""))
+            return
+        self._call_after_if_alive(self.SetStatusText, str(text or ""))
 
     def _format_remote_startup_error(self, message: str) -> str:
         env = self._runtime_environment_summary()
@@ -6742,11 +6989,11 @@ class ChatFrame(wx.Frame):
                 published_url=published_url,
             )
             if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
-                self.SetStatusText(
+                self._set_status_text_safe(
                     f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程与 rc.tingyou.cc 已验证"
                 )
             else:
-                self.SetStatusText(
+                self._set_status_text_safe(
                     f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
                 )
             return
@@ -6764,11 +7011,11 @@ class ChatFrame(wx.Frame):
             published_url=published_url,
         )
         if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
-            self.SetStatusText(
+            self._set_status_text_safe(
                 f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程已恢复 rc.tingyou.cc 连接"
             )
         else:
-            self.SetStatusText(
+            self._set_status_text_safe(
                 f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
             )
 
@@ -6810,11 +7057,11 @@ class ChatFrame(wx.Frame):
             )
             if not ensure_connectivity:
                 if runtime["fixed_domain_mode"]:
-                    self.SetStatusText(
+                    self._set_status_text_safe(
                         f"远程 NATS 本地监听已启动：监听 {self.remote_control_runtime_bind}；等待公网验证 {published_url}"
                     )
                 else:
-                    self.SetStatusText(
+                    self._set_status_text_safe(
                         f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
                     )
                 return
@@ -6829,7 +7076,7 @@ class ChatFrame(wx.Frame):
                             published_url=published_url,
                         )
                 else:
-                    self.SetStatusText(
+                    self._set_status_text_safe(
                         f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}"
                     )
                 if not runtime["fixed_domain_mode"]:
@@ -6849,7 +7096,7 @@ class ChatFrame(wx.Frame):
                     published_url=published_url,
                 )
                 if attempt_idx + 1 >= attempts:
-                    self.SetStatusText(f"远程 NATS 启动失败：{last_error}")
+                    self._set_status_text_safe(f"远程 NATS 启动失败：{last_error}")
                     raise
 
     def _start_claudecode_remote_nats_runtime_if_configured(self) -> None:
@@ -7868,6 +8115,56 @@ class ChatFrame(wx.Frame):
                 out.append(m)
         return out
 
+    def _chat_target_for_request(self, chat_id: str) -> tuple[dict | None, list, bool]:
+        normalized = str(chat_id or "").strip()
+        current_ids = {
+            str(self.active_chat_id or "").strip(),
+            str(self.current_chat_id or "").strip(),
+            "",
+        }
+        if normalized in current_ids:
+            if not isinstance(getattr(self, "_current_chat_state", None), dict):
+                self._current_chat_state = {}
+            turns = self.active_session_turns if isinstance(self.active_session_turns, list) else []
+            return self._current_chat_state, turns, True
+        if normalized:
+            chat = self._find_archived_chat(normalized)
+            if isinstance(chat, dict):
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                return chat, turns, False
+        return None, [], False
+
+    def _openclaw_session_id_for_worker_chat(self, chat_id: str, target_chat: dict | None, is_current_target: bool, explicit_session_id: str = "") -> str:
+        session_id = str(explicit_session_id or "").strip()
+        if session_id:
+            return session_id
+        if is_current_target:
+            return self._ensure_active_openclaw_session_id()
+        if isinstance(target_chat, dict):
+            session_id = str(target_chat.get("openclaw_session_id") or "").strip()
+            if not session_id:
+                session_id = self._make_openclaw_session_id(chat_id)
+                target_chat["openclaw_session_key"] = str(target_chat.get("openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
+                target_chat["openclaw_session_id"] = session_id
+            return session_id
+        return ""
+
+    def _claudecode_session_id_for_worker_chat(self, target_chat: dict | None, is_current_target: bool) -> str:
+        if is_current_target:
+            return str(self.active_claudecode_session_id or "").strip()
+        if isinstance(target_chat, dict):
+            return str(target_chat.get("claudecode_session_id") or "").strip()
+        return ""
+
+    def _sync_claudecode_session_id_for_worker_chat(self, target_chat: dict | None, is_current_target: bool, session_id: str) -> None:
+        value = str(session_id or "").strip()
+        if not value:
+            return
+        if isinstance(target_chat, dict):
+            target_chat["claudecode_session_id"] = value
+        if is_current_target:
+            self.active_claudecode_session_id = value
+
     def _worker(
         self,
         api_key: str,
@@ -7882,11 +8179,14 @@ class ChatFrame(wx.Frame):
         err = ""
         used_model = model
         fallback_msg = ""
-        history_turns = self.active_session_turns[:turn_idx] if turn_idx > 0 else []
+        target_chat, target_turns, is_current_target = self._chat_target_for_request(chat_id)
+        if target_chat is None:
+            return
+        history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
         skip_done = False
         try:
             if is_openclaw_model(model):
-                session_id = str(openclaw_session_id or "").strip() or self._ensure_active_openclaw_session_id()
+                session_id = self._openclaw_session_id_for_worker_chat(chat_id, target_chat, is_current_target, openclaw_session_id)
                 c = OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
                 last_context_usage = getattr(c, "last_context_usage", None)
@@ -7905,26 +8205,26 @@ class ChatFrame(wx.Frame):
                     """处理用户输入请求"""
                     from claudecode_remote_protocol import format_remote_user_input_request
                     request_msg = format_remote_user_input_request(params)
-                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n")
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", chat_id)
                     return ""
 
                 def on_approval(params: dict) -> str:
                     """处理批准请求"""
                     from claudecode_remote_protocol import format_remote_approval_request
                     request_msg = format_remote_approval_request(params)
-                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n")
+                    wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", chat_id)
                     return ""
 
                 client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
                 full, new_session_id = client.stream_chat(
                     question,
-                    session_id=str(self.active_claudecode_session_id or ""),
+                    session_id=self._claudecode_session_id_for_worker_chat(target_chat, is_current_target),
                     on_delta=on_delta,
                     on_user_input=on_user_input,
                     on_approval=on_approval
                 )
                 if new_session_id:
-                    self.active_claudecode_session_id = new_session_id
+                    self._sync_claudecode_session_id_for_worker_chat(target_chat, is_current_target, new_session_id)
                 last_context_usage = getattr(client, "last_context_usage", None)
                 if last_context_usage:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
@@ -7961,13 +8261,11 @@ class ChatFrame(wx.Frame):
     def _on_delta_for_chat(self, turn_idx: int, delta: str, chat_id: str = ""):
         if not delta:
             return
+        target_chat, target_turns, is_current_chat = self._chat_target_for_request(chat_id)
+        if target_chat is None:
+            return
         if self.active_chat_id and self.current_chat_id != self.active_chat_id:
             self.current_chat_id = self.active_chat_id
-        target_turns = self.active_session_turns
-        if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""}:
-            chat = self._find_archived_chat(chat_id)
-            if isinstance(chat, dict):
-                target_turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         if turn_idx < 0 or turn_idx >= len(target_turns):
             return
         cur = str(target_turns[turn_idx].get("answer_md") or "")
@@ -7976,22 +8274,18 @@ class ChatFrame(wx.Frame):
         target_turns[turn_idx]["answer_md"] = cur + remove_emojis(delta)
         target_turns[turn_idx]["request_last_attempt_at"] = time.time()
         # 流式阶段不刷新回答列表；待完成后一次性展示完整回答。
-        self._save_state()
+        self._defer_chat_state_save()
 
     def _on_done(self, turn_idx: int, full: str, err: str, used_model: str, fallback_msg: str, chat_id: str = ""):
+        target_chat, target_turns, is_current_chat = self._chat_target_for_request(chat_id)
+        if target_chat is None:
+            return
         if self.active_chat_id and self.current_chat_id != self.active_chat_id:
             self.current_chat_id = self.active_chat_id
         should_render = True
         if turn_idx < 0 and is_openclaw_model(used_model) and not err:
             should_render = False
-        target_turns = self.active_session_turns
-        target_chat = self._current_chat_state
-        is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, ""}
-        if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""}:
-            archived = self._find_archived_chat(chat_id)
-            if isinstance(archived, dict):
-                target_chat = archived
-                target_turns = archived.get("turns") if isinstance(archived.get("turns"), list) else []
+        if not is_current_chat:
             should_render = False
         if 0 <= turn_idx < len(target_turns):
             if used_model:
@@ -8160,6 +8454,7 @@ class ChatFrame(wx.Frame):
         return
 
     def _archive_active_session(self, quick_title: bool = False, schedule_async_rename: bool = False, save_after_archive: bool = True):
+        self._flush_chat_state_save()
         if not self.active_session_turns:
             return None
         turns_snapshot = copy.deepcopy(self.active_session_turns)
@@ -8579,7 +8874,10 @@ class ChatFrame(wx.Frame):
             if focus_answer_list:
                 self.answer_list.SetFocus()
             return True
-        chat = self._hydrate_chat_from_store(self._find_archived_chat(selected_id))
+        chat = self._hydrate_chat_from_store(
+            self._find_archived_chat(selected_id),
+            include_execution_steps=False,
+        )
         if not chat:
             return False
         self.view_mode = "history"
@@ -8984,6 +9282,32 @@ class ChatFrame(wx.Frame):
             return
         event.Skip()
 
+    def _listbox_strings(self, control) -> list[str]:
+        try:
+            return [control.GetString(i) for i in range(control.GetCount())]
+        except Exception:
+            return []
+
+    def _replace_listbox_items_if_changed(self, control, labels: list[str], selected_idx: int | None = None) -> bool:
+        normalized = [str(label or "") for label in labels]
+        if self._listbox_strings(control) == normalized:
+            if selected_idx is not None:
+                try:
+                    if control.GetSelection() != selected_idx:
+                        control.SetSelection(selected_idx)
+                except Exception:
+                    pass
+            return False
+        control.Clear()
+        for label in normalized:
+            control.Append(label)
+        if normalized and selected_idx is not None:
+            try:
+                control.SetSelection(max(0, min(int(selected_idx), len(normalized) - 1)))
+            except Exception:
+                pass
+        return True
+
     def _notes_refresh_notebooks(self, select_id: str | None = None) -> None:
         query = str(getattr(self, "_notes_search_query", "") or "").strip()
         projection = getattr(self, "notes_projection", None)
@@ -8992,29 +9316,24 @@ class ChatFrame(wx.Frame):
         else:
             notebooks = self.notes_store.search_notebooks(query) if query else self.notes_store.list_notebooks()
         self._notes_notebook_ids = [nb.id for nb in notebooks]
-        self.notes_notebook_list.Clear()
         if not notebooks:
-            self.notes_notebook_list.Append("暂无笔记本")
             self.notes_notebook_list.Enable(True)
-            self.notes_notebook_list.SetSelection(0)
+            self._replace_listbox_items_if_changed(self.notes_notebook_list, ["暂无笔记本"], 0)
             return
         self.notes_notebook_list.Enable(True)
-        for notebook in notebooks:
-            label = f"{'★ ' if notebook.pinned else ''}{notebook.title}"
-            self.notes_notebook_list.Append(label)
         target = str(select_id or self.notes_controller.active_notebook_id or notebooks[0].id)
+        selected_idx = 0
         if target in self._notes_notebook_ids:
-            self.notes_notebook_list.SetSelection(self._notes_notebook_ids.index(target))
-        else:
-            self.notes_notebook_list.SetSelection(0)
+            selected_idx = self._notes_notebook_ids.index(target)
+        labels = [f"{'★ ' if notebook.pinned else ''}{notebook.title}" for notebook in notebooks]
+        self._replace_listbox_items_if_changed(self.notes_notebook_list, labels, selected_idx)
 
     def _notes_refresh_entries(self, notebook_id: str | None = None, select_id: str | None = None) -> None:
         notebook_id = str(notebook_id or self.notes_controller.active_notebook_id or "").strip()
         self._notes_entry_ids = []
-        self.notes_entry_list.Clear()
         if not notebook_id:
-            self.notes_entry_list.Append("请选择笔记本")
             self.notes_entry_list.Enable(False)
+            self._replace_listbox_items_if_changed(self.notes_entry_list, ["请选择笔记本"], None)
             return
         projection = getattr(self, "notes_projection", None)
         if projection is not None:
@@ -9024,17 +9343,18 @@ class ChatFrame(wx.Frame):
         self.notes_entry_list.Enable(True)
         self._notes_entry_ids = [entry.id for entry in entries]
         if not entries:
-            self.notes_entry_list.Append("暂无条目")
+            self._replace_listbox_items_if_changed(self.notes_entry_list, ["暂无条目"], None)
             return
+        target = str(select_id or self.notes_controller.active_entry_id or entries[0].id)
+        selected_idx = 0
+        if target in self._notes_entry_ids:
+            selected_idx = self._notes_entry_ids.index(target)
+        labels = []
         for entry in entries:
             prefix = "★ " if entry.pinned else ""
             label = re.sub(r"\s*[\r\n]+\s*", " / ", str(entry.content or "")).strip()
-            self.notes_entry_list.Append(f"{prefix}{label}")
-        target = str(select_id or self.notes_controller.active_entry_id or entries[0].id)
-        if target in self._notes_entry_ids:
-            self.notes_entry_list.SetSelection(self._notes_entry_ids.index(target))
-        else:
-            self.notes_entry_list.SetSelection(0)
+            labels.append(f"{prefix}{label}")
+        self._replace_listbox_items_if_changed(self.notes_entry_list, labels, selected_idx)
 
     def _notes_sync_editor(self) -> None:
         entry = self._notes_current_entry()
@@ -9407,6 +9727,8 @@ class ChatFrame(wx.Frame):
         if show_notebook_actions:
             i_open_nb = wx.NewIdRef()
             i_new_nb = wx.NewIdRef()
+            i_export_all = wx.NewIdRef()
+            i_restore_backup = wx.NewIdRef()
             i_export_nb = wx.NewIdRef()
             i_copy_nb = wx.NewIdRef()
             i_del_nb = wx.NewIdRef()
@@ -9415,6 +9737,8 @@ class ChatFrame(wx.Frame):
             menu.Append(i_open_nb, "打开笔记")
             menu.AppendSeparator()
             menu.Append(i_new_nb, "新建笔记")
+            menu.Append(i_export_all, "导出所有笔记")
+            menu.Append(i_restore_backup, "恢复笔记")
             menu.Append(i_export_nb, "导出到剪贴板")
             menu.Append(i_copy_nb, "复制笔记")
             menu.Append(i_del_nb, "删除笔记")
@@ -9422,6 +9746,8 @@ class ChatFrame(wx.Frame):
             menu.Append(i_ren_nb, "重命名笔记")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_open_selected_notebook(), id=i_open_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_notebook(), id=i_new_nb)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_all_to_file(), id=i_export_all)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_restore_from_backup_file(), id=i_restore_backup)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_notebook_to_clipboard(), id=i_export_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_notebook_to_clipboard(), id=i_copy_nb)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_notebook(), id=i_del_nb)
@@ -9430,6 +9756,8 @@ class ChatFrame(wx.Frame):
         elif show_entry_actions:
             i_new_entry = wx.NewIdRef()
             i_copy_entry = wx.NewIdRef()
+            i_export_all = wx.NewIdRef()
+            i_restore_backup = wx.NewIdRef()
             i_export_down = wx.NewIdRef()
             i_export_up = wx.NewIdRef()
             i_del_entry = wx.NewIdRef()
@@ -9440,6 +9768,8 @@ class ChatFrame(wx.Frame):
             i_import_clip = wx.NewIdRef()
             menu.Append(i_new_entry, "新建笔记条目")
             menu.Append(i_copy_entry, "复制笔记条目")
+            menu.Append(i_export_all, "导出所有笔记")
+            menu.Append(i_restore_backup, "恢复笔记")
             menu.Append(i_export_down, "向下导出全部到剪贴板")
             menu.Append(i_export_up, "向上导出全部到剪贴板")
             menu.Append(i_del_entry, "删除笔记条目")
@@ -9451,6 +9781,8 @@ class ChatFrame(wx.Frame):
             menu.Append(i_import_clip, "从剪贴板导入")
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_create_entry(), id=i_new_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_copy_entry_to_clipboard(), id=i_copy_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_all_to_file(), id=i_export_all)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_restore_from_backup_file(), id=i_restore_backup)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("down"), id=i_export_down)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("up"), id=i_export_up)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
@@ -9712,6 +10044,59 @@ class ChatFrame(wx.Frame):
             self._notes_after_local_mutation()
         return bool(created)
 
+    def _notes_export_all_to_file(self) -> bool:
+        default_name = f"notes-backup-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        dlg = wx.FileDialog(
+            self,
+            "导出所有笔记",
+            defaultFile=default_name,
+            wildcard="笔记备份 (*.json)|*.json|所有文件 (*.*)|*.*",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            path = Path(dlg.GetPath())
+        finally:
+            dlg.Destroy()
+        if not path.suffix:
+            path = path.with_suffix(".json")
+        try:
+            result = export_notes_backup(self.notes_store, path)
+        except Exception as exc:
+            self.SetStatusText(f"导出笔记失败：{exc}")
+            return False
+        self.SetStatusText(f"已导出所有笔记：{result['notebooks']} 个笔记，{result['entries']} 条笔记条目")
+        return True
+
+    def _notes_restore_from_backup_file(self) -> bool:
+        dlg = wx.FileDialog(
+            self,
+            "恢复笔记",
+            wildcard="笔记备份 (*.json)|*.json|所有文件 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            path = Path(dlg.GetPath())
+        finally:
+            dlg.Destroy()
+        try:
+            result = restore_notes_backup(self.notes_store, path)
+        except Exception as exc:
+            self.SetStatusText(f"恢复笔记失败：{exc}")
+            return False
+        created_total = int(result.get("created_notebooks", 0) or 0) + int(result.get("created_entries", 0) or 0)
+        if created_total:
+            self._notes_refresh_ui()
+            self._notes_after_local_mutation()
+        self.SetStatusText(
+            f"已恢复笔记：新增 {int(result.get('created_notebooks', 0) or 0)} 个笔记，"
+            f"{int(result.get('created_entries', 0) or 0)} 条笔记条目"
+        )
+        return bool(created_total)
+
     def _notes_get_clipboard_text(self) -> str:
         if wx.TheClipboard.Open():
             try:
@@ -9913,6 +10298,7 @@ class ChatFrame(wx.Frame):
         return ret
 
     def _history_delete(self, _):
+        self._flush_chat_state_save()
         idx = self.history_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
             return
@@ -9969,6 +10355,7 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(c.get("id"))
 
     def _history_clear_non_pinned(self, _):
+        self._flush_chat_state_save()
         if not self._confirm("确定清空所有非置顶聊天吗？"):
             return
         self.archived_chats = [c for c in self.archived_chats if c.get("pinned")]
@@ -10000,6 +10387,7 @@ class ChatFrame(wx.Frame):
 
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
+        self._flush_chat_state_save()
         self._voice_input.cancel()
         self._realtime_call.shutdown()
         if self._answer_redirect_timer:
