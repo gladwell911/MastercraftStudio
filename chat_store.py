@@ -177,6 +177,34 @@ class ChatStore:
                 ],
             )
 
+    def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *, start_index: int = 0) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        start = max(0, self._int_or(start_index, 0))
+        suffix = turns or []
+        with self._connect() as conn:
+            conn.execute("DELETE FROM turns WHERE chat_id = ? AND turn_index >= ?", (normalized, start))
+            conn.executemany(
+                "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
+                [
+                    (normalized, start + offset, json.dumps(turn, ensure_ascii=False))
+                    for offset, turn in enumerate(suffix)
+                    if isinstance(turn, dict)
+                ],
+            )
+
+    def count_turns(self, chat_id: str) -> int:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM turns WHERE chat_id = ?",
+                (normalized,),
+            ).fetchone()
+        return self._int_or(row["total"] if row is not None else 0, 0)
+
     def load_turns(self, chat_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -184,6 +212,39 @@ class ChatStore:
                 (str(chat_id or "").strip(),),
             ).fetchall()
         return [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
+
+    def load_turns_page(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 100,
+        before_turn_index: int | None = None,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return 0, []
+        row_limit = max(1, int(limit or 1))
+        with self._connect() as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS total FROM turns WHERE chat_id = ?",
+                (normalized,),
+            ).fetchone()
+            total = self._int_or(total_row["total"] if total_row is not None else 0, 0)
+            try:
+                end = int(before_turn_index) if before_turn_index is not None else total
+            except Exception:
+                end = total
+            end = max(0, min(end, total))
+            start = max(0, end - row_limit)
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM turns
+                WHERE chat_id = ? AND turn_index >= ? AND turn_index < ?
+                ORDER BY turn_index
+                """,
+                (normalized, start, end),
+            ).fetchall()
+        return total, [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
 
     def append_execution_step(self, chat_id: str, step: dict[str, Any]) -> None:
         normalized = str(chat_id or "").strip()
@@ -332,7 +393,8 @@ class ChatStore:
             )
 
     def _summary_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        summary = self._metadata_from_row(row)
+        summary.update({
             "id": str(row["id"] or ""),
             "title": str(row["title"] or "新聊天"),
             "model": str(row["model"] or ""),
@@ -345,7 +407,8 @@ class ChatStore:
             "title_revision": self._int_or(row["title_revision"], 1),
             "detail_panel_mode": str(row["detail_panel_mode"] or "answers"),
             "turn_count": self._int_or(row["turn_count"], 0),
-        }
+        })
+        return summary
 
     def _metadata_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         return self._json_dict(row["metadata_json"])

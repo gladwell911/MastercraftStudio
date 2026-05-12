@@ -196,10 +196,10 @@ class DesktopNotesController:
         if hasattr(self.frame, "_current_notes_state"):
             self.frame._current_notes_state = self.to_state_dict()
 
-    def to_state_dict(self) -> dict:
+    def to_state_dict(self, *, capture_editor: bool = True) -> dict:
         draft = self.entry_editor_draft
         editor = getattr(self.frame, "notes_editor", None)
-        if editor is not None and hasattr(editor, "GetValue"):
+        if capture_editor and editor is not None and hasattr(editor, "GetValue"):
             try:
                 draft = str(editor.GetValue() or "")
             except Exception:

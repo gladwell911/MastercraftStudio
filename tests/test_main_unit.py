@@ -3202,9 +3202,8 @@ def test_render_answer_list_inserts_context_usage_row_first(frame):
 
     assert frame.answer_list.GetString(0) == "113k / 272k"
     assert frame.answer_meta[0] == ("context_usage", -1, "113k / 272k", "")
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.4"
-    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5.4", "")
-    assert frame.answer_list.GetString(2) == "我"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert frame.answer_list.GetString(1) == "我"
 
 
 def test_render_answer_list_keeps_empty_state_below_context_row(frame):
@@ -3215,9 +3214,8 @@ def test_render_answer_list_keeps_empty_state_below_context_row(frame):
 
     assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
-    assert frame.answer_list.GetString(1).startswith("当前模型：")
-    assert frame.answer_meta[1][0] == "current_model"
-    assert frame.answer_list.GetString(2) == "暂无对话内容"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert frame.answer_list.GetString(1) == "暂无对话内容"
 
 
 def test_render_answer_list_history_context_fallback_uses_latest_turn_model(frame):
@@ -3242,8 +3240,9 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
 
     frame._render_answer_list()
 
-    row = frame.answer_list.GetString(0)
-    assert row.endswith(" / 200k")
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert frame.answer_list.GetString(1) == "我"
 
 
 def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
@@ -3263,7 +3262,7 @@ def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
     assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
 
 
-def test_codex_submit_updates_current_model_row_to_requested_model(frame, monkeypatch):
+def test_codex_submit_does_not_show_current_model_row(frame, monkeypatch):
     monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "read_codex_cli_model_label", lambda _cwd=None: "gpt-5.5 medium")
 
@@ -3271,11 +3270,11 @@ def test_codex_submit_updates_current_model_row_to_requested_model(frame, monkey
 
     assert ok is True
     assert message == ""
-    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5.5 medium", "")
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.5 medium"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert all("当前模型：" not in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
 
 
-def test_codex_token_count_updates_current_model_row_to_actual_model(frame, monkeypatch):
+def test_codex_token_count_does_not_show_current_model_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 0
@@ -3296,7 +3295,7 @@ def test_codex_token_count_updates_current_model_row_to_actual_model(frame, monk
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5.5 medium"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -3315,8 +3314,8 @@ def test_codex_token_count_updates_current_model_row_to_actual_model(frame, monk
         ),
     )
 
-    assert frame.answer_meta[1] == ("current_model", -1, "当前模型：gpt-5-codex", "")
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert all("当前模型：" not in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
 
 
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
@@ -3430,16 +3429,24 @@ def test_on_done_openclaw_without_pending_usage_does_not_estimate(frame):
     assert "context_usage" not in frame._current_chat_state
 
 
-def test_on_done_estimates_regular_model_when_api_usage_missing(frame):
+def test_on_done_defers_regular_model_estimate_when_api_usage_missing(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
     frame.active_session_turns = [{"question": "你好", "answer_md": "", "model": "openai/gpt-5.2", "created_at": 1.0}]
+    frame._current_chat_state["id"] = "chat-current"
     frame._current_chat_state["turns"] = frame.active_session_turns
+    scheduled = []
+    monkeypatch.setattr(
+        frame,
+        "_schedule_context_usage_estimate",
+        lambda chat, turns, turn_idx, model: scheduled.append((chat.get("id"), turn_idx, model)),
+    )
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda *args, **kwargs: None)
 
     frame._on_done(0, "你好，有什么可以帮你？", "", "openai/gpt-5.2", "", frame.active_chat_id)
 
-    usage = frame._current_chat_state["context_usage"]
-    assert usage["source"] == "estimated"
-    assert usage["exact"] is False
-    assert frame.answer_list.GetString(0).endswith(" / 128k")
+    assert "context_usage" not in frame._current_chat_state
+    assert scheduled == [("chat-current", 0, "openai/gpt-5.2")]
 
 
 def test_on_done_does_not_apply_pending_context_usage_from_other_chat(frame):
@@ -3461,9 +3468,7 @@ def test_on_done_does_not_apply_pending_context_usage_from_other_chat(frame):
 
     frame._on_done(0, "你好，有什么可以帮你？", "", "openai/gpt-5.2", "", "chat-b")
 
-    usage = frame._current_chat_state["context_usage"]
-    assert usage["source"] == "estimated"
-    assert usage["exact"] is False
+    assert "context_usage" not in frame._current_chat_state
 
 
 def test_on_done_codex_does_not_consume_regular_model_pending_context_usage(frame):
@@ -3553,7 +3558,7 @@ def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame
     assert frame._pending_context_usage_by_turn == {}
 
 
-def test_active_pending_codex_token_count_event_refreshes_context_usage_row_without_moving_selection(frame, monkeypatch):
+def test_active_pending_codex_token_count_event_does_not_refresh_context_usage_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 0
@@ -3582,7 +3587,7 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
-    frame.answer_list.SetSelection(2)
+    frame.answer_list.SetSelection(1)
     assert frame.answer_list.GetString(0) == "暂无"
 
     frame._on_codex_event_for_chat(
@@ -3591,10 +3596,9 @@ def test_active_pending_codex_token_count_event_refreshes_context_usage_row_with
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
-    assert frame.answer_list.GetString(0) == "44k / 258k"
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
-    assert frame.answer_list.GetSelection() == 2
-    assert frame.answer_meta[2][0] == "user"
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetSelection() == 1
+    assert frame.answer_meta[1][0] == "user"
 
 
 def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_state(frame, monkeypatch):
@@ -3648,10 +3652,9 @@ def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_s
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
-    assert frame.answer_list.GetString(0) == "44k / 258k"
-    assert frame.answer_list.GetString(1) == "当前模型：gpt-5-codex"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert refreshes["count"] == 0
-    assert repaints["count"] == 1
+    assert repaints["count"] == 0
     assert saves["count"] == 0
 
 
@@ -3698,12 +3701,12 @@ def test_codex_token_count_same_visible_label_does_not_rebuild_answer_list(frame
 
     frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", turn_id="turn-1", usage=second_usage))
 
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert refreshes["count"] == 0
     assert repaints["count"] == 0
 
 
-def test_active_pending_codex_token_count_event_without_turn_id_refreshes_context_usage_row(frame, monkeypatch):
+def test_active_pending_codex_token_count_event_without_turn_id_does_not_refresh_context_usage_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 1
@@ -3746,7 +3749,7 @@ def test_active_pending_codex_token_count_event_without_turn_id_refreshes_contex
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 1)] == usage
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
 
 
 def test_active_pending_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
@@ -3786,7 +3789,7 @@ def test_active_pending_codex_token_count_event_preserves_selected_context_usage
         main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
     )
 
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -3829,7 +3832,7 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
         main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
     )
 
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
 
     frame._on_codex_event_for_chat(
@@ -3933,7 +3936,7 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
     assert frame.answer_list.GetString(0) == "暂无"
 
 
-def test_late_codex_token_count_event_preserves_selected_context_usage_row(frame, monkeypatch):
+def test_late_codex_token_count_event_updates_state_without_refreshing_visible_context_usage_row(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 0
@@ -3970,7 +3973,7 @@ def test_late_codex_token_count_event_preserves_selected_context_usage_row(frame
     )
 
     assert frame._current_chat_state["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -4024,7 +4027,7 @@ def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(
     assert frame.answer_list.GetString(0) == "44k / 258k"
 
 
-def test_late_codex_token_count_event_preserves_selected_context_usage_row_in_visible_history(frame, monkeypatch):
+def test_late_codex_token_count_event_updates_visible_history_state_without_refreshing_context_row(frame, monkeypatch):
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"
     frame.active_session_turns = [
@@ -4070,7 +4073,7 @@ def test_late_codex_token_count_event_preserves_selected_context_usage_row_in_vi
     )
 
     assert frame._find_archived_chat("chat-visible")["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -7420,27 +7423,36 @@ def test_voice_stop_recording_plays_end_sound(frame):
 
 def test_voice_error_no_modal_beep_only(frame, monkeypatch):
     called = {"wrong_sound": 0, "msgbox": 0}
+    statuses = []
     frame._play_voice_wrong_sound = lambda: called.__setitem__("wrong_sound", called["wrong_sound"] + 1)
+    frame.SetStatusText = lambda text: statuses.append(text)
     monkeypatch.setattr(main.wx, "MessageBox", lambda *_a, **_k: called.__setitem__("msgbox", called["msgbox"] + 1))
     frame._on_voice_error("err")
     assert called["wrong_sound"] == 1
     assert called["msgbox"] == 0
+    assert statuses == []
 
 
 def test_voice_state_recording_plays_begin_sound(frame):
     called = {"begin": 0}
+    statuses = []
     frame._play_voice_begin_sound = lambda: called.__setitem__("begin", called["begin"] + 1)
+    frame.SetStatusText = lambda text: statuses.append(text)
     frame._voice_input.state = "recording"
     frame._on_voice_state("开始录音")
     assert called["begin"] == 1
+    assert statuses == []
 
 
 def test_voice_state_non_recording_does_not_play_begin_sound(frame):
     called = {"begin": 0}
+    statuses = []
     frame._play_voice_begin_sound = lambda: called.__setitem__("begin", called["begin"] + 1)
+    frame.SetStatusText = lambda text: statuses.append(text)
     frame._voice_input.state = "transcribing"
     frame._on_voice_state("正在识别")
     assert called["begin"] == 0
+    assert statuses == []
 
 
 def test_apply_realtime_call_settings_updates_controller_and_state(frame, tmp_path):
@@ -7574,6 +7586,44 @@ def test_save_state_does_not_rewrite_incrementally_persisted_execution_steps(fra
     assert frame.chat_store.load_turns("chat-active") == frame.active_session_turns
 
 
+def test_remote_state_snapshot_omits_full_execution_steps_by_default(frame):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a", "model": "codex/main"}]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": frame.active_session_turns,
+        "execution_steps": [
+            {"turn_idx": 0, "list_text": f"step {idx}", "display_kind": "commentary"}
+            for idx in range(500)
+        ],
+    }
+
+    status, body = frame._remote_api_state_ui({"chat_id": "chat-active"})
+
+    assert status == 200
+    assert body["execution_steps"] == []
+    assert body["execution_step_count"] == 500
+
+
+def test_refresh_history_skips_list_rebuild_when_items_unchanged(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": []}
+    frame.archived_chats = [{"id": "chat-old", "title": "old", "updated_at": 1.0}]
+
+    frame._refresh_history("chat-current")
+    clears = []
+    appends = []
+    monkeypatch.setattr(frame.history_list, "Clear", lambda: clears.append(True))
+    monkeypatch.setattr(frame.history_list, "Append", lambda value: appends.append(value))
+
+    frame._refresh_history("chat-current")
+
+    assert clears == []
+    assert appends == []
+
+
 def test_history_answer_turns_hydrate_without_loading_execution_steps(frame, tmp_path, monkeypatch):
     frame.chat_db_path = tmp_path / "chat_history.db"
     frame.chat_store = main.ChatStore(frame.chat_db_path)
@@ -7655,6 +7705,28 @@ def test_append_execution_entry_prunes_cached_steps_per_turn(frame, monkeypatch)
         "other turn",
     ]
     assert persisted[-1]["list_text"] == "step 3"
+
+
+def test_codex_batch_queues_execution_step_persistence_off_ui_thread(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {"id": "chat-active", "turns": [{"question": "q"}], "execution_steps": []}
+    persisted = []
+    frame.chat_store = SimpleNamespace(
+        max_execution_steps_per_turn=1000,
+        append_execution_step=lambda chat_id, step: persisted.append((chat_id, copy.deepcopy(step))),
+    )
+    frame._chat_store_enabled = True
+    frame._codex_ui_batch_depth = 1
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: object())
+
+    assert frame._append_execution_entry_to_chat("chat-active", {"turn_idx": 0, "list_text": "step 1"})
+
+    assert persisted == []
+    assert frame._pending_execution_step_persists
 
 
 def test_load_state_uses_chat_store_summaries_without_full_turns(frame, tmp_path):
@@ -8260,6 +8332,23 @@ def test_load_chat_as_current_coerces_string_title_manual_false(frame):
     assert "整理成执行清单"[:6] not in archived["title"]
 
 
+def test_load_chat_as_current_avoids_deepcopying_turns_when_chat_store_enabled(frame, monkeypatch):
+    class NoDeepcopyList(list):
+        def __deepcopy__(self, memo):
+            raise AssertionError("chat store load should not deepcopy all turns")
+
+    turns = NoDeepcopyList(
+        [{"question": f"q{idx}", "answer_md": f"a{idx}", "model": main.DEFAULT_MODEL_ID} for idx in range(200)]
+    )
+    frame._chat_store_enabled = True
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    frame._load_chat_as_current({"id": "chat-heavy", "title": "heavy", "title_manual": False, "turns": turns})
+
+    assert len(frame.active_session_turns) == 200
+    assert frame._current_chat_state["turns"] is frame.active_session_turns
+
+
 def test_submit_question_sets_auto_title_from_first_question(frame, monkeypatch):
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
@@ -8365,6 +8454,7 @@ def test_generate_first_question_title_retries_three_times_then_keeps_default(fr
 
 def test_apply_generated_first_question_title_accepts_legacy_default_title(frame, monkeypatch):
     saved = []
+    deferred = []
     pushed = []
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -8380,13 +8470,15 @@ def test_apply_generated_first_question_title_accepts_legacy_default_title(frame
         }
     )
     monkeypatch.setattr(frame, "_save_state", lambda: saved.append(True))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
 
     frame._apply_generated_first_question_title("chat-current", "帮我整理安卓自动化测试方案", "自动化测试")
 
     assert frame._current_chat_state["title"] == "自动化测试"
     assert frame._current_chat_state["title_source"] == "auto"
-    assert saved == [True]
+    assert saved == []
+    assert deferred == [True]
     assert pushed == ["chat-current"]
 
 
@@ -8517,6 +8609,79 @@ def test_notes_refresh_ui_skips_list_rebuild_when_projection_unchanged(frame, mo
 
     assert notebook_clears == []
     assert entry_clears == []
+
+
+def test_listbox_diff_uses_cached_labels_without_rescanning_control(frame, monkeypatch):
+    frame._replace_listbox_items_if_changed(frame.history_list, ["A", "B"], 1)
+    monkeypatch.setattr(frame.history_list, "GetString", lambda _idx: pytest.fail("unchanged diff should use cached labels"))
+
+    changed = frame._replace_listbox_items_if_changed(frame.history_list, ["A", "B"], 1)
+
+    assert changed is False
+
+
+def test_notes_projection_reuses_document_snapshot_until_cursor_changes(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("cached projection notebook")
+    frame.notes_store.create_entry(notebook.id, "cached projection entry", source="manual")
+    projection = main.DesktopNotesProjection(frame.notes_store)
+
+    assert [item.id for item in projection.list_notebooks()] == [notebook.id]
+    monkeypatch.setattr(frame.notes_store, "load_documents", lambda: pytest.fail("same-cursor projection read should use cache"))
+
+    assert [item.notebook_id for item in projection.list_entries(notebook.id)] == [notebook.id]
+
+
+def test_notes_remote_ops_skip_full_refresh_for_invisible_entry_change(frame, monkeypatch):
+    active_notebook = frame.notes_store.create_notebook("active")
+    other_notebook = frame.notes_store.create_notebook("other")
+    other_entry = frame.notes_store.create_entry(other_notebook.id, "remote", source="manual")
+    frame.notes_controller.active_notebook_id = active_notebook.id
+    frame.notes_controller.active_entry_id = ""
+    frame.notes_controller.notes_view = "notes_list"
+    refresh_calls = []
+    monkeypatch.setattr(frame, "_notes_refresh_ui", lambda: refresh_calls.append("full"))
+
+    frame._on_notes_remote_ops_applied(
+        {
+            "cursor": frame.notes_store.current_cursor(),
+            "applied": [
+                {
+                    "entity_type": "entry",
+                    "entity_id": other_entry.id,
+                    "entry": other_entry.to_dict(),
+                }
+            ],
+            "conflicts": [],
+        }
+    )
+
+    assert refresh_calls == []
+
+
+def test_notes_remote_ops_refresh_visible_notebook_entries(frame, monkeypatch):
+    active_notebook = frame.notes_store.create_notebook("active")
+    active_entry = frame.notes_store.create_entry(active_notebook.id, "remote", source="manual")
+    frame.notes_controller.active_notebook_id = active_notebook.id
+    frame.notes_controller.active_entry_id = ""
+    frame.notes_controller.notes_view = "notes_list"
+    refresh_calls = []
+    monkeypatch.setattr(frame, "_notes_refresh_ui", lambda: refresh_calls.append("full"))
+
+    frame._on_notes_remote_ops_applied(
+        {
+            "cursor": frame.notes_store.current_cursor(),
+            "applied": [
+                {
+                    "entity_type": "entry",
+                    "entity_id": active_entry.id,
+                    "entry": active_entry.to_dict(),
+                }
+            ],
+            "conflicts": [],
+        }
+    )
+
+    assert refresh_calls == ["full"]
 
 
 def test_compact_first_question_title_removes_request_wrappers(frame):
@@ -8907,12 +9072,12 @@ def test_remote_history_and_state_payloads_round_trip_detail_panel_fields(frame)
     assert "execution_steps" not in current
     assert "execution_steps" not in archived
 
-    status, read = frame._remote_api_history_read_ui({"chat_id": "chat-archived"})
+    status, read = frame._remote_api_history_read_ui({"chat_id": "chat-archived", "include_execution_steps": True})
     assert status == 200
     assert read["chat"]["detail_panel_mode"] == "execution"
     assert read["chat"]["execution_steps"] == [{"step": "归档步骤"}]
 
-    status, state = frame._remote_api_state_ui({"chat_id": "chat-current"})
+    status, state = frame._remote_api_state_ui({"chat_id": "chat-current", "include_execution_steps": True})
     assert status == 200
     assert state["detail_panel_mode"] == "execution"
     assert state["execution_steps"] == [{"step": "当前步骤"}]
@@ -9007,6 +9172,49 @@ def test_remote_history_read_paging_only_renders_requested_turns(frame, monkeypa
     assert status == 200
     assert [turn["question"] for turn in body["chat"]["turns"]] == ["问题 4", "问题 5"]
     assert rendered == ["问题 4", "问题 5"]
+
+
+def test_remote_history_read_store_uses_turn_page_without_full_hydration(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.archived_chats = [
+        {
+            "id": "chat-heavy",
+            "title": "heavy",
+            "turn_count": 500,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+        }
+    ]
+    calls = []
+
+    class Store:
+        def load_turns_page(self, chat_id, *, limit=100, before_turn_index=None):
+            calls.append((chat_id, limit, before_turn_index))
+            return 500, [
+                {"question": "q498", "answer_md": "a498", "model": main.DEFAULT_MODEL_ID},
+                {"question": "q499", "answer_md": "a499", "model": main.DEFAULT_MODEL_ID},
+            ]
+
+        def load_chat(self, *args, **kwargs):
+            raise AssertionError("remote history read should not hydrate full chat")
+
+        def load_turns(self, *args, **kwargs):
+            raise AssertionError("remote history read should not load all turns")
+
+        def load_execution_steps(self, *args, **kwargs):
+            raise AssertionError("remote history read should not load execution steps by default")
+
+    frame.chat_store = Store()
+    monkeypatch.setattr(frame, "_hydrate_chat_from_store", lambda *args, **kwargs: pytest.fail("full hydrate is too heavy"))
+
+    status, body = frame._remote_api_history_read_ui({"chat_id": "chat-heavy", "limit": 2})
+
+    assert status == 200
+    assert calls == [("chat-heavy", 2, None)]
+    assert body["chat"]["turn_count"] == 500
+    assert [turn["question"] for turn in body["chat"]["turns"]] == ["q498", "q499"]
+    assert body["has_more"] is True
+    assert body["oldest_cursor"] == "498"
 
 
 def test_remote_history_read_current_chat_uses_latest_active_session_turns(frame):
@@ -9109,7 +9317,61 @@ def test_background_done_updates_archived_chat_without_switching_current(frame, 
     archived = frame._find_archived_chat("chat-old")
     assert archived["turns"][0]["answer_md"] == "后台旧回答"
     assert rendered["count"] == 0
-    assert statuses[-1] == "答复完成"
+    assert statuses == []
+
+
+def test_background_done_does_not_generate_title_over_network_on_ui_thread(frame, monkeypatch):
+    frame.active_chat_id = "chat-new"
+    frame.current_chat_id = "chat-new"
+    frame.active_session_turns = []
+    frame.archived_chats = [
+        {
+            "id": "chat-old",
+            "title": main.EMPTY_CURRENT_CHAT_TITLE,
+            "turns": [
+                {
+                    "question": "请帮我分析这个卡顿问题",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": "openai/gpt-5.2",
+                    "created_at": 1.0,
+                }
+            ],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "configured")
+    monkeypatch.setattr(
+        main.ChatClient,
+        "generate_chat_title",
+        lambda *_args, **_kwargs: pytest.fail("background completion must not call network title generation on UI thread"),
+    )
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+
+    frame._on_done(0, "后台旧回答", "", "openai/gpt-5.2", "", "chat-old")
+
+    archived = frame._find_archived_chat("chat-old")
+    assert archived["turns"][0]["answer_md"] == "后台旧回答"
+    assert archived["title"]
+
+
+def test_summarize_recent_topic_never_uses_network_title_generation(frame, monkeypatch):
+    monkeypatch.setattr(
+        main.ChatClient,
+        "generate_chat_title",
+        lambda *_args, **_kwargs: pytest.fail("recent topic summary must stay local for UI responsiveness"),
+    )
+
+    title = frame._summarize_recent_topic(
+        [{"question": "请继续深度审查读屏卡顿问题", "answer_md": "ok", "model": "openai/gpt-5.2"}],
+        "configured-api-key",
+    )
+
+    assert title
 
 
 def test_background_done_does_not_rerender_different_viewed_history_chat(frame, monkeypatch):
@@ -9216,6 +9478,16 @@ def test_focus_latest_answer_only_focuses_when_completion_window_is_foreground(f
 
     assert calls["selection"] == 1
     assert calls["focus"] == 1
+
+
+def test_focus_latest_answer_does_not_steal_focus_after_user_tabs_away(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "小诸葛", ""), ("answer", 1, "小诸葛", "最新回答")]
+    monkeypatch.setattr(frame, "IsActive", lambda: True)
+    monkeypatch.setattr(frame, "IsIconized", lambda: False)
+    monkeypatch.setattr(wx.Window, "FindFocus", lambda: frame.history_list)
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: pytest.fail("completion focus should not steal focus from history"))
+
+    frame._focus_latest_answer()
 
 
 def test_codex_ui_dispatch_coalesces_bursty_events(frame, monkeypatch):
@@ -11128,6 +11400,7 @@ def test_escape_keydown_with_raw_0_does_not_minimize(frame):
 def test_non_escape_keydown_with_raw_27_does_not_minimize(frame):
     minimized = {"n": 0}
     frame._minimize_to_tray = lambda: minimized.__setitem__("n", minimized["n"] + 1)
+    skipped = {"n": 0}
 
     class E:
         def GetKeyCode(self):
@@ -11143,10 +11416,38 @@ def test_non_escape_keydown_with_raw_27_does_not_minimize(frame):
             return False
 
         def Skip(self):
-            pass
+            skipped["n"] += 1
 
     frame._on_any_key_down_escape_minimize(E())
     assert minimized["n"] == 0
+    assert skipped["n"] == 0
+
+
+def test_frame_key_down_still_skips_non_escape_for_native_handling(frame):
+    skipped = {"n": 0}
+
+    class E:
+        def GetKeyCode(self):
+            return ord("A")
+
+        def GetRawKeyCode(self):
+            return 65
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            skipped["n"] += 1
+
+    frame._on_frame_key_down(E())
+
+    assert skipped["n"] == 1
 
 
 def test_close_not_vetoed_while_running(frame):
@@ -11528,6 +11829,30 @@ def test_answer_list_defaults_to_latest_100_rows_and_shows_more(frame):
     assert frame.answer_total_content_rows > 100
 
 
+def test_render_answer_list_does_not_format_all_old_turns_when_bounded(frame, monkeypatch):
+    frame.active_session_turns = [
+        {"question": f"q {idx}", "answer_md": f"a {idx}", "model": "openai/gpt-5.2", "created_at": float(idx)}
+        for idx in range(500)
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "detail_panel_mode": "answers"}
+    formatted = []
+    original = frame._turn_answer_markdown
+
+    def _counting_markdown(turn):
+        formatted.append(turn["question"])
+        return original(turn)
+
+    monkeypatch.setattr(frame, "_turn_answer_markdown", _counting_markdown)
+
+    frame._render_answer_list()
+
+    assert len(formatted) <= frame.answer_visible_row_limit
+    visible = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert visible[0] == "更多"
+    assert "q 0" not in visible
+    assert "q 499" in visible
+
+
 def test_answer_list_more_item_expands_upward_and_hides_when_all_rows_visible(frame):
     frame.active_session_turns = [
         {"question": f"q {idx}", "answer_md": f"a {idx}", "model": "openai/gpt-5.2", "created_at": float(idx)}
@@ -11655,6 +11980,53 @@ def test_execution_list_uses_recent_store_page_without_full_step_load(frame, tmp
     assert "process 150" in visible
     assert "process 249" in visible
     assert frame.execution_list.GetCount() == 101
+
+
+def test_open_selected_execution_detail_uses_rendered_detail_without_full_step_load(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [{"question": "q", "answer_md": "a", "model": "codex/main"}],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame.execution_list.Clear()
+    frame.execution_list.Append("process row")
+    frame.execution_list.SetSelection(0)
+    frame.execution_meta = [("execution", 499, "process row", "full detail from rendered page")]
+    monkeypatch.setattr(frame, "_current_execution_steps", lambda: pytest.fail("opening visible execution detail should not load all steps"))
+    opened = []
+    monkeypatch.setattr(frame, "_ensure_execution_detail_page", lambda step, step_idx: opened.append((step, step_idx)) or "detail.html")
+    monkeypatch.setattr(frame, "_open_local_webpage", lambda path: opened.append(("open", path)))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._try_open_selected_execution_detail() is True
+
+    assert opened[0][0]["detail_text"] == "full detail from rendered page"
+    assert opened[0][1] == 499
+    assert opened[1] == ("open", "detail.html")
+
+
+def test_open_selected_execution_detail_with_summary_does_not_hydrate_all_steps(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame.execution_list.Clear()
+    frame.execution_list.Append("remote summary row")
+    frame.execution_list.SetSelection(0)
+    frame.execution_meta = [("execution", 5000, "remote summary row", "")]
+    monkeypatch.setattr(frame, "_current_execution_steps", lambda: pytest.fail("visible execution row should not hydrate all steps"))
+    opened = []
+    monkeypatch.setattr(frame, "_ensure_execution_detail_page", lambda step, step_idx: opened.append((step, step_idx)) or "detail.html")
+    monkeypatch.setattr(frame, "_open_local_webpage", lambda path: opened.append(("open", path)))
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._try_open_selected_execution_detail() is True
+
+    assert opened[0][0]["detail_text"] == "remote summary row"
+    assert opened[0][1] == 5000
+    assert opened[1] == ("open", "detail.html")
 
 
 def test_execution_list_more_item_expands_upward_and_hides_when_all_visible(frame):
@@ -11884,17 +12256,32 @@ def test_model_changed_noops_without_state_save_when_selection_is_unchanged(fram
     assert lifecycle == []
 
 
-def test_model_changed_saves_small_state_without_rewriting_chat_history(frame, monkeypatch):
+def test_model_changed_does_not_commit_combo_navigation_or_save_state(frame, monkeypatch):
     frame.selected_model = "codex/main"
-    frame.model_combo.SetValue("openai gpt5.2")
+    frame.model_combo.SetValue(main.model_display_name("openai/gpt-5.2"))
     calls = []
+    lifecycle = []
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: lifecycle.append(True))
 
     frame._on_model_changed(None)
 
+    assert frame.selected_model == "codex/main"
+    assert calls == []
+    assert lifecycle == []
+
+
+def test_new_chat_commits_model_from_combo_after_deferred_selection(frame, monkeypatch):
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue(main.model_display_name("openai/gpt-5.2"))
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    frame._on_new_chat_clicked(None)
+
     assert frame.selected_model == "openai/gpt-5.2"
-    assert calls == [{"persist_chat_history": False}]
+    assert frame._current_chat_state["model"] == "openai/gpt-5.2"
 
 
 def test_save_state_can_skip_chat_history_persistence_for_small_config_changes(frame, monkeypatch, tmp_path):
@@ -11908,5 +12295,533 @@ def test_save_state_can_skip_chat_history_persistence_for_small_config_changes(f
     assert persists == []
     data = json.loads(frame.state_path.read_text(encoding="utf-8"))
     assert data["selected_model_id"] == frame.selected_model
+
+
+def test_save_state_does_not_rewrite_clean_chat_turns(frame):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "q0", "answer_md": "a0", "model": main.DEFAULT_MODEL_ID},
+        {"question": "q1", "answer_md": "a1", "model": main.DEFAULT_MODEL_ID},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+
+    class Store:
+        def upsert_chat(self, chat):
+            return None
+
+        def replace_turns(self, chat_id, turns):
+            raise AssertionError("clean state save should not rewrite all turns")
+
+        def replace_turns_from(self, chat_id, turns, start_index=0):
+            raise AssertionError("clean state save should not persist turns")
+
+    frame.chat_store = Store()
+
+    frame._save_state()
+
+
+def test_save_state_persists_only_dirty_turn_suffix(frame):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": f"q{idx}", "answer_md": f"a{idx}", "model": main.DEFAULT_MODEL_ID}
+        for idx in range(5)
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    calls = []
+
+    class Store:
+        def upsert_chat(self, chat):
+            return None
+
+        def replace_turns(self, chat_id, turns):
+            raise AssertionError("dirty suffix save should not rewrite all turns")
+
+        def replace_turns_from(self, chat_id, turns, start_index=0):
+            calls.append((chat_id, start_index, [turn["question"] for turn in turns]))
+
+    frame.chat_store = Store()
+    frame._mark_chat_turns_dirty("chat-current", 3)
+
+    frame._save_state()
+
+    assert calls == [("chat-current", 3, ["q3", "q4"])]
+
+
+def test_remote_state_defaults_to_latest_turn_page_without_formatting_all_turns(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": f"q {idx}", "answer_md": f"a {idx}", "model": main.DEFAULT_MODEL_ID, "created_at": float(idx)}
+        for idx in range(500)
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    rendered = []
+
+    def fake_turn_payload(turn):
+        rendered.append(turn["question"])
+        return {"question": turn["question"], "answer": "", "model": "", "created_at": 0.0}
+
+    monkeypatch.setattr(frame, "_remote_turn_payload", fake_turn_payload)
+
+    status, body = frame._remote_api_state_ui({})
+
+    assert status == 200
+    assert body["turn_count"] == 500
+    assert body["has_more"] is True
+    assert body["oldest_cursor"] == "400"
+    assert len(body["turns"]) == 100
+    assert rendered == [f"q {idx}" for idx in range(400, 500)]
+
+
+def test_remote_state_archived_store_uses_turn_page_without_full_hydration(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.archived_chats = [
+        {
+            "id": "chat-heavy",
+            "title": "heavy",
+            "turn_count": 500,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+        }
+    ]
+    calls = []
+
+    class Store:
+        def load_turns_page(self, chat_id, *, limit=100, before_turn_index=None):
+            calls.append((chat_id, limit, before_turn_index))
+            return 500, [
+                {"question": "q498", "answer_md": "a498", "model": main.DEFAULT_MODEL_ID},
+                {"question": "q499", "answer_md": "a499", "model": main.DEFAULT_MODEL_ID},
+            ]
+
+        def load_chat(self, *args, **kwargs):
+            raise AssertionError("remote state should not hydrate full archived chat")
+
+        def load_turns(self, *args, **kwargs):
+            raise AssertionError("remote state should not load all turns")
+
+        def load_execution_steps(self, *args, **kwargs):
+            raise AssertionError("remote state should not load execution steps by default")
+
+    frame.chat_store = Store()
+    monkeypatch.setattr(frame, "_hydrate_chat_from_store", lambda *args, **kwargs: pytest.fail("full hydrate is too heavy"))
+
+    status, body = frame._remote_api_state_ui({"chat_id": "chat-heavy", "limit": 2})
+
+    assert status == 200
+    assert calls == [("chat-heavy", 2, None)]
+    assert body["turn_count"] == 500
+    assert [turn["question"] for turn in body["turns"]] == ["q498", "q499"]
+    assert body["has_more"] is True
+    assert body["oldest_cursor"] == "498"
+
+
+def test_remote_turn_payload_reuses_plain_answer_cache(frame, monkeypatch):
+    turn = {"question": "q", "answer_md": "**cached**", "model": main.DEFAULT_MODEL_ID}
+    calls = []
+    original = main.md_to_plain
+
+    def counting_plain(text):
+        calls.append(text)
+        return original(text)
+
+    monkeypatch.setattr(main, "md_to_plain", counting_plain)
+
+    first = frame._remote_turn_payload(turn)
+    second = frame._remote_turn_payload(turn)
+
+    assert first == second
+    assert calls == [frame._answer_markdown_for_output("**cached**", main.DEFAULT_MODEL_ID)]
+
+
+def test_remote_state_reuses_snapshot_when_chat_has_not_changed(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": f"q {idx}", "answer_md": f"a {idx}", "model": main.DEFAULT_MODEL_ID, "created_at": float(idx)}
+        for idx in range(120)
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    calls = []
+    original = frame._remote_turn_payload
+
+    def counting_payload(turn):
+        calls.append(turn["question"])
+        return original(turn)
+
+    monkeypatch.setattr(frame, "_remote_turn_payload", counting_payload)
+
+    first_status, first_body = frame._remote_api_state_ui({})
+    first_calls = list(calls)
+    second_status, second_body = frame._remote_api_state_ui({})
+
+    assert first_status == second_status == 200
+    assert first_body == second_body
+    assert len(first_calls) == 100
+    assert calls == first_calls
+
+
+def test_remote_state_cache_invalidates_after_turn_change(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a", "model": main.DEFAULT_MODEL_ID}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+
+    frame._remote_api_state_ui({})
+    frame.active_session_turns[0]["answer_md"] = "changed"
+    frame._mark_chat_turns_dirty("chat-current", 0)
+
+    status, body = frame._remote_api_state_ui({})
+
+    assert status == 200
+    assert body["turns"][0]["answer"] == "changed"
+
+
+def test_save_state_skips_notes_editor_capture_by_default(frame, monkeypatch, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.notes_controller.notes_view = "note_edit"
+    frame.notes_controller.entry_editor_dirty = True
+    frame.notes_controller.entry_editor_draft = "cached draft"
+    monkeypatch.setattr(frame.notes_editor, "GetValue", lambda: pytest.fail("chat state save should not read large notes editor"))
+
+    frame._save_state()
+
+    data = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    assert data["notes_ui_state"]["entry_editor_draft"] == "cached draft"
+
+
+def test_save_state_can_capture_notes_editor_when_explicit(frame, monkeypatch, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.notes_controller.notes_view = "note_edit"
+    frame.notes_controller.entry_editor_dirty = True
+    monkeypatch.setattr(frame.notes_editor, "GetValue", lambda: "fresh large draft")
+
+    frame._save_state(capture_notes_editor=True)
+
+    data = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    assert data["notes_ui_state"]["entry_editor_draft"] == "fresh large draft"
+
+
+def test_large_context_usage_after_done_is_deferred_off_ui_thread(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "turns": []}
+    turns = [
+        {"question": f"q{idx}", "answer_md": f"a{idx}", "model": "openai/gpt-5.2"}
+        for idx in range(500)
+    ]
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, daemon=True):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            started.append(self.target)
+
+    monkeypatch.setattr(main.threading, "Thread", FakeThread)
+    monkeypatch.setattr(main, "estimate_turns_tokens", lambda *args, **kwargs: pytest.fail("large context usage should not be estimated on UI thread"))
+
+    frame._refresh_context_usage_after_done(frame._current_chat_state, turns, len(turns) - 1, "openai/gpt-5.2")
+
+    assert started
+    assert "context_usage" not in frame._current_chat_state
+
+
+def test_regular_context_usage_after_done_is_deferred_off_ui_thread(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "turns": []}
+    turns = [
+        {"question": "q", "answer_md": "a", "model": "openai/gpt-5.2"},
+    ]
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, daemon=True):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            started.append(self.target)
+
+    monkeypatch.setattr(main.threading, "Thread", FakeThread)
+    monkeypatch.setattr(main, "estimate_turns_tokens", lambda *args, **kwargs: pytest.fail("context usage should not be estimated on UI thread"))
+
+    frame._refresh_context_usage_after_done(frame._current_chat_state, turns, 0, "openai/gpt-5.2")
+
+    assert started
+    assert "context_usage" not in frame._current_chat_state
+
+
+def test_render_answer_list_does_not_schedule_context_usage_estimate(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a", "model": "openai/gpt-5.2"}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    scheduled = []
+    monkeypatch.setattr(main, "estimate_turns_tokens", lambda *args, **kwargs: pytest.fail("rendering must not estimate context usage on UI thread"))
+    monkeypatch.setattr(
+        frame,
+        "_schedule_context_usage_estimate",
+        lambda chat, turns, turn_idx, model: scheduled.append((chat.get("id"), turn_idx, model)),
+    )
+
+    frame._render_answer_list()
+
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert scheduled == []
+
+
+def test_context_usage_estimate_applies_state_without_refreshing_visible_header(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a", "model": "openai/gpt-5.2"}]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame.view_mode = "active"
+    refreshes = []
+    saves = []
+    usage = {
+        "used_tokens": 2000,
+        "context_window": 128000,
+        "source": "estimated",
+        "exact": False,
+        "fresh": True,
+        "model": "openai/gpt-5.2",
+    }
+    monkeypatch.setattr(frame, "_refresh_context_usage_header_rows", lambda: refreshes.append(True))
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(True))
+
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "暂无"
+
+    frame._apply_context_usage_estimate(("chat-current", 0), usage)
+
+    assert frame._current_chat_state["context_usage"] == usage
+    assert frame.answer_list.GetString(0) == "暂无"
+    assert refreshes == []
+
+
+def test_submit_question_defers_state_save_after_send(frame, monkeypatch):
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    deferred = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: pytest.fail("send path should not synchronously save state"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args, **kwargs: None)
+
+    ok, message = frame._submit_question("hello", source="remote", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert deferred == [True]
+
+
+def test_switch_current_chat_does_not_load_full_execution_steps(frame, monkeypatch):
+    calls = []
+    chat = {
+        "id": "chat-heavy",
+        "title": "heavy",
+        "turns": [{"question": "q", "answer_md": "a", "model": "codex/main"}],
+        "execution_steps": [{"step": "heavy"}],
+    }
+    frame.archived_chats = [chat]
+    frame._chat_store_enabled = True
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda chat_id: chat)
+
+    def fake_hydrate(source_chat, *, include_execution_steps=True):
+        calls.append(include_execution_steps)
+        return dict(source_chat, execution_steps=[] if not include_execution_steps else source_chat["execution_steps"])
+
+    monkeypatch.setattr(frame, "_hydrate_chat_from_store", fake_hydrate)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    assert frame._switch_current_chat("chat-heavy") is True
+
+    assert calls == [False]
+
+
+def test_archive_active_session_avoids_deepcopying_turns_when_chat_store_enabled(frame, monkeypatch):
+    class NoDeepcopyList(list):
+        def __deepcopy__(self, memo):
+            raise AssertionError("chat store archive should not deepcopy all turns")
+
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = NoDeepcopyList(
+        [{"question": f"q{idx}", "answer_md": f"a{idx}", "model": main.DEFAULT_MODEL_ID} for idx in range(200)]
+    )
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "current",
+        "turns": frame.active_session_turns,
+        "execution_steps": [{"step": "heavy"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    archived = frame._archive_active_session(quick_title=True)
+
+    assert archived["id"] == "chat-current"
+    assert len(archived["turns"]) == 200
+    assert archived["turn_count"] == 200
+    assert archived["execution_steps"] == [{"step": "heavy"}]
+
+
+def test_switch_current_chat_avoids_deepcopying_turns_when_chat_store_enabled(frame, monkeypatch):
+    class NoDeepcopyList(list):
+        def __deepcopy__(self, memo):
+            raise AssertionError("chat store switch should not deepcopy all turns")
+
+    turns = NoDeepcopyList(
+        [{"question": f"q{idx}", "answer_md": f"a{idx}", "model": main.DEFAULT_MODEL_ID} for idx in range(200)]
+    )
+    chat = {"id": "chat-heavy", "title": "heavy", "turns": turns, "execution_steps": []}
+    frame._chat_store_enabled = True
+    frame.archived_chats = [chat]
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda chat_id: chat)
+    monkeypatch.setattr(frame, "_hydrate_chat_from_store", lambda source, **kwargs: source)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    assert frame._switch_current_chat("chat-heavy") is True
+
+    assert len(frame.active_session_turns) == 200
+    assert frame._current_chat_state["turns"] is frame.active_session_turns
+
+
+def test_notes_arrow_selection_does_not_force_focus_or_full_ui_refresh(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("nb")
+    frame.notes_store.create_entry(notebook.id, "entry", source="manual")
+    frame.notes_controller.notes_view = "notes_list"
+    frame._notes_refresh_ui()
+    frame.notes_notebook_list.SetSelection(0)
+    focus_calls = []
+    refresh_calls = []
+    monkeypatch.setattr(frame.notes_notebook_list, "SetFocus", lambda: focus_calls.append("notebook"))
+    monkeypatch.setattr(frame.notes_entry_list, "SetFocus", lambda: focus_calls.append("entry"))
+    monkeypatch.setattr(frame, "_notes_refresh_ui", lambda: refresh_calls.append("full"))
+
+    frame._on_notes_notebook_selected(None)
+
+    assert focus_calls == []
+    assert refresh_calls == []
+    assert frame.notes_controller.active_notebook_id == notebook.id
+
+
+def test_notes_entry_labels_are_short_previews_for_large_entries(frame):
+    notebook = frame.notes_store.create_notebook("nb")
+    entry = frame.notes_store.create_entry(notebook.id, "A" * 5000, source="manual")
+
+    frame._notes_refresh_entries(notebook.id, entry.id)
+
+    label = frame.notes_entry_list.GetString(0)
+    assert len(label) <= main.NOTES_ENTRY_LABEL_MAX_CHARS + 1
+    assert label.endswith("...")
+
+
+def test_notes_entry_arrow_selection_does_not_sync_large_editor_text(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("nb")
+    entry = frame.notes_store.create_entry(notebook.id, "large text", source="manual")
+    frame._notes_select_notebook(notebook.id, view="notes_list", focus=False)
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(entry.id))
+    frame.notes_controller.notes_view = "note_edit"
+    monkeypatch.setattr(frame.notes_editor, "SetValue", lambda value: pytest.fail("arrow selection should not write editor text"))
+
+    frame._on_notes_entry_selected(None)
+
+    assert frame.notes_controller.active_entry_id == entry.id
+    assert frame.notes_controller.notes_view == "note_detail"
+
+
+def test_answer_arrow_selection_does_not_refocus_when_list_already_has_focus(frame, monkeypatch):
+    frame.answer_list.Append("first")
+    frame.answer_list.Append("second")
+    frame.answer_list.SetSelection(0)
+    monkeypatch.setattr(frame.answer_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: pytest.fail("arrow navigation should not emit redundant focus events"))
+
+    assert frame._move_answer_list_selection_for_key(main.wx.WXK_DOWN) is True
+
+    assert frame.answer_list.GetSelection() == 1
+
+
+def test_render_answer_list_does_not_clear_when_rows_are_unchanged(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a", "model": "openai/gpt-5.2"}]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "context_usage": {
+            "used_tokens": 1500,
+            "context_window": 128000,
+            "source": "estimated",
+            "exact": False,
+            "fresh": True,
+            "model": "openai/gpt-5.2",
+        },
+    }
+    frame._render_answer_list()
+    monkeypatch.setattr(frame.answer_list, "Clear", lambda: pytest.fail("unchanged answer rows should not rebuild the listbox"))
+
+    frame._render_answer_list()
+
+
+def test_render_execution_list_does_not_clear_when_rows_are_unchanged(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "step 1", "detail_text": "step 1"}],
+    }
+    frame._render_execution_list()
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("unchanged execution rows should not rebuild the listbox"))
+
+    frame._render_execution_list()
+
+
+def test_execution_shift_tab_uses_primary_navigation_instead_of_forcing_input_focus(frame, monkeypatch):
+    focused = []
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: pytest.fail("Shift+Tab from execution should not jump to input"))
+    monkeypatch.setattr(frame.history_list, "SetFocus", lambda: focused.append("history"))
+    monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: frame.execution_list)
+
+    event = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
+    event.SetKeyCode(main.wx.WXK_TAB)
+    event.m_shiftDown = True
+
+    frame._on_execution_key_down(event)
+
+    assert focused == ["history"]
+
+
+def test_openclaw_offset_only_poll_does_not_save_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "turns": []}
+    frame.active_openclaw_sync_offset = 10
+    saves = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(kwargs))
+
+    frame._apply_openclaw_sync_batch(
+        {
+            "chat_id": "chat-current",
+            "offset": 20,
+            "file_changed": False,
+            "session_changed": False,
+        },
+        [],
+    )
+
+    assert saves == []
+    assert frame.active_openclaw_sync_offset == 20
 
 

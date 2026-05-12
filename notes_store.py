@@ -377,6 +377,27 @@ class NotesStore:
             entries=[EntryDoc.from_row(dict(row)) for row in entry_rows],
         )
 
+    def load_dirty_documents(self) -> NotesSnapshot:
+        with self._connect() as conn:
+            notebook_rows = conn.execute(
+                """
+                SELECT * FROM notebooks
+                WHERE dirty = 1
+                ORDER BY updated_at DESC, created_at DESC, id ASC
+                """
+            ).fetchall()
+            entry_rows = conn.execute(
+                """
+                SELECT * FROM entries
+                WHERE dirty = 1
+                ORDER BY notebook_id ASC, sort_order ASC, created_at ASC, id ASC
+                """
+            ).fetchall()
+        return NotesSnapshot(
+            notebooks=[NotebookDoc.from_row(dict(row)) for row in notebook_rows],
+            entries=[EntryDoc.from_row(dict(row)) for row in entry_rows],
+        )
+
     def snapshot_documents(self) -> list[dict]:
         return self.load_documents().to_documents()
 

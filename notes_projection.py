@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 from notes_models import NoteEntry, Notebook, NotesSnapshot
 
@@ -24,13 +25,31 @@ class _ProjectionState:
 class DesktopNotesProjection:
     def __init__(self, store) -> None:
         self.store = store
+        self._lock = threading.RLock()
+        self._cached_cursor: str | None = None
+        self._cached_state: _ProjectionState | None = None
 
     def _load_state(self) -> _ProjectionState:
-        snapshot = self.store.load_documents()
-        return _ProjectionState(
-            notebooks=self._project_notebooks(snapshot),
-            entries=self._project_entries(snapshot),
-        )
+        cursor = ""
+        current_cursor = getattr(self.store, "current_cursor", None)
+        if callable(current_cursor):
+            cursor = str(current_cursor() or "")
+        with self._lock:
+            if self._cached_state is not None and self._cached_cursor == cursor:
+                return self._cached_state
+            snapshot = self.store.load_documents()
+            state = _ProjectionState(
+                notebooks=self._project_notebooks(snapshot),
+                entries=self._project_entries(snapshot),
+            )
+            self._cached_cursor = cursor
+            self._cached_state = state
+            return state
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cached_cursor = None
+            self._cached_state = None
 
     def _project_notebooks(self, snapshot: NotesSnapshot) -> list[Notebook]:
         return [

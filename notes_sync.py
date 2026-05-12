@@ -109,7 +109,8 @@ class NotesSyncService:
             self.store._set_sync_state(conn, key, str(value))
 
     def _push_dirty_documents(self, client: CouchDbClient) -> tuple[list[str], list[dict[str, Any]]]:
-        snapshot = self.store.load_documents()
+        load_dirty = getattr(self.store, "load_dirty_documents", None)
+        snapshot = load_dirty() if callable(load_dirty) else self.store.load_documents()
         dirty_docs: list[dict[str, Any]] = []
         for notebook in snapshot.notebooks:
             if notebook.dirty:

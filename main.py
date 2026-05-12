@@ -87,6 +87,9 @@ ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
 ANSWER_LIST_EXPAND_ROWS = 100
 EXECUTION_LIST_DEFAULT_VISIBLE_ROWS = 100
 EXECUTION_LIST_EXPAND_ROWS = 100
+REMOTE_STATE_DEFAULT_TURN_LIMIT = 100
+NOTES_ENTRY_LABEL_MAX_CHARS = 160
+CONTEXT_USAGE_SYNC_TURN_LIMIT = 120
 HOTKEY_ID_SHOW = 0xA112
 HOTKEY_ID_REALTIME_CALL = 0xA113
 HOTKEY_ID_REALTIME_CALL_ALT = 0xA114
@@ -249,7 +252,8 @@ def wx_call_later_if_alive(delay_ms: int, func, *args, **kwargs):
     if target is not None and not _wx_target_is_alive(target):
         return None
     try:
-        return wx.CallLater(delay_ms, func, *args, **kwargs)
+        timer = wx.CallLater(delay_ms, func, *args, **kwargs)
+        return timer if timer is not None else True
     except Exception:
         return None
 
@@ -824,6 +828,7 @@ class ChatFrame(wx.Frame):
         )
         self._notes_sync_worker_lock = threading.Lock()
         self._notes_sync_worker_scheduled = False
+        self._listbox_label_cache: dict[int, tuple[str, ...]] = {}
         self._configure_notes_couchdb_sync_from_env()
         self._current_notes_state = {}
         self.notes_sync_hint = ""
@@ -872,6 +877,14 @@ class ChatFrame(wx.Frame):
         self._codex_ui_batch_depth = 0
         self._execution_list_deferred_repaint = False
         self._execution_list_deferred_select_latest = False
+        self._pending_execution_step_persists = []
+        self._execution_step_persist_lock = threading.Lock()
+        self._execution_step_persist_scheduled = False
+        self._execution_step_persist_worker_running = False
+        self._chat_turn_dirty_from: dict[str, int] = {}
+        self._remote_turn_payload_cache: dict[int, tuple[tuple, dict]] = {}
+        self._context_usage_estimate_lock = threading.Lock()
+        self._context_usage_estimate_keys: set[tuple[str, int]] = set()
         self._alt_menu_armed = False
         self._alt_menu_suppressed = False
         self.active_project_folder = ""
@@ -1121,7 +1134,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL_ALT)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL_ALT2)
-        self.Bind(wx.EVT_KEY_DOWN, self._on_any_key_down_escape_minimize)
+        self.Bind(wx.EVT_KEY_DOWN, self._on_frame_key_down)
 
         self.answer_list.Bind(wx.EVT_KEY_DOWN, self._on_answer_key_down)
         self.answer_list.Bind(wx.EVT_CHAR, self._on_answer_char)
@@ -1474,7 +1487,7 @@ class ChatFrame(wx.Frame):
         if changed:
             self.archived_chats = list(merged_by_id.values())
             self._sort_archived_chats()
-            self._save_state()
+            self._defer_chat_state_save()
 
     def _slim_active_chat_state(self) -> dict:
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
@@ -1484,7 +1497,7 @@ class ChatFrame(wx.Frame):
             title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
         else:
             title_manual = bool(title_manual)
-        return {
+        slim = {
             "id": str(state.get("id") or self.active_chat_id or self.current_chat_id or "").strip(),
             "title": str(state.get("title") or EMPTY_CURRENT_CHAT_TITLE),
             "title_manual": title_manual,
@@ -1496,6 +1509,9 @@ class ChatFrame(wx.Frame):
             "updated_at": float(state.get("updated_at") or now),
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
         }
+        if "context_usage" in state:
+            slim["context_usage"] = copy.deepcopy(state.get("context_usage"))
+        return slim
 
     def _persist_chat_history_to_store(self) -> None:
         store = getattr(self, "chat_store", None)
@@ -1514,7 +1530,7 @@ class ChatFrame(wx.Frame):
                 active_steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
                 active["execution_steps"] = active_steps
                 store.upsert_chat(active)
-                store.replace_turns(active_id, active["turns"])
+                self._persist_dirty_chat_turns(store, active_id, active["turns"])
         for chat in self.archived_chats:
             if not isinstance(chat, dict):
                 continue
@@ -1523,7 +1539,42 @@ class ChatFrame(wx.Frame):
                 continue
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
-                store.replace_turns(chat_id, chat.get("turns") or [])
+                self._persist_dirty_chat_turns(store, chat_id, chat.get("turns") or [])
+
+    def _mark_chat_turns_dirty(self, chat_id: str | None = None, start_index: int = 0) -> None:
+        normalized = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        if not normalized:
+            return
+        self._invalidate_remote_state_cache()
+        try:
+            index = max(0, int(start_index))
+        except Exception:
+            index = 0
+        previous = self._chat_turn_dirty_from.get(normalized)
+        self._chat_turn_dirty_from[normalized] = index if previous is None else min(previous, index)
+
+    def _persist_dirty_chat_turns(self, store, chat_id: str, turns: list[dict]) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        dirty_from = self._chat_turn_dirty_from.get(normalized)
+        if dirty_from is None:
+            count_turns = getattr(store, "count_turns", None)
+            if callable(count_turns):
+                try:
+                    if int(count_turns(normalized) or 0) == 0 and turns:
+                        dirty_from = 0
+                except Exception:
+                    dirty_from = None
+        if dirty_from is None:
+            return
+        start_index = max(0, min(int(dirty_from), len(turns or [])))
+        replace_from = getattr(store, "replace_turns_from", None)
+        if callable(replace_from):
+            replace_from(normalized, list(turns or [])[start_index:], start_index=start_index)
+        else:
+            store.replace_turns(normalized, turns or [])
+        self._chat_turn_dirty_from.pop(normalized, None)
 
     def _chat_summary_by_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()
@@ -1677,14 +1728,19 @@ class ChatFrame(wx.Frame):
             self._notes_refresh_ui()
         self._sort_archived_chats()
         if changed:
-            self._save_state()
+            self._defer_chat_state_save()
 
-    def _save_state(self, *, persist_chat_history: bool = True):
+    def _save_state(self, *, persist_chat_history: bool = True, capture_notes_editor: bool = False):
         if hasattr(self, "notes_controller"):
             capture = getattr(self.notes_controller, "capture_editor_state", None)
-            if callable(capture):
+            if capture_notes_editor and callable(capture):
                 capture()
-            self._current_notes_state = self.notes_controller.to_state_dict()
+            to_state = getattr(self.notes_controller, "to_state_dict", None)
+            if callable(to_state):
+                try:
+                    self._current_notes_state = to_state(capture_editor=bool(capture_notes_editor))
+                except TypeError:
+                    self._current_notes_state = to_state()
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and persist_chat_history:
             self._persist_chat_history_to_store()
@@ -1853,7 +1909,7 @@ class ChatFrame(wx.Frame):
             changed = True
 
         if changed:
-            self._save_state()
+            self._defer_chat_state_save()
 
     def _remote_runtime_config(self) -> dict:
         has_domain_env = self._has_remote_control_env(
@@ -2120,7 +2176,7 @@ class ChatFrame(wx.Frame):
         if not self._compact_first_question_title(question, 120):
             return
         self._bump_chat_title_revision(chat, "auto", title=title)
-        self._save_state()
+        self._defer_chat_state_save()
         self._refresh_history(resolved_chat_id)
         self._push_remote_history_changed(resolved_chat_id)
 
@@ -2191,13 +2247,13 @@ class ChatFrame(wx.Frame):
 
     def _refresh_history(self, keep_id=None):
         self._sort_archived_chats()
-        self.history_list.Clear()
-        self.history_ids = []
+        labels = []
+        ids = []
         current_id = self._current_history_id()
         target = keep_id if keep_id is not None else self.view_history_id
         if current_id:
-            self.history_list.Append(self._current_history_title())
-            self.history_ids.append(current_id)
+            labels.append(self._current_history_title())
+            ids.append(current_id)
         for c in self.archived_chats:
             chat_id = str(c.get("id") or "")
             if current_id and chat_id == current_id:
@@ -2206,13 +2262,23 @@ class ChatFrame(wx.Frame):
             if self._is_default_chat_title(title):
                 title = EMPTY_CURRENT_CHAT_TITLE
             disp = f"[置顶] {title}" if c.get("pinned") else title
-            self.history_list.Append(disp)
-            self.history_ids.append(chat_id)
-        if target in self.history_ids:
-            self.history_list.SetSelection(self.history_ids.index(target))
-        elif self.history_list.GetCount() > 0:
-            self.history_list.SetSelection(0)
-        self._request_listbox_repaint(self.history_list)
+            labels.append(disp)
+            ids.append(chat_id)
+        selected_idx = None
+        if target in ids:
+            selected_idx = ids.index(target)
+        elif labels:
+            selected_idx = 0
+        changed = self._replace_listbox_items_if_changed(self.history_list, labels, selected_idx)
+        self.history_ids = ids
+        if not changed and selected_idx is not None:
+            try:
+                if self.history_list.GetSelection() != selected_idx:
+                    self.history_list.SetSelection(selected_idx)
+            except Exception:
+                pass
+        if changed:
+            self._request_listbox_repaint(self.history_list)
 
     def _get_view_turns(self):
         if self.view_mode == "history":
@@ -2236,12 +2302,18 @@ class ChatFrame(wx.Frame):
             return "图片上传成功" if success else "图片上传失败"
         return f"{name} {'上传成功' if success else '上传失败'}"
 
-    def _append_turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> None:
+    def _turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> list[tuple[str, tuple]]:
+        rows: list[tuple[str, tuple]] = []
         for attachment in attachments or []:
             label = self._attachment_label(attachment, incoming=incoming)
             open_path = str((attachment or {}).get("open_path") or (attachment or {}).get("path") or "").strip()
+            rows.append((label, ("attachment", turn_idx, label, open_path)))
+        return rows
+
+    def _append_turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> None:
+        for label, meta in self._turn_attachment_rows(turn_idx, attachments, incoming=incoming):
             self.answer_list.Append(label)
-            self.answer_meta.append(("attachment", turn_idx, label, open_path))
+            self.answer_meta.append(meta)
 
     def _input_attachment_marker_text(self, attachments: list[dict]) -> str:
         names = [str((item or {}).get("name") or "").strip() for item in attachments or [] if str((item or {}).get("name") or "").strip()]
@@ -2522,15 +2594,6 @@ class ChatFrame(wx.Frame):
         normalized = context_usage_from_dict(usage)
         if normalized is not None:
             return normalized
-        turns = self._get_view_turns()
-        model = self._resolve_current_model() if self.view_mode != "history" else self._history_context_fallback_model(chat, turns)
-        if turns:
-            pending = self._pending_context_usage_for_chat(chat, len(turns) - 1)
-            if pending is not None:
-                return pending
-            if self._is_authoritative_context_usage_model(model) or self._turns_require_authoritative_context_usage(turns):
-                return None
-            return estimate_turns_tokens(turns, model=model)
         return None
 
     def _pending_context_usage_for_chat(self, chat: dict | None, turn_idx: int):
@@ -2629,16 +2692,18 @@ class ChatFrame(wx.Frame):
                 return configured
         return selected
 
-    def _append_context_usage_row(self) -> None:
+    def _append_context_usage_row(self, rows: list[str] | None = None, metas: list[tuple] | None = None) -> None:
         label = format_context_usage_label(self._active_chat_context_usage())
+        meta = ("context_usage", -1, label, "")
+        if rows is not None and metas is not None:
+            rows.append(label)
+            metas.append(meta)
+            return
         self.answer_list.Append(label)
-        self.answer_meta.append(("context_usage", -1, label, ""))
+        self.answer_meta.append(meta)
 
-    def _append_current_model_row(self) -> None:
-        model = self._active_chat_current_model()
-        label = f"当前模型：{model or DEFAULT_MODEL_ID}"
-        self.answer_list.Append(label)
-        self.answer_meta.append(("current_model", -1, label, ""))
+    def _append_current_model_row(self, rows: list[str] | None = None, metas: list[tuple] | None = None) -> None:
+        return
 
     def _refresh_context_usage_header_rows(self) -> bool:
         if not hasattr(self, "answer_list"):
@@ -2647,7 +2712,6 @@ class ChatFrame(wx.Frame):
         changed = False
         labels = {
             "context_usage": format_context_usage_label(self._active_chat_context_usage()),
-            "current_model": f"当前模型：{self._active_chat_current_model() or DEFAULT_MODEL_ID}",
         }
         for row, meta in enumerate(list(self.answer_meta)):
             if row >= self.answer_list.GetCount():
@@ -2702,9 +2766,32 @@ class ChatFrame(wx.Frame):
         self.execution_visible_row_limit = max(EXECUTION_LIST_DEFAULT_VISIBLE_ROWS, current_limit) + EXECUTION_LIST_EXPAND_ROWS
         self._render_execution_list()
 
-    def _apply_answer_row_limit(self, header_count: int) -> None:
+    def _apply_answer_row_limit(self, header_count: int, *, force_has_more: bool = False) -> None:
         rows = [self.answer_list.GetString(idx) for idx in range(self.answer_list.GetCount())]
         metas = list(self.answer_meta)
+        rows, metas, active_idx = self._answer_rows_with_limit(
+            rows,
+            metas,
+            header_count,
+            active_meta=metas[self._active_answer_row_index] if 0 <= self._active_answer_row_index < len(metas) else None,
+            force_has_more=force_has_more,
+        )
+        self.answer_list.Clear()
+        self.answer_meta = []
+        self._active_answer_row_index = active_idx
+        for row_text, meta in zip(rows, metas):
+            self.answer_list.Append(row_text)
+            self.answer_meta.append(meta)
+
+    def _answer_rows_with_limit(
+        self,
+        rows: list[str],
+        metas: list[tuple],
+        header_count: int,
+        *,
+        active_meta: tuple | None = None,
+        force_has_more: bool = False,
+    ) -> tuple[list[str], list[tuple], int]:
         header_count = max(0, min(int(header_count or 0), len(rows), len(metas)))
         header_rows = rows[:header_count]
         header_metas = metas[:header_count]
@@ -2713,27 +2800,25 @@ class ChatFrame(wx.Frame):
         self.answer_total_content_rows = len(content_rows)
         limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0))
         self.answer_visible_row_limit = limit
-        has_more = len(content_rows) > limit
+        has_more = force_has_more or len(content_rows) > limit
         if len(content_rows) > limit:
             content_rows = content_rows[-limit:]
             content_metas = content_metas[-limit:]
-        active_meta = None
-        if 0 <= self._active_answer_row_index < len(metas):
-            active_meta = metas[self._active_answer_row_index]
-        self.answer_list.Clear()
-        self.answer_meta = []
-        self._active_answer_row_index = -1
+        limited_rows: list[str] = []
+        limited_metas: list[tuple] = []
         if has_more:
-            self.answer_list.Append("更多")
-            self.answer_meta.append(("more", -1, "更多", ""))
+            limited_rows.append("更多")
+            limited_metas.append(("more", -1, "更多", ""))
         for row_text, meta in zip(header_rows + content_rows, header_metas + content_metas):
-            self.answer_list.Append(row_text)
-            self.answer_meta.append(meta)
+            limited_rows.append(row_text)
+            limited_metas.append(meta)
+        active_idx = -1
         if active_meta is not None:
-            for idx, meta in enumerate(self.answer_meta):
+            for idx, meta in enumerate(limited_metas):
                 if meta == active_meta:
-                    self._active_answer_row_index = idx
+                    active_idx = idx
                     break
+        return limited_rows, limited_metas, active_idx
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
@@ -2762,22 +2847,38 @@ class ChatFrame(wx.Frame):
 
     def _render_answer_list(self, refresh_execution: bool = True):
         mode = self._apply_detail_panel_mode()
-        self.answer_list.Clear()
-        self.answer_meta = []
+        rows: list[str] = []
+        metas: list[tuple] = []
         self._active_answer_row_index = -1
-        self._append_context_usage_row()
-        self._append_current_model_row()
-        header_count = len(self.answer_meta)
+        self._append_context_usage_row(rows, metas)
+        self._append_current_model_row(rows, metas)
+        header_count = len(metas)
         turns = self._get_view_turns()
         if not turns:
             self.answer_total_content_rows = 1
-            self.answer_list.Append("暂无对话内容")
-            self.answer_meta.append(("info", -1, "", ""))
-            self._request_listbox_repaint(self.answer_list)
+            rows.append("暂无对话内容")
+            metas.append(("info", -1, "", ""))
+            selected_idx = 0 if rows else None
+            changed = self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
+            self.answer_meta = metas
+            if changed:
+                self._request_listbox_repaint(self.answer_list)
             if mode == "execution" and refresh_execution:
                 self._render_execution_list()
             return
-        for i, t in enumerate(turns):
+        limit = max(
+            ANSWER_LIST_DEFAULT_VISIBLE_ROWS,
+            int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0),
+        )
+        turn_offset = 0
+        force_has_more = False
+        visible_turns = turns
+        if len(turns) > limit:
+            turn_offset = len(turns) - limit
+            visible_turns = turns[turn_offset:]
+            force_has_more = True
+        for local_i, t in enumerate(visible_turns):
+            i = turn_offset + local_i
             q = str(t.get("question") or "")
             a_md, a = self._turn_answer_markdown(t)
             attachments = t.get("attachments") if isinstance(t.get("attachments"), list) else []
@@ -2794,28 +2895,43 @@ class ChatFrame(wx.Frame):
             )
             should_show_user_label = show_user_rows and ((q.strip() and not attachment_only_summary) or bool(attachments))
             if should_show_user_label:
-                self.answer_list.Append("我")
-                self.answer_meta.append(("user", i, "我", ""))
+                rows.append("我")
+                metas.append(("user", i, "我", ""))
                 if q.strip() and not attachment_only_summary:
-                    self.answer_list.Append(q)
-                    self.answer_meta.append(("question", i, q, ""))
+                    rows.append(q)
+                    metas.append(("question", i, q, ""))
             if attachments:
-                self._append_turn_attachment_rows(i, attachments, incoming=False)
+                for label, meta in self._turn_attachment_rows(i, attachments, incoming=False):
+                    rows.append(label)
+                    metas.append(meta)
             if show_pending_placeholder:
-                self.answer_list.Append("小诸葛")
-                self.answer_meta.append(("ai", i, "小诸葛", ""))
-                self.answer_list.Append(a)
-                self.answer_meta.append(("answer", i, a, a_md))
-                self._append_turn_attachment_rows(i, received_attachments, incoming=True)
+                rows.append("小诸葛")
+                metas.append(("ai", i, "小诸葛", ""))
+                rows.append(a)
+                metas.append(("answer", i, a, a_md))
+                for label, meta in self._turn_attachment_rows(i, received_attachments, incoming=True):
+                    rows.append(label)
+                    metas.append(meta)
                 if self.view_mode == "active" and i == self.active_turn_idx:
-                    self._active_answer_row_index = self.answer_list.GetCount() - 1
+                    self._active_answer_row_index = len(rows) - 1
             elif received_attachments:
-                self._append_turn_attachment_rows(i, received_attachments, incoming=True)
-        self._apply_answer_row_limit(header_count)
-        if self.answer_list.GetCount() > 0 and self.answer_list.GetSelection() == wx.NOT_FOUND:
-            # 首次渲染时仅设置选中项，不主动把焦点移到回答列表。
-            self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
-        self._request_listbox_repaint(self.answer_list)
+                for label, meta in self._turn_attachment_rows(i, received_attachments, incoming=True):
+                    rows.append(label)
+                    metas.append(meta)
+        active_meta = metas[self._active_answer_row_index] if 0 <= self._active_answer_row_index < len(metas) else None
+        rows, metas, active_idx = self._answer_rows_with_limit(rows, metas, header_count, active_meta=active_meta, force_has_more=force_has_more)
+        selected_idx = self.answer_list.GetSelection()
+        if selected_idx == wx.NOT_FOUND:
+            selected_idx = len(rows) - 1 if rows else None
+        elif rows:
+            selected_idx = max(0, min(int(selected_idx), len(rows) - 1))
+        else:
+            selected_idx = None
+        changed = self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
+        self.answer_meta = metas
+        self._active_answer_row_index = active_idx
+        if changed:
+            self._request_listbox_repaint(self.answer_list)
         if mode == "execution" and refresh_execution:
             self._render_execution_list()
 
@@ -2833,7 +2949,24 @@ class ChatFrame(wx.Frame):
 
     def _can_focus_completion_result(self) -> bool:
         # 只在窗口本来就在前台且未最小化时，才允许把焦点移到最新回答。
-        return self._is_foreground_window() and not self.IsIconized()
+        if not self._is_foreground_window() or self.IsIconized():
+            return False
+        try:
+            focus = wx.Window.FindFocus()
+        except Exception:
+            focus = None
+        if focus is None:
+            return True
+        allowed = {
+            ctrl
+            for ctrl in (
+                getattr(self, "input_edit", None),
+                getattr(self, "answer_list", None),
+                getattr(self, "send_button", None),
+            )
+            if ctrl is not None
+        }
+        return focus in allowed
 
     def _find_answer_row_index(self, turn_idx: int) -> int:
         for row, meta in enumerate(self.answer_meta):
@@ -2870,15 +3003,7 @@ class ChatFrame(wx.Frame):
         return True
 
     def _on_model_changed(self, _):
-        v = self.model_combo.GetValue().strip()
-        if v:
-            resolved = model_id_from_display_name(v)
-            next_model = resolved if resolved in MODEL_IDS else v
-            if next_model == self.selected_model:
-                return
-            self.selected_model = next_model
-            self._refresh_openclaw_sync_lifecycle()
-            self._save_state(persist_chat_history=False)
+        return
 
     def _resolve_current_model(self) -> str:
         # Always honor the model currently shown in combobox for each send.
@@ -3081,6 +3206,16 @@ class ChatFrame(wx.Frame):
         turn_id = self._event_turn_id(event)
         thread_id = self._event_thread_id(event)
         candidates = []
+        active_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        if active_id:
+            candidates.append(
+                {
+                    "id": active_id,
+                    "codex_thread_id": str(getattr(self, "active_codex_thread_id", "") or "").strip(),
+                    "codex_turn_id": str(getattr(self, "active_codex_turn_id", "") or "").strip(),
+                    "turns": self.active_session_turns if isinstance(self.active_session_turns, list) else [],
+                }
+            )
         if isinstance(getattr(self, "_current_chat_state", None), dict):
             candidates.append(self._current_chat_state)
         candidates.extend(chat for chat in (self.archived_chats or []) if isinstance(chat, dict))
@@ -3557,6 +3692,7 @@ class ChatFrame(wx.Frame):
     def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True) -> bool:
         if not isinstance(entry, dict):
             return False
+        self._invalidate_remote_state_cache()
         target_chat = self._chat_state_for_execution_steps(chat_id)
         if not isinstance(target_chat, dict):
             return False
@@ -3573,9 +3709,8 @@ class ChatFrame(wx.Frame):
             return False
         steps.append(copy.deepcopy(entry))
         resolved_chat_id = str(chat_id or target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-        if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
-            if resolved_chat_id:
-                self.chat_store.append_execution_step(resolved_chat_id, steps[-1])
+        if resolved_chat_id:
+            self._persist_execution_step_or_queue(resolved_chat_id, steps[-1])
         self._prune_cached_execution_steps_for_turn(target_chat, steps[-1])
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
@@ -3585,8 +3720,72 @@ class ChatFrame(wx.Frame):
             self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[-1]))
         self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if save_state:
-            self._save_state()
+            self._defer_chat_state_save()
         return True
+
+    def _persist_execution_step_or_queue(self, chat_id: str, step: dict) -> None:
+        if not getattr(self, "_chat_store_enabled", False) or getattr(self, "chat_store", None) is None:
+            return
+        if not chat_id or not isinstance(step, dict):
+            return
+        if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) <= 0:
+            self.chat_store.append_execution_step(chat_id, step)
+            return
+        self._queue_execution_step_persist(chat_id, step)
+
+    def _queue_execution_step_persist(self, chat_id: str, step: dict) -> None:
+        with self._execution_step_persist_lock:
+            self._pending_execution_step_persists.append((str(chat_id or ""), copy.deepcopy(step)))
+            if self._execution_step_persist_scheduled or self._execution_step_persist_worker_running:
+                return
+            self._execution_step_persist_scheduled = True
+        if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
+            return
+        self._start_execution_step_persist_worker()
+
+    def _start_execution_step_persist_worker(self) -> None:
+        with self._execution_step_persist_lock:
+            self._execution_step_persist_scheduled = False
+            if self._execution_step_persist_worker_running or not self._pending_execution_step_persists:
+                return
+            self._execution_step_persist_worker_running = True
+        threading.Thread(target=self._execution_step_persist_worker, daemon=True).start()
+
+    def _execution_step_persist_worker(self) -> None:
+        try:
+            while True:
+                with self._execution_step_persist_lock:
+                    batch = list(self._pending_execution_step_persists)
+                    self._pending_execution_step_persists.clear()
+                    if not batch:
+                        self._execution_step_persist_worker_running = False
+                        return
+                store = getattr(self, "chat_store", None)
+                if store is None:
+                    continue
+                for chat_id, step in batch:
+                    try:
+                        store.append_execution_step(chat_id, step)
+                    except Exception:
+                        continue
+        finally:
+            with self._execution_step_persist_lock:
+                if not self._pending_execution_step_persists:
+                    self._execution_step_persist_worker_running = False
+
+    def _flush_execution_step_persists_sync(self) -> None:
+        with self._execution_step_persist_lock:
+            batch = list(self._pending_execution_step_persists)
+            self._pending_execution_step_persists.clear()
+            self._execution_step_persist_scheduled = False
+        store = getattr(self, "chat_store", None)
+        if store is None:
+            return
+        for chat_id, step in batch:
+            try:
+                store.append_execution_step(chat_id, step)
+            except Exception:
+                continue
 
     def _prune_cached_execution_steps_for_turn(self, chat: dict, latest_step: dict) -> None:
         if not isinstance(chat, dict) or not isinstance(latest_step, dict):
@@ -3806,8 +4005,6 @@ class ChatFrame(wx.Frame):
 
     def _rebuild_execution_list_from_state(self) -> None:
         self._execution_list_pending_turn_reset = False
-        self.execution_list.Clear()
-        self.execution_meta = []
         total_steps, steps = self._current_execution_steps_for_render()
         visible_items = []
         for idx, step in enumerate(steps):
@@ -3825,28 +4022,34 @@ class ChatFrame(wx.Frame):
         )
         self.execution_visible_row_limit = limit
         has_more = total_steps > len(steps) or len(visible_items) > limit
+        rows: list[str] = []
+        metas: list[tuple] = []
         if has_more:
             visible_items = visible_items[-limit:]
-            self.execution_list.Append("更多")
-            self.execution_meta.append(("more", -1, "更多", ""))
+            rows.append("更多")
+            metas.append(("more", -1, "更多", ""))
         if not visible_items:
-            self.execution_list.Append("暂无执行过程")
-            self.execution_meta.append(("info", -1, "", ""))
-            try:
-                self.execution_list.SetSelection(0)
-            except Exception:
-                pass
-            self._request_listbox_repaint(self.execution_list)
+            rows.append("暂无执行过程")
+            metas.append(("info", -1, "", ""))
+            changed = self._replace_listbox_items_if_changed(self.execution_list, rows, 0)
+            self.execution_meta = metas
+            if changed:
+                self._request_listbox_repaint(self.execution_list)
             return
         for row_text, meta in visible_items:
-            self.execution_list.Append(row_text)
-            self.execution_meta.append(meta)
-        if self.execution_list.GetCount() > 0 and self.execution_list.GetSelection() == wx.NOT_FOUND:
-            try:
-                self.execution_list.SetSelection(0)
-            except Exception:
-                pass
-        self._request_listbox_repaint(self.execution_list)
+            rows.append(row_text)
+            metas.append(meta)
+        selected_idx = self.execution_list.GetSelection()
+        if selected_idx == wx.NOT_FOUND:
+            selected_idx = 0
+        elif rows:
+            selected_idx = max(0, min(int(selected_idx), len(rows) - 1))
+        else:
+            selected_idx = None
+        changed = self._replace_listbox_items_if_changed(self.execution_list, rows, selected_idx)
+        self.execution_meta = metas
+        if changed:
+            self._request_listbox_repaint(self.execution_list)
 
     def _render_execution_list(self) -> None:
         if not hasattr(self, "execution_list"):
@@ -4211,6 +4414,12 @@ class ChatFrame(wx.Frame):
         session_changed = bool(sync_state.get("session_changed"))
         current_offset = int(self.active_openclaw_sync_offset or 0) if is_active_target else int(target_chat.get("openclaw_sync_offset") or 0)
         next_offset = int(sync_state.get("offset") or current_offset or 0)
+        if not events and not file_changed and not session_changed:
+            if next_offset != current_offset:
+                target_chat["openclaw_sync_offset"] = next_offset
+                if is_active_target:
+                    self.active_openclaw_sync_offset = next_offset
+            return
         if not had_input_events and not file_changed and not session_changed and next_offset == current_offset:
             return
         had_prior_sync = bool(
@@ -4240,6 +4449,8 @@ class ChatFrame(wx.Frame):
                 changed = True
                 if event.role == "assistant":
                     assistant_changed = True
+            if result:
+                self._mark_chat_turns_dirty(chat_id if chat_id else self.active_chat_id, 0)
         sync_offset = next_offset
         target_chat["openclaw_sync_offset"] = sync_offset
         target_chat["openclaw_last_synced_at"] = time.time()
@@ -4687,6 +4898,7 @@ class ChatFrame(wx.Frame):
         }
         self.active_session_turns.append(turn)
         self.active_turn_idx = len(self.active_session_turns) - 1
+        self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
         self._mark_turn_request_pending(turn, DEFAULT_CODEX_MODEL, str(question or ""))
         return self.active_turn_idx
 
@@ -4705,6 +4917,7 @@ class ChatFrame(wx.Frame):
         }
         self.active_session_turns.append(turn)
         self.active_turn_idx = len(self.active_session_turns) - 1
+        self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
         return True
 
     @staticmethod
@@ -5201,6 +5414,7 @@ class ChatFrame(wx.Frame):
         self._publish_remote_nats_event(payload)
 
     def _push_remote_status(self, status: str, request_kind: str = "") -> None:
+        self._invalidate_remote_state_cache()
         payload = {
             "type": "status",
             "chat_id": self.active_chat_id or self.current_chat_id or "",
@@ -5240,6 +5454,8 @@ class ChatFrame(wx.Frame):
         self._broadcast_remote_event(payload)
 
     def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
+        self._invalidate_remote_history_list_cache()
+        self._invalidate_remote_state_cache()
         payload = {
             "type": "history_changed",
             "chat_id": str(chat_id or ""),
@@ -5249,6 +5465,7 @@ class ChatFrame(wx.Frame):
         self._broadcast_remote_event(payload)
 
     def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
+        self._invalidate_remote_notes_changes_cache()
         payload = {
             "type": "notes_changed",
             "cursor": str(cursor or self.notes_store.current_cursor() or "0"),
@@ -5277,6 +5494,31 @@ class ChatFrame(wx.Frame):
         payload.update({"type": "notes_sync_status", "event_id": f"evt-{uuid.uuid4().hex[:8]}", "ts": time.time()})
         self._broadcast_remote_event(payload)
 
+    def _run_remote_ui_route(self, callback, payload: dict | None = None) -> tuple[int, dict]:
+        if threading.current_thread() is threading.main_thread():
+            return callback(payload) if payload is not None else callback()
+        done = threading.Event()
+        result: dict[str, object] = {}
+
+        def _invoke() -> None:
+            try:
+                result["value"] = callback(payload) if payload is not None else callback()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        if not self._call_after_if_alive(_invoke):
+            return 503, {"accepted": False, "error": "ui_unavailable"}
+        if not done.wait(15.0):
+            return 503, {"accepted": False, "error": "ui_timeout"}
+        if "error" in result:
+            raise result["error"]  # type: ignore[misc]
+        value = result.get("value")
+        if isinstance(value, tuple) and len(value) == 2:
+            return value  # type: ignore[return-value]
+        return 500, {"accepted": False, "error": "invalid_route_result"}
+
     def _on_notes_sync_push_result(self, result: dict | None = None) -> None:
         result = dict(result or {})
         cursor = str(result.get("cursor") or self.notes_store.current_cursor() or "0")
@@ -5291,8 +5533,23 @@ class ChatFrame(wx.Frame):
         question = str(turn.get("question") or "")
         answer_md = str(turn.get("answer_md") or "")
         model = str(turn.get("model") or "")
+        signature = (
+            question,
+            answer_md,
+            model,
+            str(turn.get("request_status") or ""),
+            str(turn.get("request_error") or ""),
+        )
+        cache = getattr(self, "_remote_turn_payload_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._remote_turn_payload_cache = cache
+        cache_key = id(turn)
+        cached = cache.get(cache_key)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
+            return dict(cached[1])
         answer = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(md_to_plain(self._answer_markdown_for_output(answer_md, model)))
-        return {
+        payload = {
             "question": question,
             "answer": answer,
             "model": model,
@@ -5302,6 +5559,8 @@ class ChatFrame(wx.Frame):
             "request_status": str(turn.get("request_status") or ""),
             "request_error": str(turn.get("request_error") or ""),
         }
+        cache[cache_key] = (signature, dict(payload))
+        return payload
 
     def _remote_chat_summary(self, chat: dict) -> dict:
         if not isinstance(chat, dict):
@@ -5347,7 +5606,13 @@ class ChatFrame(wx.Frame):
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
         }
 
-    def _remote_chat_snapshot(self, chat: dict) -> dict:
+    def _remote_execution_step_payload(self, chat: dict, *, include_execution_steps: bool = False) -> tuple[list, int]:
+        steps = chat.get("execution_steps") if isinstance(chat.get("execution_steps"), list) else []
+        if not include_execution_steps:
+            return [], len(steps)
+        return copy.deepcopy(steps), len(steps)
+
+    def _remote_chat_snapshot(self, chat: dict, *, include_execution_steps: bool = False) -> dict:
         if not isinstance(chat, dict):
             return {
                 "chat_id": "",
@@ -5363,9 +5628,14 @@ class ChatFrame(wx.Frame):
                 "pinned": False,
                 "detail_panel_mode": "answers",
                 "execution_steps": [],
+                "execution_step_count": 0,
                 "turns": [],
             }
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        execution_steps, execution_step_count = self._remote_execution_step_payload(
+            chat,
+            include_execution_steps=include_execution_steps,
+        )
         chat_id = str(chat.get("id") or "")
         title = str(chat.get("title") or "新聊天")
         model = str(chat.get("model") or DEFAULT_MODEL_ID)
@@ -5390,19 +5660,21 @@ class ChatFrame(wx.Frame):
             "active": bool(chat_id) and chat_id == current_id,
             "pinned": bool(chat.get("pinned")),
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
-            "execution_steps": copy.deepcopy(chat.get("execution_steps")) if isinstance(chat.get("execution_steps"), list) else [],
+            "execution_steps": execution_steps,
+            "execution_step_count": execution_step_count,
             "turns": [self._remote_turn_payload(turn) for turn in turns if isinstance(turn, dict)],
         }
 
     def _remote_chat_snapshot_page(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
         payload = payload or {}
+        include_execution_steps = bool(payload.get("include_execution_steps"))
         raw_limit = payload.get("limit")
         try:
             limit = int(raw_limit)
         except Exception:
             limit = 0
         if limit <= 0:
-            return self._remote_chat_snapshot(chat), False, ""
+            return self._remote_chat_snapshot(chat, include_execution_steps=include_execution_steps), False, ""
         raw_turns = chat.get("turns") if isinstance(chat, dict) and isinstance(chat.get("turns"), list) else []
         turns = [turn for turn in raw_turns if isinstance(turn, dict)]
         total = len(turns)
@@ -5415,11 +5687,48 @@ class ChatFrame(wx.Frame):
         start = max(0, end - limit)
         paged_chat = dict(chat) if isinstance(chat, dict) else {}
         paged_chat["turns"] = turns[start:end]
-        snapshot = self._remote_chat_snapshot(paged_chat)
+        snapshot = self._remote_chat_snapshot(paged_chat, include_execution_steps=include_execution_steps)
         snapshot["turn_count"] = total
         return snapshot, start > 0, (str(start) if start > 0 else "")
 
-    def _current_chat_snapshot(self) -> dict:
+    def _remote_chat_snapshot_page_from_store(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
+        payload = dict(payload or {})
+        chat_id = str((chat or {}).get("id") or payload.get("chat_id") or "").strip()
+        store = getattr(self, "chat_store", None)
+        if not chat_id or store is None or not hasattr(store, "load_turns_page"):
+            return self._remote_chat_snapshot_page(chat, payload)
+        raw_limit = payload.get("limit")
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 0
+        if limit <= 0:
+            limit = REMOTE_STATE_DEFAULT_TURN_LIMIT
+        before_raw = payload.get("before_turn_index")
+        try:
+            before_turn_index = int(before_raw) if before_raw is not None else None
+        except Exception:
+            before_turn_index = None
+        total, turns = store.load_turns_page(chat_id, limit=limit, before_turn_index=before_turn_index)
+        end = before_turn_index if before_turn_index is not None else total
+        end = max(0, min(int(end or 0), int(total or 0)))
+        start = max(0, end - max(1, int(limit or 1)))
+        paged_chat = dict(chat or {})
+        paged_chat["id"] = chat_id
+        paged_chat["turns"] = turns
+        if bool(payload.get("include_execution_steps")) and "execution_steps" not in paged_chat:
+            try:
+                paged_chat["execution_steps"] = store.load_execution_steps(chat_id)
+            except Exception:
+                paged_chat["execution_steps"] = []
+        snapshot = self._remote_chat_snapshot(
+            paged_chat,
+            include_execution_steps=bool(payload.get("include_execution_steps")),
+        )
+        snapshot["turn_count"] = int(total or 0)
+        return snapshot, start > 0, (str(start) if start > 0 else "")
+
+    def _current_chat_snapshot(self, *, include_execution_steps: bool = False) -> dict:
         chat = dict(self._current_chat_state or {})
         if not chat:
             chat = {"id": self.active_chat_id or self.current_chat_id or "", "title": "新聊天", "turns": self.active_session_turns}
@@ -5437,7 +5746,12 @@ class ChatFrame(wx.Frame):
         chat["active"] = True
         chat["pinned"] = bool(chat.get("pinned"))
         chat["detail_panel_mode"] = str(chat.get("detail_panel_mode") or "answers").strip() or "answers"
-        chat["execution_steps"] = copy.deepcopy(chat.get("execution_steps")) if isinstance(chat.get("execution_steps"), list) else []
+        execution_steps, execution_step_count = self._remote_execution_step_payload(
+            chat,
+            include_execution_steps=include_execution_steps,
+        )
+        chat["execution_steps"] = execution_steps
+        chat["execution_step_count"] = execution_step_count
         chat["title_source"] = str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default"))
         chat["title_updated_at"] = float(chat.get("title_updated_at") or chat["updated_at"])
         chat["title_revision"] = int(chat.get("title_revision") or 1)
@@ -5630,6 +5944,7 @@ class ChatFrame(wx.Frame):
         self._apply_nonrecoverable_turn_metadata(turn, "system", "")
         self.active_session_turns.append(turn)
         self.active_turn_idx = len(self.active_session_turns) - 1
+        self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
 
     def _remote_api_message_ui(self, payload: dict) -> tuple[int, dict]:
         text = str(payload.get("text") or "").strip()
@@ -5764,6 +6079,9 @@ class ChatFrame(wx.Frame):
         }
 
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        cached = getattr(self, "_remote_history_list_cache", None)
+        if isinstance(cached, dict):
+            return 200, copy.deepcopy(cached)
         chats = []
         if self.active_chat_id or self.active_session_turns:
             current = dict(self._current_chat_state or {})
@@ -5781,7 +6099,19 @@ class ChatFrame(wx.Frame):
             chats.append(current_summary)
         for chat in self.archived_chats:
             chats.append(self._remote_chat_summary(chat))
-        return 200, {"accepted": True, "chats": chats}
+        body = {"accepted": True, "chats": chats}
+        self._remote_history_list_cache = copy.deepcopy(body)
+        return 200, body
+
+    def _invalidate_remote_history_list_cache(self) -> None:
+        self._remote_history_list_cache = None
+
+    def _invalidate_remote_state_cache(self) -> None:
+        self._remote_state_cache = None
+        try:
+            self._remote_state_cache_revision = int(getattr(self, "_remote_state_cache_revision", 0) or 0) + 1
+        except Exception:
+            self._remote_state_cache_revision = 1
 
     def _remote_api_history_read_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
@@ -5794,21 +6124,72 @@ class ChatFrame(wx.Frame):
             source_chat["turns"] = self.active_session_turns
             chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         else:
-            source_chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id)) or {}
-            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
+            source_chat = self._find_archived_chat(chat_id) or {}
+            if (
+                getattr(self, "_chat_store_enabled", False)
+                and getattr(self, "chat_store", None) is not None
+                and hasattr(self.chat_store, "load_turns_page")
+                and not isinstance(source_chat.get("turns"), list)
+            ):
+                chat, has_more, oldest_cursor = self._remote_chat_snapshot_page_from_store(source_chat, payload)
+            else:
+                source_chat = self._hydrate_chat_from_store(source_chat, include_execution_steps=bool(payload.get("include_execution_steps"))) or {}
+                chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         return 200, {"accepted": True, "chat": chat, "has_more": has_more, "oldest_cursor": oldest_cursor}
 
     def _remote_api_state_ui(self, payload: dict | None = None) -> tuple[int, dict]:
-        chat_id = str((payload or {}).get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
+        payload = payload or {}
+        chat_id = str(payload.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
+        include_execution_steps = bool(payload.get("include_execution_steps"))
+        raw_limit = payload.get("limit", REMOTE_STATE_DEFAULT_TURN_LIMIT)
+        raw_before = payload.get("before_turn_index")
+        cache_key = (
+            chat_id,
+            include_execution_steps,
+            str(raw_limit),
+            str(raw_before),
+            int(getattr(self, "_remote_state_cache_revision", 0) or 0),
+        )
+        cache = getattr(self, "_remote_state_cache", None)
+        if isinstance(cache, dict) and cache.get("key") == cache_key and isinstance(cache.get("body"), dict):
+            return 200, copy.deepcopy(cache["body"])
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
-            chat = self._current_chat_snapshot()
+            source_chat = dict(self._current_chat_state or {})
+            if not source_chat:
+                source_chat = {"id": self.active_chat_id or self.current_chat_id or "", "title": "新聊天"}
+            source_chat["id"] = str(source_chat.get("id") or self.active_chat_id or self.current_chat_id or "")
+            source_chat["turns"] = self.active_session_turns
+            source_chat.setdefault("execution_steps", self._current_chat_state.get("execution_steps") if isinstance(self._current_chat_state, dict) else [])
+            state_payload = dict(payload)
+            state_payload.setdefault("limit", REMOTE_STATE_DEFAULT_TURN_LIMIT)
+            chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
+            chat["running"] = bool(self.is_running)
+            chat["current"] = True
+            chat["active"] = True
         else:
-            chat = self._remote_chat_snapshot(self._hydrate_chat_from_store(self._find_archived_chat(chat_id)) or {})
+            state_payload = dict(payload)
+            state_payload.setdefault("limit", REMOTE_STATE_DEFAULT_TURN_LIMIT)
+            source_chat = self._find_archived_chat(chat_id) or {}
+            if (
+                getattr(self, "_chat_store_enabled", False)
+                and getattr(self, "chat_store", None) is not None
+                and hasattr(self.chat_store, "load_turns_page")
+                and not isinstance(source_chat.get("turns"), list)
+            ):
+                chat, has_more, oldest_cursor = self._remote_chat_snapshot_page_from_store(source_chat, state_payload)
+            else:
+                source_chat = self._hydrate_chat_from_store(
+                    source_chat,
+                    include_execution_steps=include_execution_steps,
+                ) or {}
+                chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
         status = "waiting_user_input" if self.active_codex_pending_request else "idle"
         request_kind = "user_input" if self.active_codex_pending_request else ""
         chat.update(
             {
                 "chat_id": chat.get("chat_id") or chat_id,
+                "has_more": has_more,
+                "oldest_cursor": oldest_cursor,
                 "status": status,
                 "request_kind": request_kind,
                 "settings": {"codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled},
@@ -5819,7 +6200,9 @@ class ChatFrame(wx.Frame):
                 "remote_nats_runtime_url": str(getattr(self, "remote_nats_runtime_url", "") or ""),
             }
         )
-        return 200, {"accepted": True, **chat}
+        body = {"accepted": True, **chat}
+        self._remote_state_cache = {"key": cache_key, "body": copy.deepcopy(body)}
+        return 200, body
 
     def _remote_api_notes_snapshot(self, _payload: dict | None = None) -> tuple[int, dict]:
         return self._remote_api_notes_retired()
@@ -5905,6 +6288,7 @@ class ChatFrame(wx.Frame):
     def _remote_api_update_settings_ui(self, payload: dict) -> tuple[int, dict]:
         if "codex_answer_english_filter_enabled" in payload:
             self.codex_answer_english_filter_enabled = bool(payload.get("codex_answer_english_filter_enabled"))
+            self._invalidate_remote_state_cache()
             self._save_state()
         return 200, {
             "accepted": True,
@@ -5956,6 +6340,7 @@ class ChatFrame(wx.Frame):
         finally:
             self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
             self._flush_deferred_execution_list_updates()
+            self._start_execution_step_persist_worker()
         if has_more:
             self._codex_ui_event_drain_timer = self._call_later_if_alive(
                 CODEX_UI_EVENT_BATCH_DELAY_MS,
@@ -6026,7 +6411,7 @@ class ChatFrame(wx.Frame):
         elif chat_id and (event_turn_id or event_thread_id):
             known_chat_id = self._known_codex_event_chat_id(event)
             if known_chat_id and known_chat_id != chat_id:
-                return
+                chat_id = known_chat_id
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
         if isinstance(identity_chat, dict) and not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
@@ -6043,14 +6428,13 @@ class ChatFrame(wx.Frame):
             target_idx = self._event_turn_index(target_turns, event)
             if event_type == "token_count" and event.usage and target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
+                completed_turn = str(turn.get("request_status") or "").strip() == "done"
                 if str(turn.get("request_status") or "").strip() == "done":
                     self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, target_idx), None)
                     changed = self._set_chat_context_usage(target_chat, event.usage)
-                    if changed:
-                        self._refresh_visible_history_chat(chat_id)
                 else:
                     changed = self._set_pending_context_usage_for_turn(target_chat, target_idx, event.usage)
-                if changed:
+                if changed and completed_turn:
                     self._defer_codex_state_save()
                 return
             if execution_entry:
@@ -6074,6 +6458,7 @@ class ChatFrame(wx.Frame):
                         self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
             return
@@ -6089,15 +6474,13 @@ class ChatFrame(wx.Frame):
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
             if target_idx >= 0:
                 turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
-                if str(turn.get("request_status") or "").strip() == "done":
+                completed_turn = str(turn.get("request_status") or "").strip() == "done"
+                if completed_turn:
                     self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
                     changed = self._set_chat_context_usage(self._current_chat_state, event.usage)
                 else:
                     changed = self._set_pending_context_usage_for_turn(self._current_chat_state, target_idx, event.usage)
-                if changed:
-                    if self.view_mode == "active":
-                        if not self._refresh_context_usage_header_rows():
-                            self._refresh_answer_list_preserving_selection()
+                if changed and completed_turn:
                     self._defer_codex_state_save()
             return
         if event_type == "server_request":
@@ -6106,7 +6489,7 @@ class ChatFrame(wx.Frame):
             self._play_finish_sound()
             if str(event.method or "") == "item/tool/requestUserInput":
                 self._handle_codex_request_dialog({"request_id": event.request_id, "method": event.method, "params": event.params})
-            self._save_state()
+            self._defer_chat_state_save()
             return
         if event_type == "subagent_result":
             target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
@@ -6135,6 +6518,7 @@ class ChatFrame(wx.Frame):
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._update_active_answer_row(target_idx)
+                self._mark_chat_turns_dirty(start_index=target_idx)
             if is_current_chat:
                 self.is_running = False
                 self._active_request_count = 0
@@ -6143,7 +6527,7 @@ class ChatFrame(wx.Frame):
             if is_current_chat:
                 self._push_remote_state(self.active_chat_id or self.current_chat_id or "")
                 self._play_finish_sound()
-                self._save_state()
+                self._defer_chat_state_save()
                 if self.view_mode == "active":
                     self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
             return
@@ -6177,7 +6561,8 @@ class ChatFrame(wx.Frame):
                     turn = self.active_session_turns[target_idx]
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     self._update_active_answer_row(target_idx)
-                self._save_state()
+                    self._mark_chat_turns_dirty(start_index=target_idx)
+                self._defer_codex_state_save()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
                 self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 self._call_later_if_alive(120, self._focus_latest_answer)
@@ -6195,6 +6580,9 @@ class ChatFrame(wx.Frame):
             return
 
     def _defer_codex_state_save(self) -> None:
+        active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+        if active_idx >= 0:
+            self._mark_chat_turns_dirty(start_index=active_idx)
         self._codex_background_flush_dirty = True
         if getattr(self, "_codex_background_flush_scheduled", False):
             return
@@ -6249,7 +6637,16 @@ class ChatFrame(wx.Frame):
         return client
 
     def _load_chat_as_current(self, chat: dict) -> None:
-        self._current_chat_state = copy.deepcopy(chat or {})
+        if getattr(self, "_chat_store_enabled", False):
+            self._current_chat_state = dict(chat or {})
+            self.active_session_turns = list((chat or {}).get("turns") or [])
+            self._current_chat_state["turns"] = self.active_session_turns
+            execution_steps = (chat or {}).get("execution_steps")
+            if isinstance(execution_steps, list):
+                self._current_chat_state["execution_steps"] = list(execution_steps)
+        else:
+            self._current_chat_state = copy.deepcopy(chat or {})
+            self.active_session_turns = copy.deepcopy((chat or {}).get("turns") or [])
         title_manual = self._current_chat_state.get("title_manual")
         if isinstance(title_manual, str):
             title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -6258,7 +6655,7 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["title_manual"] = title_manual
         self.current_chat_id = str(chat.get("id") or "").strip() or str(uuid.uuid4())
         self.active_chat_id = self.current_chat_id
-        self.active_session_turns = copy.deepcopy(chat.get("turns") or [])
+        self._current_chat_state["turns"] = self.active_session_turns
         self.active_session_started_at = float(chat.get("created_at") or time.time())
         self.active_turn_idx = len(self.active_session_turns) - 1
         self.selected_model = model_id_from_display_name(str(chat.get("model") or self.selected_model or STARTUP_DEFAULT_MODEL_ID))
@@ -6486,15 +6883,15 @@ class ChatFrame(wx.Frame):
                 transport = RemoteNatsTransport(
                     pair_id="default",
                     token=token,
-                    on_message=self._remote_api_message_ui,
-                    on_new_chat=self._remote_api_new_chat_ui,
-                    on_reply_request=self._remote_api_reply_request_ui,
-                    on_state=self._remote_api_state_ui,
-                    on_rename_chat=self._remote_api_rename_chat_ui,
-                    on_update_settings=self._remote_api_update_settings_ui,
-                    on_model_list=self._remote_api_model_list_ui,
-                    on_history_list=self._remote_api_history_list_ui,
-                    on_history_read=self._remote_api_history_read_ui,
+                    on_message=lambda payload: self._run_remote_ui_route(self._remote_api_message_ui, payload),
+                    on_new_chat=lambda payload: self._run_remote_ui_route(self._remote_api_new_chat_ui, payload),
+                    on_reply_request=lambda payload: self._run_remote_ui_route(self._remote_api_reply_request_ui, payload),
+                    on_state=lambda payload: self._run_remote_ui_route(self._remote_api_state_ui, payload),
+                    on_rename_chat=lambda payload: self._run_remote_ui_route(self._remote_api_rename_chat_ui, payload),
+                    on_update_settings=lambda payload: self._run_remote_ui_route(self._remote_api_update_settings_ui, payload),
+                    on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
+                    on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
+                    on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
                 )
@@ -7238,8 +7635,12 @@ class ChatFrame(wx.Frame):
         if self._is_real_escape_keydown(event):
             self._minimize_to_tray()
             return True
-        event.Skip()
         return False
+
+    def _on_frame_key_down(self, event) -> None:
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        event.Skip()
 
     def _on_input_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -7608,6 +8009,7 @@ class ChatFrame(wx.Frame):
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = turn_idx
+            self._mark_chat_turns_dirty(start_index=turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
@@ -7619,7 +8021,7 @@ class ChatFrame(wx.Frame):
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
             self._pending_input_attachments = []
-            self._save_state()
+            self._defer_chat_state_save()
             self._play_send_sound()
             self.SetStatusText(f"正在执行 Codex 命令：/{command_name}")
             self.view_mode = "active"
@@ -7650,13 +8052,14 @@ class ChatFrame(wx.Frame):
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
+            self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
             self._pending_input_attachments = []
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
-            self._save_state()
+            self._defer_chat_state_save()
             self.view_mode = "active"
             self.view_history_id = None
             self._active_answer_row_index = -1
@@ -7681,6 +8084,7 @@ class ChatFrame(wx.Frame):
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = len(self.active_session_turns) - 1
+            self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
@@ -7691,7 +8095,7 @@ class ChatFrame(wx.Frame):
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
             self._pending_input_attachments = []
-            self._save_state()
+            self._defer_chat_state_save()
             self._play_send_sound()
             self.SetStatusText("已发送")
             self.view_mode = "active"
@@ -7716,6 +8120,7 @@ class ChatFrame(wx.Frame):
         }
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
+        self._mark_chat_turns_dirty(start_index=turn_idx)
         self._reset_answer_visible_row_limit()
         self._reset_current_turn_execution_view()
         self._current_chat_state["updated_at"] = now
@@ -7729,7 +8134,7 @@ class ChatFrame(wx.Frame):
         self.input_edit.SetValue("")
         self.input_edit.SetFocus()
         self._pending_input_attachments = []
-        self._save_state()
+        self._defer_chat_state_save()
         self._play_send_sound()
         self.SetStatusText("已发送")
         self.view_mode = "active"
@@ -7750,12 +8155,10 @@ class ChatFrame(wx.Frame):
         return True, ""
 
     def _on_voice_state(self, text: str):
-        self.SetStatusText(text)
         if getattr(self._voice_input, "state", "") == "recording":
             self._play_voice_begin_sound()
 
     def _on_voice_error(self, msg: str):
-        self.SetStatusText(msg)
         self._play_voice_wrong_sound()
 
     def _on_realtime_call_status(self, message: str):
@@ -8054,7 +8457,6 @@ class ChatFrame(wx.Frame):
         elif self.IsActive():
             self._append_text_to_focused_editor(text)
         elif not self._insert_text_to_system_focus(text):
-            self.SetStatusText("语音输入失败：无法写入当前焦点位置")
             self._play_voice_wrong_sound()
             return
         if self._call_later_if_alive(200, self._speak_text_via_screen_reader, text) is None:
@@ -8120,6 +8522,7 @@ class ChatFrame(wx.Frame):
         current_ids = {
             str(self.active_chat_id or "").strip(),
             str(self.current_chat_id or "").strip(),
+            str((self._current_chat_state or {}).get("id") or "").strip() if isinstance(getattr(self, "_current_chat_state", None), dict) else "",
             "",
         }
         if normalized in current_ids:
@@ -8273,6 +8676,8 @@ class ChatFrame(wx.Frame):
             cur = ""
         target_turns[turn_idx]["answer_md"] = cur + remove_emojis(delta)
         target_turns[turn_idx]["request_last_attempt_at"] = time.time()
+        resolved_chat_id = str(chat_id or (target_chat.get("id") if isinstance(target_chat, dict) else "") or self.active_chat_id or self.current_chat_id or "").strip()
+        self._mark_chat_turns_dirty(resolved_chat_id, turn_idx)
         # 流式阶段不刷新回答列表；待完成后一次性展示完整回答。
         self._defer_chat_state_save()
 
@@ -8316,20 +8721,22 @@ class ChatFrame(wx.Frame):
             self._active_request_count = 0
             if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""} and isinstance(target_chat, dict):
                 target_chat["updated_at"] = time.time()
-                title = self._summarize_recent_topic(target_turns, os.getenv("OPENROUTER_API_KEY", "").strip())
+                title = self._summarize_last_turn_locally(target_turns)
                 if title and not target_chat.get("title_manual"):
                     target_chat["title"] = title
+            resolved_dirty_chat_id = str(chat_id or (target_chat.get("id") if isinstance(target_chat, dict) else "") or self.active_chat_id or self.current_chat_id or "").strip()
+            self._mark_chat_turns_dirty(resolved_dirty_chat_id, turn_idx)
 
         if is_current_chat:
             self.is_running = False
             self.new_chat_button.Enable()
             self._set_input_hint_idle()
-        if fallback_msg:
+        if fallback_msg and is_current_chat:
             self.selected_model = used_model or self.selected_model
             if used_model:
                 self.model_combo.SetValue(used_model)
             self.SetStatusText(fallback_msg)
-        else:
+        elif is_current_chat:
             if is_openclaw_model(used_model) and not err:
                 self.SetStatusText("已发送，等待 OpenClaw 同步回复")
             else:
@@ -8342,7 +8749,7 @@ class ChatFrame(wx.Frame):
                 if final_text and final_text != REQUESTING_TEXT:
                     self._push_remote_final_answer(resolved_chat_id, final_text)
             self._push_remote_history_changed(resolved_chat_id)
-        self._save_state()
+        self._defer_chat_state_save()
         if self._is_ui_alive():
             self._refresh_history(resolved_chat_id or None)
 
@@ -8361,6 +8768,7 @@ class ChatFrame(wx.Frame):
             if not self._context_usage_payload_changed(chat.get("context_usage"), usage):
                 return False
             chat["context_usage"] = usage
+            self._invalidate_remote_state_cache()
             return True
         return False
 
@@ -8375,7 +8783,45 @@ class ChatFrame(wx.Frame):
             if isinstance(target_chat, dict):
                 target_chat.pop("context_usage", None)
             return
-        self._set_chat_context_usage(target_chat, estimate_turns_tokens(target_turns, model=used_model))
+        self._schedule_context_usage_estimate(target_chat, target_turns, turn_idx, used_model)
+
+    def _schedule_context_usage_estimate(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
+        if not isinstance(target_chat, dict):
+            return
+        chat_id = str(target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        if not chat_id:
+            return
+        key = (chat_id, int(turn_idx))
+        with self._context_usage_estimate_lock:
+            if key in self._context_usage_estimate_keys:
+                return
+            self._context_usage_estimate_keys.add(key)
+        turns_snapshot = list(target_turns or [])
+        model = str(used_model or "").strip()
+
+        def _worker() -> None:
+            try:
+                usage = estimate_turns_tokens(turns_snapshot, model=model)
+            except Exception:
+                usage = None
+            self._call_after_if_alive(self._apply_context_usage_estimate, key, usage)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_context_usage_estimate(self, key: tuple[str, int], usage) -> None:
+        with self._context_usage_estimate_lock:
+            self._context_usage_estimate_keys.discard(key)
+        if usage is None:
+            return
+        chat_id, turn_idx = key
+        chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        if turns and int(turn_idx) >= len(turns):
+            return
+        if self._set_chat_context_usage(chat, usage):
+            self._defer_chat_state_save()
 
     def _context_usage_pending_key(self, chat_id: str, turn_idx: int) -> tuple[str, int]:
         key_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
@@ -8397,21 +8843,7 @@ class ChatFrame(wx.Frame):
     def _summarize_title(self, turns, api_key: str) -> str:
         if not turns:
             return "新聊天"
-        transcript = self._build_title_transcript(turns)
-        title = ""
-        if api_key:
-            try:
-                client = ChatClient(api_key=api_key, model=self.selected_model or DEFAULT_MODEL, timeout=15)
-                prompt = (
-                    "请只根据首轮用户提问总结一个准确、简洁的中文标题（6-16字），"
-                    "去掉寒暄和无信息前缀，只输出标题，不要标点和引号。\n\n"
-                    f"{transcript}"
-                )
-                title = client.generate_chat_title(prompt)
-            except Exception:
-                title = ""
-        if not title:
-            title = self._summarize_last_turn_locally(turns)
+        title = self._summarize_last_turn_locally(turns)
         return title.strip()[:40] or "新聊天"
 
     def _title_source_turns(self, turns):
@@ -8432,10 +8864,8 @@ class ChatFrame(wx.Frame):
         return title or "新聊天"
 
     def _summarize_recent_topic(self, turns, api_key: str) -> str:
-        if api_key:
-            title = self._summarize_title(turns, api_key)
-            if title and title != "新聊天":
-                return title
+        if not turns:
+            return EMPTY_CURRENT_CHAT_TITLE
         return self._summarize_last_turn_locally(turns)
 
     def _apply_archived_title(self, chat_id: str, title: str) -> None:
@@ -8457,7 +8887,13 @@ class ChatFrame(wx.Frame):
         self._flush_chat_state_save()
         if not self.active_session_turns:
             return None
-        turns_snapshot = copy.deepcopy(self.active_session_turns)
+        use_chat_store = bool(getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None)
+        turn_count = len(self.active_session_turns)
+        if use_chat_store:
+            self._defer_chat_state_save()
+            turns_snapshot = list(self.active_session_turns)
+        else:
+            turns_snapshot = copy.deepcopy(self.active_session_turns)
         model_snapshot = self._resolve_current_model()
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip() if (not quick_title) else ""
         title_manual = self._current_chat_state.get("title_manual")
@@ -8480,7 +8916,7 @@ class ChatFrame(wx.Frame):
             "pinned": False,
             "created_at": created,
             "updated_at": float(self._current_chat_state.get("updated_at") or created or time.time()),
-            "turns": turns_snapshot,
+            "turn_count": turn_count,
             "source_chat_id": self.active_chat_id or self.current_chat_id or "",
             "openclaw_session_key": self.active_openclaw_session_key,
             "openclaw_session_id": self.active_openclaw_session_id,
@@ -8499,13 +8935,22 @@ class ChatFrame(wx.Frame):
             "codex_latest_assistant_phase": self.active_codex_latest_assistant_phase,
             "claudecode_session_id": self.active_claudecode_session_id,
             "detail_panel_mode": str(self._current_chat_state.get("detail_panel_mode") or "").strip() or "answers",
-            "execution_steps": copy.deepcopy(self._current_chat_state.get("execution_steps"))
-            if isinstance(self._current_chat_state.get("execution_steps"), list)
-            else [],
+            "execution_steps": (
+                list(self._current_chat_state.get("execution_steps"))
+                if use_chat_store and isinstance(self._current_chat_state.get("execution_steps"), list)
+                else (
+                    copy.deepcopy(self._current_chat_state.get("execution_steps"))
+                    if isinstance(self._current_chat_state.get("execution_steps"), list)
+                    else []
+                )
+            ),
         }
+        archived["turns"] = turns_snapshot
         if "context_usage" in self._current_chat_state:
             archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
         self.archived_chats.append(archived)
+        if not use_chat_store:
+            self._mark_chat_turns_dirty(archived_id, 0)
         self._sort_archived_chats()
 
         self.active_session_turns = []
@@ -8557,7 +9002,7 @@ class ChatFrame(wx.Frame):
         self.active_project_folder = project_folder
         folder_name = Path(project_folder).name or project_folder
         self._add_system_message_to_chat(f"已载入项目文件夹：{project_folder}")
-        self._save_state()
+        self._defer_chat_state_save()
         self._render_answer_list()
         self.SetStatusText(f"已载入项目：{folder_name}")
 
@@ -8587,6 +9032,11 @@ class ChatFrame(wx.Frame):
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
+        model = model_id_from_display_name(str(self._resolve_current_model() or DEFAULT_MODEL_ID).strip())
+        if model not in MODEL_IDS and not (is_codex_model(model) or is_claudecode_model(model) or is_openclaw_model(model)):
+            model = DEFAULT_MODEL_ID
+        self.selected_model = model
+        self._current_chat_state["model"] = model
         if is_openclaw_model(self.selected_model):
             self._openclaw_session_id_for_active_chat()
         self._refresh_history(archived["id"] if archived else None)
@@ -8663,7 +9113,8 @@ class ChatFrame(wx.Frame):
             return True
         self.answer_list.SetSelection(new_idx)
         try:
-            self.answer_list.SetFocus()
+            if not self.answer_list.HasFocus():
+                self.answer_list.SetFocus()
         except Exception:
             pass
         return True
@@ -8684,9 +9135,6 @@ class ChatFrame(wx.Frame):
     def _on_execution_key_down(self, event):
         key = event.GetKeyCode()
         ctrl = event.ControlDown()
-        if key == wx.WXK_TAB and not ctrl and not event.AltDown():
-            self.input_edit.SetFocus()
-            return
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
@@ -8745,13 +9193,17 @@ class ChatFrame(wx.Frame):
             return True
         if item_type != "execution" or step_idx < 0:
             return False
-        steps = self._current_execution_steps()
-        if not (0 <= step_idx < len(steps)):
-            return False
-        step = steps[step_idx]
-        if not isinstance(step, dict):
-            step = {"step": str(step or ""), "detail_text": str(detail_text or "")}
-            steps[step_idx] = step
+        row_text = str(self.execution_meta[idx][2] or "")
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        state_steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
+        if str(detail_text or "").strip() and 0 <= step_idx < len(state_steps) and isinstance(state_steps[step_idx], dict):
+            step = state_steps[step_idx]
+        elif str(detail_text or "").strip():
+            step = {"step": row_text, "list_text": row_text, "detail_text": str(detail_text or "")}
+        else:
+            if not row_text.strip():
+                return False
+            step = {"step": row_text, "list_text": row_text, "detail_text": row_text}
         detail_source = str(
             step.get("detail_text")
             or step.get("message")
@@ -8957,7 +9409,7 @@ class ChatFrame(wx.Frame):
         if chat_id == self.current_chat_id:
             return True
         self._flush_relevant_execution_deltas_for_switch()
-        chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id))
+        chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id), include_execution_steps=False)
         if not chat:
             return False
         # Archive current session if it has turns
@@ -8965,7 +9417,8 @@ class ChatFrame(wx.Frame):
             self._archive_active_session(quick_title=True, schedule_async_rename=True)
         # Load the selected chat
         turns = chat.get("turns") or []
-        self.active_session_turns = copy.deepcopy(turns)
+        use_chat_store = bool(getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None)
+        self.active_session_turns = list(turns) if use_chat_store else copy.deepcopy(turns)
         self.active_session_started_at = float(chat.get("created_at") or time.time())
         self.active_chat_id = str(chat.get("source_chat_id") or chat.get("id") or "").strip() or str(uuid.uuid4())
         self.active_openclaw_session_key = str(chat.get("openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
@@ -8994,7 +9447,13 @@ class ChatFrame(wx.Frame):
         self.active_codex_latest_assistant_phase = str(chat.get("codex_latest_assistant_phase") or "").strip()
         self.active_claudecode_session_id = str(chat.get("claudecode_session_id") or "").strip()
         self.current_chat_id = chat_id
-        self._current_chat_state = copy.deepcopy(chat)
+        if use_chat_store:
+            self._current_chat_state = dict(chat)
+            self._current_chat_state["turns"] = self.active_session_turns
+            if not isinstance(self._current_chat_state.get("execution_steps"), list):
+                self._current_chat_state["execution_steps"] = []
+        else:
+            self._current_chat_state = copy.deepcopy(chat)
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1
@@ -9290,13 +9749,24 @@ class ChatFrame(wx.Frame):
 
     def _replace_listbox_items_if_changed(self, control, labels: list[str], selected_idx: int | None = None) -> bool:
         normalized = [str(label or "") for label in labels]
-        if self._listbox_strings(control) == normalized:
+        cache = getattr(self, "_listbox_label_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._listbox_label_cache = cache
+        cache_key = id(control)
+        normalized_tuple = tuple(normalized)
+        cached_labels = cache.get(cache_key)
+        current_matches = cached_labels == normalized_tuple
+        if not current_matches and cached_labels is None:
+            current_matches = self._listbox_strings(control) == normalized
+        if current_matches:
             if selected_idx is not None:
                 try:
                     if control.GetSelection() != selected_idx:
                         control.SetSelection(selected_idx)
                 except Exception:
                     pass
+            cache[cache_key] = normalized_tuple
             return False
         control.Clear()
         for label in normalized:
@@ -9306,6 +9776,7 @@ class ChatFrame(wx.Frame):
                 control.SetSelection(max(0, min(int(selected_idx), len(normalized) - 1)))
             except Exception:
                 pass
+        cache[cache_key] = normalized_tuple
         return True
 
     def _notes_refresh_notebooks(self, select_id: str | None = None) -> None:
@@ -9351,10 +9822,18 @@ class ChatFrame(wx.Frame):
             selected_idx = self._notes_entry_ids.index(target)
         labels = []
         for entry in entries:
-            prefix = "★ " if entry.pinned else ""
-            label = re.sub(r"\s*[\r\n]+\s*", " / ", str(entry.content or "")).strip()
-            labels.append(f"{prefix}{label}")
+            labels.append(self._notes_entry_label(entry))
         self._replace_listbox_items_if_changed(self.notes_entry_list, labels, selected_idx)
+
+    def _notes_entry_label(self, entry) -> str:
+        prefix = "★ " if getattr(entry, "pinned", False) else ""
+        raw = str(getattr(entry, "content", "") or "")
+        preview = raw[: max(NOTES_ENTRY_LABEL_MAX_CHARS * 4, NOTES_ENTRY_LABEL_MAX_CHARS)]
+        label = re.sub(r"\s*[\r\n]+\s*", " / ", preview).strip()
+        max_body = max(1, NOTES_ENTRY_LABEL_MAX_CHARS - len(prefix))
+        if len(label) > max_body:
+            label = label[: max(1, max_body - 3)].rstrip() + "..."
+        return f"{prefix}{label}"
 
     def _notes_sync_editor(self) -> None:
         entry = self._notes_current_entry()
@@ -9379,7 +9858,6 @@ class ChatFrame(wx.Frame):
             return
         if not hasattr(self, "notes_controller"):
             return
-        self._notes_sync_view_visibility()
         self._notes_refresh_notebooks()
         self._notes_refresh_entries()
         self._notes_sync_view_visibility()
@@ -9524,11 +10002,10 @@ class ChatFrame(wx.Frame):
         self._schedule_notes_couchdb_sync()
 
     def _show_notes_sync_hint(self, message: str) -> None:
-        self.notes_sync_hint = str(message or "")
-        try:
-            self.SetStatusText(self.notes_sync_hint)
-        except Exception:
-            pass
+        next_hint = str(message or "")
+        if str(getattr(self, "notes_sync_hint", "") or "") == next_hint:
+            return
+        self.notes_sync_hint = next_hint
 
     def _on_notes_sync_status_changed_safe(self, status: str | dict, *, message: str | None = None, cursor: str | None = None) -> None:
         if threading.get_ident() == getattr(self, "_notes_ui_thread_id", 0):
@@ -9541,6 +10018,12 @@ class ChatFrame(wx.Frame):
             self._on_notes_remote_ops_applied(result)
             return
         self._call_after_if_alive(self._on_notes_remote_ops_applied, result)
+
+    def _invalidate_notes_projection(self) -> None:
+        projection = getattr(self, "notes_projection", None)
+        invalidate = getattr(projection, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
 
     def _configure_notes_couchdb_sync_from_env(self) -> None:
         base_url = str(os.environ.get("NOTES_COUCHDB_URL") or "").strip()
@@ -9573,6 +10056,10 @@ class ChatFrame(wx.Frame):
             current_cursor_value = 0
         if requested_cursor >= current_cursor_value:
             return 200, {"results": [], "last_seq": current_cursor}
+        cache_key = (requested_cursor, current_cursor)
+        cache = getattr(self, "_remote_notes_changes_cache", None)
+        if isinstance(cache, dict) and cache.get("key") == cache_key and isinstance(cache.get("body"), dict):
+            return 200, copy.deepcopy(cache["body"])
         snapshot = self.notes_store.load_documents()
         results: list[dict] = []
         for notebook in snapshot.notebooks:
@@ -9587,7 +10074,12 @@ class ChatFrame(wx.Frame):
             if doc.get("_deleted"):
                 row["deleted"] = True
             results.append(row)
-        return 200, {"results": results, "last_seq": current_cursor}
+        body = {"results": results, "last_seq": current_cursor}
+        self._remote_notes_changes_cache = {"key": cache_key, "body": copy.deepcopy(body)}
+        return 200, body
+
+    def _invalidate_remote_notes_changes_cache(self) -> None:
+        self._remote_notes_changes_cache = None
 
     def _remote_api_notes_changes(self, payload: dict | None = None) -> tuple[int, dict]:
         return self._remote_api_notes_couchdb_changes(payload)
@@ -9649,6 +10141,7 @@ class ChatFrame(wx.Frame):
             if touched:
                 self.notes_store._next_cursor(conn)
         if touched:
+            self._invalidate_remote_notes_changes_cache()
             self._on_notes_remote_ops_applied_safe(
                 {
                     "cursor": self.notes_store.current_cursor(),
@@ -9683,6 +10176,8 @@ class ChatFrame(wx.Frame):
 
     def _on_notes_remote_ops_applied(self, result: dict | None) -> None:
         result = dict(result or {})
+        self._invalidate_remote_notes_changes_cache()
+        self._invalidate_notes_projection()
         active_entry_id = str(getattr(self.notes_controller, "active_entry_id", "") or "").strip()
         active_changed = False
         if active_entry_id:
@@ -9705,7 +10200,8 @@ class ChatFrame(wx.Frame):
                     if isinstance(conflict, dict) and str(conflict.get("origin_entry_id") or "") == active_entry_id:
                         active_changed = True
                         break
-        self._notes_refresh_ui()
+        if self._notes_remote_ops_affect_visible_ui(result, active_entry_id=active_entry_id):
+            self._notes_refresh_ui()
         cursor = str(result.get("cursor") or self.notes_store.current_cursor() or "0")
         if active_changed:
             message = "当前编辑的笔记已被远程更新，已刷新。"
@@ -9717,6 +10213,42 @@ class ChatFrame(wx.Frame):
         else:
             self._show_notes_sync_hint("笔记已同步")
             self._push_remote_notes_sync_status({"status": "synced"}, cursor=cursor, message="笔记已同步")
+
+    def _notes_remote_ops_affect_visible_ui(self, result: dict, *, active_entry_id: str = "") -> bool:
+        applied = list(result.get("applied") or [])
+        conflicts = list(result.get("conflicts") or [])
+        if not applied and not conflicts:
+            return False
+        active_notebook_id = str(getattr(self.notes_controller, "active_notebook_id", "") or "").strip()
+        active_entry_id = str(active_entry_id or getattr(self.notes_controller, "active_entry_id", "") or "").strip()
+        for item in applied:
+            if not isinstance(item, dict):
+                return True
+            entity_type = str(item.get("entity_type") or "").strip()
+            if entity_type == "notebook":
+                return True
+            if entity_type != "entry":
+                return True
+            entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
+            entry_id = str(item.get("entity_id") or entry.get("id") or "").strip()
+            notebook_id = str(entry.get("notebook_id") or item.get("notebook_id") or "").strip()
+            origin_entry_id = str(entry.get("origin_entry_id") or item.get("origin_entry_id") or "").strip()
+            if active_entry_id and active_entry_id in {entry_id, origin_entry_id}:
+                return True
+            if active_notebook_id and notebook_id == active_notebook_id:
+                return True
+            if not notebook_id and not entry:
+                return True
+        for conflict in conflicts:
+            if not isinstance(conflict, dict):
+                return True
+            origin_entry_id = str(conflict.get("origin_entry_id") or "").strip()
+            notebook_id = str(conflict.get("notebook_id") or "").strip()
+            if active_entry_id and origin_entry_id == active_entry_id:
+                return True
+            if active_notebook_id and notebook_id == active_notebook_id:
+                return True
+        return False
 
     def _show_notes_menu(self) -> None:
         if self.notes_editor.HasFocus():
@@ -9822,7 +10354,7 @@ class ChatFrame(wx.Frame):
         finally:
             dlg.Destroy()
 
-    def _notes_select_notebook(self, notebook_id: str, entry_id: str | None = None, view: str = "note_detail") -> None:
+    def _notes_select_notebook(self, notebook_id: str, entry_id: str | None = None, view: str = "note_detail", *, focus: bool = True) -> None:
         self.notes_controller.root_tab = "notes"
         self.notes_controller.active_notebook_id = str(notebook_id or "")
         self.notes_controller.active_entry_id = str(entry_id or "")
@@ -9832,15 +10364,16 @@ class ChatFrame(wx.Frame):
             self.notes_controller.entry_editor_base_version = 0
         self._current_notes_state = self.notes_controller.to_state_dict()
         self._notes_refresh_ui()
-        try:
-            if self.notes_controller.notes_view == "notes_list":
-                self.notes_notebook_list.SetFocus()
-            elif self.notes_controller.notes_view == "note_detail":
-                self.notes_entry_list.SetFocus()
-        except Exception:
-            pass
+        if focus:
+            try:
+                if self.notes_controller.notes_view == "notes_list":
+                    self.notes_notebook_list.SetFocus()
+                elif self.notes_controller.notes_view == "note_detail":
+                    self.notes_entry_list.SetFocus()
+            except Exception:
+                pass
 
-    def _notes_select_entry(self, entry_id: str, view: str = "note_edit") -> None:
+    def _notes_select_entry(self, entry_id: str, view: str = "note_edit", *, focus: bool = True) -> None:
         self.notes_controller.root_tab = "notes"
         self.notes_controller.active_entry_id = str(entry_id or "")
         self.notes_controller.notes_view = str(view or "note_edit")
@@ -9850,11 +10383,12 @@ class ChatFrame(wx.Frame):
         self.notes_controller.entry_editor_base_version = int(entry.version if entry is not None else 0)
         self._current_notes_state = self.notes_controller.to_state_dict()
         self._notes_refresh_ui()
-        try:
-            if self.notes_controller.notes_view == "note_edit":
-                self.notes_editor.SetFocus()
-        except Exception:
-            pass
+        if focus:
+            try:
+                if self.notes_controller.notes_view == "note_edit":
+                    self.notes_editor.SetFocus()
+            except Exception:
+                pass
 
     def _notes_set_view(self, view: str) -> None:
         self.notes_controller.root_tab = "notes"
@@ -10274,14 +10808,23 @@ class ChatFrame(wx.Frame):
     def _on_notes_notebook_selected(self, _event):
         notebook_id = self._notes_selected_notebook_id()
         if notebook_id:
-            self._notes_select_notebook(notebook_id, view="notes_list")
+            if notebook_id != str(self.notes_controller.active_notebook_id or ""):
+                self.notes_controller.root_tab = "notes"
+                self.notes_controller.active_notebook_id = notebook_id
+                self.notes_controller.active_entry_id = ""
+                self.notes_controller.notes_view = "notes_list"
+                self.notes_controller.entry_editor_dirty = False
+                self._current_notes_state = self.notes_controller.to_state_dict()
+                self._notes_refresh_entries(notebook_id)
         else:
             self._notes_refresh_ui()
 
     def _on_notes_entry_selected(self, _event):
         entry_id = self._notes_selected_entry_id()
         if entry_id:
-            self._notes_select_entry(entry_id, view=self.notes_controller.notes_view or "note_detail")
+            current_view = self.notes_controller.notes_view or "note_detail"
+            view = "note_detail" if current_view == "note_edit" else current_view
+            self._notes_select_entry(entry_id, view=view, focus=False)
 
     def _notes_open_selected_notebook(self) -> bool:
         notebook_id = self._notes_selected_notebook_id()
@@ -10388,6 +10931,7 @@ class ChatFrame(wx.Frame):
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
         self._flush_chat_state_save()
+        self._flush_execution_step_persists_sync()
         self._voice_input.cancel()
         self._realtime_call.shutdown()
         if self._answer_redirect_timer:
@@ -10415,7 +10959,7 @@ class ChatFrame(wx.Frame):
             self._stop_remote_servers()
         except Exception:
             pass
-        self._save_state()
+        self._save_state(capture_notes_editor=True)
         self._global_ctrl_hook.stop()
         self._unregister_global_hotkey()
         if self._tray_icon:

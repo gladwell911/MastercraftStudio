@@ -91,7 +91,7 @@ def test_e2e_codex_token_count_lifecycle_updates_top_row_and_preserves_selection
         main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
     assert ("chat-current", 0) in frame._pending_context_usage_by_turn
 

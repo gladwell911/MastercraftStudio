@@ -82,9 +82,9 @@ def test_ui_automation_ctrl_right_can_continue_past_recent_chats(frame):
             raise AssertionError("should not skip")
 
     frame._on_char_hook(E())
-    assert frame.current_chat_id == "chat-c"
+    assert frame.view_history_id == "chat-c"
     frame._on_char_hook(E())
-    assert frame.current_chat_id == "chat-b"
+    assert frame.view_history_id == "chat-b"
 
 
 def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
@@ -121,6 +121,6 @@ def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
     seen = [frame.current_chat_id]
     for _ in range(6):
         frame._on_char_hook(E())
-        seen.append(frame.current_chat_id)
+        seen.append(frame.view_history_id)
 
-    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]

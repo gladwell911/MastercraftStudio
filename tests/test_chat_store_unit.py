@@ -53,6 +53,62 @@ def test_chat_store_replaces_and_loads_turns(tmp_path):
     assert store.list_chat_summaries()[0]["turn_count"] == 2
 
 
+def test_chat_store_replaces_turn_suffix_without_rewriting_prefix(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+    store.replace_turns(
+        "chat-1",
+        [
+            {"question": "q0", "answer_md": "a0"},
+            {"question": "q1", "answer_md": "a1"},
+            {"question": "q2", "answer_md": "a2"},
+        ],
+    )
+
+    store.replace_turns_from(
+        "chat-1",
+        [
+            {"question": "q1 changed", "answer_md": "a1 changed"},
+            {"question": "q2 changed", "answer_md": "a2 changed"},
+        ],
+        start_index=1,
+    )
+
+    assert store.count_turns("chat-1") == 3
+    assert store.load_turns("chat-1") == [
+        {"question": "q0", "answer_md": "a0"},
+        {"question": "q1 changed", "answer_md": "a1 changed"},
+        {"question": "q2 changed", "answer_md": "a2 changed"},
+    ]
+
+
+def test_chat_store_loads_turn_page_without_full_turn_scan(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+    store.replace_turns(
+        "chat-1",
+        [{"question": f"q{idx}", "answer_md": f"a{idx}"} for idx in range(6)],
+    )
+
+    total, rows = store.load_turns_page("chat-1", limit=2)
+
+    assert total == 6
+    assert rows == [
+        {"question": "q4", "answer_md": "a4"},
+        {"question": "q5", "answer_md": "a5"},
+    ]
+
+    total, older = store.load_turns_page("chat-1", limit=2, before_turn_index=4)
+
+    assert total == 6
+    assert older == [
+        {"question": "q2", "answer_md": "a2"},
+        {"question": "q3", "answer_md": "a3"},
+    ]
+
+
 def test_chat_store_appends_and_loads_execution_steps(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()

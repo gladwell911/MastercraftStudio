@@ -57,12 +57,12 @@ def test_ui_automation_context_usage_row_is_fixed_above_answers(frame):
     frame._render_answer_list()
 
     rows = list(frame.answer_list.GetStrings())
-    assert rows[:6] == ["2k / 128k", "当前模型：openai/gpt-5.2", "我", "first question", "小诸葛", "first answer"]
+    assert rows[:5] == ["2k / 128k", "我", "first question", "小诸葛", "first answer"]
     assert frame.answer_meta[0][0] == "context_usage"
-    assert frame.answer_meta[1][0] == "current_model"
-    assert frame.answer_meta[2][0] == "user"
-    assert frame.answer_meta[3][0] == "question"
-    assert frame.answer_meta[4][0] == "ai"
+    assert all(meta[0] != "current_model" for meta in frame.answer_meta)
+    assert frame.answer_meta[1][0] == "user"
+    assert frame.answer_meta[2][0] == "question"
+    assert frame.answer_meta[3][0] == "ai"
 
     frame._focus_latest_answer()
 
@@ -86,15 +86,10 @@ def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame
 
     frame._render_answer_list()
     frame.answer_list.SetFocus()
-    frame.answer_list.SetSelection(2)
+    frame.answer_list.SetSelection(1)
 
     up = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
     up.SetKeyCode(main.wx.WXK_UP)
-
-    assert frame.answer_list.ProcessEvent(up)
-    assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "current_model"
-    assert frame.answer_list.GetString(1) == "当前模型：openai/gpt-5.2"
 
     assert frame.answer_list.ProcessEvent(up)
     assert frame.answer_list.GetSelection() == 0
@@ -106,7 +101,7 @@ def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame
 
     assert frame.answer_list.ProcessEvent(down)
     assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "current_model"
+    assert frame.answer_meta[1][0] == "user"
 
 
 def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame, wx_app):
@@ -123,16 +118,9 @@ def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame,
     }
 
     frame._render_answer_list()
-    frame.answer_list.SetSelection(2)
+    frame.answer_list.SetSelection(1)
     frame.answer_list.SetFocusFromKbd()
     wx_app.Yield()
-
-    _send_listbox_key(frame.answer_list, main.wx.WXK_UP)
-    wx_app.Yield()
-
-    assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "current_model"
-    assert frame.answer_list.GetString(1) == "当前模型：openai/gpt-5.2"
 
     _send_listbox_key(frame.answer_list, main.wx.WXK_UP)
     wx_app.Yield()
@@ -145,7 +133,7 @@ def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame,
     wx_app.Yield()
 
     assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "current_model"
+    assert frame.answer_meta[1][0] == "user"
 
 
 def test_ui_automation_history_switch_uses_stored_context_usage_then_cli_unknown(frame):
@@ -226,6 +214,6 @@ def test_ui_automation_context_row_selection_survives_visible_history_usage_refr
         main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"

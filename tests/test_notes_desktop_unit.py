@@ -491,6 +491,27 @@ def test_notes_sync_preserves_conflict_copy_on_stale_update(tmp_path):
     assert any("手机端内容" in item.content for item in entries)
 
 
+def test_notes_sync_push_dirty_documents_does_not_load_full_snapshot(tmp_path, monkeypatch):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    sync = main.NotesSyncService(store)
+    notebook = store.create_notebook("dirty notebook")
+    entry = store.create_entry(notebook.id, "dirty entry", source="manual")
+    monkeypatch.setattr(store, "load_documents", lambda: pytest.fail("dirty push should not load the full notes snapshot"))
+    written = []
+
+    class _Client:
+        def write_documents(self, docs):
+            written.extend(docs)
+            return [{"id": doc["_id"], "rev": "1-test"} for doc in docs]
+
+    pushed, conflicts = sync._push_dirty_documents(_Client())
+
+    assert conflicts == []
+    assert {item["_id"] for item in written} == {f"notebook:{notebook.id}", f"entry:{entry.id}"}
+    assert set(pushed) == {f"notebook:{notebook.id}", f"entry:{entry.id}"}
+
+
 def test_remote_create_preserves_incoming_entry_id_and_modifier_identity(tmp_path):
     store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
     store.initialize()
@@ -1854,7 +1875,7 @@ def test_notes_outbox_lifecycle_transitions_and_retry_counts(tmp_path):
     assert len(acked) == len(pending)
 
 
-def test_notes_sync_status_bar_reports_pending_sending_failed(frame, monkeypatch):
+def test_notes_sync_status_does_not_write_status_bar(frame, monkeypatch):
     statuses = []
     monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
     notebook = frame.notes_store.create_notebook("sync status notebook")
@@ -1868,9 +1889,7 @@ def test_notes_sync_status_bar_reports_pending_sending_failed(frame, monkeypatch
     claimed = frame.notes_sync.claim_outbox_ops(limit=1)
     frame.notes_sync.fail_outbox_ops([item.op_id for item in claimed])
 
-    assert any("待同步" in text for text in statuses)
-    assert any("同步中" in text for text in statuses)
-    assert any("同步失败" in text for text in statuses)
+    assert statuses == []
 
 
 @pytest.mark.parametrize(

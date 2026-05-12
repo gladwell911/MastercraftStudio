@@ -351,6 +351,34 @@ def test_remote_notes_changes_uses_couchdb_shape(frame):
     assert "last_seq" in body
 
 
+def test_remote_notes_changes_reuses_snapshot_for_same_cursor(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("cache notes")
+    frame.notes_store.create_entry(notebook.id, "cache entry", source="manual")
+    status, body = frame._remote_api_notes_changes(
+        {
+            "database": "zhuge_notes",
+            "since": "0",
+            "include_docs": True,
+        }
+    )
+    assert status == 200
+    def fail_load_documents():
+        raise AssertionError("same notes cursor should use cached changes response")
+
+    monkeypatch.setattr(frame.notes_store, "load_documents", fail_load_documents)
+
+    second_status, second_body = frame._remote_api_notes_changes(
+        {
+            "database": "zhuge_notes",
+            "since": "0",
+            "include_docs": True,
+        }
+    )
+
+    assert second_status == 200
+    assert second_body == body
+
+
 def test_remote_notes_bulk_docs_returns_write_results(frame):
     status, body = frame._remote_api_notes_bulk_docs(
         {
@@ -415,6 +443,45 @@ def test_remote_message_pushes_state_after_accept(frame, monkeypatch):
     assert status == 200
     assert body["accepted"] is True
     assert pushed == [("state", "chat-e2e"), ("history", "chat-e2e")]
+
+
+def test_remote_ui_route_from_worker_thread_is_marshaled_to_ui(frame, monkeypatch):
+    posted = []
+    main_thread = main.threading.main_thread()
+    monkeypatch.setattr(main.threading, "current_thread", lambda: object())
+    monkeypatch.setattr(main.threading, "main_thread", lambda: main_thread)
+
+    def _call_after(fn, *args, **kwargs):
+        posted.append((fn, args, kwargs))
+        fn(*args, **kwargs)
+        return True
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", _call_after)
+
+    status, body = frame._run_remote_ui_route(lambda payload: (207, {"seen": payload["text"]}), {"text": "hello"})
+
+    assert (status, body) == (207, {"seen": "hello"})
+    assert posted
+
+
+def test_remote_nats_callbacks_are_ui_marshaled(frame, monkeypatch):
+    captured = {}
+
+    class _FakeNatsTransport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start_threaded(self, url):
+            captured["url"] = url
+
+    monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    monkeypatch.setattr(main, "NatsServerProcess", lambda config: type("P", (), {"start": lambda self: None})())
+    monkeypatch.setattr(frame, "_run_remote_ui_route", lambda callback, payload=None: (299, {"callback": getattr(callback, "__name__", "")}))
+
+    frame._start_remote_nats_server_if_configured(token="secret", host="127.0.0.1")
+
+    assert callable(captured["on_message"])
+    assert captured["on_message"]({"type": "message"}) == (299, {"callback": "_remote_api_message_ui"})
 
 
 def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeypatch):
