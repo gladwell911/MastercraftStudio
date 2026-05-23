@@ -221,6 +221,118 @@ def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):
     assert frame.answer_list.HasFocus()
 
 
+def test_ui_automation_history_enter_restores_selected_chat_model_in_combo(frame, monkeypatch):
+    frame.Show()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.active_session_turns = [
+        {
+            "question": "codex question",
+            "answer_md": "codex answer",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "chat b",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "created_at": 2.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "chat a",
+            "model": "anthropic/claude-sonnet-4.6",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [
+                {
+                    "question": "claude question",
+                    "answer_md": "claude answer",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "created_at": 1.0,
+                }
+            ],
+        }
+    ]
+
+    frame._refresh_history("chat-a")
+    frame.history_list.SetFocus()
+    frame.history_list.SetSelection(frame.history_ids.index("chat-a"))
+    frame._on_history_key_down(_EnterEvent())
+
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-a"
+    assert frame.selected_model == "anthropic/claude-sonnet-4.6"
+    assert frame.model_combo.GetValue() == main.model_display_name("anthropic/claude-sonnet-4.6")
+    assert frame.answer_list.HasFocus()
+
+
+def test_ui_automation_switching_chat_restores_that_chat_model_without_losing_focus(frame, monkeypatch):
+    frame.Show()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "claude question",
+            "answer_md": "claude answer",
+            "model": "anthropic/claude-sonnet-4.6",
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "chat a",
+        "model": "anthropic/claude-sonnet-4.6",
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "turns": frame.active_session_turns,
+    }
+    frame.selected_model = "anthropic/claude-sonnet-4.6"
+    frame.model_combo.SetValue(main.model_display_name("anthropic/claude-sonnet-4.6"))
+    frame._archive_active_session(quick_title=True, save_after_archive=False)
+
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_session_turns = [
+        {
+            "question": "codex question",
+            "answer_md": "codex answer",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "chat b",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "created_at": 2.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+    }
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.answer_list.SetFocus()
+
+    assert frame._switch_current_chat("chat-a") is True
+
+    assert frame.selected_model == "anthropic/claude-sonnet-4.6"
+    assert frame.model_combo.GetValue() == main.model_display_name("anthropic/claude-sonnet-4.6")
+    assert frame.answer_list.HasFocus()
+
+
 def test_ui_automation_switched_visible_chat_does_not_receive_late_codex_answer_from_previous_chat(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-b"

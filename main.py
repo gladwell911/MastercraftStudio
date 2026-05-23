@@ -8894,7 +8894,15 @@ class ChatFrame(wx.Frame):
             turns_snapshot = list(self.active_session_turns)
         else:
             turns_snapshot = copy.deepcopy(self.active_session_turns)
-        model_snapshot = self._resolve_current_model()
+        model_snapshot = str(self._current_chat_state.get("model") or "").strip()
+        if not is_visible_model_id(model_snapshot):
+            for turn in reversed(self.active_session_turns):
+                turn_model = str((turn or {}).get("model") or "").strip()
+                if is_visible_model_id(turn_model):
+                    model_snapshot = turn_model
+                    break
+        if not is_visible_model_id(model_snapshot):
+            model_snapshot = self._resolve_current_model()
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip() if (not quick_title) else ""
         title_manual = self._current_chat_state.get("title_manual")
         if isinstance(title_manual, str):
@@ -8914,6 +8922,7 @@ class ChatFrame(wx.Frame):
             "title_updated_at": float(self._current_chat_state.get("title_updated_at") or time.time()),
             "title_revision": int(self._current_chat_state.get("title_revision") or 1),
             "pinned": False,
+            "model": model_snapshot,
             "created_at": created,
             "updated_at": float(self._current_chat_state.get("updated_at") or created or time.time()),
             "turn_count": turn_count,
@@ -9310,6 +9319,27 @@ class ChatFrame(wx.Frame):
     def _on_history_context(self, _):
         self._show_history_menu()
 
+    def _model_for_chat_selection(self, chat: dict | None) -> str:
+        model = str((chat or {}).get("model") or "").strip()
+        if is_visible_model_id(model):
+            return model
+        turns = (chat or {}).get("turns")
+        if isinstance(turns, list):
+            for turn in reversed(turns):
+                turn_model = str((turn or {}).get("model") or "").strip()
+                if is_visible_model_id(turn_model):
+                    return turn_model
+        return ""
+
+    def _apply_selected_chat_model_to_combo(self, chat: dict | None) -> None:
+        model = self._model_for_chat_selection(chat)
+        if not model:
+            return
+        display = model_display_name(model)
+        self.selected_model = model
+        if threading.current_thread() is threading.main_thread() and self.model_combo.GetValue() != display:
+            self.model_combo.SetValue(display)
+
     def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True) -> bool:
         selected_id = str(chat_id or "").strip()
         if not selected_id:
@@ -9321,6 +9351,7 @@ class ChatFrame(wx.Frame):
             self.view_mode = "active"
             self.view_history_id = None
             self._render_answer_list()
+            self._apply_selected_chat_model_to_combo(self._current_chat_state)
             self._refresh_history(selected_id)
             self._save_state()
             if focus_answer_list:
@@ -9335,6 +9366,7 @@ class ChatFrame(wx.Frame):
         self.view_mode = "history"
         self.view_history_id = selected_id
         self._render_answer_list()
+        self._apply_selected_chat_model_to_combo(chat)
         self._refresh_history(selected_id)
         self._save_state()
         self.SetStatusText("已切换到历史聊天")
@@ -9457,17 +9489,20 @@ class ChatFrame(wx.Frame):
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1
-        resolved_model = ""
+        resolved_model = str(chat.get("model") or "").strip()
+        if not is_visible_model_id(resolved_model):
+            resolved_model = ""
         for t in reversed(self.active_session_turns):
             m = str(t.get("model") or "").strip()
-            if is_visible_model_id(m):
+            if not resolved_model and is_visible_model_id(m):
                 resolved_model = m
                 break
         if not resolved_model:
             resolved_model = self.selected_model if is_visible_model_id(self.selected_model) else DEFAULT_MODEL_ID
         self.selected_model = resolved_model
         if threading.current_thread() is threading.main_thread():
-            self.model_combo.SetValue(self.selected_model)
+            self.model_combo.SetValue(model_display_name(self.selected_model))
+        self._current_chat_state["model"] = resolved_model
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         self._reset_answer_visible_row_limit()

@@ -12284,6 +12284,63 @@ def test_new_chat_commits_model_from_combo_after_deferred_selection(frame, monke
     assert frame._current_chat_state["model"] == "openai/gpt-5.2"
 
 
+def test_switch_current_chat_restores_chat_level_model_and_combo(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "claude question",
+            "answer_md": "claude answer",
+            "model": "anthropic/claude-sonnet-4.6",
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "chat a",
+        "model": "anthropic/claude-sonnet-4.6",
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "turns": frame.active_session_turns,
+    }
+    frame.selected_model = "anthropic/claude-sonnet-4.6"
+    frame.model_combo.SetValue(main.model_display_name("anthropic/claude-sonnet-4.6"))
+
+    archived = frame._archive_active_session(quick_title=True, save_after_archive=False)
+    assert archived["model"] == "anthropic/claude-sonnet-4.6"
+
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.active_session_turns = [
+        {
+            "question": "codex question",
+            "answer_md": "codex answer",
+            "model": "codex/main",
+            "created_at": 2.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "chat b",
+        "model": "codex/main",
+        "created_at": 2.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+    }
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue(main.model_display_name("codex/main"))
+
+    assert frame._switch_current_chat("chat-a") is True
+
+    assert frame.selected_model == "anthropic/claude-sonnet-4.6"
+    assert frame._current_chat_state["model"] == "anthropic/claude-sonnet-4.6"
+    assert frame.model_combo.GetValue() == main.model_display_name("anthropic/claude-sonnet-4.6")
+
+
 def test_save_state_can_skip_chat_history_persistence_for_small_config_changes(frame, monkeypatch, tmp_path):
     frame.state_path = tmp_path / "app_state.json"
     frame._chat_store_enabled = True
