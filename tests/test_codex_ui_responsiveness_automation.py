@@ -281,12 +281,18 @@ def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame
     assert renders == []
 
 
-def test_real_ui_completion_focuses_latest_answer_item(frame, wx_app, monkeypatch):
+def test_real_ui_completion_focuses_latest_answer_without_refreshing_old_selection(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-answer-focus"
     frame.current_chat_id = "chat-answer-focus"
-    frame.active_turn_idx = 0
+    frame.active_turn_idx = 1
     frame.active_session_turns = [
+        {
+            "question": "previous question",
+            "answer_md": "previous answer",
+            "model": "openai/gpt-5.2",
+            "created_at": 0.5,
+        },
         {
             "question": "question",
             "answer_md": main.REQUESTING_TEXT,
@@ -300,21 +306,50 @@ def test_real_ui_completion_focuses_latest_answer_item(frame, wx_app, monkeypatc
     monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
-    monkeypatch.setattr(frame, "_call_later_if_alive", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
+    scheduled = []
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *args, **kwargs: scheduled.append(args))
+    frame._render_answer_list()
+    old_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 0)
+    frame.answer_list.SetSelection(old_answer_row)
+    operations = []
+    original_append = frame.answer_list.Append
+    original_set_selection = frame.answer_list.SetSelection
+    original_set_focus = frame.answer_list.SetFocus
+
+    def record_append(label):
+        operations.append(("Append", label))
+        return original_append(label)
+
+    def record_set_selection(index):
+        operations.append(("SetSelection", index))
+        return original_set_selection(index)
+
+    def record_set_focus():
+        operations.append(("SetFocus",))
+        return original_set_focus()
+
+    monkeypatch.setattr(frame.answer_list, "Append", record_append)
+    monkeypatch.setattr(frame.answer_list, "SetSelection", record_set_selection)
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: operations.append(("Refresh",)))
+    monkeypatch.setattr(frame.answer_list, "SetFocus", record_set_focus)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: operations.append(("Sound",)))
 
     frame.input_edit.SetFocus()
     wx_app.Yield()
-    frame._on_done(0, "final answer", "", "openai/gpt-5.2", "", "chat-answer-focus")
+    frame._on_done(1, "final answer", "", "openai/gpt-5.2", "", "chat-answer-focus")
 
-    assert _yield_until(
-        wx_app,
-        lambda: frame.answer_list.HasFocus()
-        and frame.answer_list.GetSelection() == frame.answer_list.GetCount() - 1
-        and frame.answer_list.GetStringSelection() == "final answer",
-        timeout=2.0,
-    )
+    wx_app.Yield()
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "final answer" in rows
+    assert operations[0] == ("Sound",)
+    assert operations[1][0] == "Append"
+    assert operations[2] == ("Append", "final answer")
+    assert ("SetSelection", frame.answer_list.GetCount() - 1) in operations
+    assert ("SetFocus",) in operations
+    assert ("Refresh",) not in operations
+    assert scheduled == []
+    assert frame.answer_list.HasFocus()
+    assert frame.answer_list.GetStringSelection() == "final answer"
 
 
 def test_real_ui_f1_focuses_execution_latest_enter_opens_text_and_shift_enter_opens_detail(frame, wx_app, monkeypatch):

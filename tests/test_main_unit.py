@@ -3401,9 +3401,9 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == "我"
     assert all(meta[0] != "current_model" for meta in frame.answer_meta)
-    assert frame.answer_list.GetString(1) == "我"
+    assert frame.answer_list.GetString(1) == "历史问题"
 
 
 def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
@@ -3419,8 +3419,8 @@ def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "暂无"
-    assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
+    assert frame.answer_list.GetString(0) == "我"
+    assert all(meta[0] != "context_usage" for meta in frame.answer_meta)
 
 
 def test_codex_submit_does_not_show_current_model_row(frame, monkeypatch):
@@ -5437,6 +5437,118 @@ def test_current_chat_codex_delta_with_hidden_placeholder_does_not_rerender_ques
     assert after_rows == before_rows
 
 
+def test_codex_final_answer_appends_without_refreshing_answer_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_session_turns = [
+        {"question": "上一条问题", "answer_md": "上一条回复", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0},
+        {
+            "question": "当前 Codex 问题",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+            "codex_thread_id": "thread-current",
+            "codex_turn_id": "turn-current",
+        },
+    ]
+    frame._current_chat_state.update({
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-current",
+        "codex_turn_id": "turn-current",
+    })
+    frame.view_mode = "active"
+    frame._render_answer_list()
+    old_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 0)
+    frame.answer_list.SetSelection(old_answer_row)
+
+    operations = []
+    original_append = frame.answer_list.Append
+
+    def record_append(label):
+        operations.append(("Append", label))
+        return original_append(label)
+
+    monkeypatch.setattr(frame, "_render_answer_list_compat", lambda *args, **kwargs: pytest.fail("Codex final answer should append, not rerender answer list"))
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda *args, **kwargs: pytest.fail("Codex final answer should not preserve old selection"))
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda *args, **kwargs: None)
+    focused = []
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: focused.append(True))
+    monkeypatch.setattr(frame.answer_list, "Append", record_append)
+    monkeypatch.setattr(frame.answer_list, "SetSelection", lambda *args, **kwargs: pytest.fail("Codex final answer should not reselect old answer"))
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: pytest.fail("Codex final answer should not refresh answer list"))
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="item_completed",
+            phase="final_answer",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            text="Codex 最终回答",
+        ),
+    )
+
+    assert operations == [("Append", "小诸葛"), ("Append", "Codex 最终回答")]
+    assert frame.active_session_turns[1]["answer_md"] == "Codex 最终回答"
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows[-2:] == ["小诸葛", "Codex 最终回答"]
+    assert frame.answer_meta[-2:] == [("ai", 1, "小诸葛", ""), ("answer", 1, "Codex 最终回答", "Codex 最终回答")]
+    assert focused == [True]
+
+
+def test_codex_turn_completed_does_not_refresh_when_final_answer_already_appended(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_session_turns = [
+        {"question": "上一条问题", "answer_md": "上一条回复", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0},
+        {
+            "question": "当前 Codex 问题",
+            "answer_md": "Codex 已追加回答",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+            "codex_thread_id": "thread-current",
+            "codex_turn_id": "turn-current",
+        },
+    ]
+    frame._current_chat_state.update({
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-current",
+        "codex_turn_id": "turn-current",
+    })
+    frame.view_mode = "active"
+    frame._render_answer_list()
+    old_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 0)
+    frame.answer_list.SetSelection(old_answer_row)
+
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda *args, **kwargs: pytest.fail("Codex turn_completed should not refresh when answer row already exists"))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame.answer_list, "SetSelection", lambda *args, **kwargs: pytest.fail("Codex turn_completed should not reselect old answer"))
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: pytest.fail("Codex turn_completed should not refresh answer list"))
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="turn_completed",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            text="",
+        ),
+    )
+
+    assert frame.active_session_turns[1]["request_status"] == "done"
+
+
 def test_plan_updated_appends_execution_step(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -6697,8 +6809,8 @@ def test_render_answer_list_shows_each_uploaded_attachment_on_its_own_line(frame
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "context_usage"
-    assert rows[1:] == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
+    assert frame.answer_meta[0][0] == "user"
+    assert rows == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
 
 
 def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn(frame, tmp_path):
@@ -6727,8 +6839,8 @@ def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
-    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
+    assert rows == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
+    assert meta_types == ["user", "attachment", "ai", "answer"]
 
 
 def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):
@@ -7401,6 +7513,29 @@ def test_execution_list_keydown_f1_toggles_back_to_answers(frame, monkeypatch):
     assert frame.answer_list.HasFocus()
 
 
+def test_f1_toggles_from_visible_execution_list_even_if_saved_mode_is_stale(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-f1-stale"
+    frame.current_chat_id = "chat-f1-stale"
+    frame._current_chat_state = {
+        "id": "chat-f1-stale",
+        "title": "F1 stale",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetFocus()
+    frame._current_chat_state["detail_panel_mode"] = "answers"
+
+    frame._toggle_detail_panel_mode(focus_detail=True)
+
+    assert frame._current_chat_state["detail_panel_mode"] == "answers"
+    assert frame.answer_list.IsShown()
+    assert frame.answer_list.HasFocus()
+
+
 def test_completion_focus_does_not_return_from_execution_to_answer_list(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-execution-completion"
@@ -7567,7 +7702,7 @@ def test_char_hook_shift_enter_on_execution_list_opens_web_detail(frame, monkeyp
     assert opened_web == [True]
 
 
-def test_on_done_focuses_latest_answer_item(frame, monkeypatch):
+def test_on_done_focuses_latest_answer_item_after_appending(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-answer-focus"
     frame.current_chat_id = "chat-answer-focus"
@@ -7583,13 +7718,77 @@ def test_on_done_focuses_latest_answer_item(frame, monkeypatch):
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
-    monkeypatch.setattr(main.wx, "CallLater", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
 
     frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-answer-focus")
 
     assert frame.answer_list.HasFocus()
-    assert frame.answer_list.GetSelection() == frame.answer_list.GetCount() - 1
     assert frame.answer_list.GetStringSelection() == "最终回答"
+
+
+def test_on_done_appends_final_answer_without_refreshing_or_reselecting_old_answer(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-answer-append"
+    frame.current_chat_id = "chat-answer-append"
+    frame.active_turn_idx = 1
+    frame.active_session_turns = [
+        {"question": "上一条问题", "answer_md": "上一条回复", "model": "openai/gpt-5.2", "created_at": 1.0},
+        {"question": "当前问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 2.0},
+    ]
+    frame._current_chat_state.update({"id": "chat-answer-append", "turns": frame.active_session_turns})
+    frame._render_answer_list()
+    old_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 0)
+    frame.answer_list.SetSelection(old_answer_row)
+
+    operations = []
+    original_append = frame.answer_list.Append
+
+    def record_append(label):
+        operations.append(("Append", label))
+        return original_append(label)
+
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda *args, **kwargs: pytest.fail("completion should append final answer, not refresh answer list"))
+    focused = []
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: focused.append(True))
+    monkeypatch.setattr(frame.answer_list, "Append", record_append)
+    monkeypatch.setattr(frame.answer_list, "SetSelection", lambda *args, **kwargs: pytest.fail("completion should not reselect old answer"))
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: pytest.fail("completion should not refresh answer list"))
+
+    frame._on_done(1, "最终回答", "", "openai/gpt-5.2", "", "chat-answer-append")
+
+    assert operations == [("Append", "小诸葛"), ("Append", "最终回答")]
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows[-2:] == ["小诸葛", "最终回答"]
+    assert frame.answer_meta[-2:] == [("ai", 1, "小诸葛", ""), ("answer", 1, "最终回答", "最终回答")]
+    assert focused == [True]
+
+
+def test_on_done_plays_finish_sound_before_focusing_latest_answer(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-finish-order"
+    frame.current_chat_id = "chat-finish-order"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "当前问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0},
+    ]
+    frame._current_chat_state.update({"id": "chat-finish-order", "turns": frame.active_session_turns})
+    calls = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: calls.append("sound"))
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: calls.append("focus"))
+
+    frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-finish-order")
+
+    assert calls == ["sound", "focus"]
 
 
 def test_global_ctrl_combo_key_filter_ignores_ime_and_modifiers():
@@ -8320,6 +8519,7 @@ def test_bind_events_registers_both_hotkey_ids():
             self.new_chat_button = _Ctrl("new_chat_button")
             self.notes_button = _Ctrl("notes_button")
             self.model_combo = _Ctrl("model_combo")
+            self.codex_speed_combo = _Ctrl("codex_speed_combo")
             self.input_edit = _Ctrl("input_edit")
             self.answer_list = _Ctrl("answer_list")
             self.execution_list = _Ctrl("execution_list")
@@ -8343,9 +8543,14 @@ def test_bind_events_registers_both_hotkey_ids():
             self.notes_editor = _Ctrl("notes_editor")
             self.notes_save_button = _Ctrl("notes_save_button")
             self.notes_cancel_button = _Ctrl("notes_cancel_button")
+            self._chat_navigation_left_id = 1
+            self._chat_navigation_right_id = 2
 
         def Bind(self, _event, _handler, id=None):
             frame_bind_calls.append(id)
+
+        def SetAcceleratorTable(self, *_args, **_kwargs):
+            return None
 
         def _on_send_clicked(self, *_args):
             return None
@@ -8357,6 +8562,9 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_model_changed(self, *_args):
+            return None
+
+        def _on_codex_speed_changed(self, *_args):
             return None
 
         def _on_input_key_down(self, *_args):
@@ -8375,6 +8583,12 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_global_hotkey(self, *_args):
+            return None
+
+        def _on_frame_key_down(self, *_args):
+            return None
+
+        def _on_generic_key_down(self, *_args):
             return None
 
         def _on_any_key_down_escape_minimize(self, *_args):
@@ -8438,6 +8652,9 @@ def test_bind_events_registers_both_hotkey_ids():
     assert main.wx.EVT_KEY_UP in control_bindings["input_edit"]
     assert main.wx.EVT_KEY_UP in control_bindings["send_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["new_chat_button"]
+    assert main.wx.EVT_KEY_DOWN in control_bindings["new_chat_button"]
+    assert main.wx.EVT_CHAR_HOOK in control_bindings["new_chat_button"]
+    assert main.wx.EVT_CHAR in control_bindings["new_chat_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["model_combo"]
     assert main.wx.EVT_KEY_UP in control_bindings["answer_list"]
     assert main.wx.EVT_KEY_UP in control_bindings["execution_list"]
@@ -9127,6 +9344,139 @@ def test_listbox_diff_uses_cached_labels_without_rescanning_control(frame, monke
     changed = frame._replace_listbox_items_if_changed(frame.history_list, ["A", "B"], 1)
 
     assert changed is False
+
+
+def test_history_refresh_updates_renamed_row_without_clearing_list(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "旧标题", "turns": [], "created_at": 1.0, "updated_at": 1.0}
+    ]
+    frame._refresh_history("chat-a")
+    monkeypatch.setattr(frame.history_list, "Clear", lambda: pytest.fail("history rename should not clear whole list"))
+
+    frame.archived_chats[0]["title"] = "新标题"
+    frame._refresh_history("chat-a")
+
+    assert frame.history_list.GetString(0) == "新标题"
+
+
+def test_submit_question_appends_answer_rows_without_clearing_existing_answer_list(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "暂无"
+    monkeypatch.setattr(frame.answer_list, "Clear", lambda: pytest.fail("send should not clear answer list"))
+
+    ok, message = frame._submit_question("马上显示的问题", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "马上显示的问题" in rows
+
+
+def test_submit_question_replaces_empty_answer_state_with_delete_then_append(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+    frame._render_answer_list()
+    assert frame.answer_list.GetString(0) == "暂无"
+
+    original_delete = frame.answer_list.Delete
+    original_append = frame.answer_list.Append
+    operations = []
+
+    def record_delete(index):
+        operations.append(("Delete", index))
+        return original_delete(index)
+
+    def record_append(label):
+        operations.append(("Append", label))
+        return original_append(label)
+
+    monkeypatch.setattr(frame.answer_list, "Clear", lambda: pytest.fail("send should not clear answer list"))
+    monkeypatch.setattr(frame.answer_list, "SetString", lambda *args: pytest.fail("empty content row should be removed, not rewritten"))
+    monkeypatch.setattr(frame.answer_list, "Delete", record_delete)
+    monkeypatch.setattr(frame.answer_list, "Append", record_append)
+
+    ok, message = frame._submit_question("首次提问", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    assert operations[0] == ("Delete", 0)
+    assert [op for op in operations if op[0] == "Append"] == [("Append", "我"), ("Append", "首次提问")]
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows == ["我", "首次提问"]
+    assert "小诸葛" not in rows
+    assert main.REQUESTING_TEXT not in rows
+
+
+def test_submit_question_appends_new_question_without_refreshing_answer_list(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+    frame.active_session_turns = [
+        {"question": "上一条问题", "answer_md": "上一条回复", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame._render_answer_list()
+    old_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer")
+    frame.answer_list.SetSelection(old_answer_row)
+
+    operations = []
+    original_append = frame.answer_list.Append
+
+    def record_append(label):
+        operations.append(("Append", label))
+        return original_append(label)
+
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: pytest.fail("send should append the new question, not refresh answer list"))
+    monkeypatch.setattr(frame, "_render_answer_list_compat", lambda *args, **kwargs: pytest.fail("send should append the new question, not refresh answer list"))
+    monkeypatch.setattr(frame.answer_list, "Append", record_append)
+    monkeypatch.setattr(frame.answer_list, "SetSelection", lambda *args: pytest.fail("send should not reselect the old answer row"))
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: pytest.fail("send should not refresh answer list"))
+
+    ok, message = frame._submit_question("新问题", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    assert operations == [("Append", "我"), ("Append", "新问题")]
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows[-2:] == ["我", "新问题"]
+    assert frame.answer_meta[-2:] == [("user", 1, "我", ""), ("question", 1, "新问题", "")]
 
 
 def test_notes_projection_reuses_document_snapshot_until_cursor_changes(frame, monkeypatch):
@@ -9999,6 +10349,17 @@ def test_focus_latest_answer_does_not_steal_focus_after_user_tabs_away(frame, mo
     frame._focus_latest_answer()
 
 
+def test_focus_latest_answer_does_not_steal_focus_from_execution_list_when_find_focus_is_empty(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "小诸葛", "最新回答")]
+    monkeypatch.setattr(frame, "IsActive", lambda: True)
+    monkeypatch.setattr(frame, "IsIconized", lambda: False)
+    monkeypatch.setattr(wx.Window, "FindFocus", lambda: None)
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: pytest.fail("completion focus should not steal focus from execution list"))
+
+    frame._focus_latest_answer()
+
+
 def test_codex_ui_dispatch_coalesces_bursty_events(frame, monkeypatch):
     scheduled = []
     handled = []
@@ -10597,8 +10958,8 @@ def test_render_answer_list_hides_blank_user_for_assistant_only_turn(frame):
     frame._render_answer_list()
 
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "context_usage"
-    assert items[1:] == ["小诸葛", "只有回答"]
+    assert frame.answer_meta[0][0] == "ai"
+    assert items == ["小诸葛", "只有回答"]
 
 
 def test_codex_answer_filter_menu_label_changes_with_state(frame):
@@ -10977,6 +11338,28 @@ def test_history_menu_opens_for_current_chat_row(frame, monkeypatch):
     frame._show_history_menu()
 
     assert popup == [4]
+
+
+def test_history_f2_opens_rename_dialog_for_selected_chat(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "旧聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0, "pinned": False}
+    ]
+    frame.history_ids = ["chat-old"]
+    frame.history_list.Set(["旧聊天"])
+    frame.history_list.SetSelection(0)
+    calls = {"rename": 0}
+    monkeypatch.setattr(frame, "_history_rename", lambda _event: calls.__setitem__("rename", calls["rename"] + 1))
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_F2
+
+        def Skip(self):
+            raise AssertionError("F2 should open rename without falling through")
+
+    frame._on_history_key_down(E())
+
+    assert calls["rename"] == 1
 
 
 def test_history_rename_current_chat_updates_active_state(frame, monkeypatch):
@@ -12626,6 +13009,30 @@ def test_execution_list_defaults_to_latest_100_rows_and_shows_more_at_top(frame)
     assert frame.execution_list.GetCount() == 101
 
 
+def test_execution_list_does_not_show_more_when_filtered_visible_rows_are_under_limit(frame):
+    frame.active_chat_id = "chat-filtered"
+    frame.current_chat_id = "chat-filtered"
+    frame.active_turn_idx = 1
+    frame.view_mode = "active"
+    frame._current_chat_state.update({
+        "id": "chat-filtered",
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": f"hidden {idx}", "display_kind": "command", "turn_idx": 1}
+            if idx % 2
+            else {"step": f"visible {idx}", "list_text": f"visible {idx}", "display_kind": "commentary", "turn_idx": 1}
+            for idx in range(150)
+        ],
+    })
+
+    frame._render_execution_list()
+
+    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert "更多" not in visible
+    assert frame.execution_list.GetCount() == 75
+    assert frame.execution_total_content_rows == 75
+
+
 def test_execution_list_uses_recent_store_page_without_full_step_load(frame, tmp_path, monkeypatch):
     frame.chat_db_path = tmp_path / "chat_history.db"
     frame.chat_store = main.ChatStore(frame.chat_db_path, max_execution_steps_per_turn=1000)
@@ -12983,6 +13390,68 @@ def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypat
     assert frame.selected_model == main.DEFAULT_CODEX_MODEL
     assert frame.codex_speed_combo.GetValue() == "快速"
     assert frame._current_chat_state["codex_service_tier"] == "fast"
+
+
+def test_new_chat_button_shift_enter_prompts_for_manual_title_and_blocks_auto_rename(frame, monkeypatch):
+    frame.new_chat_button.SetFocusFromKbd()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+
+    class _Dialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def GetValue(self):
+            return "手动命名聊天"
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(main.wx, "TextEntryDialog", _Dialog)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ShiftDown(self):
+            return True
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Shift+Enter on new chat should be handled")
+
+    frame._on_generic_key_down(E())
+
+    assert frame._current_chat_state["title"] == "手动命名聊天"
+    assert frame._current_chat_state["title_manual"] is True
+    assert frame._current_chat_state["title_source"] == "manual"
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    ok, message = frame._submit_question("帮我整理安卓自动化测试方案", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    assert frame._current_chat_state["title"] == "手动命名聊天"
+    assert frame._current_chat_state["title_manual"] is True
+    assert frame._current_chat_state["title_source"] == "manual"
 
 
 def test_remote_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
@@ -13521,7 +13990,7 @@ def test_render_answer_list_does_not_schedule_context_usage_estimate(frame, monk
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == "我"
     assert scheduled == []
 
 

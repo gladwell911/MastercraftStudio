@@ -37,8 +37,40 @@ class _EnterEvent:
     def GetKeyCode(self):
         return main.wx.WXK_RETURN
 
+    def ShiftDown(self):
+        return False
+
+    def ControlDown(self):
+        return False
+
+    def AltDown(self):
+        return False
+
     def Skip(self):
         return None
+
+
+class _ShiftEnterEvent:
+    def __init__(self, event_object=None):
+        self._event_object = event_object
+
+    def GetKeyCode(self):
+        return main.wx.WXK_RETURN
+
+    def GetEventObject(self):
+        return self._event_object
+
+    def ShiftDown(self):
+        return True
+
+    def ControlDown(self):
+        return False
+
+    def AltDown(self):
+        return False
+
+    def Skip(self):
+        raise AssertionError("Shift+Enter should be handled")
 
 
 class _MenuEvent:
@@ -47,6 +79,14 @@ class _MenuEvent:
 
     def Skip(self):
         raise AssertionError("application key should open history menu")
+
+
+class _F2Event:
+    def GetKeyCode(self):
+        return main.wx.WXK_F2
+
+    def Skip(self):
+        raise AssertionError("F2 should open history rename")
 
 
 def test_ui_automation_application_menu_opens_for_current_chat(frame, wx_app, monkeypatch):
@@ -66,6 +106,57 @@ def test_ui_automation_application_menu_opens_for_current_chat(frame, wx_app, mo
 
     assert opened == [4]
     assert frame.history_ids[frame.history_list.GetSelection()] == "chat-current"
+
+
+def test_ui_automation_history_f2_opens_rename_for_selected_chat(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "chat a", "turns": [], "created_at": 1.0, "updated_at": 1.0}
+    ]
+    frame._refresh_history("chat-a")
+    frame.history_list.SetFocusFromKbd()
+    frame.history_list.SetSelection(frame.history_ids.index("chat-a"))
+    wx_app.Yield()
+    calls = {"rename": 0}
+    monkeypatch.setattr(frame, "_history_rename", lambda _event: calls.__setitem__("rename", calls["rename"] + 1))
+
+    frame._on_history_key_down(_F2Event())
+    wx_app.Yield()
+
+    assert calls["rename"] == 1
+    assert frame.history_ids[frame.history_list.GetSelection()] == "chat-a"
+
+
+def test_ui_automation_new_chat_button_shift_enter_creates_named_chat(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.new_chat_button.SetFocusFromKbd()
+    wx_app.Yield()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    class _Dialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return main.wx.ID_OK
+
+        def GetValue(self):
+            return "命名聊天"
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(main.wx, "TextEntryDialog", _Dialog)
+
+    frame._on_generic_key_down(_ShiftEnterEvent(frame.new_chat_button))
+    wx_app.Yield()
+
+    assert frame._current_chat_state["title"] == "命名聊天"
+    assert frame._current_chat_state["title_manual"] is True
+    assert frame._current_chat_state["title_source"] == "manual"
+    assert frame.input_edit.HasFocus()
 
 
 def test_ui_automation_primary_tab_sequence_matches_screen_reader_order(frame, wx_app):
@@ -145,7 +236,9 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert shown["dialog"] == 0
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
-    assert frame.answer_meta[0][0] == "context_usage"
+    rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert rows[:4] == ["我", "history question", "小诸葛", "history answer"]
+    assert frame.answer_meta[0][0] == "user"
     question_rows = [idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "question"]
     assert question_rows
     assert frame.answer_list.GetString(question_rows[0]) == "history question"

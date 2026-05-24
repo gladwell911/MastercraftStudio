@@ -1243,6 +1243,8 @@ class ChatFrame(wx.Frame):
         self.codex_speed_combo.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
         self.send_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
         self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
+        self.new_chat_button.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.new_chat_button.Bind(wx.EVT_CHAR, self._on_generic_key_down)
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
         self.SetAcceleratorTable(
@@ -2975,10 +2977,12 @@ class ChatFrame(wx.Frame):
         rows: list[str] = []
         metas: list[tuple] = []
         self._active_answer_row_index = -1
-        self._append_context_usage_row(rows, metas)
+        turns = self._get_view_turns()
+        context_usage_label = format_context_usage_label(self._active_chat_context_usage())
+        if context_usage_label != "暂无" or not turns:
+            self._append_context_usage_row(rows, metas)
         self._append_current_model_row(rows, metas)
         header_count = len(metas)
-        turns = self._get_view_turns()
         if not turns:
             self.answer_total_content_rows = 1
             rows.append("暂无对话内容")
@@ -3069,6 +3073,52 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
 
+    def _append_submitted_question_to_answer_list(self, turn_idx: int, turn: dict) -> bool:
+        if not hasattr(self, "answer_list"):
+            return False
+        if self.view_mode != "active":
+            return False
+        q = str((turn or {}).get("question") or "")
+        attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
+        if not q.strip() and not attachments:
+            return False
+
+        empty_rows: list[int] = []
+        for row, meta in enumerate(list(self.answer_meta)):
+            if row >= self.answer_list.GetCount():
+                continue
+            kind = meta[0] if meta else ""
+            label = ""
+            try:
+                label = self.answer_list.GetString(row)
+            except Exception:
+                label = ""
+            if kind == "info" or (kind == "context_usage" and label == "暂无"):
+                empty_rows.append(row)
+        if empty_rows:
+            rows_to_delete = [0] * len(empty_rows) if empty_rows == list(range(len(empty_rows))) else sorted(empty_rows, reverse=True)
+            for row in rows_to_delete:
+                try:
+                    self.answer_list.Delete(row)
+                except Exception:
+                    return False
+            for row in sorted(empty_rows, reverse=True):
+                del self.answer_meta[row]
+
+        self.answer_list.Append("我")
+        self.answer_meta.append(("user", int(turn_idx), "我", ""))
+        if q.strip():
+            self.answer_list.Append(q)
+            self.answer_meta.append(("question", int(turn_idx), q, ""))
+        for label, meta in self._turn_attachment_rows(int(turn_idx), attachments, incoming=False):
+            self.answer_list.Append(label)
+            self.answer_meta.append(meta)
+
+        cache = getattr(self, "_listbox_label_cache", None)
+        if isinstance(cache, dict):
+            cache[id(self.answer_list)] = tuple(self._listbox_strings(self.answer_list))
+        return True
+
     def _is_foreground_window(self) -> bool:
         return self.IsActive()
 
@@ -3081,6 +3131,29 @@ class ChatFrame(wx.Frame):
         except Exception:
             focus = None
         if focus is None:
+            for ctrl in (
+                getattr(self, "input_edit", None),
+                getattr(self, "answer_list", None),
+                getattr(self, "send_button", None),
+                getattr(self, "execution_list", None),
+                getattr(self, "history_list", None),
+                getattr(self, "model_combo", None),
+                getattr(self, "codex_speed_combo", None),
+                getattr(self, "notes_notebook_list", None),
+                getattr(self, "notes_entry_list", None),
+                getattr(self, "notes_editor", None),
+            ):
+                if ctrl is None:
+                    continue
+                try:
+                    if ctrl.HasFocus():
+                        return ctrl in {
+                            getattr(self, "input_edit", None),
+                            getattr(self, "answer_list", None),
+                            getattr(self, "send_button", None),
+                        }
+                except Exception:
+                    continue
             return True
         allowed = {
             ctrl
@@ -3098,6 +3171,34 @@ class ChatFrame(wx.Frame):
             if meta[0] == "answer" and meta[1] == turn_idx:
                 return row
         return -1
+
+    def _append_completed_answer_to_answer_list(self, turn_idx: int, turn: dict) -> bool:
+        if not hasattr(self, "answer_list"):
+            return False
+        if self.view_mode != "active":
+            return False
+        if self._find_answer_row_index(int(turn_idx)) >= 0:
+            return False
+        answer_md = str((turn or {}).get("answer_md") or "")
+        if not answer_md.strip() or answer_md == REQUESTING_TEXT:
+            return False
+        _answer_md, answer_text = self._turn_answer_markdown(turn or {})
+        answer_text = str(answer_text or "").strip()
+        if not answer_text:
+            return False
+        self.answer_list.Append("小诸葛")
+        self.answer_meta.append(("ai", int(turn_idx), "小诸葛", ""))
+        self.answer_list.Append(answer_text)
+        self.answer_meta.append(("answer", int(turn_idx), answer_text, answer_md))
+        received_attachments = (turn or {}).get("received_attachments") if isinstance((turn or {}).get("received_attachments"), list) else []
+        for label, meta in self._turn_attachment_rows(int(turn_idx), received_attachments, incoming=True):
+            self.answer_list.Append(label)
+            self.answer_meta.append(meta)
+        self._active_answer_row_index = len(self.answer_meta) - 1
+        cache = getattr(self, "_listbox_label_cache", None)
+        if isinstance(cache, dict):
+            cache[id(self.answer_list)] = tuple(self._listbox_strings(self.answer_list))
+        return True
 
     def _update_active_answer_row(self, turn_idx: int) -> bool:
         if self.view_mode != "active":
@@ -3336,7 +3437,7 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
         rows = list(self._current_execution_steps())
-        return len(rows), rows[-limit:]
+        return len(rows), rows
 
     @staticmethod
     def _safe_int(value, default: int = 0) -> int:
@@ -4250,7 +4351,7 @@ class ChatFrame(wx.Frame):
             int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
         )
         self.execution_visible_row_limit = limit
-        has_more = total_steps > len(steps) or len(visible_items) > limit
+        has_more = len(visible_items) > limit or (total_steps > len(steps) and len(visible_items) >= limit)
         rows: list[str] = []
         metas: list[tuple] = []
         if has_more:
@@ -4392,7 +4493,15 @@ class ChatFrame(wx.Frame):
         return True
 
     def _toggle_detail_panel_mode(self, *, focus_detail: bool = False) -> str:
-        next_mode = "answers" if self._detail_panel_mode() == "execution" else "execution"
+        current_mode = self._detail_panel_mode()
+        try:
+            if hasattr(self, "execution_list") and (self.execution_list.HasFocus() or self.execution_list.IsShown()):
+                current_mode = "execution"
+            elif hasattr(self, "answer_list") and (self.answer_list.HasFocus() or self.answer_list.IsShown()):
+                current_mode = "answers"
+        except Exception:
+            pass
+        next_mode = "answers" if current_mode == "execution" else "execution"
         self._apply_detail_panel_mode(next_mode, refresh_execution=True)
         if focus_detail:
             if next_mode == "execution":
@@ -6865,7 +6974,11 @@ class ChatFrame(wx.Frame):
                 self._play_finish_sound()
                 self._defer_chat_state_save()
                 if self.view_mode == "active":
-                    self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+                    if self._find_answer_row_index(target_idx) < 0:
+                        if self._append_completed_answer_to_answer_list(target_idx, turn):
+                            self._focus_latest_answer()
+                        else:
+                            self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
             return
         if appended_execution_step and not str(getattr(event, "text", "") or "").strip():
             self._defer_codex_state_save()
@@ -6900,8 +7013,10 @@ class ChatFrame(wx.Frame):
                     self._mark_chat_turns_dirty(start_index=target_idx)
                 self._defer_codex_state_save()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
-                self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
-                self._call_later_if_alive(120, self._focus_latest_answer)
+                if self._append_completed_answer_to_answer_list(target_idx, self.active_session_turns[target_idx] if 0 <= target_idx < len(self.active_session_turns) else {}):
+                    self._focus_latest_answer()
+                else:
+                    self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event.text:
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
@@ -7887,6 +8002,11 @@ class ChatFrame(wx.Frame):
         ):
             if self._activate_selected_history():
                 return
+        if self._handle_named_new_chat_shortcut(event):
+            return
+        if key == wx.WXK_F2 and self.history_list.HasFocus() and not ctrl_down and not alt_down:
+            self._history_rename(None)
+            return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             and self.answer_list.HasFocus()
@@ -8282,6 +8402,22 @@ class ChatFrame(wx.Frame):
             ev.SetEventObject(self.new_chat_button)
             wx.PostEvent(self.new_chat_button, ev)
 
+    def _prompt_and_create_named_chat(self) -> bool:
+        if not self.new_chat_button.IsEnabled():
+            return False
+        dlg = wx.TextEntryDialog(self, "请输入新聊天的名称：", "新建聊天")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title = str(dlg.GetValue() or "").strip()
+        finally:
+            dlg.Destroy()
+        if not title:
+            self.SetStatusText("已取消新聊天命名")
+            return False
+        self._on_new_chat_clicked(None, title=title, title_manual=True)
+        return True
+
     def _on_send_clicked(self, _):
         q = self.input_edit.GetValue().strip()
         ok, message = self._submit_question(q, source="local")
@@ -8381,10 +8517,11 @@ class ChatFrame(wx.Frame):
             self.view_mode = "active"
             self.view_history_id = None
             self._active_answer_row_index = -1
-            if self._detail_panel_mode() == "execution":
-                self._render_answer_list_compat(refresh_execution=False)
-            else:
-                self._render_answer_list()
+            if not self._append_submitted_question_to_answer_list(turn_idx, turn):
+                if self._detail_panel_mode() == "execution":
+                    self._render_answer_list_compat(refresh_execution=False)
+                else:
+                    self._render_answer_list()
             if source == "local":
                 self._start_codex_local_command_worker_for_turn(
                     chat_id or self.active_chat_id or self.current_chat_id or "",
@@ -8417,10 +8554,11 @@ class ChatFrame(wx.Frame):
             self.view_mode = "active"
             self.view_history_id = None
             self._active_answer_row_index = -1
-            if self._detail_panel_mode() == "execution":
-                self._render_answer_list_compat(refresh_execution=False)
-            else:
-                self._render_answer_list()
+            if not self._append_submitted_question_to_answer_list(self.active_turn_idx, turn):
+                if self._detail_panel_mode() == "execution":
+                    self._render_answer_list_compat(refresh_execution=False)
+                else:
+                    self._render_answer_list()
             return True, ""
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
@@ -8456,6 +8594,7 @@ class ChatFrame(wx.Frame):
             self.view_history_id = None
             self._active_answer_row_index = -1
             self._refresh_openclaw_sync_lifecycle()
+            self._append_submitted_question_to_answer_list(self.active_turn_idx, turn)
             threading.Thread(
                 target=self._worker,
                 args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id, openclaw_session_id),
@@ -8497,10 +8636,11 @@ class ChatFrame(wx.Frame):
         self.view_history_id = None
         self._active_answer_row_index = -1
         self._refresh_openclaw_sync_lifecycle()
-        if self._detail_panel_mode() == "execution":
-            self._render_answer_list_compat(refresh_execution=False)
-        else:
-            self._render_answer_list()
+        if not self._append_submitted_question_to_answer_list(turn_idx, turn):
+            if self._detail_panel_mode() == "execution":
+                self._render_answer_list_compat(refresh_execution=False)
+            else:
+                self._render_answer_list()
         if is_codex_model(resolved_model) and source == "local":
             self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
         elif is_claudecode_model(resolved_model) and source == "local":
@@ -9109,11 +9249,15 @@ class ChatFrame(wx.Frame):
         if self._is_ui_alive():
             self._refresh_history(resolved_chat_id or None)
 
-        if should_render and self.view_mode == "active":
-            self._refresh_answer_list_preserving_selection()
-            self._call_later_if_alive(120, self._focus_latest_answer)
-        if (not is_openclaw_model(used_model)) or err:
+        should_play_finish_sound = (not is_openclaw_model(used_model)) or err
+        if should_play_finish_sound:
             self._play_finish_sound()
+        if should_render and self.view_mode == "active":
+            turn = target_turns[turn_idx] if 0 <= turn_idx < len(target_turns) else {}
+            if self._append_completed_answer_to_answer_list(turn_idx, turn):
+                self._focus_latest_answer()
+            else:
+                self._refresh_answer_list_preserving_selection()
 
     def _set_chat_context_usage(self, chat: dict, usage) -> bool:
         if not isinstance(chat, dict) or usage is None:
@@ -9374,8 +9518,10 @@ class ChatFrame(wx.Frame):
         self._render_answer_list()
         self.SetStatusText(f"已载入项目：{folder_name}")
 
-    def _on_new_chat_clicked(self, _):
+    def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False):
         previous_codex_service_tier = self._current_codex_service_tier()
+        manual_title = str(title or "").strip()
+        manual = bool(title_manual and manual_title)
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
@@ -9386,9 +9532,9 @@ class ChatFrame(wx.Frame):
         now = time.time()
         self._current_chat_state = {
             "id": "",
-            "title": self._next_default_chat_title(),
-            "title_manual": False,
-            "title_source": "default",
+            "title": manual_title if manual else self._next_default_chat_title(),
+            "title_manual": manual,
+            "title_source": "manual" if manual else "default",
             "title_updated_at": now,
             "title_revision": 1,
             "turns": self.active_session_turns,
@@ -9776,6 +9922,9 @@ class ChatFrame(wx.Frame):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._activate_selected_history()
+            return
+        if key == wx.WXK_F2:
+            self._history_rename(None)
             return
         if key == wx.WXK_MENU:
             self._show_history_menu()
@@ -10282,8 +10431,36 @@ class ChatFrame(wx.Frame):
             return True
         return False
 
+    def _handle_named_new_chat_shortcut(self, event) -> bool:
+        key = event.GetKeyCode()
+        if key not in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            return False
+        if not hasattr(self, "new_chat_button"):
+            return False
+        event_object = getattr(event, "GetEventObject", lambda: None)()
+        has_new_chat_focus = False
+        try:
+            has_new_chat_focus = bool(self.new_chat_button.HasFocus())
+        except Exception:
+            has_new_chat_focus = False
+        if event_object is not self.new_chat_button and not has_new_chat_focus:
+            return False
+        shift_down = getattr(event, "ShiftDown", None)
+        ctrl_down = getattr(event, "ControlDown", None)
+        alt_down = getattr(event, "AltDown", None)
+        if not (callable(shift_down) and shift_down()):
+            return False
+        if callable(ctrl_down) and ctrl_down():
+            return False
+        if callable(alt_down) and alt_down():
+            return False
+        self._prompt_and_create_named_chat()
+        return True
+
     def _on_generic_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
+            return
+        if self._handle_named_new_chat_shortcut(event):
             return
         if self._handle_ctrl_history_navigation(event):
             return
@@ -10318,9 +10495,84 @@ class ChatFrame(wx.Frame):
                     pass
             cache[cache_key] = normalized_tuple
             return False
-        control.Clear()
-        for label in normalized:
-            control.Append(label)
+        current_labels = self._listbox_strings(control)
+        empty_answer_labels = {"暂无", "暂无对话内容"}
+        answer_list = getattr(self, "answer_list", None)
+        is_answer_list = control is answer_list
+        if not is_answer_list:
+            try:
+                is_answer_list = bool(control == answer_list)
+            except Exception:
+                is_answer_list = False
+        if (
+            is_answer_list
+            and current_labels
+            and any(label in empty_answer_labels for label in current_labels)
+            and not any(label in empty_answer_labels for label in normalized)
+        ):
+            try:
+                for idx in range(len(current_labels)):
+                    control.Delete(0)
+                for label in normalized:
+                    control.Append(label)
+                if normalized and selected_idx is not None:
+                    control.SetSelection(max(0, min(int(selected_idx), len(normalized) - 1)))
+                cache[cache_key] = normalized_tuple
+                return True
+            except Exception:
+                control.Clear()
+                for label in normalized:
+                    control.Append(label)
+                cache[cache_key] = normalized_tuple
+                return True
+        if (
+            is_answer_list
+            and current_labels == ["暂无", "暂无对话内容"]
+            and normalized[:1] == ["暂无"]
+            and "暂无对话内容" not in normalized
+        ):
+            try:
+                control.Delete(1)
+                for label in normalized[1:]:
+                    control.Append(label)
+                if normalized and selected_idx is not None:
+                    control.SetSelection(max(0, min(int(selected_idx), len(normalized) - 1)))
+                cache[cache_key] = normalized_tuple
+                return True
+            except Exception:
+                control.Clear()
+                for label in normalized:
+                    control.Append(label)
+                cache[cache_key] = normalized_tuple
+                return True
+        common = min(len(current_labels), len(normalized))
+        for idx in range(common):
+            if current_labels[idx] == normalized[idx]:
+                continue
+            try:
+                control.SetString(idx, normalized[idx])
+            except Exception:
+                try:
+                    control.Delete(idx)
+                    control.Insert(normalized[idx], idx)
+                except Exception:
+                    control.Clear()
+                    for label in normalized:
+                        control.Append(label)
+                    break
+        else:
+            if len(current_labels) > len(normalized):
+                for idx in range(len(current_labels) - 1, len(normalized) - 1, -1):
+                    try:
+                        control.Delete(idx)
+                    except Exception:
+                        control.Clear()
+                        for label in normalized:
+                            control.Append(label)
+                        break
+            elif len(normalized) > len(current_labels):
+                for label in normalized[len(current_labels):]:
+                    control.Append(label)
         if normalized and selected_idx is not None:
             try:
                 control.SetSelection(max(0, min(int(selected_idx), len(normalized) - 1)))
