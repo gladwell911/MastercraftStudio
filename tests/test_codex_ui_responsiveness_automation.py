@@ -200,6 +200,46 @@ def test_real_ui_answer_list_down_at_end_does_not_reset_selection(frame, wx_app,
     assert frame.answer_list.GetSelection() == last_row
 
 
+def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = "chat-answer-viewer"
+    frame.current_chat_id = "chat-answer-viewer"
+    frame.active_session_turns = [
+        {
+            "question": "question",
+            "answer_md": "## 标题\n\n第一段\n\n第二段",
+            "model": main.DEFAULT_MODEL_ID,
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-answer-viewer", "turns": frame.active_session_turns}
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
+
+    frame._render_answer_list()
+    answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer")
+    frame.answer_list.SetSelection(answer_row)
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    _send_window_key(frame.answer_list, main.wx.WXK_RETURN)
+    wx_app.Yield()
+
+    assert opened_viewer == [("回答详情", "标题\n\n第一段\n\n第二段")]
+    assert opened_web == []
+    assert frame.answer_list.HasFocus()
+
+    shift_enter = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
+    shift_enter.SetKeyCode(main.wx.WXK_RETURN)
+    shift_enter.SetShiftDown(True)
+    frame.answer_list.ProcessEvent(shift_enter)
+    wx_app.Yield()
+
+    assert opened_web == [True]
+
+
 def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-speed"
@@ -277,7 +317,7 @@ def test_real_ui_completion_focuses_latest_answer_item(frame, wx_app, monkeypatc
     )
 
 
-def test_real_ui_f1_focuses_execution_latest_and_enter_opens_detail(frame, wx_app, monkeypatch):
+def test_real_ui_f1_focuses_execution_latest_enter_opens_text_and_shift_enter_opens_detail(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-execution-focus"
     frame.current_chat_id = "chat-execution-focus"
@@ -290,10 +330,12 @@ def test_real_ui_f1_focuses_execution_latest_and_enter_opens_detail(frame, wx_ap
             {"event_type": "plan_updated", "display_kind": "plan", "list_text": "second step", "detail_text": "second detail"},
         ],
     }
-    opened = []
+    opened_viewer = []
+    opened_web = []
     sends = []
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_open_local_webpage", lambda path: opened.append(path))
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened_web.append(True) or True)
     monkeypatch.setattr(frame, "_trigger_send", lambda: sends.append(True))
 
     frame.input_edit.SetFocusFromKbd()
@@ -316,9 +358,20 @@ def test_real_ui_f1_focuses_execution_latest_and_enter_opens_detail(frame, wx_ap
     _send_window_key(frame.execution_list, main.wx.WXK_RETURN)
     wx_app.Yield()
 
-    assert len(opened) == 1
+    assert opened_viewer == [("回答详情", "first detail")]
+    assert opened_web == []
     assert sends == []
-    assert frame.GetStatusBar().GetStatusText() == "已打开执行过程详情网页"
+    assert frame.execution_list.HasFocus()
+
+    shift_enter = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
+    shift_enter.SetKeyCode(main.wx.WXK_RETURN)
+    shift_enter.SetShiftDown(True)
+    frame.execution_list.ProcessEvent(shift_enter)
+    wx_app.Yield()
+
+    assert opened_web == [True]
+    assert opened_viewer == [("回答详情", "first detail")]
+    assert sends == []
 
 
 def test_real_ui_f1_focuses_empty_execution_placeholder(frame, wx_app, monkeypatch):
@@ -343,6 +396,59 @@ def test_real_ui_f1_focuses_empty_execution_placeholder(frame, wx_app, monkeypat
         lambda: frame.execution_list.HasFocus()
         and frame.execution_list.GetSelection() == 0
         and frame.execution_list.GetString(0) == "暂无执行过程",
+        timeout=2.0,
+    )
+
+
+def test_real_ui_execution_mode_survives_completion_and_f1_toggles_back(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = "chat-execution-f1-regression"
+    frame.current_chat_id = "chat-execution-f1-regression"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "question",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "openai/gpt-5.2",
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-execution-f1-regression",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "execution step", "detail_text": "detail"}
+        ],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
+
+    frame.input_edit.SetFocusFromKbd()
+    wx_app.Yield()
+    _dispatch_frame_key(frame, main.wx.WXK_F1)
+    wx_app.Yield()
+    assert _yield_until(wx_app, lambda: frame.execution_list.HasFocus(), timeout=2.0)
+
+    frame._on_done(0, "final answer", "", "openai/gpt-5.2", "", "chat-execution-f1-regression")
+    wx_app.Yield()
+    assert frame._current_chat_state["detail_panel_mode"] == "execution"
+    assert frame.execution_list.IsShown()
+    assert frame.execution_list.HasFocus()
+
+    _send_window_key(frame.execution_list, main.wx.WXK_F1)
+    wx_app.Yield()
+    assert _yield_until(
+        wx_app,
+        lambda: frame._current_chat_state["detail_panel_mode"] == "answers"
+        and frame.answer_list.IsShown()
+        and frame.answer_list.HasFocus(),
         timeout=2.0,
     )
 

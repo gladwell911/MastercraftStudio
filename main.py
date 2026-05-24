@@ -29,7 +29,7 @@ import wx.adv
 from aiohttp import ClientSession, ClientTimeout, WSMsgType
 
 from chat_store import ChatStore
-from chat_client import ChatClient, DEFAULT_MODEL
+from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
 from cli_agent_manager import get_default_cli_agent_manager
 from codex_client import (
@@ -148,6 +148,10 @@ EVENT_OBJECT_FOCUS = 0x8005
 EVENT_OBJECT_VALUECHANGE = 0x800E
 OBJID_CLIENT = -4
 CHILDID_SELF = 0
+
+
+def openrouter_api_key_for_app() -> str:
+    return DEFAULT_OPENROUTER_API_KEY
 
 MODEL_IDS = [
     "codex/main",
@@ -399,6 +403,18 @@ def md_to_plain(md_text: str) -> str:
     st = _Stripper()
     st.feed(html)
     return unescape(st.text()).strip()
+
+
+def md_to_plain_preserving_paragraphs(md_text: str) -> str:
+    if not md_text:
+        return ""
+    blocks = re.split(r"\n\s*\n", str(md_text).replace("\r\n", "\n").replace("\r", "\n"))
+    plain_blocks = []
+    for block in blocks:
+        plain = md_to_plain(block).strip()
+        if plain:
+            plain_blocks.append(plain)
+    return "\n\n".join(plain_blocks).strip()
 
 
 def remove_emojis(text: str) -> str:
@@ -730,6 +746,70 @@ class RealtimeCallSettingsDialog(wx.Dialog):
             role=self.role_edit.GetValue().strip() or DEFAULT_REALTIME_CALL_ROLE,
             speech_rate=self.speed_input.GetValue(),
         ).normalized()
+
+
+class AnswerTextViewerDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, title: str, text: str, on_continue: Callable[[], None] | None = None):
+        super().__init__(
+            parent,
+            title=str(title or "文本查看"),
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX,
+        )
+        self._on_continue = on_continue
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        self.text_ctrl = wx.TextCtrl(
+            panel,
+            value=str(text or ""),
+            style=wx.TE_MULTILINE | wx.TE_RICH2,
+        )
+        self.text_ctrl.SetName("文本内容")
+        root.Add(self.text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.AddStretchSpacer(1)
+        self.close_button = wx.Button(panel, wx.ID_CLOSE, "关闭")
+        self.continue_button = wx.Button(panel, label="继续")
+        btn_row.Add(self.close_button, 0, wx.RIGHT, 8)
+        btn_row.Add(self.continue_button, 0)
+        root.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        panel.SetSizer(root)
+        self.close_button.MoveAfterInTabOrder(self.text_ctrl)
+        self.continue_button.MoveAfterInTabOrder(self.close_button)
+        self.close_button.Bind(wx.EVT_BUTTON, self._on_close)
+        self.continue_button.Bind(wx.EVT_BUTTON, self._on_continue_clicked)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.SetMinSize((720, 480))
+        self.SetSize(parent.GetSize() if parent is not None else (1024, 768))
+        try:
+            self.Maximize(True)
+        except Exception:
+            pass
+        self.text_ctrl.SetFocus()
+
+    def _on_close(self, _event=None):
+        self._finish(wx.ID_CLOSE)
+
+    def _on_continue_clicked(self, _event=None):
+        if callable(self._on_continue):
+            self._on_continue()
+        self._finish(wx.ID_OK)
+
+    def _finish(self, code: int) -> None:
+        if self.IsModal() or bool(getattr(self, "_shown_modally", False)):
+            try:
+                self.EndModal(code)
+                return
+            except Exception:
+                pass
+        self.Close()
+
+    def _on_char_hook(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self._on_close()
+            return
+        event.Skip()
 
 
 class CodexUserInputDialog(wx.Dialog):
@@ -1543,6 +1623,7 @@ class ChatFrame(wx.Frame):
                 active["execution_steps"] = active_steps
                 store.upsert_chat(active)
                 self._persist_dirty_chat_turns(store, active_id, active["turns"])
+                self._persist_initial_execution_steps_if_needed(store, active_id, active_steps)
         for chat in self.archived_chats:
             if not isinstance(chat, dict):
                 continue
@@ -1552,6 +1633,35 @@ class ChatFrame(wx.Frame):
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
                 self._persist_dirty_chat_turns(store, chat_id, chat.get("turns") or [])
+            steps = chat.get("execution_steps") if isinstance(chat.get("execution_steps"), list) else []
+            self._persist_initial_execution_steps_if_needed(store, chat_id, steps)
+
+    def _persist_initial_execution_steps_if_needed(self, store, chat_id: str, steps: list) -> None:
+        if not steps:
+            return
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        has_steps = False
+        load_recent = getattr(store, "load_recent_execution_steps", None)
+        if callable(load_recent):
+            try:
+                total, _rows = load_recent(normalized, limit=1)
+                has_steps = int(total or 0) > 0
+            except Exception:
+                has_steps = False
+        else:
+            load_steps = getattr(store, "load_execution_steps", None)
+            if callable(load_steps):
+                try:
+                    has_steps = bool(load_steps(normalized))
+                except Exception:
+                    has_steps = False
+        if has_steps:
+            return
+        replace_steps = getattr(store, "replace_execution_steps", None)
+        if callable(replace_steps):
+            replace_steps(normalized, list(steps or []))
 
     def _mark_chat_turns_dirty(self, chat_id: str | None = None, start_index: int = 0) -> None:
         normalized = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
@@ -2157,7 +2267,7 @@ class ChatFrame(wx.Frame):
         for _ in range(3):
             try:
                 client = ChatClient(
-                    api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+                    api_key=openrouter_api_key_for_app(),
                     model="doubao-2.0-mini",
                     timeout=15,
                 )
@@ -3050,8 +3160,7 @@ class ChatFrame(wx.Frame):
 
     def _current_codex_service_tier(self) -> str:
         if threading.current_thread() is threading.main_thread() and hasattr(self, "codex_speed_combo"):
-            value = self.codex_speed_combo.GetValue()
-            return normalize_codex_service_tier(value)
+            return normalize_codex_service_tier(self.codex_speed_combo.GetValue())
         return self._codex_service_tier_for_chat(self._visible_codex_speed_chat())
 
     def _sync_codex_speed_combo_enabled_for_model(self, model: str | None = None) -> None:
@@ -3084,7 +3193,30 @@ class ChatFrame(wx.Frame):
             chat["codex_service_tier"] = tier
         if chat is getattr(self, "_current_chat_state", None):
             self._current_chat_state["codex_service_tier"] = tier
+        self._invalidate_remote_state_cache()
         return tier
+
+    @staticmethod
+    def _codex_service_tier_options_payload() -> list[dict]:
+        return [
+            {"value": "standard", "label": codex_service_tier_label("standard")},
+            {"value": "fast", "label": codex_service_tier_label("fast")},
+        ]
+
+    def _codex_speed_payload_for_chat(self, chat: dict | None) -> dict:
+        tier = self._codex_service_tier_for_chat(chat) or "standard"
+        return {
+            "codex_service_tier": tier,
+            "codex_service_tier_label": codex_service_tier_label(tier),
+            "codex_service_tier_options": self._codex_service_tier_options_payload(),
+        }
+
+    def _chat_id_for_speed_chat(self, chat: dict | None) -> str:
+        if isinstance(chat, dict):
+            chat_id = str(chat.get("id") or chat.get("chat_id") or "").strip()
+            if chat_id:
+                return chat_id
+        return str(self.active_chat_id or self.current_chat_id or "").strip()
 
     def _on_codex_speed_changed(self, _):
         chat = self._visible_codex_speed_chat()
@@ -3097,6 +3229,7 @@ class ChatFrame(wx.Frame):
         if self.codex_speed_combo.GetValue() != label:
             self.codex_speed_combo.SetValue(label)
         self._defer_chat_state_save()
+        self._push_remote_state(self._chat_id_for_speed_chat(chat))
         suffix = "，将在下一条 Codex 请求生效" if bool(getattr(self, "is_running", False)) else ""
         self.SetStatusText(f"Codex 速度已切换为{codex_service_tier_label(tier)}{suffix}")
         return
@@ -5710,6 +5843,7 @@ class ChatFrame(wx.Frame):
                 "active": False,
                 "pinned": False,
                 "detail_panel_mode": "answers",
+                **self._codex_speed_payload_for_chat(None),
             }
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         turn_count = len(turns) if turns else int(chat.get("turn_count") or 0)
@@ -5737,6 +5871,7 @@ class ChatFrame(wx.Frame):
             "active": bool(chat_id) and chat_id == current_id,
             "pinned": bool(chat.get("pinned")),
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
+            **self._codex_speed_payload_for_chat(chat),
         }
 
     def _remote_execution_step_payload(self, chat: dict, *, include_execution_steps: bool = False) -> tuple[list, int]:
@@ -5763,6 +5898,7 @@ class ChatFrame(wx.Frame):
                 "execution_steps": [],
                 "execution_step_count": 0,
                 "turns": [],
+                **self._codex_speed_payload_for_chat(None),
             }
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         execution_steps, execution_step_count = self._remote_execution_step_payload(
@@ -5796,6 +5932,7 @@ class ChatFrame(wx.Frame):
             "execution_steps": execution_steps,
             "execution_step_count": execution_step_count,
             "turns": [self._remote_turn_payload(turn) for turn in turns if isinstance(turn, dict)],
+            **self._codex_speed_payload_for_chat(chat),
         }
 
     def _remote_chat_snapshot_page(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
@@ -5888,6 +6025,7 @@ class ChatFrame(wx.Frame):
         chat["title_source"] = str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default"))
         chat["title_updated_at"] = float(chat.get("title_updated_at") or chat["updated_at"])
         chat["title_revision"] = int(chat.get("title_revision") or 1)
+        chat.update(self._codex_speed_payload_for_chat(chat))
         return chat
 
     def _codex_answer_filter_menu_label(self) -> str:
@@ -6432,6 +6570,60 @@ class ChatFrame(wx.Frame):
             "accepted": True,
             "settings": {"codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled},
         }
+
+    def _chat_for_remote_speed_payload(self, payload: dict | None = None) -> tuple[str, dict | None]:
+        payload = payload or {}
+        chat_id = str(payload.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
+        if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
+            if not isinstance(getattr(self, "_current_chat_state", None), dict):
+                self._current_chat_state = {}
+            if chat_id and not self._current_chat_state.get("id"):
+                self._current_chat_state["id"] = chat_id
+            return chat_id or str(self.active_chat_id or self.current_chat_id or "").strip(), self._current_chat_state
+        chat = self._find_archived_chat(chat_id)
+        return chat_id, chat if isinstance(chat, dict) else None
+
+    def _remote_speed_state_body(self, chat_id: str, chat: dict | None) -> dict:
+        if isinstance(chat, dict):
+            status, body = self._remote_api_state_ui({"chat_id": chat_id or self._chat_id_for_speed_chat(chat)})
+            if status < 400:
+                body.update(self._codex_speed_payload_for_chat(chat))
+                return body
+        return {
+            "accepted": True,
+            "chat_id": chat_id,
+            "status": "idle",
+            "request_kind": "",
+            "turns": [],
+            **self._codex_speed_payload_for_chat(chat),
+        }
+
+    def _remote_api_speed_options_ui(self, payload: dict) -> tuple[int, dict]:
+        chat_id, chat = self._chat_for_remote_speed_payload(payload)
+        if not isinstance(chat, dict):
+            return 404, {"accepted": False, "error": "not_found"}
+        return 200, self._remote_speed_state_body(chat_id, chat)
+
+    def _remote_api_set_speed_ui(self, payload: dict) -> tuple[int, dict]:
+        chat_id, chat = self._chat_for_remote_speed_payload(payload)
+        if not isinstance(chat, dict):
+            return 404, {"accepted": False, "error": "not_found"}
+        requested = (
+            payload.get("codex_service_tier")
+            or payload.get("value")
+            or payload.get("speed")
+            or ""
+        )
+        tier = normalize_codex_service_tier(requested)
+        if not tier:
+            return 400, {"accepted": False, "error": "invalid_speed"}
+        self._set_codex_service_tier_for_chat(chat, tier)
+        if chat is getattr(self, "_current_chat_state", None) or chat_id in {self.active_chat_id, self.current_chat_id}:
+            self._sync_codex_speed_combo_from_chat(chat)
+        self._save_state()
+        self._refresh_history(chat_id)
+        self._push_remote_state(chat_id)
+        return 200, self._remote_speed_state_body(chat_id, chat)
 
     def _handle_remote_pending_request_reply(self, text: str) -> tuple[bool, str]:
         pending = self.active_codex_pending_request
@@ -7029,6 +7221,8 @@ class ChatFrame(wx.Frame):
                     on_state=lambda payload: self._run_remote_ui_route(self._remote_api_state_ui, payload),
                     on_rename_chat=lambda payload: self._run_remote_ui_route(self._remote_api_rename_chat_ui, payload),
                     on_update_settings=lambda payload: self._run_remote_ui_route(self._remote_api_update_settings_ui, payload),
+                    on_speed_options=lambda payload: self._run_remote_ui_route(self._remote_api_speed_options_ui, payload),
+                    on_set_speed=lambda payload: self._run_remote_ui_route(self._remote_api_set_speed_ui, payload),
                     on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
@@ -7694,7 +7888,12 @@ class ChatFrame(wx.Frame):
             and not ctrl_down
             and not alt_down
         ):
-            if self._try_open_selected_answer_detail():
+            shift_down = getattr(event, "ShiftDown", None)
+            if callable(shift_down) and shift_down():
+                handled = self._try_open_selected_answer_detail()
+            else:
+                handled = self._open_selected_answer_text_viewer()
+            if handled:
                 return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
@@ -7703,8 +7902,13 @@ class ChatFrame(wx.Frame):
             and not ctrl_down
             and not alt_down
         ):
-            self._try_open_selected_execution_detail()
-            return
+            shift_down = getattr(event, "ShiftDown", None)
+            if callable(shift_down) and shift_down():
+                handled = self._try_open_selected_execution_detail()
+            else:
+                handled = self._open_selected_execution_text_viewer()
+            if handled:
+                return
         if key == wx.WXK_F1 and not ctrl_down and not alt_down:
             self._toggle_detail_panel_mode(focus_detail=True)
             return
@@ -7728,8 +7932,8 @@ class ChatFrame(wx.Frame):
 
     def _event_control_down(self, event) -> bool:
         ctrl_down = getattr(event, "ControlDown", None)
-        if callable(ctrl_down) and bool(ctrl_down()):
-            return True
+        if callable(ctrl_down):
+            return bool(ctrl_down())
         try:
             return bool(wx.GetKeyState(wx.WXK_CONTROL))
         except Exception:
@@ -7737,8 +7941,8 @@ class ChatFrame(wx.Frame):
 
     def _event_alt_down(self, event) -> bool:
         alt_down = getattr(event, "AltDown", None)
-        if callable(alt_down) and bool(alt_down()):
-            return True
+        if callable(alt_down):
+            return bool(alt_down())
         try:
             return bool(wx.GetKeyState(wx.WXK_ALT))
         except Exception:
@@ -8297,7 +8501,7 @@ class ChatFrame(wx.Frame):
         elif is_claudecode_model(resolved_model) and source == "local":
             self._start_claudecode_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, worker_question, self.active_claudecode_session_id)
         else:
-            t = threading.Thread(target=self._worker, args=(os.getenv("OPENROUTER_API_KEY", "").strip(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
+            t = threading.Thread(target=self._worker, args=(openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
             t.start()
         return True, ""
 
@@ -8571,7 +8775,7 @@ class ChatFrame(wx.Frame):
         return False
 
     def _optimize_voice_text(self, text: str) -> str:
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        api_key = openrouter_api_key_for_app()
         if not api_key:
             return sanitize_optimized_text(text)
         try:
@@ -8979,6 +9183,8 @@ class ChatFrame(wx.Frame):
         return self._context_usage_pending_key(chat_id, turn_idx)
 
     def _focus_latest_answer(self):
+        if self._detail_panel_mode() != "answers":
+            return
         if not self._can_focus_completion_result():
             return
         for i in range(len(self.answer_meta) - 1, -1, -1):
@@ -9050,7 +9256,7 @@ class ChatFrame(wx.Frame):
                     break
         if not is_visible_model_id(model_snapshot):
             model_snapshot = self._resolve_current_model()
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip() if (not quick_title) else ""
+        api_key = openrouter_api_key_for_app() if (not quick_title) else ""
         title_manual = self._current_chat_state.get("title_manual")
         if isinstance(title_manual, str):
             title_manual = title_manual.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -9213,6 +9419,7 @@ class ChatFrame(wx.Frame):
         key = event.GetKeyCode()
         ctrl = self._event_control_down(event)
         alt = self._event_alt_down(event)
+        shift = bool(getattr(event, "ShiftDown", lambda: False)())
         if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
             if self._move_answer_list_selection_for_key(key):
                 return
@@ -9234,7 +9441,8 @@ class ChatFrame(wx.Frame):
             return
         item_type, turn_idx, plain, _ = self.answer_meta[idx]
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self._try_open_selected_answer_detail():
+            handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
+            if handled:
                 return
         event.Skip()
 
@@ -9284,7 +9492,9 @@ class ChatFrame(wx.Frame):
     def _on_answer_char(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self._try_open_selected_answer_detail():
+            shift = bool(getattr(event, "ShiftDown", lambda: False)())
+            handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
+            if handled:
                 return
         ch = self._extract_committed_char(event)
         if ch:
@@ -9292,11 +9502,15 @@ class ChatFrame(wx.Frame):
         event.Skip()
 
     def _on_answer_activate(self, _event):
-        self._try_open_selected_answer_detail()
+        self._open_selected_answer_text_viewer()
 
     def _on_execution_key_down(self, event):
         key = event.GetKeyCode()
         ctrl = event.ControlDown()
+        alt = self._event_alt_down(event)
+        if key == wx.WXK_F1 and not ctrl and not alt:
+            self._toggle_detail_panel_mode(focus_detail=True)
+            return
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
@@ -9304,8 +9518,10 @@ class ChatFrame(wx.Frame):
         if self._handle_primary_tab_navigation(event):
             return
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            self._on_execution_activate(event)
-            return
+            shift = bool(getattr(event, "ShiftDown", lambda: False)())
+            handled = self._try_open_selected_execution_detail() if shift else self._open_selected_execution_text_viewer()
+            if handled:
+                return
         if ctrl and key in (ord("C"), ord("c")):
             idx = self.execution_list.GetSelection()
             if idx != wx.NOT_FOUND and wx.TheClipboard.Open():
@@ -9328,15 +9544,17 @@ class ChatFrame(wx.Frame):
     def _on_execution_char(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            self._on_execution_activate(event)
-            return
+            shift = bool(getattr(event, "ShiftDown", lambda: False)())
+            handled = self._try_open_selected_execution_detail() if shift else self._open_selected_execution_text_viewer()
+            if handled:
+                return
         ch = self._extract_committed_char(event)
         if ch:
             self._queue_answer_char_redirect(ch)
         event.Skip()
 
     def _on_execution_activate(self, _event):
-        self._try_open_selected_execution_detail()
+        self._open_selected_execution_text_viewer()
 
     def _try_open_selected_execution_detail(self) -> bool:
         if self._detail_panel_mode() != "execution":
@@ -9388,6 +9606,105 @@ class ChatFrame(wx.Frame):
             wx.MessageBox("打开详情网页失败。", "提示", wx.OK | wx.ICON_WARNING)
             return False
         return True
+
+    def _selected_execution_text_viewer_content(self) -> tuple[str, str] | None:
+        if self._detail_panel_mode() != "execution":
+            return None
+        idx = self.execution_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.execution_meta):
+            return None
+        item_type, step_idx, row_text, detail_text = self.execution_meta[idx]
+        if item_type == "more":
+            self._show_more_execution_rows()
+            try:
+                if self.execution_list.GetCount() > 0:
+                    self.execution_list.SetSelection(0)
+            except Exception:
+                pass
+            return None
+        if item_type != "execution" or step_idx < 0:
+            return None
+        source = str(detail_text or row_text or "")
+        text = remove_emojis(md_to_plain_preserving_paragraphs(source)).strip()
+        if not text:
+            return None
+        return "回答详情", text
+
+    def _open_selected_execution_text_viewer(self) -> bool:
+        idx = self.execution_list.GetSelection()
+        if idx != wx.NOT_FOUND and idx < len(self.execution_meta) and self.execution_meta[idx][0] == "more":
+            self._show_more_execution_rows()
+            try:
+                if self.execution_list.GetCount() > 0:
+                    self.execution_list.SetSelection(0)
+            except Exception:
+                pass
+            return True
+        content = self._selected_execution_text_viewer_content()
+        if not content:
+            return False
+        title, text = content
+        return self._open_answer_text_viewer(title, text)
+
+    def _selected_answer_text_viewer_content(self) -> tuple[str, str] | None:
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
+            return None
+        item_type, turn_idx, plain, detail = self.answer_meta[idx]
+        if item_type not in ("question", "answer"):
+            return None
+        turns = self._get_view_turns()
+        turn = turns[turn_idx] if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict) else {}
+        if item_type == "question":
+            source = str((turn or {}).get("question") or detail or plain or "")
+            title = "回答详情"
+        else:
+            answer_md = str((turn or {}).get("answer_md") or detail or plain or "")
+            if not answer_md or answer_md == REQUESTING_TEXT:
+                return None
+            model = str((turn or {}).get("model") or self.selected_model or "")
+            source = self._answer_markdown_for_output(answer_md, model)
+            title = "回答详情"
+        text = remove_emojis(md_to_plain_preserving_paragraphs(source)).strip()
+        if not text:
+            text = remove_emojis(str(detail or plain or "")).strip()
+        if not text:
+            return None
+        return title, text
+
+    def _open_answer_text_viewer(self, title: str, text: str) -> bool:
+        dlg = AnswerTextViewerDialog(self, title, text, on_continue=self._continue_from_answer_text_viewer)
+        try:
+            dlg._shown_modally = True
+            dlg.ShowModal()
+        finally:
+            try:
+                dlg.Destroy()
+            except RuntimeError:
+                pass
+        return True
+
+    def _open_selected_answer_text_viewer(self) -> bool:
+        idx = self.answer_list.GetSelection()
+        if idx != wx.NOT_FOUND and idx < len(self.answer_meta) and self.answer_meta[idx][0] == "more":
+            self._show_more_answer_rows()
+            try:
+                if self.answer_list.GetCount() > 0:
+                    self.answer_list.SetSelection(0)
+            except Exception:
+                pass
+            return True
+        content = self._selected_answer_text_viewer_content()
+        if not content:
+            return False
+        title, text = content
+        return self._open_answer_text_viewer(title, text)
+
+    def _continue_from_answer_text_viewer(self) -> None:
+        prompt = "好的，继续"
+        if hasattr(self, "input_edit") and self.input_edit is not None:
+            self.input_edit.SetValue(prompt)
+        self._submit_question(prompt, source="local")
 
     def _try_open_selected_answer_detail(self) -> bool:
         idx = self.answer_list.GetSelection()
@@ -9505,8 +9822,8 @@ class ChatFrame(wx.Frame):
         if selected_id in current_ids:
             self.view_mode = "active"
             self.view_history_id = None
-            self._render_answer_list()
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
+            self._render_answer_list()
             self._refresh_history(selected_id)
             self._save_state()
             if focus_answer_list:
@@ -9520,8 +9837,8 @@ class ChatFrame(wx.Frame):
             return False
         self.view_mode = "history"
         self.view_history_id = selected_id
-        self._render_answer_list()
         self._apply_selected_chat_model_to_combo(chat)
+        self._render_answer_list()
         self._refresh_history(selected_id)
         self._save_state()
         self.SetStatusText("已切换到历史聊天")
@@ -9655,10 +9972,10 @@ class ChatFrame(wx.Frame):
         if not resolved_model:
             resolved_model = self.selected_model if is_visible_model_id(self.selected_model) else DEFAULT_MODEL_ID
         self.selected_model = resolved_model
+        self._current_chat_state["model"] = resolved_model
         if threading.current_thread() is threading.main_thread():
             self.model_combo.SetValue(model_display_name(self.selected_model))
             self._sync_codex_speed_combo_from_chat(self._current_chat_state)
-        self._current_chat_state["model"] = resolved_model
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
         self._reset_answer_visible_row_limit()
@@ -9774,6 +10091,7 @@ class ChatFrame(wx.Frame):
                 "send_button",
                 "new_chat_button",
                 "model_combo",
+                "codex_speed_combo",
                 "history_list",
                 "notes_notebook_list",
                 "notes_entry_list",

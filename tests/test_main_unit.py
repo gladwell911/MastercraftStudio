@@ -76,12 +76,6 @@ def test_model_combo_order_prioritizes_cli_models(frame):
     ]
 
 
-def test_codex_speed_combo_defaults_to_standard(frame):
-    assert frame.codex_speed_combo.GetValue() == "标准"
-    assert frame.codex_speed_combo.IsEnabled() is True
-    assert frame._current_codex_service_tier() == ""
-
-
 def test_codex_speed_combo_uses_short_accessible_label(frame):
     def _static_text_labels(window):
         labels = []
@@ -96,6 +90,7 @@ def test_codex_speed_combo_uses_short_accessible_label(frame):
     assert "速度：" in labels
     assert "Codex速度：" not in labels
     assert frame.codex_speed_combo.GetName() == "速度"
+
 
 def test_codex_speed_combo_change_defers_save_and_preserves_focus(frame, monkeypatch):
     frame.selected_model = main.DEFAULT_CODEX_MODEL
@@ -133,6 +128,7 @@ def test_codex_speed_combo_change_defers_save_and_preserves_focus(frame, monkeyp
     assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
     assert frame.codex_speed_combo.HasFocus()
     assert statuses == ["Codex 速度已切换为快速"]
+
 
 def test_codex_speed_combo_change_noops_when_value_is_unchanged(frame, monkeypatch):
     frame.selected_model = main.DEFAULT_CODEX_MODEL
@@ -1725,6 +1721,30 @@ def test_send_click_still_sends_while_running(frame, monkeypatch):
     assert len(frame.active_session_turns) == 2
     assert frame.active_session_turns[-1]["question"] == "第二条"
     assert frame.active_session_turns[-1]["answer_md"] == "第二条"
+
+
+def test_submit_openrouter_model_uses_embedded_key_when_env_has_stale_key(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "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")
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args, **kwargs: None)
+    started = {}
+
+    class _CaptureThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            started["target"] = target
+            started["args"] = args
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _CaptureThread)
+
+    ok, message = frame._submit_question("测试 Claude", source="local", model="anthropic/claude-sonnet-4.6")
+
+    assert ok is True
+    assert message == ""
+    assert started["args"][0] == main.DEFAULT_OPENROUTER_API_KEY
 
 
 def test_submit_question_renders_question_immediately_without_stealing_focus(frame, monkeypatch):
@@ -6359,6 +6379,184 @@ def test_detail_page_split_question_and_answer(frame):
     assert "问题详情" not in a_html
 
 
+def test_answer_enter_opens_plain_text_viewer_instead_of_web_detail(frame, monkeypatch):
+    frame.active_session_turns = [
+        {
+            "question": "测试问题",
+            "answer_md": "## 标题\n\n第一段 **加粗**。\n\n第二段",
+            "model": main.DEFAULT_MODEL_ID,
+            "created_at": time.time(),
+        }
+    ]
+    frame.view_mode = "active"
+    frame._render_answer_list()
+    answer_row = next(i for i, m in enumerate(frame.answer_meta) if m[0] == "answer")
+    frame.answer_list.SetSelection(answer_row)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Enter should be handled")
+
+    frame._on_answer_key_down(E())
+
+    assert opened_web == []
+    assert opened_viewer == [("回答详情", "标题\n\n第一段 加粗。\n\n第二段")]
+
+
+def test_answer_shift_enter_keeps_web_detail_shortcut(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "plain", "detail")]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("answer row")
+    frame.answer_list.SetSelection(0)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_selected_answer_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return True
+
+        def Skip(self):
+            raise AssertionError("Shift+Enter should be handled")
+
+    frame._on_answer_key_down(E())
+
+    assert opened_viewer == []
+    assert opened_web == [True]
+
+
+def test_answer_char_hook_enter_opens_plain_text_viewer(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "plain", "detail")]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("answer row")
+    frame.answer_list.SetSelection(0)
+    monkeypatch.setattr(frame.answer_list, "HasFocus", lambda: True)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_selected_answer_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Enter should be handled")
+
+    frame._on_char_hook(E())
+
+    assert opened_viewer == [True]
+    assert opened_web == []
+
+
+def test_answer_char_hook_shift_enter_opens_web_detail(frame, monkeypatch):
+    frame.answer_meta = [("answer", 0, "plain", "detail")]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("answer row")
+    frame.answer_list.SetSelection(0)
+    monkeypatch.setattr(frame.answer_list, "HasFocus", lambda: True)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_selected_answer_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return True
+
+        def Skip(self):
+            raise AssertionError("Shift+Enter should be handled")
+
+    frame._on_char_hook(E())
+
+    assert opened_viewer == []
+    assert opened_web == [True]
+
+
+def test_answer_text_viewer_continue_submits_expected_prompt(frame, monkeypatch):
+    submitted = []
+    frame.input_edit.SetValue("")
+    monkeypatch.setattr(frame, "_submit_question", lambda text, source="local": submitted.append((text, source)) or (True, ""))
+
+    frame._continue_from_answer_text_viewer()
+
+    assert frame.input_edit.GetValue() == "好的，继续"
+    assert submitted == [("好的，继续", "local")]
+
+
+def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
+    continued = []
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "第一段\n\n第二段", on_continue=lambda: continued.append(True))
+    try:
+        closed = []
+        dlg._finish = lambda code: closed.append(code)
+        assert dlg.GetTitle() == "回答详情"
+        assert dlg.text_ctrl.GetValue() == "第一段\n\n第二段"
+        assert dlg.text_ctrl.IsEditable()
+        assert dlg.close_button.GetLabel() == "关闭"
+        assert dlg.continue_button.GetLabel() == "继续"
+        dlg._on_continue_clicked()
+        assert continued == [True]
+        assert closed == [wx.ID_OK]
+
+        class E:
+            def GetKeyCode(self):
+                return wx.WXK_ESCAPE
+
+            def Skip(self):
+                raise AssertionError("Esc should close the viewer")
+
+        dlg._on_char_hook(E())
+        assert closed == [wx.ID_OK, wx.ID_CLOSE]
+    finally:
+        if dlg:
+            dlg.Destroy()
+
+
 def test_try_open_selected_answer_detail_opens_attachment_path(frame, monkeypatch, tmp_path):
     attachment = tmp_path / "report.txt"
     attachment.write_text("attachment body", encoding="utf-8")
@@ -7115,16 +7313,86 @@ def test_f1_focuses_empty_execution_placeholder(frame, monkeypatch):
     assert frame.execution_list.GetString(0) == "暂无执行过程"
 
 
-def test_char_hook_enter_on_execution_list_opens_detail_without_sending(frame, monkeypatch):
+def test_execution_list_keydown_f1_toggles_back_to_answers(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-f1-execution-keydown"
+    frame.current_chat_id = "chat-f1-execution-keydown"
+    frame._current_chat_state = {
+        "id": "chat-f1-execution-keydown",
+        "title": "执行列表 F1",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetFocus()
+
+    class F1KeyDownEvent:
+        def GetKeyCode(self):
+            return wx.WXK_F1
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("F1 should be handled by execution list keydown")
+
+    frame._on_execution_key_down(F1KeyDownEvent())
+
+    assert frame._current_chat_state["detail_panel_mode"] == "answers"
+    assert frame.answer_list.HasFocus()
+
+
+def test_completion_focus_does_not_return_from_execution_to_answer_list(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-execution-completion"
+    frame.current_chat_id = "chat-execution-completion"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-execution-completion",
+        "title": "执行模式完成",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "执行中"}],
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+    monkeypatch.setattr(main.wx, "CallLater", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetFocus()
+
+    frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-execution-completion")
+
+    assert frame._current_chat_state["detail_panel_mode"] == "execution"
+    assert frame.execution_list.IsShown()
+    assert frame.execution_list.HasFocus()
+    assert not frame.answer_list.HasFocus()
+
+
+def test_char_hook_enter_on_execution_list_opens_text_viewer_without_sending(frame, monkeypatch):
     frame.Show()
     frame._current_chat_state["detail_panel_mode"] = "execution"
     frame.execution_list.Set(["执行步骤"])
     frame.execution_meta = [("execution", 0, "执行步骤", "详情")]
     frame.execution_list.SetSelection(0)
     frame.execution_list.SetFocus()
-    opened = []
+    opened_viewer = []
+    opened_web = []
     sends = []
-    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened.append(True) or True)
+    monkeypatch.setattr(frame, "_open_selected_execution_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened_web.append(True) or True)
     monkeypatch.setattr(frame, "_trigger_send", lambda: sends.append(True))
 
     class EnterEvent:
@@ -7142,8 +7410,107 @@ def test_char_hook_enter_on_execution_list_opens_detail_without_sending(frame, m
 
     frame._on_char_hook(EnterEvent())
 
-    assert opened == [True]
+    assert opened_viewer == [True]
+    assert opened_web == []
     assert sends == []
+
+
+def test_execution_enter_opens_plain_text_viewer_instead_of_web_detail(frame, monkeypatch):
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame.execution_list.Set(["执行步骤"])
+    frame.execution_meta = [("execution", 0, "执行步骤", "# 标题\n\n第一段 **加粗**。\n\n第二段")]
+    frame.execution_list.SetSelection(0)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("Enter should be handled")
+
+    frame._on_execution_key_down(E())
+
+    assert opened_viewer == [("回答详情", "标题\n\n第一段 加粗。\n\n第二段")]
+    assert opened_web == []
+
+
+def test_execution_shift_enter_keeps_web_detail_shortcut(frame, monkeypatch):
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame.execution_list.Set(["执行步骤"])
+    frame.execution_meta = [("execution", 0, "执行步骤", "详情")]
+    frame.execution_list.SetSelection(0)
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_selected_execution_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened_web.append(True) or True)
+
+    class E:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return True
+
+        def Skip(self):
+            raise AssertionError("Shift+Enter should be handled")
+
+    frame._on_execution_key_down(E())
+
+    assert opened_viewer == []
+    assert opened_web == [True]
+
+
+def test_char_hook_shift_enter_on_execution_list_opens_web_detail(frame, monkeypatch):
+    frame.Show()
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame.execution_list.Set(["执行步骤"])
+    frame.execution_meta = [("execution", 0, "执行步骤", "详情")]
+    frame.execution_list.SetSelection(0)
+    frame.execution_list.SetFocus()
+    opened_viewer = []
+    opened_web = []
+    monkeypatch.setattr(frame, "_open_selected_execution_text_viewer", lambda: opened_viewer.append(True) or True)
+    monkeypatch.setattr(frame, "_try_open_selected_execution_detail", lambda: opened_web.append(True) or True)
+
+    class EnterEvent:
+        def GetKeyCode(self):
+            return wx.WXK_RETURN
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return True
+
+        def Skip(self):
+            raise AssertionError("Shift+Enter should be handled by execution list")
+
+    frame._on_char_hook(EnterEvent())
+
+    assert opened_viewer == []
+    assert opened_web == [True]
 
 
 def test_on_done_focuses_latest_answer_item(frame, monkeypatch):
@@ -7899,7 +8266,6 @@ def test_bind_events_registers_both_hotkey_ids():
             self.new_chat_button = _Ctrl("new_chat_button")
             self.notes_button = _Ctrl("notes_button")
             self.model_combo = _Ctrl("model_combo")
-            self.codex_speed_combo = _Ctrl("codex_speed_combo")
             self.input_edit = _Ctrl("input_edit")
             self.answer_list = _Ctrl("answer_list")
             self.execution_list = _Ctrl("execution_list")
@@ -7923,14 +8289,9 @@ def test_bind_events_registers_both_hotkey_ids():
             self.notes_editor = _Ctrl("notes_editor")
             self.notes_save_button = _Ctrl("notes_save_button")
             self.notes_cancel_button = _Ctrl("notes_cancel_button")
-            self._chat_navigation_left_id = 101
-            self._chat_navigation_right_id = 102
 
         def Bind(self, _event, _handler, id=None):
             frame_bind_calls.append(id)
-
-        def SetAcceleratorTable(self, *_args):
-            return None
 
         def _on_send_clicked(self, *_args):
             return None
@@ -7942,9 +8303,6 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_model_changed(self, *_args):
-            return None
-
-        def _on_codex_speed_changed(self, *_args):
             return None
 
         def _on_input_key_down(self, *_args):
@@ -7963,12 +8321,6 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_global_hotkey(self, *_args):
-            return None
-
-        def _on_frame_key_down(self, *_args):
-            return None
-
-        def _on_generic_key_down(self, *_args):
             return None
 
         def _on_any_key_down_escape_minimize(self, *_args):
@@ -8022,9 +8374,6 @@ def test_bind_events_registers_both_hotkey_ids():
         def _on_notes_editor_changed(self, *_args):
             return None
 
-        def _navigate_history_chats(self, *_args):
-            return None
-
     dummy = _DummyFrame()
     main.ChatFrame._bind_events(dummy)
 
@@ -8036,7 +8385,6 @@ def test_bind_events_registers_both_hotkey_ids():
     assert main.wx.EVT_KEY_UP in control_bindings["send_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["new_chat_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["model_combo"]
-    assert main.wx.EVT_KEY_UP in control_bindings["codex_speed_combo"]
     assert main.wx.EVT_KEY_UP in control_bindings["answer_list"]
     assert main.wx.EVT_KEY_UP in control_bindings["execution_list"]
     assert main.wx.EVT_KEY_UP in control_bindings["history_list"]
@@ -10925,13 +11273,14 @@ def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, m
             return {"turn": {"id": "turn-fast"}}
 
     monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
-    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
     frame._run_codex_turn_worker("chat-current", 0, "快速执行", "codex/main")
 
     assert seen["thread"][0]["service_tier"] == "fast"
     assert seen["turn"][0][2]["service_tier"] == "fast"
+    assert frame.active_session_turns[0]["codex_service_tier"] == "fast"
 
 
 def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monkeypatch):
@@ -11095,26 +11444,6 @@ def test_codex_slash_command_is_handled_locally_without_starting_turn(frame, mon
     assert frame.active_session_turns[0]["request_status"] == "pending"
 
 
-def test_submit_codex_turn_records_current_service_tier(frame, monkeypatch):
-    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
-    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
-    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
-    frame.active_chat_id = "chat-current"
-    frame.current_chat_id = "chat-current"
-    frame._current_chat_state["id"] = "chat-current"
-    frame.selected_model = main.DEFAULT_CODEX_MODEL
-    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
-    frame._current_chat_state["codex_service_tier"] = "fast"
-    frame._sync_codex_speed_combo_from_chat(frame._current_chat_state)
-
-    ok, message = frame._submit_question("快速问题", source="local", model=main.DEFAULT_CODEX_MODEL)
-
-    assert ok is True
-    assert message == ""
-    assert frame.active_session_turns[-1]["codex_service_tier"] == "fast"
-
-
 def test_codex_status_command_worker_reports_status_without_codex_turn(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -11188,54 +11517,7 @@ def test_codex_help_command_worker_lists_supported_commands(frame, monkeypatch):
     assert len(done) == 1
     assert "/status" in done[0][1]
     assert "/compact" in done[0][1]
-    assert "/speed" in done[0][1]
     assert done[0][2] == ""
-
-
-def test_codex_speed_command_updates_chat_state_without_changing_model(frame, monkeypatch):
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
-    frame.selected_model = main.DEFAULT_CODEX_MODEL
-    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
-    frame._current_chat_state["model"] = main.DEFAULT_CODEX_MODEL
-
-    answer = frame._handle_codex_speed_command("fast", frame._current_chat_state)
-
-    assert "快速" in answer
-    assert frame._current_chat_state["codex_service_tier"] == "fast"
-    assert frame.codex_speed_combo.GetValue() == "快速"
-    assert frame.selected_model == main.DEFAULT_CODEX_MODEL
-    assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
-
-    answer = frame._handle_codex_speed_command("standard", frame._current_chat_state)
-
-    assert "标准" in answer
-    assert frame._current_chat_state["codex_service_tier"] == ""
-    assert frame.codex_speed_combo.GetValue() == "标准"
-
-
-def test_codex_speed_command_reports_current_chat_speed(frame):
-    frame._current_chat_state["codex_service_tier"] = "fast"
-
-    answer = frame._handle_codex_speed_command("", frame._current_chat_state)
-
-    assert "当前速度" in answer
-    assert "快速" in answer
-
-
-def test_codex_speed_command_worker_updates_chat_state(frame, monkeypatch):
-    done = []
-    frame.active_chat_id = "chat-current"
-    frame.current_chat_id = "chat-current"
-    frame._current_chat_state["id"] = "chat-current"
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
-    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
-
-    frame._run_codex_local_command_worker("chat-current", 0, "speed", "fast", "codex/main")
-
-    assert frame._current_chat_state["codex_service_tier"] == "fast"
-    assert frame.codex_speed_combo.GetValue() == "快速"
-    assert "快速" in done[0][1]
 
 
 def test_codex_unknown_slash_command_worker_reports_unsupported_without_starting_turn(frame, monkeypatch):
@@ -12435,7 +12717,6 @@ def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
         "history_list",
         "input_edit",
         "model_combo",
-        "codex_speed_combo",
         "notes_notebook_list",
         "notes_entry_list",
     ):
@@ -12450,7 +12731,6 @@ def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
         "history_list",
         "input_edit",
         "model_combo",
-        "codex_speed_combo",
         "notes_notebook_list",
         "notes_entry_list",
     ):
@@ -12517,6 +12797,7 @@ def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypat
     assert frame.codex_speed_combo.GetValue() == "快速"
     assert frame._current_chat_state["codex_service_tier"] == "fast"
 
+
 def test_remote_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
     frame.selected_model = main.DEFAULT_CODEX_MODEL
     frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
@@ -12532,6 +12813,85 @@ def test_remote_new_chat_preserves_current_codex_speed_combo_selection(frame, mo
     assert result["model"] == main.DEFAULT_CODEX_MODEL
     assert frame.codex_speed_combo.GetValue() == "快速"
     assert frame._current_chat_state["codex_service_tier"] == "fast"
+
+
+def test_remote_state_includes_codex_speed_options_and_current_tier(frame):
+    frame.active_chat_id = "chat-speed"
+    frame.current_chat_id = "chat-speed"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-speed",
+        "title": "speed",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+        "codex_service_tier": "fast",
+    }
+
+    status, body = frame._remote_api_state_ui({"chat_id": "chat-speed"})
+
+    assert status == 200
+    assert body["codex_service_tier"] == "fast"
+    assert body["codex_service_tier_label"] == "快速"
+    assert body["codex_service_tier_options"] == [
+        {"value": "standard", "label": "标准"},
+        {"value": "fast", "label": "快速"},
+    ]
+
+
+def test_remote_set_speed_updates_chat_combo_and_pushes_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-speed"
+    frame.current_chat_id = "chat-speed"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-speed",
+        "title": "speed",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+        "codex_service_tier": "standard",
+    }
+    pushed = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushed.append(chat_id))
+
+    status, body = frame._remote_api_set_speed_ui(
+        {"chat_id": "chat-speed", "codex_service_tier": "fast"}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert pushed == ["chat-speed"]
+
+
+def test_desktop_codex_speed_combo_change_pushes_remote_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-speed"
+    frame.current_chat_id = "chat-speed"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state = {
+        "id": "chat-speed",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "turns": [],
+        "codex_service_tier": "standard",
+    }
+    pushed = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushed.append(chat_id))
+
+    frame.codex_speed_combo.SetValue("快速")
+    frame._on_codex_speed_changed(None)
+
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert pushed == ["chat-speed"]
 
 
 def test_switch_current_chat_restores_chat_level_model_and_combo(frame, monkeypatch):
