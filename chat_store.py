@@ -162,6 +162,25 @@ class ChatStore:
             chat["execution_steps"] = self.load_execution_steps(normalized)
         return chat
 
+    def delete_chat(self, chat_id: str) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM execution_steps WHERE chat_id = ?", (normalized,))
+            conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
+            conn.execute("DELETE FROM chats WHERE id = ?", (normalized,))
+
+    def delete_chats(self, chat_ids: list[str]) -> None:
+        normalized_ids = [str(chat_id or "").strip() for chat_id in chat_ids or []]
+        normalized_ids = [chat_id for chat_id in normalized_ids if chat_id]
+        if not normalized_ids:
+            return
+        with self._connect() as conn:
+            conn.executemany("DELETE FROM execution_steps WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
+            conn.executemany("DELETE FROM turns WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
+            conn.executemany("DELETE FROM chats WHERE id = ?", [(chat_id,) for chat_id in normalized_ids])
+
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:

@@ -986,6 +986,57 @@ def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, mon
     assert frame.answer_list.GetSelection() == 1
 
 
+def test_answer_list_ctrl_c_copies_plain_text_without_markdown_for_any_model(frame, monkeypatch):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    for model in [main.DEFAULT_CODEX_MODEL, main.DEFAULT_CLAUDECODE_MODEL, "openclaw/main", "openai/gpt-5.2"]:
+        frame.selected_model = model
+        frame.active_session_turns = [
+            {
+                "question": "q",
+                "answer_md": "## 标题\n\n第一段 **加粗**。\n\n- 第二段",
+                "model": model,
+                "created_at": time.time(),
+            }
+        ]
+        frame.view_mode = "active"
+        frame._render_answer_list()
+        answer_row = next(i for i, meta in enumerate(frame.answer_meta) if meta[0] == "answer")
+        frame.answer_list.SetSelection(answer_row)
+
+        assert frame._copy_selected_answer_to_clipboard() is True
+
+    assert copied == ["标题\n\n第一段 加粗。\n\n第二段"] * 4
+
+
+def test_execution_list_ctrl_c_copies_plain_text_without_markdown(frame, monkeypatch):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    frame.execution_list.Set(["执行步骤"])
+    frame.execution_meta = [("execution", 0, "执行步骤", "## 标题\n\n第一段 **加粗**。\n\n第二段")]
+    frame.execution_list.SetSelection(0)
+
+    class E:
+        def GetKeyCode(self):
+            return ord("C")
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def StopPropagation(self):
+            pass
+
+        def Skip(self):
+            raise AssertionError("Ctrl+C should be handled")
+
+    frame._on_execution_key_down(E())
+
+    assert copied == ["标题\n\n第一段 加粗。\n\n第二段"]
+
+
 def test_answer_list_down_at_last_row_does_not_reset_selection(frame, monkeypatch):
     frame.answer_meta = [
         ("question", 0, "q", ""),
@@ -10790,6 +10841,91 @@ def test_history_delete_broadcasts_remote_history_changed(frame, monkeypatch):
     assert any(payload.get("type") == "history_changed" for payload in seen)
 
 
+def test_history_delete_removes_chat_from_chat_store(frame, monkeypatch, tmp_path):
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-old", "title": "旧聊天", "updated_at": 1.0, "pinned": False})
+    frame.chat_store.replace_turns("chat-old", [{"question": "q", "answer_md": "a"}])
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame.history_ids = ["chat-old"]
+    frame.history_list.Set(["旧聊天"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+
+    frame._history_delete(None)
+
+    assert frame.chat_store.load_chat("chat-old") is None
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame._refresh_history()
+    assert "chat-old" not in frame.history_ids
+
+
+def test_history_delete_removes_pinned_chat_from_chat_store(frame, monkeypatch, tmp_path):
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-pin", "title": "置顶", "updated_at": 1.0, "pinned": True})
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame.history_ids = ["chat-pin"]
+    frame.history_list.Set(["[置顶] 置顶"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+
+    frame._history_delete(None)
+
+    assert frame.chat_store.load_chat("chat-pin") is None
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame._refresh_history()
+    assert "chat-pin" not in frame.history_ids
+
+
+def test_history_delete_current_chat_removes_it_from_chat_store(frame, monkeypatch, tmp_path):
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [{"question": "q", "answer_md": "a"}]
+    frame._current_chat_state = {"id": "chat-current", "title": "当前", "turns": frame.active_session_turns}
+    frame.chat_store.upsert_chat(frame._current_chat_state)
+    frame.chat_store.replace_turns("chat-current", frame.active_session_turns)
+    frame.history_ids = ["chat-current"]
+    frame.history_list.Set(["当前"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+
+    frame._history_delete(None)
+
+    assert frame.chat_store.load_chat("chat-current") is None
+    assert frame.active_chat_id == ""
+    assert frame.current_chat_id == ""
+    assert frame.active_session_turns == []
+
+
+def test_history_clear_non_pinned_removes_cleared_chats_from_chat_store(frame, monkeypatch, tmp_path):
+    frame.chat_db_path = tmp_path / "chat_history.db"
+    frame.chat_store = main.ChatStore(frame.chat_db_path)
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-old", "title": "旧聊天", "updated_at": 1.0, "pinned": False})
+    frame.chat_store.upsert_chat({"id": "chat-pin", "title": "置顶", "updated_at": 2.0, "pinned": True})
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+
+    frame._history_clear_non_pinned(None)
+
+    assert frame.chat_store.load_chat("chat-old") is None
+    assert frame.chat_store.load_chat("chat-pin") is not None
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame._refresh_history()
+    assert "chat-old" not in frame.history_ids
+    assert "chat-pin" in frame.history_ids
+
+
 def test_history_rename_broadcasts_remote_history_changed(frame, monkeypatch):
     frame.archived_chats = [
         {"id": "chat-old", "title": "旧聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0, "pinned": False}
@@ -10823,6 +10959,54 @@ def test_history_rename_broadcasts_remote_history_changed(frame, monkeypatch):
     frame._history_rename(None)
 
     assert any(payload.get("type") == "history_changed" for payload in seen)
+
+
+def test_history_menu_opens_for_current_chat_row(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update({"id": "chat-current", "title": "当前聊天", "turns": []})
+    frame.history_ids = ["chat-current"]
+    frame.history_list.Set(["当前聊天"])
+    frame.history_list.SetSelection(0)
+    popup = []
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: popup.append(menu.GetMenuItemCount()) or True)
+
+    frame._show_history_menu()
+
+    assert popup == [4]
+
+
+def test_history_rename_current_chat_updates_active_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update({"id": "chat-current", "title": "当前聊天", "turns": []})
+    frame.history_ids = ["chat-current"]
+    frame.history_list.Set(["当前聊天"])
+    frame.history_list.SetSelection(0)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    pushed = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
+
+    class _Dialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def get_value(self):
+            return "新标题"
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(main, "RenameDialog", _Dialog)
+
+    frame._history_rename(None)
+
+    assert frame._current_chat_state["title"] == "新标题"
+    assert frame._current_chat_state["title_manual"] is True
+    assert pushed == ["chat-current"]
 
 
 def test_on_close_marks_current_chat_pending_turns_before_save(frame, monkeypatch):

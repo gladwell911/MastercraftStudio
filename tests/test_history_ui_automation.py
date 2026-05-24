@@ -41,6 +41,33 @@ class _EnterEvent:
         return None
 
 
+class _MenuEvent:
+    def GetKeyCode(self):
+        return main.wx.WXK_MENU
+
+    def Skip(self):
+        raise AssertionError("application key should open history menu")
+
+
+def test_ui_automation_application_menu_opens_for_current_chat(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update({"id": "chat-current", "title": "current", "turns": []})
+    frame._refresh_history("chat-current")
+    frame.history_list.SetFocusFromKbd()
+    frame.history_list.SetSelection(frame.history_ids.index("chat-current"))
+    wx_app.Yield()
+    opened = []
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: opened.append(menu.GetMenuItemCount()) or True)
+
+    frame._on_history_key_down(_MenuEvent())
+    wx_app.Yield()
+
+    assert opened == [4]
+    assert frame.history_ids[frame.history_list.GetSelection()] == "chat-current"
+
+
 def test_ui_automation_primary_tab_sequence_matches_screen_reader_order(frame, wx_app):
     frame.Show()
     notebook = frame.notes_store.create_notebook("tab order")
@@ -277,7 +304,7 @@ def test_ui_automation_history_enter_restores_selected_chat_model_in_combo(frame
     assert frame.answer_list.HasFocus()
 
 
-def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypatch):
+def test_ui_automation_history_enter_restores_selected_chat_codex_speed(frame, monkeypatch):
     frame.Show()
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
 
@@ -287,11 +314,11 @@ def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypat
     frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
     frame.active_session_turns = [
         {
-            "question": "codex fast question",
-            "answer_md": "codex fast answer",
+            "question": "fast codex question",
+            "answer_md": "fast codex answer",
             "model": main.DEFAULT_CODEX_MODEL,
-            "codex_service_tier": "fast",
             "created_at": 2.0,
+            "codex_service_tier": "fast",
         }
     ]
     frame._current_chat_state = {
@@ -305,7 +332,6 @@ def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypat
     }
     frame._sync_codex_speed_combo_from_chat(frame._current_chat_state)
     assert frame.codex_speed_combo.GetValue() == "快速"
-
     frame.archived_chats = [
         {
             "id": "chat-a",
@@ -317,11 +343,11 @@ def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypat
             "updated_at": 1.0,
             "turns": [
                 {
-                    "question": "codex standard question",
-                    "answer_md": "codex standard answer",
+                    "question": "standard codex question",
+                    "answer_md": "standard codex answer",
                     "model": main.DEFAULT_CODEX_MODEL,
-                    "codex_service_tier": "",
                     "created_at": 1.0,
+                    "codex_service_tier": "",
                 }
             ],
         }
@@ -334,6 +360,7 @@ def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypat
 
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-a"
+    assert frame.selected_model == main.DEFAULT_CODEX_MODEL
     assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
     assert frame.codex_speed_combo.GetValue() == "标准"
     assert frame.codex_speed_combo.IsEnabled() is True

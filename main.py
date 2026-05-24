@@ -1912,6 +1912,8 @@ class ChatFrame(wx.Frame):
         if not use_chat_store:
             data["archived_chats"] = self.archived_chats
             data["active_session_turns"] = self.active_session_turns
+        elif not (self.active_chat_id or self.current_chat_id or self.active_session_turns):
+            data["active_session_turns"] = []
         try:
             self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -9454,13 +9456,19 @@ class ChatFrame(wx.Frame):
         if item_type not in ("question", "answer"):
             return False
         source_text = detail if item_type == "answer" and detail else plain
-        cleaned_text = "\n".join(line for line in str(source_text).split("\n") if line.strip())
+        cleaned_text = self._plain_text_for_clipboard(source_text)
         if not cleaned_text:
             return False
         if not self._set_clipboard_text(cleaned_text):
             return False
         self.SetStatusText("已复制")
         return True
+
+    def _plain_text_for_clipboard(self, text: str) -> str:
+        cleaned = remove_emojis(md_to_plain_preserving_paragraphs(str(text or ""))).strip()
+        if cleaned:
+            return cleaned
+        return "\n\n".join(line.strip() for line in str(text or "").splitlines() if line.strip()).strip()
 
     def _move_answer_list_selection_for_key(self, key: int) -> bool:
         count = self.answer_list.GetCount()
@@ -9524,17 +9532,15 @@ class ChatFrame(wx.Frame):
                 return
         if ctrl and key in (ord("C"), ord("c")):
             idx = self.execution_list.GetSelection()
-            if idx != wx.NOT_FOUND and wx.TheClipboard.Open():
-                try:
-                    detail_text = ""
-                    if 0 <= idx < len(self.execution_meta):
-                        detail_text = str(self.execution_meta[idx][3] or "")
-                    text = detail_text.strip() or str(self.execution_list.GetString(idx) or "").strip()
-                    if text:
-                        wx.TheClipboard.SetData(wx.TextDataObject(text))
-                        self.SetStatusText("已复制")
-                finally:
-                    wx.TheClipboard.Close()
+            if idx == wx.NOT_FOUND:
+                event.Skip()
+                return
+            detail_text = ""
+            if 0 <= idx < len(self.execution_meta):
+                detail_text = str(self.execution_meta[idx][3] or "")
+            text = self._plain_text_for_clipboard(detail_text or str(self.execution_list.GetString(idx) or ""))
+            if text and self._set_clipboard_text(text):
+                self.SetStatusText("已复制")
             stop = getattr(event, "StopPropagation", None)
             if callable(stop):
                 stop()
@@ -9995,7 +10001,7 @@ class ChatFrame(wx.Frame):
         i_pin = wx.NewIdRef()
         i_clr = wx.NewIdRef()
         i_ren = wx.NewIdRef()
-        c = self._find_archived_chat(self.history_ids[idx])
+        c = self._history_chat_for_id(self.history_ids[idx])
         if not c:
             return
         m.Append(i_del, "删除聊天")
@@ -10008,6 +10014,36 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._history_rename, id=i_ren)
         self.PopupMenu(m)
         m.Destroy()
+
+    def _history_chat_for_id(self, chat_id: str) -> dict | None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return None
+        if normalized in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}:
+            if isinstance(getattr(self, "_current_chat_state", None), dict):
+                return self._current_chat_state
+        return self._find_archived_chat(normalized)
+
+    def _delete_chat_from_store(self, chat_id: str) -> None:
+        store = getattr(self, "chat_store", None)
+        if not (getattr(self, "_chat_store_enabled", False) and store is not None):
+            return
+        delete = getattr(store, "delete_chat", None)
+        if callable(delete):
+            delete(chat_id)
+
+    def _delete_chats_from_store(self, chat_ids: list[str]) -> None:
+        store = getattr(self, "chat_store", None)
+        if not (getattr(self, "_chat_store_enabled", False) and store is not None):
+            return
+        delete_many = getattr(store, "delete_chats", None)
+        if callable(delete_many):
+            delete_many(chat_ids)
+            return
+        delete_one = getattr(store, "delete_chat", None)
+        if callable(delete_one):
+            for chat_id in chat_ids:
+                delete_one(chat_id)
 
     def _notes_current_notebook(self):
         notebook_id = str(self.notes_controller.active_notebook_id or self._notes_selected_notebook_id() or "").strip()
@@ -11359,10 +11395,11 @@ class ChatFrame(wx.Frame):
         if not self._confirm("确定删除该聊天吗？"):
             return
         cid = self.history_ids[idx]
-        target_chat = self._find_archived_chat(cid)
+        target_chat = self._history_chat_for_id(cid)
         if target_chat:
             self._cleanup_chat_detail_pages(target_chat)
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != cid]
+        self._delete_chat_from_store(cid)
         if self.view_history_id == cid:
             self.view_mode = "active"
             self.view_history_id = None
@@ -11400,7 +11437,7 @@ class ChatFrame(wx.Frame):
         idx = self.history_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
             return
-        c = self._find_archived_chat(self.history_ids[idx])
+        c = self._history_chat_for_id(self.history_ids[idx])
         if not c:
             return
         c["pinned"] = not bool(c.get("pinned"))
@@ -11412,7 +11449,9 @@ class ChatFrame(wx.Frame):
         self._flush_chat_state_save()
         if not self._confirm("确定清空所有非置顶聊天吗？"):
             return
+        removed_ids = [str(c.get("id") or "").strip() for c in self.archived_chats if not c.get("pinned")]
         self.archived_chats = [c for c in self.archived_chats if c.get("pinned")]
+        self._delete_chats_from_store(removed_ids)
         if self.view_mode == "history" and self.view_history_id not in {str(c.get("id")) for c in self.archived_chats}:
             self.view_mode = "active"
             self.view_history_id = None
@@ -11425,7 +11464,7 @@ class ChatFrame(wx.Frame):
         idx = self.history_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
             return
-        c = self._find_archived_chat(self.history_ids[idx])
+        c = self._history_chat_for_id(self.history_ids[idx])
         if not c:
             return
         d = RenameDialog(self, str(c.get("title") or ""))
