@@ -33,6 +33,8 @@ class RemoteNatsTransport:
         on_state: Callback | None = None,
         on_rename_chat: Callback | None = None,
         on_update_settings: Callback | None = None,
+        on_speed_options: Callback | None = None,
+        on_set_speed: Callback | None = None,
         on_model_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
@@ -51,6 +53,8 @@ class RemoteNatsTransport:
         self.on_state = on_state
         self.on_rename_chat = on_rename_chat
         self.on_update_settings = on_update_settings
+        self.on_speed_options = on_speed_options
+        self.on_set_speed = on_set_speed
         self.on_model_list = on_model_list
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
@@ -260,6 +264,10 @@ class RemoteNatsTransport:
             return self.on_rename_chat(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):
             return self.on_update_settings(payload)
+        if command_type == "speed_options" and callable(self.on_speed_options):
+            return self.on_speed_options(payload)
+        if command_type == "set_speed" and callable(self.on_set_speed):
+            return self.on_set_speed(payload)
         if command_type == "history_list" and callable(self.on_history_list):
             return self.on_history_list()
         if command_type == "history_read" and callable(self.on_history_read):

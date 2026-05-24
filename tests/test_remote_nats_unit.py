@@ -112,6 +112,55 @@ def test_routes_model_list_command():
     }
 
 
+def test_routes_speed_options_and_set_speed_commands():
+    routed = []
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_speed_options=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "chat_id": payload.get("chat_id"),
+                "codex_service_tier": "standard",
+                "codex_service_tier_options": [
+                    {"value": "standard", "label": "标准"},
+                    {"value": "fast", "label": "快速"},
+                ],
+            },
+        ),
+        on_set_speed=lambda payload: (
+            routed.append(payload)
+            or (
+                200,
+                {
+                    "accepted": True,
+                    "chat_id": payload.get("chat_id"),
+                    "codex_service_tier": payload.get("codex_service_tier"),
+                },
+            )
+        ),
+    )
+
+    options_status, options_body = transport._route_command(
+        {"type": "speed_options", "chat_id": "chat-1"}
+    )
+    set_status, set_body = transport._route_command(
+        {"type": "set_speed", "chat_id": "chat-1", "codex_service_tier": "fast"}
+    )
+
+    assert options_status == 200
+    assert options_body["codex_service_tier_options"][1] == {
+        "value": "fast",
+        "label": "快速",
+    }
+    assert set_status == 200
+    assert set_body["codex_service_tier"] == "fast"
+    assert routed == [
+        {"type": "set_speed", "chat_id": "chat-1", "codex_service_tier": "fast"}
+    ]
+
+
 def test_transport_routes_notes_changes_command_and_publishes_response():
     async def run():
         jetstream = FakeJetStream()

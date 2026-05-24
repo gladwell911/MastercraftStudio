@@ -3138,9 +3138,8 @@ class ChatFrame(wx.Frame):
     def _codex_service_tier_for_chat(chat: dict | None) -> str:
         if not isinstance(chat, dict):
             return ""
-        value = normalize_codex_service_tier(chat.get("codex_service_tier"))
-        if value:
-            return value
+        if "codex_service_tier" in chat:
+            return normalize_codex_service_tier(chat.get("codex_service_tier"))
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         for turn in reversed(turns):
             if not isinstance(turn, dict):
@@ -3231,7 +3230,6 @@ class ChatFrame(wx.Frame):
         if self.codex_speed_combo.GetValue() != label:
             self.codex_speed_combo.SetValue(label)
         self._defer_chat_state_save()
-        self._push_remote_state(self._chat_id_for_speed_chat(chat))
         suffix = "，将在下一条 Codex 请求生效" if bool(getattr(self, "is_running", False)) else ""
         self.SetStatusText(f"Codex 速度已切换为{codex_service_tier_label(tier)}{suffix}")
         return
@@ -6616,8 +6614,13 @@ class ChatFrame(wx.Frame):
             or payload.get("speed")
             or ""
         )
+        requested_text = str(requested or "").strip()
         tier = normalize_codex_service_tier(requested)
-        if not tier:
+        if not requested_text or (
+            not tier
+            and requested_text.lower() != "standard"
+            and requested_text != codex_service_tier_label("standard")
+        ):
             return 400, {"accepted": False, "error": "invalid_speed"}
         self._set_codex_service_tier_for_chat(chat, tier)
         if chat is getattr(self, "_current_chat_state", None) or chat_id in {self.active_chat_id, self.current_chat_id}:
