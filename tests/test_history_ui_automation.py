@@ -53,6 +53,7 @@ def test_ui_automation_primary_tab_sequence_matches_screen_reader_order(frame, w
         frame.input_edit,
         frame.new_chat_button,
         frame.model_combo,
+        frame.codex_speed_combo,
         frame.send_button,
         frame.notes_notebook_list,
         frame.history_list,
@@ -273,6 +274,69 @@ def test_ui_automation_history_enter_restores_selected_chat_model_in_combo(frame
     assert frame.view_history_id == "chat-a"
     assert frame.selected_model == "anthropic/claude-sonnet-4.6"
     assert frame.model_combo.GetValue() == main.model_display_name("anthropic/claude-sonnet-4.6")
+    assert frame.answer_list.HasFocus()
+
+
+def test_ui_automation_history_enter_restores_codex_speed_combo(frame, monkeypatch):
+    frame.Show()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.active_session_turns = [
+        {
+            "question": "codex fast question",
+            "answer_md": "codex fast answer",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "codex_service_tier": "fast",
+            "created_at": 2.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-b",
+        "title": "chat b",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_service_tier": "fast",
+        "created_at": 2.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+    }
+    frame._sync_codex_speed_combo_from_chat(frame._current_chat_state)
+    assert frame.codex_speed_combo.GetValue() == "快速"
+
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "chat a",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "codex_service_tier": "",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [
+                {
+                    "question": "codex standard question",
+                    "answer_md": "codex standard answer",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "codex_service_tier": "",
+                    "created_at": 1.0,
+                }
+            ],
+        }
+    ]
+
+    frame._refresh_history("chat-a")
+    frame.history_list.SetFocus()
+    frame.history_list.SetSelection(frame.history_ids.index("chat-a"))
+    frame._on_history_key_down(_EnterEvent())
+
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-a"
+    assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
+    assert frame.codex_speed_combo.GetValue() == "标准"
+    assert frame.codex_speed_combo.IsEnabled() is True
     assert frame.answer_list.HasFocus()
 
 

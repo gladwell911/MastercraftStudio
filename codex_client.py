@@ -33,6 +33,8 @@ DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_CODEX_TURN_TIMEOUT = 300
 DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX = "danger-full-access"
+CODEX_SERVICE_TIER_FAST = "fast"
+CODEX_SERVICE_TIER_STANDARD = ""
 
 
 def is_codex_model(model: str) -> bool:
@@ -41,6 +43,17 @@ def is_codex_model(model: str) -> bool:
 
 def codex_cli_config_for_model(model: str) -> dict[str, str]:
     return dict(CODEX_MODEL_CONFIGS.get(str(model or "").strip(), {}))
+
+
+def normalize_codex_service_tier(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"fast", "快速"}:
+        return CODEX_SERVICE_TIER_FAST
+    return CODEX_SERVICE_TIER_STANDARD
+
+
+def codex_service_tier_label(value: str | None) -> str:
+    return "快速" if normalize_codex_service_tier(value) == CODEX_SERVICE_TIER_FAST else "标准"
 
 
 def codex_model_label_for_model(model: str) -> str:
@@ -473,6 +486,7 @@ class CodexAppServerClient:
         sandbox: str = DEFAULT_CODEX_SANDBOX,
         personality: str = "pragmatic",
         ephemeral: bool = False,
+        service_tier: str | None = None,
     ) -> dict:
         params = {
             "cwd": str(cwd or "").strip() or str(Path.cwd()),
@@ -480,6 +494,7 @@ class CodexAppServerClient:
             "sandbox": sandbox,
             "personality": personality,
             "ephemeral": bool(ephemeral),
+            "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
         return self._request_clearing_context_usage("thread/start", params)
 
@@ -490,12 +505,14 @@ class CodexAppServerClient:
         sandbox: str = DEFAULT_CODEX_SANDBOX,
         personality: str = "pragmatic",
         cwd: str | None = None,
+        service_tier: str | None = None,
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "personality": personality,
+            "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
         if cwd:
             params["cwd"] = str(cwd).strip()
@@ -528,19 +545,27 @@ class CodexAppServerClient:
             },
         )
 
-    def start_turn(self, thread_id: str, text: str, timeout: int | None = None) -> dict:
+    def start_turn(self, thread_id: str, text: str, timeout: int | None = None, service_tier: str | None = None) -> dict:
         return self.start_turn_items(
             thread_id,
             [{"type": "text", "text": str(text or "")}],
             timeout=timeout,
+            service_tier=service_tier,
         )
 
-    def start_turn_items(self, thread_id: str, items: list[dict], timeout: int | None = None) -> dict:
+    def start_turn_items(
+        self,
+        thread_id: str,
+        items: list[dict],
+        timeout: int | None = None,
+        service_tier: str | None = None,
+    ) -> dict:
         return self._request_clearing_context_usage(
             "turn/start",
             {
                 "threadId": str(thread_id or "").strip(),
                 "input": list(items or []),
+                "serviceTier": normalize_codex_service_tier(service_tier) or None,
             },
             timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
         )

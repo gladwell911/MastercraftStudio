@@ -76,6 +76,93 @@ def test_model_combo_order_prioritizes_cli_models(frame):
     ]
 
 
+def test_codex_speed_combo_defaults_to_standard(frame):
+    assert frame.codex_speed_combo.GetValue() == "标准"
+    assert frame.codex_speed_combo.IsEnabled() is True
+    assert frame._current_codex_service_tier() == ""
+
+
+def test_codex_speed_combo_uses_short_accessible_label(frame):
+    def _static_text_labels(window):
+        labels = []
+        for child in window.GetChildren():
+            if isinstance(child, wx.StaticText):
+                labels.append(child.GetLabel())
+            labels.extend(_static_text_labels(child))
+        return labels
+
+    labels = _static_text_labels(frame)
+
+    assert "速度：" in labels
+    assert "Codex速度：" not in labels
+    assert frame.codex_speed_combo.GetName() == "速度"
+
+def test_codex_speed_combo_change_defers_save_and_preserves_focus(frame, monkeypatch):
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_service_tier": "",
+        "turns": [],
+    }
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame.codex_speed_combo.SetValue("快速")
+    frame.codex_speed_combo.SetFocusFromKbd()
+    saves = []
+    deferred = []
+    statuses = []
+    refreshes = []
+    renders = []
+    syncs = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append((args, kwargs)))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: refreshes.append(True))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: renders.append(True))
+    monkeypatch.setattr(frame, "_sync_codex_speed_combo_from_chat", lambda *args, **kwargs: syncs.append(True))
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+
+    frame._on_codex_speed_changed(None)
+
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert saves == []
+    assert deferred == [True]
+    assert refreshes == []
+    assert renders == []
+    assert syncs == []
+    assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
+    assert frame.codex_speed_combo.HasFocus()
+    assert statuses == ["Codex 速度已切换为快速"]
+
+def test_codex_speed_combo_change_noops_when_value_is_unchanged(frame, monkeypatch):
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_service_tier": "fast",
+        "turns": [],
+    }
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame.codex_speed_combo.SetValue("快速")
+    saves = []
+    deferred = []
+    statuses = []
+    syncs = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(True))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_sync_codex_speed_combo_from_chat", lambda *args, **kwargs: syncs.append(True))
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+
+    frame._on_codex_speed_changed(None)
+
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert saves == []
+    assert deferred == []
+    assert syncs == []
+    assert statuses == []
+
+
 def test_remote_model_list_returns_visible_combo_order(frame):
     status, body = frame._remote_api_model_list_ui()
 
@@ -6807,16 +6894,17 @@ def test_screen_reader_primary_tab_order_matches_requested_chat_flow(frame):
     frame._current_chat_state["detail_panel_mode"] = "answers"
     frame._apply_detail_panel_mode("answers", refresh_execution=False)
 
-    assert frame.root_tab_order[:7] == [
+    assert frame.root_tab_order[:8] == [
         frame.input_edit,
         frame.new_chat_button,
         frame.model_combo,
+        frame.codex_speed_combo,
         frame.send_button,
         frame.notes_notebook_list,
         frame.history_list,
         frame.answer_list,
     ]
-    assert frame.chat_tab_order == frame.root_tab_order[:7]
+    assert frame.chat_tab_order == frame.root_tab_order[:8]
 
 
 def test_tab_moves_from_notes_to_history_then_answer_then_input(frame):
@@ -7811,6 +7899,7 @@ def test_bind_events_registers_both_hotkey_ids():
             self.new_chat_button = _Ctrl("new_chat_button")
             self.notes_button = _Ctrl("notes_button")
             self.model_combo = _Ctrl("model_combo")
+            self.codex_speed_combo = _Ctrl("codex_speed_combo")
             self.input_edit = _Ctrl("input_edit")
             self.answer_list = _Ctrl("answer_list")
             self.execution_list = _Ctrl("execution_list")
@@ -7834,9 +7923,14 @@ def test_bind_events_registers_both_hotkey_ids():
             self.notes_editor = _Ctrl("notes_editor")
             self.notes_save_button = _Ctrl("notes_save_button")
             self.notes_cancel_button = _Ctrl("notes_cancel_button")
+            self._chat_navigation_left_id = 101
+            self._chat_navigation_right_id = 102
 
         def Bind(self, _event, _handler, id=None):
             frame_bind_calls.append(id)
+
+        def SetAcceleratorTable(self, *_args):
+            return None
 
         def _on_send_clicked(self, *_args):
             return None
@@ -7848,6 +7942,9 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_model_changed(self, *_args):
+            return None
+
+        def _on_codex_speed_changed(self, *_args):
             return None
 
         def _on_input_key_down(self, *_args):
@@ -7866,6 +7963,12 @@ def test_bind_events_registers_both_hotkey_ids():
             return None
 
         def _on_global_hotkey(self, *_args):
+            return None
+
+        def _on_frame_key_down(self, *_args):
+            return None
+
+        def _on_generic_key_down(self, *_args):
             return None
 
         def _on_any_key_down_escape_minimize(self, *_args):
@@ -7919,6 +8022,9 @@ def test_bind_events_registers_both_hotkey_ids():
         def _on_notes_editor_changed(self, *_args):
             return None
 
+        def _navigate_history_chats(self, *_args):
+            return None
+
     dummy = _DummyFrame()
     main.ChatFrame._bind_events(dummy)
 
@@ -7930,6 +8036,7 @@ def test_bind_events_registers_both_hotkey_ids():
     assert main.wx.EVT_KEY_UP in control_bindings["send_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["new_chat_button"]
     assert main.wx.EVT_KEY_UP in control_bindings["model_combo"]
+    assert main.wx.EVT_KEY_UP in control_bindings["codex_speed_combo"]
     assert main.wx.EVT_KEY_UP in control_bindings["answer_list"]
     assert main.wx.EVT_KEY_UP in control_bindings["execution_list"]
     assert main.wx.EVT_KEY_UP in control_bindings["history_list"]
@@ -10777,12 +10884,54 @@ def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(fram
                 "sandbox": "danger-full-access",
                 "personality": "pragmatic",
                 "cwd": frame._workspace_dir_for_codex(),
+                "service_tier": "",
             },
         )
     ]
     assert seen["turn"] == [("thread-saved", "第三轮")]
     assert frame.active_codex_thread_id == "thread-saved"
     assert frame.active_codex_turn_id == "turn-new"
+
+
+def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "model": "codex/main",
+            "codex_service_tier": "fast",
+        }
+    )
+    frame.active_session_turns = [
+        {
+            "question": "快速执行",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/main",
+            "created_at": 1.0,
+            "codex_service_tier": "fast",
+        }
+    ]
+    frame.active_turn_idx = 0
+    seen = {"thread": [], "turn": []}
+
+    class _Client:
+        def start_thread(self, **kwargs):
+            seen["thread"].append(kwargs)
+            return {"thread": {"id": "thread-fast"}}
+
+        def start_turn_items(self, thread_id, items, **kwargs):
+            seen["turn"].append((thread_id, items, kwargs))
+            return {"turn": {"id": "turn-fast"}}
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker("chat-current", 0, "快速执行", "codex/main")
+
+    assert seen["thread"][0]["service_tier"] == "fast"
+    assert seen["turn"][0][2]["service_tier"] == "fast"
 
 
 def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monkeypatch):
@@ -10946,6 +11095,26 @@ def test_codex_slash_command_is_handled_locally_without_starting_turn(frame, mon
     assert frame.active_session_turns[0]["request_status"] == "pending"
 
 
+def test_submit_codex_turn_records_current_service_tier(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state["codex_service_tier"] = "fast"
+    frame._sync_codex_speed_combo_from_chat(frame._current_chat_state)
+
+    ok, message = frame._submit_question("快速问题", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert frame.active_session_turns[-1]["codex_service_tier"] == "fast"
+
+
 def test_codex_status_command_worker_reports_status_without_codex_turn(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -11019,7 +11188,54 @@ def test_codex_help_command_worker_lists_supported_commands(frame, monkeypatch):
     assert len(done) == 1
     assert "/status" in done[0][1]
     assert "/compact" in done[0][1]
+    assert "/speed" in done[0][1]
     assert done[0][2] == ""
+
+
+def test_codex_speed_command_updates_chat_state_without_changing_model(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state["model"] = main.DEFAULT_CODEX_MODEL
+
+    answer = frame._handle_codex_speed_command("fast", frame._current_chat_state)
+
+    assert "快速" in answer
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert frame.selected_model == main.DEFAULT_CODEX_MODEL
+    assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
+
+    answer = frame._handle_codex_speed_command("standard", frame._current_chat_state)
+
+    assert "标准" in answer
+    assert frame._current_chat_state["codex_service_tier"] == ""
+    assert frame.codex_speed_combo.GetValue() == "标准"
+
+
+def test_codex_speed_command_reports_current_chat_speed(frame):
+    frame._current_chat_state["codex_service_tier"] = "fast"
+
+    answer = frame._handle_codex_speed_command("", frame._current_chat_state)
+
+    assert "当前速度" in answer
+    assert "快速" in answer
+
+
+def test_codex_speed_command_worker_updates_chat_state(frame, monkeypatch):
+    done = []
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "speed", "fast", "codex/main")
+
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert "快速" in done[0][1]
 
 
 def test_codex_unknown_slash_command_worker_reports_unsupported_without_starting_turn(frame, monkeypatch):
@@ -12219,6 +12435,7 @@ def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
         "history_list",
         "input_edit",
         "model_combo",
+        "codex_speed_combo",
         "notes_notebook_list",
         "notes_entry_list",
     ):
@@ -12233,6 +12450,7 @@ def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
         "history_list",
         "input_edit",
         "model_combo",
+        "codex_speed_combo",
         "notes_notebook_list",
         "notes_entry_list",
     ):
@@ -12282,6 +12500,38 @@ def test_new_chat_commits_model_from_combo_after_deferred_selection(frame, monke
 
     assert frame.selected_model == "openai/gpt-5.2"
     assert frame._current_chat_state["model"] == "openai/gpt-5.2"
+
+
+def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state["model"] = main.DEFAULT_CODEX_MODEL
+    frame.codex_speed_combo.SetValue("快速")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    frame._on_new_chat_clicked(None)
+
+    assert frame.selected_model == main.DEFAULT_CODEX_MODEL
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+
+def test_remote_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state["model"] = main.DEFAULT_CODEX_MODEL
+    frame.codex_speed_combo.SetValue("快速")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+
+    result = frame._start_remote_new_chat({})
+
+    assert result["model"] == main.DEFAULT_CODEX_MODEL
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
 
 
 def test_switch_current_chat_restores_chat_level_model_and_combo(frame, monkeypatch):

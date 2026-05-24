@@ -37,7 +37,9 @@ from codex_client import (
     CodexEvent,
     DEFAULT_CODEX_MODEL,
     codex_model_label_for_model,
+    codex_service_tier_label,
     is_codex_model,
+    normalize_codex_service_tier,
     read_codex_cli_model_label,
 )
 from context_usage import (
@@ -997,6 +999,7 @@ class ChatFrame(wx.Frame):
         else:
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.model_combo.SetValue(model_display_name(self.selected_model))
+        self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         self._refresh_history()
         self._render_answer_list()
         self._set_input_hint_idle()
@@ -1038,6 +1041,11 @@ class ChatFrame(wx.Frame):
                 model_choices.append(display_choice)
         self.model_combo = wx.ComboBox(panel, choices=model_choices, style=wx.CB_READONLY, size=(320, -1))
         row.Add(self.model_combo, 0, wx.ALIGN_CENTER_VERTICAL)
+        row.Add(wx.StaticText(panel, label="速度："), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 6)
+        self.codex_speed_combo = wx.ComboBox(panel, choices=["标准", "快速"], style=wx.CB_READONLY, size=(96, -1))
+        self.codex_speed_combo.SetName("速度")
+        self.codex_speed_combo.SetValue("标准")
+        row.Add(self.codex_speed_combo, 0, wx.ALIGN_CENTER_VERTICAL)
         right.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         self.detail_title_label = wx.StaticText(panel, label="回答：")
@@ -1091,7 +1099,8 @@ class ChatFrame(wx.Frame):
         right.Add(self.notes_edit_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.new_chat_button.MoveAfterInTabOrder(self.input_edit)
         self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
-        self.send_button.MoveAfterInTabOrder(self.model_combo)
+        self.codex_speed_combo.MoveAfterInTabOrder(self.model_combo)
+        self.send_button.MoveAfterInTabOrder(self.codex_speed_combo)
         self.notes_list_panel.MoveAfterInTabOrder(self.send_button)
         self.history_list.MoveAfterInTabOrder(self.notes_list_panel)
         self.answer_list.MoveAfterInTabOrder(self.history_list)
@@ -1120,11 +1129,13 @@ class ChatFrame(wx.Frame):
         self.send_button.Bind(wx.EVT_BUTTON, self._on_send_clicked)
         self.new_chat_button.Bind(wx.EVT_BUTTON, self._on_new_chat_clicked)
         self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_model_changed)
+        self.codex_speed_combo.Bind(wx.EVT_COMBOBOX, self._on_codex_speed_changed)
         self.input_edit.Bind(wx.EVT_KEY_DOWN, self._on_input_key_down)
         self.input_edit.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.send_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.new_chat_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.model_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
+        self.codex_speed_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.answer_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.history_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
@@ -1149,6 +1160,7 @@ class ChatFrame(wx.Frame):
         self.history_list.Bind(wx.EVT_LISTBOX, self._on_history_selected)
         self.history_list.Bind(wx.EVT_CONTEXT_MENU, self._on_history_context)
         self.model_combo.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
+        self.codex_speed_combo.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
         self.send_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
         self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
@@ -2465,6 +2477,7 @@ class ChatFrame(wx.Frame):
             ("help", "列出本程序支持的 Codex 斜杠命令"),
             ("compact", "请求 Codex 压缩当前线程上下文"),
             ("model", "不带参数显示当前模型；带 Codex 模型名时切换模型"),
+            ("speed", "不带参数显示当前速度；支持 fast、standard、normal"),
             ("new", "开始一个新的本地聊天"),
             ("clear", "清除当前聊天关联的 Codex 线程状态"),
             ("stop", "中断当前活跃 Codex turn"),
@@ -3003,6 +3016,89 @@ class ChatFrame(wx.Frame):
         return True
 
     def _on_model_changed(self, _):
+        try:
+            self._sync_codex_speed_combo_enabled_for_model(self._resolve_current_model())
+        except Exception:
+            pass
+        return
+
+    @staticmethod
+    def _codex_service_tier_for_chat(chat: dict | None) -> str:
+        if not isinstance(chat, dict):
+            return ""
+        value = normalize_codex_service_tier(chat.get("codex_service_tier"))
+        if value:
+            return value
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            model = str(turn.get("model") or "").strip()
+            tier = normalize_codex_service_tier(turn.get("codex_service_tier"))
+            if tier and is_codex_model(model):
+                return tier
+        return ""
+
+    def _visible_codex_speed_chat(self) -> dict:
+        if self.view_mode == "history":
+            chat = self._find_archived_chat(self.view_history_id)
+            if isinstance(chat, dict):
+                return chat
+        if not isinstance(getattr(self, "_current_chat_state", None), dict):
+            self._current_chat_state = {}
+        return self._current_chat_state
+
+    def _current_codex_service_tier(self) -> str:
+        if threading.current_thread() is threading.main_thread() and hasattr(self, "codex_speed_combo"):
+            value = self.codex_speed_combo.GetValue()
+            return normalize_codex_service_tier(value)
+        return self._codex_service_tier_for_chat(self._visible_codex_speed_chat())
+
+    def _sync_codex_speed_combo_enabled_for_model(self, model: str | None = None) -> None:
+        combo = getattr(self, "codex_speed_combo", None)
+        if combo is None:
+            return
+        resolved_model = model_id_from_display_name(str(model or self.selected_model or ""))
+        combo.Enable(is_codex_model(resolved_model))
+
+    def _sync_codex_speed_combo_from_chat(self, chat: dict | None) -> None:
+        combo = getattr(self, "codex_speed_combo", None)
+        if combo is None:
+            return
+        tier = self._codex_service_tier_for_chat(chat)
+        label = codex_service_tier_label(tier)
+        if combo.GetValue() != label:
+            combo.SetValue(label)
+        model = str((chat or {}).get("model") or self.selected_model or "").strip()
+        if not model and isinstance(chat, dict):
+            turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+            for turn in reversed(turns):
+                if isinstance(turn, dict) and str(turn.get("model") or "").strip():
+                    model = str(turn.get("model") or "").strip()
+                    break
+        self._sync_codex_speed_combo_enabled_for_model(model)
+
+    def _set_codex_service_tier_for_chat(self, chat: dict | None, service_tier: str | None) -> str:
+        tier = normalize_codex_service_tier(service_tier)
+        if isinstance(chat, dict):
+            chat["codex_service_tier"] = tier
+        if chat is getattr(self, "_current_chat_state", None):
+            self._current_chat_state["codex_service_tier"] = tier
+        return tier
+
+    def _on_codex_speed_changed(self, _):
+        chat = self._visible_codex_speed_chat()
+        previous_tier = self._codex_service_tier_for_chat(chat)
+        requested_tier = normalize_codex_service_tier(self.codex_speed_combo.GetValue())
+        if requested_tier == previous_tier:
+            return
+        tier = self._set_codex_service_tier_for_chat(chat, requested_tier)
+        label = codex_service_tier_label(tier)
+        if self.codex_speed_combo.GetValue() != label:
+            self.codex_speed_combo.SetValue(label)
+        self._defer_chat_state_save()
+        suffix = "，将在下一条 Codex 请求生效" if bool(getattr(self, "is_running", False)) else ""
+        self.SetStatusText(f"Codex 速度已切换为{codex_service_tier_label(tier)}{suffix}")
         return
 
     def _resolve_current_model(self) -> str:
@@ -5061,6 +5157,8 @@ class ChatFrame(wx.Frame):
                 answer = self._handle_codex_compact_command(client, target_chat)
             elif normalized_command == "model":
                 answer = self._handle_codex_model_command(str(args or ""), target_chat)
+            elif normalized_command == "speed":
+                answer = self._handle_codex_speed_command(str(args or ""), target_chat)
             elif normalized_command == "new":
                 answer = "## Codex 新聊天\n\n已请求开始新聊天。"
                 self._call_after_if_alive(self._on_new_chat_clicked, None)
@@ -5098,6 +5196,30 @@ class ChatFrame(wx.Frame):
         self._save_state()
         return f"## Codex 模型\n\n已切换到：`{model_display_name(model_id) or model_id}`。"
 
+    def _handle_codex_speed_command(self, args: str, chat: dict) -> str:
+        requested = str(args or "").strip().lower()
+        if not requested:
+            tier = self._codex_service_tier_for_chat(chat)
+            return f"## Codex 速度\n\n当前速度：`{codex_service_tier_label(tier)}`。"
+        aliases = {
+            "fast": "fast",
+            "快速": "fast",
+            "standard": "",
+            "normal": "",
+            "default": "",
+            "标准": "",
+        }
+        if requested not in aliases:
+            return "## Codex 速度\n\n可用参数：`fast`、`standard`、`normal`。"
+        tier = self._set_codex_service_tier_for_chat(chat, aliases[requested])
+        if threading.current_thread() is threading.main_thread():
+            self._sync_codex_speed_combo_from_chat(chat)
+        else:
+            self._call_after_if_alive(self._sync_codex_speed_combo_from_chat, chat)
+        self._save_state()
+        suffix = "，将在下一条 Codex 请求生效" if bool(getattr(self, "is_running", False)) else ""
+        return f"## Codex 速度\n\n已切换到：`{codex_service_tier_label(tier)}`{suffix}。"
+
     def _handle_codex_clear_command(self, chat: dict) -> str:
         if isinstance(chat, dict):
             chat["codex_thread_id"] = ""
@@ -5127,7 +5249,7 @@ class ChatFrame(wx.Frame):
         client.interrupt_turn(thread_id, turn_id)
         return f"## Codex 中断\n\n已请求中断 turn：`{turn_id}`。"
 
-    def _ensure_codex_thread_resumed(self, client, thread_id: str) -> None:
+    def _ensure_codex_thread_resumed(self, client, thread_id: str, service_tier: str = "") -> None:
         thread_value = str(thread_id or "").strip()
         if not thread_value or not hasattr(client, "resume_thread"):
             return
@@ -5143,6 +5265,7 @@ class ChatFrame(wx.Frame):
             sandbox="danger-full-access",
             personality="pragmatic",
             cwd=self._workspace_dir_for_codex(),
+            service_tier=service_tier,
         )
         resumed.add(thread_value)
 
@@ -5213,6 +5336,7 @@ class ChatFrame(wx.Frame):
                 approval_policy="never",
                 sandbox="danger-full-access",
                 personality="pragmatic",
+                service_tier=service_tier,
             )
             new_thread_id = str((thread_resp.get("thread") or {}).get("id") or "").strip()
             if not new_thread_id:
@@ -5223,8 +5347,12 @@ class ChatFrame(wx.Frame):
 
         def _start_turn_with_items(thread_value: str, items: list[dict]) -> dict:
             if hasattr(client, "start_turn_items"):
+                if service_tier:
+                    return client.start_turn_items(thread_value, items, service_tier=service_tier)
                 return client.start_turn_items(thread_value, items)
             text = str((items or [{}])[0].get("text") or "") if items else ""
+            if service_tier:
+                return client.start_turn(thread_value, text, service_tier=service_tier)
             return client.start_turn(thread_value, text)
 
         def _steer_turn_with_items(thread_value: str, expected_turn_id: str, items: list[dict]) -> dict:
@@ -5246,6 +5374,11 @@ class ChatFrame(wx.Frame):
                 if not is_current_target:
                     return
                 target_turns = self.active_session_turns
+            service_tier = self._codex_service_tier_for_chat(target_chat)
+            if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
+                service_tier = normalize_codex_service_tier(target_turns[turn_idx].get("codex_service_tier")) or service_tier
+            if isinstance(target_chat, dict):
+                target_chat["codex_service_tier"] = service_tier
             turn_attachments = []
             if 0 <= turn_idx < len(target_turns):
                 maybe_attachments = target_turns[turn_idx].get("attachments") if isinstance(target_turns[turn_idx], dict) else []
@@ -5257,7 +5390,7 @@ class ChatFrame(wx.Frame):
                 thread_id = _start_new_thread()
             else:
                 try:
-                    self._ensure_codex_thread_resumed(client, thread_id)
+                    self._ensure_codex_thread_resumed(client, thread_id, service_tier=service_tier)
                 except Exception as exc:
                     if self._is_codex_thread_missing_error(exc) or self._is_codex_rollout_missing_error(exc):
                         self._forget_codex_thread_resume(client, thread_id)
@@ -6008,6 +6141,7 @@ class ChatFrame(wx.Frame):
 
     def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
         previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        previous_codex_service_tier = self._current_codex_service_tier()
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
         self.view_mode = "active"
         self.view_history_id = None
@@ -6032,6 +6166,7 @@ class ChatFrame(wx.Frame):
             "updated_at": now,
             "detail_panel_mode": "answers",
             "execution_steps": [],
+            "codex_service_tier": "",
         }
         self.active_chat_id = str(uuid.uuid4())
         self.current_chat_id = self.active_chat_id
@@ -6045,10 +6180,13 @@ class ChatFrame(wx.Frame):
         elif model not in MODEL_IDS:
             model = DEFAULT_MODEL_ID
         self.selected_model = model
+        self._current_chat_state["model"] = model
+        if is_codex_model(model):
+            self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
         if threading.current_thread() is threading.main_thread():
             self.model_combo.SetValue(model_display_name(model))
+            self._sync_codex_speed_combo_from_chat(self._current_chat_state)
             self.input_edit.SetFocus()
-        self._current_chat_state["model"] = model
         self._save_state()
         self._refresh_history(archived["id"] if archived else previous_chat_id or None)
         self._render_answer_list()
@@ -6364,6 +6502,7 @@ class ChatFrame(wx.Frame):
             getattr(self, "history_list", None),
             getattr(self, "input_edit", None),
             getattr(self, "model_combo", None),
+            getattr(self, "codex_speed_combo", None),
             getattr(self, "notes_notebook_list", None),
             getattr(self, "notes_entry_list", None),
         ]
@@ -6662,6 +6801,7 @@ class ChatFrame(wx.Frame):
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.model_combo.SetValue(model_display_name(self.selected_model))
+        self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         self.active_codex_thread_id = ""
         self.active_codex_turn_id = ""
         self.active_codex_turn_active = False
@@ -7989,6 +8129,10 @@ class ChatFrame(wx.Frame):
         self._current_chat_state.setdefault("title_source", "default")
         self._current_chat_state.setdefault("title_updated_at", time.time())
         self._current_chat_state.setdefault("title_revision", 1)
+        codex_service_tier = self._current_codex_service_tier() if is_codex_model(resolved_model) else ""
+        if is_codex_model(resolved_model):
+            self._current_chat_state["codex_service_tier"] = codex_service_tier
+            self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         worker_question = q
         if success_attachments and not is_codex_model(resolved_model):
             attachment_context = self._build_cli_attachment_context(success_attachments)
@@ -8006,6 +8150,7 @@ class ChatFrame(wx.Frame):
                 "created_at": now,
                 "local_command": command_name,
                 "local_command_args": command_args,
+                "codex_service_tier": codex_service_tier,
             }
             self.active_session_turns.append(turn)
             self.active_turn_idx = turn_idx
@@ -8118,6 +8263,8 @@ class ChatFrame(wx.Frame):
             "created_at": now,
             "attachments": outgoing_attachments,
         }
+        if is_codex_model(resolved_model):
+            turn["codex_service_tier"] = codex_service_tier
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
         self._mark_chat_turns_dirty(start_index=turn_idx)
@@ -8942,6 +9089,7 @@ class ChatFrame(wx.Frame):
             "codex_thread_flags": copy.deepcopy(self.active_codex_thread_flags),
             "codex_latest_assistant_text": self.active_codex_latest_assistant_text,
             "codex_latest_assistant_phase": self.active_codex_latest_assistant_phase,
+            "codex_service_tier": self._codex_service_tier_for_chat(self._current_chat_state),
             "claudecode_session_id": self.active_claudecode_session_id,
             "detail_panel_mode": str(self._current_chat_state.get("detail_panel_mode") or "").strip() or "answers",
             "execution_steps": (
@@ -9016,6 +9164,7 @@ class ChatFrame(wx.Frame):
         self.SetStatusText(f"已载入项目：{folder_name}")
 
     def _on_new_chat_clicked(self, _):
+        previous_codex_service_tier = self._current_codex_service_tier()
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
@@ -9037,6 +9186,7 @@ class ChatFrame(wx.Frame):
             "updated_at": now,
             "detail_panel_mode": "answers",
             "execution_steps": [],
+            "codex_service_tier": "",
         }
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
@@ -9046,6 +9196,9 @@ class ChatFrame(wx.Frame):
             model = DEFAULT_MODEL_ID
         self.selected_model = model
         self._current_chat_state["model"] = model
+        if is_codex_model(model):
+            self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
+        self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         if is_openclaw_model(self.selected_model):
             self._openclaw_session_id_for_active_chat()
         self._refresh_history(archived["id"] if archived else None)
@@ -9339,6 +9492,8 @@ class ChatFrame(wx.Frame):
         self.selected_model = model
         if threading.current_thread() is threading.main_thread() and self.model_combo.GetValue() != display:
             self.model_combo.SetValue(display)
+        if threading.current_thread() is threading.main_thread():
+            self._sync_codex_speed_combo_from_chat(chat)
 
     def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True) -> bool:
         selected_id = str(chat_id or "").strip()
@@ -9502,6 +9657,7 @@ class ChatFrame(wx.Frame):
         self.selected_model = resolved_model
         if threading.current_thread() is threading.main_thread():
             self.model_combo.SetValue(model_display_name(self.selected_model))
+            self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         self._current_chat_state["model"] = resolved_model
         # Remove from archived chats since it's now active
         self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
@@ -9635,6 +9791,7 @@ class ChatFrame(wx.Frame):
                 self.input_edit,
                 self.new_chat_button,
                 self.model_combo,
+                self.codex_speed_combo,
                 self.send_button,
                 self.history_list,
                 primary_notes_ctrl,
@@ -9648,6 +9805,7 @@ class ChatFrame(wx.Frame):
                 self.input_edit,
                 self.new_chat_button,
                 self.model_combo,
+                self.codex_speed_combo,
                 self.send_button,
                 primary_notes_ctrl,
                 self.history_list,
@@ -9665,7 +9823,7 @@ class ChatFrame(wx.Frame):
             seen.add(marker)
             root_tab_order.append(ctrl)
         self.root_tab_order = root_tab_order
-        self.chat_tab_order = root_tab_order[:7]
+        self.chat_tab_order = root_tab_order[:8]
         self.notes_tab_order = [primary_notes_ctrl] + [
             ctrl
             for ctrl in (self.notes_notebook_list, self.notes_entry_list, self.notes_editor)

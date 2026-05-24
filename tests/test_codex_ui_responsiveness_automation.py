@@ -200,6 +200,47 @@ def test_real_ui_answer_list_down_at_end_does_not_reset_selection(frame, wx_app,
     assert frame.answer_list.GetSelection() == last_row
 
 
+def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = "chat-speed"
+    frame.current_chat_id = "chat-speed"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame._current_chat_state = {
+        "id": "chat-speed",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_service_tier": "",
+        "turns": [],
+    }
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    frame._sync_codex_speed_combo_from_chat(frame._current_chat_state)
+    frame.codex_speed_combo.SetSelection(0)
+    frame.codex_speed_combo.SetFocusFromKbd()
+    wx_app.Yield()
+    saves = []
+    deferred = []
+    refreshes = []
+    renders = []
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(True))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: refreshes.append(True))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: renders.append(True))
+
+    started = time.perf_counter()
+    _send_window_key(frame.codex_speed_combo, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+    assert frame.codex_speed_combo.HasFocus()
+    assert frame.codex_speed_combo.GetValue() == "快速"
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert saves == []
+    assert deferred == [True]
+    assert refreshes == []
+    assert renders == []
+
+
 def test_real_ui_completion_focuses_latest_answer_item(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-answer-focus"
