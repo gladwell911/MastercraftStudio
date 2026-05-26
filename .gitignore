@@ -29,6 +29,7 @@ Thumbs.db
 *.local
 .venv/
 .venv311/
+.codex-home/
 .codex-home-*/
 codex-home-*/
 app_state.json

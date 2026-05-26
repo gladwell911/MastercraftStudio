@@ -173,6 +173,34 @@ def test_remote_model_list_returns_visible_combo_order(frame):
     ]
 
 
+def test_remote_message_preserves_dynamic_claudecode_model(frame, monkeypatch):
+    captured = {}
+
+    def fake_submit_question(question, **kwargs):
+        captured["call"] = (question, kwargs)
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+
+    status, body = frame._remote_api_message_ui(
+        {"chat_id": "remote-chat", "text": "hello", "model": "claudecode/opus"}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert captured["call"][1]["model"] == "claudecode/opus"
+
+
+def test_remote_new_chat_preserves_dynamic_claudecode_model(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    chat = frame._start_remote_new_chat({"model": "claudecode/opus"})
+
+    assert chat["model"] == "claudecode/opus"
+    assert frame.selected_model == "claudecode/opus"
+    assert frame._current_chat_state["model"] == "claudecode/opus"
+
+
 def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)

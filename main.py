@@ -388,6 +388,14 @@ def model_id_from_display_name(display_name: str) -> str:
     return display_name
 
 
+def normalize_model_id(value: str, *, default: str = DEFAULT_MODEL_ID) -> str:
+    """Resolve display labels and accepted dynamic CLI model IDs consistently."""
+    resolved = model_id_from_display_name(str(value or "").strip())
+    if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_openclaw_model(resolved):
+        return resolved
+    return default
+
+
 def is_cli_filtered_model(model_id: str) -> bool:
     return is_codex_model(model_id) or is_claudecode_model(model_id) or is_openclaw_model(model_id)
 
@@ -3339,41 +3347,28 @@ class ChatFrame(wx.Frame):
         # Always honor the model currently shown in combobox for each send.
         if threading.current_thread() is not threading.main_thread():
             cached = str(self.selected_model or "").strip()
-            if cached in MODEL_IDS:
-                return cached
-            resolved_cached = model_id_from_display_name(cached)
-            if resolved_cached in MODEL_IDS:
-                return resolved_cached
-            return DEFAULT_MODEL_ID
+            return normalize_model_id(cached)
         current = (self.model_combo.GetStringSelection() or "").strip()
-        if current in MODEL_IDS:
-            return current
-        resolved = model_id_from_display_name(current)
-        if resolved in MODEL_IDS:
+        resolved = normalize_model_id(current, default="")
+        if resolved:
             return resolved
         try:
             sel = self.model_combo.GetSelection()
             if sel != wx.NOT_FOUND:
                 current = (self.model_combo.GetString(sel) or "").strip()
-                if current in MODEL_IDS:
-                    return current
-                resolved = model_id_from_display_name(current)
-                if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_openclaw_model(resolved):
+                resolved = normalize_model_id(current, default="")
+                if resolved:
                     return resolved
         except Exception:
             pass
         current = (self.model_combo.GetValue() or "").strip()
-        if current in MODEL_IDS:
-            return current
-        resolved = model_id_from_display_name(current)
-        if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_openclaw_model(resolved):
+        resolved = normalize_model_id(current, default="")
+        if resolved:
             return resolved
         if self.selected_model in MODEL_IDS and not is_visible_model_id(self.selected_model):
             return self.selected_model
-        if self.selected_model in MODEL_IDS:
-            return self.selected_model
-        resolved = model_id_from_display_name(self.selected_model)
-        if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_openclaw_model(resolved):
+        resolved = normalize_model_id(self.selected_model, default="")
+        if resolved:
             return resolved
         return DEFAULT_MODEL_ID
 
@@ -6350,12 +6345,7 @@ class ChatFrame(wx.Frame):
             current_model = self._resolve_current_model()
         else:
             current_model = str(self.selected_model or DEFAULT_MODEL_ID)
-        model = str(payload.get("model") or current_model or DEFAULT_MODEL_ID).strip()
-        resolved = model_id_from_display_name(model)
-        if resolved in MODEL_IDS:
-            model = resolved
-        elif model not in MODEL_IDS:
-            model = DEFAULT_MODEL_ID
+        model = normalize_model_id(payload.get("model") or current_model or DEFAULT_MODEL_ID)
         if threading.current_thread() is threading.main_thread():
             self.model_combo.SetValue(model_display_name(model))
         self.selected_model = model
@@ -6420,12 +6410,7 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["id"] = self.active_chat_id
         self._reset_answer_visible_row_limit()
         self._reset_current_turn_execution_view()
-        model = str((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID).strip()
-        resolved = model_id_from_display_name(model)
-        if resolved in MODEL_IDS:
-            model = resolved
-        elif model not in MODEL_IDS:
-            model = DEFAULT_MODEL_ID
+        model = normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
         self.selected_model = model
         self._current_chat_state["model"] = model
         if is_codex_model(model):
@@ -8444,10 +8429,7 @@ class ChatFrame(wx.Frame):
             self.input_edit.SetFocus()
             return True, ""
 
-        resolved_model = str(model or self._resolve_current_model() or "").strip()
-        resolved_model = model_id_from_display_name(resolved_model)
-        if resolved_model not in MODEL_IDS and not (is_codex_model(resolved_model) or is_claudecode_model(resolved_model) or is_openclaw_model(resolved_model)):
-            resolved_model = DEFAULT_MODEL_ID
+        resolved_model = normalize_model_id(model or self._resolve_current_model() or "")
         if (not chat_id) and self.view_mode == "history":
             selected_history_id = str(self.view_history_id or "").strip()
             if selected_history_id and selected_history_id not in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}:
@@ -9230,7 +9212,7 @@ class ChatFrame(wx.Frame):
         if fallback_msg and is_current_chat:
             self.selected_model = used_model or self.selected_model
             if used_model:
-                self.model_combo.SetValue(used_model)
+                self.model_combo.SetValue(model_display_name(used_model))
             self.SetStatusText(fallback_msg)
         elif is_current_chat:
             if is_openclaw_model(used_model) and not err:
@@ -9548,9 +9530,7 @@ class ChatFrame(wx.Frame):
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
-        model = model_id_from_display_name(str(self._resolve_current_model() or DEFAULT_MODEL_ID).strip())
-        if model not in MODEL_IDS and not (is_codex_model(model) or is_claudecode_model(model) or is_openclaw_model(model)):
-            model = DEFAULT_MODEL_ID
+        model = normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
         self.selected_model = model
         self._current_chat_state["model"] = model
         if is_codex_model(model):
