@@ -7299,6 +7299,168 @@ def test_screen_reader_primary_tab_order_matches_requested_chat_flow(frame):
     assert frame.chat_tab_order == frame.root_tab_order[:8]
 
 
+def test_chat_frame_initializes_incremental_list_models(frame):
+    assert frame.history_list_model.control is frame.history_list
+    assert frame.answer_list_model.control is frame.answer_list
+    assert frame.execution_list_model.control is frame.execution_list
+    assert frame.notes_notebook_list_model.control is frame.notes_notebook_list
+    assert frame.notes_entry_list_model.control is frame.notes_entry_list
+
+
+def test_history_title_change_updates_single_row_without_full_refresh(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame._current_chat_state = {"id": "chat-active", "title": "old title", "turns": []}
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "old archived", "turns": [], "created_at": 1.0, "updated_at": 1.0}
+    ]
+    frame._refresh_history("chat-active")
+    frame.history_list.SetSelection(0)
+
+    monkeypatch.setattr(frame.history_list, "Clear", lambda: pytest.fail("history title update must not clear the list"))
+    frame._current_chat_state["title"] = "new title"
+
+    changed = frame._upsert_history_row("chat-active", allow_reorder=False)
+
+    assert changed is True
+    assert frame.history_list.GetString(0) == "new title"
+    assert frame.history_ids == ["chat-active", "chat-old"]
+    assert frame.history_list.GetSelection() == 0
+
+
+def test_background_history_update_defers_reorder_while_primary_control_has_focus(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame._current_chat_state = {"id": "chat-active", "title": "active", "turns": [], "updated_at": 10.0}
+    frame.archived_chats = [
+        {"id": "chat-old", "title": "old", "turns": [], "created_at": 1.0, "updated_at": 1.0}
+    ]
+    frame._refresh_history("chat-active")
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    frame.history_list.SetSelection(0)
+
+    frame.archived_chats[0]["updated_at"] = 99.0
+    changed = frame._upsert_history_row("chat-old", allow_reorder=True)
+
+    assert changed is True
+    assert frame.history_ids == ["chat-active", "chat-old"]
+    assert frame._pending_history_reorder is True
+    assert frame.history_list.GetSelection() == 0
+
+
+def test_execution_list_render_populates_incremental_model(frame):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "title": "active",
+        "turns": [{"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "old step"}],
+    }
+
+    frame._render_execution_list()
+
+    assert frame.execution_list_model.visible_ids
+    assert len(frame.execution_list_model.visible_ids) == frame.execution_list.GetCount()
+
+
+def test_execution_event_appends_single_row_without_clearing_visible_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "title": "active",
+        "turns": [{"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("execution append must not clear visible list"))
+
+    frame._on_codex_event_for_chat(
+        "chat-active",
+        main.CodexEvent(type="plan_updated", thread_id="", turn_id="", text="step one"),
+    )
+
+    assert any(frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount()))
+    assert frame.execution_list_model.visible_ids
+
+
+def test_execution_append_does_not_select_latest_while_execution_list_has_focus(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "title": "active",
+        "turns": [{"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "old step"}],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetSelection(0)
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
+
+    frame._on_codex_event_for_chat(
+        "chat-active",
+        main.CodexEvent(type="plan_updated", thread_id="", turn_id="", text="new step"),
+    )
+
+    assert frame.execution_list.GetSelection() == 0
+
+
+def test_answer_list_render_populates_incremental_model(frame):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns, "detail_panel_mode": "answers"}
+
+    frame._render_answer_list(refresh_execution=False)
+
+    assert frame.answer_list_model.visible_ids
+    assert len(frame.answer_list_model.visible_ids) == frame.answer_list.GetCount()
+
+
+def test_final_answer_updates_existing_pending_answer_row_without_clearing(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns, "detail_panel_mode": "answers"}
+    frame._render_answer_list(refresh_execution=False)
+    monkeypatch.setattr(frame.answer_list, "Clear", lambda: pytest.fail("final answer must not clear answer list"))
+
+    frame._on_done(0, "final answer", "", main.DEFAULT_CODEX_MODEL, "", "chat-active")
+
+    labels = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
+    assert "final answer" in labels
+    assert len(frame.answer_list_model.visible_ids) == frame.answer_list.GetCount()
+
+
+def test_answer_update_preserves_history_focus(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns, "detail_panel_mode": "answers"}
+    frame._render_answer_list(refresh_execution=False)
+    monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: False)
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: pytest.fail("answer completion must not steal focus"))
+
+    frame._on_done(0, "final answer", "", main.DEFAULT_CODEX_MODEL, "", "chat-active")
+
+    assert frame.active_session_turns[0]["answer_md"] == "final answer"
+
+
 def test_tab_moves_from_notes_to_history_then_answer_then_input(frame):
     frame.Show()
     notebook = frame.notes_store.create_notebook("tab notebook")
@@ -14170,6 +14332,71 @@ def test_notes_entry_labels_are_short_previews_for_large_entries(frame):
     label = frame.notes_entry_list.GetString(0)
     assert len(label) <= main.NOTES_ENTRY_LABEL_MAX_CHARS + 1
     assert label.endswith("...")
+
+
+def test_notes_notebook_title_change_updates_single_row_without_full_refresh(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("old notebook")
+    frame._notes_refresh_notebooks(notebook.id)
+    monkeypatch.setattr(frame.notes_notebook_list, "Clear", lambda: pytest.fail("notebook title update should not rebuild the listbox"))
+
+    frame.notes_store.update_notebook(notebook.id, "new notebook")
+    assert frame._notes_upsert_notebook_row(notebook.id) is True
+
+    assert frame.notes_notebook_list.GetCount() == 1
+    assert frame.notes_notebook_list.GetString(0) == "new notebook"
+    assert frame._notes_notebook_ids == [notebook.id]
+
+
+def test_notes_entry_content_change_updates_single_row_without_full_refresh(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("nb")
+    entry = frame.notes_store.create_entry(notebook.id, "old entry", source="manual")
+    frame._notes_refresh_entries(notebook.id, entry.id)
+    monkeypatch.setattr(frame.notes_entry_list, "Clear", lambda: pytest.fail("entry update should not rebuild the listbox"))
+
+    frame.notes_store.update_entry(entry.id, "new entry body", source="manual")
+    assert frame._notes_upsert_entry_row(entry.id) is True
+
+    assert frame.notes_entry_list.GetCount() == 1
+    assert frame.notes_entry_list.GetString(0) == "new entry body"
+    assert frame._notes_entry_ids == [entry.id]
+
+
+def test_notes_rename_action_updates_single_notebook_row_without_full_refresh(frame, monkeypatch):
+    class _RenameDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return main.wx.ID_OK
+
+        def GetValue(self):
+            return "renamed notebook"
+
+        def Destroy(self):
+            pass
+
+    notebook = frame.notes_store.create_notebook("old notebook")
+    frame._notes_select_notebook(notebook.id, view="notes_list", focus=False)
+    monkeypatch.setattr(main.wx, "TextEntryDialog", _RenameDialog)
+    monkeypatch.setattr(frame.notes_notebook_list, "Clear", lambda: pytest.fail("rename action should not rebuild notebooks"))
+
+    assert frame._notes_rename_notebook() is True
+
+    assert frame.notes_notebook_list.GetString(frame._notes_notebook_ids.index(notebook.id)) == "renamed notebook"
+
+
+def test_notes_save_action_updates_single_entry_row_without_full_refresh(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("nb")
+    entry = frame.notes_store.create_entry(notebook.id, "old entry", source="manual")
+    frame._notes_select_notebook(notebook.id, entry.id, view="note_edit", focus=False)
+    frame.notes_editor.SetValue("saved entry")
+    frame._on_notes_editor_changed(None)
+    monkeypatch.setattr(frame.notes_entry_list, "Clear", lambda: pytest.fail("save action should not rebuild entries"))
+
+    assert frame._notes_save_current_entry() is True
+
+    assert frame.notes_entry_list.GetString(frame._notes_entry_ids.index(entry.id)) == "saved entry"
+    assert frame.notes_controller.notes_view == "note_detail"
 
 
 def test_notes_entry_arrow_selection_does_not_sync_large_editor_text(frame, monkeypatch):

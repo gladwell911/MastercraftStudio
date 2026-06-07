@@ -47,6 +47,7 @@ from context_usage import (
     estimate_turns_tokens,
     format_context_usage_label,
 )
+from listbox_model import IncrementalListBoxModel
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_backup import export_notes_backup, restore_notes_backup
 from notes_projection import DesktopNotesProjection
@@ -965,6 +966,7 @@ class ChatFrame(wx.Frame):
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
         self._codex_ui_batch_depth = 0
+        self._pending_history_reorder = False
         self._execution_list_deferred_repaint = False
         self._execution_list_deferred_select_latest = False
         self._pending_execution_step_persists = []
@@ -1198,6 +1200,11 @@ class ChatFrame(wx.Frame):
         self.root_tab_order = []
         self.chat_tab_order = []
         self.notes_tab_order = []
+        self.history_list_model = IncrementalListBoxModel(self.history_list)
+        self.answer_list_model = IncrementalListBoxModel(self.answer_list)
+        self.execution_list_model = IncrementalListBoxModel(self.execution_list)
+        self.notes_notebook_list_model = IncrementalListBoxModel(self.notes_notebook_list)
+        self.notes_entry_list_model = IncrementalListBoxModel(self.notes_entry_list)
         self._notes_rebuild_tab_order()
         self._sync_notes_ui()
 
@@ -2403,16 +2410,92 @@ class ChatFrame(wx.Frame):
             selected_idx = ids.index(target)
         elif labels:
             selected_idx = 0
-        changed = self._replace_listbox_items_if_changed(self.history_list, labels, selected_idx)
-        self.history_ids = ids
-        if not changed and selected_idx is not None:
-            try:
-                if self.history_list.GetSelection() != selected_idx:
-                    self.history_list.SetSelection(selected_idx)
-            except Exception:
-                pass
+        selected_id = ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(ids) else ""
+        if hasattr(self, "history_list_model"):
+            changed = self.history_list_model.replace_visible_page(list(zip(ids, labels)), selected_id=selected_id)
+            self.history_ids = list(self.history_list_model.visible_ids)
+        else:
+            changed = self._replace_listbox_items_if_changed(self.history_list, labels, selected_idx)
+            self.history_ids = ids
+            if not changed and selected_idx is not None:
+                try:
+                    if self.history_list.GetSelection() != selected_idx:
+                        self.history_list.SetSelection(selected_idx)
+                except Exception:
+                    pass
         if changed:
             self._request_listbox_repaint(self.history_list)
+
+    def _history_chat_label(self, chat: dict, *, is_current: bool = False) -> str:
+        if is_current:
+            return self._current_history_title()
+        title = str((chat or {}).get("title") or "新聊天")
+        if self._is_default_chat_title(title):
+            title = EMPTY_CURRENT_CHAT_TITLE
+        return f"[置顶] {title}" if (chat or {}).get("pinned") else title
+
+    def _history_chat_sort_key(self, chat_id: str) -> tuple:
+        chat_id = str(chat_id or "").strip()
+        current_id = self._current_history_id()
+        if current_id and chat_id == current_id:
+            return (0, 0, 0, chat_id)
+        chat = self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return (9, 0, 0, chat_id)
+        pinned_rank = 0 if chat.get("pinned") else 1
+        updated = float(chat.get("updated_at") or chat.get("created_at") or 0.0)
+        created = float(chat.get("created_at") or 0.0)
+        return (1, pinned_rank, -updated, -created, chat_id)
+
+    def _history_row_for_chat_id(self, chat_id: str) -> tuple[str, str] | None:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return None
+        current_id = self._current_history_id()
+        if current_id and chat_id == current_id:
+            return chat_id, self._history_chat_label(self._current_chat_state, is_current=True)
+        chat = self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return None
+        return chat_id, self._history_chat_label(chat)
+
+    def _desired_history_index(self, chat_id: str) -> int:
+        chat_id = str(chat_id or "").strip()
+        ids = list(getattr(self, "history_ids", []) or [])
+        if chat_id and chat_id not in ids:
+            ids.append(chat_id)
+        ordered = sorted(ids, key=self._history_chat_sort_key)
+        try:
+            return ordered.index(chat_id)
+        except ValueError:
+            return len(ids)
+
+    def _upsert_history_row(self, chat_id: str, *, allow_reorder: bool = True) -> bool:
+        if not hasattr(self, "history_list_model"):
+            self._refresh_history(chat_id)
+            return True
+        row = self._history_row_for_chat_id(chat_id)
+        if row is None:
+            return False
+        item_id, label = row
+        selected_id = self.history_list_model.selected_id()
+        changed = False
+        if item_id not in self.history_list_model.labels_by_id:
+            index = self._desired_history_index(item_id) if allow_reorder else len(self.history_ids)
+            changed = self.history_list_model.insert(item_id, label, index)
+        else:
+            changed = self.history_list_model.update_label(item_id, label)
+            if allow_reorder and not self._primary_navigation_control_has_focus():
+                changed = self.history_list_model.move(item_id, self._desired_history_index(item_id)) or changed
+            elif allow_reorder:
+                self._pending_history_reorder = True
+                changed = True
+        self.history_ids = list(self.history_list_model.visible_ids)
+        if selected_id:
+            self.history_list_model.set_selection_by_id(selected_id)
+        if changed:
+            self._request_listbox_repaint(self.history_list)
+        return changed
 
     def _get_view_turns(self):
         if self.view_mode == "history":
@@ -2446,7 +2529,10 @@ class ChatFrame(wx.Frame):
 
     def _append_turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> None:
         for label, meta in self._turn_attachment_rows(turn_idx, attachments, incoming=incoming):
-            self.answer_list.Append(label)
+            if hasattr(self, "answer_list_model"):
+                self.answer_list_model.append(self._answer_row_id(meta), label)
+            else:
+                self.answer_list.Append(label)
             self.answer_meta.append(meta)
 
     def _input_attachment_marker_text(self, attachments: list[dict]) -> str:
@@ -2955,6 +3041,28 @@ class ChatFrame(wx.Frame):
                     break
         return limited_rows, limited_metas, active_idx
 
+    def _answer_row_id(self, meta: tuple) -> str:
+        kind = str(meta[0] if meta else "")
+        try:
+            turn_idx = int(meta[1] if len(meta) > 1 else -1)
+        except Exception:
+            turn_idx = -1
+        if kind in {"user", "question", "ai", "answer", "attachment"}:
+            detail = str(meta[3] if len(meta) > 3 else "")
+            if kind == "attachment":
+                return f"answer:{turn_idx}:attachment:{detail}"
+            return f"answer:{turn_idx}:{kind}"
+        if kind in {"context_usage", "current_model", "more", "info"}:
+            return f"answer:special:{kind}"
+        return f"answer:{turn_idx}:{kind}:{len(str(meta))}"
+
+    def _replace_answer_list_rows(self, rows: list[str], metas: list[tuple], selected_idx: int | None) -> bool:
+        if not hasattr(self, "answer_list_model"):
+            return self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
+        row_ids = [self._answer_row_id(meta) for meta in metas]
+        selected_id = row_ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(row_ids) else ""
+        return self.answer_list_model.replace_visible_page(list(zip(row_ids, rows)), selected_id=selected_id)
+
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
         selected_meta = None
         idx = self.answer_list.GetSelection() if hasattr(self, "answer_list") else wx.NOT_FOUND
@@ -2996,7 +3104,7 @@ class ChatFrame(wx.Frame):
             rows.append("暂无对话内容")
             metas.append(("info", -1, "", ""))
             selected_idx = 0 if rows else None
-            changed = self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
+            changed = self._replace_answer_list_rows(rows, metas, selected_idx)
             self.answer_meta = metas
             if changed:
                 self._request_listbox_repaint(self.answer_list)
@@ -3064,7 +3172,7 @@ class ChatFrame(wx.Frame):
             selected_idx = max(0, min(int(selected_idx), len(rows) - 1))
         else:
             selected_idx = None
-        changed = self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
+        changed = self._replace_answer_list_rows(rows, metas, selected_idx)
         self.answer_meta = metas
         self._active_answer_row_index = active_idx
         if changed:
@@ -3107,19 +3215,33 @@ class ChatFrame(wx.Frame):
             rows_to_delete = [0] * len(empty_rows) if empty_rows == list(range(len(empty_rows))) else sorted(empty_rows, reverse=True)
             for row in rows_to_delete:
                 try:
-                    self.answer_list.Delete(row)
+                    if hasattr(self, "answer_list_model") and row < len(self.answer_meta):
+                        self.answer_list_model.remove(self._answer_row_id(self.answer_meta[row]))
+                    else:
+                        self.answer_list.Delete(row)
                 except Exception:
                     return False
             for row in sorted(empty_rows, reverse=True):
                 del self.answer_meta[row]
 
-        self.answer_list.Append("我")
-        self.answer_meta.append(("user", int(turn_idx), "我", ""))
+        meta = ("user", int(turn_idx), "我", "")
+        if hasattr(self, "answer_list_model"):
+            self.answer_list_model.append(self._answer_row_id(meta), "我")
+        else:
+            self.answer_list.Append("我")
+        self.answer_meta.append(meta)
         if q.strip():
-            self.answer_list.Append(q)
-            self.answer_meta.append(("question", int(turn_idx), q, ""))
+            meta = ("question", int(turn_idx), q, "")
+            if hasattr(self, "answer_list_model"):
+                self.answer_list_model.append(self._answer_row_id(meta), q)
+            else:
+                self.answer_list.Append(q)
+            self.answer_meta.append(meta)
         for label, meta in self._turn_attachment_rows(int(turn_idx), attachments, incoming=False):
-            self.answer_list.Append(label)
+            if hasattr(self, "answer_list_model"):
+                self.answer_list_model.append(self._answer_row_id(meta), label)
+            else:
+                self.answer_list.Append(label)
             self.answer_meta.append(meta)
 
         cache = getattr(self, "_listbox_label_cache", None)
@@ -3194,13 +3316,24 @@ class ChatFrame(wx.Frame):
         answer_text = str(answer_text or "").strip()
         if not answer_text:
             return False
-        self.answer_list.Append("小诸葛")
-        self.answer_meta.append(("ai", int(turn_idx), "小诸葛", ""))
-        self.answer_list.Append(answer_text)
-        self.answer_meta.append(("answer", int(turn_idx), answer_text, answer_md))
+        meta = ("ai", int(turn_idx), "小诸葛", "")
+        if hasattr(self, "answer_list_model"):
+            self.answer_list_model.append(self._answer_row_id(meta), "小诸葛")
+        else:
+            self.answer_list.Append("小诸葛")
+        self.answer_meta.append(meta)
+        meta = ("answer", int(turn_idx), answer_text, answer_md)
+        if hasattr(self, "answer_list_model"):
+            self.answer_list_model.append(self._answer_row_id(meta), answer_text)
+        else:
+            self.answer_list.Append(answer_text)
+        self.answer_meta.append(meta)
         received_attachments = (turn or {}).get("received_attachments") if isinstance((turn or {}).get("received_attachments"), list) else []
         for label, meta in self._turn_attachment_rows(int(turn_idx), received_attachments, incoming=True):
-            self.answer_list.Append(label)
+            if hasattr(self, "answer_list_model"):
+                self.answer_list_model.append(self._answer_row_id(meta), label)
+            else:
+                self.answer_list.Append(label)
             self.answer_meta.append(meta)
         self._active_answer_row_index = len(self.answer_meta) - 1
         cache = getattr(self, "_listbox_label_cache", None)
@@ -3231,7 +3364,11 @@ class ChatFrame(wx.Frame):
             current_text = ""
         if current_text == text and current_meta_md == answer_md:
             return True
-        self.answer_list.SetString(row, text)
+        row_id = self._answer_row_id(self.answer_meta[row])
+        if hasattr(self, "answer_list_model"):
+            self.answer_list_model.update_label(row_id, text)
+        else:
+            self.answer_list.SetString(row, text)
         self.answer_meta[row] = (item_type, idx, text, answer_md)
         self._request_listbox_repaint(self.answer_list)
         return True
@@ -3832,6 +3969,16 @@ class ChatFrame(wx.Frame):
             return False
         return self._append_execution_entry_to_chat(chat_id, {"step": text}, save_state=save_state)
 
+    def _execution_row_id(self, step_idx: int, step) -> str:
+        if isinstance(step, dict):
+            item_id = str(step.get("id") or step.get("event_id") or step.get("item_id") or "").strip()
+            if item_id:
+                return f"execution:{item_id}"
+            created_at = str(step.get("created_at") or "").strip()
+            list_text = self._execution_step_text(step)
+            return f"execution:{step_idx}:{created_at}:{self._normalize_execution_text_for_compare(list_text)}"
+        return f"execution:{step_idx}:{self._normalize_execution_text_for_compare(str(step or ''))}"
+
     def _visible_execution_chat_state(self) -> dict | None:
         if self._detail_panel_mode() != "execution":
             return None
@@ -3854,7 +4001,7 @@ class ChatFrame(wx.Frame):
         if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
             self._execution_list_pending_turn_reset = False
             try:
-                self.execution_list.Clear()
+                self.execution_list_model.replace_visible_page([])
             except Exception:
                 return False
             self.execution_meta = []
@@ -3862,13 +4009,20 @@ class ChatFrame(wx.Frame):
         row_text = str(meta[2] or "").strip()
         if not row_text:
             return False
+        row_id = self._execution_row_id(step_idx, step)
+        selected_id_before = self.execution_list_model.selected_id() if hasattr(self, "execution_list_model") else ""
+        try:
+            selected_idx_before = self.execution_list.GetSelection()
+        except Exception:
+            selected_idx_before = wx.NOT_FOUND
         if (
             self.execution_list.GetCount() == 1
             and len(self.execution_meta) == 1
             and self.execution_meta[0][0] == "info"
         ):
             try:
-                self.execution_list.Delete(0)
+                if not self.execution_list_model.remove("__execution_info__"):
+                    self.execution_list.Delete(0)
             except Exception:
                 return False
             self.execution_meta = []
@@ -3879,11 +4033,12 @@ class ChatFrame(wx.Frame):
         visible_execution_rows = sum(1 for item in self.execution_meta if item[0] == "execution")
         has_more_row = bool(self.execution_meta and self.execution_meta[0][0] == "more")
         if has_more_row:
-            self.execution_list.Append(row_text)
+            self.execution_list_model.append(row_id, row_text)
             self.execution_meta.append(meta)
             if visible_execution_rows >= limit:
                 try:
-                    self.execution_list.Delete(1)
+                    old_row_id = self.execution_list_model.visible_ids[1]
+                    self.execution_list_model.remove(old_row_id)
                     del self.execution_meta[1]
                 except Exception:
                     self._rebuild_execution_list_from_state()
@@ -3891,19 +4046,18 @@ class ChatFrame(wx.Frame):
                 self._execution_list_deferred_repaint = True
                 self._execution_list_deferred_select_latest = True
             else:
-                try:
-                    self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
-                except Exception:
-                    pass
+                self._restore_execution_selection_if_focused(selected_id_before, selected_idx_before)
+                self._select_latest_execution_row_if_not_focused()
                 self._request_listbox_repaint(self.execution_list)
             return True
         if visible_execution_rows >= limit:
             try:
-                self.execution_list.Insert("更多", 0)
+                self.execution_list_model.insert("__execution_more__", "更多", 0)
                 self.execution_meta.insert(0, ("more", -1, "更多", ""))
-                self.execution_list.Append(row_text)
+                self.execution_list_model.append(row_id, row_text)
                 self.execution_meta.append(meta)
-                self.execution_list.Delete(1)
+                old_row_id = self.execution_list_model.visible_ids[1]
+                self.execution_list_model.remove(old_row_id)
                 del self.execution_meta[1]
             except Exception:
                 self._rebuild_execution_list_from_state()
@@ -3911,24 +4065,46 @@ class ChatFrame(wx.Frame):
                 self._execution_list_deferred_repaint = True
                 self._execution_list_deferred_select_latest = True
             else:
-                try:
-                    self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
-                except Exception:
-                    pass
+                self._restore_execution_selection_if_focused(selected_id_before, selected_idx_before)
+                self._select_latest_execution_row_if_not_focused()
                 self._request_listbox_repaint(self.execution_list)
             return True
-        self.execution_list.Append(row_text)
+        self.execution_list_model.append(row_id, row_text)
         self.execution_meta.append(meta)
         if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
             self._execution_list_deferred_repaint = True
             self._execution_list_deferred_select_latest = True
             return True
+        self._restore_execution_selection_if_focused(selected_id_before, selected_idx_before)
+        self._select_latest_execution_row_if_not_focused()
+        self._request_listbox_repaint(self.execution_list)
+        return True
+
+    def _restore_execution_selection_if_focused(self, selected_id: str, selected_idx: int) -> None:
+        try:
+            has_focus = self.execution_list.HasFocus()
+        except Exception:
+            has_focus = False
+        if not has_focus:
+            return
+        if selected_id and hasattr(self, "execution_list_model") and self.execution_list_model.set_selection_by_id(selected_id):
+            return
+        if selected_idx != wx.NOT_FOUND and 0 <= int(selected_idx) < self.execution_list.GetCount():
+            try:
+                self.execution_list.SetSelection(int(selected_idx))
+            except Exception:
+                pass
+
+    def _select_latest_execution_row_if_not_focused(self) -> None:
+        try:
+            if self.execution_list.HasFocus():
+                return
+        except Exception:
+            pass
         try:
             self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
         except Exception:
             pass
-        self._request_listbox_repaint(self.execution_list)
-        return True
 
     def _flush_deferred_execution_list_updates(self) -> None:
         if not bool(getattr(self, "_execution_list_deferred_repaint", False)):
@@ -3943,7 +4119,7 @@ class ChatFrame(wx.Frame):
                 should_select_latest = True
         if should_select_latest and hasattr(self, "execution_list") and self.execution_list.GetCount() > 0:
             try:
-                self.execution_list.SetSelection(self.execution_list.GetCount() - 1)
+                self._select_latest_execution_row_if_not_focused()
             except Exception:
                 pass
         self._request_listbox_repaint(self.execution_list)
@@ -4356,14 +4532,19 @@ class ChatFrame(wx.Frame):
         if not visible_items:
             rows.append("暂无执行过程")
             metas.append(("info", -1, "", ""))
-            changed = self._replace_listbox_items_if_changed(self.execution_list, rows, 0)
+            if hasattr(self, "execution_list_model"):
+                changed = self.execution_list_model.replace_visible_page([("__execution_info__", rows[0])], selected_id="__execution_info__")
+            else:
+                changed = self._replace_listbox_items_if_changed(self.execution_list, rows, 0)
             self.execution_meta = metas
             if changed:
                 self._request_listbox_repaint(self.execution_list)
             return
+        row_ids = ["__execution_more__"] if has_more else []
         for row_text, meta in visible_items:
             rows.append(row_text)
             metas.append(meta)
+            row_ids.append(self._execution_row_id(meta[1], steps[meta[1]] if 0 <= int(meta[1]) < len(steps) else row_text))
         selected_idx = self.execution_list.GetSelection()
         if selected_idx == wx.NOT_FOUND:
             selected_idx = 0
@@ -4371,7 +4552,11 @@ class ChatFrame(wx.Frame):
             selected_idx = max(0, min(int(selected_idx), len(rows) - 1))
         else:
             selected_idx = None
-        changed = self._replace_listbox_items_if_changed(self.execution_list, rows, selected_idx)
+        if hasattr(self, "execution_list_model"):
+            selected_id = row_ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(row_ids) else ""
+            changed = self.execution_list_model.replace_visible_page(list(zip(row_ids, rows)), selected_id=selected_id)
+        else:
+            changed = self._replace_listbox_items_if_changed(self.execution_list, rows, selected_idx)
         self.execution_meta = metas
         if changed:
             self._request_listbox_repaint(self.execution_list)
@@ -9229,7 +9414,13 @@ class ChatFrame(wx.Frame):
             self._push_remote_history_changed(resolved_chat_id)
         self._defer_chat_state_save()
         if self._is_ui_alive():
-            self._refresh_history(resolved_chat_id or None)
+            if resolved_chat_id:
+                self._upsert_history_row(
+                    resolved_chat_id,
+                    allow_reorder=not self._primary_navigation_control_has_focus(),
+                )
+            else:
+                self._refresh_history(None)
 
         should_play_finish_sound = (not is_openclaw_model(used_model)) or err
         if should_play_finish_sound:
@@ -10278,11 +10469,11 @@ class ChatFrame(wx.Frame):
                 self.new_chat_button,
                 self.model_combo,
                 self.codex_speed_combo,
-                self.send_button,
                 self.history_list,
                 primary_notes_ctrl,
                 detail_target,
                 secondary_detail_target,
+                self.send_button,
                 self.notes_notebook_list,
                 self.notes_editor,
             ]
@@ -10323,7 +10514,7 @@ class ChatFrame(wx.Frame):
                 pass
         if primary_notes_ctrl is self.notes_entry_list:
             try:
-                self.history_list.MoveAfterInTabOrder(self.send_button)
+                self.history_list.MoveAfterInTabOrder(self.codex_speed_combo)
             except Exception:
                 pass
             try:
@@ -10405,9 +10596,15 @@ class ChatFrame(wx.Frame):
         if focus is self.history_list:
             if detail_target is not None:
                 detail_target.SetFocus()
+            skip = getattr(event, "Skip", None)
+            if callable(skip):
+                skip()
             return True
         if focus is detail_target or focus in detail_controls:
             self.input_edit.SetFocus()
+            skip = getattr(event, "Skip", None)
+            if callable(skip):
+                skip()
             return True
         return False
 
@@ -10569,8 +10766,11 @@ class ChatFrame(wx.Frame):
         else:
             notebooks = self.notes_store.search_notebooks(query) if query else self.notes_store.list_notebooks()
         self._notes_notebook_ids = [nb.id for nb in notebooks]
+        model = getattr(self, "notes_notebook_list_model", None)
         if not notebooks:
             self.notes_notebook_list.Enable(True)
+            if model is not None:
+                model.replace_visible_page([])
             self._replace_listbox_items_if_changed(self.notes_notebook_list, ["暂无笔记本"], 0)
             return
         self.notes_notebook_list.Enable(True)
@@ -10578,14 +10778,20 @@ class ChatFrame(wx.Frame):
         selected_idx = 0
         if target in self._notes_notebook_ids:
             selected_idx = self._notes_notebook_ids.index(target)
-        labels = [f"{'★ ' if notebook.pinned else ''}{notebook.title}" for notebook in notebooks]
-        self._replace_listbox_items_if_changed(self.notes_notebook_list, labels, selected_idx)
+        labels = [self._notes_notebook_label(notebook) for notebook in notebooks]
+        if model is not None:
+            model.replace_visible_page(list(zip(self._notes_notebook_ids, labels)), target)
+        else:
+            self._replace_listbox_items_if_changed(self.notes_notebook_list, labels, selected_idx)
 
     def _notes_refresh_entries(self, notebook_id: str | None = None, select_id: str | None = None) -> None:
         notebook_id = str(notebook_id or self.notes_controller.active_notebook_id or "").strip()
         self._notes_entry_ids = []
+        model = getattr(self, "notes_entry_list_model", None)
         if not notebook_id:
             self.notes_entry_list.Enable(False)
+            if model is not None:
+                model.replace_visible_page([])
             self._replace_listbox_items_if_changed(self.notes_entry_list, ["请选择笔记本"], None)
             return
         projection = getattr(self, "notes_projection", None)
@@ -10596,6 +10802,8 @@ class ChatFrame(wx.Frame):
         self.notes_entry_list.Enable(True)
         self._notes_entry_ids = [entry.id for entry in entries]
         if not entries:
+            if model is not None:
+                model.replace_visible_page([])
             self._replace_listbox_items_if_changed(self.notes_entry_list, ["暂无条目"], None)
             return
         target = str(select_id or self.notes_controller.active_entry_id or entries[0].id)
@@ -10605,7 +10813,92 @@ class ChatFrame(wx.Frame):
         labels = []
         for entry in entries:
             labels.append(self._notes_entry_label(entry))
-        self._replace_listbox_items_if_changed(self.notes_entry_list, labels, selected_idx)
+        if model is not None:
+            model.replace_visible_page(list(zip(self._notes_entry_ids, labels)), target)
+        else:
+            self._replace_listbox_items_if_changed(self.notes_entry_list, labels, selected_idx)
+
+    def _notes_notebook_label(self, notebook) -> str:
+        return f"{'★ ' if getattr(notebook, 'pinned', False) else ''}{getattr(notebook, 'title', '')}"
+
+    def _notes_upsert_notebook_row(self, notebook_id: str) -> bool:
+        notebook_id = str(notebook_id or "").strip()
+        if not notebook_id:
+            return False
+        projection = getattr(self, "notes_projection", None)
+        notebook = projection.get_notebook(notebook_id) if projection is not None else self.notes_store.get_notebook(notebook_id)
+        if notebook is None:
+            return self._notes_remove_notebook_row(notebook_id)
+        model = getattr(self, "notes_notebook_list_model", None)
+        if model is None:
+            self._notes_refresh_notebooks(notebook_id)
+            return True
+        label = self._notes_notebook_label(notebook)
+        row_idx = model.row_for_id(notebook_id)
+        if row_idx >= 0:
+            changed = model.update_label(notebook_id, label)
+            self._notes_notebook_ids = list(model.visible_ids)
+            return changed
+        if not self._notes_notebook_ids or self.notes_notebook_list.GetCount() != len(self._notes_notebook_ids):
+            self.notes_notebook_list.Clear()
+            self._notes_notebook_ids = []
+            model.visible_ids = []
+            model.labels_by_id = {}
+        model.append(notebook_id, label)
+        self._notes_notebook_ids = list(model.visible_ids)
+        return True
+
+    def _notes_remove_notebook_row(self, notebook_id: str) -> bool:
+        notebook_id = str(notebook_id or "").strip()
+        model = getattr(self, "notes_notebook_list_model", None)
+        changed = model.remove(notebook_id) if model is not None else False
+        if notebook_id in self._notes_notebook_ids:
+            self._notes_notebook_ids = [item_id for item_id in self._notes_notebook_ids if item_id != notebook_id]
+            changed = True
+        if model is not None:
+            self._notes_notebook_ids = list(model.visible_ids)
+        return changed
+
+    def _notes_upsert_entry_row(self, entry_id: str) -> bool:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        projection = getattr(self, "notes_projection", None)
+        entry = projection.get_entry(entry_id) if projection is not None else self.notes_store.get_entry(entry_id)
+        if entry is None:
+            return self._notes_remove_entry_row(entry_id)
+        active_notebook_id = str(getattr(self.notes_controller, "active_notebook_id", "") or "")
+        if active_notebook_id and str(getattr(entry, "notebook_id", "") or "") != active_notebook_id:
+            return False
+        model = getattr(self, "notes_entry_list_model", None)
+        if model is None:
+            self._notes_refresh_entries(entry.notebook_id, entry_id)
+            return True
+        label = self._notes_entry_label(entry)
+        row_idx = model.row_for_id(entry_id)
+        if row_idx >= 0:
+            changed = model.update_label(entry_id, label)
+            self._notes_entry_ids = list(model.visible_ids)
+            return changed
+        if not self._notes_entry_ids or self.notes_entry_list.GetCount() != len(self._notes_entry_ids):
+            self.notes_entry_list.Clear()
+            self._notes_entry_ids = []
+            model.visible_ids = []
+            model.labels_by_id = {}
+        model.append(entry_id, label)
+        self._notes_entry_ids = list(model.visible_ids)
+        return True
+
+    def _notes_remove_entry_row(self, entry_id: str) -> bool:
+        entry_id = str(entry_id or "").strip()
+        model = getattr(self, "notes_entry_list_model", None)
+        changed = model.remove(entry_id) if model is not None else False
+        if entry_id in self._notes_entry_ids:
+            self._notes_entry_ids = [item_id for item_id in self._notes_entry_ids if item_id != entry_id]
+            changed = True
+        if model is not None:
+            self._notes_entry_ids = list(model.visible_ids)
+        return changed
 
     def _notes_entry_label(self, entry) -> str:
         prefix = "★ " if getattr(entry, "pinned", False) else ""
@@ -11226,7 +11519,12 @@ class ChatFrame(wx.Frame):
         self.notes_controller.entry_editor_base_version = entry.version
         self.notes_controller.notes_view = "note_detail"
         self._current_notes_state = self.notes_controller.to_state_dict()
-        self._notes_refresh_ui()
+        self._notes_upsert_entry_row(entry.id)
+        model = getattr(self, "notes_entry_list_model", None)
+        if model is not None:
+            model.set_selection_by_id(entry.id)
+            self._notes_entry_ids = list(model.visible_ids)
+        self._notes_sync_view_visibility()
         try:
             self.notes_entry_list.SetFocus()
         except Exception:
@@ -11263,7 +11561,12 @@ class ChatFrame(wx.Frame):
         if not title:
             return False
         self.notes_store.rename_notebook(notebook.id, title)
-        self._notes_refresh_ui()
+        self._notes_upsert_notebook_row(notebook.id)
+        model = getattr(self, "notes_notebook_list_model", None)
+        if model is not None:
+            model.set_selection_by_id(notebook.id)
+            self._notes_notebook_ids = list(model.visible_ids)
+        self._notes_sync_view_visibility()
         self._notes_after_local_mutation()
         return True
 

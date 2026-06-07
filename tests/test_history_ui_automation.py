@@ -33,6 +33,34 @@ def _focused_control():
     return main.wx.Window.FindFocus()
 
 
+def test_history_navigation_stays_stable_when_background_chat_title_updates(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame._current_chat_state = {"id": "chat-active", "title": "active", "turns": []}
+    frame.archived_chats = [
+        {
+            "id": "chat-old",
+            "title": "old",
+            "turns": [{"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame._refresh_history("chat-active")
+    frame.history_list.SetSelection(0)
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    frame._on_done(0, "background answer", "", main.DEFAULT_CODEX_MODEL, "", "chat-old")
+    wx_app.Yield()
+
+    assert frame.history_list.GetSelection() == 0
+    assert frame.history_ids == ["chat-active", "chat-old"]
+    assert frame.history_list.GetString(1)
+
+
 class _EnterEvent:
     def GetKeyCode(self):
         return main.wx.WXK_RETURN

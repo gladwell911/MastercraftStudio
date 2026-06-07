@@ -1,4 +1,41 @@
+import ctypes
+import time
+
+import main
 import wx
+
+
+def _send_listbox_key(window, key_code):
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    wm_keydown = 0x0100
+    wm_keyup = 0x0101
+    scan_codes = {
+        main.wx.WXK_UP: 0x48,
+        main.wx.WXK_DOWN: 0x50,
+        main.wx.WXK_HOME: 0x47,
+        main.wx.WXK_END: 0x4F,
+    }
+    virtual_keys = {
+        main.wx.WXK_UP: 0x26,
+        main.wx.WXK_DOWN: 0x28,
+        main.wx.WXK_HOME: 0x24,
+        main.wx.WXK_END: 0x23,
+    }
+    scan = scan_codes.get(key_code, 0)
+    virtual_key = virtual_keys.get(key_code, int(key_code))
+    down_lparam = 1 | (scan << 16)
+    up_lparam = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    hwnd = int(window.GetHandle())
+    user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
+    user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
+
+
+def _activate_frame(frame, wx_app):
+    frame.Show()
+    frame.Raise()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetForegroundWindow(int(frame.GetHandle()))
+    wx_app.Yield()
 
 
 def test_notes_ui_automation_application_menu_exports_and_restores_all_notes(frame, monkeypatch, tmp_path):
@@ -124,3 +161,31 @@ def test_notes_ui_automation_detail_view_hides_notebook_list_and_keeps_tab_slot(
     assert frame.notes_detail_panel.IsShown()
     assert frame.root_tab_order[4] is frame.history_list
     assert frame.root_tab_order[5] is frame.notes_entry_list
+
+
+def test_notes_ui_automation_entry_navigation_stays_responsive_when_background_entry_updates(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    notebook = frame.notes_store.create_notebook("ui automation incremental notebook")
+    frame.notes_store.create_entry(notebook.id, "first entry", source="manual")
+    frame.notes_store.create_entry(notebook.id, "second entry", source="manual")
+    frame.notes_store.create_entry(notebook.id, "third entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail", focus=False)
+    assert frame.notes_entry_list.GetCount() >= 3
+    frame.notes_entry_list.SetSelection(0)
+    frame.notes_entry_list.SetFocusFromKbd()
+    wx_app.Yield()
+    assert frame.notes_entry_list.HasFocus()
+    background_entry_id = frame._notes_entry_ids[1]
+    monkeypatch.setattr(frame.notes_entry_list, "Clear", lambda: (_ for _ in ()).throw(AssertionError("background note update rebuilt entries")))
+
+    frame.notes_store.update_entry(background_entry_id, "second entry updated", source="manual")
+    assert frame._notes_upsert_entry_row(background_entry_id) is True
+
+    started = time.perf_counter()
+    _send_listbox_key(frame.notes_entry_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+    assert frame.notes_entry_list.GetSelection() == 1
+    assert frame.notes_entry_list.HasFocus()
