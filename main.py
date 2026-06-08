@@ -14,6 +14,7 @@ import uuid
 import webbrowser
 import winsound
 import sys
+from contextlib import contextmanager
 from ctypes import wintypes
 from html import escape, unescape
 from html.parser import HTMLParser
@@ -86,6 +87,9 @@ CODEX_BACKGROUND_FLUSH_DELAY_MS = 250
 CODEX_UI_EVENT_BATCH_SIZE = 25
 CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE = 5
 CODEX_UI_EVENT_BATCH_DELAY_MS = 10
+IDLE_UI_REFRESH_DELAY_MS = 1000
+UI_PERF_SLOW_THRESHOLD_MS = 50.0
+UI_PERF_MAX_SLOW_SAMPLES = 100
 ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
 ANSWER_LIST_EXPAND_ROWS = 100
 EXECUTION_LIST_DEFAULT_VISIBLE_ROWS = 100
@@ -967,6 +971,15 @@ class ChatFrame(wx.Frame):
         self._codex_ui_event_drain_timer = None
         self._codex_ui_batch_depth = 0
         self._pending_history_reorder = False
+        self._history_list_dirty = False
+        self._pending_history_keep_id = None
+        self._execution_list_dirty = False
+        self._openclaw_lifecycle_dirty = False
+        self._idle_ui_refresh_timer = None
+        self._idle_ui_refresh_scheduled = False
+        self._last_primary_interaction_at = time.monotonic()
+        self.ui_perf_slow_threshold_ms = UI_PERF_SLOW_THRESHOLD_MS
+        self.ui_perf_slow_samples: list[dict] = []
         self._execution_list_deferred_repaint = False
         self._execution_list_deferred_select_latest = False
         self._pending_execution_step_persists = []
@@ -1225,7 +1238,8 @@ class ChatFrame(wx.Frame):
         self.new_chat_button.Bind(wx.EVT_BUTTON, self._on_new_chat_clicked)
         self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_model_changed)
         self.codex_speed_combo.Bind(wx.EVT_COMBOBOX, self._on_codex_speed_changed)
-        self.input_edit.Bind(wx.EVT_KEY_DOWN, self._on_input_key_down)
+        self.input_edit.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("input_key_down", self._on_input_key_down))
+        self.input_edit.Bind(wx.EVT_TEXT, self._monitored_ui_handler("input_text", self._on_input_text_changed))
         self.input_edit.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.send_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.new_chat_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
@@ -1242,22 +1256,22 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL_ALT2)
         self.Bind(wx.EVT_KEY_DOWN, self._on_frame_key_down)
 
-        self.answer_list.Bind(wx.EVT_KEY_DOWN, self._on_answer_key_down)
+        self.answer_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("answer_key_down", self._on_answer_key_down))
         self.answer_list.Bind(wx.EVT_CHAR, self._on_answer_char)
         self.answer_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_answer_activate)
-        self.execution_list.Bind(wx.EVT_KEY_DOWN, self._on_execution_key_down)
+        self.execution_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("execution_key_down", self._on_execution_key_down))
         self.execution_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.execution_list.Bind(wx.EVT_CHAR, self._on_execution_char)
         self.execution_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_execution_activate)
-        self.history_list.Bind(wx.EVT_KEY_DOWN, self._on_history_key_down)
+        self.history_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("history_key_down", self._on_history_key_down))
         self.history_list.Bind(wx.EVT_CHAR, self._on_history_char)
         self.history_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._activate_selected_history())
         self.history_list.Bind(wx.EVT_LISTBOX, self._on_history_selected)
         self.history_list.Bind(wx.EVT_CONTEXT_MENU, self._on_history_context)
-        self.model_combo.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
-        self.codex_speed_combo.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
-        self.send_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
-        self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._on_generic_key_down)
+        self.model_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
+        self.codex_speed_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
+        self.send_button.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
+        self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
         self.new_chat_button.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.new_chat_button.Bind(wx.EVT_CHAR, self._on_generic_key_down)
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
@@ -1274,14 +1288,14 @@ class ChatFrame(wx.Frame):
         if hasattr(self, "notes_notebook_list"):
             self.notes_notebook_list.Bind(wx.EVT_LISTBOX, self._on_notes_notebook_selected)
             self.notes_notebook_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._notes_open_selected_notebook())
-            self.notes_notebook_list.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_notebook_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("notes_key_down", self._on_notes_key_down))
             self.notes_notebook_list.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
             self.notes_entry_list.Bind(wx.EVT_LISTBOX, self._on_notes_entry_selected)
             self.notes_entry_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._notes_edit_entry())
-            self.notes_entry_list.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_entry_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("notes_key_down", self._on_notes_key_down))
             self.notes_entry_list.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
             self.notes_editor.Bind(wx.EVT_TEXT, self._on_notes_editor_changed)
-            self.notes_editor.Bind(wx.EVT_KEY_DOWN, self._on_notes_key_down)
+            self.notes_editor.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("notes_key_down", self._on_notes_key_down))
             self.notes_editor.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
 
     def _resolve_sound_path(self, name: str):
@@ -1799,6 +1813,13 @@ class ChatFrame(wx.Frame):
                 merged["id"] = self.active_chat_id
                 merged["turns"] = self.active_session_turns
                 self._current_chat_state = merged
+            elif isinstance(active_turns, list) and active_turns:
+                self.active_session_turns = active_turns
+                current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
+                if not current:
+                    current = {}
+                current["turns"] = self.active_session_turns
+                self._current_chat_state = current
             else:
                 self.active_session_turns = []
         self.active_openclaw_session_key = str(data.get("active_openclaw_session_key") or DEFAULT_OPENCLAW_SESSION_KEY).strip() or DEFAULT_OPENCLAW_SESSION_KEY
@@ -2497,6 +2518,23 @@ class ChatFrame(wx.Frame):
             self._request_listbox_repaint(self.history_list)
         return changed
 
+    def _select_history_row_if_present(self, chat_id: str) -> bool:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return False
+        if hasattr(self, "history_list_model"):
+            return self.history_list_model.set_selection_by_id(chat_id)
+        try:
+            idx = list(getattr(self, "history_ids", []) or []).index(chat_id)
+        except ValueError:
+            return False
+        try:
+            if self.history_list.GetSelection() != idx:
+                self.history_list.SetSelection(idx)
+        except Exception:
+            return False
+        return True
+
     def _get_view_turns(self):
         if self.view_mode == "history":
             chat = self._hydrate_chat_from_store(
@@ -2926,13 +2964,33 @@ class ChatFrame(wx.Frame):
     def _append_current_model_row(self, rows: list[str] | None = None, metas: list[tuple] | None = None) -> None:
         return
 
+    def _should_show_context_usage_row(self, label: str | None = None, turns: list[dict] | None = None) -> bool:
+        usage_label = str(label if label is not None else format_context_usage_label(self._active_chat_context_usage()) or "")
+        if usage_label != "暂无":
+            return True
+        view_turns = turns if isinstance(turns, list) else self._get_view_turns()
+        if not view_turns:
+            return True
+        if self.view_mode == "history":
+            return False
+        for turn in reversed(view_turns):
+            model = str((turn or {}).get("model") or "").strip()
+            if is_claudecode_model(model):
+                return True
+            if is_codex_model(model):
+                return str((turn or {}).get("answer_md") or "") == REQUESTING_TEXT or str((turn or {}).get("request_status") or "") == "pending"
+            if model:
+                return False
+        return False
+
     def _refresh_context_usage_header_rows(self) -> bool:
         if not hasattr(self, "answer_list"):
             return False
         handled = False
         changed = False
+        context_label = format_context_usage_label(self._active_chat_context_usage())
         labels = {
-            "context_usage": format_context_usage_label(self._active_chat_context_usage()),
+            "context_usage": context_label,
         }
         for row, meta in enumerate(list(self.answer_meta)):
             if row >= self.answer_list.GetCount():
@@ -2954,6 +3012,21 @@ class ChatFrame(wx.Frame):
             except Exception:
                 continue
             self.answer_meta[row] = (kind, -1, label, "")
+            changed = True
+        if not handled and self._should_show_context_usage_row(context_label):
+            meta = ("context_usage", -1, context_label, "")
+            selected_idx = self.answer_list.GetSelection()
+            if hasattr(self, "answer_list_model"):
+                self.answer_list_model.insert(self._answer_row_id(meta), context_label, 0)
+            else:
+                self.answer_list.Insert(context_label, 0)
+            self.answer_meta.insert(0, meta)
+            if selected_idx in {wx.NOT_FOUND, 0}:
+                try:
+                    self.answer_list.SetSelection(0)
+                except Exception:
+                    pass
+            handled = True
             changed = True
         if changed:
             self._request_listbox_repaint(self.answer_list)
@@ -3095,7 +3168,7 @@ class ChatFrame(wx.Frame):
         self._active_answer_row_index = -1
         turns = self._get_view_turns()
         context_usage_label = format_context_usage_label(self._active_chat_context_usage())
-        if context_usage_label != "暂无" or not turns:
+        if self._should_show_context_usage_row(context_usage_label, turns):
             self._append_context_usage_row(rows, metas)
         self._append_current_model_row(rows, metas)
         header_count = len(metas)
@@ -3181,13 +3254,112 @@ class ChatFrame(wx.Frame):
             self._render_execution_list()
 
     def _request_listbox_repaint(self, *controls) -> None:
-        for control in controls:
-            if control is None:
-                continue
-            try:
-                control.Refresh()
-            except Exception:
-                pass
+        with self._measure_ui_operation("listbox_repaint"):
+            for control in controls:
+                if control is None:
+                    continue
+                try:
+                    control.Refresh()
+                except Exception:
+                    pass
+
+    @contextmanager
+    def _measure_ui_operation(self, name: str, **metadata):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+            self._record_slow_ui_operation(name, elapsed_ms, **metadata)
+
+    def _record_slow_ui_operation(self, name: str, elapsed_ms: float, **metadata) -> None:
+        threshold = float(getattr(self, "ui_perf_slow_threshold_ms", UI_PERF_SLOW_THRESHOLD_MS) or UI_PERF_SLOW_THRESHOLD_MS)
+        if elapsed_ms < threshold:
+            return
+        samples = getattr(self, "ui_perf_slow_samples", None)
+        if not isinstance(samples, list):
+            samples = []
+            self.ui_perf_slow_samples = samples
+        sample = {
+            "name": str(name or "unknown"),
+            "elapsed_ms": float(elapsed_ms),
+            "ts": time.time(),
+        }
+        if metadata:
+            sample["metadata"] = dict(metadata)
+        samples.append(sample)
+        overflow = len(samples) - UI_PERF_MAX_SLOW_SAMPLES
+        if overflow > 0:
+            del samples[:overflow]
+
+    def _monitored_ui_handler(self, name: str, handler):
+        def _wrapped(event):
+            self._mark_primary_interaction()
+            with self._measure_ui_operation(name):
+                return handler(event)
+
+        _wrapped._ui_perf_name = str(name or "")
+        return _wrapped
+
+    def _mark_primary_interaction(self) -> None:
+        self._last_primary_interaction_at = time.monotonic()
+
+    def _primary_navigation_control_is_recently_active(self) -> bool:
+        if not self._primary_navigation_control_has_focus():
+            return False
+        last = float(getattr(self, "_last_primary_interaction_at", 0.0) or 0.0)
+        if last <= 0:
+            return True
+        elapsed_ms = max(0.0, (time.monotonic() - last) * 1000.0)
+        return elapsed_ms < IDLE_UI_REFRESH_DELAY_MS
+
+    def _schedule_idle_ui_refresh(self, delay_ms: int = IDLE_UI_REFRESH_DELAY_MS) -> None:
+        if bool(getattr(self, "_idle_ui_refresh_scheduled", False)):
+            return
+        self._idle_ui_refresh_scheduled = True
+        timer = self._call_later_if_alive(int(delay_ms), self._flush_idle_ui_refreshes)
+        if timer is None:
+            self._idle_ui_refresh_scheduled = False
+            return
+        self._idle_ui_refresh_timer = timer
+
+    def _mark_history_list_dirty(self, keep_id: str | None = None) -> None:
+        self._history_list_dirty = True
+        if keep_id is not None:
+            self._pending_history_keep_id = keep_id
+        self._schedule_idle_ui_refresh()
+
+    def _mark_openclaw_lifecycle_dirty(self) -> None:
+        self._openclaw_lifecycle_dirty = True
+        self._schedule_idle_ui_refresh()
+
+    def _flush_idle_ui_refreshes(self) -> None:
+        self._idle_ui_refresh_scheduled = False
+        self._idle_ui_refresh_timer = None
+        has_history_work = bool(getattr(self, "_history_list_dirty", False))
+        has_execution_work = bool(getattr(self, "_execution_list_dirty", False))
+        has_openclaw_work = bool(getattr(self, "_openclaw_lifecycle_dirty", False))
+        if not has_history_work and not has_execution_work and not has_openclaw_work:
+            return
+        if self._primary_navigation_control_is_recently_active():
+            self._schedule_idle_ui_refresh()
+            return
+        if bool(getattr(self, "_history_list_dirty", False)):
+            keep_id = getattr(self, "_pending_history_keep_id", None)
+            self._history_list_dirty = False
+            self._pending_history_keep_id = None
+            with self._measure_ui_operation("idle_history_list_refresh"):
+                self._refresh_history(keep_id)
+        if bool(getattr(self, "_execution_list_dirty", False)) and self._execution_list_visible_for_updates():
+            with self._measure_ui_operation("idle_execution_list_refresh"):
+                self._render_execution_list(force=True)
+        if bool(getattr(self, "_openclaw_lifecycle_dirty", False)):
+            self._openclaw_lifecycle_dirty = False
+            with self._measure_ui_operation("idle_openclaw_lifecycle_refresh"):
+                self._refresh_openclaw_sync_lifecycle()
+
+    def _on_input_text_changed(self, event) -> None:
+        event.Skip()
 
     def _append_submitted_question_to_answer_list(self, turn_idx: int, turn: dict) -> bool:
         if not hasattr(self, "answer_list"):
@@ -3212,15 +3384,22 @@ class ChatFrame(wx.Frame):
             if kind == "info" or (kind == "context_usage" and label == "暂无"):
                 empty_rows.append(row)
         if empty_rows:
-            rows_to_delete = [0] * len(empty_rows) if empty_rows == list(range(len(empty_rows))) else sorted(empty_rows, reverse=True)
-            for row in rows_to_delete:
-                try:
-                    if hasattr(self, "answer_list_model") and row < len(self.answer_meta):
-                        self.answer_list_model.remove(self._answer_row_id(self.answer_meta[row]))
-                    else:
+            if hasattr(self, "answer_list_model"):
+                for row in sorted(empty_rows, reverse=True):
+                    try:
+                        if row < len(self.answer_meta):
+                            self.answer_list_model.remove(self._answer_row_id(self.answer_meta[row]))
+                        else:
+                            self.answer_list.Delete(row)
+                    except Exception:
+                        return False
+            else:
+                rows_to_delete = [0] * len(empty_rows) if empty_rows == list(range(len(empty_rows))) else sorted(empty_rows, reverse=True)
+                for row in rows_to_delete:
+                    try:
                         self.answer_list.Delete(row)
-                except Exception:
-                    return False
+                    except Exception:
+                        return False
             for row in sorted(empty_rows, reverse=True):
                 del self.answer_meta[row]
 
@@ -3302,12 +3481,25 @@ class ChatFrame(wx.Frame):
                 return row
         return -1
 
+    def _has_visible_answer_turn_rows(self, turn_idx: int) -> bool:
+        for meta in list(getattr(self, "answer_meta", []) or []):
+            if not meta or len(meta) < 2:
+                continue
+            if meta[1] != turn_idx:
+                continue
+            if meta[0] in {"user", "question", "attachment", "attachment_error", "attachment_pending"}:
+                return True
+        return False
+
     def _append_completed_answer_to_answer_list(self, turn_idx: int, turn: dict) -> bool:
         if not hasattr(self, "answer_list"):
             return False
         if self.view_mode != "active":
             return False
         if self._find_answer_row_index(int(turn_idx)) >= 0:
+            return False
+        attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
+        if attachments and not self._has_visible_answer_turn_rows(int(turn_idx)):
             return False
         answer_md = str((turn or {}).get("answer_md") or "")
         if not answer_md.strip() or answer_md == REQUESTING_TEXT:
@@ -3316,6 +3508,7 @@ class ChatFrame(wx.Frame):
         answer_text = str(answer_text or "").strip()
         if not answer_text:
             return False
+        self._refresh_context_usage_header_rows()
         meta = ("ai", int(turn_idx), "小诸葛", "")
         if hasattr(self, "answer_list_model"):
             self.answer_list_model.append(self._answer_row_id(meta), "小诸葛")
@@ -3988,6 +4181,16 @@ class ChatFrame(wx.Frame):
         state = getattr(self, "_current_chat_state", None)
         return state if isinstance(state, dict) else None
 
+    def _execution_step_targets_visible_chat_while_hidden(self, target_chat: dict) -> bool:
+        if not isinstance(target_chat, dict):
+            return False
+        if self._detail_panel_mode() == "execution":
+            return False
+        if self.view_mode == "history":
+            chat = self._find_archived_chat(self.view_history_id)
+            return chat is target_chat
+        return target_chat is getattr(self, "_current_chat_state", None)
+
     def _append_visible_execution_entry(self, target_chat: dict, step_idx: int, step) -> bool:
         if not isinstance(target_chat, dict) or not hasattr(self, "execution_list"):
             return False
@@ -4112,6 +4315,9 @@ class ChatFrame(wx.Frame):
         self._execution_list_deferred_repaint = False
         should_select_latest = bool(getattr(self, "_execution_list_deferred_select_latest", False))
         self._execution_list_deferred_select_latest = False
+        if self._primary_navigation_control_has_focus():
+            self._mark_execution_list_dirty()
+            return
         if should_select_latest and hasattr(self, "execution_list") and self.execution_list.GetCount() > 0:
             try:
                 should_select_latest = not self.execution_list.HasFocus()
@@ -4219,7 +4425,9 @@ class ChatFrame(wx.Frame):
             target_chat["execution_steps"] = steps
         if resolved_chat_id:
             self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[-1]))
-        self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
+        appended_visible = self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
+        if not appended_visible and self._execution_step_targets_visible_chat_while_hidden(target_chat):
+            self._mark_execution_list_dirty()
         if save_state:
             self._defer_chat_state_save()
         return True
@@ -4561,14 +4769,33 @@ class ChatFrame(wx.Frame):
         if changed:
             self._request_listbox_repaint(self.execution_list)
 
-    def _render_execution_list(self) -> None:
+    def _execution_list_visible_for_updates(self) -> bool:
+        if not hasattr(self, "execution_list"):
+            return False
+        return self._detail_panel_mode() == "execution"
+
+    def _mark_execution_list_dirty(self) -> None:
+        self._execution_list_dirty = True
+        if self._execution_list_visible_for_updates():
+            self._schedule_idle_ui_refresh()
+
+    def _render_execution_list(self, *, force: bool = False) -> None:
         if not hasattr(self, "execution_list"):
             return
+        if not force and not self._execution_list_visible_for_updates():
+            self._mark_execution_list_dirty()
+            return
         self._rebuild_execution_list_from_state()
+        self._execution_list_dirty = False
 
     def _reset_current_turn_execution_view(self) -> None:
         self._reset_execution_visible_row_limit()
         if hasattr(self, "execution_list"):
+            if not self._execution_list_visible_for_updates():
+                self._execution_list_pending_turn_reset = True
+                self.execution_meta = []
+                self._mark_execution_list_dirty()
+                return
             if self._detail_panel_mode() == "execution" and self.execution_list.GetCount() > 0:
                 self._execution_list_pending_turn_reset = True
                 return
@@ -4648,9 +4875,9 @@ class ChatFrame(wx.Frame):
                 self.answer_list.SetFocus()
             except Exception:
                 pass
-        if normalized == "execution" and (refresh_execution or previous_mode != "execution"):
+        if normalized == "execution" and (refresh_execution or previous_mode != "execution" or bool(getattr(self, "_execution_list_dirty", False))):
             self._flush_all_execution_deltas_for_chat(self._visible_execution_chat_id())
-            self._render_execution_list()
+            self._render_execution_list(force=True)
         self._notes_rebuild_tab_order()
         try:
             self.Layout()
@@ -6905,7 +7132,6 @@ class ChatFrame(wx.Frame):
         if chat is getattr(self, "_current_chat_state", None) or chat_id in {self.active_chat_id, self.current_chat_id}:
             self._sync_codex_speed_combo_from_chat(chat)
         self._save_state()
-        self._refresh_history(chat_id)
         self._push_remote_state(chat_id)
         return 200, self._remote_speed_state_body(chat_id, chat)
 
@@ -6942,29 +7168,30 @@ class ChatFrame(wx.Frame):
 
     def _drain_codex_ui_events(self) -> None:
         batch_size = self._codex_ui_event_batch_size()
-        with self._codex_ui_event_lock:
-            batch = self._pending_codex_ui_events[:batch_size]
-            del self._pending_codex_ui_events[: len(batch)]
-            has_more = bool(self._pending_codex_ui_events)
-            self._codex_ui_event_flush_scheduled = has_more
-        self._codex_ui_batch_depth += 1
-        try:
-            for queued_chat_id, queued_event in batch:
-                self._on_codex_event_for_chat(queued_chat_id, queued_event)
-        finally:
-            self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
-            self._flush_deferred_execution_list_updates()
-            self._start_execution_step_persist_worker()
-        if has_more:
-            self._codex_ui_event_drain_timer = self._call_later_if_alive(
-                CODEX_UI_EVENT_BATCH_DELAY_MS,
-                self._drain_codex_ui_events,
-            )
-            if self._codex_ui_event_drain_timer is None and not self._call_after_if_alive(self._drain_codex_ui_events):
-                with self._codex_ui_event_lock:
-                    self._codex_ui_event_flush_scheduled = False
-        else:
-            self._codex_ui_event_drain_timer = None
+        with self._measure_ui_operation("codex_ui_event_drain", batch_size=batch_size):
+            with self._codex_ui_event_lock:
+                batch = self._pending_codex_ui_events[:batch_size]
+                del self._pending_codex_ui_events[: len(batch)]
+                has_more = bool(self._pending_codex_ui_events)
+                self._codex_ui_event_flush_scheduled = has_more
+            self._codex_ui_batch_depth += 1
+            try:
+                for queued_chat_id, queued_event in batch:
+                    self._on_codex_event_for_chat(queued_chat_id, queued_event)
+            finally:
+                self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
+                self._flush_deferred_execution_list_updates()
+                self._start_execution_step_persist_worker()
+            if has_more:
+                self._codex_ui_event_drain_timer = self._call_later_if_alive(
+                    CODEX_UI_EVENT_BATCH_DELAY_MS,
+                    self._drain_codex_ui_events,
+                )
+                if self._codex_ui_event_drain_timer is None and not self._call_after_if_alive(self._drain_codex_ui_events):
+                    with self._codex_ui_event_lock:
+                        self._codex_ui_event_flush_scheduled = False
+            else:
+                self._codex_ui_event_drain_timer = None
 
     def _codex_ui_event_batch_size(self) -> int:
         if self._primary_navigation_control_has_focus():
@@ -9558,8 +9785,16 @@ class ChatFrame(wx.Frame):
     def _schedule_async_archive_rename(self, chat_id: str, turns_snapshot: list[dict], model_snapshot: str) -> None:
         return
 
-    def _archive_active_session(self, quick_title: bool = False, schedule_async_rename: bool = False, save_after_archive: bool = True):
-        self._flush_chat_state_save()
+    def _archive_active_session(
+        self,
+        quick_title: bool = False,
+        schedule_async_rename: bool = False,
+        save_after_archive: bool = True,
+        flush_before_archive: bool = True,
+        refresh_lifecycle_after_archive: bool = True,
+    ):
+        if flush_before_archive:
+            self._flush_chat_state_save()
         if not self.active_session_turns:
             return None
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None)
@@ -9664,7 +9899,8 @@ class ChatFrame(wx.Frame):
         self.view_history_id = None
         if save_after_archive:
             self._save_state()
-        self._refresh_openclaw_sync_lifecycle()
+        if refresh_lifecycle_after_archive:
+            self._refresh_openclaw_sync_lifecycle()
         if schedule_async_rename:
             self._schedule_async_archive_rename(str(archived["id"]), turns_snapshot, model_snapshot)
         return archived
@@ -9699,7 +9935,13 @@ class ChatFrame(wx.Frame):
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
         self._active_claudecode_client = None
-        archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+        archived = self._archive_active_session(
+            quick_title=True,
+            schedule_async_rename=True,
+            save_after_archive=False,
+            flush_before_archive=False,
+            refresh_lifecycle_after_archive=False,
+        )
         self.current_chat_id = ""
         self.active_chat_id = ""
         now = time.time()
@@ -9729,12 +9971,12 @@ class ChatFrame(wx.Frame):
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         if is_openclaw_model(self.selected_model):
             self._openclaw_session_id_for_active_chat()
-        self._refresh_history(archived["id"] if archived else None)
+        self._mark_history_list_dirty(archived["id"] if archived else None)
         self._render_answer_list()
         self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
-        self._save_state()
-        self._refresh_openclaw_sync_lifecycle()
+        self._defer_chat_state_save()
+        self._mark_openclaw_lifecycle_dirty()
         self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
@@ -10153,7 +10395,8 @@ class ChatFrame(wx.Frame):
             self.view_history_id = None
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
             self._render_answer_list()
-            self._refresh_history(selected_id)
+            if not self._select_history_row_if_present(selected_id):
+                self._refresh_history(selected_id)
             self._save_state()
             if focus_answer_list:
                 self.answer_list.SetFocus()
@@ -10168,7 +10411,8 @@ class ChatFrame(wx.Frame):
         self.view_history_id = selected_id
         self._apply_selected_chat_model_to_combo(chat)
         self._render_answer_list()
-        self._refresh_history(selected_id)
+        if not self._select_history_row_if_present(selected_id):
+            self._refresh_history(selected_id)
         self._save_state()
         self.SetStatusText("已切换到历史聊天")
         if focus_answer_list:

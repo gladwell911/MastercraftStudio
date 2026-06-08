@@ -1253,6 +1253,31 @@ def test_refresh_history_keeps_switched_chat_in_sorted_position(frame):
     assert frame.history_list.GetSelection() == frame.history_ids.index("chat-b")
 
 
+def test_show_history_chat_selects_existing_row_without_refreshing_history(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["title"] = "当前聊天"
+    frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答"}]
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "聊天A", "turns": [{"question": "A", "answer_md": "A"}], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-b", "title": "聊天B", "turns": [{"question": "B", "answer_md": "B"}], "created_at": 2.0, "updated_at": 2.0},
+    ]
+    frame._refresh_history("chat-current")
+    before_ids = list(frame.history_ids)
+    before_rows = list(frame.history_list.GetStrings())
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("switching to an existing history row should not refresh the whole list"))
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    assert frame._show_history_chat("chat-b", focus_answer_list=False) is True
+
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-b"
+    assert frame.history_ids == before_ids
+    assert list(frame.history_list.GetStrings()) == before_rows
+    assert frame.history_list.GetSelection() == frame.history_ids.index("chat-b")
+
+
 def test_ctrl_history_navigation_keeps_history_order_unchanged(frame):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -1917,7 +1942,7 @@ def test_new_chat_allowed_while_waiting_for_reply(frame, monkeypatch):
     frame._current_chat_state = {"id": "chat-old", "turns": frame.active_session_turns}
     seen = {}
 
-    def fake_archive(quick_title=False, schedule_async_rename=False):
+    def fake_archive(quick_title=False, schedule_async_rename=False, **_kwargs):
         seen["archive"] = (quick_title, schedule_async_rename)
         return {"id": "chat-old"}
 
@@ -1936,7 +1961,7 @@ def test_new_chat_allowed_while_waiting_for_reply(frame, monkeypatch):
     assert seen["status"] == "已开始新聊天"
 
 
-def test_new_chat_immediately_appears_in_history_with_placeholder_title(frame):
+def test_new_chat_schedules_history_refresh_with_placeholder_title(frame, monkeypatch):
     frame.active_chat_id = ""
     frame.current_chat_id = ""
     frame.active_session_turns = []
@@ -1945,6 +1970,10 @@ def test_new_chat_immediately_appears_in_history_with_placeholder_title(frame):
 
     frame._on_new_chat_clicked(None)
 
+    assert list(frame.history_list.GetStrings()) == []
+    assert frame._history_list_dirty is True
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: False)
+    frame._flush_idle_ui_refreshes()
     assert list(frame.history_list.GetStrings()) == ["心聊天"]
 
 
@@ -1959,6 +1988,109 @@ def test_new_chat_initializes_detail_panel_defaults(frame):
 
     assert frame._current_chat_state["detail_panel_mode"] == "answers"
     assert frame._current_chat_state["execution_steps"] == []
+
+
+def test_new_chat_defers_heavy_history_refresh_and_state_save(frame, monkeypatch):
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = [
+        {"question": "旧问题", "answer_md": "旧回答", "model": "openai/gpt-5.2", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-old",
+        "title": "旧聊天",
+        "turns": frame.active_session_turns,
+        "updated_at": time.time(),
+    }
+    delayed = []
+    monkeypatch.setattr(frame, "_flush_chat_state_save", lambda: pytest.fail("new chat click should not flush pending state synchronously"))
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("new chat click should not refresh history synchronously"))
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: pytest.fail("new chat click should not save state synchronously"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda: pytest.fail("new chat click should not refresh OpenClaw lifecycle synchronously"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda _chat_id="": None)
+
+    frame._on_new_chat_clicked(None)
+
+    assert frame.active_chat_id and frame.active_chat_id != "chat-old"
+    assert frame.active_session_turns == []
+    assert [chat.get("id") for chat in frame.archived_chats] == ["chat-old"]
+    assert frame._history_list_dirty is True
+    assert frame._pending_history_keep_id == "chat-old"
+    assert frame._openclaw_lifecycle_dirty is True
+    assert any(delay == main.IDLE_UI_REFRESH_DELAY_MS and fn == frame._flush_idle_ui_refreshes for delay, fn, _args in delayed)
+    assert frame._chat_state_flush_dirty is True
+
+
+def test_idle_history_flush_defers_while_primary_control_has_focus(frame, monkeypatch):
+    frame._history_list_dirty = True
+    frame._pending_history_keep_id = "chat-old"
+    delayed = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("focused controls should defer idle history refresh"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_idle_ui_refreshes()
+
+    assert frame._history_list_dirty is True
+    assert frame._pending_history_keep_id == "chat-old"
+    assert delayed == [(main.IDLE_UI_REFRESH_DELAY_MS, frame._flush_idle_ui_refreshes, ())]
+
+
+def test_idle_history_flush_runs_when_focused_control_has_been_idle(frame, monkeypatch):
+    frame._history_list_dirty = True
+    frame._pending_history_keep_id = "chat-old"
+    calls = []
+    frame._last_primary_interaction_at = main.time.monotonic() - ((main.IDLE_UI_REFRESH_DELAY_MS + 200) / 1000.0)
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_refresh_history", lambda keep_id=None: calls.append(keep_id))
+
+    frame._flush_idle_ui_refreshes()
+
+    assert calls == ["chat-old"]
+    assert frame._history_list_dirty is False
+    assert frame._pending_history_keep_id is None
+
+
+def test_idle_history_flush_refreshes_when_user_is_idle(frame, monkeypatch):
+    frame._history_list_dirty = True
+    frame._pending_history_keep_id = "chat-old"
+    calls = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: False)
+    monkeypatch.setattr(frame, "_refresh_history", lambda keep_id=None: calls.append(keep_id))
+
+    frame._flush_idle_ui_refreshes()
+
+    assert calls == ["chat-old"]
+    assert frame._history_list_dirty is False
+    assert frame._pending_history_keep_id is None
+
+
+def test_idle_openclaw_lifecycle_flush_defers_while_primary_control_has_focus(frame, monkeypatch):
+    frame._openclaw_lifecycle_dirty = True
+    delayed = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda: pytest.fail("focused controls should defer OpenClaw lifecycle refresh"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_idle_ui_refreshes()
+
+    assert frame._openclaw_lifecycle_dirty is True
+    assert delayed == [(main.IDLE_UI_REFRESH_DELAY_MS, frame._flush_idle_ui_refreshes, ())]
+
+
+def test_idle_openclaw_lifecycle_flush_runs_when_user_is_idle(frame, monkeypatch):
+    frame._openclaw_lifecycle_dirty = True
+    calls = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: False)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda: calls.append("refresh"))
+
+    frame._flush_idle_ui_refreshes()
+
+    assert calls == ["refresh"]
+    assert frame._openclaw_lifecycle_dirty is False
 
 
 def test_chat_detail_panel_f1_toggles_mode(frame, monkeypatch):
@@ -7958,6 +8090,37 @@ def test_on_done_appends_final_answer_without_refreshing_or_reselecting_old_answ
     assert focused == [True]
 
 
+def test_on_done_upserts_history_row_without_full_refresh(frame, monkeypatch):
+    frame.active_chat_id = "chat-done-history"
+    frame.current_chat_id = "chat-done-history"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "当前问题",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "openai/gpt-5.2",
+            "request_status": "pending",
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state.update({"id": "chat-done-history", "title": "done", "turns": frame.active_session_turns})
+    upserts = []
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("completion should not refresh the whole history list"))
+    monkeypatch.setattr(frame, "_upsert_history_row", lambda chat_id, **kwargs: upserts.append((chat_id, kwargs)) or True)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_append_completed_answer_to_answer_list", lambda *args, **kwargs: True)
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+
+    frame._on_done(0, "最终回答", "", "openai/gpt-5.2", "", "chat-done-history")
+
+    assert upserts == [("chat-done-history", {"allow_reorder": not frame._primary_navigation_control_has_focus()})]
+    assert frame.active_session_turns[0]["answer_md"] == "最终回答"
+
+
 def test_on_done_plays_finish_sound_before_focusing_latest_answer(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-finish-order"
@@ -10048,7 +10211,7 @@ def test_new_chat_archives_with_async_rename(frame):
     ]
     seen = {"quick": None, "async": None}
 
-    def fake_archive(quick_title=False, schedule_async_rename=False):
+    def fake_archive(quick_title=False, schedule_async_rename=False, **_kwargs):
         seen["quick"] = quick_title
         seen["async"] = schedule_async_rename
         return None
@@ -13718,6 +13881,35 @@ def test_remote_set_speed_updates_chat_combo_and_pushes_state(frame, monkeypatch
     assert pushed == ["chat-speed"]
 
 
+def test_remote_set_speed_does_not_refresh_history_list(frame, monkeypatch):
+    frame.active_chat_id = "chat-speed"
+    frame.current_chat_id = "chat-speed"
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-speed",
+        "title": "speed",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "turns": frame.active_session_turns,
+        "codex_service_tier": "standard",
+    }
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda _chat_id: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("remote speed changes do not affect history rows"))
+
+    status, body = frame._remote_api_set_speed_ui(
+        {"chat_id": "chat-speed", "codex_service_tier": "fast"}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert frame._current_chat_state["codex_service_tier"] == "fast"
+    assert frame.codex_speed_combo.GetValue() == "快速"
+
+
 def test_remote_set_speed_accepts_repeated_fast_and_standard_changes(frame, monkeypatch):
     frame.active_chat_id = "chat-speed"
     frame.current_chat_id = "chat-speed"
@@ -14457,6 +14649,211 @@ def test_render_execution_list_does_not_clear_when_rows_are_unchanged(frame, mon
     monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("unchanged execution rows should not rebuild the listbox"))
 
     frame._render_execution_list()
+
+
+def test_hidden_execution_render_only_marks_dirty_without_touching_listbox(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "hidden step", "detail_text": "hidden step"}],
+    }
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    monkeypatch.setattr(
+        frame.execution_list_model,
+        "replace_visible_page",
+        lambda *args, **kwargs: pytest.fail("hidden execution render should not update execution listbox"),
+    )
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("hidden execution render should not clear execution listbox"))
+    monkeypatch.setattr(frame.execution_list, "Append", lambda _label: pytest.fail("hidden execution render should not append execution rows"))
+    monkeypatch.setattr(frame.execution_list, "Refresh", lambda *args, **kwargs: pytest.fail("hidden execution render should not repaint execution listbox"))
+
+    frame._render_execution_list()
+
+    assert frame._execution_list_dirty is True
+
+
+def test_hidden_execution_reset_only_marks_dirty_without_touching_listbox(frame, monkeypatch):
+    frame._current_chat_state = {"id": "chat-current", "turns": [], "detail_panel_mode": "answers", "execution_steps": []}
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    monkeypatch.setattr(
+        frame.execution_list_model,
+        "replace_visible_page",
+        lambda *args, **kwargs: pytest.fail("hidden execution reset should not update execution listbox"),
+    )
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("hidden execution reset should not clear execution listbox"))
+    monkeypatch.setattr(frame.execution_list, "Append", lambda _label: pytest.fail("hidden execution reset should not append execution rows"))
+    monkeypatch.setattr(frame.execution_list, "Refresh", lambda *args, **kwargs: pytest.fail("hidden execution reset should not repaint execution listbox"))
+
+    frame._reset_current_turn_execution_view()
+
+    assert frame._execution_list_dirty is True
+
+
+def test_hidden_execution_background_event_marks_dirty_without_touching_listbox(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "codex_thread_id": "thread-current",
+            "codex_turn_id": "turn-current",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    monkeypatch.setattr(
+        frame.execution_list_model,
+        "append",
+        lambda *args, **kwargs: pytest.fail("hidden background event should not append execution rows"),
+    )
+    monkeypatch.setattr(
+        frame.execution_list_model,
+        "replace_visible_page",
+        lambda *args, **kwargs: pytest.fail("hidden background event should not rebuild execution rows"),
+    )
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: pytest.fail("hidden background event should not clear execution listbox"))
+    monkeypatch.setattr(frame.execution_list, "Append", lambda _label: pytest.fail("hidden background event should not append execution listbox rows"))
+    monkeypatch.setattr(frame.execution_list, "Refresh", lambda *args, **kwargs: pytest.fail("hidden background event should not repaint execution listbox"))
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="plan_updated",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            text="hidden background plan",
+        ),
+    )
+
+    assert frame._current_chat_state["execution_steps"]
+    assert frame._execution_list_dirty is True
+
+
+def test_idle_execution_flush_defers_while_primary_control_has_focus(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "idle step", "detail_text": "idle step"}],
+    }
+    frame._execution_list_dirty = True
+    delayed = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_render_execution_list", lambda *args, **kwargs: pytest.fail("focused controls should defer idle execution refresh"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_idle_ui_refreshes()
+
+    assert frame._execution_list_dirty is True
+    assert delayed == [(main.IDLE_UI_REFRESH_DELAY_MS, frame._flush_idle_ui_refreshes, ())]
+
+
+def test_idle_execution_flush_does_not_reschedule_when_nothing_is_dirty(frame, monkeypatch):
+    frame._execution_list_dirty = False
+    delayed = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_idle_ui_refreshes()
+
+    assert delayed == []
+
+
+def test_idle_ui_refresh_delay_is_one_second():
+    assert main.IDLE_UI_REFRESH_DELAY_MS == 1000
+
+
+def test_idle_execution_flush_renders_when_user_is_idle(frame, monkeypatch):
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"turn_idx": 0, "display_kind": "commentary", "list_text": "idle step", "detail_text": "idle step"}],
+    }
+    frame._execution_list_dirty = True
+    calls = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: False)
+    monkeypatch.setattr(frame, "_render_execution_list", lambda *args, **kwargs: calls.append(kwargs) or setattr(frame, "_execution_list_dirty", False))
+
+    frame._flush_idle_ui_refreshes()
+
+    assert calls == [{"force": True}]
+    assert frame._execution_list_dirty is False
+
+
+def test_deferred_execution_repaint_waits_for_idle_when_primary_control_has_focus(frame, monkeypatch):
+    frame._current_chat_state = {"id": "chat-current", "turns": [], "detail_panel_mode": "execution", "execution_steps": []}
+    frame._execution_list_deferred_repaint = True
+    frame._execution_list_deferred_select_latest = True
+    delayed = []
+    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: pytest.fail("focused controls should not repaint execution list immediately"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_deferred_execution_list_updates()
+
+    assert frame._execution_list_dirty is True
+    assert delayed == [(main.IDLE_UI_REFRESH_DELAY_MS, frame._flush_idle_ui_refreshes, ())]
+
+
+def test_slow_ui_operation_records_only_above_threshold(frame, monkeypatch):
+    frame.ui_perf_slow_threshold_ms = 20.0
+    samples = iter([10.0, 10.01, 20.0, 20.05])
+    monkeypatch.setattr(main.time, "perf_counter", lambda: next(samples))
+
+    with frame._measure_ui_operation("fast-path"):
+        pass
+    with frame._measure_ui_operation("slow-path"):
+        pass
+
+    assert [sample["name"] for sample in frame.ui_perf_slow_samples] == ["slow-path"]
+    assert frame.ui_perf_slow_samples[0]["elapsed_ms"] == pytest.approx(50.0)
+
+
+def test_input_text_change_is_bound_to_slow_operation_monitor(frame, monkeypatch):
+    calls = []
+    original_bind = frame.input_edit.Bind
+
+    def capture_bind(event_type, handler, *args, **kwargs):
+        if event_type == main.wx.EVT_TEXT:
+            calls.append(handler)
+        return original_bind(event_type, handler, *args, **kwargs)
+
+    monkeypatch.setattr(frame.input_edit, "Bind", capture_bind)
+    frame._bind_events()
+
+    assert calls
+    assert getattr(calls[-1], "_ui_perf_name", "") == "input_text"
+
+
+def test_append_submitted_question_removes_all_initial_empty_rows_with_incremental_model(frame):
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "context_usage": None}
+    frame._render_answer_list()
+
+    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["暂无", "暂无对话内容"]
+
+    changed = frame._append_submitted_question_to_answer_list(
+        0,
+        {"question": "新问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID},
+    )
+
+    assert changed is True
+    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["我", "新问题"]
+    assert frame.answer_meta == [("user", 0, "我", ""), ("question", 0, "新问题", "")]
+    assert frame.answer_list_model.visible_ids == ["answer:0:user", "answer:0:question"]
 
 
 def test_execution_shift_tab_uses_primary_navigation_instead_of_forcing_input_focus(frame, monkeypatch):

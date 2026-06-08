@@ -50,6 +50,17 @@ class IncrementalListBoxModel:
             if selected_id:
                 self.set_selection_by_id(selected_id)
             return False
+        if self.visible_ids == ids:
+            changed = False
+            for idx, (item_id, label) in enumerate(normalized_rows):
+                if self.labels_by_id.get(item_id, "") == label:
+                    continue
+                self.control.SetString(idx, label)
+                self.labels_by_id[item_id] = label
+                changed = True
+            if selected_id:
+                self.set_selection_by_id(selected_id)
+            return changed
         self.control.Clear()
         self.visible_ids = []
         self.labels_by_id = {}
