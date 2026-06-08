@@ -47,6 +47,13 @@ def test_build_messages_with_history_context():
     assert msgs[5] == {"role": "user", "content": "Q3"}
 
 
+def test_empty_api_key_uses_configured_openrouter_fallback(monkeypatch):
+    monkeypatch.setattr(chat_client, "DEFAULT_OPENROUTER_API_KEY", "fallback-key")
+    client = ChatClient(api_key="")
+
+    assert client._headers()["Authorization"] == "Bearer fallback-key"
+
+
 class _StreamingResponse:
     status_code = 200
     text = ""

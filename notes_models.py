@@ -95,6 +95,7 @@ class EntryDoc:
     created_at: str
     updated_at: str
     sort_order: int
+    pinned: bool = False
     version: int = 1
     device_id: str = ""
     last_modified_by: str = "desktop"
@@ -114,6 +115,7 @@ class EntryDoc:
             created_at=str(row.get("created_at") or ""),
             updated_at=str(row.get("updated_at") or ""),
             sort_order=_as_int(row.get("sort_order")),
+            pinned=_as_bool(row.get("pinned")),
             version=_as_int(row.get("version"), 1),
             device_id=str(row.get("device_id") or ""),
             last_modified_by=str(row.get("last_modified_by") or "desktop"),
@@ -133,6 +135,7 @@ class EntryDoc:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "sort_order": self.sort_order,
+            "pinned": int(self.pinned),
             "version": self.version,
             "device_id": self.device_id,
             "last_modified_by": self.last_modified_by,
@@ -153,6 +156,7 @@ class EntryDoc:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "sort_order": self.sort_order,
+            "pinned": self.pinned,
             "version": self.version,
             "device_id": self.device_id,
             "last_modified_by": self.last_modified_by,
@@ -281,7 +285,7 @@ class NoteEntry:
             created_at=doc.created_at,
             updated_at=doc.updated_at,
             deleted_at=doc.updated_at if doc.deleted else None,
-            pinned=False,
+            pinned=doc.pinned,
             sort_order=doc.sort_order,
             version=doc.version,
             device_id=doc.device_id or device_id,

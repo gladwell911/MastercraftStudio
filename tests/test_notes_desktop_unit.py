@@ -1,4 +1,5 @@
 import json
+import time
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +58,7 @@ def test_notes_store_creates_document_cache_schema(tmp_path):
         "created_at",
         "updated_at",
         "sort_order",
+        "pinned",
         "version",
         "device_id",
         "last_modified_by",
@@ -1578,6 +1580,106 @@ def test_notes_menu_actions_create_and_edit_notes(frame, monkeypatch):
     monkeypatch.setattr(frame, "_confirm", lambda *_a, **_k: True)
     frame._notes_delete_entry()
     assert frame.notes_store.get_entry(entry.id) is None
+
+
+def test_notes_store_reorders_entries_with_pin_top_bottom_and_step_moves(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("order notebook")
+    first = store.create_entry(notebook.id, "first", source="manual", sort_order=10)
+    second = store.create_entry(notebook.id, "second", source="manual", sort_order=20)
+    third = store.create_entry(notebook.id, "third", source="manual", sort_order=30)
+    fourth = store.create_entry(notebook.id, "fourth", source="manual", sort_order=40)
+
+    store.move_entry_up(third.id)
+    assert [entry.id for entry in store.list_entries(notebook.id)] == [first.id, third.id, second.id, fourth.id]
+
+    store.move_entry_down(third.id)
+    assert [entry.id for entry in store.list_entries(notebook.id)] == [first.id, second.id, third.id, fourth.id]
+
+    store.pin_entry(third.id)
+    assert store.get_entry(third.id).pinned is True
+    assert [entry.id for entry in store.list_entries(notebook.id)][0] == third.id
+
+    store.move_entry_to_bottom(third.id)
+    assert store.get_entry(third.id).pinned is False
+    assert [entry.id for entry in store.list_entries(notebook.id)] == [first.id, second.id, fourth.id, third.id]
+
+
+def test_notes_entry_ctrl_arrow_shortcuts_move_selected_entry(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("shortcut move notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first", source="manual", sort_order=10)
+    second = frame.notes_store.create_entry(notebook.id, "second", source="manual", sort_order=20)
+    third = frame.notes_store.create_entry(notebook.id, "third", source="manual", sort_order=30)
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(second.id))
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)
+    monkeypatch.setattr(frame, "_notes_after_local_mutation", lambda *args, **kwargs: None)
+
+    class _Event:
+        def __init__(self, key):
+            self._key = key
+            self.skipped = False
+
+        def GetKeyCode(self):
+            return self._key
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            self.skipped = True
+
+    frame._on_notes_key_down(_Event(wx.WXK_UP))
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [second.id, first.id, third.id]
+    assert frame._notes_selected_entry_id() == second.id
+
+    frame._on_notes_key_down(_Event(wx.WXK_END))
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [first.id, third.id, second.id]
+    assert frame._notes_selected_entry_id() == second.id
+
+
+def test_notes_editor_uses_answer_detail_like_wide_multiline_area(frame):
+    assert frame.notes_editor.GetWindowStyleFlag() & wx.TE_MULTILINE
+    assert frame.notes_editor.GetWindowStyleFlag() & wx.TE_DONTWRAP
+    assert frame.notes_editor.GetWindowStyleFlag() & wx.HSCROLL
+    assert frame.notes_edit_panel.GetContainingSizer().GetItem(frame.notes_edit_panel).GetProportion() >= 2
+
+
+def test_pinned_note_entry_label_uses_text_prefix(frame):
+    notebook = frame.notes_store.create_notebook("pinned label notebook")
+    entry = frame.notes_store.create_entry(notebook.id, "important entry", source="manual")
+    frame.notes_store.pin_entry(entry.id)
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+
+    assert frame.notes_entry_list.GetString(0).startswith("置顶：")
+    assert "★" not in frame.notes_entry_list.GetString(0)
+
+
+def test_answer_refresh_does_not_steal_focus_from_note_editor(frame, monkeypatch):
+    frame.notes_controller.notes_view = "note_edit"
+    frame.notes_editor.SetFocus()
+    monkeypatch.setattr(frame.notes_editor, "HasFocus", lambda: True)
+    focus_calls = []
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: focus_calls.append("answer"))
+    frame._current_chat_state = {"id": "chat-focus", "turns": frame.active_session_turns, "detail_panel_mode": "answers"}
+    frame.active_chat_id = "chat-focus"
+    frame.current_chat_id = "chat-focus"
+    frame.active_session_turns = [
+        {"question": "q", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL, "created_at": time.time()}
+    ]
+    frame.active_turn_idx = 0
+    frame._render_answer_list()
+
+    frame._on_done(0, "final answer", "", main.DEFAULT_CODEX_MODEL, "", "chat-focus")
+
+    assert focus_calls == []
 
 
 def test_notes_create_entry_from_detail_keeps_blank_draft_and_focuses_editor(frame):

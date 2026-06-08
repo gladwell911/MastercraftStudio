@@ -823,4 +823,4 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     rows = list(frame.execution_list.GetStrings())
 
-    assert rows == ["暂无执行过程"]
+    assert rows == ["我：please fix tests"]

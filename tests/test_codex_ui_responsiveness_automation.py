@@ -240,6 +240,62 @@ def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail
     assert opened_web == [True]
 
 
+def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_current_editor_text(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = "chat-answer-viewer-tab-copy"
+    frame.current_chat_id = "chat-answer-viewer-tab-copy"
+    frame.active_session_turns = [
+        {
+            "question": "first question",
+            "answer_md": "first answer",
+            "model": main.DEFAULT_MODEL_ID,
+            "created_at": 1.0,
+        },
+        {
+            "question": "second question",
+            "answer_md": "1. 第一项\n2. 第二项",
+            "model": main.DEFAULT_MODEL_ID,
+            "created_at": 2.0,
+        },
+    ]
+    frame._current_chat_state = {"id": frame.active_chat_id, "turns": frame.active_session_turns}
+    opened_viewer = []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+
+    frame._render_answer_list()
+    second_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 1)
+    frame.answer_list.SetSelection(second_answer_row - 1)
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert frame.answer_list.GetSelection() == second_answer_row
+
+    _send_window_key(frame.answer_list, main.wx.WXK_RETURN)
+    wx_app.Yield()
+    assert opened_viewer == [("回答详情", "1. 第一项\n2. 第二项")]
+
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", opened_viewer[0][1], on_continue=None)
+    try:
+        dlg.text_ctrl.SetValue("当前编辑框内容")
+        tab = main.wx.KeyEvent(main.wx.wxEVT_CHAR_HOOK)
+        tab.SetKeyCode(main.wx.WXK_TAB)
+        dlg.ProcessEvent(tab)
+        wx_app.Yield()
+
+        assert copied == []
+        assert dlg.copy_button.GetLabel() == "复制"
+        dlg._on_copy_clicked()
+        assert copied == ["当前编辑框内容"]
+        assert dlg.text_ctrl.GetWindowStyleFlag() & main.wx.TE_DONTWRAP
+    finally:
+        if dlg:
+            dlg.Destroy()
+
+
 def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-speed"

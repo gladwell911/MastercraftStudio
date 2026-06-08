@@ -42,6 +42,7 @@ class NatsRuntimeConfig:
 host: "{self.host}"
 
 authorization {{
+  timeout: 30
   token: "{escaped_token}"
 }}
 

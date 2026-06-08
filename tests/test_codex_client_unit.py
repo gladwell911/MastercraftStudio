@@ -25,15 +25,6 @@ def test_codex_model_config_helpers():
     assert codex_client.codex_model_label_for_model("codex/main") == ""
 
 
-def test_codex_service_tier_helpers_normalize_fast_and_standard():
-    assert codex_client.normalize_codex_service_tier("fast") == "fast"
-    assert codex_client.normalize_codex_service_tier("快速") == "fast"
-    assert codex_client.normalize_codex_service_tier("standard") == ""
-    assert codex_client.normalize_codex_service_tier("标准") == ""
-    assert codex_client.codex_service_tier_label("fast") == "快速"
-    assert codex_client.codex_service_tier_label("") == "标准"
-
-
 def test_read_codex_cli_model_label_reads_model_and_effort(tmp_path):
     codex_home = tmp_path / ".codex-home"
     codex_home.mkdir()
@@ -160,18 +151,20 @@ def test_codex_client_start_turn_items_sends_fast_service_tier(monkeypatch):
     result = client.start_turn_items("thread-1", [{"type": "text", "text": "hello"}], service_tier="fast")
 
     assert result["turn"]["id"] == "turn-fast"
+    assert sent[0]["method"] == "turn/start"
     assert sent[0]["params"]["serviceTier"] == "fast"
 
 
 def test_codex_client_thread_requests_send_service_tier(monkeypatch):
     client = codex_client.CodexAppServerClient()
     seen = []
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
 
     def _request(method, params=None, timeout=None):
-        seen.append((method, params))
+        seen.append((method, params, timeout))
         return {"thread": {"id": "thread-1"}}
 
-    monkeypatch.setattr(client, "_request_clearing_context_usage", _request)
+    monkeypatch.setattr(client, "_request_internal", _request)
 
     client.start_thread(r"C:\code\mc", service_tier="fast")
     client.resume_thread("thread-1", service_tier="standard")

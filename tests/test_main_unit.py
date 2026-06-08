@@ -52,6 +52,42 @@ def test_continue_shortcut_mapping(frame):
     assert not frame._is_continue_shortcut(ord("C"), alt=False)
 
 
+def test_clear_context_shortcut_mapping(frame):
+    assert frame._is_clear_context_shortcut(ord("A"), alt=True)
+    assert frame._is_clear_context_shortcut(ord("a"), alt=True)
+    assert not frame._is_clear_context_shortcut(ord("A"), alt=False)
+
+
+def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, monkeypatch):
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_started_at = time.time()
+    frame.active_session_turns = [
+        {"question": "old question", "answer_md": "old answer", "model": "openclaw/main", "created_at": time.time()}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-old",
+        "title": "old",
+        "turns": frame.active_session_turns,
+        "created_at": frame.active_session_started_at,
+        "updated_at": frame.active_session_started_at,
+    }
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda _chat_id: None)
+    archived_before = list(frame.archived_chats)
+
+    frame._clear_context_and_start_new_chat()
+
+    assert frame.active_chat_id == "chat-old"
+    assert frame.current_chat_id == "chat-old"
+    assert frame._current_chat_state["id"] == "chat-old"
+    assert frame._current_chat_state["title"] == "old"
+    assert frame.archived_chats == archived_before
+    assert frame.active_session_turns == []
+    assert frame.answer_list.GetCount() >= 1
+    assert frame.answer_list.GetString(frame.answer_list.GetCount() - 1) == "以开启新会话"
+
+
 def test_visible_model_order_prioritizes_codex_then_claudecode_then_openclaw():
     visible = list(main.VISIBLE_MODEL_IDS)
 
@@ -2212,6 +2248,37 @@ def test_render_execution_list_filters_fixed_lifecycle_and_command_noise(frame):
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
     assert rows == ["我先检查 main.py，再处理过滤逻辑。", "计划：先整理结构"]
+
+
+def test_render_execution_list_includes_question_and_final_answer_with_execution_labels(frame):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "执行测试",
+        "turns": [
+            {
+                "question": "请总结项目",
+                "answer_md": "最终 **回复**",
+                "model": main.DEFAULT_CODEX_MODEL,
+                "created_at": 1.0,
+            }
+        ],
+        "detail_panel_mode": "execution",
+        "execution_steps": [
+            {
+                "event_type": "agent_message_delta",
+                "display_kind": "commentary",
+                "detail_text": "处理中",
+                "list_text": "处理中",
+                "turn_idx": 0,
+            }
+        ],
+    }
+
+    frame._render_execution_list()
+
+    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert rows == ["我：请总结项目", "处理中", "小诸葛：最终 回复"]
 
 
 def test_render_execution_list_filters_phase_only_commentary_noise(frame):
@@ -6745,6 +6812,23 @@ def test_answer_enter_opens_plain_text_viewer_instead_of_web_detail(frame, monke
     assert opened_viewer == [("回答详情", "标题\n\n第一段 加粗。\n\n第二段")]
 
 
+def test_answer_text_viewer_preserves_ordered_list_markers(frame):
+    frame.active_session_turns = [
+        {
+            "question": "测试问题",
+            "answer_md": "1. 第一项\n2. 第二项",
+            "model": main.DEFAULT_MODEL_ID,
+            "created_at": time.time(),
+        }
+    ]
+    frame.view_mode = "active"
+    frame._render_answer_list()
+    answer_row = next(i for i, m in enumerate(frame.answer_meta) if m[0] == "answer")
+    frame.answer_list.SetSelection(answer_row)
+
+    assert frame._selected_answer_text_viewer_content() == ("回答详情", "1. 第一项\n2. 第二项")
+
+
 def test_answer_shift_enter_keeps_web_detail_shortcut(frame, monkeypatch):
     frame.answer_meta = [("answer", 0, "plain", "detail")]
     frame.answer_list.Clear()
@@ -6878,6 +6962,43 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
 
         dlg._on_char_hook(E())
         assert closed == [wx.ID_OK, wx.ID_CLOSE]
+    finally:
+        if dlg:
+            dlg.Destroy()
+
+
+def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves_focus(frame, monkeypatch):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "原始内容", on_continue=None)
+    try:
+        dlg.text_ctrl.SetValue("编辑后的当前内容")
+        skipped = []
+
+        class E:
+            def GetKeyCode(self):
+                return wx.WXK_TAB
+
+            def ControlDown(self):
+                return False
+
+            def AltDown(self):
+                return False
+
+            def ShiftDown(self):
+                return False
+
+            def Skip(self):
+                skipped.append(True)
+
+        dlg._on_char_hook(E())
+
+        assert copied == []
+        assert skipped == [True]
+        assert dlg.copy_button.GetLabel() == "复制"
+        dlg._on_copy_clicked()
+        assert copied == ["编辑后的当前内容"]
+        assert dlg.text_ctrl.GetWindowStyleFlag() & wx.TE_DONTWRAP
     finally:
         if dlg:
             dlg.Destroy()
@@ -9938,6 +10059,124 @@ def test_generate_first_question_title_ignores_answer_style_output_for_question(
     assert title == "MCP 协议"
 
 
+def test_unique_chat_title_appends_numeric_suffix_for_duplicates(frame):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "项目", "turns": []},
+        {"id": "chat-b", "title": "项目1", "turns": []},
+    ]
+    frame._current_chat_state = {"id": "current", "title": "当前", "turns": []}
+
+    assert frame._unique_chat_title("项目") == "项目2"
+
+
+def test_new_named_chat_uses_unique_manual_title(frame, monkeypatch):
+    frame.archived_chats = [
+        {"id": "chat-a", "title": "项目", "turns": [], "created_at": 1.0, "updated_at": 1.0}
+    ]
+    monkeypatch.setattr(frame, "_archive_active_session", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_ensure_active_chat_id", lambda: "chat-new")
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+
+    frame._on_new_chat_clicked(None, title="项目", title_manual=True)
+
+    assert frame._current_chat_state["title"] == "项目1"
+    assert frame._current_chat_state["title_manual"] is True
+
+
+def test_clear_context_shortcut_clears_current_chat_backend_thread_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "旧问题", "answer_md": "旧回答", "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame.active_openclaw_session_key = "openclaw-key"
+    frame.active_openclaw_session_id = "openclaw-session"
+    frame.active_openclaw_session_file = "session.jsonl"
+    frame.active_openclaw_sync_offset = 42
+    frame.active_openclaw_last_event_id = "event-old"
+    frame.active_openclaw_last_synced_at = 123.0
+    frame.active_codex_thread_id = "thread-old"
+    frame.active_codex_turn_id = "turn-old"
+    frame.active_codex_turn_active = True
+    frame.active_codex_pending_prompt = "pending"
+    frame.active_codex_pending_request = {"kind": "user_input"}
+    frame.active_codex_request_queue = [{"prompt": "queued"}]
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame.active_codex_latest_assistant_text = "partial"
+    frame.active_codex_latest_assistant_phase = "answer"
+    frame.active_claudecode_session_id = "claude-session"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "openclaw_session_key": "openclaw-key",
+        "openclaw_session_id": "openclaw-session",
+        "openclaw_session_file": "session.jsonl",
+        "openclaw_sync_offset": 42,
+        "openclaw_last_event_id": "event-old",
+        "openclaw_last_synced_at": 123.0,
+        "codex_thread_id": "thread-old",
+        "codex_turn_id": "turn-old",
+        "codex_turn_active": True,
+        "codex_pending_prompt": "pending",
+        "codex_pending_request": {"kind": "user_input"},
+        "codex_request_queue": [{"prompt": "queued"}],
+        "codex_thread_flags": ["waitingOnUserInput"],
+        "codex_latest_assistant_text": "partial",
+        "codex_latest_assistant_phase": "answer",
+        "claudecode_session_id": "claude-session",
+    }
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    assert frame._clear_context_and_start_new_chat() is True
+
+    assert frame._current_chat_state["turns"] == []
+    assert frame._current_chat_state["codex_thread_id"] == ""
+    assert frame._current_chat_state["codex_turn_id"] == ""
+    assert frame._current_chat_state["codex_turn_active"] is False
+    assert frame._current_chat_state["codex_pending_prompt"] == ""
+    assert frame._current_chat_state["codex_pending_request"] is None
+    assert frame._current_chat_state["codex_request_queue"] == []
+    assert frame._current_chat_state["codex_thread_flags"] == []
+    assert frame._current_chat_state["codex_latest_assistant_text"] == ""
+    assert frame._current_chat_state["codex_latest_assistant_phase"] == ""
+    assert frame._current_chat_state["openclaw_session_key"] == main.DEFAULT_OPENCLAW_SESSION_KEY
+    assert frame._current_chat_state["openclaw_session_id"] == ""
+    assert frame._current_chat_state["openclaw_session_file"] == ""
+    assert frame._current_chat_state["openclaw_sync_offset"] == 0
+    assert frame._current_chat_state["openclaw_last_event_id"] == ""
+    assert frame._current_chat_state["openclaw_last_synced_at"] == 0.0
+    assert frame._current_chat_state["claudecode_session_id"] == ""
+
+
+def test_cd_first_question_auto_title_uses_directory_name_and_unique_suffix(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.archived_chats = [{"id": "chat-old", "title": "sj", "turns": []}]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": main.EMPTY_CURRENT_CHAT_TITLE,
+        "title_manual": False,
+        "title_source": "default",
+        "title_revision": 1,
+        "turns": [],
+    }
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.threading, "Thread", lambda *args, **kwargs: type("_NoThread", (), {"start": lambda self: None})())
+
+    frame._schedule_first_question_auto_title("chat-current", r"cd c:\code\sj")
+
+    assert frame._current_chat_state["title"] == "sj1"
+    assert frame._current_chat_state["title_source"] == "auto"
+
+
 def test_summarize_recent_topic_uses_normalized_default_title(frame):
     assert frame._summarize_recent_topic([], "") == main.EMPTY_CURRENT_CHAT_TITLE
 
@@ -10872,6 +11111,43 @@ def test_remote_title_update_does_not_change_history_recency_order(frame, monkey
     assert [chat["id"] for chat in frame.archived_chats] == ["new-chat", "old-chat"]
     assert frame._find_archived_chat("old-chat")["updated_at"] == 1.0
     assert frame._find_archived_chat("old-chat")["title_updated_at"] == 100.0
+
+
+def test_remote_rename_current_chat_matches_current_chat_id_and_invalidates_history_cache(frame, monkeypatch):
+    frame.active_chat_id = ""
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "旧标题",
+        "title_source": "default",
+        "title_manual": False,
+        "title_updated_at": 1.0,
+        "title_revision": 1,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "turns": [],
+    }
+    frame._remote_history_list_cache = {"accepted": True, "chats": [{"chat_id": "chat-current", "title": "旧标题"}]}
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    pushed = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id: pushed.append(chat_id))
+
+    status, body = frame._remote_api_rename_chat_ui(
+        {
+            "chat_id": "chat-current",
+            "title": "手机标题",
+            "title_source": "manual",
+            "title_updated_at": 10.0,
+            "title_revision": 2,
+        }
+    )
+
+    assert status == 200
+    assert body["title"] == "手机标题"
+    assert frame._current_chat_state["title"] == "手机标题"
+    assert frame._remote_history_list_cache is None
+    assert pushed == ["chat-current"]
 
 
 def test_codex_ui_event_drain_coalesces_execution_list_repaints(frame, monkeypatch):

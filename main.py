@@ -424,10 +424,31 @@ def md_to_plain_preserving_paragraphs(md_text: str) -> str:
     blocks = re.split(r"\n\s*\n", str(md_text).replace("\r\n", "\n").replace("\r", "\n"))
     plain_blocks = []
     for block in blocks:
-        plain = md_to_plain(block).strip()
+        plain = _md_block_to_plain_preserving_ordered_lists(block).strip()
         if plain:
             plain_blocks.append(plain)
     return "\n\n".join(plain_blocks).strip()
+
+
+def _md_block_to_plain_preserving_ordered_lists(block: str) -> str:
+    lines = str(block or "").splitlines()
+    if not any(re.match(r"^\s*\d+[.)]\s+", line) for line in lines):
+        return md_to_plain(block)
+    plain_lines = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        match = re.match(r"^(\d+)[.)]\s+(.*)$", raw)
+        if match:
+            item_text = md_to_plain(match.group(2)).strip()
+            if item_text:
+                plain_lines.append(f"{match.group(1)}. {item_text}")
+            continue
+        plain = md_to_plain(raw).strip()
+        if plain:
+            plain_lines.append(plain)
+    return "\n".join(plain_lines)
 
 
 def remove_emojis(text: str) -> str:
@@ -774,22 +795,26 @@ class AnswerTextViewerDialog(wx.Dialog):
         self.text_ctrl = wx.TextCtrl(
             panel,
             value=str(text or ""),
-            style=wx.TE_MULTILINE | wx.TE_RICH2,
+            style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL,
         )
         self.text_ctrl.SetName("文本内容")
         root.Add(self.text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
 
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         btn_row.AddStretchSpacer(1)
+        self.copy_button = wx.Button(panel, label="复制")
         self.close_button = wx.Button(panel, wx.ID_CLOSE, "关闭")
         self.continue_button = wx.Button(panel, label="继续")
+        btn_row.Add(self.copy_button, 0, wx.RIGHT, 8)
         btn_row.Add(self.close_button, 0, wx.RIGHT, 8)
         btn_row.Add(self.continue_button, 0)
         root.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         panel.SetSizer(root)
-        self.close_button.MoveAfterInTabOrder(self.text_ctrl)
+        self.copy_button.MoveAfterInTabOrder(self.text_ctrl)
+        self.close_button.MoveAfterInTabOrder(self.copy_button)
         self.continue_button.MoveAfterInTabOrder(self.close_button)
+        self.copy_button.Bind(wx.EVT_BUTTON, self._on_copy_clicked)
         self.close_button.Bind(wx.EVT_BUTTON, self._on_close)
         self.continue_button.Bind(wx.EVT_BUTTON, self._on_continue_clicked)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
@@ -803,6 +828,13 @@ class AnswerTextViewerDialog(wx.Dialog):
 
     def _on_close(self, _event=None):
         self._finish(wx.ID_CLOSE)
+
+    def _on_copy_clicked(self, _event=None):
+        setter = getattr(self.GetParent(), "_set_clipboard_text", None)
+        if callable(setter) and setter(self.text_ctrl.GetValue()):
+            status = getattr(self.GetParent(), "SetStatusText", None)
+            if callable(status):
+                status("已复制")
 
     def _on_continue_clicked(self, _event=None):
         if callable(self._on_continue):
@@ -1060,6 +1092,11 @@ class ChatFrame(wx.Frame):
         )
         self._chat_navigation_left_id = wx.NewIdRef()
         self._chat_navigation_right_id = wx.NewIdRef()
+        self._clear_context_id = wx.NewIdRef()
+        self._notes_move_entry_up_id = wx.NewIdRef()
+        self._notes_move_entry_down_id = wx.NewIdRef()
+        self._notes_move_entry_top_id = wx.NewIdRef()
+        self._notes_move_entry_bottom_id = wx.NewIdRef()
         self._realtime_call = RealtimeCallController(
             settings=RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate),
             on_status=lambda message: wx_call_after_if_alive(self._on_realtime_call_status, message),
@@ -1109,6 +1146,12 @@ class ChatFrame(wx.Frame):
         wx_call_after_if_alive(self.input_edit.SetFocus)
 
     def _build_ui(self):
+        app_menu = wx.Menu()
+        app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
+        menu_bar = wx.MenuBar()
+        menu_bar.Append(app_menu, "应用(&A)")
+        self.SetMenuBar(menu_bar)
+
         frame_panel = wx.Panel(self)
         frame_root = wx.BoxSizer(wx.VERTICAL)
         self.chat_root_panel = wx.Panel(frame_panel)
@@ -1191,7 +1234,7 @@ class ChatFrame(wx.Frame):
         edit_sizer = wx.BoxSizer(wx.VERTICAL)
         self.notes_edit_title = wx.StaticText(self.notes_edit_panel, label="笔记")
         edit_sizer.Add(self.notes_edit_title, 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
-        self.notes_editor = wx.TextCtrl(self.notes_edit_panel, style=wx.TE_MULTILINE)
+        self.notes_editor = wx.TextCtrl(self.notes_edit_panel, style=wx.TE_MULTILINE | wx.TE_DONTWRAP | wx.HSCROLL)
         self.notes_editor.SetName("笔记")
         self.notes_editor.SetToolTip("笔记")
         edit_sizer.Add(self.notes_editor, 1, wx.EXPAND | wx.ALL, 10)
@@ -1199,7 +1242,7 @@ class ChatFrame(wx.Frame):
         self.notes_content_label = wx.StaticText(panel, label="笔记：")
         right.Add(self.notes_content_label, 0, wx.LEFT, 10)
         right.Add(self.notes_detail_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        right.Add(self.notes_edit_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        right.Add(self.notes_edit_panel, 2, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.new_chat_button.MoveAfterInTabOrder(self.input_edit)
         self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
         self.codex_speed_combo.MoveAfterInTabOrder(self.model_combo)
@@ -1276,11 +1319,21 @@ class ChatFrame(wx.Frame):
         self.new_chat_button.Bind(wx.EVT_CHAR, self._on_generic_key_down)
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=int(self._notes_move_entry_down_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_top(), id=int(self._notes_move_entry_top_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_bottom(), id=int(self._notes_move_entry_bottom_id))
         self.SetAcceleratorTable(
             wx.AcceleratorTable(
                 [
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_LEFT, int(self._chat_navigation_left_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_RIGHT, int(self._chat_navigation_right_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_ALT, ord("A"), int(self._clear_context_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._notes_move_entry_up_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._notes_move_entry_down_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_HOME, int(self._notes_move_entry_top_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_END, int(self._notes_move_entry_bottom_id)),
                 ]
             )
         )
@@ -2266,21 +2319,51 @@ class ChatFrame(wx.Frame):
             or bool(re.fullmatch(rf"{re.escape(EMPTY_CURRENT_CHAT_TITLE)}\d+", text))
         )
 
-    def _next_default_chat_title(self) -> str:
+    def _existing_chat_titles(self, *, exclude_chat_id: str = "") -> set[str]:
+        excluded = str(exclude_chat_id or "").strip()
         existing_titles = {
             str(chat.get("title") or "").strip()
             for chat in self.archived_chats
-            if isinstance(chat, dict)
+            if isinstance(chat, dict) and str(chat.get("id") or "").strip() != excluded
         }
+        current_id = str((self._current_chat_state or {}).get("id") or "").strip()
         current_title = str((self._current_chat_state or {}).get("title") or "").strip()
-        if current_title:
+        if current_title and current_id != excluded:
             existing_titles.add(current_title)
-        if EMPTY_CURRENT_CHAT_TITLE not in existing_titles:
-            return EMPTY_CURRENT_CHAT_TITLE
+        return {title for title in existing_titles if title}
+
+    def _unique_chat_title(self, title: str, *, exclude_chat_id: str = "") -> str:
+        base = str(title or "").strip() or EMPTY_CURRENT_CHAT_TITLE
+        existing_titles = self._existing_chat_titles(exclude_chat_id=exclude_chat_id)
+        if base not in existing_titles:
+            return base
         index = 1
-        while f"{EMPTY_CURRENT_CHAT_TITLE}{index}" in existing_titles:
+        while f"{base}{index}" in existing_titles:
             index += 1
-        return f"{EMPTY_CURRENT_CHAT_TITLE}{index}"
+        return f"{base}{index}"
+
+    def _next_default_chat_title(self) -> str:
+        return self._unique_chat_title(EMPTY_CURRENT_CHAT_TITLE)
+
+    @staticmethod
+    def _cd_command_title(question: str) -> str:
+        text = str(question or "").strip()
+        match = re.match(r"^(?:cd|chdir)\s+(.+)$", text, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        target = match.group(1).strip()
+        if target.lower().startswith("/d "):
+            target = target[3:].strip()
+        target = target.strip().strip('"').strip("'").strip()
+        if not target:
+            return ""
+        try:
+            name = Path(target).name
+            if not name and Path(target).anchor:
+                name = Path(target).anchor.rstrip("\\/")
+        except Exception:
+            name = ""
+        return str(name or "").strip()
 
     def _bump_chat_title_revision(self, chat: dict, source: str, updated_at: float | None = None, title: str | None = None) -> None:
         timestamp = float(updated_at or time.time())
@@ -2337,7 +2420,7 @@ class ChatFrame(wx.Frame):
             return
         if not self._compact_first_question_title(question, 120):
             return
-        self._bump_chat_title_revision(chat, "auto", title=title)
+        self._bump_chat_title_revision(chat, "auto", title=self._unique_chat_title(title, exclude_chat_id=resolved_chat_id))
         self._defer_chat_state_save()
         self._refresh_history(resolved_chat_id)
         self._push_remote_history_changed(resolved_chat_id)
@@ -2356,6 +2439,14 @@ class ChatFrame(wx.Frame):
         if bool(chat.get("title_manual")) or str(chat.get("title_source") or "").strip() == "manual":
             return
         if not self._is_default_chat_title(str(chat.get("title") or "")):
+            return
+        command_title = self._cd_command_title(normalized_question)
+        if command_title:
+            self._apply_generated_first_question_title(
+                resolved_chat_id,
+                normalized_question,
+                command_title,
+            )
             return
         immediate_title = self._compact_first_question_title(normalized_question, 12)
         if immediate_title:
@@ -3125,7 +3216,7 @@ class ChatFrame(wx.Frame):
             if kind == "attachment":
                 return f"answer:{turn_idx}:attachment:{detail}"
             return f"answer:{turn_idx}:{kind}"
-        if kind in {"context_usage", "current_model", "more", "info"}:
+        if kind in {"context_usage", "current_model", "more", "info", "notice"}:
             return f"answer:special:{kind}"
         return f"answer:{turn_idx}:{kind}:{len(str(meta))}"
 
@@ -3176,6 +3267,10 @@ class ChatFrame(wx.Frame):
             self.answer_total_content_rows = 1
             rows.append("暂无对话内容")
             metas.append(("info", -1, "", ""))
+            tail_notice = str(getattr(self, "_answer_list_tail_notice", "") or "").strip()
+            if tail_notice:
+                rows.append(tail_notice)
+                metas.append(("notice", -1, tail_notice, ""))
             selected_idx = 0 if rows else None
             changed = self._replace_answer_list_rows(rows, metas, selected_idx)
             self.answer_meta = metas
@@ -3238,6 +3333,10 @@ class ChatFrame(wx.Frame):
                     metas.append(meta)
         active_meta = metas[self._active_answer_row_index] if 0 <= self._active_answer_row_index < len(metas) else None
         rows, metas, active_idx = self._answer_rows_with_limit(rows, metas, header_count, active_meta=active_meta, force_has_more=force_has_more)
+        tail_notice = str(getattr(self, "_answer_list_tail_notice", "") or "").strip()
+        if tail_notice:
+            rows.append(tail_notice)
+            metas.append(("notice", -1, tail_notice, ""))
         selected_idx = self.answer_list.GetSelection()
         if selected_idx == wx.NOT_FOUND:
             selected_idx = len(rows) - 1 if rows else None
@@ -3435,6 +3534,8 @@ class ChatFrame(wx.Frame):
         # 只在窗口本来就在前台且未最小化时，才允许把焦点移到最新回答。
         if not self._is_foreground_window() or self.IsIconized():
             return False
+        if self._notes_editor_has_protected_focus():
+            return False
         try:
             focus = wx.Window.FindFocus()
         except Exception:
@@ -3474,6 +3575,18 @@ class ChatFrame(wx.Frame):
             if ctrl is not None
         }
         return focus in allowed
+
+    def _notes_editor_has_protected_focus(self) -> bool:
+        editor = getattr(self, "notes_editor", None)
+        controller = getattr(self, "notes_controller", None)
+        if editor is None or controller is None:
+            return False
+        try:
+            if getattr(controller, "notes_view", "") != "note_edit":
+                return False
+            return bool(editor.HasFocus())
+        except Exception:
+            return False
 
     def _find_answer_row_index(self, turn_idx: int) -> int:
         for row, meta in enumerate(self.answer_meta):
@@ -3728,7 +3841,7 @@ class ChatFrame(wx.Frame):
         if not isinstance(steps, list):
             return []
         if self.view_mode == "active" and any(isinstance(step, dict) and "turn_idx" in step for step in steps):
-            active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+            active_idx = self._active_turn_index_value()
             return [
                 step
                 for step in steps
@@ -3753,7 +3866,7 @@ class ChatFrame(wx.Frame):
         ):
             turn_idx = None
             if self.view_mode == "active":
-                active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+                active_idx = self._active_turn_index_value()
                 turn_idx = active_idx if active_idx >= 0 else None
             try:
                 total, rows = store.load_recent_execution_steps(chat_id, turn_idx=turn_idx, limit=limit)
@@ -3770,6 +3883,9 @@ class ChatFrame(wx.Frame):
             return int(value)
         except Exception:
             return default
+
+    def _active_turn_index_value(self) -> int:
+        return self._safe_int(getattr(self, "active_turn_idx", -1), -1)
 
     def _visible_execution_chat_id(self) -> str:
         if self.view_mode == "history":
@@ -4404,7 +4520,7 @@ class ChatFrame(wx.Frame):
         if not isinstance(target_chat, dict):
             return False
         if "turn_idx" not in entry and target_chat is getattr(self, "_current_chat_state", None):
-            active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+            active_idx = self._active_turn_index_value()
             if active_idx >= 0:
                 entry = dict(entry)
                 entry["turn_idx"] = active_idx
@@ -4613,6 +4729,58 @@ class ChatFrame(wx.Frame):
     def _execution_step_text(self, step) -> str:
         return self._execution_meta_tuple(-1, step)[2]
 
+    def _execution_turn_context_steps(self, steps: list) -> list:
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        turns = state.get("turns") if isinstance(state.get("turns"), list) else []
+        if not turns:
+            return list(steps or [])
+        turn_indices: list[int] = []
+        if self.view_mode == "active":
+            active_idx = self._active_turn_index_value()
+            if 0 <= active_idx < len(turns):
+                turn_indices = [active_idx]
+        if not turn_indices:
+            seen = []
+            for step in steps or []:
+                if isinstance(step, dict) and "turn_idx" in step:
+                    idx = self._safe_int(step.get("turn_idx"), -1)
+                    if 0 <= idx < len(turns) and idx not in seen:
+                        seen.append(idx)
+            turn_indices = seen or ([0] if len(turns) == 1 else [])
+        if not turn_indices:
+            return list(steps or [])
+        first_idx = turn_indices[0]
+        turn = turns[first_idx] if 0 <= first_idx < len(turns) and isinstance(turns[first_idx], dict) else {}
+        question = str(turn.get("question") or "").strip()
+        answer_md = str(turn.get("answer_md") or "").strip()
+        answer_text = ""
+        if answer_md and answer_md != REQUESTING_TEXT:
+            model = str(turn.get("model") or self.selected_model or "")
+            answer_text = remove_emojis(md_to_plain_preserving_paragraphs(self._answer_markdown_for_output(answer_md, model))).strip()
+        prefix_steps = []
+        if question:
+            prefix_steps.append(
+                {
+                    "display_kind": "turn_context",
+                    "list_text": f"我：{question}",
+                    "detail_text": question,
+                    "turn_idx": first_idx,
+                    "synthetic": "question",
+                }
+            )
+        suffix_steps = []
+        if answer_text:
+            suffix_steps.append(
+                {
+                    "display_kind": "turn_context",
+                    "list_text": f"小诸葛：{answer_text}",
+                    "detail_text": answer_text,
+                    "turn_idx": first_idx,
+                    "synthetic": "answer",
+                }
+            )
+        return prefix_steps + list(steps or []) + suffix_steps
+
     @staticmethod
     def _strip_ansi_control_sequences(text: str) -> str:
         return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text or ""))
@@ -4704,7 +4872,7 @@ class ChatFrame(wx.Frame):
             return False
         if list_text in {"active", "idle"} or detail_text in {"active", "idle"}:
             return False
-        if display_kind in {"commentary", "plan", "error", "user_input"}:
+        if display_kind in {"commentary", "plan", "error", "user_input", "turn_context"}:
             return bool(list_text or detail_text)
         if event_type in {"agent_message_delta", "plan_updated", "stderr", "server_request"}:
             return bool(list_text or detail_text)
@@ -4715,6 +4883,8 @@ class ChatFrame(wx.Frame):
     def _rebuild_execution_list_from_state(self) -> None:
         self._execution_list_pending_turn_reset = False
         total_steps, steps = self._current_execution_steps_for_render()
+        steps = self._execution_turn_context_steps(steps)
+        total_steps = max(total_steps, len(steps))
         visible_items = []
         for idx, step in enumerate(steps):
             if not self._should_show_execution_step(step):
@@ -7017,7 +7187,7 @@ class ChatFrame(wx.Frame):
         if not chat_id or not title:
             return 400, {"accepted": False, "error": "invalid_payload"}
         chat = self._find_archived_chat(chat_id)
-        if not chat and chat_id == self.active_chat_id:
+        if not chat and chat_id in {self.active_chat_id, self.current_chat_id}:
             chat = self._current_chat_state
         if not isinstance(chat, dict):
             return 404, {"accepted": False, "error": "not_found"}
@@ -7055,6 +7225,8 @@ class ChatFrame(wx.Frame):
         chat["title_source"] = incoming_source
         chat["title_updated_at"] = incoming_updated_at
         chat["title_revision"] = resolved_revision
+        self._invalidate_remote_history_list_cache()
+        self._invalidate_remote_state_cache()
         self._save_state()
         self._refresh_history(chat_id)
         self._push_remote_history_changed(chat_id)
@@ -7208,6 +7380,7 @@ class ChatFrame(wx.Frame):
             getattr(self, "codex_speed_combo", None),
             getattr(self, "notes_notebook_list", None),
             getattr(self, "notes_entry_list", None),
+            getattr(self, "notes_editor", None),
         ]
         for control in controls:
             if control is None:
@@ -7428,7 +7601,7 @@ class ChatFrame(wx.Frame):
             return
 
     def _defer_codex_state_save(self) -> None:
-        active_idx = int(getattr(self, "active_turn_idx", -1) or -1)
+        active_idx = self._active_turn_index_value()
         if active_idx >= 0:
             self._mark_chat_turns_dirty(start_index=active_idx)
         self._codex_background_flush_dirty = True
@@ -8437,6 +8610,9 @@ class ChatFrame(wx.Frame):
         if self._is_continue_shortcut(key, alt_down):
             self._submit_question("继续", source="local")
             return
+        if self._is_clear_context_shortcut(key, alt_down):
+            self._clear_context_and_start_new_chat()
+            return
         if ctrl_down and key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             direction = -1 if key == wx.WXK_LEFT else 1
             if self._navigate_history_chats(direction):
@@ -8527,6 +8703,9 @@ class ChatFrame(wx.Frame):
         if self._is_send_shortcut(key, event.ControlDown(), event.AltDown()):
             self._trigger_send()
             return
+        if self._is_clear_context_shortcut(key, event.AltDown()):
+            self._clear_context_and_start_new_chat()
+            return
         if self._is_new_chat_shortcut(key, event.AltDown()):
             self._trigger_new_chat()
             return
@@ -8534,6 +8713,9 @@ class ChatFrame(wx.Frame):
 
     def _is_continue_shortcut(self, key, alt):
         return alt and key in (ord("C"), ord("c"))
+
+    def _is_clear_context_shortcut(self, key, alt):
+        return alt and key in (ord("A"), ord("a"))
 
     def _on_input_key_up(self, event):
         if event.GetKeyCode() == wx.WXK_ALT:
@@ -8799,6 +8981,64 @@ class ChatFrame(wx.Frame):
             ev.SetEventObject(self.new_chat_button)
             wx.PostEvent(self.new_chat_button, ev)
 
+    def _clear_context_and_start_new_chat(self) -> bool:
+        if not self.new_chat_button.IsEnabled():
+            return False
+        now = time.time()
+        if not self.active_chat_id:
+            self.active_chat_id = self._ensure_active_chat_id()
+        if not self.current_chat_id:
+            self.current_chat_id = self.active_chat_id
+        self.active_session_turns = []
+        self.active_session_started_at = now
+        self.active_turn_idx = -1
+        self.active_openclaw_session_key = DEFAULT_OPENCLAW_SESSION_KEY
+        self.active_openclaw_session_id = ""
+        self.active_openclaw_session_file = ""
+        self.active_openclaw_sync_offset = 0
+        self.active_openclaw_last_event_id = ""
+        self.active_openclaw_last_synced_at = 0.0
+        self.active_codex_thread_id = ""
+        self.active_codex_turn_id = ""
+        self.active_codex_turn_active = False
+        self.active_codex_pending_prompt = ""
+        self.active_codex_pending_request = None
+        self.active_codex_request_queue = []
+        self.active_codex_thread_flags = []
+        self.active_codex_latest_assistant_text = ""
+        self.active_codex_latest_assistant_phase = ""
+        self.active_claudecode_session_id = ""
+        self._active_claudecode_client = None
+        self._pending_context_usage_by_turn = {}
+        self._current_chat_state["id"] = self.active_chat_id
+        self._current_chat_state["turns"] = self.active_session_turns
+        self._current_chat_state["updated_at"] = now
+        self._current_chat_state["openclaw_session_key"] = self.active_openclaw_session_key
+        self._current_chat_state["openclaw_session_id"] = self.active_openclaw_session_id
+        self._current_chat_state["openclaw_session_file"] = self.active_openclaw_session_file
+        self._current_chat_state["openclaw_sync_offset"] = self.active_openclaw_sync_offset
+        self._current_chat_state["openclaw_last_event_id"] = self.active_openclaw_last_event_id
+        self._current_chat_state["openclaw_last_synced_at"] = self.active_openclaw_last_synced_at
+        self._current_chat_state["codex_thread_id"] = self.active_codex_thread_id
+        self._current_chat_state["codex_turn_id"] = self.active_codex_turn_id
+        self._current_chat_state["codex_turn_active"] = self.active_codex_turn_active
+        self._current_chat_state["codex_pending_prompt"] = self.active_codex_pending_prompt
+        self._current_chat_state["codex_pending_request"] = self.active_codex_pending_request
+        self._current_chat_state["codex_request_queue"] = self.active_codex_request_queue
+        self._current_chat_state["codex_thread_flags"] = self.active_codex_thread_flags
+        self._current_chat_state["codex_latest_assistant_text"] = self.active_codex_latest_assistant_text
+        self._current_chat_state["codex_latest_assistant_phase"] = self.active_codex_latest_assistant_phase
+        self._current_chat_state["claudecode_session_id"] = self.active_claudecode_session_id
+        self._current_chat_state["context_usage"] = None
+        self._current_chat_state["execution_steps"] = []
+        self._answer_list_tail_notice = "以开启新会话"
+        self._render_answer_list()
+        self._defer_chat_state_save()
+        self._mark_openclaw_lifecycle_dirty()
+        self._push_remote_history_changed(self.active_chat_id)
+        self.SetStatusText("已清空上下文")
+        return True
+
     def _prompt_and_create_named_chat(self) -> bool:
         if not self.new_chat_button.IsEnabled():
             return False
@@ -8831,6 +9071,7 @@ class ChatFrame(wx.Frame):
         display_question = q
         if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
+        self._answer_list_tail_notice = ""
 
         # 检查是否有活跃的 Claude Code 客户端在等待输入
         if hasattr(self, '_active_claudecode_client') and self._active_claudecode_client is not None:
@@ -9947,7 +10188,7 @@ class ChatFrame(wx.Frame):
         now = time.time()
         self._current_chat_state = {
             "id": "",
-            "title": manual_title if manual else self._next_default_chat_title(),
+            "title": self._unique_chat_title(manual_title) if manual else self._next_default_chat_title(),
             "title_manual": manual,
             "title_source": "manual" if manual else "default",
             "title_updated_at": now,
@@ -10623,12 +10864,20 @@ class ChatFrame(wx.Frame):
 
     def _notes_current_entry(self):
         active_entry_id = str(getattr(self.notes_controller, "active_entry_id", "") or "").strip()
-        if active_entry_id:
+        selected_entry_id = str(self._notes_selected_entry_id() or "").strip()
+        entry_list_has_focus = False
+        try:
+            entry_list_has_focus = bool(self.notes_entry_list.HasFocus())
+        except Exception:
+            entry_list_has_focus = False
+        if entry_list_has_focus and selected_entry_id:
+            entry_id = selected_entry_id
+        elif active_entry_id:
             entry_id = active_entry_id
         elif str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit":
             entry_id = ""
         else:
-            entry_id = str(self._notes_selected_entry_id() or "").strip()
+            entry_id = selected_entry_id
         if not entry_id:
             return None
         projection = getattr(self, "notes_projection", None)
@@ -11145,7 +11394,7 @@ class ChatFrame(wx.Frame):
         return changed
 
     def _notes_entry_label(self, entry) -> str:
-        prefix = "★ " if getattr(entry, "pinned", False) else ""
+        prefix = "置顶：" if getattr(entry, "pinned", False) else ""
         raw = str(getattr(entry, "content", "") or "")
         preview = raw[: max(NOTES_ENTRY_LABEL_MAX_CHARS * 4, NOTES_ENTRY_LABEL_MAX_CHARS)]
         label = re.sub(r"\s*[\r\n]+\s*", " / ", preview).strip()
@@ -11614,6 +11863,8 @@ class ChatFrame(wx.Frame):
             i_del_entry = wx.NewIdRef()
             i_edit_entry = wx.NewIdRef()
             i_pin_entry = wx.NewIdRef()
+            i_up_entry = wx.NewIdRef()
+            i_down_entry = wx.NewIdRef()
             i_bottom_entry = wx.NewIdRef()
             i_import_file = wx.NewIdRef()
             i_import_clip = wx.NewIdRef()
@@ -11626,6 +11877,8 @@ class ChatFrame(wx.Frame):
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
             menu.Append(i_pin_entry, "置顶笔记条目")
+            menu.Append(i_up_entry, "向上移动笔记条目")
+            menu.Append(i_down_entry, "向下移动笔记条目")
             menu.Append(i_bottom_entry, "置底笔记条目")
             menu.AppendSeparator()
             menu.Append(i_import_file, "从文件导入")
@@ -11638,7 +11891,9 @@ class ChatFrame(wx.Frame):
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("up"), id=i_export_up)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_pin_entry(), id=i_pin_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_top(), id=i_pin_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=i_up_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=i_down_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_bottom(), id=i_bottom_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_file(), id=i_import_file)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_clipboard(), id=i_import_clip)
@@ -11877,16 +12132,45 @@ class ChatFrame(wx.Frame):
         if entry is None:
             return False
         self.notes_store.pin_entry(entry.id)
-        self._notes_refresh_ui()
+        self._notes_refresh_entries(entry.notebook_id, entry.id)
         self._notes_after_local_mutation()
         return True
 
+    def _notes_move_entry_up(self) -> bool:
+        return self._notes_move_selected_entry("up")
+
+    def _notes_move_entry_down(self) -> bool:
+        return self._notes_move_selected_entry("down")
+
+    def _notes_move_entry_to_top(self) -> bool:
+        return self._notes_move_selected_entry("top")
+
     def _notes_move_entry_to_bottom(self) -> bool:
+        return self._notes_move_selected_entry("bottom")
+
+    def _notes_move_selected_entry(self, direction: str) -> bool:
         entry = self._notes_current_entry()
         if entry is None:
             return False
-        self.notes_store.move_entry_to_bottom(entry.id)
-        self._notes_refresh_ui()
+        direction_key = str(direction or "").strip().lower()
+        if direction_key == "up":
+            moved = self.notes_store.move_entry_up(entry.id)
+        elif direction_key == "down":
+            moved = self.notes_store.move_entry_down(entry.id)
+        elif direction_key == "top":
+            moved = self.notes_store.move_entry_to_top(entry.id)
+        elif direction_key == "bottom":
+            moved = self.notes_store.move_entry_to_bottom(entry.id)
+        else:
+            return False
+        self._invalidate_notes_projection()
+        self.notes_controller.active_entry_id = moved.id
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_refresh_entries(moved.notebook_id, moved.id)
+        try:
+            self.notes_entry_list.SetFocus()
+        except Exception:
+            pass
         self._notes_after_local_mutation()
         return True
 
@@ -12073,11 +12357,24 @@ class ChatFrame(wx.Frame):
         return bool(created)
 
     def _on_notes_key_down(self, event):
+        key = event.GetKeyCode()
+        if event.ControlDown() and not event.AltDown() and self.notes_entry_list.HasFocus():
+            if key == wx.WXK_UP:
+                if self._notes_move_entry_up():
+                    return
+            elif key == wx.WXK_DOWN:
+                if self._notes_move_entry_down():
+                    return
+            elif key == wx.WXK_HOME:
+                if self._notes_move_entry_to_top():
+                    return
+            elif key == wx.WXK_END:
+                if self._notes_move_entry_to_bottom():
+                    return
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
             return
-        key = event.GetKeyCode()
         if key == wx.WXK_ESCAPE and getattr(self, "notes_controller", None) and self.notes_controller.notes_view == "note_edit":
             if self._notes_request_exit_edit():
                 return

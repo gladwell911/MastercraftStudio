@@ -1,4 +1,5 @@
 ﻿import json
+import os
 import re
 from typing import Callable
 
@@ -10,6 +11,7 @@ BASE_URL = "https://openrouter.ai/api/v1"
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 DEFAULT_MODEL = "openai/gpt-5.2"
+DEFAULT_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 TIMEOUT_SECONDS = 60
 TITLE_SYSTEM_PROMPT = (
     "你是标题助手。请把输入内容压缩成简洁精炼的中文主题短语，优先使用4-8个字的名词短语，"
@@ -35,7 +37,7 @@ def resolve_doubao_model(model: str | None) -> str:
 
 class ChatClient:
     def __init__(self, api_key: str, base_url: str = BASE_URL, model: str = DEFAULT_MODEL, timeout: int = TIMEOUT_SECONDS) -> None:
-        self.api_key = api_key
+        self.api_key = str(api_key or "").strip() or DEFAULT_OPENROUTER_API_KEY
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout

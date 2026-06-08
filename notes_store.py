@@ -36,6 +36,7 @@ ENTRY_COLUMNS = {
     "created_at",
     "updated_at",
     "sort_order",
+    "pinned",
     "version",
     "device_id",
     "last_modified_by",
@@ -133,6 +134,7 @@ class NotesStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 sort_order INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
                 version INTEGER NOT NULL DEFAULT 1,
                 device_id TEXT NOT NULL DEFAULT '',
                 last_modified_by TEXT NOT NULL DEFAULT 'desktop',
@@ -148,9 +150,11 @@ class NotesStore:
                 value TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_entries_notebook_sort
-            ON entries (notebook_id, sort_order, created_at);
+            ON entries (notebook_id, pinned, sort_order, created_at);
             """
         )
+        if "pinned" not in self._table_columns(conn, "entries"):
+            conn.execute("ALTER TABLE entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
 
     def _drop_notes_tables(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -255,10 +259,10 @@ class NotesStore:
             """
             INSERT INTO entries (
                 id, notebook_id, content, created_at, updated_at,
-                sort_order, version, device_id, last_modified_by,
+                sort_order, pinned, version, device_id, last_modified_by,
                 is_conflict_copy, origin_entry_id, source,
                 rev, deleted, dirty
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 doc.id,
@@ -267,6 +271,7 @@ class NotesStore:
                 doc.created_at,
                 doc.updated_at,
                 doc.sort_order,
+                int(doc.pinned),
                 doc.version,
                 doc.device_id,
                 doc.last_modified_by,
@@ -557,6 +562,7 @@ class NotesStore:
                 created_at=str(created_at or now),
                 updated_at=str(updated_at or created_at or now),
                 sort_order=int(sort_order) if sort_order is not None else self._next_entry_sort_order(conn, notebook_id),
+                pinned=bool(pinned) if pinned is not None else False,
                 version=int(version) if version is not None else 1,
                 device_id=str(device_id or self.device_id),
                 last_modified_by=str(last_modified_by or "desktop"),
@@ -590,7 +596,7 @@ class NotesStore:
         sql = "SELECT * FROM entries WHERE notebook_id = ?"
         if not include_deleted:
             sql += " AND deleted = 0"
-        sql += " ORDER BY sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql, (notebook_id,)).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -599,7 +605,7 @@ class NotesStore:
         sql = "SELECT * FROM entries"
         if not include_deleted:
             sql += " WHERE deleted = 0"
-        sql += " ORDER BY notebook_id ASC, sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY notebook_id ASC, pinned DESC, sort_order ASC, created_at ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -609,7 +615,7 @@ class NotesStore:
         params: list[object] = [notebook_id, f"%{str(query or '').strip()}%"]
         if not include_deleted:
             sql += " AND deleted = 0"
-        sql += " ORDER BY sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -669,6 +675,7 @@ class NotesStore:
                     created_at=now,
                     updated_at=now,
                     sort_order=next_sort_order,
+                    pinned=False,
                     version=1,
                     device_id=self.device_id,
                     last_modified_by="desktop",
@@ -688,32 +695,72 @@ class NotesStore:
         return created
 
     def pin_entry(self, entry_id: str, pinned: bool | None = None, *, record_outbox: bool = True) -> NoteEntry:
-        entry = self.get_entry(entry_id, include_deleted=True)
-        if entry is None:
+        current = self.get_entry(entry_id, include_deleted=True)
+        if current is None:
             raise KeyError(entry_id)
-        return entry
+        next_pinned = True if pinned is None else bool(pinned)
+        if next_pinned:
+            entries = self.list_entries(current.notebook_id, include_deleted=True)
+            min_sort = min((int(item.sort_order) for item in entries), default=0)
+            sort_order = min_sort - 1
+        else:
+            sort_order = current.sort_order
+        return self._update_entry_position(entry_id, sort_order=sort_order, pinned=next_pinned, record_outbox=record_outbox)
 
     def move_entry_to_bottom(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         current = self.get_entry(entry_id, include_deleted=True)
         if current is None:
             raise KeyError(entry_id)
+        entries = [item for item in self.list_entries(current.notebook_id, include_deleted=True) if not item.deleted_at]
+        max_sort = max((int(item.sort_order) for item in entries), default=0)
+        return self._update_entry_position(entry_id, sort_order=max_sort + 1, pinned=False, record_outbox=record_outbox)
+
+    def move_entry_to_top(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
+        return self.pin_entry(entry_id, True, record_outbox=record_outbox)
+
+    def move_entry_up(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
+        return self._move_entry_by_delta(entry_id, -1, record_outbox=record_outbox)
+
+    def move_entry_down(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
+        return self._move_entry_by_delta(entry_id, 1, record_outbox=record_outbox)
+
+    def _move_entry_by_delta(self, entry_id: str, delta: int, *, record_outbox: bool = True) -> NoteEntry:
+        current = self.get_entry(entry_id, include_deleted=True)
+        if current is None:
+            raise KeyError(entry_id)
+        entries = [item for item in self.list_entries(current.notebook_id, include_deleted=True) if not item.deleted_at]
+        ids = [item.id for item in entries]
+        try:
+            old_idx = ids.index(entry_id)
+        except ValueError:
+            raise KeyError(entry_id)
+        new_idx = max(0, min(old_idx + int(delta), len(entries) - 1))
+        if new_idx == old_idx:
+            return current
+        neighbor = entries[new_idx]
         with self._connect() as conn:
-            row = conn.execute("SELECT notebook_id FROM entries WHERE id = ?", (entry_id,)).fetchone()
-            if row is None:
-                raise KeyError(entry_id)
-            next_sort_order = self._next_entry_sort_order(conn, str(row["notebook_id"]))
+            now = _utc_now()
             conn.execute(
                 """
                 UPDATE entries
-                SET sort_order = ?, updated_at = ?, version = ?, device_id = ?,
-                    last_modified_by = ?, dirty = 1
+                SET sort_order = ?, pinned = ?, updated_at = ?, version = version + 1,
+                    device_id = ?, last_modified_by = ?, dirty = 1
                 WHERE id = ?
                 """,
-                (next_sort_order, _utc_now(), current.version + 1, self.device_id, "desktop", entry_id),
+                (neighbor.sort_order, int(neighbor.pinned), now, self.device_id, "desktop", current.id),
             )
-            updated_row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
-            assert updated_row is not None
-            updated_doc = EntryDoc.from_row(dict(updated_row))
+            conn.execute(
+                """
+                UPDATE entries
+                SET sort_order = ?, pinned = ?, updated_at = ?, version = version + 1,
+                    device_id = ?, last_modified_by = ?, dirty = 1
+                WHERE id = ?
+                """,
+                (current.sort_order, int(current.pinned), now, self.device_id, "desktop", neighbor.id),
+            )
+            row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+            assert row is not None
+            updated_doc = EntryDoc.from_row(dict(row))
             if record_outbox:
                 self._record_compat_op(
                     conn,
@@ -726,18 +773,22 @@ class NotesStore:
         return self._project_entry(updated_doc, source=updated_doc.source)
 
     def _set_entry_sort_order(self, entry_id: str, sort_order: int, *, pinned: bool | None = None, record_outbox: bool = True) -> NoteEntry:
+        return self._update_entry_position(entry_id, sort_order=sort_order, pinned=pinned, record_outbox=record_outbox)
+
+    def _update_entry_position(self, entry_id: str, *, sort_order: int, pinned: bool | None = None, record_outbox: bool = True) -> NoteEntry:
         current = self.get_entry(entry_id, include_deleted=True)
         if current is None:
             raise KeyError(entry_id)
+        next_pinned = current.pinned if pinned is None else bool(pinned)
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE entries
-                SET sort_order = ?, updated_at = ?, version = ?, device_id = ?,
+                SET sort_order = ?, pinned = ?, updated_at = ?, version = ?, device_id = ?,
                     last_modified_by = ?, dirty = 1
                 WHERE id = ?
                 """,
-                (int(sort_order), _utc_now(), current.version + 1, self.device_id, "desktop", entry_id),
+                (int(sort_order), int(next_pinned), _utc_now(), current.version + 1, self.device_id, "desktop", entry_id),
             )
             row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
             assert row is not None

@@ -52,6 +52,7 @@ def test_write_creates_nats_server_config(tmp_path: Path) -> None:
     assert 'host: "0.0.0.0"' in contents
     assert "jetstream" in contents
     assert f'store_dir: "{expected_store}"' in contents
+    assert "timeout: 30" in contents
     assert 'token: "secret"' in contents
     assert "websocket" in contents
     assert "port: 18080" in contents
