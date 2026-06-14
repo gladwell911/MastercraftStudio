@@ -8,6 +8,7 @@ import threading
 from typing import Any
 
 from remote_nats_protocol import (
+    FILE_EVENT_TYPES,
     NatsSubjects,
     build_error_response,
     build_response_event,
@@ -40,6 +41,7 @@ class RemoteNatsTransport:
         on_history_read: Callback | None = None,
         on_notes_changes: Callback | None = None,
         on_notes_bulk_docs: Callback | None = None,
+        on_file_command: Callback | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
         invoke_callback: CallbackInvoker | None = None,
     ) -> None:
@@ -60,6 +62,7 @@ class RemoteNatsTransport:
         self.on_history_read = on_history_read
         self.on_notes_changes = on_notes_changes
         self.on_notes_bulk_docs = on_notes_bulk_docs
+        self.on_file_command = on_file_command
         self._invoke_callback = invoke_callback
         self._nats_client: Any | None = None
         self._command_subscription: Any | None = None
@@ -181,7 +184,8 @@ class RemoteNatsTransport:
         event_type = str(event.get("type") or "event")
         if not event.get("event_id"):
             event["event_id"] = make_event_id(event_type)
-        await self.jetstream.publish(self.subjects.events, encode_payload(event))
+        subject = self.subjects.files if event_type.startswith("file_") else self.subjects.events
+        await self.jetstream.publish(subject, encode_payload(event))
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -276,6 +280,8 @@ class RemoteNatsTransport:
             return self.on_notes_changes(payload)
         if command_type == "notes_bulk_docs" and callable(self.on_notes_bulk_docs):
             return self.on_notes_bulk_docs(payload)
+        if command_type in FILE_EVENT_TYPES and callable(self.on_file_command):
+            return self.on_file_command(payload)
         return 404, {"accepted": False, "error": "unknown_type"}
 
     def _invoke_route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:

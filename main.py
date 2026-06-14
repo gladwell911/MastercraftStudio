@@ -22,12 +22,12 @@ from pathlib import Path
 from typing import Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import markdown
 import wx
 import wx.adv
-from aiohttp import ClientSession, ClientTimeout, WSMsgType
+from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
 from chat_store import ChatStore
 from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
@@ -48,6 +48,7 @@ from context_usage import (
     estimate_turns_tokens,
     format_context_usage_label,
 )
+from file_transfer import CopypartyFileService, DesktopFileLibrary, FileDirection, FileTransferStatus, extract_windows_file_paths
 from listbox_model import IncrementalListBoxModel
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_backup import export_notes_backup, restore_notes_backup
@@ -75,6 +76,7 @@ from realtime_call import (
     RealtimeCallController,
     RealtimeCallSettings,
 )
+from remote_nats_protocol import build_file_command_event
 from speech_input import MODE_DIRECT, MODE_OPTIMIZE, VoiceInputController
 from zdsr_tts import ZDSRTTSClient
 
@@ -139,6 +141,13 @@ REMOTE_NATS_WEBSOCKET_PORT_FALLBACKS = (
     28081,
 )
 DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT = 18080
+REMOTE_CLOUDFLARED_ORIGIN_PORT_FALLBACKS = (
+    19080,
+    19081,
+    18082,
+    10080,
+    28080,
+)
 DEFAULT_REMOTE_NATS_CLOUDFLARED_URL = "wss://rc.tingyou.cc/nats"
 REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS = 5
 VK_PROCESSKEY = 0xE5
@@ -924,6 +933,129 @@ class CodexUserInputDialog(wx.Dialog):
         return answers
 
 
+class CloudflaredOriginProxy:
+    def __init__(self, *, listen_host: str, listen_port: int, nats_ws_url: str, file_base_url: str):
+        self.listen_host = listen_host
+        self.listen_port = int(listen_port)
+        self.nats_ws_url = str(nats_ws_url or "").strip()
+        self.file_base_url = str(file_base_url or "").strip().rstrip("/")
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._runner: web.AppRunner | None = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._error: Exception | None = None
+
+    def start(self, timeout: float = 5.0) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._started.clear()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name="cloudflared-origin-proxy", daemon=True)
+        self._thread.start()
+        if not self._started.wait(timeout):
+            raise TimeoutError(f"cloudflared origin proxy did not start on {self.listen_host}:{self.listen_port}")
+        if self._error is not None:
+            raise self._error
+
+    def stop(self) -> None:
+        loop = self._loop
+        runner = self._runner
+        if loop is not None and runner is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(runner.cleanup(), loop)
+            try:
+                future.result(timeout=3.0)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        self._thread = None
+        self._loop = None
+        self._runner = None
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._handle_request)
+        runner = web.AppRunner(app)
+        self._runner = runner
+        try:
+            loop.run_until_complete(runner.setup())
+            site = web.TCPSite(runner, self.listen_host, self.listen_port)
+            loop.run_until_complete(site.start())
+            self._started.set()
+            loop.run_forever()
+        except Exception as exc:
+            self._error = exc
+            self._started.set()
+        finally:
+            try:
+                loop.run_until_complete(runner.cleanup())
+            except Exception:
+                pass
+            loop.close()
+
+    async def _handle_request(self, request: web.Request) -> web.StreamResponse:
+        if request.path.rstrip("/") == "/nats":
+            return await self._proxy_websocket(request)
+        return await self._proxy_file_request(request)
+
+    async def _proxy_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        downstream = web.WebSocketResponse(heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+        await downstream.prepare(request)
+        async with ClientSession() as session:
+            async with session.ws_connect(self.nats_ws_url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as upstream:
+                async def client_to_upstream() -> None:
+                    async for msg in downstream:
+                        if msg.type == WSMsgType.TEXT:
+                            await upstream.send_str(msg.data)
+                        elif msg.type == WSMsgType.BINARY:
+                            await upstream.send_bytes(msg.data)
+                        elif msg.type == WSMsgType.CLOSE:
+                            await upstream.close()
+
+                async def upstream_to_client() -> None:
+                    async for msg in upstream:
+                        if msg.type == WSMsgType.TEXT:
+                            await downstream.send_str(msg.data)
+                        elif msg.type == WSMsgType.BINARY:
+                            await downstream.send_bytes(msg.data)
+                        elif msg.type == WSMsgType.CLOSE:
+                            await downstream.close()
+
+                tasks = [
+                    asyncio.create_task(client_to_upstream()),
+                    asyncio.create_task(upstream_to_client()),
+                ]
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    task.result()
+        return downstream
+
+    async def _proxy_file_request(self, request: web.Request) -> web.Response:
+        if not self.file_base_url:
+            return web.Response(status=503, text="file service is not configured")
+        target_url = f"{self.file_base_url}{request.rel_url.raw_path_qs}"
+        body = await request.read()
+        excluded = {"host", "connection", "content-length", "transfer-encoding"}
+        headers = {key: value for key, value in request.headers.items() if key.lower() not in excluded}
+        timeout = ClientTimeout(total=None, sock_connect=10)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.request(request.method, target_url, data=body, headers=headers) as response:
+                response_body = await response.read()
+                response_headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in {"connection", "content-length", "transfer-encoding", "content-encoding"}
+                }
+                return web.Response(status=response.status, body=response_body, headers=response_headers)
+
+
 class ChatFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_WINDOW_TITLE, size=(1200, 800))
@@ -937,6 +1069,10 @@ class ChatFrame(wx.Frame):
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
         self.chat_uploads_dir = self.app_data_dir / "chat_uploads"
         self.chat_uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.file_library = DesktopFileLibrary()
+        self.file_service = CopypartyFileService(self.file_library)
+        self.file_http_base_url = self.file_service.base_url
+        self._cloudflared_origin_proxy = None
         self.notes_db_path = self.app_data_dir / "notes.db"
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
@@ -1093,6 +1229,10 @@ class ChatFrame(wx.Frame):
         self._chat_navigation_left_id = wx.NewIdRef()
         self._chat_navigation_right_id = wx.NewIdRef()
         self._clear_context_id = wx.NewIdRef()
+        self._file_manager_menu_id = wx.NewIdRef()
+        self._realtime_call_settings_menu_id = wx.NewIdRef()
+        self._load_chat_attachments_menu_id = wx.NewIdRef()
+        self._codex_answer_filter_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
         self._notes_move_entry_down_id = wx.NewIdRef()
         self._notes_move_entry_top_id = wx.NewIdRef()
@@ -1121,6 +1261,7 @@ class ChatFrame(wx.Frame):
         if not getattr(self, "_chat_store_enabled", False):
             self._merge_legacy_archived_chats()
         self._schedule_remote_nats_autostart()
+        self._start_file_service_if_configured()
         self._start_claudecode_remote_nats_runtime_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
         if self.active_session_turns:
@@ -1148,6 +1289,12 @@ class ChatFrame(wx.Frame):
     def _build_ui(self):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
+        app_menu.Append(int(self._file_manager_menu_id), "文件管理")
+        app_menu.AppendSeparator()
+        app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
+        app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
+        filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
+        filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
         menu_bar = wx.MenuBar()
         menu_bar.Append(app_menu, "应用(&A)")
         self.SetMenuBar(menu_bar)
@@ -1202,6 +1349,14 @@ class ChatFrame(wx.Frame):
         self.execution_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.execution_list.SetName("执行过程列表")
         right.Add(self.execution_list, 1, wx.EXPAND | wx.ALL, 10)
+        self.file_manager_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.file_manager_list.SetName("文件管理")
+        right.Add(self.file_manager_list, 1, wx.EXPAND | wx.ALL, 10)
+        self.file_manager_list.Hide()
+        self.extracted_file_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.extracted_file_list.SetName("提取文件")
+        right.Add(self.extracted_file_list, 1, wx.EXPAND | wx.ALL, 10)
+        self.extracted_file_list.Hide()
         root.Add(right, 2, wx.EXPAND)
         panel.SetSizer(root)
 
@@ -1259,6 +1414,10 @@ class ChatFrame(wx.Frame):
         self.history_list_model = IncrementalListBoxModel(self.history_list)
         self.answer_list_model = IncrementalListBoxModel(self.answer_list)
         self.execution_list_model = IncrementalListBoxModel(self.execution_list)
+        self.file_manager_list_model = IncrementalListBoxModel(self.file_manager_list)
+        self.file_manager_ids = []
+        self.extracted_file_list_model = IncrementalListBoxModel(self.extracted_file_list)
+        self.extracted_file_ids = []
         self.notes_notebook_list_model = IncrementalListBoxModel(self.notes_notebook_list)
         self.notes_entry_list_model = IncrementalListBoxModel(self.notes_entry_list)
         self._notes_rebuild_tab_order()
@@ -1306,6 +1465,11 @@ class ChatFrame(wx.Frame):
         self.execution_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.execution_list.Bind(wx.EVT_CHAR, self._on_execution_char)
         self.execution_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_execution_activate)
+        self.file_manager_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("file_manager_key_down", self._on_file_manager_key_down))
+        self.file_manager_list.Bind(wx.EVT_CONTEXT_MENU, self._on_file_manager_context)
+        self.file_manager_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._open_selected_file_manager_record())
+        self.extracted_file_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("extracted_file_key_down", self._on_extracted_file_key_down))
+        self.extracted_file_list.Bind(wx.EVT_CONTEXT_MENU, self._on_extracted_file_context)
         self.history_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("history_key_down", self._on_history_key_down))
         self.history_list.Bind(wx.EVT_CHAR, self._on_history_char)
         self.history_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._activate_selected_history())
@@ -1320,6 +1484,10 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_file_manager(), id=int(self._file_manager_menu_id))
+        self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=int(self._notes_move_entry_down_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_top(), id=int(self._notes_move_entry_top_id))
@@ -1350,6 +1518,432 @@ class ChatFrame(wx.Frame):
             self.notes_editor.Bind(wx.EVT_TEXT, self._on_notes_editor_changed)
             self.notes_editor.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("notes_key_down", self._on_notes_key_down))
             self.notes_editor.Bind(wx.EVT_CONTEXT_MENU, self._on_notes_context)
+
+    def _show_file_manager(self) -> None:
+        if not hasattr(self, "file_manager_list"):
+            return
+        self.detail_title_label.SetLabel("文件管理：")
+        self.answer_list.Hide()
+        self.execution_list.Hide()
+        self.extracted_file_list.Hide()
+        self.file_manager_list.Show()
+        self._refresh_file_manager_list()
+        self.chat_root_panel.Layout()
+        self.file_manager_list.SetFocus()
+
+    def _refresh_file_manager_list(self, selected_id: str | None = None) -> bool:
+        if hasattr(self.file_library, "sync_storage_dir"):
+            self.file_library.sync_storage_dir()
+        records = self.file_library.list_records()
+        rows = [(record.id, record.label()) for record in records]
+        changed = self.file_manager_list_model.replace_visible_page(rows, selected_id=selected_id)
+        self.file_manager_ids = list(self.file_manager_list_model.visible_ids)
+        if changed:
+            self._request_listbox_repaint(self.file_manager_list)
+        return changed
+
+    def _selected_file_manager_record(self):
+        record_id = self.file_manager_list_model.selected_id()
+        if not record_id:
+            return None
+        return self.file_library.get_record(record_id)
+
+    def _open_path_with_default_app(self, path) -> bool:
+        target = Path(path)
+        if not target.exists():
+            self.SetStatusText(f"文件不存在：{target}")
+            return False
+        try:
+            os.startfile(str(target))
+            return True
+        except Exception as exc:
+            self.SetStatusText(f"打开文件失败：{exc}")
+            return False
+
+    def _open_selected_file_manager_record(self) -> bool:
+        record = self._selected_file_manager_record()
+        if record is None:
+            return False
+        return self._open_path_with_default_app(record.stored_path)
+
+    def _delete_selected_file_manager_record(self) -> bool:
+        record = self._selected_file_manager_record()
+        if record is None:
+            return False
+        if not self._confirm(f"确定删除 {record.name} 吗？"):
+            return False
+        if not self.file_library.delete_record(record.id):
+            self.SetStatusText("删除文件失败")
+            return False
+        self._refresh_file_manager_list()
+        self.SetStatusText("已删除文件")
+        return True
+
+    def _send_selected_file_to_phone(self) -> bool:
+        record = self._selected_file_manager_record()
+        if record is None:
+            return False
+        return self._publish_file_offer_for_record(record)
+
+    def _publish_file_offer_for_record(self, record) -> bool:
+        offer = self._file_offer_for_record(record)
+        download_url = str(offer.get("body", {}).get("download_url") or "").strip()
+        if not download_url:
+            error = str(offer.get("body", {}).get("error") or "文件下载地址不可用").strip()
+            self.file_library.update_record_status(
+                record.id,
+                FileTransferStatus.FAILED,
+                error_message=error,
+            )
+            self._refresh_file_manager_if_visible(selected_id=record.id)
+            self.SetStatusText(error)
+            return False
+        self._last_file_offer_event = offer
+        self._broadcast_remote_event(offer)
+        self._mark_file_offer_waiting(record.id)
+        self.SetStatusText(f"已创建文件发送请求：{record.name}")
+        return True
+
+    def _mark_file_offer_waiting(self, record_id: str) -> None:
+        record = self.file_library.update_record_status(
+            record_id,
+            FileTransferStatus.WAITING_CONFIRMATION,
+            transferred_bytes=0,
+            speed_bytes_per_second=0,
+        )
+        if record is not None:
+            self._refresh_file_manager_if_visible(selected_id=record.id)
+
+    def _file_offer_for_record(self, record) -> dict:
+        public_route_ready = self._ensure_public_file_route_ready()
+        file_service = getattr(self, "file_service", None)
+        error = ""
+        if file_service is not None and hasattr(file_service, "download_url_for"):
+            if public_route_ready:
+                download_url = file_service.download_url_for(record)
+            else:
+                download_url = ""
+                error = "公网文件通道不可用，未向手机下发本地下载地址。请确认 cloudflared 已将文件服务代理到 rc.tingyou.cc 后重试。"
+        else:
+            base_url = str(getattr(self, "file_http_base_url", "") or "").rstrip("/")
+            download_url = f"{base_url}/files/{record.id}" if base_url else ""
+        event = build_file_command_event(
+            request_id=f"file-offer-{uuid.uuid4().hex}",
+            event_type="file_offer",
+            device_id=str(getattr(self, "notes_device_id", "desktop") or "desktop"),
+            body={
+                "file_id": record.id,
+                "name": record.name,
+                "size_bytes": record.size_bytes,
+                "download_url": download_url,
+            },
+            chat_id=str(getattr(self, "active_chat_id", "") or ""),
+        )
+        if error:
+            event["body"]["error"] = error
+        return event
+
+    def _ensure_public_file_route_ready(self) -> bool:
+        service = getattr(self, "file_service", None)
+        public_base_url = str(getattr(service, "public_base_url", "") or "").strip()
+        if not public_base_url:
+            return True
+        if not self._start_cloudflared_origin_proxy():
+            return False
+        origin_port = self._cloudflared_origin_port()
+        configured, reconfigured = self._ensure_cloudflared_service_url(origin_port)
+        if not configured:
+            if reconfigured:
+                return self._replace_stale_cloudflared_with_managed(origin_port)
+            return self._start_managed_cloudflared_process(origin_port)
+        if reconfigured:
+            return self._restart_cloudflared_service() or self._start_managed_cloudflared_process(origin_port)
+        return self._start_cloudflared_service() or self._start_managed_cloudflared_process(origin_port)
+
+    def _file_command_body(self, payload: dict) -> dict:
+        body = payload.get("body")
+        if isinstance(body, dict):
+            return dict(body)
+        return {key: value for key, value in dict(payload or {}).items() if key not in {"type", "id", "event_id", "chat_id", "device_id", "created_at"}}
+
+    def _refresh_file_manager_if_visible(self, selected_id: str | None = None) -> None:
+        try:
+            if getattr(self, "file_manager_list", None) is not None and self.file_manager_list.IsShown():
+                self._refresh_file_manager_list(selected_id=selected_id)
+        except Exception:
+            pass
+
+    def _remote_api_file_command_ui(self, payload: dict) -> tuple[int, dict]:
+        command_type = str((payload or {}).get("type") or "").strip()
+        body = self._file_command_body(payload or {})
+        file_id = str(body.get("file_id") or "").strip()
+        if command_type == "file_list":
+            self.file_library.sync_storage_dir()
+            files = [
+                {
+                    "file_id": record.id,
+                    "name": record.name,
+                    "size_bytes": record.size_bytes,
+                    "local_path": str(record.stored_path),
+                    "direction": record.direction.value,
+                    "status": record.status.value,
+                    "transferred_bytes": record.transferred_bytes,
+                    "speed_bytes_per_second": record.speed_bytes_per_second,
+                    "error": record.error_message,
+                }
+                for record in self.file_library.list_records()
+            ]
+            return 200, {"accepted": True, "files": files}
+        if command_type == "file_add":
+            path = str(body.get("path") or "").strip()
+            try:
+                record = self.file_library.add_local_file(Path(path))
+            except FileNotFoundError:
+                return 404, {"accepted": False, "exists": False, "path": path}
+            except Exception as exc:
+                return 500, {"accepted": False, "error": str(exc)}
+            self._refresh_file_manager_if_visible(selected_id=record.id)
+            return 200, {
+                "accepted": True,
+                "file_id": record.id,
+                "name": record.name,
+                "size_bytes": record.size_bytes,
+                "local_path": str(record.stored_path),
+            }
+        if command_type == "file_delete":
+            deleted = self.file_library.delete_record(file_id)
+            self._refresh_file_manager_if_visible()
+            return (200 if deleted else 404), {"accepted": bool(deleted), "file_id": file_id}
+        if command_type == "file_accept":
+            record = self.file_library.update_record_status(file_id, FileTransferStatus.ACCEPTED)
+            self._refresh_file_manager_if_visible(selected_id=file_id)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type == "file_reject":
+            record = self.file_library.update_record_status(file_id, FileTransferStatus.REJECTED)
+            self._refresh_file_manager_if_visible(selected_id=file_id)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type == "file_progress":
+            record = self.file_library.update_record_status(
+                file_id,
+                FileTransferStatus.TRANSFERRING,
+                transferred_bytes=int(body.get("transferred_bytes") or 0),
+                speed_bytes_per_second=int(body.get("speed_bytes_per_second") or 0),
+                size_bytes=int(body.get("size_bytes") or 0) or (self.file_library.get_record(file_id).size_bytes if self.file_library.get_record(file_id) else 0),
+            )
+            self._refresh_file_manager_if_visible(selected_id=file_id)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type == "file_complete":
+            existing = self.file_library.get_record(file_id)
+            size = int(body.get("size_bytes") or (existing.size_bytes if existing else 0) or 0)
+            transferred = int(body.get("transferred_bytes") or size)
+            record = self.file_library.update_record_status(
+                file_id,
+                FileTransferStatus.COMPLETED,
+                size_bytes=size,
+                transferred_bytes=transferred,
+                speed_bytes_per_second=0,
+            )
+            self.file_library.sync_storage_dir()
+            self._refresh_file_manager_if_visible(selected_id=file_id)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type == "file_error":
+            record = self.file_library.update_record_status(
+                file_id,
+                FileTransferStatus.FAILED,
+                error_message=str(body.get("error") or body.get("message") or "error"),
+            )
+            self._refresh_file_manager_if_visible(selected_id=file_id)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type in ("file_probe", "file_download_request"):
+            path = str(body.get("path") or "").strip()
+            info = self.file_library.probe_path(path)
+            if not info.get("exists"):
+                return 404, {"accepted": False, **info}
+            try:
+                record = self.file_library.add_local_file(Path(str(info["path"])), direction=FileDirection.DESKTOP_TO_PHONE)
+            except Exception as exc:
+                return 500, {"accepted": False, "exists": True, "error": str(exc)}
+            offer = self._file_offer_for_record(record)
+            download_url = str(offer.get("body", {}).get("download_url") or "").strip()
+            if not download_url:
+                error = str(offer.get("body", {}).get("error") or "文件下载地址不可用").strip()
+                self.file_library.update_record_status(
+                    record.id,
+                    FileTransferStatus.FAILED,
+                    error_message=error,
+                )
+                self._refresh_file_manager_if_visible(selected_id=record.id)
+                return 503, {
+                    "accepted": False,
+                    "exists": True,
+                    "file_id": record.id,
+                    "name": record.name,
+                    "size_bytes": record.size_bytes,
+                    "download_url": "",
+                    "error": error,
+                }
+            self._last_file_offer_event = offer
+            self._broadcast_remote_event(offer)
+            self._refresh_file_manager_if_visible(selected_id=record.id)
+            return 200, {
+                "accepted": True,
+                "exists": True,
+                "file_id": record.id,
+                "name": record.name,
+                "size_bytes": record.size_bytes,
+                "download_url": download_url,
+            }
+        if command_type == "file_upload_request":
+            name = str(body.get("name") or "upload.bin").strip() or "upload.bin"
+            size = int(body.get("size_bytes") or 0)
+            record = self.file_library.prepare_incoming_upload(name, size_bytes=size)
+            service = getattr(self, "file_service", None)
+            upload_url = service.upload_url_for(record.name) if service is not None and hasattr(service, "upload_url_for") else ""
+            self._refresh_file_manager_if_visible(selected_id=record.id)
+            return 200, {"accepted": True, "file_id": record.id, "name": record.name, "size_bytes": record.size_bytes, "upload_url": upload_url}
+        return 404, {"accepted": False, "error": "unknown_file_command"}
+
+    def _start_file_service_if_configured(self) -> bool:
+        if str(os.getenv("DESKTOP_FILE_SERVICE_AUTOSTART", "1")).strip().lower() in {"0", "false", "no"}:
+            return False
+        service = getattr(self, "file_service", None)
+        if service is None:
+            return False
+        try:
+            service.start()
+        except Exception as exc:
+            self.SetStatusText(f"copyparty 文件服务启动失败：{exc}")
+            return False
+        self.file_http_base_url = service.base_url
+        return True
+
+    def _add_file_to_manager_from_dialog(self) -> bool:
+        dlg = wx.FileDialog(self, "添加文件", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            record = self.file_library.add_local_file(Path(dlg.GetPath()))
+        finally:
+            dlg.Destroy()
+        self._refresh_file_manager_list(selected_id=record.id)
+        return True
+
+    def _show_file_manager_menu(self) -> None:
+        menu = wx.Menu()
+        add_id = wx.NewIdRef()
+        send_id = wx.NewIdRef()
+        delete_id = wx.NewIdRef()
+        menu.Append(int(add_id), "添加文件")
+        menu.Append(int(send_id), "发送到手机")
+        menu.Append(int(delete_id), "删除")
+        self.Bind(wx.EVT_MENU, lambda _evt: self._add_file_to_manager_from_dialog(), id=int(add_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._send_selected_file_to_phone(), id=int(send_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._delete_selected_file_manager_record(), id=int(delete_id))
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _on_file_manager_context(self, _event) -> None:
+        self._show_file_manager_menu()
+
+    def _on_file_manager_key_down(self, event) -> None:
+        key = event.GetKeyCode()
+        if self._is_context_menu_key(key):
+            self._show_file_manager_menu()
+            return
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self._open_selected_file_manager_record():
+                return
+        if key == wx.WXK_DELETE:
+            if self._delete_selected_file_manager_record():
+                return
+        event.Skip()
+
+    def _selected_answer_source_text(self) -> str:
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
+            return ""
+        item_type, turn_idx, plain, detail = self.answer_meta[idx]
+        if item_type not in ("question", "answer"):
+            return ""
+        turns = self._get_view_turns()
+        turn = turns[turn_idx] if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict) else {}
+        if item_type == "question":
+            return str(turn.get("question") or detail or plain or "")
+        return str(turn.get("answer_md") or detail or plain or "")
+
+    def _show_answer_menu(self) -> None:
+        menu = wx.Menu()
+        extract_id = wx.NewIdRef()
+        menu.Append(int(extract_id), "提取文件")
+        self.Bind(wx.EVT_MENU, lambda _evt: self._extract_files_from_selected_answer(), id=int(extract_id))
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _extract_files_from_selected_answer(self) -> bool:
+        paths = extract_windows_file_paths(self._selected_answer_source_text())
+        rows = [(path, Path(path).name or path) for path in paths]
+        self.detail_title_label.SetLabel("提取文件：")
+        self.answer_list.Hide()
+        self.execution_list.Hide()
+        self.file_manager_list.Hide()
+        self.extracted_file_list.Show()
+        changed = self.extracted_file_list_model.replace_visible_page(rows, selected_id=paths[0] if paths else None)
+        self.extracted_file_ids = list(self.extracted_file_list_model.visible_ids)
+        if changed:
+            self._request_listbox_repaint(self.extracted_file_list)
+        self.chat_root_panel.Layout()
+        if paths:
+            self.extracted_file_list.SetFocus()
+            return True
+        self.SetStatusText("当前内容未提取到文件路径")
+        return False
+
+    def _selected_extracted_file_path(self) -> str:
+        return self.extracted_file_list_model.selected_id()
+
+    def _add_selected_extracted_file_to_manager(self) -> bool:
+        path = self._selected_extracted_file_path()
+        if not path:
+            return False
+        try:
+            record = self.file_library.add_local_file(Path(path))
+        except Exception as exc:
+            self.SetStatusText(f"添加到文件管理失败：{exc}")
+            return False
+        self._show_file_manager()
+        self._refresh_file_manager_list(selected_id=record.id)
+        return True
+
+    def _send_selected_extracted_file_to_phone(self) -> bool:
+        path = self._selected_extracted_file_path()
+        if not path:
+            return False
+        try:
+            record = self.file_library.add_local_file(Path(path))
+        except Exception as exc:
+            self.SetStatusText(f"发送到手机失败：{exc}")
+            return False
+        return self._publish_file_offer_for_record(record)
+
+    def _show_extracted_file_menu(self) -> None:
+        menu = wx.Menu()
+        add_id = wx.NewIdRef()
+        send_id = wx.NewIdRef()
+        menu.Append(int(add_id), "添加到文件管理")
+        menu.Append(int(send_id), "发送到手机")
+        self.Bind(wx.EVT_MENU, lambda _evt: self._add_selected_extracted_file_to_manager(), id=int(add_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._send_selected_extracted_file_to_phone(), id=int(send_id))
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _on_extracted_file_context(self, _event) -> None:
+        self._show_extracted_file_menu()
+
+    def _on_extracted_file_key_down(self, event) -> None:
+        if self._is_context_menu_key(event.GetKeyCode()):
+            self._show_extracted_file_menu()
+            return
+        event.Skip()
 
     def _resolve_sound_path(self, name: str):
         base = os.path.dirname(os.path.abspath(__file__))
@@ -6824,10 +7418,14 @@ class ChatFrame(wx.Frame):
     def _handle_alt_key_up(self) -> bool:
         should_open = bool(getattr(self, "_alt_menu_armed", False)) and not bool(getattr(self, "_alt_menu_suppressed", False))
         self._cancel_pending_tools_menu_open()
-        if should_open:
-            self._show_tools_menu()
-            return True
         return False
+
+    def _is_context_menu_key(self, key: int) -> bool:
+        menu_keys = {wx.WXK_MENU}
+        windows_menu = getattr(wx, "WXK_WINDOWS_MENU", None)
+        if windows_menu is not None:
+            menu_keys.add(windows_menu)
+        return key in menu_keys
 
     def _focus_control_safely(self, control) -> bool:
         if control is None:
@@ -7783,6 +8381,30 @@ class ChatFrame(wx.Frame):
             status["last_error"] = str(last_error or "")
         self.remote_nats_runtime_status = status
         self.remote_nats_runtime_url = status["websocket_url"] if status["enabled"] else ""
+        self._configure_file_service_public_base_from_remote_status()
+
+    def _cloudflare_file_public_base_url(self) -> str:
+        status = getattr(self, "remote_nats_runtime_status", {}) or {}
+        if not status.get("enabled"):
+            return ""
+        remote_url = str(status.get("cloudflared_url") or DEFAULT_REMOTE_NATS_CLOUDFLARED_URL or "").strip()
+        if not remote_url:
+            return ""
+        try:
+            parsed = urlsplit(remote_url)
+        except Exception:
+            return ""
+        scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
+        if not parsed.netloc:
+            return ""
+        return urlunsplit((scheme, parsed.netloc, "", "", ""))
+
+    def _configure_file_service_public_base_from_remote_status(self) -> None:
+        service = getattr(self, "file_service", None)
+        if service is None or not hasattr(service, "set_public_base_url"):
+            return
+        service.set_public_base_url(self._cloudflare_file_public_base_url())
+        self.file_http_base_url = service.base_url
 
     def _remote_nats_call_ui(self, callback: Callable[[], tuple[int, dict]]) -> tuple[int, dict]:
         if threading.current_thread() is threading.main_thread():
@@ -7812,6 +8434,7 @@ class ChatFrame(wx.Frame):
 
     def _stop_remote_servers(self) -> None:
         self._stop_managed_cloudflared_process()
+        self._stop_cloudflared_origin_proxy()
         transport = getattr(self, "_remote_nats_transport", None)
         if transport is not None:
             try:
@@ -7827,6 +8450,75 @@ class ChatFrame(wx.Frame):
                 pass
         self._remote_nats_process = None
         self._set_remote_nats_runtime_status(enabled=False)
+
+    def _stop_cloudflared_origin_proxy(self) -> None:
+        proxy = getattr(self, "_cloudflared_origin_proxy", None)
+        self._cloudflared_origin_proxy = None
+        self._cloudflared_origin_proxy_port = 0
+        if proxy is None:
+            return
+        try:
+            proxy.stop()
+        except Exception:
+            pass
+
+    def _cloudflared_origin_port(self) -> int:
+        active_port = int(getattr(self, "_cloudflared_origin_proxy_port", 0) or 0)
+        if active_port > 0:
+            return active_port
+        return int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
+
+    def _resolve_cloudflared_origin_port(self) -> int:
+        preferred_port = int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
+        existing_bridge_targets = self._cloudflared_origin_bridge_target_ports()
+        candidates = [
+            *existing_bridge_targets,
+            preferred_port,
+            DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT,
+            *REMOTE_CLOUDFLARED_ORIGIN_PORT_FALLBACKS,
+        ]
+        seen = set()
+        current_proxy = getattr(self, "_cloudflared_origin_proxy", None)
+        current_proxy_port = int(getattr(current_proxy, "listen_port", 0) or 0)
+        for port in candidates:
+            if port in seen or port <= 0:
+                continue
+            seen.add(port)
+            if current_proxy_port == port:
+                return port
+            if self._can_bind_loopback_tcp_port(port):
+                return port
+        return preferred_port
+
+    def _start_cloudflared_origin_proxy(self) -> bool:
+        if not self._start_file_service_if_configured():
+            return False
+        websocket_url = str((getattr(self, "remote_nats_runtime_status", {}) or {}).get("websocket_url") or "").strip()
+        if not websocket_url:
+            websocket_url = f"ws://127.0.0.1:{int(getattr(self, '_remote_nats_websocket_port', DEFAULT_REMOTE_NATS_WEBSOCKET_PORT))}/nats"
+        service = getattr(self, "file_service", None)
+        file_base_url = str(getattr(service, "local_base_url", "") or getattr(self, "file_http_base_url", "") or "").rstrip("/")
+        proxy = getattr(self, "_cloudflared_origin_proxy", None)
+        listen_port = self._resolve_cloudflared_origin_port()
+        if proxy is not None and getattr(proxy, "listen_port", None) == listen_port:
+            self._cloudflared_origin_proxy_port = listen_port
+            return True
+        self._stop_cloudflared_origin_proxy()
+        proxy = CloudflaredOriginProxy(
+            listen_host="127.0.0.1",
+            listen_port=listen_port,
+            nats_ws_url=websocket_url,
+            file_base_url=file_base_url,
+        )
+        try:
+            proxy.start()
+        except Exception as exc:
+            self._set_status_text_safe(f"cloudflared origin 代理启动失败：{exc}")
+            return False
+        self._cloudflared_origin_proxy = proxy
+        self._cloudflared_origin_proxy_port = listen_port
+        self._ensure_cloudflared_origin_bridge(listen_port)
+        return True
 
     def _start_remote_servers(self, *, token: str, host: str, port: int) -> None:
         self._start_remote_nats_server_if_configured(token=token, host=host)
@@ -7856,6 +8548,10 @@ class ChatFrame(wx.Frame):
         preferred_websocket_port = self._resolve_remote_nats_websocket_port(
             DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         )
+        if preferred_websocket_port == self._cloudflared_origin_port():
+            preferred_websocket_port = self._resolve_remote_nats_websocket_port(
+                REMOTE_NATS_WEBSOCKET_PORT_FALLBACKS[0]
+            )
         websocket_port = preferred_websocket_port
         self._remote_nats_websocket_port = websocket_port
         preferred_ports = [DEFAULT_REMOTE_NATS_PORT, *REMOTE_NATS_PORT_FALLBACKS]
@@ -7918,6 +8614,7 @@ class ChatFrame(wx.Frame):
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
+                    on_file_command=lambda payload: self._run_remote_ui_route(self._remote_api_file_command_ui, payload),
                 )
                 transport.start_threaded(tcp_url)
             except Exception as exc:
@@ -8030,65 +8727,82 @@ class ChatFrame(wx.Frame):
         ok, _detail = self._verify_remote_public_ws(url)
         return ok
 
-    def _ensure_cloudflared_origin_bridge(self) -> None:
+    def _cloudflared_origin_bridge_target_ports(self) -> list[int]:
         listen_port = int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
-        target_port = int(
-            getattr(self, "_remote_nats_websocket_port", DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
-            or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
-        )
-        for delete_args, add_args in (
-            (
-                [
-                    "netsh",
-                    "interface",
-                    "portproxy",
-                    "delete",
-                    "v4tov4",
-                    f"listenport={listen_port}",
-                    "listenaddress=127.0.0.1",
-                ],
-                [
-                    "netsh",
-                    "interface",
-                    "portproxy",
-                    "add",
-                    "v4tov4",
-                    f"listenport={listen_port}",
-                    "listenaddress=127.0.0.1",
-                    f"connectport={target_port}",
-                    "connectaddress=127.0.0.1",
-                ],
-            ),
-            (
-                [
-                    "netsh",
-                    "interface",
-                    "portproxy",
-                    "delete",
-                    "v6tov4",
-                    f"listenport={listen_port}",
-                    "listenaddress=::1",
-                ],
-                [
-                    "netsh",
-                    "interface",
-                    "portproxy",
-                    "add",
-                    "v6tov4",
-                    f"listenport={listen_port}",
-                    "listenaddress=::1",
-                    f"connectport={target_port}",
-                    "connectaddress=127.0.0.1",
-                ],
-            ),
+        try:
+            result = self._run_remote_check_command(
+                ["netsh", "interface", "portproxy", "show", "all"],
+                timeout=10.0,
+            )
+        except Exception:
+            return []
+        if getattr(result, "returncode", 1) != 0:
+            return []
+        ports: list[int] = []
+        for line in str(getattr(result, "stdout", "") or "").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                row_listen_port = int(parts[1])
+                row_connect_port = int(parts[3])
+            except Exception:
+                continue
+            if row_listen_port == listen_port and row_connect_port > 0:
+                ports.append(row_connect_port)
+        return ports
+
+    def _ensure_cloudflared_origin_bridge(self, target_port: int | None = None) -> None:
+        listen_port = int(getattr(self, "remote_control_port", 0) or DEFAULT_REMOTE_CLOUDFLARED_ORIGIN_PORT)
+        connect_port = int(target_port or self._cloudflared_origin_port())
+        for delete_args in (
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "delete",
+                "v4tov4",
+                f"listenport={listen_port}",
+                "listenaddress=127.0.0.1",
+            ],
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "delete",
+                "v6tov4",
+                f"listenport={listen_port}",
+                "listenaddress=::1",
+            ],
         ):
             self._run_remote_check_command(delete_args, timeout=10.0)
-            result = self._run_remote_check_command(add_args, timeout=10.0)
-            if result is None:
-                continue
-            detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-            if result.returncode == 0 or "already exists" in detail:
-                continue
+        if connect_port <= 0 or connect_port == listen_port:
+            return
+        for add_args in (
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "add",
+                "v4tov4",
+                f"listenport={listen_port}",
+                "listenaddress=127.0.0.1",
+                f"connectport={connect_port}",
+                "connectaddress=127.0.0.1",
+            ],
+            [
+                "netsh",
+                "interface",
+                "portproxy",
+                "add",
+                "v6tov4",
+                f"listenport={listen_port}",
+                "listenaddress=::1",
+                f"connectport={connect_port}",
+                "connectaddress=127.0.0.1",
+            ],
+        ):
+            self._run_remote_check_command(add_args, timeout=10.0)
 
     def _run_remote_check_command(self, args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess | None:
         kwargs = {
@@ -8222,6 +8936,10 @@ class ChatFrame(wx.Frame):
 
     def _kill_cloudflared_processes(self) -> None:
         self._run_remote_check_command(["taskkill", "/F", "/IM", "cloudflared.exe"], timeout=15.0)
+
+    def _replace_stale_cloudflared_with_managed(self, origin_port: int) -> bool:
+        self._kill_cloudflared_processes()
+        return self._start_managed_cloudflared_process(origin_port)
 
     def _restart_cloudflared_service(self) -> bool:
         state = self._query_cloudflared_service()
@@ -8385,17 +9103,22 @@ class ChatFrame(wx.Frame):
         local_ok, local_detail = self._verify_remote_local_health(token, port)
         if not local_ok:
             raise RuntimeError(self._format_remote_startup_error(local_detail or "远程控制本地健康检查失败。"))
-        service_configured, service_reconfigured = self._ensure_cloudflared_service_url(port)
+        if not self._start_cloudflared_origin_proxy():
+            raise RuntimeError(self._format_remote_startup_error("cloudflared origin 代理启动失败。"))
+        origin_port = self._cloudflared_origin_port()
+        service_configured, service_reconfigured = self._ensure_cloudflared_service_url(origin_port)
         managed_cloudflared_started = False
         if not service_configured:
-            raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或配置缺失。"))
-        if service_reconfigured:
+            if not service_reconfigured or not self._replace_stale_cloudflared_with_managed(origin_port):
+                raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装、配置缺失或无法替换旧映射。"))
+            managed_cloudflared_started = True
+        elif service_reconfigured:
             if not self._restart_cloudflared_service():
-                if not self._start_managed_cloudflared_process(port):
+                if not self._start_managed_cloudflared_process(origin_port):
                     raise RuntimeError(self._format_remote_startup_error("cloudflared 已更新映射但重启失败。"))
                 managed_cloudflared_started = True
         elif not self._start_cloudflared_service():
-            if not self._start_managed_cloudflared_process(port):
+            if not self._start_managed_cloudflared_process(origin_port):
                 raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
             managed_cloudflared_started = True
         if managed_cloudflared_started:
@@ -8418,8 +9141,10 @@ class ChatFrame(wx.Frame):
                     f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
                 )
             return
+        if managed_cloudflared_started:
+            raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 进程公网验证失败。"))
         if not self._restart_cloudflared_service():
-            if not self._start_managed_cloudflared_process(port):
+            if not self._start_managed_cloudflared_process(origin_port):
                 raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 重启失败。"))
             managed_cloudflared_started = True
         public_ok, public_detail = self._verify_remote_public_ws(published_url)
@@ -8536,7 +9261,7 @@ class ChatFrame(wx.Frame):
             )
         )
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
-            self._arm_tools_menu_open()
+            event.Skip()
             return
         self._suppress_tools_menu_open()
         if (
@@ -8551,7 +9276,7 @@ class ChatFrame(wx.Frame):
         if self._handle_window_focus_shortcut(key, alt_down, ctrl_down):
             return
         if (
-            key == wx.WXK_MENU
+            self._is_context_menu_key(key)
             and notes_has_focus
         ):
             self._show_notes_menu()
@@ -10245,6 +10970,9 @@ class ChatFrame(wx.Frame):
                 stop_propagation()
             return
         item_type, turn_idx, plain, _ = self.answer_meta[idx]
+        if self._is_context_menu_key(key):
+            self._show_answer_menu()
+            return
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
             if handled:
@@ -10503,6 +11231,8 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
             return True
+        if idx != wx.NOT_FOUND and idx < len(self.answer_meta) and self.answer_meta[idx][0] == "attachment":
+            return self._try_open_selected_answer_detail()
         content = self._selected_answer_text_viewer_content()
         if not content:
             return False
@@ -10580,7 +11310,7 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_F2:
             self._history_rename(None)
             return
-        if key == wx.WXK_MENU:
+        if self._is_context_menu_key(key):
             self._show_history_menu()
             return
         if key == wx.WXK_DELETE:
@@ -12380,7 +13110,7 @@ class ChatFrame(wx.Frame):
                 return
         if self._on_any_key_down_escape_minimize(event):
             return
-        if key == wx.WXK_MENU:
+        if self._is_context_menu_key(key):
             self._show_notes_menu()
             return
         if event.AltDown() and key in (ord("X"), ord("x")):
@@ -12586,6 +13316,12 @@ class ChatFrame(wx.Frame):
             pass
         try:
             self._stop_remote_servers()
+        except Exception:
+            pass
+        try:
+            service = getattr(self, "file_service", None)
+            if service is not None:
+                service.stop()
         except Exception:
             pass
         self._save_state(capture_notes_editor=True)

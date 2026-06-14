@@ -298,3 +298,36 @@ def test_transport_publish_event_threadsafe_schedules_on_running_loop():
         assert b'"chat_id":"c1"' in jetstream.published[0][1]
 
     asyncio.run(run())
+
+
+def test_transport_publishes_file_events_to_files_subject():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(
+            pair_id="default",
+            token="secret",
+            jetstream=jetstream,
+        )
+
+        await transport.publish_event({"type": "file_offer", "chat_id": "c1"})
+        await transport.publish_event({"type": "state", "chat_id": "c1"})
+
+        assert jetstream.published[0][0] == "zgwd.default.files"
+        assert jetstream.published[1][0] == "zgwd.default.events"
+
+    asyncio.run(run())
+
+
+def test_transport_routes_file_commands_to_file_callback():
+    seen = []
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="secret",
+        on_file_command=lambda payload: seen.append(payload) or (200, {"accepted": True}),
+    )
+
+    status, body = transport._route_command({"type": "file_accept", "body": {"file_id": "file-1"}})
+
+    assert status == 200
+    assert body == {"accepted": True}
+    assert seen == [{"type": "file_accept", "body": {"file_id": "file-1"}}]

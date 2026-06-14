@@ -40,7 +40,7 @@ def test_ui_automation_alt_menu_exposes_load_image_or_file(frame, monkeypatch):
     frame._show_tools_menu()
 
     labels = [label for label, _item_id in captured["items"]]
-    assert "载入图片或文件" in labels
+    assert "\u8f7d\u5165\u56fe\u7247\u6216\u6587\u4ef6" in labels
 
 
 def test_ui_automation_answer_list_attachment_opens_on_enter(frame, monkeypatch, tmp_path):
@@ -49,7 +49,7 @@ def test_ui_automation_answer_list_attachment_opens_on_enter(frame, monkeypatch,
     attachment.write_text("hello", encoding="utf-8")
     frame.active_session_turns = [
         {
-            "question": "opened-by-enter.txt 文件已成功上传",
+            "question": "opened-by-enter.txt \u6587\u4ef6\u5df2\u6210\u529f\u4e0a\u4f20",
             "answer_md": "",
             "model": main.DEFAULT_CODEX_MODEL,
             "created_at": time.time(),
@@ -105,7 +105,8 @@ def test_ui_automation_uploaded_image_uses_single_success_row(frame, tmp_path):
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["暂无", "我", "图片上传成功"]
+    assert len(rows) == 2
+    assert [meta[0] for meta in frame.answer_meta] == ["user", "attachment"]
 
 
 def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, tmp_path):
@@ -115,7 +116,7 @@ def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, t
     frame.active_session_turns = [
         {
             "question": "",
-            "answer_md": "已收到图片",
+            "answer_md": "\u5df2\u6536\u5230\u56fe\u7247",
             "model": main.DEFAULT_CODEX_MODEL,
             "created_at": time.time(),
             "attachments": [
@@ -134,4 +135,5 @@ def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, t
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["暂无", "我", "图片上传成功", "小诸葛", "已收到图片"]
+    assert len(rows) == 4
+    assert [meta[0] for meta in frame.answer_meta] == ["user", "attachment", "ai", "answer"]

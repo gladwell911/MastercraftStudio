@@ -90,3 +90,55 @@ def build_error_response(request_id: str, status: int, error: str) -> dict:
         status=status,
         body={"error": error},
     )
+
+
+FILE_EVENT_TYPES = {
+    "file_list",
+    "file_add",
+    "file_offer",
+    "file_accept",
+    "file_reject",
+    "file_upload_request",
+    "file_download_request",
+    "file_progress",
+    "file_complete",
+    "file_error",
+    "file_delete",
+    "file_probe",
+}
+
+
+def _int_body_field(body: dict, key: str) -> None:
+    if key not in body:
+        return
+    try:
+        body[key] = int(body[key])
+    except (TypeError, ValueError):
+        body[key] = 0
+
+
+def build_file_command_event(
+    *,
+    request_id: str,
+    event_type: str,
+    device_id: str,
+    body: dict,
+    chat_id: str | None = None,
+) -> dict:
+    normalized_type = str(event_type or "").strip()
+    if normalized_type not in FILE_EVENT_TYPES:
+        raise ValueError("invalid_file_event_type")
+    normalized_body = dict(body or {})
+    for key in ("size_bytes", "transferred_bytes", "speed_bytes_per_second"):
+        _int_body_field(normalized_body, key)
+    event = {
+        "type": normalized_type,
+        "event_id": make_event_id(normalized_type),
+        "request_id": str(request_id or "").strip(),
+        "device_id": str(device_id or "").strip(),
+        "body": normalized_body,
+        "ts": now_ts(),
+    }
+    if chat_id:
+        event["chat_id"] = str(chat_id or "").strip()
+    return event
