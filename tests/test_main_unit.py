@@ -7779,6 +7779,27 @@ def test_screen_reader_primary_tab_order_matches_requested_chat_flow(frame):
     assert frame.chat_tab_order == frame.root_tab_order[:8]
 
 
+def test_screen_reader_primary_tab_order_stays_notes_history_answers_in_note_detail(frame):
+    frame.Show()
+    notebook = frame.notes_store.create_notebook("tab order detail notebook")
+    frame.notes_store.create_entry(notebook.id, "tab order detail entry", source="manual")
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame._current_chat_state["detail_panel_mode"] = "answers"
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+
+    assert frame.root_tab_order[:8] == [
+        frame.input_edit,
+        frame.new_chat_button,
+        frame.model_combo,
+        frame.codex_speed_combo,
+        frame.send_button,
+        frame.notes_entry_list,
+        frame.history_list,
+        frame.answer_list,
+    ]
+    assert frame.chat_tab_order == frame.root_tab_order[:8]
+
+
 def test_chat_frame_initializes_incremental_list_models(frame):
     assert frame.history_list_model.control is frame.history_list
     assert frame.answer_list_model.control is frame.answer_list
@@ -8113,6 +8134,47 @@ def test_f1_focuses_latest_execution_item(frame, monkeypatch):
     assert frame.execution_list.HasFocus()
     assert frame.execution_list.GetSelection() == frame.execution_list.GetCount() - 1
     assert frame.execution_list.GetStringSelection() == "第二步"
+
+
+def test_f1_switch_to_execution_defers_full_execution_render_when_rows_are_current(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-f1-fast"
+    frame.current_chat_id = "chat-f1-fast"
+    frame._current_chat_state = {
+        "id": "chat-f1-fast",
+        "title": "F1 fast",
+        "turns": [],
+        "detail_panel_mode": "answers",
+        "execution_steps": [{"step": "第一步"}],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        frame,
+        "_rebuild_execution_list_from_state",
+        lambda *args, **kwargs: pytest.fail("F1 must not force a full execution list rebuild when rows are current"),
+    )
+
+    class F1Event:
+        def GetKeyCode(self):
+            return wx.WXK_F1
+
+        def ControlDown(self):
+            return False
+
+        def AltDown(self):
+            return False
+
+        def Skip(self):
+            raise AssertionError("F1 should be handled")
+
+    frame.answer_list.SetFocus()
+    frame._on_char_hook(F1Event())
+
+    assert frame._current_chat_state["detail_panel_mode"] == "execution"
+    assert frame.execution_list.HasFocus()
+    assert frame.execution_list.GetStringSelection() == "第一步"
 
 
 def test_f1_focuses_empty_execution_placeholder(frame, monkeypatch):
@@ -10383,6 +10445,21 @@ def test_clear_context_shortcut_clears_current_chat_backend_thread_state(frame, 
     assert frame._current_chat_state["claudecode_session_id"] == ""
 
 
+def test_remote_api_clear_context_uses_desktop_clear_context_command(frame, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        frame,
+        "_clear_context_and_start_new_chat",
+        lambda: calls.append("clear") or True,
+    )
+
+    status, body = frame._remote_api_clear_context_ui({"chat_id": "chat-current"})
+
+    assert status == 200
+    assert body == {"accepted": True, "chat_id": "chat-current"}
+    assert calls == ["clear"]
+
+
 def test_cd_first_question_auto_title_uses_directory_name_and_unique_suffix(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -12432,6 +12509,32 @@ def test_load_state_restores_codex_answer_filter_flag(frame, tmp_path):
 def test_resolve_app_data_dir_is_dist_history():
     p = main.resolve_app_data_dir()
     assert str(p).lower().endswith("dist\\history")
+
+
+def test_resolve_notes_data_dir_uses_d_code_note():
+    p = main.resolve_notes_data_dir()
+    assert str(p).lower() == r"d:\code\note"
+
+
+def test_chat_frame_uses_independent_notes_data_dir(monkeypatch, tmp_path):
+    app_data_dir = tmp_path / "app"
+    notes_data_dir = tmp_path / "notes"
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: app_data_dir)
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: notes_data_dir)
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
+
+    f = main.ChatFrame()
+    try:
+        assert f.notes_db_path == notes_data_dir / "notes.db"
+        assert f.chat_db_path == app_data_dir / "chat_history.db"
+        assert f.notes_db_path.parent.exists()
+    finally:
+        f.Destroy()
+
+
+def test_frame_fixture_uses_temp_notes_dir(frame, tmp_path):
+    assert frame.notes_db_path == tmp_path / "notes" / "notes.db"
 
 
 def test_model_ids_contains_new_models():

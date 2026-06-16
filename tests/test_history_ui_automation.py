@@ -2,6 +2,7 @@ import ctypes
 import time
 
 import main
+import pytest
 
 
 def _send_listbox_key(window, key_code):
@@ -271,6 +272,49 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert question_rows
     assert frame.answer_list.GetString(question_rows[0]) == "history question"
     assert frame.answer_list.HasFocus()
+
+
+def test_ui_automation_history_enter_focuses_answer_before_background_work(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": []}
+    frame.archived_chats = [
+        {
+            "id": "hist-fast",
+            "title": "history fast",
+            "pinned": False,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "turns": [
+                {"question": "q1", "answer_md": "a1", "model": "openai/gpt-5.2", "created_at": 1.0},
+                {"question": "q2", "answer_md": "a2", "model": "openai/gpt-5.2", "created_at": 2.0},
+            ],
+        }
+    ]
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: pytest.fail("Enter must not synchronously refresh history"))
+    monkeypatch.setattr(frame, "_save_state", lambda *_args, **_kwargs: pytest.fail("Enter must not synchronously save state"))
+    deferred = []
+    monkeypatch.setattr(frame, "_mark_history_list_dirty", lambda keep_id=None: deferred.append(("history", keep_id)))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(("save", None)))
+
+    frame.history_ids = ["hist-fast"]
+    frame.history_list.Clear()
+    frame.history_list.Append("history fast")
+    frame.history_list.SetSelection(0)
+    frame.history_list.SetFocus()
+
+    frame._on_history_key_down(_EnterEvent())
+
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "hist-fast"
+    assert frame.answer_list.HasFocus()
+    selected = frame.answer_list.GetSelection()
+    assert selected != main.wx.NOT_FOUND
+    assert frame.answer_meta[selected][0] == "answer"
+    assert frame.answer_list.GetStringSelection() == "a2"
+    assert ("history", "hist-fast") in deferred
+    assert ("save", None) in deferred
 
 
 def test_ui_automation_large_sqlite_history_keeps_history_list_responsive(frame, wx_app):

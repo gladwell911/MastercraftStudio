@@ -159,8 +159,9 @@ def test_notes_ui_automation_detail_view_hides_notebook_list_and_keeps_tab_slot(
 
     assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()
-    assert frame.root_tab_order[4] is frame.history_list
     assert frame.root_tab_order[5] is frame.notes_entry_list
+    assert frame.root_tab_order[6] is frame.history_list
+    assert frame.root_tab_order[7] is frame.answer_list
 
 
 def test_notes_ui_automation_entry_navigation_stays_responsive_when_background_entry_updates(frame, wx_app, monkeypatch):

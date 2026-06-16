@@ -161,6 +161,32 @@ def test_routes_speed_options_and_set_speed_commands():
     ]
 
 
+def test_routes_clear_context_command():
+    routed = []
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_clear_context=lambda payload: (
+            routed.append(payload)
+            or (
+                200,
+                {
+                    "accepted": True,
+                    "chat_id": payload.get("chat_id"),
+                },
+            )
+        ),
+    )
+
+    status, body = transport._route_command(
+        {"type": "clear_context", "chat_id": "chat-1"}
+    )
+
+    assert status == 200
+    assert body == {"accepted": True, "chat_id": "chat-1"}
+    assert routed == [{"type": "clear_context", "chat_id": "chat-1"}]
+
+
 def test_transport_routes_notes_changes_command_and_publishes_response():
     async def run():
         jetstream = FakeJetStream()

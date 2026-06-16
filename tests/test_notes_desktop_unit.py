@@ -957,16 +957,17 @@ def test_notes_notebook_list_is_visible_in_main_view(frame):
 
 
 def test_notes_root_tab_path_keeps_chat_and_notes_controls_linked(frame):
-    assert frame.root_tab_order[:7] == [
+    assert frame.root_tab_order[:8] == [
         frame.input_edit,
         frame.new_chat_button,
         frame.model_combo,
+        frame.codex_speed_combo,
         frame.send_button,
         frame.notes_notebook_list,
         frame.history_list,
         frame.answer_list,
     ]
-    assert frame.chat_tab_order == frame.root_tab_order[:7]
+    assert frame.chat_tab_order == frame.root_tab_order[:8]
     assert frame.notes_tab_order[0] is frame.notes_notebook_list
 
 
@@ -1397,6 +1398,7 @@ def test_notes_tab_order_links_chat_and_notes_controls(frame):
         frame.input_edit,
         frame.new_chat_button,
         frame.model_combo,
+        frame.codex_speed_combo,
         frame.send_button,
         frame.notes_notebook_list,
         frame.history_list,
@@ -1417,12 +1419,13 @@ def test_notes_detail_view_moves_history_tab_target_to_entry_list(frame):
         frame.input_edit,
         frame.new_chat_button,
         frame.model_combo,
+        frame.codex_speed_combo,
         frame.send_button,
         frame.notes_entry_list,
         frame.history_list,
-        frame.answer_list,
     ]
-    assert frame.chat_tab_order == frame.root_tab_order[:7]
+    assert frame.root_tab_order[7] is frame.answer_list
+    assert frame.chat_tab_order == frame.root_tab_order[:8]
     assert frame.notes_tab_order[0] is frame.notes_entry_list
     assert not frame.notes_list_panel.IsShown()
     assert frame.notes_detail_panel.IsShown()

@@ -38,6 +38,7 @@ def disable_system_hooks(monkeypatch):
 @pytest.fixture
 def frame(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     f = main.ChatFrame()
     f.Hide()

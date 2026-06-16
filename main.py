@@ -297,6 +297,10 @@ def resolve_app_data_dir() -> Path:
     return Path(__file__).resolve().parent / "dist" / "history"
 
 
+def resolve_notes_data_dir() -> Path:
+    return Path(r"D:\code\note")
+
+
 _CHAT_TITLE_RULES_CACHE: dict | None = None
 
 
@@ -1073,7 +1077,9 @@ class ChatFrame(wx.Frame):
         self.file_service = CopypartyFileService(self.file_library)
         self.file_http_base_url = self.file_service.base_url
         self._cloudflared_origin_proxy = None
-        self.notes_db_path = self.app_data_dir / "notes.db"
+        self.notes_data_dir = resolve_notes_data_dir()
+        self.notes_data_dir.mkdir(parents=True, exist_ok=True)
+        self.notes_db_path = self.notes_data_dir / "notes.db"
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
@@ -5552,6 +5558,24 @@ class ChatFrame(wx.Frame):
         self._rebuild_execution_list_from_state()
         self._execution_list_dirty = False
 
+    def _execution_list_rows_match_current_steps(self) -> bool:
+        if not hasattr(self, "execution_list"):
+            return False
+        steps = self._current_execution_steps()
+        metas = list(getattr(self, "execution_meta", []) or [])
+        if not steps:
+            return (
+                self.execution_list.GetCount() == 1
+                and len(metas) == 1
+                and metas[0][0] == "info"
+            )
+        execution_metas = [meta for meta in metas if meta and meta[0] == "execution"]
+        if not execution_metas:
+            return False
+        expected_indices = list(range(max(0, len(steps) - len(execution_metas)), len(steps)))
+        actual_indices = [int(meta[1]) for meta in execution_metas]
+        return actual_indices == expected_indices
+
     def _reset_current_turn_execution_view(self) -> None:
         self._reset_execution_visible_row_limit()
         if hasattr(self, "execution_list"):
@@ -5639,7 +5663,12 @@ class ChatFrame(wx.Frame):
                 self.answer_list.SetFocus()
             except Exception:
                 pass
-        if normalized == "execution" and (refresh_execution or previous_mode != "execution" or bool(getattr(self, "_execution_list_dirty", False))):
+        execution_rows_current = False
+        if normalized == "execution":
+            execution_rows_current = self._execution_list_rows_match_current_steps()
+        if normalized == "execution" and (
+            bool(getattr(self, "_execution_list_dirty", False)) or (refresh_execution and not execution_rows_current)
+        ):
             self._flush_all_execution_deltas_for_chat(self._visible_execution_chat_id())
             self._render_execution_list(force=True)
         self._notes_rebuild_tab_order()
@@ -7905,6 +7934,16 @@ class ChatFrame(wx.Frame):
         self._push_remote_state(chat_id)
         return 200, self._remote_speed_state_body(chat_id, chat)
 
+    def _remote_api_clear_context_ui(self, payload: dict) -> tuple[int, dict]:
+        chat_id = str((payload or {}).get("chat_id") or "")
+        if not self._clear_context_and_start_new_chat():
+            return 409, {
+                "accepted": False,
+                "chat_id": chat_id,
+                "error": "clear_context_unavailable",
+            }
+        return 200, {"accepted": True, "chat_id": chat_id}
+
     def _handle_remote_pending_request_reply(self, text: str) -> tuple[bool, str]:
         pending = self.active_codex_pending_request
         if not pending:
@@ -8609,6 +8648,7 @@ class ChatFrame(wx.Frame):
                     on_update_settings=lambda payload: self._run_remote_ui_route(self._remote_api_update_settings_ui, payload),
                     on_speed_options=lambda payload: self._run_remote_ui_route(self._remote_api_speed_options_ui, payload),
                     on_set_speed=lambda payload: self._run_remote_ui_route(self._remote_api_set_speed_ui, payload),
+                    on_clear_context=lambda payload: self._run_remote_ui_route(self._remote_api_clear_context_ui, payload),
                     on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
@@ -11367,10 +11407,11 @@ class ChatFrame(wx.Frame):
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
             self._render_answer_list()
             if not self._select_history_row_if_present(selected_id):
-                self._refresh_history(selected_id)
-            self._save_state()
+                self._mark_history_list_dirty(selected_id)
+            self._defer_chat_state_save()
             if focus_answer_list:
-                self.answer_list.SetFocus()
+                if not self._focus_latest_answer_immediately():
+                    self.answer_list.SetFocus()
             return True
         chat = self._hydrate_chat_from_store(
             self._find_archived_chat(selected_id),
@@ -11383,12 +11424,32 @@ class ChatFrame(wx.Frame):
         self._apply_selected_chat_model_to_combo(chat)
         self._render_answer_list()
         if not self._select_history_row_if_present(selected_id):
-            self._refresh_history(selected_id)
-        self._save_state()
+            self._mark_history_list_dirty(selected_id)
+        self._defer_chat_state_save()
         self.SetStatusText("已切换到历史聊天")
         if focus_answer_list:
-            self.answer_list.SetFocus()
+            if not self._focus_latest_answer_immediately():
+                self.answer_list.SetFocus()
         return True
+
+    def _focus_latest_answer_immediately(self) -> bool:
+        if not hasattr(self, "answer_list"):
+            return False
+        for i in range(len(getattr(self, "answer_meta", []) or []) - 1, -1, -1):
+            if self.answer_meta[i][0] == "answer":
+                try:
+                    self.answer_list.SetSelection(i)
+                    self.answer_list.SetFocus()
+                    return True
+                except Exception:
+                    return False
+        try:
+            if self.answer_list.GetCount() > 0:
+                self.answer_list.SetSelection(self.answer_list.GetCount() - 1)
+            self.answer_list.SetFocus()
+            return True
+        except Exception:
+            return False
 
     def _activate_selected_history(self) -> bool:
         if self.history_list.GetCount() == 0:
@@ -11686,34 +11747,20 @@ class ChatFrame(wx.Frame):
         primary_notes_ctrl = self._notes_primary_tab_target()
         detail_target = self._current_detail_tab_target()
         secondary_detail_target = self.execution_list if detail_target is self.answer_list else self.answer_list
-        if primary_notes_ctrl is self.notes_entry_list:
-            ordered_controls = [
-                self.input_edit,
-                self.new_chat_button,
-                self.model_combo,
-                self.codex_speed_combo,
-                self.history_list,
-                primary_notes_ctrl,
-                detail_target,
-                secondary_detail_target,
-                self.send_button,
-                self.notes_notebook_list,
-                self.notes_editor,
-            ]
-        else:
-            ordered_controls = [
-                self.input_edit,
-                self.new_chat_button,
-                self.model_combo,
-                self.codex_speed_combo,
-                self.send_button,
-                primary_notes_ctrl,
-                self.history_list,
-                detail_target,
-                secondary_detail_target,
-                self.notes_entry_list,
-                self.notes_editor,
-            ]
+        ordered_controls = [
+            self.input_edit,
+            self.new_chat_button,
+            self.model_combo,
+            self.codex_speed_combo,
+            self.send_button,
+            primary_notes_ctrl,
+            self.history_list,
+            detail_target,
+            secondary_detail_target,
+            self.notes_notebook_list,
+            self.notes_entry_list,
+            self.notes_editor,
+        ]
         seen = set()
         root_tab_order = []
         for ctrl in ordered_controls:
@@ -11735,40 +11782,22 @@ class ChatFrame(wx.Frame):
                 nxt.MoveAfterInTabOrder(previous)
             except Exception:
                 pass
-        if primary_notes_ctrl is self.notes_entry_list:
-            try:
-                self.history_list.MoveAfterInTabOrder(self.codex_speed_combo)
-            except Exception:
-                pass
-            try:
-                primary_notes_panel.MoveAfterInTabOrder(self.history_list)
-            except Exception:
-                pass
-            try:
-                primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
-            except Exception:
-                pass
-            try:
-                detail_target.MoveAfterInTabOrder(primary_notes_ctrl)
-            except Exception:
-                pass
-        else:
-            try:
-                primary_notes_panel.MoveAfterInTabOrder(self.send_button)
-            except Exception:
-                pass
-            try:
-                primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
-            except Exception:
-                pass
-            try:
-                self.history_list.MoveAfterInTabOrder(primary_notes_ctrl)
-            except Exception:
-                pass
-            try:
-                detail_target.MoveAfterInTabOrder(self.history_list)
-            except Exception:
-                pass
+        try:
+            primary_notes_panel.MoveAfterInTabOrder(self.send_button)
+        except Exception:
+            pass
+        try:
+            primary_notes_ctrl.MoveAfterInTabOrder(primary_notes_panel)
+        except Exception:
+            pass
+        try:
+            self.history_list.MoveAfterInTabOrder(primary_notes_ctrl)
+        except Exception:
+            pass
+        try:
+            detail_target.MoveAfterInTabOrder(self.history_list)
+        except Exception:
+            pass
 
     def _handle_ctrl_history_navigation(self, event) -> bool:
         key = event.GetKeyCode()

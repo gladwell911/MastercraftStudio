@@ -7,6 +7,11 @@
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 
+## 关键当前事实
+
+- 笔记数据库不再跟随通用应用数据目录；当前固定使用 `D:\code\note\notes.db`。
+- 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
+
 ## 历史归档
 
 - `archive/superpowers/specs/`：历史设计文档

@@ -34,6 +34,11 @@ setx OPENROUTER_API_KEY "你的Key"
 
 如果项目目录下存在 `.venv` 或 `.venv311`，打包和测试流程优先使用对应虚拟环境。
 
+## 数据位置
+
+- 聊天历史和通用应用状态仍按应用数据目录解析；源码运行时通常在项目内的 `dist\history`。
+- 笔记数据库独立存放在 `D:\code\note\notes.db`，由 `resolve_notes_data_dir()` 创建目录并定位文件。测试中应 monkeypatch 这个函数，避免读写真实笔记库。
+
 ## 打包
 
 标准打包入口：
