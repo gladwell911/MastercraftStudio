@@ -319,6 +319,8 @@ class CopypartyFileService:
         self.public_base_url = str(public_base_url or "").strip().rstrip("/")
         self.wait_for_ready = bool(wait_for_ready)
         self._process = None
+        self._embedded_server: ThreadingHTTPServer | None = None
+        self._embedded_thread: threading.Thread | None = None
 
     @property
     def base_url(self) -> str:
@@ -328,7 +330,8 @@ class CopypartyFileService:
 
     @property
     def local_base_url(self) -> str:
-        return f"http://{self.advertised_host}:{self.port}"
+        connect_host = "127.0.0.1" if self.host in {"0.0.0.0", "::"} else self.host
+        return f"http://{connect_host}:{self.port}"
 
     def set_public_base_url(self, public_base_url: str | None) -> None:
         self.public_base_url = str(public_base_url or "").strip().rstrip("/")
@@ -371,9 +374,14 @@ class CopypartyFileService:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._process = self.process_factory(self.command(), **kwargs)
         if self.wait_for_ready:
-            self._wait_until_ready()
+            try:
+                self._wait_until_ready()
+            except RuntimeError:
+                self._process = None
+                self._start_embedded_http_server()
 
     def stop(self) -> None:
+        self._stop_embedded_http_server()
         process = self._process
         self._process = None
         if process is None or process.poll() is not None:
@@ -391,6 +399,75 @@ class CopypartyFileService:
     def upload_url_for(self, filename: str) -> str:
         target = unique_destination_path(self.library.storage_dir, filename)
         return f"{self.base_url}/{quote(target.name)}"
+
+    def _start_embedded_http_server(self) -> None:
+        if self._embedded_server is not None:
+            return
+        service = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                service._handle_embedded_get(self)
+
+            def do_HEAD(self):  # noqa: N802
+                service._handle_embedded_get(self, include_body=False)
+
+            def do_PUT(self):  # noqa: N802
+                service._handle_embedded_put(self)
+
+            def log_message(self, _format, *args):
+                return
+
+        self.library.storage_dir.mkdir(parents=True, exist_ok=True)
+        self._embedded_server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._embedded_thread = threading.Thread(target=self._embedded_server.serve_forever, daemon=True)
+        self._embedded_thread.start()
+
+    def _stop_embedded_http_server(self) -> None:
+        server = self._embedded_server
+        if server is None:
+            return
+        server.shutdown()
+        server.server_close()
+        if self._embedded_thread is not None:
+            self._embedded_thread.join(timeout=2.0)
+        self._embedded_server = None
+        self._embedded_thread = None
+
+    def _handle_embedded_get(self, handler: BaseHTTPRequestHandler, *, include_body: bool = True) -> None:
+        filename = Path(unquote(urlsplit(handler.path).path.lstrip("/")).strip()).name
+        target = self.library.storage_dir / filename
+        if not filename or not target.is_file():
+            self._send_embedded_text(handler, HTTPStatus.NOT_FOUND, "not_found")
+            return
+        data = target.read_bytes()
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "application/octet-stream")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.end_headers()
+        if include_body:
+            handler.wfile.write(data)
+
+    def _handle_embedded_put(self, handler: BaseHTTPRequestHandler) -> None:
+        filename = Path(unquote(urlsplit(handler.path).path.lstrip("/")).strip()).name or "upload.bin"
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        data = handler.rfile.read(max(0, content_length))
+        self.library.storage_dir.mkdir(parents=True, exist_ok=True)
+        target = unique_destination_path(self.library.storage_dir, filename)
+        target.write_bytes(data)
+        self._send_embedded_text(handler, HTTPStatus.CREATED, target.name)
+
+    def _send_embedded_text(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, text: str) -> None:
+        data = str(text or "").encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "text/plain; charset=utf-8")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
 
     def _wait_until_ready(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout

@@ -43,13 +43,18 @@ def _can_bind_loopback_tcp_port(port: int) -> bool:
 
 def _choose_available_port(preferred_port: int, fallbacks: tuple[int, ...]) -> int:
     seen = set()
-    for candidate in (preferred_port, *fallbacks):
+    ranged_candidates: tuple[int, ...] = ()
+    if preferred_port > 0:
+        ranged_candidates = tuple(range(preferred_port + 1, preferred_port + 51))
+    for candidate in (preferred_port, *fallbacks, *ranged_candidates):
         if candidate in seen or candidate <= 0:
             continue
         seen.add(candidate)
         if _can_bind_loopback_tcp_port(candidate):
             return candidate
-    raise RuntimeError(f"no available loopback port found near {preferred_port}")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def main() -> None:
@@ -63,6 +68,7 @@ def main() -> None:
     desktop_name = os.environ.get("FILE_E2E_DESKTOP_NAME", "desktop-offer.txt")
     phone_upload_name = os.environ.get("FILE_E2E_PHONE_UPLOAD_NAME", "phone-upload.txt")
     phone_upload_content = os.environ.get("FILE_E2E_PHONE_UPLOAD_CONTENT", "phone-to-desktop")
+    file_probe_delay_seconds = float(os.environ.get("FILE_E2E_FILE_PROBE_DELAY_SECONDS", "0") or "0")
 
     work_dir = Path(os.environ.get("FILE_E2E_APP_DATA", tempfile.mkdtemp(prefix="zgwd-file-e2e-")))
     storage_dir = work_dir / "storage"
@@ -127,6 +133,21 @@ def main() -> None:
         if command_type == "file_error":
             seen["errors"].append(dict(body))
             return 200, {"ok": True}
+        if command_type in {"file_probe", "file_download_request"}:
+            if file_probe_delay_seconds > 0:
+                time.sleep(file_probe_delay_seconds)
+            path = str(body.get("path") or "")
+            exists = Path(path) == desktop_source or Path(path).is_file()
+            if not exists:
+                return 404, {"accepted": False, "exists": False, "path": path}
+            return 200, {
+                "accepted": True,
+                "exists": True,
+                "file_id": desktop_record.id,
+                "name": desktop_record.name,
+                "size_bytes": desktop_record.size_bytes,
+                "download_url": f"{http_service.base_url}/files/{desktop_record.id}",
+            }
         if command_type == "file_upload_request":
             name = Path(str(body.get("name") or phone_upload_name)).name or phone_upload_name
             return 200, {
@@ -153,6 +174,7 @@ def main() -> None:
             "token": token,
             "pair_id": pair_id,
             "desktop_file_id": desktop_record.id,
+            "desktop_path": str(desktop_source),
             "desktop_file_name": desktop_record.name,
             "desktop_content": desktop_content,
             "phone_upload_name": phone_upload_name,

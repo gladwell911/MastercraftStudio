@@ -27,6 +27,11 @@ class FakeProcess:
         self.killed = True
 
 
+class ExitedProcess:
+    def poll(self):
+        return 1
+
+
 def test_copyparty_service_starts_storage_only_volume(tmp_path):
     storage = tmp_path / "storage"
     library = DesktopFileLibrary(storage)
@@ -91,6 +96,7 @@ def test_copyparty_default_binds_all_interfaces_and_advertises_lan_host(tmp_path
     command = captured["command"]
     assert command[command.index("-i") + 1] == "0.0.0.0"
     assert service.base_url == "http://192.168.50.23:49233"
+    assert service.local_base_url == "http://127.0.0.1:49233"
 
 
 def test_copyparty_urls_are_filename_based_and_escaped(tmp_path):
@@ -144,6 +150,27 @@ def test_copyparty_service_serves_storage_files(tmp_path):
         with request.urlopen(service.download_url_for(record), timeout=5) as response:
             assert response.status == 200
             assert response.read() == b"served-payload"
+    finally:
+        service.stop()
+
+
+def test_copyparty_service_falls_back_to_embedded_http_when_process_exits(tmp_path):
+    source = tmp_path / "app-release (3).apk"
+    source.write_bytes(b"apk-payload")
+    library = DesktopFileLibrary(tmp_path / "storage")
+    record = library.add_local_file(source)
+    service = CopypartyFileService(
+        library,
+        host="127.0.0.1",
+        port=_free_port(),
+        process_factory=lambda _command, **_kwargs: ExitedProcess(),
+        wait_for_ready=True,
+    )
+    service.start()
+    try:
+        with request.urlopen(service.download_url_for(record), timeout=5) as response:
+            assert response.status == 200
+            assert response.read() == b"apk-payload"
     finally:
         service.stop()
 
