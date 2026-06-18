@@ -1,5 +1,7 @@
 import io
 import json
+import threading
+import time
 
 from codex_worker_client import CodexWorkerClient
 
@@ -172,10 +174,10 @@ def test_worker_client_compacts_deltas_by_event_turn_id_variants():
 
     for text, event_extra in (
         ("turn-a-old", {"turn_id": "turn-a"}),
-        ("turn-b-old", {"turnId": "turn-b"}),
-        ("turn-c-old", {"data": {"turn_id": "turn-c"}}),
         ("turn-a-new", {"turn_id": "turn-a"}),
+        ("turn-b-old", {"turnId": "turn-b"}),
         ("turn-b-new", {"turnId": "turn-b"}),
+        ("turn-c-old", {"data": {"turn_id": "turn-c"}}),
         ("turn-c-new", {"data": {"turn_id": "turn-c"}}),
     ):
         client._enqueue_worker_message(
@@ -274,6 +276,80 @@ def test_worker_client_merges_delta_fragments_for_same_chat_turn_and_item():
     assert event["item_id"] == "item-1"
 
 
+def test_worker_client_contiguous_deltas_with_same_key_merge_one_queue_entry():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    for text in ("A", "B", "C"):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {
+                        "type": "agent_message_delta",
+                        "text": text,
+                        "turn_id": "turn-1",
+                        "item_id": "item-1",
+                    },
+                },
+            }
+        )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["ABC"]
+
+
+def test_worker_client_interleaved_delta_keeps_arrival_order():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {
+                    "type": "agent_message_delta",
+                    "text": "A",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                },
+            },
+        }
+    )
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "item_completed", "text": "done"},
+            },
+        }
+    )
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {
+                    "type": "agent_message_delta",
+                    "text": "B",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                },
+            },
+        }
+    )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["A", "done", "B"]
+
+
 def test_worker_client_does_not_merge_different_item_ids_in_same_turn():
     client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
 
@@ -360,6 +436,42 @@ def test_worker_client_on_message_receives_pending_notifications_only():
         }
     )
 
+    assert observed == [{"type": "messages_pending"}]
+
+
+def test_worker_client_on_message_coalesces_until_drain():
+    observed = []
+    client = CodexWorkerClient(
+        process_factory=lambda args: FakeProcess(), on_message=observed.append, start_reader_threads=False
+    )
+
+    for text in ("A", "B", "C"):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {"type": "agent_message_delta", "text": text, "turn_id": "turn-1"},
+                },
+            }
+        )
+
+    assert observed == [{"type": "messages_pending"}]
+
+    assert client.drain_pending_messages(limit=1)
+
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "item_completed", "text": "done"},
+            },
+        }
+    )
+
     assert observed == [{"type": "messages_pending"}, {"type": "messages_pending"}]
 
 
@@ -402,3 +514,44 @@ def test_worker_client_stdout_loop_reports_captured_process_returncode():
     client._stdout_loop()
 
     assert observed == [11]
+
+
+def test_worker_client_concurrent_start_uses_process_factory_once_for_live_process():
+    proc = FakeProcess()
+    calls = []
+
+    def process_factory(args):
+        calls.append(args)
+        time.sleep(0.05)
+        return proc
+
+    client = CodexWorkerClient(process_factory=process_factory, start_reader_threads=False)
+    threads = [threading.Thread(target=client.start) for _ in range(5)]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert len(calls) == 1
+    assert client.process is proc
+
+
+def test_worker_client_refuses_send_after_close_but_close_sends_shutdown():
+    proc = FakeProcess()
+    client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
+    client.start()
+
+    client.close()
+
+    written_after_close = proc.stdin.getvalue()
+    assert '"type":"shutdown"' in written_after_close
+
+    try:
+        client.start_turn(chat_id="chat-c")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("start_turn should refuse writes after close")
+
+    assert proc.stdin.getvalue() == written_after_close

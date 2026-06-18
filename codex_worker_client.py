@@ -37,72 +37,75 @@ class CodexWorkerClient:
         self.queue_limit = max(int(queue_limit or 0), 1)
         self.process = None
         self._queue: deque[dict[str, Any]] = deque()
-        self._delta_messages: dict[tuple[str, ...], dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._closed = False
+        self._pending_notification = False
 
     def start(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            return
-        args = [sys.executable, "-m", self.worker_module]
-        if self.process_factory is not None:
-            self.process = self.process_factory(args)
-        else:
-            self.process = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(Path(__file__).resolve().parent),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                shell=False,
-                creationflags=self._creationflags(),
-            )
-        self._closed = False
-        if self.start_reader_threads:
-            self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
-            self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
-            self._stdout_thread.start()
-            self._stderr_thread.start()
+        with self._lifecycle_lock:
+            if self.process is not None and self.process.poll() is None:
+                return
+            args = [sys.executable, "-m", self.worker_module]
+            if self.process_factory is not None:
+                self.process = self.process_factory(args)
+            else:
+                self.process = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=str(Path(__file__).resolve().parent),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    shell=False,
+                    creationflags=self._creationflags(),
+                )
+            self._closed = False
+            if self.start_reader_threads:
+                self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
+                self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+                self._stdout_thread.start()
+                self._stderr_thread.start()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        proc = self.process
-        if proc is None:
-            return
-        try:
-            self._send_message(make_ui_request(self._next_id(), "shutdown", {}))
-        except Exception:
-            pass
-        if proc.poll() is not None:
-            return
-        try:
-            if proc.wait(timeout=1) is not None:
+        with self._lifecycle_lock:
+            if self._closed:
                 return
-        except Exception:
-            pass
-        if proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-            return
-        except Exception:
-            pass
-        try:
-            if proc.poll() is None:
-                proc.kill()
+            self._closed = True
+            proc = self.process
+            if proc is None:
+                return
+            try:
+                self._send_message(make_ui_request(self._next_id(), "shutdown", {}), allow_closed=True)
+            except Exception:
+                pass
+            if proc.poll() is not None:
+                return
+            try:
+                if proc.wait(timeout=1) is not None:
+                    return
+            except Exception:
+                pass
+            if proc.poll() is not None:
+                return
+            try:
+                proc.terminate()
                 proc.wait(timeout=2)
-        except Exception:
-            pass
+                return
+            except Exception:
+                pass
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
 
     def start_turn(self, **payload: Any) -> str:
         request_id = self._next_id()
@@ -135,31 +138,33 @@ class CodexWorkerClient:
             while remaining and self._queue:
                 entry = self._queue.popleft()
                 if entry["kind"] == "delta":
-                    message = self._delta_messages.pop(entry["key"], None)
-                    if message is None:
-                        continue
-                    drained.append(message)
+                    drained.append(entry["message"])
                 else:
                     drained.append(entry["message"])
                 remaining -= 1
+            if drained:
+                self._pending_notification = False
         return drained
 
     def _enqueue_worker_message(self, message: dict[str, Any]) -> None:
         validated = validate_chat_scoped_message(message)
+        notify_pending = False
         with self._lock:
             if self._is_agent_message_delta(validated):
                 key = self._delta_key(validated)
-                existing = self._delta_messages.get(key)
-                if existing is None:
-                    self._delta_messages[key] = deepcopy(validated)
-                    self._queue.append({"kind": "delta", "key": key})
-                    self._enforce_queue_limit_locked()
+                last_entry = self._queue[-1] if self._queue else None
+                if last_entry and last_entry["kind"] == "delta" and last_entry["key"] == key:
+                    last_entry["message"] = self._merge_delta_message(last_entry["message"], validated)
                 else:
-                    self._delta_messages[key] = self._merge_delta_message(existing, validated)
+                    self._queue.append({"kind": "delta", "key": key, "message": deepcopy(validated)})
+                    self._enforce_queue_limit_locked()
             else:
                 self._queue.append({"kind": "message", "message": validated})
                 self._enforce_queue_limit_locked()
-        if self.on_message is not None:
+            if not self._pending_notification:
+                self._pending_notification = True
+                notify_pending = True
+        if notify_pending and self.on_message is not None:
             self.on_message({"type": "messages_pending"})
 
     def _stdout_loop(self) -> None:
@@ -189,17 +194,20 @@ class CodexWorkerClient:
         except Exception:
             pass
 
-    def _send_message(self, message: dict[str, Any]) -> None:
-        proc = self.process
-        if proc is None:
-            raise RuntimeError("Codex worker process is not started.")
-        stdin = getattr(proc, "stdin", None)
-        if stdin is None:
-            raise RuntimeError("Codex worker process has no stdin.")
-        line = encode_worker_message(message)
-        with self._send_lock:
-            stdin.write(line)
-            stdin.flush()
+    def _send_message(self, message: dict[str, Any], allow_closed: bool = False) -> None:
+        with self._lifecycle_lock:
+            if self._closed and not allow_closed:
+                raise RuntimeError("Codex worker client is closed.")
+            proc = self.process
+            if proc is None:
+                raise RuntimeError("Codex worker process is not started.")
+            stdin = getattr(proc, "stdin", None)
+            if stdin is None:
+                raise RuntimeError("Codex worker process has no stdin.")
+            line = encode_worker_message(message)
+            with self._send_lock:
+                stdin.write(line)
+                stdin.flush()
 
     def _notify_exit(self, proc: Any | None = None) -> None:
         if self.on_exit is None:
@@ -207,10 +215,7 @@ class CodexWorkerClient:
         if proc is None:
             proc = self.process
         returncode = proc.poll() if proc is not None else None
-        try:
-            self.on_exit(returncode)
-        except TypeError:
-            self.on_exit()
+        self.on_exit(returncode)
 
     def _delta_key(self, message: dict[str, Any]) -> tuple[str, ...]:
         payload = message.get("payload") or {}
@@ -226,9 +231,7 @@ class CodexWorkerClient:
 
     def _enforce_queue_limit_locked(self) -> None:
         while len(self._queue) > self.queue_limit:
-            entry = self._queue.popleft()
-            if entry["kind"] == "delta":
-                self._delta_messages.pop(entry["key"], None)
+            self._queue.popleft()
 
     @staticmethod
     def _merge_delta_message(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
