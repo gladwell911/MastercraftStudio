@@ -1174,6 +1174,7 @@ class ChatFrame(wx.Frame):
         self._last_primary_interaction_at = time.monotonic()
         self._navigation_quiet_until = 0.0
         self._navigation_quiet_last_trigger = ""
+        self._navigation_quiet_flush_timer = None
         self._deferred_background_ui_counts = {}
         self._pending_execution_tail_appends = {}
         self.ui_perf_slow_threshold_ms = UI_PERF_SLOW_THRESHOLD_MS
@@ -5099,6 +5100,7 @@ class ChatFrame(wx.Frame):
 
     def _flush_pending_background_ui_updates(self) -> None:
         if self._navigation_quiet_active():
+            self._schedule_navigation_quiet_flush()
             return
         self._flush_pending_execution_tail_appends()
         if not bool(getattr(self, "_background_answer_list_dirty", False)):
@@ -9633,9 +9635,15 @@ class ChatFrame(wx.Frame):
         except Exception:
             key = 0
         self._navigation_quiet_last_trigger = f"key:{key}"
+        self._schedule_navigation_quiet_flush()
 
     def _navigation_quiet_active(self) -> bool:
         return time.monotonic() < float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0)
+
+    def _schedule_navigation_quiet_flush(self) -> None:
+        remaining = max(0.0, float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0) - time.monotonic())
+        delay_ms = int(round(remaining * 1000))
+        self._navigation_quiet_flush_timer = self._call_later_if_alive(delay_ms, self._flush_pending_background_ui_updates)
 
     def _in_background_ui_update(self) -> bool:
         return int(getattr(self, "_background_ui_update_depth", 0) or 0) > 0

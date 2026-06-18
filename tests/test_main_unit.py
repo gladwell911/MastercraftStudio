@@ -106,7 +106,7 @@ def test_navigation_quiet_trigger_keys(frame):
 
 
 def test_navigation_quiet_window_extends_on_repeated_trigger(frame, monkeypatch):
-    times = iter([100.0, 101.5])
+    times = iter([100.0, 100.0, 101.5, 101.5])
     monkeypatch.setattr(main.time, "monotonic", lambda: next(times))
 
     frame._touch_navigation_quiet_window(_QuietKeyEvent(main.wx.WXK_DOWN))
@@ -247,6 +247,16 @@ def test_idle_history_flush_waits_for_navigation_quiet_window(frame, monkeypatch
     assert 1 <= delay_ms <= 3000
     assert fn == frame._flush_idle_ui_refreshes
     assert args == ()
+
+
+def test_quiet_window_schedules_flush_after_expiration(frame, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay, fn, *args: scheduled.append((delay, fn.__name__)) or object())
+
+    frame._touch_navigation_quiet_window(_QuietKeyEvent(main.wx.WXK_DOWN))
+
+    assert scheduled == [(3000, "_flush_pending_background_ui_updates")]
 
 
 def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, monkeypatch):
