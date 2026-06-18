@@ -1160,6 +1160,10 @@ class ChatFrame(wx.Frame):
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
         self._codex_ui_batch_depth = 0
+        self._background_ui_update_depth = 0
+        self._background_answer_list_dirty = False
+        self._background_history_dirty_ids = set()
+        self._background_context_usage_dirty_ids = set()
         self._pending_history_reorder = False
         self._history_list_dirty = False
         self._pending_history_keep_id = None
@@ -4066,6 +4070,10 @@ class ChatFrame(wx.Frame):
         has_openclaw_work = bool(getattr(self, "_openclaw_lifecycle_dirty", False))
         if not has_history_work and not has_execution_work and not has_openclaw_work:
             return
+        if self._navigation_quiet_active():
+            remaining_ms = int(max(1.0, (float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0) - time.monotonic()) * 1000.0))
+            self._schedule_idle_ui_refresh(remaining_ms)
+            return
         if self._primary_navigation_control_is_recently_active():
             self._schedule_idle_ui_refresh()
             return
@@ -5345,6 +5353,13 @@ class ChatFrame(wx.Frame):
         if self.view_mode != "history":
             return
         if str(self.view_history_id or "").strip() != str(chat_id or "").strip():
+            return
+        if self._background_ui_mutations_blocked():
+            target_id = str(chat_id or "").strip()
+            if target_id:
+                self._background_history_dirty_ids.add(target_id)
+            self._mark_history_list_dirty(target_id)
+            self._mark_background_answer_list_dirty()
             return
         self._refresh_history(chat_id)
         self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
@@ -8051,10 +8066,12 @@ class ChatFrame(wx.Frame):
                 has_more = bool(self._pending_codex_ui_events)
                 self._codex_ui_event_flush_scheduled = has_more
             self._codex_ui_batch_depth += 1
+            self._background_ui_update_depth += 1
             try:
                 for queued_chat_id, queued_event in batch:
                     self._on_codex_event_for_chat(queued_chat_id, queued_event)
             finally:
+                self._background_ui_update_depth = max(0, self._background_ui_update_depth - 1)
                 self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
                 self._flush_deferred_execution_list_updates()
                 self._start_execution_step_persist_worker()
@@ -8217,9 +8234,12 @@ class ChatFrame(wx.Frame):
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
                 if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
-                    self._update_active_answer_row(target_idx)
-                    if self._find_answer_row_index(target_idx) < 0 and self.view_mode == "active":
-                        self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+                    if self._background_ui_mutations_blocked():
+                        self._mark_background_answer_list_dirty()
+                    else:
+                        self._update_active_answer_row(target_idx)
+                        if self._find_answer_row_index(target_idx) < 0 and self.view_mode == "active":
+                            self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
                     self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(turn.get("answer_md") or ""))
                     self._defer_codex_state_save()
             return
@@ -8239,7 +8259,10 @@ class ChatFrame(wx.Frame):
                 ):
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
-                self._update_active_answer_row(target_idx)
+                if self._background_ui_mutations_blocked():
+                    self._mark_background_answer_list_dirty()
+                else:
+                    self._update_active_answer_row(target_idx)
                 self._mark_chat_turns_dirty(start_index=target_idx)
             if is_current_chat:
                 self.is_running = False
@@ -8251,7 +8274,9 @@ class ChatFrame(wx.Frame):
                 self._play_finish_sound()
                 self._defer_chat_state_save()
                 if self.view_mode == "active":
-                    if self._find_answer_row_index(target_idx) < 0:
+                    if self._background_ui_mutations_blocked():
+                        self._mark_background_answer_list_dirty()
+                    elif self._find_answer_row_index(target_idx) < 0:
                         if self._append_completed_answer_to_answer_list(target_idx, turn):
                             self._focus_latest_answer()
                         else:
@@ -8278,7 +8303,10 @@ class ChatFrame(wx.Frame):
                         }
                         if self._record_received_attachment(self.active_session_turns[target_idx], attachment):
                             self._defer_codex_state_save()
-                            self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
+                            if self._background_ui_mutations_blocked():
+                                self._mark_background_answer_list_dirty()
+                            else:
+                                self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event_type == "item_completed" and str(event.phase or "") == "final_answer":
                 self.active_codex_pending_prompt = str(event.text or "")
@@ -8286,11 +8314,16 @@ class ChatFrame(wx.Frame):
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
-                    self._update_active_answer_row(target_idx)
+                    if self._background_ui_mutations_blocked():
+                        self._mark_background_answer_list_dirty()
+                    else:
+                        self._update_active_answer_row(target_idx)
                     self._mark_chat_turns_dirty(start_index=target_idx)
                 self._defer_codex_state_save()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
-                if self._append_completed_answer_to_answer_list(target_idx, self.active_session_turns[target_idx] if 0 <= target_idx < len(self.active_session_turns) else {}):
+                if self._background_ui_mutations_blocked():
+                    self._mark_background_answer_list_dirty()
+                elif self._append_completed_answer_to_answer_list(target_idx, self.active_session_turns[target_idx] if 0 <= target_idx < len(self.active_session_turns) else {}):
                     self._focus_latest_answer()
                 else:
                     self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
@@ -8303,7 +8336,10 @@ class ChatFrame(wx.Frame):
                         turn["answer_md"] = str(event.text or "")
                     elif not str(turn.get("answer_md") or "").strip():
                         turn["answer_md"] = REQUESTING_TEXT
-                    self._update_active_answer_row(target_idx)
+                    if self._background_ui_mutations_blocked():
+                        self._mark_background_answer_list_dirty()
+                    else:
+                        self._update_active_answer_row(target_idx)
                 self._defer_codex_state_save()
             return
 
@@ -9507,6 +9543,18 @@ class ChatFrame(wx.Frame):
 
     def _navigation_quiet_active(self) -> bool:
         return time.monotonic() < float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0)
+
+    def _in_background_ui_update(self) -> bool:
+        return int(getattr(self, "_background_ui_update_depth", 0) or 0) > 0
+
+    def _background_ui_mutations_blocked(self) -> bool:
+        return self._in_background_ui_update() and self._navigation_quiet_active()
+
+    def _mark_background_answer_list_dirty(self) -> None:
+        self._background_answer_list_dirty = True
+        counts = getattr(self, "_deferred_background_ui_counts", {})
+        counts["answer"] = int(counts.get("answer", 0)) + 1
+        self._deferred_background_ui_counts = counts
 
     def _is_real_escape_keydown(self, event) -> bool:
         ctrl_down = getattr(event, "ControlDown", None)

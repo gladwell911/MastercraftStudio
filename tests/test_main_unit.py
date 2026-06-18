@@ -146,6 +146,109 @@ def test_input_key_down_touches_quiet_window_before_send_shortcut(frame, monkeyp
     assert observed == [303.0]
 
 
+def test_background_codex_event_defers_answer_list_mutation_during_quiet(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.view_mode = "active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "codex_turn_id": "turn-1",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": frame.active_session_turns,
+        "execution_steps": [],
+        "codex_turn_id": "turn-1",
+    }
+    frame._background_ui_update_depth = 1
+    frame._navigation_quiet_until = time.monotonic() + 3.0
+    monkeypatch.setattr(
+        frame,
+        "_update_active_answer_row",
+        lambda *_args, **_kwargs: pytest.fail("background answer row update must be deferred during quiet"),
+    )
+    monkeypatch.setattr(
+        frame,
+        "_refresh_answer_list_preserving_selection",
+        lambda *_args, **_kwargs: pytest.fail("background answer list refresh must be deferred during quiet"),
+    )
+
+    event = main.CodexEvent(type="subagent_result", turn_id="turn-1", text="background answer")
+    frame._on_codex_event_for_chat("chat-active", event)
+
+    assert frame.active_session_turns[0]["answer_md"] == "background answer"
+    assert frame._background_answer_list_dirty is True
+
+
+def test_background_history_chat_event_defers_visible_refresh_during_quiet(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.archived_chats = [
+        {
+            "id": "chat-history",
+            "title": "history",
+            "turns": [
+                {
+                    "question": "q",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                    "request_status": "pending",
+                    "codex_turn_id": "turn-1",
+                }
+            ],
+            "execution_steps": [],
+            "codex_turn_id": "turn-1",
+        }
+    ]
+    frame._background_ui_update_depth = 1
+    frame._navigation_quiet_until = time.monotonic() + 3.0
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: pytest.fail("history refresh must be deferred during quiet"))
+    monkeypatch.setattr(
+        frame,
+        "_refresh_answer_list_preserving_selection",
+        lambda *_args, **_kwargs: pytest.fail("history answer refresh must be deferred during quiet"),
+    )
+
+    event = main.CodexEvent(type="subagent_result", turn_id="turn-1", text="history answer")
+    frame._on_codex_event_for_chat("chat-history", event)
+
+    archived = frame._find_archived_chat("chat-history")
+    assert archived["turns"][0]["answer_md"] == "history answer"
+    assert frame._background_answer_list_dirty is True
+    assert "chat-history" in frame._background_history_dirty_ids
+    assert frame._history_list_dirty is True
+    assert frame._pending_history_keep_id == "chat-history"
+
+
+def test_idle_history_flush_waits_for_navigation_quiet_window(frame, monkeypatch):
+    frame._history_list_dirty = True
+    frame._pending_history_keep_id = "chat-old"
+    frame._navigation_quiet_until = time.monotonic() + 3.0
+    delayed = []
+    monkeypatch.setattr(frame, "_refresh_history", lambda *args, **kwargs: pytest.fail("quiet window should defer idle history refresh"))
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+
+    frame._flush_idle_ui_refreshes()
+
+    assert frame._history_list_dirty is True
+    assert frame._pending_history_keep_id == "chat-old"
+    assert delayed
+    delay_ms, fn, args = delayed[-1]
+    assert 1 <= delay_ms <= 3000
+    assert fn == frame._flush_idle_ui_refreshes
+    assert args == ()
+
+
 def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, monkeypatch):
     frame.active_chat_id = "chat-old"
     frame.current_chat_id = "chat-old"
