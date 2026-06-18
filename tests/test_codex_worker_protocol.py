@@ -22,7 +22,7 @@ def test_encode_decode_roundtrip_preserves_ascii_and_chinese_text():
         {
             "chat_id": "chat-c",
             "turn_idx": 2,
-            "question": "继续分析这个问题",
+            "question": "继续分析这个问题\n第二行",
             "model": "codex/main",
         },
     )
@@ -33,6 +33,7 @@ def test_encode_decode_roundtrip_preserves_ascii_and_chinese_text():
     decoded = decode_worker_line(line)
 
     assert decoded == message
+    assert decoded["payload"]["question"] == "继续分析这个问题\n第二行"
 
 
 def test_decode_rejects_invalid_json_line():
