@@ -1,5 +1,6 @@
 import io
 
+from codex_client import CodexEvent
 from codex_worker_process import CodexWorkerRuntime
 from codex_worker_protocol import decode_worker_line, encode_worker_message, make_ui_request
 
@@ -100,6 +101,94 @@ def test_worker_runtime_reply_user_input_routes_to_matching_chat_client():
     )
 
     assert created[0].replies == [("ask-1", {"reply": ["ok"]})]
+
+
+def test_worker_runtime_reply_user_input_uses_request_id_mapping_before_latest_chat_model():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    for idx, model in enumerate(("model-a", "model-b")):
+        runtime.handle_message(
+            make_ui_request(
+                f"req-start-{idx}",
+                "start_turn",
+                {
+                    "chat_id": "chat-c",
+                    "turn_idx": idx,
+                    "question": "问题",
+                    "model": model,
+                    "cwd": "c:/code/sj",
+                    "thread_id": "",
+                    "turn_id": "",
+                    "input_items": [{"type": "text", "text": "问题"}],
+                    "attachments": [],
+                    "service_tier": "",
+                },
+            )
+        )
+
+    created[0].on_event(CodexEvent(type="server_request", request_id="ask-a", method="item/tool/requestUserInput"))
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply",
+            "reply_user_input",
+            {"chat_id": "chat-c", "request_id": "ask-a", "answers": {"reply": ["ok"]}},
+        )
+    )
+
+    assert created[0].codex_model == "model-a"
+    assert created[1].codex_model == "model-b"
+    assert created[0].replies == [("ask-a", {"reply": ["ok"]})]
+    assert created[1].replies == []
+
+
+def test_worker_runtime_reply_user_input_with_unknown_request_id_errors_when_chat_has_multiple_clients():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    for idx, model in enumerate(("model-a", "model-b")):
+        runtime.handle_message(
+            make_ui_request(
+                f"req-start-{idx}",
+                "start_turn",
+                {
+                    "chat_id": "chat-c",
+                    "turn_idx": idx,
+                    "question": "问题",
+                    "model": model,
+                    "cwd": "c:/code/sj",
+                    "thread_id": "",
+                    "turn_id": "",
+                    "input_items": [{"type": "text", "text": "问题"}],
+                    "attachments": [],
+                    "service_tier": "",
+                },
+            )
+        )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply",
+            "reply_user_input",
+            {"chat_id": "chat-c", "request_id": "unknown", "answers": {"reply": ["ok"]}},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].replies == []
+    assert created[1].replies == []
+    assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
 
 
 def test_worker_process_source_does_not_import_wx():

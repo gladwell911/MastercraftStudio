@@ -23,6 +23,7 @@ class CodexWorkerRuntime:
         self._clients: dict[tuple[str, str], Any] = {}
         self._chat_models: dict[str, str] = {}
         self._turn_indices: dict[tuple[str, str], Any] = {}
+        self._input_request_clients: dict[str, tuple[str, str]] = {}
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         self.output.write(encode_worker_message(make_worker_event(message_type, payload, request_id)))
@@ -52,6 +53,7 @@ class CodexWorkerRuntime:
         self._clients.clear()
         self._chat_models.clear()
         self._turn_indices.clear()
+        self._input_request_clients.clear()
         for client in clients:
             client.close()
 
@@ -75,6 +77,11 @@ class CodexWorkerRuntime:
         key = (chat_id, model)
         if key in self._turn_indices:
             payload["turn_idx"] = self._turn_indices[key]
+        request_id = getattr(event, "request_id", None)
+        method = str(getattr(event, "method", "") or "")
+        event_type = str(getattr(event, "type", "") or "")
+        if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
+            self._input_request_clients[str(request_id)] = key
         self.emit("event", payload)
 
     def _handle_start_turn(self, message: dict[str, Any]) -> None:
@@ -122,8 +129,20 @@ class CodexWorkerRuntime:
     def _handle_reply_user_input(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})
         chat_id = str(payload.get("chat_id") or "").strip()
-        model = str(payload.get("model") or "").strip() or self._chat_models.get(chat_id, DEFAULT_CODEX_MODEL)
-        client = self._clients[(chat_id, model)]
+        request_id = payload.get("request_id")
+        key = self._client_key_for_reply(chat_id, request_id)
+        if key is None:
+            self.emit(
+                "error",
+                {
+                    "chat_id": chat_id,
+                    "request_id": request_id,
+                    "message": "cannot route reply_user_input to a unique Codex client",
+                },
+                request_id=message.get("id"),
+            )
+            return
+        client = self._clients[key]
         client.respond_tool_request_user_input(payload.get("request_id"), dict(payload.get("answers") or {}))
 
     @staticmethod
@@ -138,6 +157,16 @@ class CodexWorkerRuntime:
         if isinstance(nested, dict) and nested.get("id"):
             return str(nested.get("id") or "")
         return str(response.get(flat_key) or response.get("id") or "")
+
+    def _client_key_for_reply(self, chat_id: str, request_id: Any) -> tuple[str, str] | None:
+        if request_id is not None:
+            mapped_key = self._input_request_clients.get(str(request_id))
+            if mapped_key is not None:
+                return mapped_key
+        matching_keys = [key for key in self._clients if key[0] == chat_id]
+        if len(matching_keys) == 1:
+            return matching_keys[0]
+        return None
 
 
 def main() -> int:
