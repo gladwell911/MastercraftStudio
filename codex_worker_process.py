@@ -45,11 +45,7 @@ class CodexWorkerRuntime:
             self.close()
             return False
         else:
-            self.emit(
-                "error",
-                {"message": f"unsupported worker message type: {message_type}"},
-                request_id=message.get("id"),
-            )
+            self._emit_protocol_error(message, f"unsupported worker message type: {message_type}")
         return True
 
     def close(self) -> None:
@@ -106,7 +102,7 @@ class CodexWorkerRuntime:
         service_tier = payload.get("service_tier")
         service_tier_arg = service_tier if str(service_tier or "").strip() else None
         if not chat_id:
-            self._emit_scoped_error(message, "start_turn requires payload.chat_id", chat_id, turn_idx, model)
+            self._emit_protocol_error(message, "start_turn requires payload.chat_id")
             return
 
         try:
@@ -164,6 +160,9 @@ class CodexWorkerRuntime:
         payload = dict(message.get("payload") or {})
         chat_id = str(payload.get("chat_id") or "").strip()
         request_id = payload.get("request_id")
+        if not chat_id:
+            self._emit_protocol_error(message, "reply_user_input requires payload.chat_id")
+            return
         key = self._client_key_for_reply(chat_id, request_id)
         if key is None:
             self.emit(
@@ -226,6 +225,9 @@ class CodexWorkerRuntime:
             },
             request_id=message.get("id"),
         )
+
+    def _emit_protocol_error(self, message: dict[str, Any], error_message: str) -> None:
+        self.emit("protocol_error", {"message": error_message}, request_id=message.get("id"))
 
 
 def main() -> int:

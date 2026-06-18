@@ -59,6 +59,12 @@ def test_turn_started_ack_requires_chat_id():
         validate_chat_scoped_message(message)
 
 
+def test_protocol_error_is_not_chat_scoped():
+    message = make_worker_event("protocol_error", {"message": "bad request"})
+
+    assert validate_chat_scoped_message(message) == message
+
+
 def test_chat_scoped_message_rejects_non_dict_message():
     with pytest.raises(CodexWorkerProtocolError):
         validate_chat_scoped_message(None)

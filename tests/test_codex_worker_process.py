@@ -4,7 +4,7 @@ import time
 
 from codex_client import CodexEvent
 from codex_worker_process import CodexWorkerRuntime
-from codex_worker_protocol import decode_worker_line, encode_worker_message, make_ui_request
+from codex_worker_protocol import decode_worker_line, encode_worker_message, make_ui_request, validate_chat_scoped_message
 
 
 class FakeCodexClient:
@@ -321,7 +321,9 @@ def test_worker_runtime_reply_user_input_without_chat_id_errors_even_when_reques
 
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     assert created[0].replies == []
-    assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
+    protocol_errors = [item for item in messages if item["type"] == "protocol_error" and item.get("id") == "req-reply"]
+    assert protocol_errors
+    validate_chat_scoped_message(protocol_errors[0])
 
 
 def test_worker_runtime_pending_input_mapping_marks_same_chat_request_id_collision_ambiguous():
@@ -400,7 +402,11 @@ def test_worker_runtime_start_turn_with_empty_chat_id_emits_error_without_creati
 
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     assert created == []
-    assert any(item["type"] == "error" and item.get("id") == "req-empty-chat" for item in messages)
+    protocol_errors = [
+        item for item in messages if item["type"] == "protocol_error" and item.get("id") == "req-empty-chat"
+    ]
+    assert protocol_errors
+    validate_chat_scoped_message(protocol_errors[0])
 
 
 def test_worker_runtime_start_turn_failure_emits_scoped_error():
@@ -432,6 +438,17 @@ def test_worker_runtime_start_turn_failure_emits_scoped_error():
     )
 
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    scoped_errors = [
+        item
+        for item in messages
+        if item["type"] == "error"
+        and item.get("id") == "req-fail"
+        and item["payload"]["chat_id"] == "chat-c"
+        and item["payload"]["turn_idx"] == 7
+        and item["payload"]["model"] == "model-a"
+    ]
+    assert scoped_errors
+    validate_chat_scoped_message(scoped_errors[0])
     assert any(
         item["type"] == "error"
         and item.get("id") == "req-fail"
@@ -504,6 +521,19 @@ def test_worker_runtime_emit_serializes_concurrent_writes():
     assert not second.is_alive()
     assert output.overlapped is False
     assert [decode_worker_line(line)["type"] for line in output.lines] == ["pong", "pong"]
+
+
+def test_worker_runtime_unsupported_message_type_emits_valid_protocol_error():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(output=output)
+
+    runtime.handle_message(make_ui_request("req-unsupported", "unknown_command", {}))
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert len(messages) == 1
+    assert messages[0]["type"] == "protocol_error"
+    assert messages[0]["id"] == "req-unsupported"
+    validate_chat_scoped_message(messages[0])
 
 
 def test_worker_process_source_does_not_import_wx():
