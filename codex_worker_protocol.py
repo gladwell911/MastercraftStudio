@@ -18,6 +18,7 @@ CHAT_SCOPED_TYPES = {
     "event",
     "thread_state",
     "request_user_input",
+    "turn_started_ack",
     "turn_finished",
     "error",
 }

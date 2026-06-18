@@ -1,4 +1,6 @@
 import io
+import threading
+import time
 
 from codex_client import CodexEvent
 from codex_worker_process import CodexWorkerRuntime
@@ -37,6 +39,29 @@ class FakeCodexClient:
 class RaisingTurnCodexClient(FakeCodexClient):
     def start_turn_items(self, thread_id, items, service_tier=None):
         raise RuntimeError("turn failed")
+
+
+class OverlapDetectingOutput:
+    def __init__(self):
+        self.lines = []
+        self.overlapped = False
+        self._active_writes = 0
+        self._first_write_entered = threading.Event()
+        self._guard = threading.Lock()
+
+    def write(self, text):
+        with self._guard:
+            self._active_writes += 1
+            if self._active_writes > 1:
+                self.overlapped = True
+            self._first_write_entered.set()
+        time.sleep(0.02)
+        self.lines.append(text)
+        with self._guard:
+            self._active_writes -= 1
+
+    def flush(self):
+        pass
 
 
 def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ack():
@@ -415,6 +440,7 @@ def test_worker_runtime_start_turn_failure_emits_scoped_error():
         and item["payload"]["model"] == "model-a"
         for item in messages
     )
+    assert not any(item["type"] == "thread_state" and item["payload"].get("active") is True for item in messages)
 
 
 def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
@@ -459,6 +485,25 @@ def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
         )
     ]
     assert created[0].started_turns[0][0] == "thread-existing"
+
+
+def test_worker_runtime_emit_serializes_concurrent_writes():
+    output = OverlapDetectingOutput()
+    runtime = CodexWorkerRuntime(output=output)
+
+    first = threading.Thread(target=lambda: runtime.emit("pong", {"seq": 1}))
+    second = threading.Thread(target=lambda: runtime.emit("pong", {"seq": 2}))
+
+    first.start()
+    assert output._first_write_entered.wait(timeout=1)
+    second.start()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert output.overlapped is False
+    assert [decode_worker_line(line)["type"] for line in output.lines] == ["pong", "pong"]
 
 
 def test_worker_process_source_does_not_import_wx():
