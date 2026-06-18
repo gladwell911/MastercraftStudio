@@ -4625,7 +4625,33 @@ class ChatFrame(wx.Frame):
         known_chat_id = self._known_codex_event_chat_id(event)
         if known_chat_id:
             return known_chat_id
-        return str(self.active_chat_id or self.current_chat_id or "").strip()
+        return self._active_codex_event_fallback_chat_id(event)
+
+    def _active_codex_event_fallback_chat_id(self, event: CodexEvent) -> str:
+        active_chat = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        active_id = str(self.active_chat_id or self.current_chat_id or active_chat.get("id") or "").strip()
+        event_type = str(getattr(event, "type", "") or "").strip()
+        active_running = (
+            bool(getattr(self, "active_codex_turn_active", False))
+            or bool(active_chat.get("codex_turn_active"))
+            or event_type == "server_request"
+        )
+        if not active_running:
+            turns = active_chat.get("turns") if isinstance(active_chat.get("turns"), list) else []
+            active_idx = self._active_turn_index_value()
+            if 0 <= active_idx < len(turns) and isinstance(turns[active_idx], dict):
+                turn = turns[active_idx]
+                active_running = (
+                    str(turn.get("request_status") or "").strip() == "pending"
+                    and is_codex_model(str(turn.get("model") or ""))
+                )
+        if not active_running:
+            return ""
+        if not active_id:
+            active_id = self._ensure_active_chat_id()
+        if not self._codex_event_turn_is_compatible_with_chat(active_chat, event):
+            return ""
+        return active_id
 
     @staticmethod
     def _codex_execution_step_fallback(event: CodexEvent) -> str:
@@ -6739,12 +6765,14 @@ class ChatFrame(wx.Frame):
         thread_id = str(target_chat.get("codex_thread_id") or (self.active_codex_thread_id if is_current_target else "") or "").strip()
         turn_id = str(target_chat.get("codex_turn_id") or (self.active_codex_turn_id if is_current_target else "") or "").strip()
         recovery_context = bool(getattr(self, "_codex_recovery_context", False))
-        use_shared_client = (not from_recovery) and (not recovery_context) and chat_id in {self.active_chat_id, self.current_chat_id, ""}
-        if use_shared_client:
-            client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
-        else:
-            client_chat_id = chat_id or self.active_chat_id or self.current_chat_id or ""
-            client = self._get_or_create_codex_client(client_chat_id, model) if model != DEFAULT_CODEX_MODEL else self._get_or_create_codex_client(client_chat_id)
+        client_chat_id = str(chat_id or (target_chat.get("id") if isinstance(target_chat, dict) else "") or self.active_chat_id or self.current_chat_id or "").strip()
+        if not client_chat_id:
+            client_chat_id = self._ensure_active_chat_id()
+        client = (
+            self._get_or_create_codex_client(client_chat_id, model)
+            if model != DEFAULT_CODEX_MODEL
+            else self._get_or_create_codex_client(client_chat_id)
+        )
 
         def _sync_codex_thread_state(new_thread_id: str = "", new_turn_id: str = "", active: bool | None = None) -> None:
             if not isinstance(target_chat, dict):
@@ -7935,8 +7963,21 @@ class ChatFrame(wx.Frame):
         return 200, self._remote_speed_state_body(chat_id, chat)
 
     def _remote_api_clear_context_ui(self, payload: dict) -> tuple[int, dict]:
-        chat_id = str((payload or {}).get("chat_id") or "")
-        if not self._clear_context_and_start_new_chat():
+        chat_id = str((payload or {}).get("chat_id") or "").strip()
+        if not chat_id:
+            return 400, {
+                "accepted": False,
+                "chat_id": "",
+                "error": "missing_chat_id",
+            }
+        result = self._clear_context_for_chat_id(chat_id)
+        if result == "not_found":
+            return 404, {
+                "accepted": False,
+                "chat_id": chat_id,
+                "error": "chat_not_found",
+            }
+        if result != "cleared":
             return 409, {
                 "accepted": False,
                 "chat_id": chat_id,
@@ -8031,6 +8072,8 @@ class ChatFrame(wx.Frame):
 
     def _on_codex_event(self, event: CodexEvent) -> None:
         chat_id = self._resolve_codex_event_chat_id(event)
+        if not chat_id:
+            return
         if threading.current_thread() is not threading.main_thread():
             self._dispatch_codex_event_to_ui(chat_id, event)
             return
@@ -8063,7 +8106,7 @@ class ChatFrame(wx.Frame):
         elif chat_id and (event_turn_id or event_thread_id):
             known_chat_id = self._known_codex_event_chat_id(event)
             if known_chat_id and known_chat_id != chat_id:
-                chat_id = known_chat_id
+                return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
         if isinstance(identity_chat, dict) and not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
@@ -8159,6 +8202,7 @@ class ChatFrame(wx.Frame):
                 self.active_codex_turn_active = False
                 self.active_codex_pending_request = None
             target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            turn = {}
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
                 turn["request_status"] = "done"
@@ -9803,6 +9847,54 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
         self.SetStatusText("已清空上下文")
         return True
+
+    def _clear_context_for_chat_id(self, chat_id: str) -> str:
+        target_id = str(chat_id or "").strip()
+        if not target_id:
+            return "missing"
+        current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
+        current_ids.discard("")
+        if target_id in current_ids:
+            return "cleared" if self._clear_context_and_start_new_chat() else "unavailable"
+        target_chat = self._find_archived_chat(target_id)
+        if not isinstance(target_chat, dict):
+            return "not_found"
+        self._clear_context_chat_state(target_chat, target_id, time.time())
+        self._mark_chat_turns_dirty(target_id, 0)
+        if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
+            try:
+                self.chat_store.replace_turns(target_id, [])
+                self.chat_store.replace_execution_steps(target_id, [])
+            except Exception:
+                pass
+        self._defer_codex_state_save()
+        self._push_remote_history_changed(target_id)
+        self._push_remote_state(target_id)
+        self.SetStatusText("已清空上下文")
+        return "cleared"
+
+    def _clear_context_chat_state(self, chat: dict, chat_id: str, updated_at: float) -> None:
+        chat["id"] = str(chat.get("id") or chat_id or "").strip()
+        chat["turns"] = []
+        chat["updated_at"] = updated_at
+        chat["openclaw_session_key"] = DEFAULT_OPENCLAW_SESSION_KEY
+        chat["openclaw_session_id"] = ""
+        chat["openclaw_session_file"] = ""
+        chat["openclaw_sync_offset"] = 0
+        chat["openclaw_last_event_id"] = ""
+        chat["openclaw_last_synced_at"] = 0.0
+        chat["codex_thread_id"] = ""
+        chat["codex_turn_id"] = ""
+        chat["codex_turn_active"] = False
+        chat["codex_pending_prompt"] = ""
+        chat["codex_pending_request"] = None
+        chat["codex_request_queue"] = []
+        chat["codex_thread_flags"] = []
+        chat["codex_latest_assistant_text"] = ""
+        chat["codex_latest_assistant_phase"] = ""
+        chat["claudecode_session_id"] = ""
+        chat["context_usage"] = None
+        chat["execution_steps"] = []
 
     def _prompt_and_create_named_chat(self) -> bool:
         if not self.new_chat_button.IsEnabled():

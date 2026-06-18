@@ -57,7 +57,7 @@ def test_send_click_routes_codex_start(frame, monkeypatch):
         def steer_turn(self, thread_id, expected_turn_id, text):
             raise AssertionError("should not steer")
 
-    frame._ensure_codex_client = lambda: _Client()
+    frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("鍐欎竴涓?hello world")
 
     frame._on_send_clicked(None)
@@ -98,7 +98,7 @@ def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):
             seen["steer"] = (thread_id, expected_turn_id, text)
             return {"turnId": expected_turn_id}
 
-    frame._ensure_codex_client = lambda: _Client()
+    frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("src/app.py")
 
     frame._on_send_clicked(None)
@@ -135,7 +135,7 @@ def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt
             seen["steer"] = (thread_id, expected_turn_id, text)
             return {"turnId": expected_turn_id}
 
-    frame._ensure_codex_client = lambda: _Client()
+    frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("缁х画澶勭悊")
 
     frame._on_send_clicked(None)
@@ -172,7 +172,7 @@ def test_send_click_routes_codex_start_when_turn_is_inactive_even_with_stale_pro
         def steer_turn(self, thread_id, expected_turn_id, text):
             raise AssertionError("should not steer when the turn is inactive")
 
-    frame._ensure_codex_client = lambda: _Client()
+    frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("新的补充")
 
     frame._on_send_clicked(None)
@@ -230,6 +230,9 @@ def test_codex_final_question_sets_pending_prompt_and_updates_answer(frame):
 
 
 def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
     frame.active_codex_turn_active = True
     frame.active_session_turns = [
         {
@@ -239,6 +242,12 @@ def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(fram
             "created_at": time.time(),
         }
     ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
     rendered = {"n": 0}
     focused = {"n": 0}
     monkeypatch.setattr(frame, "_render_answer_list", lambda: rendered.__setitem__("n", rendered["n"] + 1))
@@ -255,7 +264,7 @@ def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(fram
     )
 
     assert frame.active_session_turns[0]["answer_md"] == "done"
-    assert rendered["n"] == 1
+    assert rendered["n"] == 0
     assert focused["n"] == 1
 
 
@@ -382,7 +391,7 @@ def test_multiple_chat_ids_get_distinct_codex_clients(frame):
     assert frame._codex_clients["chat-b"] is client_b
 
 
-def test_codex_event_for_stale_chat_id_still_refreshes_current_chat(frame, monkeypatch):
+def test_codex_event_for_stale_chat_id_with_current_thread_id_is_ignored(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.active_codex_thread_id = TEST_THREAD_ID
     frame.active_codex_turn_id = TEST_TURN_ID
@@ -426,9 +435,10 @@ def test_codex_event_for_stale_chat_id_still_refreshes_current_chat(frame, monke
         ),
     )
 
-    assert frame.active_session_turns[0]["answer_md"] == "final answer"
-    assert rendered["n"] == 1
-    assert focused["n"] == 1
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+    assert frame.archived_chats[0]["turns"][0]["answer_md"] == main.REQUESTING_TEXT
+    assert rendered["n"] == 0
+    assert focused["n"] == 0
 
 
 def test_background_codex_progress_event_defers_ui_feedback_and_state_flush(frame, monkeypatch):

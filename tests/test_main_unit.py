@@ -3241,6 +3241,51 @@ def test_background_chat_execution_event_does_not_append_to_visible_execution_li
     assert append_count["n"] == 0
 
 
+def test_unresolved_codex_event_does_not_append_to_idle_visible_execution_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_codex_turn_active = False
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "聊天 A",
+        "turns": [{"question": "A 的问题", "answer_md": "A 的回答", "model": main.DEFAULT_CODEX_MODEL}],
+        "detail_panel_mode": "execution",
+        "execution_steps": [{"step": "A 原有过程"}],
+        "codex_turn_active": False,
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "聊天 B",
+            "turns": [
+                {
+                    "question": "B 的问题",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "request_status": "pending",
+                }
+            ],
+            "detail_panel_mode": "execution",
+            "execution_steps": [],
+            "codex_turn_active": True,
+        }
+    ]
+    frame._render_execution_list()
+    before_rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    frame._on_codex_event(
+        main.CodexEvent(
+            type="plan_updated",
+            text="B 的计划不应写入 A",
+        )
+    )
+
+    assert frame._current_chat_state["execution_steps"] == [{"step": "A 原有过程"}]
+    assert frame.archived_chats[0]["execution_steps"] == []
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == before_rows
+
+
 def test_execution_list_enter_and_double_click_open_execution_detail(frame, monkeypatch):
     frame._current_chat_state = {
         "id": "chat-1",
@@ -4901,6 +4946,51 @@ def test_codex_submit_sets_resume_recovery_mode(frame, monkeypatch):
         "thread_id": "11111111-1111-1111-1111-111111111111",
         "turn_id": "22222222-2222-2222-2222-222222222222",
     }
+
+
+def test_codex_worker_uses_chat_bound_client_for_current_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A 正在执行",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+        }
+    ]
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "聊天 A",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: "C:\\code\\sj\\mc")
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda func, *args, **kwargs: func(*args, **kwargs))
+
+    class _Client:
+        def start_thread(self, **_kwargs):
+            return {"thread": {"id": "thread-a"}}
+
+        def start_turn_items(self, thread_id, items, **_kwargs):
+            assert thread_id == "thread-a"
+            assert items
+            return {"turn": {"id": "turn-a"}}
+
+    bound_calls = []
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda *_args, **_kwargs: pytest.fail("current chat turns need a chat-bound Codex client"))
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": bound_calls.append((chat_id, model)) or _Client())
+
+    frame._run_codex_turn_worker("chat-a", 0, "A 正在执行", main.DEFAULT_CODEX_MODEL)
+
+    assert bound_calls == [("chat-a", "")]
+    assert frame.active_session_turns[0]["codex_thread_id"] == "thread-a"
+    assert frame.active_session_turns[0]["codex_turn_id"] == "turn-a"
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_session_turns[0].get("request_error", "") == ""
 
 
 def test_claudecode_submit_sets_resume_recovery_mode(frame, monkeypatch):
@@ -10446,6 +10536,8 @@ def test_clear_context_shortcut_clears_current_chat_backend_thread_state(frame, 
 
 
 def test_remote_api_clear_context_uses_desktop_clear_context_command(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
     calls = []
     monkeypatch.setattr(
         frame,
@@ -10458,6 +10550,116 @@ def test_remote_api_clear_context_uses_desktop_clear_context_command(frame, monk
     assert status == 200
     assert body == {"accepted": True, "chat_id": "chat-current"}
     assert calls == ["clear"]
+
+
+def test_remote_api_clear_context_clears_requested_archived_chat_without_touching_active_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A 正在执行",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "created_at": 1.0,
+        }
+    ]
+    frame.active_codex_thread_id = "thread-a"
+    frame.active_codex_turn_id = "turn-a"
+    frame.active_codex_turn_active = True
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "聊天 A",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-a",
+        "codex_turn_id": "turn-a",
+        "codex_turn_active": True,
+        "execution_steps": [{"list_text": "A 执行过程"}],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "聊天 B",
+            "turns": [
+                {
+                    "question": "B 旧问题",
+                    "answer_md": "B 旧回答",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 2.0,
+                }
+            ],
+            "codex_thread_id": "thread-b",
+            "codex_turn_id": "turn-b",
+            "codex_turn_active": True,
+            "codex_pending_prompt": "prompt-b",
+            "codex_pending_request": {"kind": "user_input"},
+            "codex_request_queue": [{"prompt": "queued-b"}],
+            "codex_thread_flags": ["waitingOnUserInput"],
+            "codex_latest_assistant_text": "partial-b",
+            "codex_latest_assistant_phase": "answer",
+            "openclaw_session_key": "openclaw-b",
+            "openclaw_session_id": "openclaw-session-b",
+            "openclaw_session_file": "openclaw-b.jsonl",
+            "openclaw_sync_offset": 9,
+            "openclaw_last_event_id": "openclaw-event-b",
+            "openclaw_last_synced_at": 123.0,
+            "claudecode_session_id": "claude-b",
+            "context_usage": {"input_tokens": 1},
+            "execution_steps": [{"list_text": "B 执行过程"}],
+            "created_at": 2.0,
+            "updated_at": 3.0,
+        }
+    ]
+    pushed = []
+    monkeypatch.setattr(frame, "_clear_context_and_start_new_chat", lambda: pytest.fail("remote clear for archived chat must not clear active chat"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id: pushed.append(chat_id))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushed.append(f"state:{chat_id}"))
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    status, body = frame._remote_api_clear_context_ui({"chat_id": "chat-b"})
+
+    archived = frame._find_archived_chat("chat-b")
+    assert status == 200
+    assert body == {"accepted": True, "chat_id": "chat-b"}
+    assert frame.active_chat_id == "chat-a"
+    assert frame.current_chat_id == "chat-a"
+    assert frame.active_session_turns[0]["question"] == "A 正在执行"
+    assert frame.active_codex_thread_id == "thread-a"
+    assert frame.active_codex_turn_active is True
+    assert frame._current_chat_state["execution_steps"] == [{"list_text": "A 执行过程"}]
+    assert archived["turns"] == []
+    assert archived["codex_thread_id"] == ""
+    assert archived["codex_turn_id"] == ""
+    assert archived["codex_turn_active"] is False
+    assert archived["codex_pending_prompt"] == ""
+    assert archived["codex_pending_request"] is None
+    assert archived["codex_request_queue"] == []
+    assert archived["codex_thread_flags"] == []
+    assert archived["codex_latest_assistant_text"] == ""
+    assert archived["codex_latest_assistant_phase"] == ""
+    assert archived["openclaw_session_key"] == main.DEFAULT_OPENCLAW_SESSION_KEY
+    assert archived["openclaw_session_id"] == ""
+    assert archived["openclaw_session_file"] == ""
+    assert archived["openclaw_sync_offset"] == 0
+    assert archived["openclaw_last_event_id"] == ""
+    assert archived["openclaw_last_synced_at"] == 0.0
+    assert archived["claudecode_session_id"] == ""
+    assert archived["context_usage"] is None
+    assert archived["execution_steps"] == []
+    assert pushed == ["chat-b", "state:chat-b"]
+
+
+def test_remote_api_clear_context_rejects_missing_or_unknown_chat_id(frame):
+    missing_status, missing_body = frame._remote_api_clear_context_ui({})
+    unknown_status, unknown_body = frame._remote_api_clear_context_ui({"chat_id": "missing-chat"})
+
+    assert missing_status == 400
+    assert missing_body["accepted"] is False
+    assert missing_body["error"] == "missing_chat_id"
+    assert unknown_status == 404
+    assert unknown_body["accepted"] is False
+    assert unknown_body["error"] == "chat_not_found"
 
 
 def test_cd_first_question_auto_title_uses_directory_name_and_unique_suffix(frame, monkeypatch):
@@ -12699,7 +12901,7 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
         def steer_turn(self, thread_id, expected_turn_id, text):
             raise AssertionError("should not steer when the turn is inactive")
 
-    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
@@ -12749,7 +12951,7 @@ def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(fram
             seen["turn"].append((thread_id, text))
             return {"turn": {"id": "turn-new"}}
 
-    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
@@ -12803,7 +13005,7 @@ def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, m
             seen["turn"].append((thread_id, items, kwargs))
             return {"turn": {"id": "turn-fast"}}
 
-    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
@@ -12859,7 +13061,7 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
             seen["turn"].append((thread_id, text))
             return {"turn": {"id": "turn-new"}}
 
-    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
@@ -12911,7 +13113,7 @@ def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, 
             seen["items"].append((thread_id, items))
             return {"turn": {"id": "turn-new"}}
 
-    monkeypatch.setattr(frame, "_ensure_codex_client", lambda: _Client())
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
