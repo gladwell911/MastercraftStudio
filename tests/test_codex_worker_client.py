@@ -475,6 +475,54 @@ def test_worker_client_on_message_coalesces_until_drain():
     assert observed == [{"type": "messages_pending"}, {"type": "messages_pending"}]
 
 
+def test_worker_client_partial_drain_notifies_for_remaining_messages():
+    observed = []
+    client = CodexWorkerClient(
+        process_factory=lambda args: FakeProcess(), on_message=observed.append, start_reader_threads=False
+    )
+
+    for text in ("step 1", "step 2", "step 3"):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {"type": "item_started", "text": text},
+                },
+            }
+        )
+
+    assert observed == [{"type": "messages_pending"}]
+
+    drained = client.drain_pending_messages(limit=1)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["step 1"]
+    assert observed == [{"type": "messages_pending"}, {"type": "messages_pending"}]
+
+    assert [item["payload"]["event"]["text"] for item in client.drain_pending_messages(limit=10)] == [
+        "step 2",
+        "step 3",
+    ]
+
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "item_completed", "text": "done"},
+            },
+        }
+    )
+
+    assert observed == [
+        {"type": "messages_pending"},
+        {"type": "messages_pending"},
+        {"type": "messages_pending"},
+    ]
+
+
 def test_worker_client_queue_limit_counts_delta_entries_and_normal_entries():
     client = CodexWorkerClient(
         process_factory=lambda args: FakeProcess(), start_reader_threads=False, queue_limit=2

@@ -134,6 +134,7 @@ class CodexWorkerClient:
         drained: list[dict[str, Any]] = []
         if remaining == 0:
             return drained
+        notify_pending = False
         with self._lock:
             while remaining and self._queue:
                 entry = self._queue.popleft()
@@ -143,7 +144,13 @@ class CodexWorkerClient:
                     drained.append(entry["message"])
                 remaining -= 1
             if drained:
-                self._pending_notification = False
+                if self._queue:
+                    self._pending_notification = True
+                    notify_pending = True
+                else:
+                    self._pending_notification = False
+        if notify_pending and self.on_message is not None:
+            self.on_message({"type": "messages_pending"})
         return drained
 
     def _enqueue_worker_message(self, message: dict[str, Any]) -> None:
