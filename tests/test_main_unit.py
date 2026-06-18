@@ -10552,6 +10552,124 @@ def test_remote_api_clear_context_uses_desktop_clear_context_command(frame, monk
     assert calls == ["clear"]
 
 
+def test_clear_context_shortcut_targets_visible_history_chat_not_running_active_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-b"
+    frame.active_session_turns = [
+        {
+            "question": "A 正在执行",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "created_at": 1.0,
+        }
+    ]
+    frame.active_codex_thread_id = "thread-a"
+    frame.active_codex_turn_active = True
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "聊天 A",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-a",
+        "codex_turn_active": True,
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "聊天 B",
+            "turns": [
+                {
+                    "question": "B 旧问题",
+                    "answer_md": "B 旧回答",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 2.0,
+                }
+            ],
+            "codex_thread_id": "thread-b",
+            "codex_turn_active": True,
+            "execution_steps": [{"list_text": "B 执行过程"}],
+            "created_at": 2.0,
+            "updated_at": 3.0,
+        }
+    ]
+    pushed = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id: pushed.append(chat_id))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushed.append(f"state:{chat_id}"))
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    assert frame._clear_context_and_start_new_chat() is True
+
+    archived = frame._find_archived_chat("chat-b")
+    assert frame.active_chat_id == "chat-a"
+    assert frame.current_chat_id == "chat-a"
+    assert frame.active_session_turns[0]["question"] == "A 正在执行"
+    assert frame.active_codex_thread_id == "thread-a"
+    assert frame.active_codex_turn_active is True
+    assert frame._current_chat_state["turns"] == frame.active_session_turns
+    assert archived["turns"] == []
+    assert archived["codex_thread_id"] == ""
+    assert archived["codex_turn_active"] is False
+    assert archived["execution_steps"] == []
+    assert frame.answer_list.GetCount() >= 1
+    assert "B 旧问题" not in [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert frame.answer_list.GetString(frame.answer_list.GetCount() - 1) == "以开启新会话"
+    assert pushed == ["chat-b", "state:chat-b"]
+
+
+def test_clear_context_tail_notice_stays_with_cleared_history_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A 问题",
+            "answer_md": "A 回答",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "聊天 A",
+        "turns": frame.active_session_turns,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-c",
+            "title": "聊天 C",
+            "turns": [
+                {
+                    "question": "C 问题",
+                    "answer_md": "C 回答",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 2.0,
+                }
+            ],
+            "created_at": 2.0,
+            "updated_at": 2.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda *_args, **_kwargs: None)
+
+    assert frame._show_history_chat("chat-c")
+    assert frame._clear_context_and_start_new_chat() is True
+    cleared_rows = list(frame.answer_list.GetStrings())
+    assert "以开启新会话" in cleared_rows
+
+    assert frame._show_history_chat("chat-a")
+    active_rows = list(frame.answer_list.GetStrings())
+
+    assert "以开启新会话" not in active_rows
+    assert any("A 问题" in row for row in active_rows)
+
+
 def test_remote_api_clear_context_clears_requested_archived_chat_without_touching_active_chat(frame, monkeypatch):
     frame.active_chat_id = "chat-a"
     frame.current_chat_id = "chat-a"

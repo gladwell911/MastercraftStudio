@@ -3858,6 +3858,11 @@ class ChatFrame(wx.Frame):
         metas: list[tuple] = []
         self._active_answer_row_index = -1
         turns = self._get_view_turns()
+        visible_chat_id = (
+            str(self.view_history_id or "").strip()
+            if self.view_mode == "history"
+            else str(self.active_chat_id or self.current_chat_id or (self._current_chat_state or {}).get("id") or "").strip()
+        )
         context_usage_label = format_context_usage_label(self._active_chat_context_usage())
         if self._should_show_context_usage_row(context_usage_label, turns):
             self._append_context_usage_row(rows, metas)
@@ -3868,7 +3873,8 @@ class ChatFrame(wx.Frame):
             rows.append("暂无对话内容")
             metas.append(("info", -1, "", ""))
             tail_notice = str(getattr(self, "_answer_list_tail_notice", "") or "").strip()
-            if tail_notice:
+            tail_notice_chat_id = str(getattr(self, "_answer_list_tail_notice_chat_id", "") or "").strip()
+            if tail_notice and (not tail_notice_chat_id or tail_notice_chat_id == visible_chat_id):
                 rows.append(tail_notice)
                 metas.append(("notice", -1, tail_notice, ""))
             selected_idx = 0 if rows else None
@@ -3934,7 +3940,8 @@ class ChatFrame(wx.Frame):
         active_meta = metas[self._active_answer_row_index] if 0 <= self._active_answer_row_index < len(metas) else None
         rows, metas, active_idx = self._answer_rows_with_limit(rows, metas, header_count, active_meta=active_meta, force_has_more=force_has_more)
         tail_notice = str(getattr(self, "_answer_list_tail_notice", "") or "").strip()
-        if tail_notice:
+        tail_notice_chat_id = str(getattr(self, "_answer_list_tail_notice_chat_id", "") or "").strip()
+        if tail_notice and (not tail_notice_chat_id or tail_notice_chat_id == visible_chat_id):
             rows.append(tail_notice)
             metas.append(("notice", -1, tail_notice, ""))
         selected_idx = self.answer_list.GetSelection()
@@ -9793,6 +9800,12 @@ class ChatFrame(wx.Frame):
     def _clear_context_and_start_new_chat(self) -> bool:
         if not self.new_chat_button.IsEnabled():
             return False
+        visible_history_id = str(getattr(self, "view_history_id", "") or "").strip()
+        if getattr(self, "view_mode", "") == "history" and visible_history_id:
+            current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
+            current_ids.discard("")
+            if visible_history_id not in current_ids:
+                return self._clear_context_for_chat_id(visible_history_id) == "cleared"
         now = time.time()
         if not self.active_chat_id:
             self.active_chat_id = self._ensure_active_chat_id()
@@ -9841,6 +9854,7 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["context_usage"] = None
         self._current_chat_state["execution_steps"] = []
         self._answer_list_tail_notice = "以开启新会话"
+        self._answer_list_tail_notice_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         self._render_answer_list()
         self._defer_chat_state_save()
         self._mark_openclaw_lifecycle_dirty()
@@ -9870,6 +9884,10 @@ class ChatFrame(wx.Frame):
         self._defer_codex_state_save()
         self._push_remote_history_changed(target_id)
         self._push_remote_state(target_id)
+        if getattr(self, "view_mode", "") == "history" and str(getattr(self, "view_history_id", "") or "").strip() == target_id:
+            self._answer_list_tail_notice = "以开启新会话"
+            self._answer_list_tail_notice_chat_id = target_id
+            self._render_answer_list()
         self.SetStatusText("已清空上下文")
         return "cleared"
 
@@ -9929,6 +9947,7 @@ class ChatFrame(wx.Frame):
         if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
         self._answer_list_tail_notice = ""
+        self._answer_list_tail_notice_chat_id = ""
 
         # 检查是否有活跃的 Claude Code 客户端在等待输入
         if hasattr(self, '_active_claudecode_client') and self._active_claudecode_client is not None:

@@ -118,6 +118,29 @@ class _F2Event:
         raise AssertionError("F2 should open history rename")
 
 
+class _AltAEvent:
+    def __init__(self, event_object=None):
+        self._event_object = event_object
+
+    def GetKeyCode(self):
+        return ord("A")
+
+    def GetEventObject(self):
+        return self._event_object
+
+    def ShiftDown(self):
+        return False
+
+    def ControlDown(self):
+        return False
+
+    def AltDown(self):
+        return True
+
+    def Skip(self):
+        raise AssertionError("Alt+A should clear the visible chat context")
+
+
 def test_ui_automation_application_menu_opens_for_current_chat(frame, wx_app, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-current"
@@ -154,6 +177,85 @@ def test_ui_automation_history_f2_opens_rename_for_selected_chat(frame, wx_app, 
 
     assert calls["rename"] == 1
     assert frame.history_ids[frame.history_list.GetSelection()] == "chat-a"
+
+
+def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_running_active_chat(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A running question",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "created_at": 2.0,
+        }
+    ]
+    frame.active_codex_thread_id = "thread-a"
+    frame.active_codex_turn_active = True
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "chat a",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-a",
+        "codex_turn_active": True,
+        "execution_steps": [{"list_text": "A execution remains"}],
+        "created_at": 2.0,
+        "updated_at": 2.0,
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "chat b",
+            "turns": [
+                {
+                    "question": "B old question",
+                    "answer_md": "B old answer",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                }
+            ],
+            "codex_thread_id": "thread-b",
+            "codex_turn_active": True,
+            "execution_steps": [{"list_text": "B execution clears"}],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+
+    assert frame._show_history_chat("chat-b")
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-b"
+    assert any("B old question" in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
+    frame.answer_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    frame._on_char_hook(_AltAEvent(frame.answer_list))
+    wx_app.Yield()
+
+    archived = frame._find_archived_chat("chat-b")
+    assert frame.active_chat_id == "chat-a"
+    assert frame.current_chat_id == "chat-a"
+    assert frame.active_session_turns[0]["question"] == "A running question"
+    assert frame.active_codex_thread_id == "thread-a"
+    assert frame.active_codex_turn_active is True
+    assert archived["turns"] == []
+    assert archived["codex_thread_id"] == ""
+    assert archived["codex_turn_active"] is False
+    assert archived["execution_steps"] == []
+    rows = list(frame.answer_list.GetStrings())
+    assert "B old question" not in rows
+    assert rows[-1] == "以开启新会话"
+
+    assert frame._show_history_chat("chat-a")
+    active_rows = list(frame.answer_list.GetStrings())
+    assert "以开启新会话" not in active_rows
+    assert any("A running question" in row for row in active_rows)
 
 
 def test_ui_automation_new_chat_button_shift_enter_creates_named_chat(frame, wx_app, monkeypatch):
