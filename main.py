@@ -9373,6 +9373,7 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
             event.Skip()
             return
+        self._touch_navigation_quiet_window(event)
         self._suppress_tools_menu_open()
         if (
             ctrl_down
@@ -9548,6 +9549,7 @@ class ChatFrame(wx.Frame):
     def _on_input_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
             return
+        self._touch_navigation_quiet_window(event)
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
@@ -11142,6 +11144,9 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
 
     def _on_answer_key_down(self, event):
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        self._touch_navigation_quiet_window(event)
         key = event.GetKeyCode()
         ctrl = self._event_control_down(event)
         alt = self._event_alt_down(event)
@@ -11149,8 +11154,6 @@ class ChatFrame(wx.Frame):
         if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
             if self._move_answer_list_selection_for_key(key):
                 return
-        if self._on_any_key_down_escape_minimize(event):
-            return
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
@@ -11240,13 +11243,14 @@ class ChatFrame(wx.Frame):
         self._open_selected_answer_text_viewer()
 
     def _on_execution_key_down(self, event):
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        self._touch_navigation_quiet_window(event)
         key = event.GetKeyCode()
         ctrl = event.ControlDown()
         alt = self._event_alt_down(event)
         if key == wx.WXK_F1 and not ctrl and not alt:
             self._toggle_detail_panel_mode(focus_detail=True)
-            return
-        if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_ctrl_history_navigation(event):
             return
@@ -11495,6 +11499,7 @@ class ChatFrame(wx.Frame):
     def _on_history_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
             return
+        self._touch_navigation_quiet_window(event)
         if self._handle_ctrl_history_navigation(event):
             return
         if self._handle_primary_tab_navigation(event):
@@ -12045,6 +12050,7 @@ class ChatFrame(wx.Frame):
     def _on_generic_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
             return
+        self._touch_navigation_quiet_window(event)
         if self._handle_named_new_chat_shortcut(event):
             return
         if self._handle_ctrl_history_navigation(event):

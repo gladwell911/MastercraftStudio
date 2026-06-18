@@ -116,6 +116,36 @@ def test_navigation_quiet_window_extends_on_repeated_trigger(frame, monkeypatch)
     assert frame._navigation_quiet_until == 104.5
 
 
+def test_char_hook_touches_quiet_window_before_alt_a_clear(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "turns": []}
+    observed = []
+
+    def fake_clear():
+        observed.append(frame._navigation_quiet_until)
+        return True
+
+    monkeypatch.setattr(main.time, "monotonic", lambda: 200.0)
+    monkeypatch.setattr(frame, "_clear_context_and_start_new_chat", fake_clear)
+
+    event = _QuietKeyEvent(ord("A"), alt=True)
+    frame._on_char_hook(event)
+
+    assert observed == [203.0]
+
+
+def test_input_key_down_touches_quiet_window_before_send_shortcut(frame, monkeypatch):
+    observed = []
+    monkeypatch.setattr(main.time, "monotonic", lambda: 300.0)
+    monkeypatch.setattr(frame, "_trigger_send", lambda: observed.append(frame._navigation_quiet_until))
+
+    event = _QuietKeyEvent(main.wx.WXK_RETURN)
+    frame._on_input_key_down(event)
+
+    assert observed == [303.0]
+
+
 def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, monkeypatch):
     frame.active_chat_id = "chat-old"
     frame.current_chat_id = "chat-old"
