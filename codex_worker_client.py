@@ -206,7 +206,8 @@ class CodexWorkerClient:
         event = payload.get("event") or {}
         turn_key = self._event_turn_id(event)
         if not turn_key:
-            turn_key = str(payload.get("turn_idx") or "")
+            turn_idx = payload.get("turn_idx")
+            turn_key = "" if turn_idx is None else str(turn_idx)
         return str(payload.get("chat_id") or ""), turn_key
 
     @staticmethod

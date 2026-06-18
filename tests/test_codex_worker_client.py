@@ -195,3 +195,42 @@ def test_worker_client_compacts_deltas_by_event_turn_id_variants():
     assert "turn-a-old" not in event_texts
     assert "turn-b-old" not in event_texts
     assert "turn-c-old" not in event_texts
+
+
+def test_worker_client_delta_fallback_preserves_zero_turn_idx():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+    zero_turn_message = {
+        "type": "event",
+        "payload": {
+            "chat_id": "chat-c",
+            "turn_idx": 0,
+            "event": {
+                "type": "agent_message_delta",
+                "text": "turn-idx-zero",
+            },
+        },
+    }
+
+    assert client._delta_key(zero_turn_message) == ("chat-c", "0")
+
+    for message in (
+        zero_turn_message,
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 1,
+                "event": {
+                    "type": "agent_message_delta",
+                    "text": "turn-idx-one",
+                },
+            },
+        },
+    ):
+        client._enqueue_worker_message(message)
+
+    drained = client.drain_pending_messages(limit=10)
+
+    event_texts = [item["payload"]["event"]["text"] for item in drained]
+    assert "turn-idx-zero" in event_texts
+    assert "turn-idx-one" in event_texts
