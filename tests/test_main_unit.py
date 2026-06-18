@@ -58,6 +58,64 @@ def test_clear_context_shortcut_mapping(frame):
     assert not frame._is_clear_context_shortcut(ord("A"), alt=False)
 
 
+class _QuietKeyEvent:
+    def __init__(self, key, *, alt=False, shift=False, ctrl=False):
+        self._key = key
+        self._alt = alt
+        self._shift = shift
+        self._ctrl = ctrl
+
+    def GetKeyCode(self):
+        return self._key
+
+    def AltDown(self):
+        return self._alt
+
+    def ShiftDown(self):
+        return self._shift
+
+    def ControlDown(self):
+        return self._ctrl
+
+
+def test_navigation_quiet_trigger_keys(frame):
+    keys = [
+        main.wx.WXK_TAB,
+        main.wx.WXK_UP,
+        main.wx.WXK_DOWN,
+        main.wx.WXK_LEFT,
+        main.wx.WXK_RIGHT,
+        main.wx.WXK_HOME,
+        main.wx.WXK_END,
+        main.wx.WXK_PAGEUP,
+        main.wx.WXK_PAGEDOWN,
+        main.wx.WXK_RETURN,
+        main.wx.WXK_NUMPAD_ENTER,
+        main.wx.WXK_SPACE,
+    ]
+    for key in keys:
+        assert frame._is_navigation_quiet_trigger(_QuietKeyEvent(key))
+    assert frame._is_navigation_quiet_trigger(_QuietKeyEvent(main.wx.WXK_TAB, shift=True))
+    for key in "ASDFGBCasdfgbc":
+        assert frame._is_navigation_quiet_trigger(_QuietKeyEvent(ord(key), alt=True))
+    assert not frame._is_navigation_quiet_trigger(_QuietKeyEvent(main.wx.WXK_TAB, ctrl=True))
+    assert not frame._is_navigation_quiet_trigger(_QuietKeyEvent(main.wx.WXK_RETURN, ctrl=True))
+    assert not frame._is_navigation_quiet_trigger(_QuietKeyEvent(ord("A"), alt=True, ctrl=True))
+    assert not frame._is_navigation_quiet_trigger(_QuietKeyEvent(ord("X"), alt=True))
+    assert not frame._is_navigation_quiet_trigger(_QuietKeyEvent(ord("A"), alt=False))
+
+
+def test_navigation_quiet_window_extends_on_repeated_trigger(frame, monkeypatch):
+    times = iter([100.0, 101.5])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(times))
+
+    frame._touch_navigation_quiet_window(_QuietKeyEvent(main.wx.WXK_DOWN))
+    assert frame._navigation_quiet_until == 103.0
+
+    frame._touch_navigation_quiet_window(_QuietKeyEvent(main.wx.WXK_UP))
+    assert frame._navigation_quiet_until == 104.5
+
+
 def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, monkeypatch):
     frame.active_chat_id = "chat-old"
     frame.current_chat_id = "chat-old"

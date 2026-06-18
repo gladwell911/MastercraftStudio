@@ -162,6 +162,22 @@ EVENT_OBJECT_FOCUS = 0x8005
 EVENT_OBJECT_VALUECHANGE = 0x800E
 OBJID_CLIENT = -4
 CHILDID_SELF = 0
+NAVIGATION_QUIET_SECONDS = 3.0
+NAVIGATION_QUIET_ALT_KEYS = {ord(ch) for ch in "ASDFGBCasdfgbc"}
+NAVIGATION_QUIET_KEYS = {
+    wx.WXK_TAB,
+    wx.WXK_UP,
+    wx.WXK_DOWN,
+    wx.WXK_LEFT,
+    wx.WXK_RIGHT,
+    wx.WXK_HOME,
+    wx.WXK_END,
+    wx.WXK_PAGEUP,
+    wx.WXK_PAGEDOWN,
+    wx.WXK_RETURN,
+    wx.WXK_NUMPAD_ENTER,
+    wx.WXK_SPACE,
+}
 
 
 def openrouter_api_key_for_app() -> str:
@@ -1152,6 +1168,9 @@ class ChatFrame(wx.Frame):
         self._idle_ui_refresh_timer = None
         self._idle_ui_refresh_scheduled = False
         self._last_primary_interaction_at = time.monotonic()
+        self._navigation_quiet_until = 0.0
+        self._navigation_quiet_last_trigger = ""
+        self._deferred_background_ui_counts = {}
         self.ui_perf_slow_threshold_ms = UI_PERF_SLOW_THRESHOLD_MS
         self.ui_perf_slow_samples: list[dict] = []
         self._execution_list_deferred_repaint = False
@@ -9461,6 +9480,32 @@ class ChatFrame(wx.Frame):
             return bool(wx.GetKeyState(wx.WXK_ALT))
         except Exception:
             return False
+
+    def _is_navigation_quiet_trigger(self, event) -> bool:
+        try:
+            key = int(event.GetKeyCode())
+        except Exception:
+            return False
+        alt_down = self._event_alt_down(event)
+        ctrl_down = self._event_control_down(event)
+        if ctrl_down:
+            return False
+        if alt_down:
+            return key in NAVIGATION_QUIET_ALT_KEYS
+        return key in NAVIGATION_QUIET_KEYS
+
+    def _touch_navigation_quiet_window(self, event) -> None:
+        if not self._is_navigation_quiet_trigger(event):
+            return
+        self._navigation_quiet_until = time.monotonic() + NAVIGATION_QUIET_SECONDS
+        try:
+            key = int(event.GetKeyCode())
+        except Exception:
+            key = 0
+        self._navigation_quiet_last_trigger = f"key:{key}"
+
+    def _navigation_quiet_active(self) -> bool:
+        return time.monotonic() < float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0)
 
     def _is_real_escape_keydown(self, event) -> bool:
         ctrl_down = getattr(event, "ControlDown", None)
