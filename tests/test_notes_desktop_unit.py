@@ -72,6 +72,116 @@ def test_notes_store_creates_document_cache_schema(tmp_path):
     assert sync_state_columns == {"key", "value"}
 
 
+def _create_may_document_cache_notes_db(db_path, *, migration_marker: bool) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE notebooks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL DEFAULT '',
+                last_modified_by TEXT NOT NULL DEFAULT 'desktop',
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_notebook_id TEXT,
+                rev TEXT NOT NULL DEFAULT '',
+                deleted INTEGER NOT NULL DEFAULT 0,
+                dirty INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE entries (
+                id TEXT PRIMARY KEY,
+                notebook_id TEXT NOT NULL REFERENCES notebooks(id),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                device_id TEXT NOT NULL DEFAULT '',
+                last_modified_by TEXT NOT NULL DEFAULT 'desktop',
+                is_conflict_copy INTEGER NOT NULL DEFAULT 0,
+                origin_entry_id TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                rev TEXT NOT NULL DEFAULT '',
+                deleted INTEGER NOT NULL DEFAULT 0,
+                dirty INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE sync_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO notebooks (
+                id, title, created_at, updated_at, version, device_id,
+                last_modified_by, is_conflict_copy, origin_notebook_id,
+                rev, deleted, dirty
+            ) VALUES (
+                'may-nb', 'May notebook', '2026-05-26T00:00:00+00:00',
+                '2026-05-26T00:01:00+00:00', 3, 'desktop-may',
+                'desktop', 0, NULL, '1-may-nb', 0, 0
+            );
+            INSERT INTO entries (
+                id, notebook_id, content, created_at, updated_at,
+                sort_order, version, device_id, last_modified_by,
+                is_conflict_copy, origin_entry_id, source,
+                rev, deleted, dirty
+            ) VALUES (
+                'may-entry', 'may-nb', 'May entry body',
+                '2026-05-26T00:02:00+00:00',
+                '2026-05-26T00:03:00+00:00',
+                7, 4, 'desktop-may', 'desktop', 0, NULL,
+                'manual', '1-may-entry', 0, 0
+            );
+            INSERT INTO sync_state (key, value) VALUES ('last_cursor', '42');
+            """
+        )
+        if migration_marker:
+            conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?, ?)",
+                ("legacy_notes_migration_complete", "complete"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_notes_store_upgrades_may_document_cache_schema_without_marker_without_data_loss(tmp_path):
+    db_path = tmp_path / "notes.db"
+    _create_may_document_cache_notes_db(db_path, migration_marker=False)
+
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+
+    notebook = store.get_notebook("may-nb", include_deleted=True)
+    entry = store.get_entry("may-entry", include_deleted=True)
+    assert notebook is not None
+    assert notebook.title == "May notebook"
+    assert entry is not None
+    assert entry.notebook_id == "may-nb"
+    assert entry.content == "May entry body"
+    assert entry.sort_order == 7
+    assert entry.pinned is False
+    assert store.current_cursor() == "42"
+
+
+def test_notes_store_upgrades_may_document_cache_schema_with_marker_without_data_loss(tmp_path):
+    db_path = tmp_path / "notes.db"
+    _create_may_document_cache_notes_db(db_path, migration_marker=True)
+
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+
+    notebook = store.get_notebook("may-nb", include_deleted=True)
+    entry = store.get_entry("may-entry", include_deleted=True)
+    assert notebook is not None
+    assert notebook.title == "May notebook"
+    assert entry is not None
+    assert entry.content == "May entry body"
+    assert entry.pinned is False
+    assert store.current_cursor() == "42"
+
+
 def test_notes_store_migrates_legacy_tables_to_document_cache(tmp_path):
     db_path = tmp_path / "notes.db"
     long_text = "第二条" * 200

@@ -47,6 +47,7 @@ ENTRY_COLUMNS = {
     "deleted",
     "dirty",
 }
+MAY_DOCUMENT_CACHE_ENTRY_COLUMNS = ENTRY_COLUMNS - {"pinned"}
 
 
 def _utc_now() -> str:
@@ -106,8 +107,10 @@ class NotesStore:
             return True
         if "notebooks" in tables and self._table_columns(conn, "notebooks") != NOTEBOOK_COLUMNS:
             return True
-        if "entries" in tables and self._table_columns(conn, "entries") != ENTRY_COLUMNS:
-            return True
+        if "entries" in tables:
+            entry_columns = self._table_columns(conn, "entries")
+            if entry_columns not in (ENTRY_COLUMNS, MAY_DOCUMENT_CACHE_ENTRY_COLUMNS):
+                return True
         return False
 
     def _create_document_cache_schema(self, conn: sqlite3.Connection) -> None:
@@ -149,12 +152,16 @@ class NotesStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_entries_notebook_sort
-            ON entries (notebook_id, pinned, sort_order, created_at);
             """
         )
         if "pinned" not in self._table_columns(conn, "entries"):
             conn.execute("ALTER TABLE entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_entries_notebook_sort
+            ON entries (notebook_id, pinned, sort_order, created_at)
+            """
+        )
 
     def _drop_notes_tables(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
