@@ -258,6 +258,54 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
     assert any("A running question" in row for row in active_rows)
 
 
+def test_ui_automation_background_events_do_not_mutate_lists_during_reader_quiet(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "codex_turn_id": "turn-1",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+        "codex_turn_id": "turn-1",
+    }
+    frame._render_answer_list()
+    frame.answer_list.SetFocus()
+    wx_app.Yield()
+    focused_before = _focused_control()
+
+    frame._touch_navigation_quiet_window(_AltAEvent(frame.answer_list))
+    forbidden = []
+    monkeypatch.setattr(frame.answer_list, "Refresh", lambda *args, **kwargs: forbidden.append("answer.Refresh"))
+    monkeypatch.setattr(frame.answer_list, "SetSelection", lambda *args, **kwargs: forbidden.append("answer.SetSelection"))
+    monkeypatch.setattr(frame.execution_list, "Refresh", lambda *args, **kwargs: forbidden.append("execution.Refresh"))
+    monkeypatch.setattr(frame.execution_list, "Append", lambda *args, **kwargs: forbidden.append("execution.Append"))
+
+    frame._background_ui_update_depth = 1
+    frame._on_codex_event_for_chat(
+        "chat-active",
+        main.CodexEvent(type="subagent_result", turn_id="turn-1", text="background answer"),
+    )
+    frame._on_codex_event_for_chat(
+        "chat-active",
+        main.CodexEvent(type="item_started", turn_id="turn-1", status="commandExecution", data={"title": "run tests"}),
+    )
+
+    assert forbidden == []
+    assert _focused_control() is focused_before
+
+
 def test_ui_automation_new_chat_button_shift_enter_creates_named_chat(frame, wx_app, monkeypatch):
     frame.Show()
     frame.new_chat_button.SetFocusFromKbd()
