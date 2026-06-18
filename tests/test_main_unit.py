@@ -5404,7 +5404,7 @@ def test_handle_codex_request_dialog_does_not_submit_when_user_cancels(frame, mo
     assert calls == ["destroy"]
 
 
-def test_codex_client_event_bridge_ignores_events_after_wx_app_gone(frame, monkeypatch):
+def test_codex_worker_event_bridge_ignores_events_after_wx_app_gone(frame, monkeypatch):
     seen = {"called": False}
 
     monkeypatch.setattr(main.wx, "GetApp", lambda: None)
@@ -5415,11 +5415,247 @@ def test_codex_client_event_bridge_ignores_events_after_wx_app_gone(frame, monke
     monkeypatch.setattr(main.wx, "CallAfter", _call_after)
     monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda *_args, **_kwargs: seen.__setitem__("called", True))
 
-    client = frame._get_or_create_codex_client("chat-a")
-
-    client.on_event(main.CodexEvent(type="stderr", text="late event"))
+    frame._on_codex_worker_message(
+        "chat-a",
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-a",
+                "event": {"type": "stderr", "text": "late event"},
+            },
+        },
+    )
 
     assert seen["called"] is False
+
+
+def test_ui_get_or_create_codex_client_returns_worker_client(frame, monkeypatch):
+    created = []
+
+    class FakeWorkerClient:
+        codex_model = main.DEFAULT_CODEX_MODEL
+
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs)
+            self.closed = False
+
+        def start(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(main, "CodexWorkerClient", FakeWorkerClient)
+    monkeypatch.setattr(
+        main,
+        "CodexAppServerClient",
+        lambda *a, **k: pytest.fail("UI process must not instantiate CodexAppServerClient"),
+        raising=False,
+    )
+
+    client = frame._get_or_create_codex_client("chat-c", main.DEFAULT_CODEX_MODEL)
+
+    assert isinstance(client, FakeWorkerClient)
+    assert created
+
+
+def test_ui_source_no_longer_constructs_codex_app_server_client_directly():
+    source = Path("main.py").read_text(encoding="utf-8")
+    assert "CodexAppServerClient(" not in source
+
+
+def test_codex_worker_message_pending_drains_and_dispatches_event(frame, monkeypatch):
+    dispatched = []
+
+    class _FakeWorkerClient:
+        def drain_pending_messages(self, limit=100):
+            return [
+                {
+                    "type": "event",
+                    "payload": {
+                        "chat_id": "chat-c",
+                        "event": {
+                            "type": "plan_updated",
+                            "text": "worker step",
+                            "thread_id": "thread-c",
+                            "turn_id": "turn-c",
+                        },
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(frame, "_dispatch_codex_event_to_ui", lambda chat_id, event: dispatched.append((chat_id, event)))
+
+    frame._on_codex_worker_message("chat-c", {"type": "messages_pending"}, client=_FakeWorkerClient())
+
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == "chat-c"
+    assert dispatched[0][1] == main.CodexEvent(
+        type="plan_updated",
+        text="worker step",
+        thread_id="thread-c",
+        turn_id="turn-c",
+    )
+
+
+def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_codex_thread_id = "thread-a"
+    frame.active_codex_turn_id = "turn-a"
+    frame.active_codex_turn_active = True
+    frame.active_session_turns = [
+        {
+            "question": "active",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "codex_thread_id": "thread-a",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-a",
+        "codex_turn_id": "turn-a",
+        "codex_turn_active": True,
+        "execution_steps": [],
+    }
+    frame.archived_chats = [
+        {
+            "id": "chat-c",
+            "turns": [
+                {
+                    "question": "archived",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 2.0,
+                    "request_status": "pending",
+                    "codex_thread_id": "",
+                    "codex_turn_id": "",
+                }
+            ],
+            "codex_thread_id": "",
+            "codex_turn_id": "",
+            "codex_turn_active": False,
+            "execution_steps": [],
+        }
+    ]
+    deferred = []
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: deferred.append(True))
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {
+            "type": "thread_state",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "thread_id": "thread-c-new",
+                "turn_id": "turn-c-new",
+                "active": True,
+            },
+        },
+    )
+
+    archived = frame._find_archived_chat("chat-c")
+    assert archived["codex_thread_id"] == "thread-c-new"
+    assert archived["codex_turn_id"] == "turn-c-new"
+    assert archived["codex_turn_active"] is True
+    assert archived["turns"][0]["codex_thread_id"] == "thread-c-new"
+    assert archived["turns"][0]["codex_turn_id"] == "turn-c-new"
+    assert frame.active_codex_thread_id == "thread-a"
+    assert frame.active_codex_turn_id == "turn-a"
+    assert frame.active_session_turns[0]["codex_thread_id"] == "thread-a"
+    assert deferred == [True]
+
+
+def test_codex_worker_turn_started_ack_does_not_mark_request_done(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "active",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "codex_thread_id": "",
+            "codex_turn_id": "",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-c",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "",
+        "codex_turn_id": "",
+        "codex_turn_active": False,
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {
+            "type": "turn_started_ack",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "thread_id": "thread-c",
+                "turn_id": "turn-c",
+                "active": True,
+            },
+        },
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_codex_turn_active is True
+
+
+def test_codex_worker_protocol_error_does_not_mutate_active_chat_state(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_codex_thread_id = "thread-a"
+    frame.active_codex_turn_id = "turn-a"
+    frame.active_codex_turn_active = True
+    frame.active_session_turns = [
+        {
+            "question": "active",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "request_error": "",
+            "codex_thread_id": "thread-a",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-a",
+        "codex_turn_id": "turn-a",
+        "codex_turn_active": True,
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: pytest.fail("protocol_error should not save state"))
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {
+            "type": "protocol_error",
+            "payload": {"message": "bad request"},
+        },
+    )
+
+    assert frame.active_codex_thread_id == "thread-a"
+    assert frame.active_codex_turn_id == "turn-a"
+    assert frame.active_codex_turn_active is True
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_session_turns[0]["request_error"] == ""
 
 
 @pytest.mark.parametrize("event_type", ["agent_message_delta", "stderr", "plan_updated", "diff_updated"])
