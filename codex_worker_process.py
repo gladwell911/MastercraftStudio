@@ -23,7 +23,7 @@ class CodexWorkerRuntime:
         self._clients: dict[tuple[str, str], Any] = {}
         self._chat_models: dict[str, str] = {}
         self._turn_indices: dict[tuple[str, str], Any] = {}
-        self._input_request_clients: dict[str, tuple[str, str]] = {}
+        self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         self.output.write(encode_worker_message(make_worker_event(message_type, payload, request_id)))
@@ -81,7 +81,7 @@ class CodexWorkerRuntime:
         method = str(getattr(event, "method", "") or "")
         event_type = str(getattr(event, "type", "") or "")
         if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
-            self._input_request_clients[str(request_id)] = key
+            self._input_request_clients[(chat_id, str(request_id))] = key
         self.emit("event", payload)
 
     def _handle_start_turn(self, message: dict[str, Any]) -> None:
@@ -159,8 +159,10 @@ class CodexWorkerRuntime:
         return str(response.get(flat_key) or response.get("id") or "")
 
     def _client_key_for_reply(self, chat_id: str, request_id: Any) -> tuple[str, str] | None:
+        if not chat_id:
+            return None
         if request_id is not None:
-            mapped_key = self._input_request_clients.get(str(request_id))
+            mapped_key = self._input_request_clients.get((chat_id, str(request_id)))
             if mapped_key is not None:
                 return mapped_key
         matching_keys = [key for key in self._clients if key[0] == chat_id]

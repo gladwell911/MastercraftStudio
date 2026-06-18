@@ -191,6 +191,98 @@ def test_worker_runtime_reply_user_input_with_unknown_request_id_errors_when_cha
     assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
 
 
+def test_worker_runtime_pending_input_mapping_is_scoped_by_chat_id():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    for chat_id, model in (("chat-a", "model-a"), ("chat-b", "model-b")):
+        runtime.handle_message(
+            make_ui_request(
+                f"req-start-{chat_id}",
+                "start_turn",
+                {
+                    "chat_id": chat_id,
+                    "turn_idx": 0,
+                    "question": "问题",
+                    "model": model,
+                    "cwd": "c:/code/sj",
+                    "thread_id": "",
+                    "turn_id": "",
+                    "input_items": [{"type": "text", "text": "问题"}],
+                    "attachments": [],
+                    "service_tier": "",
+                },
+            )
+        )
+
+    created[0].on_event(CodexEvent(type="server_request", request_id="same-id", method="item/tool/requestUserInput"))
+    created[1].on_event(CodexEvent(type="server_request", request_id="same-id", method="item/tool/requestUserInput"))
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply-a",
+            "reply_user_input",
+            {"chat_id": "chat-a", "request_id": "same-id", "answers": {"reply": ["a"]}},
+        )
+    )
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply-b",
+            "reply_user_input",
+            {"chat_id": "chat-b", "request_id": "same-id", "answers": {"reply": ["b"]}},
+        )
+    )
+
+    assert created[0].replies == [("same-id", {"reply": ["a"]})]
+    assert created[1].replies == [("same-id", {"reply": ["b"]})]
+
+
+def test_worker_runtime_reply_user_input_without_chat_id_errors_even_when_request_id_is_known():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+    runtime.handle_message(
+        make_ui_request(
+            "req-start",
+            "start_turn",
+            {
+                "chat_id": "chat-a",
+                "turn_idx": 0,
+                "question": "问题",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "问题"}],
+                "attachments": [],
+                "service_tier": "",
+            },
+        )
+    )
+    created[0].on_event(CodexEvent(type="server_request", request_id="ask-a", method="item/tool/requestUserInput"))
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply",
+            "reply_user_input",
+            {"request_id": "ask-a", "answers": {"reply": ["ok"]}},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].replies == []
+    assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
+
+
 def test_worker_process_source_does_not_import_wx():
     import pathlib
 
