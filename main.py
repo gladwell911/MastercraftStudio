@@ -8146,10 +8146,12 @@ class ChatFrame(wx.Frame):
         pending = self.active_codex_pending_request
         if not pending:
             return False, "当前没有待回复的请求"
-        client = self._ensure_codex_client()
+        chat_id = str(pending.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
+        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
+        model = str(pending.get("model") or (target_chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
+        client = self._get_or_create_codex_client(chat_id, model)
         try:
             if hasattr(client, "reply_user_input"):
-                chat_id = str(pending.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
                 client.start()
                 client.reply_user_input(chat_id, pending.get("request_id"), {"reply": [str(text or "")]})
             else:
@@ -8255,9 +8257,11 @@ class ChatFrame(wx.Frame):
             answers = dlg.get_answers()
         finally:
             dlg.Destroy()
-        client = self._ensure_codex_client()
+        chat_id = str(request.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
+        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
+        model = str(request.get("model") or (target_chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
+        client = self._get_or_create_codex_client(chat_id, model)
         if hasattr(client, "reply_user_input"):
-            chat_id = str(request.get("chat_id") or self.active_chat_id or self.current_chat_id or "").strip()
             client.start()
             client.reply_user_input(chat_id, request.get("request_id"), answers)
         else:
@@ -8354,7 +8358,15 @@ class ChatFrame(wx.Frame):
             self._push_remote_status("waiting_user_input", "user_input")
             self._play_finish_sound()
             if str(event.method or "") == "item/tool/requestUserInput":
-                self._handle_codex_request_dialog({"request_id": event.request_id, "method": event.method, "params": event.params})
+                self._handle_codex_request_dialog(
+                    {
+                        "chat_id": chat_id,
+                        "model": self.selected_model or DEFAULT_CODEX_MODEL,
+                        "request_id": event.request_id,
+                        "method": event.method,
+                        "params": event.params,
+                    }
+                )
             self._defer_chat_state_save()
             return
         if event_type == "subagent_result":
@@ -8535,7 +8547,12 @@ class ChatFrame(wx.Frame):
             self._apply_codex_worker_turn_started_ack(chat_id, payload)
             return
         if message_type == "error":
-            self._apply_codex_worker_error(chat_id, str(payload.get("message") or ""), payload.get("turn_idx"))
+            self._apply_codex_worker_error(
+                chat_id,
+                str(payload.get("message") or ""),
+                payload.get("turn_idx"),
+                payload.get("turn_id"),
+            )
             return
         if message_type == "protocol_error":
             return
@@ -8599,19 +8616,30 @@ class ChatFrame(wx.Frame):
     def _apply_codex_worker_turn_started_ack(self, chat_id: str, payload: dict) -> None:
         self._apply_codex_worker_thread_state(chat_id, payload)
 
-    def _apply_codex_worker_error(self, chat_id: str, message: str, turn_idx=None) -> None:
+    def _apply_codex_worker_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None) -> None:
         target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
         if not isinstance(target_chat, dict):
             return
         target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
-        target_idx = turn_idx if isinstance(turn_idx, int) else -1
-        if (target_idx < 0 or not isinstance(target_turns, list) or target_idx >= len(target_turns)) and isinstance(target_turns, list):
-            turn_id = str((target_chat or {}).get("codex_turn_id") or "").strip()
+        if not isinstance(target_turns, list):
+            return
+        if isinstance(turn_idx, int):
+            target_idx = turn_idx if 0 <= turn_idx < len(target_turns) else -1
+        else:
+            target_idx = -1
+        if target_idx < 0:
+            turn_id_value = str(turn_id or "").strip()
+            if not turn_id_value:
+                return
             for idx, turn in enumerate(target_turns):
-                if isinstance(turn, dict) and str(turn.get("codex_turn_id") or "").strip() == turn_id:
+                if isinstance(turn, dict) and str(turn.get("codex_turn_id") or "").strip() == turn_id_value:
                     target_idx = idx
                     break
-        if not isinstance(target_turns, list) or target_idx < 0 or target_idx >= len(target_turns):
+            if target_idx < 0 and str(target_chat.get("codex_turn_id") or "").strip() == turn_id_value:
+                active_idx = self.active_turn_idx if is_current_target else -1
+                if 0 <= active_idx < len(target_turns):
+                    target_idx = active_idx
+        if target_idx < 0 or target_idx >= len(target_turns):
             return
         turn = target_turns[target_idx]
         if not isinstance(turn, dict):
