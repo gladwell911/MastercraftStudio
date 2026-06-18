@@ -12010,6 +12010,136 @@ def test_codex_ui_event_drain_coalesces_execution_list_repaints(frame, monkeypat
     assert repaint_calls == [(frame.execution_list,)]
 
 
+def test_background_execution_step_defers_list_append_during_quiet(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 1
+    frame.view_mode = "active"
+    frame._current_chat_state = {"id": "chat-active", "turns": [], "execution_steps": []}
+    frame._navigation_quiet_until = time.monotonic() + 3.0
+    frame._background_ui_update_depth = 1
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        frame.execution_list_model,
+        "append",
+        lambda *_args, **_kwargs: pytest.fail("execution append must be deferred during quiet"),
+    )
+
+    assert frame._append_execution_entry_to_chat(
+        "chat-active",
+        {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 1", "detail_text": "step 1"},
+        save_state=False,
+    )
+
+    assert frame._current_chat_state["execution_steps"][0]["list_text"] == "step 1"
+    assert frame._pending_execution_tail_appends["chat-active"]
+
+
+def test_pending_execution_steps_append_after_quiet_in_order(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 1
+    frame.view_mode = "active"
+    frame._current_chat_state = {"id": "chat-active", "turns": [], "detail_panel_mode": "execution", "execution_steps": []}
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame._navigation_quiet_until = 0.0
+    frame._pending_execution_tail_appends = {
+        "chat-active": [
+            (0, {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 1", "detail_text": "step 1"}),
+            (1, {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 2", "detail_text": "step 2"}),
+        ]
+    }
+    appended = []
+    original_append = frame.execution_list_model.append
+
+    def record_append(row_id, row_text):
+        appended.append(row_text)
+        return original_append(row_id, row_text)
+
+    monkeypatch.setattr(frame.execution_list_model, "append", record_append)
+
+    frame._flush_pending_background_ui_updates()
+
+    assert appended == ["step 1", "step 2"]
+    assert frame.execution_list.GetString(frame.execution_list.GetCount() - 1) == "step 2"
+
+
+def test_pending_execution_flush_skips_rows_already_rendered_from_store(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 1
+    frame.view_mode = "active"
+    step = {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 1", "detail_text": "step 1"}
+    frame._current_chat_state = {
+        "id": "chat-active",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [copy.deepcopy(step)],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame._render_execution_list(force=True)
+    frame._pending_execution_tail_appends = {"chat-active": [(0, copy.deepcopy(step))]}
+    monkeypatch.setattr(frame.execution_list_model, "append", lambda *_args, **_kwargs: pytest.fail("already-rendered pending rows must not append again"))
+
+    frame._flush_pending_background_ui_updates()
+
+    assert frame._pending_execution_tail_appends == {}
+    assert frame.execution_meta == [("execution", 0, "step 1", "step 1")]
+
+
+def test_pending_execution_flush_keeps_unappendable_rows(frame, monkeypatch):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_turn_idx = 2
+    frame.view_mode = "active"
+    step = {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 1", "detail_text": "step 1"}
+    frame._current_chat_state = {"id": "chat-active", "turns": [], "detail_panel_mode": "execution", "execution_steps": [step]}
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame._pending_execution_tail_appends = {"chat-active": [(0, copy.deepcopy(step))]}
+
+    frame._flush_pending_background_ui_updates()
+
+    assert frame._pending_execution_tail_appends["chat-active"][0][1]["list_text"] == "step 1"
+    assert frame._execution_list_dirty is True
+
+
+def test_background_history_answer_dirty_flushes_visible_history_answer_after_quiet(frame, monkeypatch):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame._background_answer_list_dirty = True
+    frame._background_history_dirty_ids = {"chat-history"}
+    refreshed = []
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda **kwargs: refreshed.append(kwargs))
+
+    frame._flush_pending_background_ui_updates()
+
+    assert refreshed == [{"refresh_execution": frame._detail_panel_mode() != "execution"}]
+    assert frame._background_answer_list_dirty is False
+    assert "chat-history" not in frame._background_history_dirty_ids
+
+
+def test_idle_history_flush_also_flushes_visible_history_answer_dirty_after_quiet(frame, monkeypatch):
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame._history_list_dirty = True
+    frame._pending_history_keep_id = "chat-history"
+    frame._background_answer_list_dirty = True
+    frame._background_history_dirty_ids = {"chat-history"}
+    frame._navigation_quiet_until = 0.0
+    history_refreshed = []
+    answer_refreshed = []
+    monkeypatch.setattr(frame, "_refresh_history", lambda keep_id=None: history_refreshed.append(keep_id))
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda **kwargs: answer_refreshed.append(kwargs))
+
+    frame._flush_idle_ui_refreshes()
+
+    assert history_refreshed == ["chat-history"]
+    assert answer_refreshed == [{"refresh_execution": frame._detail_panel_mode() != "execution"}]
+    assert frame._background_answer_list_dirty is False
+    assert "chat-history" not in frame._background_history_dirty_ids
+
+
 def test_codex_ui_event_drain_preserves_execution_selection_when_list_has_focus(frame, monkeypatch):
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"

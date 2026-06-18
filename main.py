@@ -1175,6 +1175,7 @@ class ChatFrame(wx.Frame):
         self._navigation_quiet_until = 0.0
         self._navigation_quiet_last_trigger = ""
         self._deferred_background_ui_counts = {}
+        self._pending_execution_tail_appends = {}
         self.ui_perf_slow_threshold_ms = UI_PERF_SLOW_THRESHOLD_MS
         self.ui_perf_slow_samples: list[dict] = []
         self._execution_list_deferred_repaint = False
@@ -4090,6 +4091,7 @@ class ChatFrame(wx.Frame):
             self._openclaw_lifecycle_dirty = False
             with self._measure_ui_operation("idle_openclaw_lifecycle_refresh"):
                 self._refresh_openclaw_sync_lifecycle()
+        self._flush_pending_background_ui_updates()
 
     def _on_input_text_changed(self, event) -> None:
         event.Skip()
@@ -4973,10 +4975,19 @@ class ChatFrame(wx.Frame):
         if self._visible_execution_chat_state() is not target_chat:
             return False
         if self.view_mode == "active" and isinstance(step, dict) and "turn_idx" in step:
-            if self._safe_int(step.get("turn_idx"), -1) != int(getattr(self, "active_turn_idx", -1) or -1):
+            if self._safe_int(step.get("turn_idx"), -1) != self._active_turn_index_value():
                 return False
         if not self._should_show_execution_step(step):
             return False
+        if self._background_ui_mutations_blocked():
+            chat_id = str((target_chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+            if chat_id:
+                pending = self._pending_execution_tail_appends.setdefault(chat_id, [])
+                pending.append((int(step_idx), copy.deepcopy(step)))
+            counts = getattr(self, "_deferred_background_ui_counts", {})
+            counts["execution"] = int(counts.get("execution", 0)) + 1
+            self._deferred_background_ui_counts = counts
+            return True
         if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
             self._execution_list_pending_turn_reset = False
             try:
@@ -5005,6 +5016,25 @@ class ChatFrame(wx.Frame):
             except Exception:
                 return False
             self.execution_meta = []
+        if (
+            self.execution_meta
+            and self.execution_meta[0][0] == "execution"
+            and str(self.execution_meta[0][2] or "").startswith("我：")
+            and isinstance(step, dict)
+            and str(step.get("synthetic") or "").strip() != "question"
+        ):
+            try:
+                first_id = self.execution_list_model.visible_ids[0] if getattr(self.execution_list_model, "visible_ids", None) else ""
+                if first_id and not self.execution_list_model.remove(first_id):
+                    self.execution_list.Delete(0)
+            except Exception:
+                return False
+            del self.execution_meta[0]
+            try:
+                if selected_idx_before == 0 and self.execution_list.HasFocus() and self.execution_list.GetCount() > 0:
+                    self.execution_list.SetSelection(0)
+            except Exception:
+                pass
         limit = max(
             EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
             int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
@@ -5016,9 +5046,17 @@ class ChatFrame(wx.Frame):
             self.execution_meta.append(meta)
             if visible_execution_rows >= limit:
                 try:
-                    old_row_id = self.execution_list_model.visible_ids[1]
+                    remove_idx = 1
+                    if (
+                        len(self.execution_meta) >= 3
+                        and isinstance(step, dict)
+                        and str(step.get("synthetic") or "").strip() != "answer"
+                        and str(self.execution_meta[-2][2] or "").startswith("小诸葛：")
+                    ):
+                        remove_idx = len(self.execution_meta) - 2
+                    old_row_id = self.execution_list_model.visible_ids[remove_idx]
                     self.execution_list_model.remove(old_row_id)
-                    del self.execution_meta[1]
+                    del self.execution_meta[remove_idx]
                 except Exception:
                     self._rebuild_execution_list_from_state()
             if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
@@ -5058,6 +5096,59 @@ class ChatFrame(wx.Frame):
         self._select_latest_execution_row_if_not_focused()
         self._request_listbox_repaint(self.execution_list)
         return True
+
+    def _flush_pending_background_ui_updates(self) -> None:
+        if self._navigation_quiet_active():
+            return
+        self._flush_pending_execution_tail_appends()
+        if not bool(getattr(self, "_background_answer_list_dirty", False)):
+            return
+        if self.view_mode == "active":
+            self._background_answer_list_dirty = False
+            self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+            return
+        if self.view_mode == "history":
+            viewed_id = str(getattr(self, "view_history_id", "") or "").strip()
+            dirty_ids = getattr(self, "_background_history_dirty_ids", set())
+            if viewed_id and viewed_id in dirty_ids:
+                self._background_answer_list_dirty = False
+                try:
+                    dirty_ids.discard(viewed_id)
+                except Exception:
+                    pass
+                self._background_history_dirty_ids = dirty_ids
+                self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+
+    def _flush_pending_execution_tail_appends(self) -> None:
+        chat_id = self._visible_execution_chat_id()
+        if not chat_id:
+            return
+        pending_by_chat = getattr(self, "_pending_execution_tail_appends", {})
+        pending = list(pending_by_chat.get(chat_id) or [])
+        if not pending:
+            return
+        if not self._execution_list_visible_for_updates():
+            self._mark_execution_list_dirty()
+            return
+        chat = self._chat_state_for_execution_steps(chat_id)
+        if not isinstance(chat, dict):
+            return
+        remaining = []
+        for step_idx, step in sorted(pending, key=lambda item: item[0]):
+            try:
+                row_id = self._execution_row_id(int(step_idx), step)
+                if hasattr(self, "execution_list_model") and self.execution_list_model.row_for_id(row_id) >= 0:
+                    continue
+            except Exception:
+                pass
+            if not self._append_visible_execution_entry(chat, int(step_idx), step):
+                remaining.append((int(step_idx), copy.deepcopy(step)))
+        if remaining:
+            pending_by_chat[chat_id] = remaining
+            self._mark_execution_list_dirty()
+        else:
+            pending_by_chat.pop(chat_id, None)
+        self._pending_execution_tail_appends = pending_by_chat
 
     def _restore_execution_selection_if_focused(self, selected_id: str, selected_idx: int) -> None:
         try:
@@ -8074,6 +8165,8 @@ class ChatFrame(wx.Frame):
                 self._background_ui_update_depth = max(0, self._background_ui_update_depth - 1)
                 self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
                 self._flush_deferred_execution_list_updates()
+                if not self._navigation_quiet_active():
+                    self._flush_pending_background_ui_updates()
                 self._start_execution_step_persist_worker()
             if has_more:
                 self._codex_ui_event_drain_timer = self._call_later_if_alive(
