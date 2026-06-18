@@ -11,12 +11,17 @@ class FakeCodexClient:
         self.codex_model = codex_model
         self.started_threads = []
         self.started_turns = []
+        self.resumed_threads = []
         self.replies = []
         self.closed = False
 
     def start_thread(self, **kwargs):
         self.started_threads.append(kwargs)
         return {"thread": {"id": "thread-1"}}
+
+    def resume_thread(self, thread_id, **kwargs):
+        self.resumed_threads.append((thread_id, kwargs))
+        return {"thread": {"id": thread_id}}
 
     def start_turn_items(self, thread_id, items, service_tier=None):
         self.started_turns.append((thread_id, items, service_tier))
@@ -29,7 +34,12 @@ class FakeCodexClient:
         self.closed = True
 
 
-def test_worker_runtime_start_turn_emits_thread_state_and_turn_finished():
+class RaisingTurnCodexClient(FakeCodexClient):
+    def start_turn_items(self, thread_id, items, service_tier=None):
+        raise RuntimeError("turn failed")
+
+
+def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ack():
     output = io.StringIO()
     created = []
 
@@ -59,8 +69,14 @@ def test_worker_runtime_start_turn_emits_thread_state_and_turn_finished():
     )
 
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
-    assert any(item["type"] == "thread_state" and item["payload"]["chat_id"] == "chat-c" for item in messages)
-    assert any(item["type"] == "turn_finished" and item["payload"]["turn_id"] == "turn-1" for item in messages)
+    assert any(
+        item["type"] == "thread_state"
+        and item["payload"]["chat_id"] == "chat-c"
+        and item["payload"]["active"] is True
+        for item in messages
+    )
+    assert any(item["type"] == "turn_started_ack" and item["payload"]["turn_id"] == "turn-1" for item in messages)
+    assert not any(item["type"] == "turn_finished" for item in messages)
     assert created[0].started_threads[0]["cwd"] == "c:/code/sj"
     assert created[0].started_turns[0][2] == "fast"
 
@@ -281,6 +297,168 @@ def test_worker_runtime_reply_user_input_without_chat_id_errors_even_when_reques
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     assert created[0].replies == []
     assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
+
+
+def test_worker_runtime_pending_input_mapping_marks_same_chat_request_id_collision_ambiguous():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    for idx, model in enumerate(("model-a", "model-b")):
+        runtime.handle_message(
+            make_ui_request(
+                f"req-start-{idx}",
+                "start_turn",
+                {
+                    "chat_id": "chat-c",
+                    "turn_idx": idx,
+                    "question": "问题",
+                    "model": model,
+                    "cwd": "c:/code/sj",
+                    "thread_id": "",
+                    "turn_id": "",
+                    "input_items": [{"type": "text", "text": "问题"}],
+                    "attachments": [],
+                    "service_tier": "",
+                },
+            )
+        )
+
+    created[0].on_event(CodexEvent(type="server_request", request_id="same-id", method="item/tool/requestUserInput"))
+    created[1].on_event(CodexEvent(type="server_request", request_id="same-id", method="item/tool/requestUserInput"))
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply",
+            "reply_user_input",
+            {"chat_id": "chat-c", "request_id": "same-id", "answers": {"reply": ["ok"]}},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].replies == []
+    assert created[1].replies == []
+    assert any(item["type"] == "error" and item.get("id") == "req-reply" for item in messages)
+
+
+def test_worker_runtime_start_turn_with_empty_chat_id_emits_error_without_creating_client():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-empty-chat",
+            "start_turn",
+            {
+                "chat_id": "",
+                "turn_idx": 3,
+                "question": "问题",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "问题"}],
+                "attachments": [],
+                "service_tier": "",
+            },
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created == []
+    assert any(item["type"] == "error" and item.get("id") == "req-empty-chat" for item in messages)
+
+
+def test_worker_runtime_start_turn_failure_emits_scoped_error():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(RaisingTurnCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-fail",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 7,
+                "question": "问题",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "问题"}],
+                "attachments": [],
+                "service_tier": "",
+            },
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert any(
+        item["type"] == "error"
+        and item.get("id") == "req-fail"
+        and item["payload"]["chat_id"] == "chat-c"
+        and item["payload"]["turn_idx"] == 7
+        and item["payload"]["model"] == "model-a"
+        for item in messages
+    )
+
+
+def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-resume",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "question": "问题",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "thread-existing",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "问题"}],
+                "attachments": [],
+                "service_tier": "fast",
+            },
+        )
+    )
+
+    assert created[0].started_threads == []
+    assert created[0].resumed_threads == [
+        (
+            "thread-existing",
+            {
+                "approval_policy": "never",
+                "sandbox": "danger-full-access",
+                "personality": "pragmatic",
+                "cwd": "c:/code/sj",
+                "service_tier": "fast",
+            },
+        )
+    ]
+    assert created[0].started_turns[0][0] == "thread-existing"
 
 
 def test_worker_process_source_does_not_import_wx():

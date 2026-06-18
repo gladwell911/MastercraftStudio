@@ -21,9 +21,9 @@ class CodexWorkerRuntime:
         self.client_factory = client_factory or self._default_client_factory
         self.output = output or sys.stdout
         self._clients: dict[tuple[str, str], Any] = {}
-        self._chat_models: dict[str, str] = {}
         self._turn_indices: dict[tuple[str, str], Any] = {}
         self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
+        self._ambiguous_input_requests: set[tuple[str, str]] = set()
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         self.output.write(encode_worker_message(make_worker_event(message_type, payload, request_id)))
@@ -51,9 +51,9 @@ class CodexWorkerRuntime:
     def close(self) -> None:
         clients = list(self._clients.values())
         self._clients.clear()
-        self._chat_models.clear()
         self._turn_indices.clear()
         self._input_request_clients.clear()
+        self._ambiguous_input_requests.clear()
         for client in clients:
             client.close()
 
@@ -66,7 +66,6 @@ class CodexWorkerRuntime:
                 lambda event, chat_id=normalized_chat_id, model=normalized_model: self._on_event(chat_id, model, event),
                 normalized_model,
             )
-        self._chat_models[normalized_chat_id] = normalized_model
         return self._clients[key]
 
     def _on_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
@@ -81,7 +80,13 @@ class CodexWorkerRuntime:
         method = str(getattr(event, "method", "") or "")
         event_type = str(getattr(event, "type", "") or "")
         if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
-            self._input_request_clients[(chat_id, str(request_id))] = key
+            request_key = (chat_id, str(request_id))
+            existing_key = self._input_request_clients.get(request_key)
+            if existing_key is not None and existing_key != key:
+                self._ambiguous_input_requests.add(request_key)
+                self._input_request_clients.pop(request_key, None)
+            elif request_key not in self._ambiguous_input_requests:
+                self._input_request_clients[request_key] = key
         self.emit("event", payload)
 
     def _handle_start_turn(self, message: dict[str, Any]) -> None:
@@ -91,40 +96,58 @@ class CodexWorkerRuntime:
         turn_idx = payload.get("turn_idx")
         service_tier = payload.get("service_tier")
         service_tier_arg = service_tier if str(service_tier or "").strip() else None
-        client = self._client_for(chat_id, model)
-        self._turn_indices[(chat_id, model)] = turn_idx
+        if not chat_id:
+            self._emit_scoped_error(message, "start_turn requires payload.chat_id", chat_id, turn_idx, model)
+            return
 
-        thread_id = str(payload.get("thread_id") or "").strip()
-        if not thread_id:
-            thread_response = client.start_thread(cwd=payload.get("cwd") or "", service_tier=service_tier_arg)
-            thread_id = self._extract_id(thread_response, "thread", "thread_id")
-        self.emit(
-            "thread_state",
-            {
-                "chat_id": chat_id,
-                "turn_idx": turn_idx,
-                "model": model,
-                "thread_id": thread_id,
-            },
-            request_id=message.get("id"),
-        )
+        try:
+            client = self._client_for(chat_id, model)
+            self._turn_indices[(chat_id, model)] = turn_idx
 
-        items = list(payload.get("input_items") or [])
-        if not items and payload.get("question"):
-            items = [{"type": "text", "text": str(payload.get("question") or "")}]
-        turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
-        turn_id = self._extract_id(turn_response, "turn", "turn_id")
-        self.emit(
-            "turn_finished",
-            {
-                "chat_id": chat_id,
-                "turn_idx": turn_idx,
-                "model": model,
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-            },
-            request_id=message.get("id"),
-        )
+            thread_id = str(payload.get("thread_id") or "").strip()
+            if not thread_id:
+                thread_response = client.start_thread(cwd=payload.get("cwd") or "", service_tier=service_tier_arg)
+                thread_id = self._extract_id(thread_response, "thread", "thread_id")
+            elif hasattr(client, "resume_thread"):
+                client.resume_thread(
+                    thread_id,
+                    approval_policy="never",
+                    sandbox="danger-full-access",
+                    personality="pragmatic",
+                    cwd=payload.get("cwd") or "",
+                    service_tier=service_tier_arg,
+                )
+            self.emit(
+                "thread_state",
+                {
+                    "chat_id": chat_id,
+                    "turn_idx": turn_idx,
+                    "model": model,
+                    "thread_id": thread_id,
+                    "active": True,
+                },
+                request_id=message.get("id"),
+            )
+
+            items = list(payload.get("input_items") or [])
+            if not items and payload.get("question"):
+                items = [{"type": "text", "text": str(payload.get("question") or "")}]
+            turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
+            turn_id = self._extract_id(turn_response, "turn", "turn_id")
+            self.emit(
+                "turn_started_ack",
+                {
+                    "chat_id": chat_id,
+                    "turn_idx": turn_idx,
+                    "model": model,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "active": True,
+                },
+                request_id=message.get("id"),
+            )
+        except Exception as exc:
+            self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
 
     def _handle_reply_user_input(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})
@@ -162,13 +185,35 @@ class CodexWorkerRuntime:
         if not chat_id:
             return None
         if request_id is not None:
-            mapped_key = self._input_request_clients.get((chat_id, str(request_id)))
+            request_key = (chat_id, str(request_id))
+            if request_key in self._ambiguous_input_requests:
+                return None
+            mapped_key = self._input_request_clients.get(request_key)
             if mapped_key is not None:
                 return mapped_key
         matching_keys = [key for key in self._clients if key[0] == chat_id]
         if len(matching_keys) == 1:
             return matching_keys[0]
         return None
+
+    def _emit_scoped_error(
+        self,
+        message: dict[str, Any],
+        error_message: str,
+        chat_id: str,
+        turn_idx: Any,
+        model: str,
+    ) -> None:
+        self.emit(
+            "error",
+            {
+                "chat_id": chat_id,
+                "turn_idx": turn_idx,
+                "model": model,
+                "message": error_message,
+            },
+            request_id=message.get("id"),
+        )
 
 
 def main() -> int:
