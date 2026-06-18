@@ -1150,6 +1150,7 @@ class ChatFrame(wx.Frame):
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
         self._codex_clients: dict[str, CodexWorkerClient] = {}
+        self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
         self._managed_cloudflared_process = None
@@ -8321,6 +8322,7 @@ class ChatFrame(wx.Frame):
                 elif event_type == "turn_completed":
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
+                    self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
                     if (
                         (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
                         and str(event.text or "").strip()
@@ -8393,6 +8395,7 @@ class ChatFrame(wx.Frame):
                 turn = self.active_session_turns[target_idx]
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
+                self._clear_codex_worker_active_turn(chat_id or self.active_chat_id or self.current_chat_id, target_idx, event_turn_id)
                 if (
                     (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
                     and str(event.text or "").strip()
@@ -8527,6 +8530,12 @@ class ChatFrame(wx.Frame):
         if not isinstance(message, dict):
             return
         message_type = str(message.get("type") or "").strip()
+        if (
+            message_type in {"thread_state", "turn_started_ack", "error", "protocol_error"}
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            self._call_after_if_alive(self._on_codex_worker_message, default_chat_id, message, client)
+            return
         if message_type == "messages_pending":
             self._drain_codex_worker_client_messages(default_chat_id, client)
             return
@@ -8579,6 +8588,34 @@ class ChatFrame(wx.Frame):
         chat = self._find_archived_chat(normalized)
         return (chat if isinstance(chat, dict) else None), False
 
+    def _remember_codex_worker_active_turn(self, chat_id: str, payload: dict) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        metadata: dict = {}
+        turn_idx = payload.get("turn_idx")
+        if isinstance(turn_idx, int):
+            metadata["turn_idx"] = turn_idx
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if turn_id:
+            metadata["turn_id"] = turn_id
+        if metadata:
+            self._codex_worker_active_turns[normalized] = metadata
+
+    def _clear_codex_worker_active_turn(self, chat_id: str, turn_idx=None, turn_id: str | None = None) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        metadata = self._codex_worker_active_turns.get(normalized)
+        if not isinstance(metadata, dict):
+            return
+        if isinstance(turn_idx, int) and metadata.get("turn_idx") != turn_idx:
+            return
+        turn_id_value = str(turn_id or "").strip()
+        if turn_id_value and str(metadata.get("turn_id") or "").strip() != turn_id_value:
+            return
+        self._codex_worker_active_turns.pop(normalized, None)
+
     def _apply_codex_worker_thread_state(self, chat_id: str, payload: dict) -> None:
         target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
         if not isinstance(target_chat, dict):
@@ -8597,6 +8634,10 @@ class ChatFrame(wx.Frame):
             target_chat["codex_turn_active"] = bool(payload.get("active"))
             if is_current_target:
                 self.active_codex_turn_active = bool(payload.get("active"))
+            if payload.get("active"):
+                self._remember_codex_worker_active_turn(chat_id, payload)
+            else:
+                self._clear_codex_worker_active_turn(chat_id)
         target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
         turn_idx = payload.get("turn_idx")
         if isinstance(target_turns, list) and isinstance(turn_idx, int) and 0 <= turn_idx < len(target_turns):
@@ -8651,15 +8692,27 @@ class ChatFrame(wx.Frame):
             self.active_codex_pending_request = None
             self.is_running = False
             self._active_request_count = 0
+        self._clear_codex_worker_active_turn(chat_id, target_idx, turn.get("codex_turn_id"))
         self._mark_chat_turns_dirty(None if is_current_target else chat_id, target_idx)
         if not is_current_target:
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 
     def _on_codex_worker_exit(self, chat_id: str, returncode) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self._call_after_if_alive(self._on_codex_worker_exit, chat_id, returncode)
+            return
         if returncode in {None, 0}:
             return
-        self._apply_codex_worker_error(chat_id, f"Codex worker exited with code {returncode}")
+        metadata = self._codex_worker_active_turns.get(str(chat_id or "").strip())
+        if not isinstance(metadata, dict):
+            return
+        self._apply_codex_worker_error(
+            chat_id,
+            f"Codex worker exited with code {returncode}",
+            metadata.get("turn_idx"),
+            metadata.get("turn_id"),
+        )
 
     def _get_or_create_codex_client(self, chat_id: str, model: str = "") -> CodexWorkerClient:
         key = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip() or self._ensure_active_chat_id()

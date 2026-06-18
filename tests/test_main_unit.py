@@ -5648,6 +5648,31 @@ def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, mo
     assert deferred == [True]
 
 
+def test_codex_worker_thread_state_from_reader_thread_schedules_ui_apply(frame, monkeypatch):
+    scheduled = []
+    message = {
+        "type": "thread_state",
+        "payload": {
+            "chat_id": "chat-c",
+            "turn_idx": 0,
+            "thread_id": "thread-c",
+            "turn_id": "turn-c",
+            "active": True,
+        },
+    }
+    monkeypatch.setattr(main.threading, "current_thread", lambda: SimpleNamespace(name="codex-stdout-thread"))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: scheduled.append((fn, args)) or True)
+    monkeypatch.setattr(
+        frame,
+        "_apply_codex_worker_thread_state",
+        lambda *_args, **_kwargs: pytest.fail("worker reader thread must not mutate chat state inline"),
+    )
+
+    frame._on_codex_worker_message("chat-c", message)
+
+    assert scheduled == [(frame._on_codex_worker_message, ("chat-c", message, None))]
+
+
 def test_codex_worker_turn_started_ack_does_not_mark_request_done(frame, monkeypatch):
     frame.active_chat_id = "chat-c"
     frame.current_chat_id = "chat-c"
@@ -5813,6 +5838,68 @@ def test_codex_worker_error_with_matching_turn_id_fails_only_that_turn(frame, mo
     assert frame.active_session_turns[0]["request_error"] == ""
     assert frame.active_session_turns[1]["request_status"] == "failed"
     assert frame.active_session_turns[1]["request_error"] == "id boom"
+
+
+def test_codex_worker_error_from_reader_thread_schedules_ui_apply(frame, monkeypatch):
+    scheduled = []
+    message = {
+        "type": "error",
+        "payload": {
+            "chat_id": "chat-c",
+            "turn_idx": 0,
+            "turn_id": "turn-c",
+            "message": "boom",
+        },
+    }
+    monkeypatch.setattr(main.threading, "current_thread", lambda: SimpleNamespace(name="codex-stdout-thread"))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: scheduled.append((fn, args)) or True)
+    monkeypatch.setattr(
+        frame,
+        "_apply_codex_worker_error",
+        lambda *_args, **_kwargs: pytest.fail("worker reader thread must not mutate error state inline"),
+    )
+
+    frame._on_codex_worker_message("chat-c", message)
+
+    assert scheduled == [(frame._on_codex_worker_message, ("chat-c", message, None))]
+
+
+def test_codex_worker_exit_with_active_metadata_fails_matching_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_session_turns = [
+        {"question": "first", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-1"},
+        {"question": "second", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-2"},
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "codex_turn_id": "turn-1"}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    frame._apply_codex_worker_thread_state(
+        "chat-c",
+        {"chat_id": "chat-c", "turn_idx": 0, "turn_id": "turn-1", "active": True},
+    )
+    frame._on_codex_worker_exit("chat-c", -9)
+
+    assert frame.active_session_turns[0]["request_status"] == "failed"
+    assert "exited with code -9" in frame.active_session_turns[0]["request_error"]
+    assert frame.active_session_turns[1]["request_status"] == "pending"
+    assert frame.active_session_turns[1]["request_error"] == ""
+
+
+def test_codex_worker_exit_without_active_metadata_does_not_fail_latest_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "current", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-current"},
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "codex_turn_id": "turn-current"}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: pytest.fail("unscoped worker exit should not save state"))
+
+    frame._on_codex_worker_exit("chat-c", -9)
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_session_turns[0]["request_error"] == ""
 
 
 @pytest.mark.parametrize("event_type", ["agent_message_delta", "stderr", "plan_updated", "diff_updated"])
@@ -13758,7 +13845,7 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
     assert frame.active_session_turns[0]["codex_turn_id"] == "turn-new"
 
 
-def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(frame, monkeypatch):
+def test_codex_worker_sends_existing_thread_to_worker_after_restart(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
@@ -13782,16 +13869,15 @@ def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(fram
     frame.active_codex_turn_id = ""
     frame.active_codex_turn_active = False
 
-    seen = {"resume": [], "turn": []}
+    seen = {"started": 0, "payloads": []}
 
     class _Client:
-        def resume_thread(self, thread_id, **kwargs):
-            seen["resume"].append((thread_id, kwargs))
-            return {"thread": {"id": thread_id}}
+        def start(self):
+            seen["started"] += 1
 
-        def start_turn(self, thread_id, text):
-            seen["turn"].append((thread_id, text))
-            return {"turn": {"id": "turn-new"}}
+        def start_turn(self, **payload):
+            seen["payloads"].append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -13799,21 +13885,15 @@ def test_codex_worker_resumes_existing_thread_before_new_turn_after_restart(fram
 
     frame._run_codex_turn_worker("chat-current", 1, "第三轮", "codex/main")
 
-    assert seen["resume"] == [
-        (
-            "thread-saved",
-            {
-                "approval_policy": "never",
-                "sandbox": "danger-full-access",
-                "personality": "pragmatic",
-                "cwd": frame._workspace_dir_for_codex(),
-                "service_tier": "",
-            },
-        )
-    ]
-    assert seen["turn"] == [("thread-saved", "第三轮")]
+    assert seen["started"] == 1
+    assert len(seen["payloads"]) == 1
+    assert seen["payloads"][0]["chat_id"] == "chat-current"
+    assert seen["payloads"][0]["turn_idx"] == 1
+    assert seen["payloads"][0]["question"] == "第三轮"
+    assert seen["payloads"][0]["thread_id"] == "thread-saved"
+    assert seen["payloads"][0]["turn_id"] == ""
     assert frame.active_codex_thread_id == "thread-saved"
-    assert frame.active_codex_turn_id == "turn-new"
+    assert frame.active_codex_turn_id == ""
 
 
 def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, monkeypatch):
