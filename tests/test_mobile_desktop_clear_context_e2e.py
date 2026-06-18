@@ -73,9 +73,11 @@ def _run_with_wx_yield(wx_app, command: list[str], cwd: Path, timeout: float = 3
 
 
 def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, tmp_path):
+    active_chat_id = "chat-clear-context-active-e2e"
     chat_id = "chat-clear-context-e2e"
-    question = "desktop clear context question from real frame"
-    answer = "desktop clear context answer from real frame"
+    active_question = "desktop active running question remains"
+    question = "desktop clear context question from archived frame"
+    answer = "desktop clear context answer from archived frame"
     pair_id = "clear-context-e2e"
     token = "clear-context-token"
     device_id = os.environ.get("NATS_CLEAR_CONTEXT_E2E_DEVICE", "emulator-5556")
@@ -87,26 +89,51 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
     )
 
     frame.Show()
-    frame.active_chat_id = chat_id
-    frame.current_chat_id = chat_id
+    frame.active_chat_id = active_chat_id
+    frame.current_chat_id = active_chat_id
     frame.active_session_turns = [
         {
-            "question": question,
-            "answer_md": answer,
+            "question": active_question,
+            "answer_md": main.REQUESTING_TEXT,
             "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
             "created_at": time.time(),
         }
     ]
+    frame.active_codex_thread_id = "thread-active-e2e"
+    frame.active_codex_turn_id = "turn-active-e2e"
+    frame.active_codex_turn_active = True
     frame._current_chat_state = {
-        "id": chat_id,
-        "title": "clear context e2e",
+        "id": active_chat_id,
+        "title": "active clear context e2e",
         "turns": frame.active_session_turns,
+        "codex_thread_id": "thread-active-e2e",
+        "codex_turn_id": "turn-active-e2e",
+        "codex_turn_active": True,
+        "execution_steps": [{"list_text": "active execution must remain"}],
         "created_at": time.time(),
         "updated_at": time.time(),
     }
+    frame.archived_chats = [
+        {
+            "id": chat_id,
+            "title": "clear context e2e",
+            "turns": [
+                {
+                    "question": question,
+                    "answer_md": answer,
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": time.time(),
+                }
+            ],
+            "execution_steps": [{"list_text": "archived execution should clear"}],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    ]
     frame._render_answer_list()
     wx_app.Yield()
-    assert any(question in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
+    assert any(active_question in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
 
     server = NatsServerProcess(
         NatsRuntimeConfig(
@@ -194,8 +221,17 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
         assert completed.returncode == 0, completed.stdout
         wx_app.Yield()
 
-        assert frame.active_session_turns == []
-        assert frame._current_chat_state["turns"] == []
+        archived = frame._find_archived_chat(chat_id)
+        assert archived is not None
+        assert archived["turns"] == []
+        assert archived["execution_steps"] == []
+        assert frame.active_chat_id == active_chat_id
+        assert frame.current_chat_id == active_chat_id
+        assert frame.active_session_turns[0]["question"] == active_question
+        assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+        assert frame.active_codex_thread_id == "thread-active-e2e"
+        assert frame.active_codex_turn_active is True
+        assert any(active_question in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
         assert not any(question in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
     finally:
         if "reversed_websocket" in locals() and reversed_websocket and "adb_bin" in locals() and adb_bin:
