@@ -63,8 +63,10 @@ def decode_worker_line(line: str) -> dict[str, Any]:
 
 
 def validate_chat_scoped_message(message: dict[str, Any]) -> dict[str, Any]:
-    message_type = str((message or {}).get("type") or "").strip()
-    payload = (message or {}).get("payload")
+    if not isinstance(message, dict):
+        raise CodexWorkerProtocolError("worker message must be a dict")
+    message_type = str(message.get("type") or "").strip()
+    payload = message.get("payload")
     if message_type in CHAT_SCOPED_TYPES:
         if not isinstance(payload, dict) or not str(payload.get("chat_id") or "").strip():
             raise CodexWorkerProtocolError(f"{message_type} message requires payload.chat_id")
@@ -80,5 +82,7 @@ def event_to_payload(event: CodexEvent) -> dict[str, Any]:
 def event_from_payload(payload: dict[str, Any]) -> CodexEvent:
     if not isinstance(payload, dict):
         raise CodexWorkerProtocolError("Codex event payload must be dict")
+    if not isinstance(payload.get("type"), str) or not payload["type"].strip():
+        raise CodexWorkerProtocolError("Codex event payload requires type")
     allowed = CodexEvent.__dataclass_fields__.keys()
-    return CodexEvent(**{key: payload.get(key) for key in allowed})
+    return CodexEvent(**{key: payload[key] for key in allowed if key in payload})

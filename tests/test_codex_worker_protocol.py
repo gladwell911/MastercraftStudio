@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from codex_client import CodexEvent
@@ -54,6 +52,11 @@ def test_chat_scoped_message_requires_chat_id():
         validate_chat_scoped_message(message)
 
 
+def test_chat_scoped_message_rejects_non_dict_message():
+    with pytest.raises(CodexWorkerProtocolError):
+        validate_chat_scoped_message(None)
+
+
 def test_codex_event_payload_roundtrip():
     event = CodexEvent(
         type="item_completed",
@@ -81,3 +84,16 @@ def test_codex_event_payload_roundtrip():
     assert restored.method == "item/tool/requestUserInput"
     assert restored.params == {"x": 1}
     assert restored.data == {"thread_id": "thread-1", "turn_id": "turn-1"}
+
+
+def test_codex_event_payload_requires_type():
+    with pytest.raises(CodexWorkerProtocolError):
+        event_from_payload({})
+
+
+def test_codex_event_payload_preserves_defaults_for_omitted_fields():
+    restored = event_from_payload({"type": "stderr"})
+
+    assert restored.type == "stderr"
+    assert restored.text == ""
+    assert restored.data == {}
