@@ -1,4 +1,5 @@
 import io
+import json
 
 from codex_worker_client import CodexWorkerClient
 
@@ -24,6 +25,17 @@ class FakeProcess:
         self.returncode = -9
 
     def wait(self, timeout=None):
+        return self.returncode
+
+
+class GracefulExitAfterShutdownProcess(FakeProcess):
+    def __init__(self):
+        super().__init__()
+        self.wait_calls = []
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        self.returncode = 0
         return self.returncode
 
 
@@ -59,9 +71,10 @@ def test_worker_client_reply_user_input_writes_ipc_message():
     client.reply_user_input("chat-c", "request-7", {"reply": ["ok"]})
 
     written = proc.stdin.getvalue()
+    message = json.loads(written)
     assert '"type":"reply_user_input"' in written
     assert '"request_id":"request-7"' in written
-    assert '"reply":["ok"]' in written
+    assert message["payload"]["answers"] == {"reply": ["ok"]}
 
 
 def test_worker_client_close_terminates_process():
@@ -72,6 +85,20 @@ def test_worker_client_close_terminates_process():
     client.close()
 
     assert proc.terminated is True
+
+
+def test_worker_client_close_waits_for_graceful_shutdown_before_terminate():
+    proc = GracefulExitAfterShutdownProcess()
+    client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
+    client.start()
+
+    client.close()
+
+    written = proc.stdin.getvalue()
+    assert '"type":"shutdown"' in written
+    assert proc.wait_calls == [1]
+    assert proc.terminated is False
+    assert proc.killed is False
 
 
 def test_worker_client_enqueue_compacts_answer_delta_but_keeps_execution_rows():
@@ -131,3 +158,40 @@ def test_worker_client_enqueue_compacts_answer_delta_but_keeps_execution_rows():
     assert "delta-0" not in event_texts
     assert "step 1" in event_texts
     assert "step 2" in event_texts
+
+
+def test_worker_client_compacts_deltas_by_event_turn_id_variants():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    for text, event_extra in (
+        ("turn-a-old", {"turn_id": "turn-a"}),
+        ("turn-b-old", {"turnId": "turn-b"}),
+        ("turn-c-old", {"data": {"turn_id": "turn-c"}}),
+        ("turn-a-new", {"turn_id": "turn-a"}),
+        ("turn-b-new", {"turnId": "turn-b"}),
+        ("turn-c-new", {"data": {"turn_id": "turn-c"}}),
+    ):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {
+                        "type": "agent_message_delta",
+                        "text": text,
+                        **event_extra,
+                    },
+                },
+            }
+        )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    event_texts = [item["payload"]["event"]["text"] for item in drained]
+    assert "turn-a-new" in event_texts
+    assert "turn-b-new" in event_texts
+    assert "turn-c-new" in event_texts
+    assert "turn-a-old" not in event_texts
+    assert "turn-b-old" not in event_texts
+    assert "turn-c-old" not in event_texts

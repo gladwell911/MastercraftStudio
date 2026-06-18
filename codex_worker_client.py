@@ -83,6 +83,13 @@ class CodexWorkerClient:
         if proc.poll() is not None:
             return
         try:
+            if proc.wait(timeout=1) is not None:
+                return
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            return
+        try:
             proc.terminate()
             proc.wait(timeout=2)
             return
@@ -102,8 +109,7 @@ class CodexWorkerClient:
 
     def reply_user_input(self, chat_id: str, request_id: str, answers: dict[str, Any]) -> str:
         message_id = self._next_id()
-        payload = {"chat_id": chat_id, "request_id": request_id}
-        payload.update(dict(answers or {}))
+        payload = {"chat_id": chat_id, "request_id": request_id, "answers": dict(answers or {})}
         self._send_message(make_ui_request(message_id, "reply_user_input", payload))
         return message_id
 
@@ -198,10 +204,7 @@ class CodexWorkerClient:
     def _delta_key(self, message: dict[str, Any]) -> tuple[str, str]:
         payload = message.get("payload") or {}
         event = payload.get("event") or {}
-        data = event.get("data") if isinstance(event, dict) else {}
-        turn_key = ""
-        if isinstance(data, dict):
-            turn_key = str(data.get("turn_id") or "").strip()
+        turn_key = self._event_turn_id(event)
         if not turn_key:
             turn_key = str(payload.get("turn_idx") or "")
         return str(payload.get("chat_id") or ""), turn_key
@@ -215,6 +218,18 @@ class CodexWorkerClient:
     @staticmethod
     def _next_id() -> str:
         return uuid.uuid4().hex
+
+    @staticmethod
+    def _event_turn_id(event: Any) -> str:
+        if not isinstance(event, dict):
+            return ""
+        turn_id = str(event.get("turn_id") or event.get("turnId") or "").strip()
+        if turn_id:
+            return turn_id
+        data = event.get("data")
+        if isinstance(data, dict):
+            return str(data.get("turn_id") or "").strip()
+        return ""
 
     @staticmethod
     def _creationflags() -> int:
