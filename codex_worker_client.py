@@ -5,7 +5,8 @@ import subprocess
 import sys
 import threading
 import uuid
-from collections import OrderedDict, deque
+from collections import deque
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,9 +36,10 @@ class CodexWorkerClient:
         self.worker_module = str(worker_module or "codex_worker_process")
         self.queue_limit = max(int(queue_limit or 0), 1)
         self.process = None
-        self._pending_messages: deque[dict[str, Any]] = deque()
-        self._compacted_deltas: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._queue: deque[dict[str, Any]] = deque()
+        self._delta_messages: dict[tuple[str, ...], dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._closed = False
@@ -130,29 +132,35 @@ class CodexWorkerClient:
         if remaining == 0:
             return drained
         with self._lock:
-            while remaining and self._compacted_deltas:
-                _, message = self._compacted_deltas.popitem(last=False)
-                drained.append(message)
-                remaining -= 1
-            while remaining and self._pending_messages:
-                drained.append(self._pending_messages.popleft())
+            while remaining and self._queue:
+                entry = self._queue.popleft()
+                if entry["kind"] == "delta":
+                    message = self._delta_messages.pop(entry["key"], None)
+                    if message is None:
+                        continue
+                    drained.append(message)
+                else:
+                    drained.append(entry["message"])
                 remaining -= 1
         return drained
 
     def _enqueue_worker_message(self, message: dict[str, Any]) -> None:
         validated = validate_chat_scoped_message(message)
-        if self._is_agent_message_delta(validated):
-            key = self._delta_key(validated)
-            with self._lock:
-                self._compacted_deltas[key] = validated
-                self._compacted_deltas.move_to_end(key)
-        else:
-            with self._lock:
-                while len(self._pending_messages) >= self.queue_limit:
-                    self._pending_messages.popleft()
-                self._pending_messages.append(validated)
+        with self._lock:
+            if self._is_agent_message_delta(validated):
+                key = self._delta_key(validated)
+                existing = self._delta_messages.get(key)
+                if existing is None:
+                    self._delta_messages[key] = deepcopy(validated)
+                    self._queue.append({"kind": "delta", "key": key})
+                    self._enforce_queue_limit_locked()
+                else:
+                    self._delta_messages[key] = self._merge_delta_message(existing, validated)
+            else:
+                self._queue.append({"kind": "message", "message": validated})
+                self._enforce_queue_limit_locked()
         if self.on_message is not None:
-            self.on_message(validated)
+            self.on_message({"type": "messages_pending"})
 
     def _stdout_loop(self) -> None:
         proc = self.process
@@ -168,7 +176,7 @@ class CodexWorkerClient:
                 except Exception:
                     continue
         finally:
-            self._notify_exit()
+            self._notify_exit(proc)
 
     def _stderr_loop(self) -> None:
         proc = self.process
@@ -188,27 +196,56 @@ class CodexWorkerClient:
         stdin = getattr(proc, "stdin", None)
         if stdin is None:
             raise RuntimeError("Codex worker process has no stdin.")
-        stdin.write(encode_worker_message(message))
-        stdin.flush()
+        line = encode_worker_message(message)
+        with self._send_lock:
+            stdin.write(line)
+            stdin.flush()
 
-    def _notify_exit(self) -> None:
+    def _notify_exit(self, proc: Any | None = None) -> None:
         if self.on_exit is None:
             return
-        proc = self.process
+        if proc is None:
+            proc = self.process
         returncode = proc.poll() if proc is not None else None
         try:
             self.on_exit(returncode)
         except TypeError:
             self.on_exit()
 
-    def _delta_key(self, message: dict[str, Any]) -> tuple[str, str]:
+    def _delta_key(self, message: dict[str, Any]) -> tuple[str, ...]:
         payload = message.get("payload") or {}
         event = payload.get("event") or {}
         turn_key = self._event_turn_id(event)
         if not turn_key:
             turn_idx = payload.get("turn_idx")
             turn_key = "" if turn_idx is None else str(turn_idx)
+        item_id = self._event_item_id(event)
+        if item_id:
+            return str(payload.get("chat_id") or ""), turn_key, item_id
         return str(payload.get("chat_id") or ""), turn_key
+
+    def _enforce_queue_limit_locked(self) -> None:
+        while len(self._queue) > self.queue_limit:
+            entry = self._queue.popleft()
+            if entry["kind"] == "delta":
+                self._delta_messages.pop(entry["key"], None)
+
+    @staticmethod
+    def _merge_delta_message(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        merged = deepcopy(incoming)
+        existing_event = ((existing.get("payload") or {}).get("event") or {})
+        merged_event = ((merged.get("payload") or {}).get("event") or {})
+        incoming_event = ((incoming.get("payload") or {}).get("event") or {})
+        if not isinstance(existing_event, dict) or not isinstance(merged_event, dict) or not isinstance(incoming_event, dict):
+            return merged
+        existing_text = str(existing_event.get("text") or "")
+        incoming_text = str(incoming_event.get("text") or "")
+        merged_event["text"] = existing_text + incoming_text
+        if "raw_text" in existing_event or "raw_text" in incoming_event:
+            existing_raw = str(existing_event.get("raw_text") or "")
+            incoming_raw = str(incoming_event.get("raw_text") or "")
+            merged_event["raw_text"] = existing_raw + incoming_raw
+        return merged
 
     @staticmethod
     def _is_agent_message_delta(message: dict[str, Any]) -> bool:
@@ -230,6 +267,18 @@ class CodexWorkerClient:
         data = event.get("data")
         if isinstance(data, dict):
             return str(data.get("turn_id") or "").strip()
+        return ""
+
+    @staticmethod
+    def _event_item_id(event: Any) -> str:
+        if not isinstance(event, dict):
+            return ""
+        item_id = str(event.get("item_id") or event.get("itemId") or "").strip()
+        if item_id:
+            return item_id
+        data = event.get("data")
+        if isinstance(data, dict):
+            return str(data.get("item_id") or data.get("itemId") or "").strip()
         return ""
 
     @staticmethod

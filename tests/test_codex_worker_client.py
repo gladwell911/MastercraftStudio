@@ -39,6 +39,15 @@ class GracefulExitAfterShutdownProcess(FakeProcess):
         return self.returncode
 
 
+class ReplacingStdout:
+    def __init__(self, replace):
+        self.replace = replace
+
+    def __iter__(self):
+        self.replace()
+        return iter(())
+
+
 def test_worker_client_send_start_turn_writes_json_line():
     proc = FakeProcess()
     client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
@@ -154,10 +163,8 @@ def test_worker_client_enqueue_compacts_answer_delta_but_keeps_execution_rows():
     drained = client.drain_pending_messages(limit=10)
 
     event_texts = [item["payload"]["event"].get("text") for item in drained if item["type"] == "event"]
-    assert "delta-19" in event_texts
-    assert "delta-0" not in event_texts
-    assert "step 1" in event_texts
-    assert "step 2" in event_texts
+    assert event_texts == ["".join(f"delta-{idx}" for idx in range(20)), "step 1", "step 2"]
+    assert event_texts[0].index("delta-0") < event_texts[0].index("delta-19")
 
 
 def test_worker_client_compacts_deltas_by_event_turn_id_variants():
@@ -189,9 +196,9 @@ def test_worker_client_compacts_deltas_by_event_turn_id_variants():
     drained = client.drain_pending_messages(limit=10)
 
     event_texts = [item["payload"]["event"]["text"] for item in drained]
-    assert "turn-a-new" in event_texts
-    assert "turn-b-new" in event_texts
-    assert "turn-c-new" in event_texts
+    assert "turn-a-oldturn-a-new" in event_texts
+    assert "turn-b-oldturn-b-new" in event_texts
+    assert "turn-c-oldturn-c-new" in event_texts
     assert "turn-a-old" not in event_texts
     assert "turn-b-old" not in event_texts
     assert "turn-c-old" not in event_texts
@@ -234,3 +241,164 @@ def test_worker_client_delta_fallback_preserves_zero_turn_idx():
     event_texts = [item["payload"]["event"]["text"] for item in drained]
     assert "turn-idx-zero" in event_texts
     assert "turn-idx-one" in event_texts
+
+
+def test_worker_client_merges_delta_fragments_for_same_chat_turn_and_item():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    for text, raw_text in (("hello ", "raw-a"), ("world", "raw-b")):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {
+                        "type": "agent_message_delta",
+                        "text": text,
+                        "raw_text": raw_text,
+                        "turn_id": "turn-1",
+                        "item_id": "item-1",
+                        "phase": "answer",
+                    },
+                },
+            }
+        )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert len(drained) == 1
+    event = drained[0]["payload"]["event"]
+    assert event["text"] == "hello world"
+    assert event["raw_text"] == "raw-araw-b"
+    assert event["item_id"] == "item-1"
+
+
+def test_worker_client_does_not_merge_different_item_ids_in_same_turn():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    for item_id, text in (("item-a", "delta-a"), ("item-b", "delta-b")):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": {
+                        "type": "agent_message_delta",
+                        "text": text,
+                        "turn_id": "turn-1",
+                        "item_id": item_id,
+                    },
+                },
+            }
+        )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["delta-a", "delta-b"]
+
+
+def test_worker_client_preserves_queue_order_between_rows_and_delta_entries():
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), start_reader_threads=False)
+
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "item_started", "text": "step 1"},
+            },
+        }
+    )
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {
+                    "type": "agent_message_delta",
+                    "text": "answer",
+                    "turn_id": "turn-1",
+                    "item_id": "answer-1",
+                },
+            },
+        }
+    )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["step 1", "answer"]
+
+
+def test_worker_client_on_message_receives_pending_notifications_only():
+    observed = []
+    client = CodexWorkerClient(
+        process_factory=lambda args: FakeProcess(), on_message=observed.append, start_reader_threads=False
+    )
+
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "item_started", "text": "step 1"},
+            },
+        }
+    )
+    client._enqueue_worker_message(
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "event": {"type": "agent_message_delta", "text": "delta", "turn_id": "turn-1"},
+            },
+        }
+    )
+
+    assert observed == [{"type": "messages_pending"}, {"type": "messages_pending"}]
+
+
+def test_worker_client_queue_limit_counts_delta_entries_and_normal_entries():
+    client = CodexWorkerClient(
+        process_factory=lambda args: FakeProcess(), start_reader_threads=False, queue_limit=2
+    )
+
+    for event in (
+        {"type": "item_started", "text": "step 1"},
+        {"type": "agent_message_delta", "text": "answer", "turn_id": "turn-1", "item_id": "answer-1"},
+        {"type": "item_completed", "text": "step 2"},
+    ):
+        client._enqueue_worker_message(
+            {
+                "type": "event",
+                "payload": {
+                    "chat_id": "chat-c",
+                    "turn_idx": 0,
+                    "event": event,
+                },
+            }
+        )
+
+    drained = client.drain_pending_messages(limit=10)
+
+    assert [item["payload"]["event"]["text"] for item in drained] == ["answer", "step 2"]
+
+
+def test_worker_client_stdout_loop_reports_captured_process_returncode():
+    observed = []
+    client = CodexWorkerClient(process_factory=lambda args: FakeProcess(), on_exit=observed.append)
+    first_proc = FakeProcess()
+    replacement_proc = FakeProcess()
+    first_proc.returncode = 11
+    replacement_proc.returncode = 22
+    first_proc.stdout = ReplacingStdout(lambda: setattr(client, "process", replacement_proc))
+    client.process = first_proc
+
+    client._stdout_loop()
+
+    assert observed == [11]
