@@ -597,6 +597,8 @@ def test_real_ui_worker_events_do_not_mutate_lists_during_navigation_quiet(frame
     frame.Show()
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
+    frame.view_mode = "active"
+    frame.active_codex_thread_id = "thread-current"
     frame.active_codex_turn_id = "turn-1"
     frame.active_turn_idx = 0
     frame.active_session_turns = [
@@ -606,25 +608,56 @@ def test_real_ui_worker_events_do_not_mutate_lists_during_navigation_quiet(frame
             "model": main.DEFAULT_CODEX_MODEL,
             "created_at": 1.0,
             "request_status": "pending",
+            "codex_thread_id": "thread-current",
             "codex_turn_id": "turn-1",
         }
     ]
     frame._current_chat_state = {
         "id": "chat-current",
         "turns": frame.active_session_turns,
-        "detail_panel_mode": "answers",
+        "detail_panel_mode": "execution",
         "execution_steps": [],
+        "codex_thread_id": "thread-current",
         "codex_turn_id": "turn-1",
     }
-    frame._render_answer_list()
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args, **kwargs: bool(fn(*args, **kwargs)) or True)
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda _delay, fn, *args, **kwargs: None)
+
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
     wx_app.Yield()
 
-    mutations = []
-    monkeypatch.setattr(frame.answer_list, "Append", lambda *args, **kwargs: mutations.append(("answer_append", args)))
+    append_entry_calls = []
+    original_append_execution_entry = frame._append_execution_entry_to_chat
+
+    def _append_execution_entry_spy(*args, **kwargs):
+        append_entry_calls.append((args, kwargs))
+        return original_append_execution_entry(*args, **kwargs)
+
+    monkeypatch.setattr(frame, "_append_execution_entry_to_chat", _append_execution_entry_spy)
+    execution_appends = []
+    immediate_answer_mutations = []
+    monkeypatch.setattr(frame.execution_list_model, "append", lambda *args, **kwargs: execution_appends.append(args))
     monkeypatch.setattr(
-        frame.execution_list,
-        "Append",
-        lambda *args, **kwargs: mutations.append(("execution_append", args)),
+        frame,
+        "_update_active_answer_row",
+        lambda *args, **kwargs: immediate_answer_mutations.append(("_update_active_answer_row", args)),
+    )
+    monkeypatch.setattr(
+        frame,
+        "_append_completed_answer_to_answer_list",
+        lambda *args, **kwargs: immediate_answer_mutations.append(("_append_completed_answer_to_answer_list", args)),
+    )
+    monkeypatch.setattr(
+        frame,
+        "_refresh_answer_list_preserving_selection",
+        lambda *args, **kwargs: immediate_answer_mutations.append(("_refresh_answer_list_preserving_selection", args)),
+    )
+    monkeypatch.setattr(
+        frame,
+        "_render_answer_list_compat",
+        lambda *args, **kwargs: immediate_answer_mutations.append(("_render_answer_list_compat", args)),
     )
 
     frame._navigation_quiet_until = time.monotonic() + 3.0
@@ -636,16 +669,41 @@ def test_real_ui_worker_events_do_not_mutate_lists_during_navigation_quiet(frame
                 "chat_id": "chat-current",
                 "turn_idx": 0,
                 "event": {
-                    "type": "item_started",
+                    "type": "plan_updated",
+                    "thread_id": "thread-current",
+                    "turn_id": "turn-1",
                     "text": "run pytest",
-                    "data": {"turn_id": "turn-1", "step_seq": 1},
+                    "data": {"step_seq": 1},
+                },
+            },
+        },
+    )
+    frame._on_codex_worker_message(
+        "chat-current",
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-current",
+                "turn_idx": 0,
+                "event": {
+                    "type": "item_completed",
+                    "thread_id": "thread-current",
+                    "turn_id": "turn-1",
+                    "phase": "final_answer",
+                    "text": "final answer",
+                    "data": {"step_seq": 2},
                 },
             },
         },
     )
     wx_app.Yield()
 
-    assert mutations == []
+    assert execution_appends == []
+    assert immediate_answer_mutations == []
+    assert append_entry_calls
+    assert frame._pending_execution_tail_appends.get("chat-current")
+    assert frame._background_answer_list_dirty is True
+    assert frame.active_session_turns[0]["answer_md"] == "final answer"
 
 
 def test_real_ui_subagent_result_appears_in_answer_list_without_stealing_input_focus(frame, wx_app, monkeypatch):
