@@ -15,6 +15,8 @@ class FakeCodexClient:
         self.started_turns = []
         self.steered_turns = []
         self.resumed_threads = []
+        self.compacted_threads = []
+        self.interrupted_turns = []
         self.replies = []
         self.closed = False
 
@@ -36,6 +38,14 @@ class FakeCodexClient:
 
     def respond_tool_request_user_input(self, request_id, answers):
         self.replies.append((request_id, answers))
+
+    def compact_thread(self, thread_id):
+        self.compacted_threads.append(thread_id)
+        return {}
+
+    def interrupt_turn(self, thread_id, turn_id):
+        self.interrupted_turns.append((thread_id, turn_id))
+        return {}
 
     def close(self):
         self.closed = True
@@ -128,6 +138,9 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
     assert any(item["type"] == "turn_started_ack" and item["payload"]["turn_id"] == "turn-1" for item in messages)
     assert not any(item["type"] == "turn_finished" for item in messages)
     assert created[0].started_threads[0]["cwd"] == "c:/code/sj"
+    assert created[0].started_threads[0]["approval_policy"] == "never"
+    assert created[0].started_threads[0]["sandbox"] == "danger-full-access"
+    assert created[0].started_threads[0]["personality"] == "pragmatic"
     assert created[0].started_turns[0][2] == "fast"
 
 
@@ -679,6 +692,52 @@ def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
     assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
     assert created[0].started_turns == [("thread-existing", [{"type": "text", "text": "继续"}], "fast")]
     assert any(item["type"] == "turn_started_ack" for item in messages)
+
+
+def test_worker_runtime_compact_thread_calls_client_without_protocol_error():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-compact",
+            "compact_thread",
+            {"chat_id": "chat-c", "model": "model-a", "thread_id": "thread-1"},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].compacted_threads == ["thread-1"]
+    assert not any(item["type"] == "protocol_error" for item in messages)
+    assert not any(item["type"] == "error" for item in messages)
+
+
+def test_worker_runtime_cancel_turn_calls_interrupt_without_protocol_error():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-cancel",
+            "cancel_turn",
+            {"chat_id": "chat-c", "model": "model-a", "thread_id": "thread-1", "turn_id": "turn-1"},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].interrupted_turns == [("thread-1", "turn-1")]
+    assert not any(item["type"] == "protocol_error" for item in messages)
+    assert not any(item["type"] == "error" for item in messages)
 
 
 def test_worker_runtime_emit_serializes_concurrent_writes():

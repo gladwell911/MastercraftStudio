@@ -6758,7 +6758,7 @@ class ChatFrame(wx.Frame):
             elif normalized_command == "help":
                 answer = self._build_codex_help_markdown()
             elif normalized_command == "compact":
-                answer = self._handle_codex_compact_command(client, target_chat)
+                answer = self._handle_codex_compact_command(client, target_chat, model=model)
             elif normalized_command == "model":
                 answer = self._handle_codex_model_command(str(args or ""), target_chat)
             elif normalized_command == "speed":
@@ -6769,20 +6769,21 @@ class ChatFrame(wx.Frame):
             elif normalized_command == "clear":
                 answer = self._handle_codex_clear_command(target_chat)
             elif normalized_command == "stop":
-                answer = self._handle_codex_stop_command(client, target_chat)
+                answer = self._handle_codex_stop_command(client, target_chat, model=model)
             else:
                 answer = self._build_codex_unsupported_command_markdown(normalized_command or command, args)
             self._call_after_if_alive(self._on_done, turn_idx, answer, "", model, "", chat_id)
         except Exception as exc:
             self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
 
-    def _handle_codex_compact_command(self, client, chat: dict) -> str:
+    def _handle_codex_compact_command(self, client, chat: dict, model: str = "") -> str:
         thread_id = self._codex_thread_id_for_chat(chat)
         if not thread_id:
             return "## Codex 压缩\n\n当前聊天还没有 Codex 线程，无法执行 `/compact`。"
         if client is None or not hasattr(client, "compact_thread"):
             return "## Codex 压缩\n\n当前 Codex 客户端不支持 `thread/compact/start`。"
-        client.compact_thread(thread_id)
+        chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        client.compact_thread(thread_id, chat_id=chat_id, model=str(model or (chat or {}).get("model") or DEFAULT_CODEX_MODEL))
         return f"## Codex 压缩\n\n已开始压缩当前 Codex 线程：`{thread_id}`。"
 
     def _handle_codex_model_command(self, args: str, chat: dict) -> str:
@@ -6843,14 +6844,20 @@ class ChatFrame(wx.Frame):
         self._save_state()
         return "## Codex 清理\n\n已清除当前聊天关联的 Codex 线程状态。聊天记录不会被删除。"
 
-    def _handle_codex_stop_command(self, client, chat: dict) -> str:
+    def _handle_codex_stop_command(self, client, chat: dict, model: str = "") -> str:
         thread_id = self._codex_thread_id_for_chat(chat)
         turn_id = self._codex_turn_id_for_chat(chat)
         if not thread_id or not turn_id:
             return "## Codex 中断\n\n当前没有可中断的 Codex turn。"
         if client is None or not hasattr(client, "interrupt_turn"):
             return "## Codex 中断\n\n当前 Codex 客户端不支持 `turn/interrupt`。"
-        client.interrupt_turn(thread_id, turn_id)
+        chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        client.interrupt_turn(
+            thread_id,
+            turn_id,
+            chat_id=chat_id,
+            model=str(model or (chat or {}).get("model") or DEFAULT_CODEX_MODEL),
+        )
         return f"## Codex 中断\n\n已请求中断 turn：`{turn_id}`。"
 
     def _ensure_codex_thread_resumed(self, client, thread_id: str, service_tier: str = "") -> None:
@@ -6919,8 +6926,6 @@ class ChatFrame(wx.Frame):
             service_tier = self._codex_service_tier_for_chat(target_chat)
             if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
                 service_tier = normalize_codex_service_tier(target_turns[turn_idx].get("codex_service_tier")) or service_tier
-            if isinstance(target_chat, dict):
-                target_chat["codex_service_tier"] = service_tier
             turn_attachments = []
             if 0 <= turn_idx < len(target_turns):
                 maybe_attachments = target_turns[turn_idx].get("attachments") if isinstance(target_turns[turn_idx], dict) else []
@@ -6945,15 +6950,43 @@ class ChatFrame(wx.Frame):
                 should_steer=should_steer,
                 history_turns=history_turns,
             )
-            if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
-                turn = target_turns[turn_idx]
-                turn["request_recovery_mode"] = "resume"
-                turn["request_resume_token"] = {"thread_id": thread_id, "turn_id": turn_id}
-                if (not from_recovery) and (not recovery_context):
-                    turn["request_status"] = "pending"
-            self._defer_codex_state_save()
+            self._call_after_if_alive(
+                self._mark_codex_worker_turn_request_started,
+                client_chat_id,
+                turn_idx,
+                service_tier,
+                thread_id,
+                turn_id,
+                from_recovery,
+                recovery_context,
+            )
         except Exception as exc:
             self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+
+    def _mark_codex_worker_turn_request_started(
+        self,
+        chat_id: str,
+        turn_idx: int,
+        service_tier: str,
+        thread_id: str,
+        turn_id: str,
+        from_recovery: bool = False,
+        recovery_context: bool = False,
+    ) -> None:
+        target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
+        if not isinstance(target_chat, dict):
+            return
+        target_chat["codex_service_tier"] = normalize_codex_service_tier(service_tier)
+        target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
+        if isinstance(target_turns, list) and 0 <= int(turn_idx) < len(target_turns):
+            turn = target_turns[int(turn_idx)]
+            if isinstance(turn, dict):
+                turn["request_recovery_mode"] = "resume"
+                turn["request_resume_token"] = {"thread_id": str(thread_id or ""), "turn_id": str(turn_id or "")}
+                if (not from_recovery) and (not recovery_context):
+                    turn["request_status"] = "pending"
+                self._mark_chat_turns_dirty(None if is_current_target else chat_id, int(turn_idx))
+        self._defer_codex_state_save()
 
     def _start_claudecode_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, session_id: str) -> None:
         def _worker() -> None:

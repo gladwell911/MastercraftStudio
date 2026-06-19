@@ -118,13 +118,27 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(message_id, "reply_user_input", payload))
         return message_id
 
-    def cancel_turn(self, chat_id: str, thread_id: str, turn_id: str) -> str:
+    def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "") -> str:
+        request_id = self._next_id()
+        payload = {"chat_id": str(chat_id or ""), "model": str(model or ""), "thread_id": str(thread_id or "")}
+        self._send_message(make_ui_request(request_id, "compact_thread", payload))
+        return request_id
+
+    def interrupt_turn(self, thread_id: str, turn_id: str, *, chat_id: str, model: str = "") -> str:
+        return self.cancel_turn(chat_id=chat_id, thread_id=thread_id, turn_id=turn_id, model=model)
+
+    def cancel_turn(self, chat_id: str, thread_id: str, turn_id: str, model: str = "") -> str:
         request_id = self._next_id()
         self._send_message(
             make_ui_request(
                 request_id,
                 "cancel_turn",
-                {"chat_id": chat_id, "thread_id": thread_id, "turn_id": turn_id},
+                {
+                    "chat_id": str(chat_id or ""),
+                    "model": str(model or ""),
+                    "thread_id": str(thread_id or ""),
+                    "turn_id": str(turn_id or ""),
+                },
             )
         )
         return request_id

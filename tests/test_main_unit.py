@@ -13833,6 +13833,60 @@ def test_run_codex_turn_worker_sends_start_turn_to_worker(frame, monkeypatch):
     assert sent[0]["input_items"][0]["type"] == "text"
 
 
+def test_run_codex_turn_worker_schedules_request_state_mutation(frame, monkeypatch):
+    sent = []
+    scheduled = []
+
+    class FakeWorker:
+        codex_model = main.DEFAULT_CODEX_MODEL
+
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": FakeWorker())
+    in_scheduled_mutation = {"value": False}
+    defer_calls = []
+
+    def defer_save():
+        if not in_scheduled_mutation["value"]:
+            pytest.fail("state save must be scheduled onto UI thread")
+        defer_calls.append(True)
+
+    monkeypatch.setattr(frame, "_defer_codex_state_save", defer_save)
+
+    def schedule(func, *args, **kwargs):
+        scheduled.append((func, args, kwargs))
+        return True
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", schedule)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update({"id": "chat-current", "codex_service_tier": ""})
+    frame._current_chat_state["turns"] = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame.active_session_turns = frame._current_chat_state["turns"]
+
+    frame._run_codex_turn_worker("chat-current", 0, "问题", main.DEFAULT_CODEX_MODEL)
+
+    assert sent
+    assert scheduled
+    assert frame._current_chat_state["codex_service_tier"] == ""
+    assert frame.active_session_turns[0].get("request_recovery_mode") is None
+
+    in_scheduled_mutation["value"] = True
+    scheduled[0][0](*scheduled[0][1], **scheduled[0][2])
+    in_scheduled_mutation["value"] = False
+
+    assert frame.active_session_turns[0]["request_recovery_mode"] == "resume"
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert defer_calls == [True]
+
+
 def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
@@ -14226,9 +14280,9 @@ def test_codex_compact_command_worker_calls_app_server_compact(frame, monkeypatc
     done = []
 
     class _Client:
-        def compact_thread(self, thread_id):
-            calls.append(thread_id)
-            return {}
+        def compact_thread(self, thread_id, **payload):
+            calls.append((thread_id, payload))
+            return "req-compact"
 
     monkeypatch.setattr(frame, "_ensure_codex_client", lambda _model="": _Client())
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
@@ -14236,8 +14290,31 @@ def test_codex_compact_command_worker_calls_app_server_compact(frame, monkeypatc
 
     frame._run_codex_local_command_worker("chat-current", 0, "compact", "now", "codex/main")
 
-    assert calls == ["thread-1"]
+    assert calls == [("thread-1", {"chat_id": "chat-current", "model": "codex/main"})]
     assert "已开始压缩" in done[0][1]
+    assert done[0][2] == ""
+
+
+def test_codex_stop_command_worker_sends_interrupt_turn(frame, monkeypatch):
+    frame._current_chat_state.update(
+        {"id": "chat-current", "model": "codex/main", "codex_thread_id": "thread-1", "codex_turn_id": "turn-1"}
+    )
+    calls = []
+    done = []
+
+    class _Client:
+        def interrupt_turn(self, thread_id, turn_id, **payload):
+            calls.append((thread_id, turn_id, payload))
+            return "req-stop"
+
+    monkeypatch.setattr(frame, "_ensure_codex_client", lambda _model="": _Client())
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    monkeypatch.setattr(frame, "_on_done", lambda *args: done.append(args))
+
+    frame._run_codex_local_command_worker("chat-current", 0, "stop", "", "codex/main")
+
+    assert calls == [("thread-1", "turn-1", {"chat_id": "chat-current", "model": "codex/main"})]
+    assert "已请求中断" in done[0][1]
     assert done[0][2] == ""
 
 

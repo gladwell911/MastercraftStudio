@@ -39,6 +39,10 @@ class CodexWorkerRuntime:
             self._handle_start_turn(message)
         elif message_type == "reply_user_input":
             self._handle_reply_user_input(message)
+        elif message_type == "compact_thread":
+            self._handle_compact_thread(message)
+        elif message_type == "cancel_turn":
+            self._handle_cancel_turn(message)
         elif message_type == "ping":
             self.emit("pong", request_id=message.get("id"))
         elif message_type == "shutdown":
@@ -175,7 +179,13 @@ class CodexWorkerRuntime:
             self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
 
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
-        thread_response = client.start_thread(cwd=payload.get("cwd") or "", service_tier=service_tier_arg)
+        thread_response = client.start_thread(
+            cwd=payload.get("cwd") or "",
+            approval_policy="never",
+            sandbox="danger-full-access",
+            personality="pragmatic",
+            service_tier=service_tier_arg,
+        )
         return self._extract_id(thread_response, "thread", "thread_id")
 
     def _recovery_input_items(self, payload: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -251,6 +261,44 @@ class CodexWorkerRuntime:
             return
         client = self._clients[key]
         client.respond_tool_request_user_input(payload.get("request_id"), dict(payload.get("answers") or {}))
+
+    def _handle_compact_thread(self, message: dict[str, Any]) -> None:
+        payload = dict(message.get("payload") or {})
+        chat_id = str(payload.get("chat_id") or "").strip()
+        model = str(payload.get("model") or "").strip() or DEFAULT_CODEX_MODEL
+        thread_id = str(payload.get("thread_id") or "").strip()
+        if not chat_id:
+            self._emit_protocol_error(message, "compact_thread requires payload.chat_id")
+            return
+        if not thread_id:
+            self._emit_scoped_error(message, "compact_thread requires payload.thread_id", chat_id, None, model)
+            return
+        try:
+            client = self._client_for(chat_id, model)
+            client.compact_thread(thread_id)
+        except Exception as exc:
+            self._emit_scoped_error(message, str(exc), chat_id, None, model)
+
+    def _handle_cancel_turn(self, message: dict[str, Any]) -> None:
+        payload = dict(message.get("payload") or {})
+        chat_id = str(payload.get("chat_id") or "").strip()
+        model = str(payload.get("model") or "").strip() or DEFAULT_CODEX_MODEL
+        thread_id = str(payload.get("thread_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if not chat_id:
+            self._emit_protocol_error(message, "cancel_turn requires payload.chat_id")
+            return
+        if not thread_id or not turn_id:
+            self._emit_scoped_error(message, "cancel_turn requires payload.thread_id and payload.turn_id", chat_id, None, model)
+            return
+        try:
+            client = self._client_for(chat_id, model)
+            if hasattr(client, "interrupt_turn"):
+                client.interrupt_turn(thread_id, turn_id)
+            else:
+                client.cancel_turn(thread_id, turn_id)
+        except Exception as exc:
+            self._emit_scoped_error(message, str(exc), chat_id, None, model)
 
     @staticmethod
     def _default_client_factory(on_event: Callable[[CodexEvent], None], codex_model: str) -> CodexAppServerClient:

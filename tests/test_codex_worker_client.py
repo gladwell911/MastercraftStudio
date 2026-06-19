@@ -88,6 +88,35 @@ def test_worker_client_reply_user_input_writes_ipc_message():
     assert message["payload"]["answers"] == {"reply": ["ok"]}
 
 
+def test_worker_client_compact_thread_writes_ipc_message():
+    proc = FakeProcess()
+    client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
+    client.start()
+
+    client.compact_thread("thread-1", chat_id="chat-c", model="codex/main")
+
+    message = json.loads(proc.stdin.getvalue())
+    assert message["type"] == "compact_thread"
+    assert message["payload"] == {"chat_id": "chat-c", "model": "codex/main", "thread_id": "thread-1"}
+
+
+def test_worker_client_interrupt_turn_writes_ipc_message():
+    proc = FakeProcess()
+    client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
+    client.start()
+
+    client.interrupt_turn("thread-1", "turn-1", chat_id="chat-c", model="codex/main")
+
+    message = json.loads(proc.stdin.getvalue())
+    assert message["type"] == "cancel_turn"
+    assert message["payload"] == {
+        "chat_id": "chat-c",
+        "model": "codex/main",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }
+
+
 def test_worker_client_close_terminates_process():
     proc = FakeProcess()
     client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
