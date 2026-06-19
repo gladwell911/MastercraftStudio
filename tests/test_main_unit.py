@@ -14,6 +14,11 @@ import main
 import speech_input
 
 
+def test_main_does_not_call_respond_tool_request_user_input_directly():
+    source = Path("main.py").read_text(encoding="utf-8")
+    assert "respond_tool_request_user_input" not in source
+
+
 REQUEST_METADATA_FIELDS = {
     "request_status",
     "request_model",
@@ -5483,10 +5488,37 @@ def test_remote_pending_request_reply_uses_matching_chat_worker(frame, monkeypat
     ok, message = frame._handle_remote_pending_request_reply("remote ok")
 
     assert ok is True
-    assert message == ""
+    assert "已提交" in message
     assert ("start", "chat-c") in calls
     assert ("reply", "chat-c", "chat-c", "req-remote", {"reply": ["remote ok"]}) in calls
     assert frame.active_codex_pending_request is None
+
+
+def test_remote_pending_request_reply_uses_worker_ipc(frame, monkeypatch):
+    replies = []
+
+    class FakeWorker:
+        def start(self):
+            pass
+
+        def reply_user_input(self, chat_id, request_id, answers):
+            replies.append((chat_id, request_id, answers))
+
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_pending_request = {"request_id": "ask-1", "chat_id": "chat-current"}
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": FakeWorker())
+    monkeypatch.setattr(
+        frame,
+        "_ensure_codex_client",
+        lambda *a, **k: pytest.fail("pending reply must not use singleton codex client"),
+    )
+
+    ok, message = frame._handle_remote_pending_request_reply("答案")
+
+    assert ok is True
+    assert replies == [("chat-current", "ask-1", {"reply": ["答案"]})]
+    assert "已提交" in message
 
 
 def test_codex_worker_event_bridge_ignores_events_after_wx_app_gone(frame, monkeypatch):

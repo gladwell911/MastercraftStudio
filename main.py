@@ -8070,16 +8070,15 @@ class ChatFrame(wx.Frame):
         model = str(pending.get("model") or (target_chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = self._get_or_create_codex_client(chat_id, model)
         try:
-            if hasattr(client, "reply_user_input"):
-                client.start()
-                client.reply_user_input(chat_id, pending.get("request_id"), {"reply": [str(text or "")]})
-            else:
-                client.respond_tool_request_user_input(pending.get("request_id"), {"reply": [str(text or "")]})
+            start = getattr(client, "start", None)
+            if callable(start):
+                start()
+            client.reply_user_input(chat_id, pending.get("request_id"), {"reply": [str(text or "")]})
         except Exception as exc:
             return False, str(exc)
         self.active_codex_pending_request = None
         self._save_state()
-        return True, ""
+        return True, "已提交"
 
     def _should_queue_codex_ui_event(self, chat_id: str, event: CodexEvent) -> bool:
         return True
@@ -8180,11 +8179,10 @@ class ChatFrame(wx.Frame):
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
         model = str(request.get("model") or (target_chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = self._get_or_create_codex_client(chat_id, model)
-        if hasattr(client, "reply_user_input"):
-            client.start()
-            client.reply_user_input(chat_id, request.get("request_id"), answers)
-        else:
-            client.respond_tool_request_user_input(request.get("request_id"), answers)
+        start = getattr(client, "start", None)
+        if callable(start):
+            start()
+        client.reply_user_input(chat_id, request.get("request_id"), answers)
 
     def _on_codex_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):

@@ -270,11 +270,14 @@ def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(fram
 
 
 def test_codex_request_user_input_dialog_returns_answers(frame, monkeypatch):
-    seen = {}
+    replies = []
 
     class _Client:
-        def respond_tool_request_user_input(self, request_id, answers):
-            seen["request"] = (request_id, answers)
+        def start(self):
+            pass
+
+        def reply_user_input(self, chat_id, request_id, answers):
+            replies.append((chat_id, request_id, answers))
 
     class _Dialog:
         def __init__(self, _parent, _questions):
@@ -289,18 +292,71 @@ def test_codex_request_user_input_dialog_returns_answers(frame, monkeypatch):
         def Destroy(self):
             pass
 
-    frame._ensure_codex_client = lambda: _Client()
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
+    monkeypatch.setattr(
+        frame,
+        "_ensure_codex_client",
+        lambda *a, **k: pytest.fail("dialog reply must not use singleton codex client"),
+    )
     monkeypatch.setattr(main, "CodexUserInputDialog", _Dialog)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
 
     frame._handle_codex_request_dialog(
         {
-            "request_id": 7,
+            "request_id": "ask-1",
             "method": "item/tool/requestUserInput",
+            "chat_id": "chat-current",
             "params": {"questions": [{"id": "q1", "header": "闂", "question": "璇烽€夋嫨"}]},
         }
     )
 
-    assert seen["request"] == (7, {"q1": ["閫夐」A"]})
+    assert replies == [("chat-current", "ask-1", {"q1": ["閫夐」A"]})]
+
+
+def test_codex_request_user_input_dialog_replies_through_worker(frame, monkeypatch):
+    replies = []
+
+    class FakeWorker:
+        def start(self):
+            pass
+
+        def reply_user_input(self, chat_id, request_id, answers):
+            replies.append((chat_id, request_id, answers))
+
+    class _Dialog:
+        def __init__(self, _parent, _questions):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def get_answers(self):
+            return {"reply": ["ok"]}
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": FakeWorker())
+    monkeypatch.setattr(
+        frame,
+        "_ensure_codex_client",
+        lambda *a, **k: pytest.fail("dialog reply must not use singleton codex client"),
+    )
+    monkeypatch.setattr(main, "CodexUserInputDialog", _Dialog)
+
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._handle_codex_request_dialog(
+        {
+            "request_id": "ask-1",
+            "method": "item/tool/requestUserInput",
+            "params": {"questions": []},
+            "chat_id": "chat-current",
+        }
+    )
+
+    assert replies == [("chat-current", "ask-1", {"reply": ["ok"]})]
 
 
 def test_codex_turn_completed_clears_busy_state(frame, monkeypatch):
