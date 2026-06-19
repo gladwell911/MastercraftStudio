@@ -889,16 +889,16 @@ def test_ui_automation_background_codex_worker_does_not_reuse_visible_chat_threa
             "execution_steps": [],
         }
     ]
-    calls = []
+    starts = []
+    payloads = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            calls.append(("start_thread", kwargs))
-            return {"thread": {"id": "thread-a-new"}}
+        def start(self):
+            starts.append(True)
 
-        def start_turn_items(self, thread_id, items):
-            calls.append(("start_turn_items", thread_id, items))
-            return {"turn": {"id": "turn-a-new"}}
+        def start_turn(self, **payload):
+            payloads.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -910,12 +910,14 @@ def test_ui_automation_background_codex_worker_does_not_reuse_visible_chat_threa
     frame._run_codex_turn_worker("chat-a", 0, "question b", main.DEFAULT_CODEX_MODEL)
 
     after_rows = list(frame.answer_list.GetStrings())
-    archived = frame._find_archived_chat("chat-a")
-    assert calls[0][0] == "start_thread"
-    assert calls[1][1] == "thread-a-new"
-    assert archived["codex_thread_id"] == "thread-a-new"
-    assert archived["turns"][0]["codex_thread_id"] == "thread-a-new"
+    assert starts == [True]
+    assert len(payloads) == 1
+    assert payloads[0]["chat_id"] == "chat-a"
+    assert payloads[0]["thread_id"] in {"", None}
     assert frame.active_codex_thread_id == "thread-c"
+    assert frame.active_codex_turn_id == "turn-c"
+    assert frame._current_chat_state["codex_thread_id"] == "thread-c"
+    assert frame._current_chat_state["codex_turn_id"] == "turn-c"
     assert frame.active_session_turns[0]["answer_md"] == "answer d"
     assert after_rows == before_rows
     assert frame.answer_list.HasFocus()
