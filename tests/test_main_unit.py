@@ -5172,24 +5172,33 @@ def test_codex_worker_uses_chat_bound_client_for_current_chat(frame, monkeypatch
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_call_after_if_alive", lambda func, *args, **kwargs: func(*args, **kwargs))
 
-    class _Client:
-        def start_thread(self, **_kwargs):
-            return {"thread": {"id": "thread-a"}}
-
-        def start_turn_items(self, thread_id, items, **_kwargs):
-            assert thread_id == "thread-a"
-            assert items
-            return {"turn": {"id": "turn-a"}}
-
     bound_calls = []
+    sent = []
+
+    class _Client:
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
+
     monkeypatch.setattr(frame, "_ensure_codex_client", lambda *_args, **_kwargs: pytest.fail("current chat turns need a chat-bound Codex client"))
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": bound_calls.append((chat_id, model)) or _Client())
 
     frame._run_codex_turn_worker("chat-a", 0, "A 正在执行", main.DEFAULT_CODEX_MODEL)
 
     assert bound_calls == [("chat-a", "")]
-    assert frame.active_session_turns[0]["codex_thread_id"] == "thread-a"
-    assert frame.active_session_turns[0]["codex_turn_id"] == "turn-a"
+    assert sent
+    assert sent[0]["chat_id"] == "chat-a"
+    assert sent[0]["turn_idx"] == 0
+    assert sent[0]["question"] == "A 正在执行"
+    assert sent[0]["model"] == main.DEFAULT_CODEX_MODEL
+    assert sent[0]["cwd"] == "C:\\code\\sj\\mc"
+    assert sent[0]["thread_id"] == ""
+    assert sent[0]["turn_id"] == ""
+    assert sent[0]["input_items"][0]["type"] == "text"
+    assert sent[0]["input_items"][0]["text"] == "A 正在执行"
     assert frame.active_session_turns[0]["request_status"] == "pending"
     assert frame.active_session_turns[0].get("request_error", "") == ""
 
