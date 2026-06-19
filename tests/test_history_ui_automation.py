@@ -258,6 +258,34 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
     assert any("A running question" in row for row in active_rows)
 
 
+def test_ui_automation_worker_notice_stays_with_cleared_history_chat(frame, monkeypatch):
+    chat_a = {
+        "id": "chat-a",
+        "title": "A",
+        "turns": [{"question": "A", "answer_md": "running"}],
+        "codex_thread_id": "thread-a",
+    }
+    chat_c = {
+        "id": "chat-c",
+        "title": "C",
+        "turns": [{"question": "C", "answer_md": "old"}],
+        "codex_thread_id": "thread-c",
+    }
+    frame.archived_chats = [chat_a, chat_c]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-c"
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+
+    assert frame._clear_context_and_start_new_chat() is True
+
+    assert chat_c["codex_thread_id"] == ""
+    assert chat_a["codex_thread_id"] == "thread-a"
+    assert frame._answer_list_tail_notice_chat_id == "chat-c"
+
+
 def test_ui_automation_background_events_do_not_mutate_lists_during_reader_quiet(frame, wx_app, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-active"

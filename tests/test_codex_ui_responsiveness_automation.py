@@ -593,6 +593,61 @@ def test_real_ui_execution_updates_do_not_steal_input_focus_during_event_burst(f
     assert frame.input_edit.GetValue().endswith("x")
 
 
+def test_real_ui_worker_events_do_not_mutate_lists_during_navigation_quiet(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_turn_id = "turn-1"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "q",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "request_status": "pending",
+            "codex_turn_id": "turn-1",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+        "codex_turn_id": "turn-1",
+    }
+    frame._render_answer_list()
+    wx_app.Yield()
+
+    mutations = []
+    monkeypatch.setattr(frame.answer_list, "Append", lambda *args, **kwargs: mutations.append(("answer_append", args)))
+    monkeypatch.setattr(
+        frame.execution_list,
+        "Append",
+        lambda *args, **kwargs: mutations.append(("execution_append", args)),
+    )
+
+    frame._navigation_quiet_until = time.monotonic() + 3.0
+    frame._on_codex_worker_message(
+        "chat-current",
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-current",
+                "turn_idx": 0,
+                "event": {
+                    "type": "item_started",
+                    "text": "run pytest",
+                    "data": {"turn_id": "turn-1", "step_seq": 1},
+                },
+            },
+        },
+    )
+    wx_app.Yield()
+
+    assert mutations == []
+
+
 def test_real_ui_subagent_result_appears_in_answer_list_without_stealing_input_focus(frame, wx_app, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-subagent"
