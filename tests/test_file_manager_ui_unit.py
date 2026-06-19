@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import wx
 
@@ -7,6 +8,13 @@ from file_transfer import FileDirection, FileTransferStatus
 
 def _menu_labels(menu):
     return [item.GetItemLabelText() for item in menu.GetMenuItems() if not item.IsSeparator()]
+
+
+def _assert_url_path_and_token(url: str, expected_base_path: str) -> None:
+    parsed = urlsplit(url)
+    query = parse_qs(parsed.query)
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == expected_base_path
+    assert query.get("t")
 
 
 def test_alt_app_menu_contains_file_manager(frame):
@@ -315,8 +323,8 @@ def test_remote_file_probe_uses_cloudflare_download_url(frame, tmp_path, monkeyp
     })
 
     assert status == 200
-    assert body["download_url"] == "https://rc.tingyou.cc/cloud-probe.txt"
-    assert published[0]["body"]["download_url"] == "https://rc.tingyou.cc/cloud-probe.txt"
+    _assert_url_path_and_token(body["download_url"], "https://rc.tingyou.cc/cloud-probe.txt")
+    _assert_url_path_and_token(published[0]["body"]["download_url"], "https://rc.tingyou.cc/cloud-probe.txt")
 
 
 def test_remote_file_probe_fails_when_public_route_unavailable(frame, tmp_path, monkeypatch):
@@ -374,7 +382,7 @@ def test_remote_file_upload_request_uses_cloudflare_upload_url(frame, tmp_path, 
 
     assert status == 200
     assert body["accepted"] is True
-    assert body["upload_url"] == "https://rc.tingyou.cc/phone.txt"
+    _assert_url_path_and_token(body["upload_url"], "https://rc.tingyou.cc/phone.txt")
 
 
 def test_remote_file_list_returns_records(frame, tmp_path, monkeypatch):

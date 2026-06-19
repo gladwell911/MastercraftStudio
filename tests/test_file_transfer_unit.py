@@ -1,11 +1,15 @@
 from pathlib import Path
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from file_transfer import (
     DesktopFileLibrary,
     FileDirection,
     FileTransferRecord,
     FileTransferStatus,
+    append_file_transfer_token,
     extract_windows_file_paths,
+    file_transfer_token_for,
+    is_valid_file_transfer_token,
     unique_destination_path,
 )
 
@@ -32,6 +36,48 @@ def test_unique_destination_path_keeps_existing_files(tmp_path):
     target = unique_destination_path(tmp_path, "report.txt")
 
     assert target == tmp_path / "report (2).txt"
+
+
+def test_file_transfer_token_is_stable_and_opaque_for_record(tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_text("payload", encoding="utf-8")
+    library = DesktopFileLibrary(tmp_path / "storage")
+    record = library.add_local_file(source)
+    other_source = tmp_path / "other.txt"
+    other_source.write_text("payload", encoding="utf-8")
+    other_record = library.add_local_file(other_source)
+
+    first = file_transfer_token_for(record)
+    second = file_transfer_token_for(record)
+
+    assert first
+    assert first == second
+    assert first != file_transfer_token_for(other_record)
+    assert record.id not in first
+    assert is_valid_file_transfer_token(record, first) is True
+    assert is_valid_file_transfer_token(record, "wrong-token") is False
+
+
+def test_append_file_transfer_token_preserves_existing_url_parts(tmp_path):
+    source = tmp_path / "hello report.txt"
+    source.write_text("payload", encoding="utf-8")
+    library = DesktopFileLibrary(tmp_path / "storage")
+    record = library.add_local_file(source)
+
+    url = append_file_transfer_token(
+        "https://files.example.test/hello%20report.txt?existing=1&tag=a&tag=b&t=old",
+        record,
+    )
+
+    parsed = urlsplit(url)
+    query = parse_qs(parsed.query)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "files.example.test"
+    assert parsed.path == "/hello%20report.txt"
+    assert query["existing"] == ["1"]
+    assert query["tag"] == ["a", "b"]
+    assert query["t"] == [file_transfer_token_for(record)]
+    assert parse_qsl(parsed.query).count(("t", "old")) == 0
 
 
 def test_desktop_file_library_adds_files_newest_first_without_overwrite(tmp_path):

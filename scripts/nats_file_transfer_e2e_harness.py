@@ -8,7 +8,6 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import quote
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,13 +145,14 @@ def main() -> None:
                 "file_id": desktop_record.id,
                 "name": desktop_record.name,
                 "size_bytes": desktop_record.size_bytes,
-                "download_url": f"{http_service.base_url}/files/{desktop_record.id}",
+                "download_url": http_service.download_url_for(desktop_record),
             }
         if command_type == "file_upload_request":
             name = Path(str(body.get("name") or phone_upload_name)).name or phone_upload_name
+            upload_record = library.prepare_incoming_upload(name, size_bytes=int(body.get("size_bytes") or 0))
             return 200, {
                 "ok": True,
-                "upload_url": f"{http_service.base_url}/uploads/{quote(name)}",
+                "upload_url": http_service.upload_url_for(upload_record),
             }
         return 404, {"error": "unsupported_file_command", "type": command_type}
 
@@ -196,7 +196,7 @@ def main() -> None:
                         "size_bytes": desktop_record.size_bytes,
                         "direction": "desktop_to_phone",
                         "status": "pending",
-                        "download_url": f"{http_service.base_url}/files/{desktop_record.id}",
+                        "download_url": http_service.download_url_for(desktop_record),
                     },
                 )
                 transport.publish_event_threadsafe(offer)

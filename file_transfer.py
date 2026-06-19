@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import hmac
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -14,10 +16,13 @@ import sys
 import threading
 import time
 import uuid
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 
 DEFAULT_DESKTOP_FILE_STORAGE_DIR = Path("D:/code/file")
+FILE_TRANSFER_TOKEN_QUERY_PARAM = "t"
+DEFAULT_MAX_FILE_TRANSFER_BYTES = 512 * 1024 * 1024
+FILE_TRANSFER_CHUNK_SIZE = 1024 * 1024
 
 
 def detect_lan_ip() -> str:
@@ -75,6 +80,7 @@ class FileTransferRecord:
     transferred_bytes: int = 0
     speed_bytes_per_second: int = 0
     error_message: str = ""
+    access_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
 
     @property
     def percent(self) -> int:
@@ -146,6 +152,70 @@ def unique_destination_path(storage_dir: Path | str, filename: str) -> Path:
         if not next_candidate.exists():
             return next_candidate
         idx += 1
+
+
+def file_transfer_token_for(record: FileTransferRecord) -> str:
+    return str(record.access_token or "")
+
+
+def append_file_transfer_token(url: str, record: FileTransferRecord) -> str:
+    parsed = urlsplit(str(url or ""))
+    query = [
+        item
+        for item in parse_qsl(parsed.query, keep_blank_values=True)
+        if item[0] != FILE_TRANSFER_TOKEN_QUERY_PARAM
+    ]
+    query.append((FILE_TRANSFER_TOKEN_QUERY_PARAM, file_transfer_token_for(record)))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def is_valid_file_transfer_token(record: FileTransferRecord, token: str | None) -> bool:
+    expected = file_transfer_token_for(record)
+    provided = str(token or "")
+    return bool(expected and provided and hmac.compare_digest(expected, provided))
+
+
+def file_transfer_token_from_url(path: str) -> str:
+    parsed = urlsplit(str(path or ""))
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    return str(query.get(FILE_TRANSFER_TOKEN_QUERY_PARAM) or "")
+
+
+def _content_length_from_headers(handler: BaseHTTPRequestHandler) -> int | None:
+    raw_value = handler.headers.get("Content-Length")
+    if raw_value is None:
+        return None
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return None
+
+
+def _stream_file_to_handler(source: Path, handler: BaseHTTPRequestHandler) -> None:
+    with source.open("rb") as reader:
+        while True:
+            chunk = reader.read(FILE_TRANSFER_CHUNK_SIZE)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+
+
+def _write_request_body_to_file(
+    handler: BaseHTTPRequestHandler,
+    target: Path,
+    content_length: int,
+) -> int:
+    remaining = max(0, int(content_length or 0))
+    written = 0
+    with target.open("wb") as writer:
+        while remaining > 0:
+            chunk = handler.rfile.read(min(FILE_TRANSFER_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            writer.write(chunk)
+            written += len(chunk)
+            remaining -= len(chunk)
+    return written
 
 
 class DesktopFileLibrary:
@@ -309,6 +379,7 @@ class CopypartyFileService:
         python_executable: str | None = None,
         public_base_url: str | None = None,
         wait_for_ready: bool = False,
+        use_copyparty_process: bool | None = None,
     ):
         self.library = library
         self.host = host or "0.0.0.0"
@@ -318,6 +389,13 @@ class CopypartyFileService:
         self.python_executable = python_executable or sys.executable
         self.public_base_url = str(public_base_url or "").strip().rstrip("/")
         self.wait_for_ready = bool(wait_for_ready)
+        if use_copyparty_process is None:
+            use_copyparty_process = str(os.environ.get("DESKTOP_FILE_SERVICE_USE_COPYPARTY") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+        self.use_copyparty_process = bool(use_copyparty_process)
         self._process = None
         self._embedded_server: ThreadingHTTPServer | None = None
         self._embedded_thread: threading.Thread | None = None
@@ -364,6 +442,11 @@ class CopypartyFileService:
     def start(self) -> None:
         if self._process is not None and self._process.poll() is None:
             return
+        if self._embedded_server is not None:
+            return
+        if not self.use_copyparty_process:
+            self._start_embedded_http_server()
+            return
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
         kwargs = {
             "stdout": subprocess.DEVNULL,
@@ -376,8 +459,16 @@ class CopypartyFileService:
         if self.wait_for_ready:
             try:
                 self._wait_until_ready()
-            except RuntimeError:
+            except (RuntimeError, TimeoutError):
+                process = self._process
                 self._process = None
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3.0)
                 self._start_embedded_http_server()
 
     def stop(self) -> None:
@@ -394,11 +485,32 @@ class CopypartyFileService:
             process.wait(timeout=3.0)
 
     def download_url_for(self, record: FileTransferRecord) -> str:
-        return f"{self.base_url}/{quote(Path(record.name).name)}"
+        return append_file_transfer_token(f"{self.base_url}/{quote(Path(record.name).name)}", record)
 
     def upload_url_for(self, filename: str) -> str:
         target = unique_destination_path(self.library.storage_dir, filename)
-        return f"{self.base_url}/{quote(target.name)}"
+        record = self._upload_record_for_name(target.name)
+        if record is None:
+            record = self.library.prepare_incoming_upload(target.name)
+        return append_file_transfer_token(f"{self.base_url}/{quote(record.name)}", record)
+
+    def _record_for_storage_name(self, filename: str) -> FileTransferRecord | None:
+        target_name = Path(str(filename or "")).name
+        for record in self.library.list_records():
+            if Path(record.name).name == target_name:
+                return record
+        return None
+
+    def _upload_record_for_name(self, filename: str) -> FileTransferRecord | None:
+        target_name = Path(str(filename or "")).name
+        for record in self.library.list_records():
+            if (
+                Path(record.name).name == target_name
+                and record.direction == FileDirection.PHONE_TO_DESKTOP
+                and record.status == FileTransferStatus.ACCEPTED
+            ):
+                return record
+        return None
 
     def _start_embedded_http_server(self) -> None:
         if self._embedded_server is not None:
@@ -440,26 +552,45 @@ class CopypartyFileService:
         if not filename or not target.is_file():
             self._send_embedded_text(handler, HTTPStatus.NOT_FOUND, "not_found")
             return
-        data = target.read_bytes()
+        record = self._record_for_storage_name(filename)
+        if record is None or not is_valid_file_transfer_token(record, file_transfer_token_from_url(handler.path)):
+            self._send_embedded_text(handler, HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        size = target.stat().st_size
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "application/octet-stream")
-        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Content-Length", str(size))
         handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         handler.end_headers()
         if include_body:
-            handler.wfile.write(data)
+            _stream_file_to_handler(target, handler)
 
     def _handle_embedded_put(self, handler: BaseHTTPRequestHandler) -> None:
         filename = Path(unquote(urlsplit(handler.path).path.lstrip("/")).strip()).name or "upload.bin"
-        try:
-            content_length = int(handler.headers.get("Content-Length", "0"))
-        except ValueError:
-            content_length = 0
-        data = handler.rfile.read(max(0, content_length))
+        content_length = _content_length_from_headers(handler)
+        if content_length is None:
+            self._send_embedded_text(handler, HTTPStatus.LENGTH_REQUIRED, "length_required")
+            return
+        if content_length > DEFAULT_MAX_FILE_TRANSFER_BYTES:
+            self._send_embedded_text(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "too_large")
+            return
+        record = self._upload_record_for_name(filename)
+        if record is None or not is_valid_file_transfer_token(record, file_transfer_token_from_url(handler.path)):
+            self._send_embedded_text(handler, HTTPStatus.FORBIDDEN, "forbidden")
+            return
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
-        target = unique_destination_path(self.library.storage_dir, filename)
-        target.write_bytes(data)
-        self._send_embedded_text(handler, HTTPStatus.CREATED, target.name)
+        written = _write_request_body_to_file(handler, record.stored_path, content_length)
+        if written != content_length:
+            record.stored_path.unlink(missing_ok=True)
+            self._send_embedded_text(handler, HTTPStatus.BAD_REQUEST, "incomplete_upload")
+            return
+        updated = self.library.update_record_status(
+            record.id,
+            FileTransferStatus.COMPLETED,
+            size_bytes=written,
+            transferred_bytes=written,
+        )
+        self._send_embedded_text(handler, HTTPStatus.CREATED, (updated or record).name)
 
     def _send_embedded_text(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, text: str) -> None:
         data = str(text or "").encode("utf-8")
@@ -527,6 +658,16 @@ class DesktopFileHttpService:
         self._server = None
         self._thread = None
 
+    def download_url_for(self, record: FileTransferRecord) -> str:
+        return append_file_transfer_token(f"{self.base_url}/files/{quote(record.id)}", record)
+
+    def upload_url_for(self, record: FileTransferRecord | str) -> str:
+        if isinstance(record, FileTransferRecord):
+            upload_record = record
+        else:
+            upload_record = self.library.prepare_incoming_upload(str(record or "upload.bin"))
+        return append_file_transfer_token(f"{self.base_url}/uploads/{quote(upload_record.id)}", upload_record)
+
     def _handle_get(self, handler: BaseHTTPRequestHandler) -> None:
         path = urlsplit(handler.path).path
         prefix = "/files/"
@@ -538,13 +679,16 @@ class DesktopFileHttpService:
         if record is None or not record.stored_path.is_file():
             self._send_text(handler, HTTPStatus.NOT_FOUND, "not_found")
             return
-        data = record.stored_path.read_bytes()
+        if not is_valid_file_transfer_token(record, file_transfer_token_from_url(handler.path)):
+            self._send_text(handler, HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        size = record.stored_path.stat().st_size
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "application/octet-stream")
-        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Content-Length", str(size))
         handler.send_header("Content-Disposition", f'attachment; filename="{record.name}"')
         handler.end_headers()
-        handler.wfile.write(data)
+        _stream_file_to_handler(record.stored_path, handler)
 
     def _handle_put(self, handler: BaseHTTPRequestHandler) -> None:
         path = urlsplit(handler.path).path
@@ -552,27 +696,34 @@ class DesktopFileHttpService:
         if not path.startswith(prefix):
             self._send_text(handler, HTTPStatus.NOT_FOUND, "not_found")
             return
-        filename = Path(unquote(path[len(prefix):]).strip()).name or "upload.bin"
-        try:
-            content_length = int(handler.headers.get("Content-Length", "0"))
-        except ValueError:
-            content_length = 0
-        data = handler.rfile.read(max(0, content_length))
+        record_id = unquote(path[len(prefix):]).strip()
+        record = self.library.get_record(record_id)
+        if record is None or record.direction != FileDirection.PHONE_TO_DESKTOP or record.status != FileTransferStatus.ACCEPTED:
+            self._send_text(handler, HTTPStatus.NOT_FOUND, "not_found")
+            return
+        if not is_valid_file_transfer_token(record, file_transfer_token_from_url(handler.path)):
+            self._send_text(handler, HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        content_length = _content_length_from_headers(handler)
+        if content_length is None:
+            self._send_text(handler, HTTPStatus.LENGTH_REQUIRED, "length_required")
+            return
+        if content_length > DEFAULT_MAX_FILE_TRANSFER_BYTES:
+            self._send_text(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "too_large")
+            return
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
-        target = unique_destination_path(self.library.storage_dir, filename)
-        target.write_bytes(data)
-        record = FileTransferRecord(
-            id=f"file-{uuid.uuid4().hex}",
-            name=target.name,
-            stored_path=target,
-            size_bytes=target.stat().st_size,
-            direction=FileDirection.PHONE_TO_DESKTOP,
-            status=FileTransferStatus.COMPLETED,
-            created_at=time.time(),
-            transferred_bytes=target.stat().st_size,
+        written = _write_request_body_to_file(handler, record.stored_path, content_length)
+        if written != content_length:
+            record.stored_path.unlink(missing_ok=True)
+            self._send_text(handler, HTTPStatus.BAD_REQUEST, "incomplete_upload")
+            return
+        updated = self.library.update_record_status(
+            record.id,
+            FileTransferStatus.COMPLETED,
+            size_bytes=written,
+            transferred_bytes=written,
         )
-        self.library.add_record(record)
-        self._send_text(handler, HTTPStatus.CREATED, record.name)
+        self._send_text(handler, HTTPStatus.CREATED, (updated or record).name)
 
     def _send_text(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, text: str) -> None:
         data = str(text or "").encode("utf-8")

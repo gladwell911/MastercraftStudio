@@ -8221,6 +8221,16 @@ class ChatFrame(wx.Frame):
             start()
         client.reply_user_input(chat_id, request.get("request_id"), answers)
 
+    def _codex_pending_request_from_event(self, chat_id: str, target_chat: dict | None, event: CodexEvent) -> dict:
+        event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        return {
+            "chat_id": str(chat_id or "").strip(),
+            "model": str(event_data.get("model") or (target_chat or {}).get("model") or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL,
+            "request_id": event.request_id,
+            "method": event.method,
+            "params": event.params,
+        }
+
     def _on_codex_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
@@ -8264,6 +8274,20 @@ class ChatFrame(wx.Frame):
             if execution_entry:
                 self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
                 appended_execution_step = True
+            if (
+                event_type == "server_request"
+                and str(event.method or "") == "item/tool/requestUserInput"
+                and isinstance(target_chat, dict)
+            ):
+                target_chat["codex_pending_request"] = self._codex_pending_request_from_event(chat_id, target_chat, event)
+                target_chat["request_kind"] = "user_input"
+                target_chat["codex_turn_active"] = True
+                target_chat["updated_at"] = time.time()
+                if target_idx >= 0:
+                    self._mark_chat_turns_dirty(chat_id, target_idx)
+                self._refresh_visible_history_chat(chat_id)
+                self._defer_codex_state_save()
+                return
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
                 if event_type == "item_completed" and str(event.phase or "") == "final_answer":
@@ -8648,6 +8672,19 @@ class ChatFrame(wx.Frame):
     def _apply_codex_worker_turn_started_ack(self, chat_id: str, payload: dict) -> None:
         self._apply_codex_worker_thread_state(chat_id, payload)
 
+    def _codex_active_request_turn_count(self, turns) -> int:
+        if not isinstance(turns, list):
+            return 0
+        count = 0
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            status = str(turn.get("request_status") or "").strip()
+            answer_md = str(turn.get("answer_md") or "").strip()
+            if status in {"pending", "running"} or answer_md == REQUESTING_TEXT:
+                count += 1
+        return count
+
     def _apply_codex_worker_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None) -> None:
         target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
         if not isinstance(target_chat, dict):
@@ -8677,12 +8714,17 @@ class ChatFrame(wx.Frame):
         if not isinstance(turn, dict):
             return
         self._mark_turn_request_failed(turn, message)
-        target_chat["codex_turn_active"] = False
+        active_count = self._codex_active_request_turn_count(target_turns)
+        target_chat["codex_turn_active"] = active_count > 0
         if is_current_target:
-            self.active_codex_turn_active = False
-            self.active_codex_pending_request = None
-            self.is_running = False
-            self._active_request_count = 0
+            self.active_codex_turn_active = active_count > 0
+            if active_count > 0:
+                self.is_running = True
+                self._active_request_count = active_count
+            else:
+                self.active_codex_pending_request = None
+                self.is_running = False
+                self._active_request_count = 0
         self._clear_codex_worker_active_turn(chat_id, target_idx, turn.get("codex_turn_id"))
         self._mark_chat_turns_dirty(None if is_current_target else chat_id, target_idx)
         if not is_current_target:
@@ -8709,18 +8751,19 @@ class ChatFrame(wx.Frame):
         key = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip() or self._ensure_active_chat_id()
         codex_model = str(model or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = self._codex_clients.get(key)
-        if client is not None and getattr(client, "codex_model", DEFAULT_CODEX_MODEL) == codex_model:
-            return client
         if client is not None:
-            client.close()
+            setattr(client, "codex_model", codex_model)
+            return client
+        client_ref = {}
+
+        def _on_message(message, cid=key, ref=client_ref):
+            self._on_codex_worker_message(cid, message, ref.get("client"))
+
         client = CodexWorkerClient(
-            on_message=lambda message, cid=key: self._on_codex_worker_message(
-                cid,
-                message,
-                self._codex_clients.get(cid),
-            ),
+            on_message=_on_message,
             on_exit=lambda code, cid=key: self._on_codex_worker_exit(cid, code),
         )
+        client_ref["client"] = client
         setattr(client, "codex_model", codex_model)
         self._codex_clients[key] = client
         return client
@@ -8728,16 +8771,22 @@ class ChatFrame(wx.Frame):
     def _ensure_codex_client(self, model: str = "") -> CodexWorkerClient:
         codex_model = str(model or self.selected_model or DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
         client = getattr(self, "_codex_client", None)
-        if client is None or getattr(client, "codex_model", DEFAULT_CODEX_MODEL) != codex_model:
-            if client is not None:
-                client.close()
-            key = str(self.active_chat_id or self.current_chat_id or "").strip() or self._ensure_active_chat_id()
-            client = CodexWorkerClient(
-                on_message=lambda message, cid=key: self._on_codex_worker_message(cid, message, self._codex_client),
-                on_exit=lambda code, cid=key: self._on_codex_worker_exit(cid, code),
-            )
+        if client is not None:
             setattr(client, "codex_model", codex_model)
-            self._codex_client = client
+            return client
+        key = str(self.active_chat_id or self.current_chat_id or "").strip() or self._ensure_active_chat_id()
+        client_ref = {}
+
+        def _on_message(message, cid=key, ref=client_ref):
+            self._on_codex_worker_message(cid, message, ref.get("client"))
+
+        client = CodexWorkerClient(
+            on_message=_on_message,
+            on_exit=lambda code, cid=key: self._on_codex_worker_exit(cid, code),
+        )
+        client_ref["client"] = client
+        setattr(client, "codex_model", codex_model)
+        self._codex_client = client
         return client
 
     def _load_chat_as_current(self, chat: dict) -> None:
