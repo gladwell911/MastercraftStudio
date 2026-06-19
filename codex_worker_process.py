@@ -79,6 +79,7 @@ class CodexWorkerRuntime:
     def _on_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
+            "model": model,
             "event": event_to_payload(event),
         }
         key = (chat_id, model)
@@ -260,7 +261,15 @@ class CodexWorkerRuntime:
             )
             return
         client = self._clients[key]
-        client.respond_tool_request_user_input(payload.get("request_id"), dict(payload.get("answers") or {}))
+        try:
+            client.respond_tool_request_user_input(payload.get("request_id"), dict(payload.get("answers") or {}))
+        except Exception as exc:
+            turn_idx = None
+            model = DEFAULT_CODEX_MODEL
+            with self._lock:
+                turn_idx = self._turn_indices.get(key)
+                model = key[1] if len(key) > 1 else DEFAULT_CODEX_MODEL
+            self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
 
     def _handle_compact_thread(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})

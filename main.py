@@ -4569,6 +4569,10 @@ class ChatFrame(wx.Frame):
                 for key in ("turn_id", "codex_turn_id", "id"):
                     if str(turn.get(key) or "").strip() == turn_id:
                         return idx
+        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        turn_idx = data.get("turn_idx")
+        if isinstance(turn_idx, int) and isinstance(turns, list) and 0 <= turn_idx < len(turns):
+            return turn_idx
         return len(turns) - 1 if isinstance(turns, list) and turns else -1
 
     def _known_codex_turn_ids_for_chat(self, chat: dict | None) -> set[str]:
@@ -8276,10 +8280,11 @@ class ChatFrame(wx.Frame):
             self._push_remote_status("waiting_user_input", "user_input")
             self._play_finish_sound()
             if str(event.method or "") == "item/tool/requestUserInput":
+                event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
                 self._handle_codex_request_dialog(
                     {
                         "chat_id": chat_id,
-                        "model": self.selected_model or DEFAULT_CODEX_MODEL,
+                        "model": event_data.get("model") or self.selected_model or DEFAULT_CODEX_MODEL,
                         "request_id": event.request_id,
                         "method": event.method,
                         "params": event.params,
@@ -8447,7 +8452,7 @@ class ChatFrame(wx.Frame):
             return
         message_type = str(message.get("type") or "").strip()
         if (
-            message_type in {"thread_state", "turn_started_ack", "error", "protocol_error"}
+            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error"}
             and threading.current_thread() is not threading.main_thread()
         ):
             self._call_after_if_alive(self._on_codex_worker_message, default_chat_id, message, client)
@@ -8463,6 +8468,7 @@ class ChatFrame(wx.Frame):
                 event = codex_worker_protocol.event_from_payload(event_payload)
             except Exception:
                 return
+            self._apply_codex_worker_event_scope(event, payload)
             self._dispatch_codex_event_to_ui(chat_id, event)
             return
         if message_type == "thread_state":
@@ -8481,6 +8487,42 @@ class ChatFrame(wx.Frame):
             return
         if message_type == "protocol_error":
             return
+        if message_type == "fatal":
+            self._apply_codex_worker_fatal(chat_id, payload)
+            return
+
+    @staticmethod
+    def _apply_codex_worker_event_scope(event: CodexEvent, payload: dict) -> None:
+        if not isinstance(event, CodexEvent) or not isinstance(payload, dict):
+            return
+        data = dict(event.data or {}) if isinstance(event.data, dict) else {}
+        if "turn_idx" not in data and "turn_idx" in payload:
+            data["turn_idx"] = payload.get("turn_idx")
+        model = str(payload.get("model") or "").strip()
+        if model and "model" not in data:
+            data["model"] = model
+        if data:
+            event.data = data
+
+    def _apply_codex_worker_fatal(self, chat_id: str, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        normalized = str(chat_id or payload.get("chat_id") or "").strip()
+        metadata = self._codex_worker_active_turns.get(normalized) if normalized else None
+        if not isinstance(metadata, dict):
+            metadata = {}
+        has_explicit_scope = any(key in payload for key in ("chat_id", "turn_idx", "turn_id"))
+        has_tracked_scope = bool(metadata)
+        if not has_explicit_scope and not has_tracked_scope:
+            return
+        turn_idx = payload.get("turn_idx") if "turn_idx" in payload else metadata.get("turn_idx")
+        turn_id = payload.get("turn_id") if "turn_id" in payload else metadata.get("turn_id")
+        self._apply_codex_worker_error(
+            normalized,
+            str(payload.get("message") or "Codex worker failed"),
+            turn_idx,
+            str(turn_id or "").strip() or None,
+        )
 
     def _drain_codex_worker_client_messages(
         self,

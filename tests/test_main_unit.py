@@ -5463,6 +5463,64 @@ def test_codex_request_user_input_replies_through_matching_chat_worker(frame, mo
     assert ("reply", "chat-c", "chat-c", "req-1", {"reply": ["ok"]}) in calls
 
 
+def test_codex_server_request_reply_uses_event_model_after_selected_model_changes(frame, monkeypatch):
+    calls = []
+
+    class _FakeWorkerClient:
+        def __init__(self, chat_id, model):
+            self.chat_id = chat_id
+            self.model = model
+
+        def start(self):
+            calls.append(("start", self.chat_id, self.model))
+
+        def reply_user_input(self, chat_id, request_id, answers):
+            calls.append(("reply", self.chat_id, self.model, chat_id, request_id, answers))
+
+    class _FakeDialog:
+        def __init__(self, parent, questions):
+            self.parent = parent
+            self.questions = questions
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def Destroy(self):
+            calls.append(("destroy",))
+
+        def get_answers(self):
+            return {"reply": ["ok"]}
+
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.selected_model = "codex/new-selection"
+    frame.active_codex_turn_active = True
+    frame.active_session_turns = [
+        {"question": "current", "answer_md": main.REQUESTING_TEXT, "model": "codex/original", "request_status": "pending"}
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "codex_turn_active": True}
+
+    monkeypatch.setattr(frame, "_push_remote_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _FakeWorkerClient(chat_id, model))
+    monkeypatch.setattr(main, "CodexUserInputDialog", _FakeDialog)
+
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(
+            type="server_request",
+            request_id="req-1",
+            method="item/tool/requestUserInput",
+            params={"questions": [{"id": "reply"}]},
+            data={"model": "codex/original"},
+        ),
+    )
+
+    assert ("start", "chat-c", "codex/original") in calls
+    assert ("reply", "chat-c", "codex/original", "chat-c", "req-1", {"reply": ["ok"]}) in calls
+
+
 def test_remote_pending_request_reply_uses_matching_chat_worker(frame, monkeypatch):
     calls = []
 
@@ -5492,6 +5550,37 @@ def test_remote_pending_request_reply_uses_matching_chat_worker(frame, monkeypat
     assert ("start", "chat-c") in calls
     assert ("reply", "chat-c", "chat-c", "req-remote", {"reply": ["remote ok"]}) in calls
     assert frame.active_codex_pending_request is None
+
+
+def test_remote_pending_request_reply_uses_pending_model_after_selected_model_changes(frame, monkeypatch):
+    calls = []
+
+    class _FakeWorkerClient:
+        def __init__(self, chat_id, model):
+            self.chat_id = chat_id
+            self.model = model
+
+        def start(self):
+            calls.append(("start", self.chat_id, self.model))
+
+        def reply_user_input(self, chat_id, request_id, answers):
+            calls.append(("reply", self.chat_id, self.model, chat_id, request_id, answers))
+
+    frame.selected_model = "codex/new-selection"
+    frame.active_codex_pending_request = {
+        "chat_id": "chat-c",
+        "model": "codex/original",
+        "request_id": "req-remote",
+    }
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _FakeWorkerClient(chat_id, model))
+    monkeypatch.setattr(frame, "_save_state", lambda: calls.append(("save",)))
+
+    ok, message = frame._handle_remote_pending_request_reply("remote ok")
+
+    assert ok is True
+    assert "已提交" in message
+    assert ("start", "chat-c", "codex/original") in calls
+    assert ("reply", "chat-c", "codex/original", "chat-c", "req-remote", {"reply": ["remote ok"]}) in calls
 
 
 def test_remote_pending_request_reply_uses_worker_ipc(frame, monkeypatch):
@@ -5613,6 +5702,34 @@ def test_codex_worker_message_pending_drains_and_dispatches_event(frame, monkeyp
         thread_id="thread-c",
         turn_id="turn-c",
     )
+
+
+def test_codex_worker_event_bridge_preserves_outer_turn_idx_and_model(frame, monkeypatch):
+    dispatched = []
+    monkeypatch.setattr(frame, "_dispatch_codex_event_to_ui", lambda chat_id, event: dispatched.append((chat_id, event)))
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {
+            "type": "event",
+            "payload": {
+                "chat_id": "chat-c",
+                "turn_idx": 3,
+                "model": "codex/original",
+                "event": {
+                    "type": "plan_updated",
+                    "text": "worker step",
+                    "data": {"existing": True},
+                },
+            },
+        },
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == "chat-c"
+    assert dispatched[0][1].data["existing"] is True
+    assert dispatched[0][1].data["turn_idx"] == 3
+    assert dispatched[0][1].data["model"] == "codex/original"
 
 
 def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, monkeypatch):
@@ -5879,6 +5996,49 @@ def test_codex_worker_error_with_matching_turn_id_fails_only_that_turn(frame, mo
     assert frame.active_session_turns[0]["request_error"] == ""
     assert frame.active_session_turns[1]["request_status"] == "failed"
     assert frame.active_session_turns[1]["request_error"] == "id boom"
+
+
+def test_codex_worker_fatal_with_tracked_metadata_fails_matching_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_session_turns = [
+        {"question": "first", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-1"},
+        {"question": "second", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-2"},
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "codex_turn_id": "turn-2"}
+    frame._codex_worker_active_turns = {"chat-c": {"turn_idx": 1, "turn_id": "turn-2"}}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {"type": "fatal", "payload": {"chat_id": "chat-c", "message": "fatal boom"}},
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_session_turns[0]["request_error"] == ""
+    assert frame.active_session_turns[1]["request_status"] == "failed"
+    assert frame.active_session_turns[1]["request_error"] == "fatal boom"
+
+
+def test_codex_worker_fatal_without_metadata_does_not_fail_latest_turn(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 1
+    frame.active_session_turns = [
+        {"question": "first", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-1"},
+        {"question": "second", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_error": "", "codex_turn_id": "turn-2"},
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "codex_turn_id": "turn-2"}
+    frame._codex_worker_active_turns = {}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: pytest.fail("unscoped fatal should not save state"))
+
+    frame._on_codex_worker_message(
+        "chat-c",
+        {"type": "fatal", "payload": {"message": "global fatal"}},
+    )
+
+    assert [turn["request_status"] for turn in frame.active_session_turns] == ["pending", "pending"]
+    assert [turn["request_error"] for turn in frame.active_session_turns] == ["", ""]
 
 
 def test_codex_worker_error_for_archived_chat_does_not_fail_active_chat(frame, monkeypatch):

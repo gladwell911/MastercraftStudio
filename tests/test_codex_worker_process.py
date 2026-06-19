@@ -56,6 +56,11 @@ class RaisingTurnCodexClient(FakeCodexClient):
         raise RuntimeError("turn failed")
 
 
+class RaisingReplyCodexClient(FakeCodexClient):
+    def respond_tool_request_user_input(self, request_id, answers):
+        raise RuntimeError("reply failed")
+
+
 class MissingResumeCodexClient(FakeCodexClient):
     def __init__(self, on_event=None, codex_model="codex/main", message="thread not found"):
         super().__init__(on_event, codex_model)
@@ -180,6 +185,56 @@ def test_worker_runtime_reply_user_input_routes_to_matching_chat_client():
     )
 
     assert created[0].replies == [("ask-1", {"reply": ["ok"]})]
+
+
+def test_worker_runtime_reply_user_input_failure_emits_scoped_error_not_fatal():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(RaisingReplyCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+    runtime.handle_message(
+        make_ui_request(
+            "req-start",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 4,
+                "question": "闂",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "闂"}],
+                "attachments": [],
+                "service_tier": "",
+            },
+        )
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-reply",
+            "reply_user_input",
+            {"chat_id": "chat-c", "request_id": "ask-1", "answers": {"reply": ["ok"]}},
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    scoped_errors = [
+        item
+        for item in messages
+        if item["type"] == "error"
+        and item.get("id") == "req-reply"
+        and item["payload"]["chat_id"] == "chat-c"
+        and item["payload"]["turn_idx"] == 4
+        and item["payload"]["model"] == "model-a"
+        and "reply failed" in item["payload"]["message"]
+    ]
+    assert scoped_errors
+    assert not any(item["type"] == "fatal" for item in messages)
 
 
 def test_worker_runtime_reply_user_input_uses_request_id_mapping_before_latest_chat_model():
