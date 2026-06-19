@@ -5881,6 +5881,49 @@ def test_codex_worker_error_with_matching_turn_id_fails_only_that_turn(frame, mo
     assert frame.active_session_turns[1]["request_error"] == "id boom"
 
 
+def test_codex_worker_error_for_archived_chat_does_not_fail_active_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [
+        {
+            "question": "A",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "running",
+            "request_error": "",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-a", "turns": frame.active_session_turns, "codex_turn_id": "turn-a"}
+    chat_b = {
+        "id": "chat-b",
+        "title": "B",
+        "turns": [
+            {
+                "question": "B",
+                "answer_md": main.REQUESTING_TEXT,
+                "model": main.DEFAULT_CODEX_MODEL,
+                "request_status": "running",
+                "request_error": "",
+                "codex_turn_id": "turn-b",
+            }
+        ],
+        "codex_turn_id": "turn-b",
+    }
+    frame.archived_chats = [chat_b]
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    frame._on_codex_worker_message(
+        "chat-b",
+        {"type": "error", "payload": {"chat_id": "chat-b", "turn_id": "turn-b", "message": "archived boom"}},
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "running"
+    assert frame.active_session_turns[0]["request_error"] == ""
+    assert chat_b["turns"][0]["request_status"] == "failed"
+    assert chat_b["turns"][0]["request_error"] == "archived boom"
+
+
 def test_codex_worker_error_from_reader_thread_schedules_ui_apply(frame, monkeypatch):
     scheduled = []
     message = {
@@ -5903,6 +5946,47 @@ def test_codex_worker_error_from_reader_thread_schedules_ui_apply(frame, monkeyp
     frame._on_codex_worker_message("chat-c", message)
 
     assert scheduled == [(frame._on_codex_worker_message, ("chat-c", message, None))]
+
+
+def test_worker_exit_marks_only_matching_chat_failed(frame, monkeypatch):
+    saved = []
+    monkeypatch.setattr(frame, "_save_state", lambda: saved.append(True))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda func, *args, **kwargs: func(*args, **kwargs) or True)
+
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame._current_chat_state["id"] = "chat-a"
+    frame._current_chat_state["turns"] = [
+        {
+            "question": "A",
+            "answer_md": main.REQUESTING_TEXT,
+            "request_status": "running",
+            "request_error": "",
+            "codex_turn_id": "turn-a",
+        }
+    ]
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    chat_b = {
+        "id": "chat-b",
+        "title": "B",
+        "turns": [
+            {
+                "question": "B",
+                "answer_md": main.REQUESTING_TEXT,
+                "request_status": "running",
+                "request_error": "",
+                "codex_turn_id": "turn-b",
+            }
+        ],
+    }
+    frame.archived_chats = [chat_b]
+
+    frame._apply_codex_worker_thread_state("chat-b", {"chat_id": "chat-b", "turn_idx": 0, "turn_id": "turn-b", "active": True})
+    frame._on_codex_worker_exit("chat-b", -9)
+
+    assert frame.active_session_turns[0]["request_status"] == "running"
+    assert chat_b["turns"][0]["request_status"] == "failed"
+    assert "exited" in chat_b["turns"][0]["request_error"]
 
 
 def test_codex_worker_exit_with_active_metadata_fails_matching_turn(frame, monkeypatch):
@@ -5941,6 +6025,21 @@ def test_codex_worker_exit_without_active_metadata_does_not_fail_latest_turn(fra
 
     assert frame.active_session_turns[0]["request_status"] == "pending"
     assert frame.active_session_turns[0]["request_error"] == ""
+
+
+def test_codex_worker_exit_from_reader_thread_schedules_ui_apply(frame, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(main.threading, "current_thread", lambda: SimpleNamespace(name="codex-exit-thread"))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: scheduled.append((fn, args)) or True)
+    monkeypatch.setattr(
+        frame,
+        "_apply_codex_worker_error",
+        lambda *_args, **_kwargs: pytest.fail("worker exit reader thread must not mutate error state inline"),
+    )
+
+    frame._on_codex_worker_exit("chat-c", -9)
+
+    assert scheduled == [(frame._on_codex_worker_exit, ("chat-c", -9))]
 
 
 @pytest.mark.parametrize("event_type", ["agent_message_delta", "stderr", "plan_updated", "diff_updated"])
