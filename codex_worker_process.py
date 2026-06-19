@@ -111,23 +111,41 @@ class CodexWorkerRuntime:
                 self._turn_indices[(chat_id, model)] = turn_idx
 
             thread_id = str(payload.get("thread_id") or "").strip()
-            if not thread_id:
-                thread_response = client.start_thread(cwd=payload.get("cwd") or "", service_tier=service_tier_arg)
-                thread_id = self._extract_id(thread_response, "thread", "thread_id")
-            elif hasattr(client, "resume_thread"):
-                client.resume_thread(
-                    thread_id,
-                    approval_policy="never",
-                    sandbox="danger-full-access",
-                    personality="pragmatic",
-                    cwd=payload.get("cwd") or "",
-                    service_tier=service_tier_arg,
-                )
-
             items = list(payload.get("input_items") or [])
             if not items and payload.get("question"):
                 items = [{"type": "text", "text": str(payload.get("question") or "")}]
-            turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
+            if not thread_id:
+                thread_id = self._start_thread(client, payload, service_tier_arg)
+            elif hasattr(client, "resume_thread"):
+                try:
+                    client.resume_thread(
+                        thread_id,
+                        approval_policy="never",
+                        sandbox="danger-full-access",
+                        personality="pragmatic",
+                        cwd=payload.get("cwd") or "",
+                        service_tier=service_tier_arg,
+                    )
+                except Exception as exc:
+                    if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
+                        raise
+                    thread_id = self._start_thread(client, payload, service_tier_arg)
+                    items = self._recovery_input_items(payload, items)
+
+            should_steer = bool(payload.get("should_steer")) and bool(str(payload.get("turn_id") or "").strip())
+            if should_steer and hasattr(client, "steer_turn_items"):
+                try:
+                    turn_response = client.steer_turn_items(
+                        thread_id,
+                        str(payload.get("turn_id") or "").strip(),
+                        items,
+                    )
+                except Exception as exc:
+                    if not self._is_no_active_turn_error(exc):
+                        raise
+                    turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
+            else:
+                turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
             self.emit(
                 "thread_state",
@@ -155,6 +173,62 @@ class CodexWorkerRuntime:
             )
         except Exception as exc:
             self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
+
+    def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
+        thread_response = client.start_thread(cwd=payload.get("cwd") or "", service_tier=service_tier_arg)
+        return self._extract_id(thread_response, "thread", "thread_id")
+
+    def _recovery_input_items(self, payload: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prompt = self._build_rollout_recovery_prompt(
+            list(payload.get("history_turns") or []),
+            str(payload.get("question") or ""),
+        )
+        if not prompt:
+            return items
+        non_text_items = [item for item in items if not (isinstance(item, dict) and item.get("type") == "text")]
+        return [{"type": "text", "text": prompt}, *non_text_items]
+
+    @staticmethod
+    def _build_rollout_recovery_prompt(history_turns: list[dict[str, Any]], question: str) -> str:
+        clean_question = str(question or "").strip()
+        transcript_parts: list[str] = []
+        for turn in history_turns or []:
+            if not isinstance(turn, dict):
+                continue
+            prior_question = str(turn.get("question") or "").strip()
+            prior_answer = str(turn.get("answer_md") or "").strip()
+            if prior_answer == "正在请求...":
+                prior_answer = ""
+            if prior_question:
+                transcript_parts.append(f"用户：{prior_question}")
+            if prior_answer:
+                transcript_parts.append(f"Codex：{prior_answer}")
+        if not transcript_parts:
+            return clean_question
+        transcript = "\n".join(transcript_parts)
+        return (
+            "下面是当前聊天在本地保存的历史记录，请把它当作本次会话上下文继续：\n"
+            f"{transcript}\n\n"
+            "请基于以上上下文继续回答下面这个新问题：\n"
+            f"{clean_question}"
+        )
+
+    @staticmethod
+    def _error_text(exc: Exception | str) -> str:
+        return str(exc or "").strip().lower()
+
+    @classmethod
+    def _is_thread_missing_error(cls, exc: Exception | str) -> bool:
+        text = cls._error_text(exc)
+        return "thread not found" in text or "unknown thread" in text
+
+    @classmethod
+    def _is_rollout_missing_error(cls, exc: Exception | str) -> bool:
+        return "no rollout found" in cls._error_text(exc)
+
+    @classmethod
+    def _is_no_active_turn_error(cls, exc: Exception | str) -> bool:
+        return "no active turn to steer" in cls._error_text(exc)
 
     def _handle_reply_user_input(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})

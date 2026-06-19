@@ -6095,16 +6095,15 @@ def test_background_codex_worker_without_thread_does_not_reuse_active_chat_threa
             "execution_steps": [],
         }
     ]
-    calls = []
+    sent = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            calls.append(("start_thread", kwargs))
-            return {"thread": {"id": "thread-a-new"}}
+        def start(self):
+            pass
 
-        def start_turn_items(self, thread_id, items):
-            calls.append(("start_turn_items", thread_id, items))
-            return {"turn": {"id": "turn-a-new"}}
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -6112,13 +6111,12 @@ def test_background_codex_worker_without_thread_does_not_reuse_active_chat_threa
     frame._run_codex_turn_worker("chat-a", 0, "问题 b", main.DEFAULT_CODEX_MODEL)
 
     archived = frame._find_archived_chat("chat-a")
-    assert calls[0][0] == "start_thread"
-    assert calls[1][0] == "start_turn_items"
-    assert calls[1][1] == "thread-a-new"
-    assert archived["codex_thread_id"] == "thread-a-new"
-    assert archived["codex_turn_id"] == "turn-a-new"
-    assert archived["turns"][0]["codex_thread_id"] == "thread-a-new"
-    assert archived["turns"][0]["codex_turn_id"] == "turn-a-new"
+    assert sent[0]["chat_id"] == "chat-a"
+    assert sent[0]["thread_id"] == ""
+    assert sent[0]["turn_id"] == ""
+    assert sent[0]["input_items"][0]["text"] == "问题 b"
+    assert archived.get("codex_thread_id", "") == ""
+    assert archived.get("codex_turn_id", "") == ""
     assert frame.active_codex_thread_id == "thread-c"
     assert frame.active_session_turns[0]["codex_thread_id"] == "thread-c"
 
@@ -6151,13 +6149,12 @@ def test_codex_worker_for_missing_background_chat_does_not_use_active_thread(fra
     calls = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            calls.append(("start_thread", kwargs))
-            return {"thread": {"id": "thread-missing-new"}}
+        def start(self):
+            pass
 
-        def start_turn_items(self, thread_id, items):
-            calls.append(("start_turn_items", thread_id, items))
-            return {"turn": {"id": "turn-missing-new"}}
+        def start_turn(self, **payload):
+            calls.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -6208,13 +6205,12 @@ def test_codex_worker_for_background_chat_without_loaded_turns_does_not_touch_ac
     calls = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            calls.append(("start_thread", kwargs))
-            return {"thread": {"id": "thread-a-new"}}
+        def start(self):
+            pass
 
-        def start_turn_items(self, thread_id, items):
-            calls.append(("start_turn_items", thread_id, items))
-            return {"turn": {"id": "turn-a-new"}}
+        def start_turn(self, **payload):
+            calls.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -13767,26 +13763,65 @@ def test_codex_worker_uses_target_chat_runtime_state_instead_of_current_chat(fra
         }
     ]
 
-    seen = {}
+    sent = []
 
     class _Client:
-        def start_thread(self, **_kwargs):
-            raise AssertionError("should reuse archived chat thread id")
+        codex_model = main.DEFAULT_CODEX_MODEL
 
-        def start_turn(self, thread_id, text):
-            seen["turn"] = (thread_id, text)
-            return {"turn": {"id": "33333333-3333-3333-3333-333333333333"}}
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id: _Client())
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
     frame._worker("", 0, "恢复旧聊天", "codex/main", False, archived_chat_id)
 
-    assert seen["turn"] == ("11111111-1111-1111-1111-111111111111", "恢复旧聊天")
+    assert sent
+    assert sent[0]["chat_id"] == archived_chat_id
+    assert sent[0]["thread_id"] == "11111111-1111-1111-1111-111111111111"
+    assert sent[0]["turn_id"] == "22222222-2222-2222-2222-222222222222"
+    assert sent[0]["question"] == "恢复旧聊天"
+    assert sent[0]["should_steer"] is False
     assert frame.active_chat_id == current_chat_id
     archived = frame._find_archived_chat(archived_chat_id)
     assert archived is not None
-    assert archived["codex_turn_id"] == "33333333-3333-3333-3333-333333333333"
+    assert archived["codex_turn_id"] == "22222222-2222-2222-2222-222222222222"
+
+
+def test_run_codex_turn_worker_sends_start_turn_to_worker(frame, monkeypatch):
+    sent = []
+
+    class FakeWorker:
+        codex_model = main.DEFAULT_CODEX_MODEL
+
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda chat_id, model="": FakeWorker())
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda func, *args, **kwargs: True)
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["turns"] = [
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+    ]
+    frame.active_session_turns = frame._current_chat_state["turns"]
+
+    frame._run_codex_turn_worker("chat-current", 0, "问题", main.DEFAULT_CODEX_MODEL)
+
+    assert sent
+    assert sent[0]["chat_id"] == "chat-current"
+    assert sent[0]["turn_idx"] == 0
+    assert sent[0]["question"] == "问题"
+    assert sent[0]["input_items"][0]["type"] == "text"
 
 
 def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeypatch):
@@ -13813,22 +13848,15 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
     frame.active_codex_pending_prompt = "stale prompt"
     frame.active_codex_thread_flags = ["waitingOnUserInput"]
 
-    seen = {"start_thread": 0, "turns": []}
+    sent = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            seen["start_thread"] += 1
-            seen["thread_kwargs"] = kwargs
-            return {"thread": {"id": "thread-new"}}
+        def start(self):
+            pass
 
-        def start_turn(self, thread_id, text):
-            seen["turns"].append((thread_id, text))
-            if len(seen["turns"]) == 1:
-                raise RuntimeError("Codex app-server request failed: turn/start: thread not found: thread-old")
-            return {"turn": {"id": "turn-new"}}
-
-        def steer_turn(self, thread_id, expected_turn_id, text):
-            raise AssertionError("should not steer when the turn is inactive")
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -13836,16 +13864,17 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
 
     frame._run_codex_turn_worker("chat-current", 0, "新的 Codex 问题", "codex/main")
 
-    assert seen["start_thread"] == 1
-    assert seen["turns"] == [("thread-old", "新的 Codex 问题"), ("thread-new", "新的 Codex 问题")]
-    assert frame.active_codex_thread_id == "thread-new"
-    assert frame.active_codex_turn_id == "turn-new"
-    assert frame.active_codex_turn_active is True
-    assert frame.active_session_turns[0]["codex_thread_id"] == "thread-new"
-    assert frame.active_session_turns[0]["codex_turn_id"] == "turn-new"
+    assert sent
+    assert sent[0]["thread_id"] == "thread-old"
+    assert sent[0]["turn_id"] == "turn-old"
+    assert sent[0]["service_tier"] == ""
+    assert sent[0]["should_steer"] is False
+    assert sent[0]["history_turns"] == []
+    assert frame.active_codex_thread_id == "thread-old"
+    assert frame.active_codex_turn_id == "turn-old"
 
 
-def test_codex_worker_sends_existing_thread_to_worker_after_restart(frame, monkeypatch):
+def test_codex_worker_resumes_existing_thread_after_restart(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
@@ -13916,16 +13945,15 @@ def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, m
         }
     ]
     frame.active_turn_idx = 0
-    seen = {"thread": [], "turn": []}
+    sent = []
 
     class _Client:
-        def start_thread(self, **kwargs):
-            seen["thread"].append(kwargs)
-            return {"thread": {"id": "thread-fast"}}
+        def start(self):
+            pass
 
-        def start_turn_items(self, thread_id, items, **kwargs):
-            seen["turn"].append((thread_id, items, kwargs))
-            return {"turn": {"id": "turn-fast"}}
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
@@ -13933,8 +13961,7 @@ def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, m
 
     frame._run_codex_turn_worker("chat-current", 0, "快速执行", "codex/main")
 
-    assert seen["thread"][0]["service_tier"] == "fast"
-    assert seen["turn"][0][2]["service_tier"] == "fast"
+    assert sent[0]["service_tier"] == "fast"
     assert frame.active_session_turns[0]["codex_service_tier"] == "fast"
 
 
@@ -13968,20 +13995,15 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
     frame.active_codex_turn_id = ""
     frame.active_codex_turn_active = False
 
-    seen = {"resume": [], "start_thread": 0, "turn": []}
+    sent = []
 
     class _Client:
-        def resume_thread(self, thread_id, **kwargs):
-            seen["resume"].append((thread_id, kwargs))
-            raise RuntimeError("Codex app-server request failed: thread/resume: no rollout found for thread id thread-stale")
+        def start(self):
+            pass
 
-        def start_thread(self, **kwargs):
-            seen["start_thread"] += 1
-            return {"thread": {"id": "thread-new"}}
-
-        def start_turn(self, thread_id, text):
-            seen["turn"].append((thread_id, text))
-            return {"turn": {"id": "turn-new"}}
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -13989,15 +14011,11 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
 
     frame._run_codex_turn_worker("chat-current", 2, "第三轮问题", "codex/main")
 
-    assert len(seen["resume"]) == 1
-    assert seen["start_thread"] == 1
-    assert seen["turn"][0][0] == "thread-new"
-    assert "第一轮问题" in seen["turn"][0][1]
-    assert "第一轮回答" in seen["turn"][0][1]
-    assert "第二轮问题" in seen["turn"][0][1]
-    assert "第三轮问题" in seen["turn"][0][1]
-    assert frame.active_codex_thread_id == "thread-new"
-    assert frame.active_codex_turn_id == "turn-new"
+    assert sent[0]["thread_id"] == "thread-stale"
+    assert sent[0]["history_turns"] == frame.active_session_turns[:2]
+    assert sent[0]["input_items"][0]["text"] == "第三轮问题"
+    assert frame.active_codex_thread_id == "thread-stale"
+    assert frame.active_codex_turn_id == ""
 
 
 def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, monkeypatch, tmp_path):
@@ -14025,15 +14043,15 @@ def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, 
         }
     ]
     frame.active_turn_idx = 0
-    seen = {"items": []}
+    sent = []
 
     class _Client:
-        def start_thread(self, **_kwargs):
-            return {"thread": {"id": "thread-new"}}
+        def start(self):
+            pass
 
-        def start_turn_items(self, thread_id, items):
-            seen["items"].append((thread_id, items))
-            return {"turn": {"id": "turn-new"}}
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
 
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -14041,12 +14059,8 @@ def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, 
 
     frame._run_codex_turn_worker("chat-current", 0, "", "codex/main")
 
-    assert seen["items"] == [
-        (
-            "thread-new",
-            [{"type": "localImage", "path": str(image_path)}],
-        )
-    ]
+    assert sent[0]["input_items"] == [{"type": "localImage", "path": str(image_path)}]
+    assert sent[0]["attachments"][0]["path"] == str(image_path)
 
 
 @pytest.mark.parametrize(

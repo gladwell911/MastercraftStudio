@@ -13,6 +13,7 @@ class FakeCodexClient:
         self.codex_model = codex_model
         self.started_threads = []
         self.started_turns = []
+        self.steered_turns = []
         self.resumed_threads = []
         self.replies = []
         self.closed = False
@@ -29,6 +30,10 @@ class FakeCodexClient:
         self.started_turns.append((thread_id, items, service_tier))
         return {"turn": {"id": "turn-1"}}
 
+    def steer_turn_items(self, thread_id, turn_id, items):
+        self.steered_turns.append((thread_id, turn_id, items))
+        return {"turn": {"id": "turn-steered"}}
+
     def respond_tool_request_user_input(self, request_id, answers):
         self.replies.append((request_id, answers))
 
@@ -39,6 +44,26 @@ class FakeCodexClient:
 class RaisingTurnCodexClient(FakeCodexClient):
     def start_turn_items(self, thread_id, items, service_tier=None):
         raise RuntimeError("turn failed")
+
+
+class MissingResumeCodexClient(FakeCodexClient):
+    def __init__(self, on_event=None, codex_model="codex/main", message="thread not found"):
+        super().__init__(on_event, codex_model)
+        self.message = message
+
+    def start_thread(self, **kwargs):
+        self.started_threads.append(kwargs)
+        return {"thread": {"id": "thread-recovered"}}
+
+    def resume_thread(self, thread_id, **kwargs):
+        self.resumed_threads.append((thread_id, kwargs))
+        raise RuntimeError(self.message)
+
+
+class NoActiveSteerCodexClient(FakeCodexClient):
+    def steer_turn_items(self, thread_id, turn_id, items):
+        self.steered_turns.append((thread_id, turn_id, items))
+        raise RuntimeError("no active turn to steer")
 
 
 class OverlapDetectingOutput:
@@ -502,6 +527,158 @@ def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
         )
     ]
     assert created[0].started_turns[0][0] == "thread-existing"
+
+
+def test_worker_runtime_resume_thread_not_found_starts_new_thread_and_emits_state():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(
+            MissingResumeCodexClient(on_event, codex_model, "thread not found: thread-stale")
+        )
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-recover",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 2,
+                "question": "第三轮问题",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "thread-stale",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "第三轮问题"}],
+                "attachments": [],
+                "service_tier": "",
+                "history_turns": [{"question": "第一轮问题", "answer_md": "第一轮回答"}],
+            },
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].resumed_threads[0][0] == "thread-stale"
+    assert created[0].started_threads
+    assert created[0].started_turns[0][0] == "thread-recovered"
+    assert "第一轮问题" in created[0].started_turns[0][1][0]["text"]
+    assert "第三轮问题" in created[0].started_turns[0][1][0]["text"]
+    assert any(
+        item["type"] == "thread_state"
+        and item["payload"]["thread_id"] == "thread-recovered"
+        and item["payload"]["active"] is True
+        for item in messages
+    )
+
+
+def test_worker_runtime_resume_no_rollout_found_starts_new_thread():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(
+            MissingResumeCodexClient(on_event, codex_model, "no rollout found for thread id thread-stale")
+        )
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-rollout",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 1,
+                "question": "继续",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "thread-stale",
+                "turn_id": "",
+                "input_items": [{"type": "text", "text": "继续"}],
+                "attachments": [],
+                "service_tier": "fast",
+                "history_turns": [],
+            },
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].started_threads[0]["service_tier"] == "fast"
+    assert created[0].started_turns[0][0] == "thread-recovered"
+    assert any(item["type"] == "thread_state" and item["payload"]["thread_id"] == "thread-recovered" for item in messages)
+
+
+def test_worker_runtime_start_turn_steers_existing_active_turn():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-steer",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "question": "继续",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "thread-existing",
+                "turn_id": "turn-active",
+                "input_items": [{"type": "text", "text": "继续"}],
+                "attachments": [],
+                "service_tier": "",
+                "should_steer": True,
+                "history_turns": [],
+            },
+        )
+    )
+
+    assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
+    assert created[0].started_turns == []
+
+
+def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(NoActiveSteerCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+
+    runtime.handle_message(
+        make_ui_request(
+            "req-steer-fallback",
+            "start_turn",
+            {
+                "chat_id": "chat-c",
+                "turn_idx": 0,
+                "question": "继续",
+                "model": "model-a",
+                "cwd": "c:/code/sj",
+                "thread_id": "thread-existing",
+                "turn_id": "turn-active",
+                "input_items": [{"type": "text", "text": "继续"}],
+                "attachments": [],
+                "service_tier": "fast",
+                "should_steer": True,
+                "history_turns": [],
+            },
+        )
+    )
+
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
+    assert created[0].started_turns == [("thread-existing", [{"type": "text", "text": "继续"}], "fast")]
+    assert any(item["type"] == "turn_started_ack" for item in messages)
 
 
 def test_worker_runtime_emit_serializes_concurrent_writes():

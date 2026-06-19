@@ -6910,70 +6910,6 @@ class ChatFrame(wx.Frame):
             else self._get_or_create_codex_client(client_chat_id)
         )
 
-        def _sync_codex_thread_state(new_thread_id: str = "", new_turn_id: str = "", active: bool | None = None) -> None:
-            if not isinstance(target_chat, dict):
-                return
-            if new_thread_id is not None:
-                target_chat["codex_thread_id"] = str(new_thread_id or "").strip()
-                if is_current_target:
-                    self.active_codex_thread_id = str(new_thread_id or "").strip()
-            if new_turn_id is not None:
-                target_chat["codex_turn_id"] = str(new_turn_id or "").strip()
-                if is_current_target:
-                    self.active_codex_turn_id = str(new_turn_id or "").strip()
-            if active is not None:
-                target_chat["codex_turn_active"] = bool(active)
-                if is_current_target:
-                    self.active_codex_turn_active = bool(active)
-
-        def _clear_stale_codex_thread_state() -> None:
-            _sync_codex_thread_state("", "", active=False)
-            target_chat["codex_pending_prompt"] = ""
-            target_chat["codex_pending_request"] = None
-            target_chat["codex_thread_flags"] = []
-            if is_current_target:
-                self.active_codex_pending_prompt = ""
-                self.active_codex_pending_request = None
-                self.active_codex_thread_flags = []
-
-        def _start_new_thread() -> str:
-            thread_resp = client.start_thread(
-                cwd=self._workspace_dir_for_codex(),
-                approval_policy="never",
-                sandbox="danger-full-access",
-                personality="pragmatic",
-                service_tier=service_tier,
-            )
-            new_thread_id = str((thread_resp.get("thread") or {}).get("id") or "").strip()
-            if not new_thread_id:
-                raise RuntimeError("Codex app-server did not return a thread id.")
-            _sync_codex_thread_state(new_thread_id, "", active=False)
-            self._remember_codex_thread_resumed(client, new_thread_id)
-            return new_thread_id
-
-        def _start_turn_with_items(thread_value: str, items: list[dict]) -> dict:
-            if hasattr(client, "start_turn_items"):
-                if service_tier:
-                    return client.start_turn_items(thread_value, items, service_tier=service_tier)
-                return client.start_turn_items(thread_value, items)
-            text = str((items or [{}])[0].get("text") or "") if items else ""
-            if service_tier:
-                return client.start_turn(thread_value, text, service_tier=service_tier)
-            return client.start_turn(thread_value, text)
-
-        def _steer_turn_with_items(thread_value: str, expected_turn_id: str, items: list[dict]) -> dict:
-            if hasattr(client, "steer_turn_items"):
-                return client.steer_turn_items(thread_value, expected_turn_id, items)
-            text = str((items or [{}])[0].get("text") or "") if items else ""
-            return client.steer_turn(thread_value, expected_turn_id, text)
-
-        def _send_turn(thread_value: str, steer: bool, items: list[dict]) -> dict:
-            if steer:
-                if not turn_id:
-                    raise RuntimeError("Codex app-server cannot steer without an active turn id.")
-                return _steer_turn_with_items(thread_value, turn_id, items)
-            return _start_turn_with_items(thread_value, items)
-
         try:
             target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
             if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
@@ -6992,81 +6928,30 @@ class ChatFrame(wx.Frame):
                     turn_attachments = [item for item in maybe_attachments if str((item or {}).get("status") or "") == "success"]
             send_question = question
             input_items = self._build_codex_input_items(send_question, turn_attachments)
-            if hasattr(client, "start_turn") and not hasattr(client, "start_thread"):
-                client.start()
-                client.start_turn(
-                    chat_id=client_chat_id,
-                    turn_idx=turn_idx,
-                    question=send_question,
-                    model=model,
-                    cwd=self._workspace_dir_for_codex(),
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    input_items=input_items,
-                    attachments=turn_attachments,
-                    service_tier=service_tier,
-                )
-                if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
-                    turn = target_turns[turn_idx]
-                    turn["request_recovery_mode"] = "resume"
-                    turn["request_resume_token"] = {"thread_id": thread_id, "turn_id": turn_id}
-                    if (not from_recovery) and (not recovery_context):
-                        turn["request_status"] = "pending"
-                self._defer_codex_state_save()
-                return
-            if not thread_id:
-                thread_id = _start_new_thread()
-            else:
-                try:
-                    self._ensure_codex_thread_resumed(client, thread_id, service_tier=service_tier)
-                except Exception as exc:
-                    if self._is_codex_thread_missing_error(exc) or self._is_codex_rollout_missing_error(exc):
-                        self._forget_codex_thread_resume(client, thread_id)
-                        _clear_stale_codex_thread_state()
-                        history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
-                        send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
-                        input_items = self._build_codex_input_items(send_question, turn_attachments)
-                        thread_id = _start_new_thread()
-                    else:
-                        raise
             should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
-            try:
-                if should_steer:
-                    turn_resp = _send_turn(thread_id, should_steer, input_items)
-                else:
-                    turn_resp = _start_turn_with_items(thread_id, input_items)
-            except Exception as exc:
-                if should_steer and self._is_codex_no_active_turn_error(exc):
-                    should_steer = False
-                    turn_resp = _start_turn_with_items(thread_id, input_items)
-                elif self._is_codex_thread_missing_error(exc):
-                    self._forget_codex_thread_resume(client, thread_id)
-                    _clear_stale_codex_thread_state()
-                    history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
-                    send_question = self._build_codex_rollout_recovery_prompt(history_turns, question)
-                    input_items = self._build_codex_input_items(send_question, turn_attachments)
-                    thread_id = _start_new_thread()
-                    should_steer = False
-                    turn_resp = _start_turn_with_items(thread_id, input_items)
-                else:
-                    raise
-            new_turn_id = str((turn_resp.get("turn") or turn_resp.get("turnId") or {}).get("id") if isinstance(turn_resp.get("turn"), dict) else (turn_resp.get("turnId") or "")).strip()
-            if new_turn_id:
-                _sync_codex_thread_state(thread_id, new_turn_id, active=True)
-            else:
-                _sync_codex_thread_state(thread_id, "", active=True)
-            if is_current_target:
-                self.active_codex_turn_active = True
-                self.active_codex_pending_prompt = ""
-                self.active_codex_pending_request = None
-            turn = target_turns[turn_idx]
-            turn["codex_thread_id"] = thread_id
-            turn["codex_turn_id"] = new_turn_id
-            turn["request_recovery_mode"] = "resume"
-            turn["request_resume_token"] = {"thread_id": thread_id, "turn_id": new_turn_id}
-            if (not from_recovery) and (not recovery_context):
-                turn["request_status"] = "pending"
-            self._save_state()
+            history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+            client.start()
+            client.start_turn(
+                chat_id=client_chat_id,
+                turn_idx=turn_idx,
+                question=send_question,
+                model=model,
+                cwd=self._workspace_dir_for_codex(),
+                thread_id=thread_id,
+                turn_id=turn_id,
+                input_items=input_items,
+                attachments=turn_attachments,
+                service_tier=service_tier,
+                should_steer=should_steer,
+                history_turns=history_turns,
+            )
+            if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
+                turn = target_turns[turn_idx]
+                turn["request_recovery_mode"] = "resume"
+                turn["request_resume_token"] = {"thread_id": thread_id, "turn_id": turn_id}
+                if (not from_recovery) and (not recovery_context):
+                    turn["request_status"] = "pending"
+            self._defer_codex_state_save()
         except Exception as exc:
             self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
 
