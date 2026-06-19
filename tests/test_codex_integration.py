@@ -46,29 +46,24 @@ def test_send_click_routes_codex_start(frame, monkeypatch):
     seen = {}
 
     class _Client:
-        def start_thread(self, **kwargs):
-            seen["thread_started"] = kwargs
-            return {"thread": {"id": TEST_THREAD_ID}}
+        def start(self):
+            pass
 
-        def start_turn(self, thread_id, text):
-            seen["turn"] = (thread_id, text)
-            return {"turn": {"id": TEST_TURN_ID}}
-
-        def steer_turn(self, thread_id, expected_turn_id, text):
-            raise AssertionError("should not steer")
+        def start_turn(self, **payload):
+            seen["payload"] = payload
+            return "request-1"
 
     frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("鍐欎竴涓?hello world")
 
     frame._on_send_clicked(None)
 
-    assert seen["turn"] == (TEST_THREAD_ID, "鍐欎竴涓?hello world")
-    assert seen["thread_started"]["cwd"] == frame._workspace_dir_for_codex()
-    assert seen["thread_started"]["approval_policy"] == "never"
-    assert seen["thread_started"]["sandbox"] == "danger-full-access"
-    assert frame.active_codex_thread_id == TEST_THREAD_ID
-    assert frame.active_codex_turn_id == TEST_TURN_ID
-    assert frame.active_codex_turn_active is True
+    payload = seen["payload"]
+    assert payload["chat_id"] == frame.active_chat_id
+    assert payload["thread_id"] == ""
+    assert payload["question"] == "鍐欎竴涓?hello world"
+    assert payload["should_steer"] is False
+    assert payload["cwd"] == frame._workspace_dir_for_codex()
     assert frame.active_session_turns[-1]["answer_md"] == main.REQUESTING_TEXT
     assert frame._active_request_count == 1
 
@@ -88,24 +83,24 @@ def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):
     seen = {}
 
     class _Client:
-        def start_thread(self, **kwargs):
-            raise AssertionError("should not create new thread")
+        def start(self):
+            pass
 
-        def start_turn(self, thread_id, text):
-            raise AssertionError("should not start new turn")
-
-        def steer_turn(self, thread_id, expected_turn_id, text):
-            seen["steer"] = (thread_id, expected_turn_id, text)
-            return {"turnId": expected_turn_id}
+        def start_turn(self, **payload):
+            seen["payload"] = payload
+            return "request-1"
 
     frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("src/app.py")
 
     frame._on_send_clicked(None)
 
-    assert seen["steer"] == (TEST_THREAD_ID, TEST_TURN_ID, "src/app.py")
+    payload = seen["payload"]
+    assert payload["thread_id"] == TEST_THREAD_ID
+    assert payload["turn_id"] == TEST_TURN_ID
+    assert payload["question"] == "src/app.py"
+    assert payload["should_steer"] is True
     assert frame._active_request_count == 1
-    assert frame.active_codex_pending_prompt == ""
     assert frame.active_session_turns[-1]["question"] == "src/app.py"
 
 
@@ -125,22 +120,23 @@ def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt
     seen = {}
 
     class _Client:
-        def start_thread(self, **kwargs):
-            raise AssertionError("should not create new thread")
+        def start(self):
+            pass
 
-        def start_turn(self, thread_id, text):
-            raise AssertionError("should not start new turn")
-
-        def steer_turn(self, thread_id, expected_turn_id, text):
-            seen["steer"] = (thread_id, expected_turn_id, text)
-            return {"turnId": expected_turn_id}
+        def start_turn(self, **payload):
+            seen["payload"] = payload
+            return "request-1"
 
     frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("缁х画澶勭悊")
 
     frame._on_send_clicked(None)
 
-    assert seen["steer"] == (TEST_THREAD_ID, TEST_TURN_ID, "缁х画澶勭悊")
+    payload = seen["payload"]
+    assert payload["thread_id"] == TEST_THREAD_ID
+    assert payload["turn_id"] == TEST_TURN_ID
+    assert payload["question"] == "缁х画澶勭悊"
+    assert payload["should_steer"] is True
     assert frame._active_request_count == 1
     assert frame.active_codex_pending_prompt == ""
     assert frame.active_session_turns[-1]["question"] == "缁х画澶勭悊"
@@ -162,24 +158,22 @@ def test_send_click_routes_codex_start_when_turn_is_inactive_even_with_stale_pro
     seen = {}
 
     class _Client:
-        def start_thread(self, **kwargs):
-            raise AssertionError("should not create new thread")
+        def start(self):
+            pass
 
-        def start_turn(self, thread_id, text):
-            seen["turn"] = (thread_id, text)
-            return {"turn": {"id": TEST_TURN_ID}}
-
-        def steer_turn(self, thread_id, expected_turn_id, text):
-            raise AssertionError("should not steer when the turn is inactive")
+        def start_turn(self, **payload):
+            seen["payload"] = payload
+            return "request-1"
 
     frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
     frame.input_edit.SetValue("新的补充")
 
     frame._on_send_clicked(None)
 
-    assert seen["turn"] == (TEST_THREAD_ID, "新的补充")
-    assert frame.active_codex_turn_active is True
-    assert frame.active_codex_pending_prompt == ""
+    payload = seen["payload"]
+    assert payload["thread_id"] == TEST_THREAD_ID
+    assert payload["question"] == "新的补充"
+    assert payload["should_steer"] is False
     assert frame.active_session_turns[-1]["question"] == "新的补充"
 
 
