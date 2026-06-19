@@ -5732,6 +5732,146 @@ def test_codex_worker_event_bridge_preserves_outer_turn_idx_and_model(frame, mon
     assert dispatched[0][1].data["model"] == "codex/original"
 
 
+def test_active_codex_final_answer_uses_worker_turn_idx_scope(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 1
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "first",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "request_error": "",
+        },
+        {
+            "question": "second",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "request_error": "",
+        },
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "execution_steps": []}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_final_answer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_update_active_answer_row", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_append_completed_answer_to_answer_list", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(frame, "_render_answer_list_compat", lambda *_args, **_kwargs: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(type="item_completed", phase="final_answer", text="first answer", data={"turn_idx": 0}),
+    )
+
+    assert frame.active_session_turns[0]["answer_md"] == "first answer"
+    assert frame.active_session_turns[1]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_active_codex_turn_completed_uses_worker_turn_idx_scope(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 1
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {
+            "question": "first",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "request_error": "",
+        },
+        {
+            "question": "second",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "request_status": "pending",
+            "request_error": "",
+        },
+    ]
+    frame._current_chat_state = {"id": "chat-c", "turns": frame.active_session_turns, "execution_steps": []}
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
+    monkeypatch.setattr(frame, "_update_active_answer_row", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_append_completed_answer_to_answer_list", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda *_args, **_kwargs: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(type="turn_completed", status="completed", text="first done", data={"turn_idx": 0}),
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert frame.active_session_turns[0]["answer_md"] == "first done"
+    assert frame.active_session_turns[1]["request_status"] == "pending"
+    assert frame.active_session_turns[1]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_active_codex_execution_entry_uses_worker_turn_idx_scope(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 1
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {"question": "first", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL},
+        {"question": "second", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    frame._current_chat_state = {
+        "id": "chat-c",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(type="stderr", text="scoped stderr", data={"turn_idx": 0}),
+    )
+
+    assert frame._current_chat_state["execution_steps"][0]["turn_idx"] == 0
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "scoped stderr"
+
+
+def test_active_codex_delta_flush_preserves_worker_turn_idx_scope(frame, monkeypatch):
+    frame.active_chat_id = "chat-c"
+    frame.current_chat_id = "chat-c"
+    frame.active_turn_idx = 1
+    frame.active_codex_turn_active = True
+    frame.view_mode = "active"
+    frame.active_session_turns = [
+        {"question": "first", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL},
+        {"question": "second", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    frame._current_chat_state = {
+        "id": "chat-c",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(type="agent_message_delta", text="delta text", item_id="item-1", data={"turn_idx": 0, "model": "codex/original"}),
+    )
+    frame._on_codex_event_for_chat(
+        "chat-c",
+        main.CodexEvent(type="stderr", text="flush", data={"turn_idx": 1}),
+    )
+
+    assert frame._current_chat_state["execution_steps"][0]["turn_idx"] == 0
+    assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "delta text"
+
+
 def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, monkeypatch):
     frame.active_chat_id = "chat-a"
     frame.current_chat_id = "chat-a"
@@ -6934,7 +7074,7 @@ def test_current_chat_codex_delta_with_hidden_placeholder_does_not_rerender_ques
     frame._render_answer_list()
     before_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert frame.answer_meta[0][0] == "context_usage"
-    assert before_rows[2:] == ["我", "Codex 正在处理的问题"]
+    assert before_rows[-1] == "Codex 正在处理的问题"
 
     seen = {"render": 0, "save": 0}
     monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))

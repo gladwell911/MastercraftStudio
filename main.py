@@ -4560,7 +4560,21 @@ class ChatFrame(wx.Frame):
     def _event_thread_id(event: CodexEvent) -> str:
         return str(getattr(event, "thread_id", "") or "").strip()
 
-    def _event_turn_index(self, turns: list, event: CodexEvent) -> int:
+    @staticmethod
+    def _event_data_turn_idx_value(event: CodexEvent) -> int:
+        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        if "turn_idx" not in data:
+            return -1
+        try:
+            value = int(data.get("turn_idx"))
+        except Exception:
+            return -1
+        return value if value >= 0 else -1
+
+    def _event_scoped_turn_index(self, turns: list, event: CodexEvent) -> int:
+        data_idx = self._event_data_turn_idx_value(event)
+        if isinstance(turns, list) and 0 <= data_idx < len(turns):
+            return data_idx
         turn_id = self._event_turn_id(event)
         if turn_id:
             for idx, turn in enumerate(turns or []):
@@ -4569,11 +4583,21 @@ class ChatFrame(wx.Frame):
                 for key in ("turn_id", "codex_turn_id", "id"):
                     if str(turn.get(key) or "").strip() == turn_id:
                         return idx
-        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
-        turn_idx = data.get("turn_idx")
-        if isinstance(turn_idx, int) and isinstance(turns, list) and 0 <= turn_idx < len(turns):
-            return turn_idx
+        return -1
+
+    def _event_turn_index(self, turns: list, event: CodexEvent) -> int:
+        scoped_idx = self._event_scoped_turn_index(turns, event)
+        if scoped_idx >= 0:
+            return scoped_idx
         return len(turns) - 1 if isinstance(turns, list) and turns else -1
+
+    def _active_codex_event_target_index(self, event: CodexEvent) -> int:
+        scoped_idx = self._event_scoped_turn_index(self.active_session_turns, event)
+        if scoped_idx >= 0:
+            return scoped_idx
+        if 0 <= self.active_turn_idx < len(self.active_session_turns):
+            return self.active_turn_idx
+        return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
 
     def _known_codex_turn_ids_for_chat(self, chat: dict | None) -> set[str]:
         ids: set[str] = set()
@@ -4602,6 +4626,9 @@ class ChatFrame(wx.Frame):
         if not known_turn_ids:
             return True
         if not turn_id:
+            turns = chat.get("turns") if isinstance(chat, dict) and isinstance(chat.get("turns"), list) else []
+            if self._codex_event_requires_known_turn(event) and self._event_scoped_turn_index(turns, event) >= 0:
+                return True
             return not self._codex_event_requires_known_turn(event)
         return turn_id in known_turn_ids
 
@@ -4922,7 +4949,7 @@ class ChatFrame(wx.Frame):
             list_text = self._execution_command_list_text(event_type, title, command, exit_code, command_fallback)
         else:
             list_text = self._execution_list_text_from_detail(detail_text, display_kind)
-        return {
+        entry = {
             "event_type": event_type,
             "display_kind": display_kind,
             "subtype": subtype,
@@ -4940,6 +4967,10 @@ class ChatFrame(wx.Frame):
             "item_id": str(getattr(event, "item_id", "") or "").strip(),
             "created_at": time.time(),
         }
+        turn_idx = self._event_data_turn_idx_value(event)
+        if turn_idx >= 0:
+            entry["turn_idx"] = turn_idx
+        return entry
 
     def _append_execution_step_to_chat(self, chat_id: str, step_text: str, *, save_state: bool = True) -> bool:
         text = str(step_text or "").strip()
@@ -5428,6 +5459,7 @@ class ChatFrame(wx.Frame):
             base_event = state.get("event")
             if not text or not isinstance(base_event, CodexEvent):
                 continue
+            base_data = dict(base_event.data or {}) if isinstance(getattr(base_event, "data", None), dict) else {}
             merged_event = CodexEvent(
                 type="agent_message_delta",
                 thread_id=self._event_thread_id(base_event),
@@ -5439,6 +5471,7 @@ class ChatFrame(wx.Frame):
                 status=str(getattr(base_event, "status", "") or "").strip(),
                 subtype=str(getattr(base_event, "subtype", "") or "").strip() or "agentMessageDelta",
                 display_kind="commentary",
+                data=base_data,
             )
             entry = self._build_execution_entry(merged_event)
             if entry and self._append_execution_entry_to_chat(chat_id, entry, save_state=False):
@@ -8293,7 +8326,7 @@ class ChatFrame(wx.Frame):
             self._defer_chat_state_save()
             return
         if event_type == "subagent_result":
-            target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            target_idx = self._active_codex_event_target_index(event)
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
                 if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
@@ -8310,7 +8343,7 @@ class ChatFrame(wx.Frame):
             if is_current_chat:
                 self.active_codex_turn_active = False
                 self.active_codex_pending_request = None
-            target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            target_idx = self._active_codex_event_target_index(event)
             turn = {}
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
@@ -8352,7 +8385,7 @@ class ChatFrame(wx.Frame):
             self.active_codex_latest_assistant_text = str(event.text or "")
             self.active_codex_latest_assistant_phase = str(event.phase or "")
             if event_type == "item_completed" and str(event.status or "") == "imageView":
-                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+                target_idx = self._active_codex_event_target_index(event)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     path = str((event.data or {}).get("path") or "").strip()
                     if path and Path(path).is_file():
@@ -8374,7 +8407,7 @@ class ChatFrame(wx.Frame):
                 return
             if event_type == "item_completed" and str(event.phase or "") == "final_answer":
                 self.active_codex_pending_prompt = str(event.text or "")
-                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+                target_idx = self._active_codex_event_target_index(event)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
@@ -8393,7 +8426,7 @@ class ChatFrame(wx.Frame):
                     self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event.text:
-                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+                target_idx = self._active_codex_event_target_index(event)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
                     if str(event.phase or "") == "final_answer":
