@@ -2532,6 +2532,12 @@ def test_new_chat_clears_stale_active_codex_state_without_turns(frame, monkeypat
     assert frame._current_chat_state["codex_thread_id"] == ""
     assert frame._current_chat_state["codex_turn_id"] == ""
     assert frame._current_chat_state["codex_turn_active"] is False
+    assert frame._current_chat_state["codex_pending_prompt"] == ""
+    assert frame._current_chat_state["codex_pending_request"] is None
+    assert frame._current_chat_state["codex_request_queue"] == []
+    assert frame._current_chat_state["codex_thread_flags"] == []
+    assert frame._current_chat_state["codex_latest_assistant_text"] == ""
+    assert frame._current_chat_state["codex_latest_assistant_phase"] == ""
 
 
 def test_idle_history_flush_defers_while_primary_control_has_focus(frame, monkeypatch):
