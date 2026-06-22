@@ -898,7 +898,7 @@ def test_build_codex_app_server_command_adds_model_config(monkeypatch):
         codex_model="codex/gpt-5.3-codex-spark-high",
     )
 
-    assert command == [
+    assert command[:9] == [
         "codex.cmd",
         "app-server",
         "--listen",
@@ -909,6 +909,52 @@ def test_build_codex_app_server_command_adds_model_config(monkeypatch):
         "-c",
         'model_reasoning_effort="high"',
     ]
+
+
+def test_codex_disabled_features_for_53_spark():
+    assert codex_client.codex_disabled_features_for_model(
+        "codex/gpt-5.3-codex-spark-high"
+    ) == ("image_generation",)
+
+
+def test_codex_disabled_features_for_non_53_spark_models():
+    assert codex_client.codex_disabled_features_for_model("codex/gpt-5.4-medium") == ()
+    assert codex_client.codex_disabled_features_for_model("codex/main") == ()
+
+
+def test_build_codex_app_server_command_disables_image_generation_for_53_spark(monkeypatch):
+    monkeypatch.setattr(codex_client, "resolve_codex_launch_command", lambda: ["codex.cmd"])
+
+    command = codex_client.build_codex_app_server_command(
+        r"C:\code\codex",
+        codex_model="codex/gpt-5.3-codex-spark-high",
+    )
+
+    assert command == [
+        "codex.cmd",
+        "app-server",
+        "--listen",
+        "stdio://",
+        "--analytics-default-enabled",
+        "-c",
+        'model="gpt-5.3-codex-spark"',
+        "-c",
+        'model_reasoning_effort="high"',
+        "--disable",
+        "image_generation",
+    ]
+
+
+def test_build_codex_app_server_command_does_not_disable_image_generation_for_54(monkeypatch):
+    monkeypatch.setattr(codex_client, "resolve_codex_launch_command", lambda: ["codex.cmd"])
+
+    command = codex_client.build_codex_app_server_command(
+        r"C:\code\codex",
+        codex_model="codex/gpt-5.4-medium",
+    )
+
+    assert "--disable" not in command
+    assert "image_generation" not in command
 
 
 def test_build_codex_app_server_env_seeds_clean_home(tmp_path, monkeypatch):

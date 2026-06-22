@@ -45,6 +45,13 @@ def codex_cli_config_for_model(model: str) -> dict[str, str]:
     return dict(CODEX_MODEL_CONFIGS.get(str(model or "").strip(), {}))
 
 
+def codex_disabled_features_for_model(model: str) -> tuple[str, ...]:
+    normalized = str(model or "").strip()
+    if normalized == "codex/gpt-5.3-codex-spark-high":
+        return ("image_generation",)
+    return ()
+
+
 def normalize_codex_service_tier(value: str | None) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"fast", "快速"}:
@@ -99,6 +106,8 @@ def build_codex_app_server_command(cwd: str | None = None, codex_model: str = DE
     ]
     for key, value in codex_cli_config_for_model(codex_model).items():
         command.extend(["-c", f'{key}="{value}"'])
+    for feature_name in codex_disabled_features_for_model(codex_model):
+        command.extend(["--disable", feature_name])
     return command
 
 
