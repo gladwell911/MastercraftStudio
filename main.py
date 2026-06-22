@@ -7730,6 +7730,7 @@ class ChatFrame(wx.Frame):
         previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         previous_codex_service_tier = self._current_codex_service_tier()
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+        self._reset_active_codex_session_state()
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
@@ -7763,6 +7764,7 @@ class ChatFrame(wx.Frame):
         model = normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
         self.selected_model = model
         self._current_chat_state["model"] = model
+        self._write_active_codex_session_state_to_chat(self._current_chat_state)
         if is_codex_model(model):
             self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
         if threading.current_thread() is threading.main_thread():
@@ -10310,15 +10312,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_sync_offset = 0
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
-        self.active_codex_thread_id = ""
-        self.active_codex_turn_id = ""
-        self.active_codex_turn_active = False
-        self.active_codex_pending_prompt = ""
-        self.active_codex_pending_request = None
-        self.active_codex_request_queue = []
-        self.active_codex_thread_flags = []
-        self.active_codex_latest_assistant_text = ""
-        self.active_codex_latest_assistant_phase = ""
+        self._reset_active_codex_session_state()
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
         self._pending_context_usage_by_turn = {}
@@ -10331,15 +10325,7 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["openclaw_sync_offset"] = self.active_openclaw_sync_offset
         self._current_chat_state["openclaw_last_event_id"] = self.active_openclaw_last_event_id
         self._current_chat_state["openclaw_last_synced_at"] = self.active_openclaw_last_synced_at
-        self._current_chat_state["codex_thread_id"] = self.active_codex_thread_id
-        self._current_chat_state["codex_turn_id"] = self.active_codex_turn_id
-        self._current_chat_state["codex_turn_active"] = self.active_codex_turn_active
-        self._current_chat_state["codex_pending_prompt"] = self.active_codex_pending_prompt
-        self._current_chat_state["codex_pending_request"] = self.active_codex_pending_request
-        self._current_chat_state["codex_request_queue"] = self.active_codex_request_queue
-        self._current_chat_state["codex_thread_flags"] = self.active_codex_thread_flags
-        self._current_chat_state["codex_latest_assistant_text"] = self.active_codex_latest_assistant_text
-        self._current_chat_state["codex_latest_assistant_phase"] = self.active_codex_latest_assistant_phase
+        self._write_active_codex_session_state_to_chat(self._current_chat_state)
         self._current_chat_state["claudecode_session_id"] = self.active_claudecode_session_id
         self._current_chat_state["context_usage"] = None
         self._current_chat_state["execution_steps"] = []
@@ -10403,6 +10389,28 @@ class ChatFrame(wx.Frame):
         chat["claudecode_session_id"] = ""
         chat["context_usage"] = None
         chat["execution_steps"] = []
+
+    def _reset_active_codex_session_state(self) -> None:
+        self.active_codex_thread_id = ""
+        self.active_codex_turn_id = ""
+        self.active_codex_turn_active = False
+        self.active_codex_pending_prompt = ""
+        self.active_codex_pending_request = None
+        self.active_codex_request_queue = []
+        self.active_codex_thread_flags = []
+        self.active_codex_latest_assistant_text = ""
+        self.active_codex_latest_assistant_phase = ""
+
+    def _write_active_codex_session_state_to_chat(self, chat: dict) -> None:
+        chat["codex_thread_id"] = self.active_codex_thread_id
+        chat["codex_turn_id"] = self.active_codex_turn_id
+        chat["codex_turn_active"] = self.active_codex_turn_active
+        chat["codex_pending_prompt"] = self.active_codex_pending_prompt
+        chat["codex_pending_request"] = self.active_codex_pending_request
+        chat["codex_request_queue"] = self.active_codex_request_queue
+        chat["codex_thread_flags"] = self.active_codex_thread_flags
+        chat["codex_latest_assistant_text"] = self.active_codex_latest_assistant_text
+        chat["codex_latest_assistant_phase"] = self.active_codex_latest_assistant_phase
 
     def _prompt_and_create_named_chat(self) -> bool:
         if not self.new_chat_button.IsEnabled():
@@ -11549,6 +11557,7 @@ class ChatFrame(wx.Frame):
             flush_before_archive=False,
             refresh_lifecycle_after_archive=False,
         )
+        self._reset_active_codex_session_state()
         self.current_chat_id = ""
         self.active_chat_id = ""
         now = time.time()
@@ -11573,6 +11582,7 @@ class ChatFrame(wx.Frame):
         model = normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
         self.selected_model = model
         self._current_chat_state["model"] = model
+        self._write_active_codex_session_state_to_chat(self._current_chat_state)
         if is_codex_model(model):
             self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
