@@ -2493,6 +2493,47 @@ def test_new_chat_defers_heavy_history_refresh_and_state_save(frame, monkeypatch
     assert frame._chat_state_flush_dirty is True
 
 
+def test_new_chat_clears_stale_active_codex_state_without_turns(frame, monkeypatch):
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = []
+    frame.active_codex_thread_id = "thread-stale"
+    frame.active_codex_turn_id = "turn-stale"
+    frame.active_codex_turn_active = True
+    frame.active_codex_pending_prompt = "pending"
+    frame.active_codex_pending_request = {"kind": "user_input"}
+    frame.active_codex_request_queue = [{"prompt": "queued"}]
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame.active_codex_latest_assistant_text = "partial"
+    frame.active_codex_latest_assistant_phase = "answer"
+    frame._current_chat_state = {"id": "chat-old", "turns": []}
+
+    monkeypatch.setattr(frame, "_archive_active_session", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_sync_codex_speed_combo_from_chat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_mark_history_list_dirty", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    frame._on_new_chat_clicked(None)
+
+    assert frame.active_codex_thread_id == ""
+    assert frame.active_codex_turn_id == ""
+    assert frame.active_codex_turn_active is False
+    assert frame.active_codex_pending_prompt == ""
+    assert frame.active_codex_pending_request is None
+    assert frame.active_codex_request_queue == []
+    assert frame.active_codex_thread_flags == []
+    assert frame.active_codex_latest_assistant_text == ""
+    assert frame.active_codex_latest_assistant_phase == ""
+    assert frame._current_chat_state["codex_thread_id"] == ""
+    assert frame._current_chat_state["codex_turn_id"] == ""
+    assert frame._current_chat_state["codex_turn_active"] is False
+
+
 def test_idle_history_flush_defers_while_primary_control_has_focus(frame, monkeypatch):
     frame._history_list_dirty = True
     frame._pending_history_keep_id = "chat-old"
@@ -4035,6 +4076,39 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
     assert frame.answer_list.GetString(0) == "暂无"
+
+
+def test_remote_new_chat_clears_stale_active_codex_state_without_turns(frame, monkeypatch):
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = []
+    frame.active_codex_thread_id = "thread-stale"
+    frame.active_codex_turn_id = "turn-stale"
+    frame.active_codex_turn_active = True
+    frame.active_codex_pending_prompt = "pending"
+    frame.active_codex_pending_request = {"kind": "user_input"}
+    frame.active_codex_request_queue = [{"prompt": "queued"}]
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame.active_codex_latest_assistant_text = "partial"
+    frame.active_codex_latest_assistant_phase = "answer"
+    frame._current_chat_state = {"id": "chat-old", "turns": []}
+
+    monkeypatch.setattr(frame, "_archive_active_session", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    created = frame._start_remote_new_chat({"model": "codex/gpt-5.4-medium"})
+
+    assert created["model"] == "codex/gpt-5.4-medium"
+    assert frame.active_codex_thread_id == ""
+    assert frame.active_codex_turn_id == ""
+    assert frame.active_codex_turn_active is False
+    assert frame._current_chat_state["codex_thread_id"] == ""
+    assert frame._current_chat_state["codex_turn_id"] == ""
+    assert frame._current_chat_state["codex_turn_active"] is False
 
 
 def test_render_answer_list_hides_requesting_placeholder_until_done(frame):
@@ -14612,6 +14686,59 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
     assert sent[0]["input_items"][0]["text"] == "第三轮问题"
     assert frame.active_codex_thread_id == "thread-stale"
     assert frame.active_codex_turn_id == ""
+
+
+def test_codex_worker_does_not_reuse_stale_thread_after_new_chat_reset(frame, monkeypatch):
+    frame.active_chat_id = "chat-old"
+    frame.current_chat_id = "chat-old"
+    frame.active_session_turns = []
+    frame.active_codex_thread_id = "thread-stale"
+    frame.active_codex_turn_id = "turn-stale"
+    frame.active_codex_turn_active = True
+    frame._current_chat_state = {"id": "chat-old", "turns": []}
+
+    monkeypatch.setattr(frame, "_archive_active_session", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_sync_codex_speed_combo_from_chat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_mark_history_list_dirty", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    frame._on_new_chat_clicked(None)
+
+    frame.active_session_turns = [
+        {
+            "question": "新问题",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "codex/gpt-5.4-medium",
+            "created_at": 1.0,
+        }
+    ]
+    frame.active_turn_idx = 0
+    frame._current_chat_state["id"] = frame.active_chat_id
+    frame._current_chat_state["model"] = "codex/gpt-5.4-medium"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+
+    sent = []
+
+    class _Client:
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            sent.append(payload)
+            return "req-1"
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id, _model="": _Client())
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
+
+    frame._run_codex_turn_worker(frame.active_chat_id, 0, "新问题", "codex/gpt-5.4-medium")
+
+    assert sent[0]["thread_id"] == ""
 
 
 def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, monkeypatch, tmp_path):
