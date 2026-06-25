@@ -11499,15 +11499,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_sync_offset = 0
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
-        self.active_codex_thread_id = ""
-        self.active_codex_turn_id = ""
-        self.active_codex_turn_active = False
-        self.active_codex_pending_prompt = ""
-        self.active_codex_pending_request = None
-        self.active_codex_request_queue = []
-        self.active_codex_thread_flags = []
-        self.active_codex_latest_assistant_text = ""
-        self.active_codex_latest_assistant_phase = ""
+        self._reset_active_codex_session_state()
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
         self.view_mode = "active"

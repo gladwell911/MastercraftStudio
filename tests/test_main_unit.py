@@ -5754,6 +5754,59 @@ def test_remote_pending_request_reply_uses_worker_ipc(frame, monkeypatch):
     assert "已提交" in message
 
 
+def test_archive_active_session_clears_active_codex_runtime_state_consistently(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_started_at = 1.0
+    frame.active_session_turns = [
+        {
+            "question": "旧问题",
+            "answer_md": "旧回答",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+        }
+    ]
+    frame.active_codex_thread_id = "thread-old"
+    frame.active_codex_turn_id = "turn-old"
+    frame.active_codex_turn_active = True
+    frame.active_codex_pending_prompt = "pending"
+    frame.active_codex_pending_request = {"kind": "user_input"}
+    frame.active_codex_request_queue = [{"prompt": "queued"}]
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame.active_codex_latest_assistant_text = "partial"
+    frame.active_codex_latest_assistant_phase = "answer"
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "当前聊天",
+        "turns": frame.active_session_turns,
+        "updated_at": 1.0,
+    }
+
+    monkeypatch.setattr(frame, "_flush_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+
+    archived = frame._archive_active_session(save_after_archive=False, flush_before_archive=False)
+
+    assert archived["codex_thread_id"] == "thread-old"
+    assert archived["codex_turn_id"] == "turn-old"
+    assert archived["codex_turn_active"] is True
+    assert archived["codex_pending_prompt"] == "pending"
+    assert archived["codex_pending_request"] == {"kind": "user_input"}
+    assert archived["codex_request_queue"] == [{"prompt": "queued"}]
+    assert archived["codex_thread_flags"] == ["waitingOnUserInput"]
+    assert archived["codex_latest_assistant_text"] == "partial"
+    assert archived["codex_latest_assistant_phase"] == "answer"
+    assert frame.active_codex_thread_id == ""
+    assert frame.active_codex_turn_id == ""
+    assert frame.active_codex_turn_active is False
+    assert frame.active_codex_pending_prompt == ""
+    assert frame.active_codex_pending_request is None
+    assert frame.active_codex_request_queue == []
+    assert frame.active_codex_thread_flags == []
+    assert frame.active_codex_latest_assistant_text == ""
+    assert frame.active_codex_latest_assistant_phase == ""
+
+
 def test_codex_worker_event_bridge_ignores_events_after_wx_app_gone(frame, monkeypatch):
     seen = {"called": False}
 
