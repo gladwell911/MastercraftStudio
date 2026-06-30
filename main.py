@@ -1166,12 +1166,19 @@ class CommonCommandsDialog(wx.Dialog):
     def refresh_commands(self, select_id: str | None = None) -> bool:
         snapshot = self.owner.common_commands_store.read_snapshot()
         commands = list(snapshot.commands)
+        previous_selection = self.common_commands_list.GetSelection()
         self.common_commands_by_id = {command.id: command for command in commands}
         self.common_commands_list_ids = [command.id for command in commands]
         if not commands:
             self.common_commands_list_model.replace_visible_page([])
             return self.owner._replace_listbox_items_if_changed(self.common_commands_list, ["暂无常用命令"], None)
-        target_id = str(select_id or self.selected_command_id() or commands[0].id)
+        target_id = str(select_id or self.selected_command_id() or "")
+        if target_id not in self.common_commands_by_id:
+            fallback_index = min(
+                max(previous_selection, 0),
+                len(commands) - 1,
+            )
+            target_id = commands[fallback_index].id
         rows = [(command.id, self.owner._common_command_label(command)) for command in commands]
         changed = self.common_commands_list_model.replace_visible_page(rows, target_id)
         self.common_commands_list_ids = list(self.common_commands_list_model.visible_ids)

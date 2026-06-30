@@ -237,3 +237,26 @@ def test_ui_automation_common_commands_refresh_does_not_steal_focus_when_list_ha
     assert dialog.common_commands_list.HasFocus()
     assert dialog.selected_command_id() == first.id
     assert "Second updated" in [dialog.common_commands_list.GetString(idx) for idx in range(dialog.common_commands_list.GetCount())]
+
+
+def test_ui_automation_remote_delete_refresh_keeps_list_focus_and_moves_selection(frame, wx_app):
+    _activate_frame(frame, wx_app)
+    first = _seed_command(frame, title="First", content="echo first")
+    second = _seed_command(frame, title="Second", content="echo second")
+    third = _seed_command(frame, title="Third", content="echo third")
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(dialog.common_commands_list_ids.index(second.id))
+    dialog.common_commands_list.SetFocus()
+    wx_app.Yield()
+
+    frame.common_commands_store.delete_command(second.id, expected_version=second.version)
+    assert dialog.refresh_commands() is True
+    wx_app.Yield()
+
+    assert dialog.common_commands_list.HasFocus()
+    assert dialog.selected_command_id() == third.id
+    assert [dialog.common_commands_list.GetString(idx) for idx in range(dialog.common_commands_list.GetCount())] == [
+        "First",
+        "Third",
+    ]

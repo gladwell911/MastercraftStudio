@@ -1018,3 +1018,51 @@ def test_real_ui_primary_controls_stay_responsive_while_codex_events_are_pending
 
     assert frame._pending_codex_ui_events
     assert frame._codex_ui_event_drain_timer is not None
+
+
+def test_real_ui_common_commands_list_stays_responsive_during_remote_refresh_burst(frame, wx_app):
+    _activate_frame(frame, wx_app)
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="One", content="echo one")
+    )
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Two", content="echo two")
+    )
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Three", content="echo three")
+    )
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(0)
+    dialog.common_commands_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    for idx in range(12):
+        selected = dialog.selected_command()
+        updated = frame.common_commands_store.update_command(
+            selected.id,
+            main.CommonCommandUpdate(
+                expected_version=selected.version,
+                title=selected.title,
+                content=f"echo selected {idx}",
+            ),
+        )
+        frame.common_commands_store.update_command(
+            dialog.common_commands_list_ids[-1],
+            main.CommonCommandUpdate(
+                expected_version=dialog.common_commands_by_id[dialog.common_commands_list_ids[-1]].version,
+                title=f"Three {idx}",
+                content=f"echo three {idx}",
+            ),
+        )
+        dialog.refresh_commands(select_id=updated.id)
+        wx_app.Yield()
+
+    started = time.perf_counter()
+    _send_listbox_key(dialog.common_commands_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+    assert dialog.common_commands_list.HasFocus()
+    assert dialog.selected_command().title == "Two"
