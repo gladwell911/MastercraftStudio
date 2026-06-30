@@ -16209,6 +16209,17 @@ def test_window_focus_shortcuts_route_to_expected_controls(frame, monkeypatch):
     ]
 
 
+def test_alt_m_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
+    calls = []
+    monkeypatch.setattr(frame, "_show_common_commands_surface", lambda: calls.append("open") or True)
+
+    event = main.wx.CommandEvent(main.wx.wxEVT_MENU, int(frame._common_commands_menu_id))
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert calls == ["open"]
+
+
 def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):
     focused = []
     monkeypatch.setattr(frame.notes_notebook_list, "SetFocus", lambda: focused.append("notes_notebook_list"))

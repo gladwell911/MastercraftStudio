@@ -29,7 +29,12 @@ import wx
 import wx.adv
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
-from common_commands_store import DesktopCommonCommandsStore
+from common_commands_models import CommonCommandCreate, CommonCommandUpdate, CommonCommandsSnapshot
+from common_commands_store import (
+    CommonCommandsReadError,
+    CommonCommandsVersionConflictError,
+    DesktopCommonCommandsStore,
+)
 from chat_store import ChatStore
 from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -1078,6 +1083,106 @@ class CloudflaredOriginProxy:
                 return web.Response(status=response.status, body=response_body, headers=response_headers)
 
 
+class CommonCommandEditDialog(wx.Dialog):
+    def __init__(self, parent, *, dialog_title: str, initial_title: str = "", initial_content: str = ""):
+        super().__init__(parent, title=dialog_title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(panel, label="标题："), 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        self.title_edit = wx.TextCtrl(panel, value=str(initial_title or ""))
+        self.title_edit.SetName("常用命令标题")
+        root.Add(self.title_edit, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(wx.StaticText(panel, label="内容："), 0, wx.LEFT | wx.RIGHT, 10)
+        self.content_edit = wx.TextCtrl(panel, value=str(initial_content or ""), style=wx.TE_MULTILINE)
+        self.content_edit.SetName("常用命令内容")
+        root.Add(self.content_edit, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        buttons = self.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        if buttons is not None:
+            ok_button = self.FindWindowById(wx.ID_OK)
+            if ok_button is not None:
+                ok_button.SetLabel("保存")
+            root.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
+        panel.SetSizer(root)
+        self.SetMinSize((420, 320))
+        self.SetSize((520, 420))
+        self.Bind(wx.EVT_BUTTON, self._on_save, id=wx.ID_OK)
+
+    def _on_save(self, event) -> None:
+        if not str(self.content_edit.GetValue() or "").strip():
+            wx.MessageBox("请输入命令内容。", "提示", wx.OK | wx.ICON_WARNING)
+            self.content_edit.SetFocus()
+            return
+        event.Skip()
+
+    def values(self) -> tuple[str, str]:
+        return (
+            str(self.title_edit.GetValue() or "").strip(),
+            str(self.content_edit.GetValue() or "").strip(),
+        )
+
+
+class CommonCommandsDialog(wx.Dialog):
+    def __init__(self, owner: "ChatFrame"):
+        super().__init__(owner, title="常用命令", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.owner = owner
+        self.common_commands_list_ids: list[str] = []
+        self.common_commands_by_id: dict[str, object] = {}
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(panel, label="常用命令："), 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        self.common_commands_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.common_commands_list.SetName("常用命令")
+        root.Add(self.common_commands_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        button_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.common_commands_add_button = wx.Button(panel, label="添加(&A)")
+        self.common_commands_add_button.SetName("添加常用命令")
+        button_row.Add(self.common_commands_add_button, 0)
+        root.Add(button_row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        panel.SetSizer(root)
+        self.common_commands_list_model = IncrementalListBoxModel(self.common_commands_list)
+        self.SetMinSize((320, 280))
+        self.SetSize((420, 420))
+        self.common_commands_add_button.Bind(wx.EVT_BUTTON, lambda _evt: self.owner._add_common_command())
+        self.common_commands_list.Bind(wx.EVT_KEY_DOWN, self.owner._monitored_ui_handler("common_commands_key_down", self.owner._on_common_commands_key_down))
+        self.common_commands_list.Bind(wx.EVT_CONTEXT_MENU, self.owner._on_common_commands_context)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def _on_close(self, _event) -> None:
+        self.owner.common_commands_dialog = None
+        self.Destroy()
+
+    def selected_command_id(self) -> str:
+        model = getattr(self, "common_commands_list_model", None)
+        if model is None:
+            return ""
+        return str(model.selected_id() or "")
+
+    def selected_command(self):
+        command_id = self.selected_command_id()
+        if not command_id:
+            return None
+        return self.common_commands_by_id.get(command_id)
+
+    def refresh_commands(self, select_id: str | None = None) -> bool:
+        snapshot = self.owner.common_commands_store.read_snapshot()
+        commands = list(snapshot.commands)
+        self.common_commands_by_id = {command.id: command for command in commands}
+        self.common_commands_list_ids = [command.id for command in commands]
+        if not commands:
+            self.common_commands_list_model.replace_visible_page([])
+            return self.owner._replace_listbox_items_if_changed(self.common_commands_list, ["暂无常用命令"], None)
+        target_id = str(select_id or self.selected_command_id() or commands[0].id)
+        rows = [(command.id, self.owner._common_command_label(command)) for command in commands]
+        changed = self.common_commands_list_model.replace_visible_page(rows, target_id)
+        self.common_commands_list_ids = list(self.common_commands_list_model.visible_ids)
+        return changed
+
+    def focus_default_control(self) -> bool:
+        if self.common_commands_list_ids:
+            return self.owner._focus_control_safely(self.common_commands_list)
+        return self.owner._focus_control_safely(self.common_commands_add_button)
+
+
 class ChatFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_WINDOW_TITLE, size=(1200, 800))
@@ -1196,6 +1301,7 @@ class ChatFrame(wx.Frame):
         self._context_usage_estimate_keys: set[tuple[str, int]] = set()
         self._alt_menu_armed = False
         self._alt_menu_suppressed = False
+        self.common_commands_dialog = None
         self.active_project_folder = ""
         self.view_mode = "active"
         self.view_history_id = None
@@ -1265,6 +1371,7 @@ class ChatFrame(wx.Frame):
         self._chat_navigation_left_id = wx.NewIdRef()
         self._chat_navigation_right_id = wx.NewIdRef()
         self._clear_context_id = wx.NewIdRef()
+        self._common_commands_menu_id = wx.NewIdRef()
         self._file_manager_menu_id = wx.NewIdRef()
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
@@ -1325,6 +1432,7 @@ class ChatFrame(wx.Frame):
     def _build_ui(self):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
+        app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+M")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -1520,6 +1628,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_common_commands_surface(), id=int(self._common_commands_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_file_manager(), id=int(self._file_manager_menu_id))
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
@@ -1534,6 +1643,7 @@ class ChatFrame(wx.Frame):
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_LEFT, int(self._chat_navigation_left_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_RIGHT, int(self._chat_navigation_right_id)),
                     wx.AcceleratorEntry(wx.ACCEL_ALT, ord("A"), int(self._clear_context_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_ALT, ord("M"), int(self._common_commands_menu_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._notes_move_entry_up_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._notes_move_entry_down_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_HOME, int(self._notes_move_entry_top_id)),
@@ -1566,6 +1676,190 @@ class ChatFrame(wx.Frame):
         self._refresh_file_manager_list()
         self.chat_root_panel.Layout()
         self.file_manager_list.SetFocus()
+
+    def _common_command_label(self, command) -> str:
+        title = str(getattr(command, "title", "") or "").strip()
+        if title:
+            return title
+        content = str(getattr(command, "content", "") or "").strip()
+        return content or "未命名命令"
+
+    def _get_common_commands_dialog(self) -> CommonCommandsDialog:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is not None:
+            try:
+                if dialog.IsBeingDeleted():
+                    dialog = None
+            except Exception:
+                dialog = None
+        if dialog is None:
+            dialog = CommonCommandsDialog(self)
+            self.common_commands_dialog = dialog
+        return dialog
+
+    def _show_common_commands_surface(self) -> bool:
+        try:
+            dialog = self._get_common_commands_dialog()
+            dialog.refresh_commands()
+        except CommonCommandsReadError as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        dialog.Show()
+        dialog.Raise()
+        dialog.focus_default_control()
+        return True
+
+    def _selected_common_command(self):
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return None
+        return dialog.selected_command()
+
+    def _selected_common_command_id(self) -> str:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return ""
+        return dialog.selected_command_id()
+
+    def _restore_common_commands_focus(self, select_id: str | None = None) -> None:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return
+        dialog.refresh_commands(select_id)
+        if select_id and dialog.common_commands_list_ids:
+            dialog.common_commands_list_model.set_selection_by_id(select_id)
+            self._focus_control_safely(dialog.common_commands_list)
+            return
+        dialog.focus_default_control()
+
+    def _write_common_commands_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
+        self.common_commands_store._write_snapshot(snapshot)
+
+    def _add_common_command(self) -> bool:
+        dlg = CommonCommandEditDialog(self, dialog_title="添加常用命令")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title, content = dlg.values()
+        finally:
+            dlg.Destroy()
+        try:
+            command = self.common_commands_store.create_command(CommonCommandCreate(title=title, content=content))
+        except CommonCommandsReadError as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        self._restore_common_commands_focus(command.id)
+        self.SetStatusText("常用命令已保存")
+        return True
+
+    def _edit_selected_common_command(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        dlg = CommonCommandEditDialog(
+            self,
+            dialog_title="编辑常用命令",
+            initial_title=str(getattr(command, "title", "") or ""),
+            initial_content=str(getattr(command, "content", "") or ""),
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title, content = dlg.values()
+        finally:
+            dlg.Destroy()
+        try:
+            updated = self.common_commands_store.update_command(
+                command.id,
+                CommonCommandUpdate(
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                    title=title,
+                    content=content,
+                ),
+            )
+        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        self._restore_common_commands_focus(updated.id)
+        self.SetStatusText("常用命令已保存")
+        return True
+
+    def _delete_selected_common_command(self) -> bool:
+        dialog = getattr(self, "common_commands_dialog", None)
+        command = self._selected_common_command()
+        if dialog is None or command is None:
+            return False
+        if not self._confirm("确定删除该常用命令吗？"):
+            return False
+        try:
+            snapshot = self.common_commands_store.read_snapshot()
+        except CommonCommandsReadError as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        commands = list(snapshot.commands)
+        selected_idx = next((idx for idx, item in enumerate(commands) if item.id == command.id), -1)
+        if selected_idx < 0:
+            return False
+        remaining = [item for item in commands if item.id != command.id]
+        self._write_common_commands_snapshot(
+            CommonCommandsSnapshot(
+                revision=int(snapshot.revision or 0) + 1,
+                commands=remaining,
+            )
+        )
+        next_id = ""
+        if remaining:
+            next_idx = min(selected_idx, len(remaining) - 1)
+            next_id = remaining[next_idx].id
+        self._restore_common_commands_focus(next_id or None)
+        self.SetStatusText("常用命令已删除")
+        return True
+
+    def _send_selected_common_command(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        self.input_edit.SetValue(str(getattr(command, "content", "") or ""))
+        self._trigger_send()
+        return True
+
+    def _show_common_commands_menu(self) -> bool:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return False
+        menu = wx.Menu()
+        add_id = wx.NewIdRef()
+        menu.Append(add_id, "添加")
+        self.Bind(wx.EVT_MENU, lambda _evt: self._add_common_command(), id=add_id)
+        if dialog.selected_command() is not None:
+            edit_id = wx.NewIdRef()
+            delete_id = wx.NewIdRef()
+            menu.Append(edit_id, "编辑")
+            menu.Append(delete_id, "删除")
+            self.Bind(wx.EVT_MENU, lambda _evt: self._edit_selected_common_command(), id=edit_id)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._delete_selected_common_command(), id=delete_id)
+        dialog.PopupMenu(menu)
+        menu.Destroy()
+        return True
+
+    def _on_common_commands_context(self, _event) -> None:
+        self._show_common_commands_menu()
+
+    def _on_common_commands_key_down(self, event) -> None:
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        self._touch_navigation_quiet_window(event)
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self._send_selected_common_command():
+                return
+        if self._is_context_menu_key(key):
+            if self._show_common_commands_menu():
+                return
+        if key == wx.WXK_DELETE:
+            if self._delete_selected_common_command():
+                return
+        event.Skip()
 
     def _refresh_file_manager_list(self, selected_id: str | None = None) -> bool:
         if hasattr(self.file_library, "sync_storage_dir"):
