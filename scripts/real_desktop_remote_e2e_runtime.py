@@ -311,6 +311,18 @@ def main_entry() -> None:
             on_common_commands_list=lambda: frame._run_remote_ui_route(
                 frame._remote_api_common_commands_list_ui
             ),
+            on_common_commands_create=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_create_ui,
+                payload,
+            ),
+            on_common_commands_update=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_update_ui,
+                payload,
+            ),
+            on_common_commands_delete=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_delete_ui,
+                payload,
+            ),
             on_notes_changes=frame._remote_api_notes_changes,
             on_notes_bulk_docs=frame._remote_api_notes_bulk_docs,
         )
