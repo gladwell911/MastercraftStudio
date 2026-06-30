@@ -19,6 +19,23 @@ def test_main_does_not_call_respond_tool_request_user_input_directly():
     assert "respond_tool_request_user_input" not in source
 
 
+def test_chat_frame_initializes_common_commands_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
+    monkeypatch.setattr(main.ChatFrame, "_merge_legacy_archived_chats", lambda self: None)
+
+    frame = main.ChatFrame()
+    frame.Hide()
+    try:
+        assert frame.common_commands_store is not None
+        assert frame.common_commands_store.path == tmp_path / "common_commands.json"
+        assert frame.common_commands_store.path.exists()
+    finally:
+        frame.Destroy()
+
+
 REQUEST_METADATA_FIELDS = {
     "request_status",
     "request_model",

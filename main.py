@@ -29,6 +29,7 @@ import wx
 import wx.adv
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from common_commands_store import DesktopCommonCommandsStore
 from chat_store import ChatStore
 from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -1100,6 +1101,8 @@ class ChatFrame(wx.Frame):
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
+        self.common_commands_store = DesktopCommonCommandsStore(self.app_data_dir / "common_commands.json")
+        self.common_commands_store.initialize()
         self.chat_db_path = self.app_data_dir / "chat_history.db"
         self.chat_store = ChatStore(self.chat_db_path)
         self.chat_store.initialize()
