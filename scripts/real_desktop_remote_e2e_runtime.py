@@ -124,6 +124,8 @@ def main_entry() -> None:
     desktop_chat_title = _require_env("DESKTOP_E2E_DESKTOP_CHAT_TITLE")
     desktop_note_title = _require_env("DESKTOP_E2E_DESKTOP_NOTE_TITLE")
     desktop_note_body = _require_env("DESKTOP_E2E_DESKTOP_NOTE_BODY")
+    desktop_common_command_title = _require_env("DESKTOP_E2E_COMMON_COMMAND_TITLE")
+    desktop_common_command_content = _require_env("DESKTOP_E2E_COMMON_COMMAND_CONTENT")
     mobile_chat_title = _require_env("DESKTOP_E2E_MOBILE_CHAT_TITLE")
     mobile_chat_message = _require_env("DESKTOP_E2E_MOBILE_CHAT_MESSAGE")
     desktop_chat_reply = _require_env("DESKTOP_E2E_DESKTOP_CHAT_REPLY")
@@ -306,6 +308,9 @@ def main_entry() -> None:
             on_update_settings=lambda _payload: (200, {"accepted": True, "settings": {}}),
             on_history_list=_remote_history_list,
             on_history_read=_remote_history_read,
+            on_common_commands_list=lambda: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_list_ui
+            ),
             on_notes_changes=frame._remote_api_notes_changes,
             on_notes_bulk_docs=frame._remote_api_notes_bulk_docs,
         )
@@ -340,6 +345,12 @@ def main_entry() -> None:
 
         notebook = frame.notes_store.create_notebook(desktop_note_title)
         frame.notes_store.create_entry(notebook.id, desktop_note_body, source="manual")
+        frame.common_commands_store.create_command(
+            main.CommonCommandCreate(
+                title=desktop_common_command_title,
+                content=desktop_common_command_content,
+            )
+        )
 
         ready_payload = {
             "endpoint": f"ws://127.0.0.1:{websocket_port}/nats",
@@ -347,6 +358,8 @@ def main_entry() -> None:
             "desktop_chat_title": desktop_chat_title,
             "desktop_note_title": desktop_note_title,
             "desktop_note_body": desktop_note_body,
+            "desktop_common_command_title": desktop_common_command_title,
+            "desktop_common_command_content": desktop_common_command_content,
             "mobile_chat_title": mobile_chat_title,
             "mobile_chat_message": mobile_chat_message,
             "desktop_chat_reply": desktop_chat_reply,
@@ -376,6 +389,7 @@ def main_entry() -> None:
                     "mobile_note_visible_on_desktop": observed_mobile_note,
                     "desktop_chat_title": desktop_chat_title,
                     "desktop_note_title": desktop_note_title,
+                    "desktop_common_command_title": desktop_common_command_title,
                     "mobile_chat_title": mobile_chat_title,
                     "mobile_note_title": mobile_note_title,
                 },
