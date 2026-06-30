@@ -7676,14 +7676,33 @@ class ChatFrame(wx.Frame):
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
         requested_chat_id = str(payload.get("chat_id") or "").strip()
+        current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
+        current_ids.discard("")
+        archived_target = None
+        is_new_chat = False
+        if requested_chat_id and requested_chat_id not in current_ids:
+            archived_target = self._find_archived_chat(requested_chat_id)
+            is_new_chat = archived_target is None
+        preview_chat = self._current_chat_state if requested_chat_id in current_ids else archived_target
+        if threading.current_thread() is threading.main_thread():
+            current_model = self._resolve_current_model()
+        else:
+            current_model = str(self.selected_model or DEFAULT_MODEL_ID)
+        model, model_error = self._resolve_remote_message_model(
+            payload,
+            preview_chat,
+            current_model=current_model,
+            is_new_chat=is_new_chat,
+        )
+        if model_error:
+            error = "missing_explicit_model" if model_error == "missing_explicit_model" else "invalid_explicit_model"
+            return 400, {"accepted": False, "error": error, "chat_id": requested_chat_id or str(self.active_chat_id or self.current_chat_id or "").strip()}
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
-                if self._find_archived_chat(requested_chat_id):
+                if archived_target is not None:
                     self._switch_current_chat(requested_chat_id)
                 else:
-                    self.active_chat_id = requested_chat_id
-                    self.current_chat_id = requested_chat_id
-                    self._current_chat_state["id"] = requested_chat_id
+                    self._start_remote_new_chat({"chat_id": requested_chat_id, "model": model})
             chat_id = requested_chat_id
         else:
             chat_id = self.active_chat_id or self.current_chat_id or self._ensure_active_chat_id()
@@ -7691,17 +7710,12 @@ class ChatFrame(wx.Frame):
                 self.current_chat_id = self.active_chat_id
             if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
-        if threading.current_thread() is threading.main_thread():
-            current_model = self._resolve_current_model()
-        else:
-            current_model = str(self.selected_model or DEFAULT_MODEL_ID)
-        model = normalize_model_id(payload.get("model") or current_model or DEFAULT_MODEL_ID)
+        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
         if threading.current_thread() is threading.main_thread():
             self.model_combo.SetValue(model_display_name(model))
         self.selected_model = model
         if threading.current_thread() is threading.main_thread():
             self.input_edit.SetValue(text)
-        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
         title_revision_before = 0
         if isinstance(target_chat, dict):
             try:
@@ -7721,6 +7735,35 @@ class ChatFrame(wx.Frame):
             if title_revision_after == title_revision_before:
                 self._push_remote_history_changed(chat_id)
         return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
+
+    def _resolve_remote_message_model(
+        self,
+        payload: dict,
+        target_chat: dict | None,
+        *,
+        current_model: str,
+        is_new_chat: bool,
+    ) -> tuple[str, str]:
+        change_mode = str((payload or {}).get("model_change_mode") or "inherit").strip().lower()
+        if change_mode not in {"inherit", "explicit"}:
+            change_mode = "inherit"
+        requested_raw = str((payload or {}).get("model") or "").strip()
+        requested_model = normalize_model_id(requested_raw, default="") if requested_raw else ""
+        chat_model = self._model_for_chat_selection(target_chat)
+        if is_new_chat and requested_model:
+            return requested_model, ""
+        if change_mode == "explicit":
+            if not requested_raw:
+                return "", "missing_explicit_model"
+            if requested_model:
+                return requested_model, ""
+            if requested_raw:
+                return "", "invalid_explicit_model"
+        if chat_model:
+            return chat_model, ""
+        if requested_model:
+            return requested_model, ""
+        return normalize_model_id(current_model or DEFAULT_MODEL_ID), ""
 
     def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat = self._start_remote_new_chat(payload)
@@ -7756,7 +7799,8 @@ class ChatFrame(wx.Frame):
             "execution_steps": [],
             "codex_service_tier": "",
         }
-        self.active_chat_id = str(uuid.uuid4())
+        requested_chat_id = str((payload or {}).get("chat_id") or "").strip()
+        self.active_chat_id = requested_chat_id or str(uuid.uuid4())
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
         self._reset_answer_visible_row_limit()

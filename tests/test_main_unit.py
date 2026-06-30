@@ -433,6 +433,212 @@ def test_remote_message_preserves_dynamic_claudecode_model(frame, monkeypatch):
     assert captured["call"][1]["model"] == "claudecode/opus"
 
 
+def test_remote_message_preserves_existing_chat_model_when_payload_uses_default_codex(frame, monkeypatch):
+    captured = {}
+
+    frame.active_chat_id = "chat-gpt54"
+    frame.current_chat_id = "chat-gpt54"
+    frame.selected_model = "codex/gpt-5.4-medium"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-gpt54",
+            "title": "gpt5.4 chat",
+            "model": "codex/gpt-5.4-medium",
+            "turns": [
+                {
+                    "question": "old",
+                    "answer_md": "answer",
+                    "model": "codex/gpt-5.4-medium",
+                }
+            ],
+        }
+    )
+
+    def fake_submit_question(question, **kwargs):
+        captured["call"] = (question, kwargs)
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_message_ui(
+        {"chat_id": "chat-gpt54", "text": "continue", "model": "codex/main"}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["model"] == "codex/gpt-5.4-medium"
+    assert captured["call"][1]["model"] == "codex/gpt-5.4-medium"
+    assert frame.selected_model == "codex/gpt-5.4-medium"
+
+
+def test_remote_message_explicitly_switches_existing_chat_model(frame, monkeypatch):
+    captured = {}
+
+    frame.active_chat_id = "chat-gpt54"
+    frame.current_chat_id = "chat-gpt54"
+    frame.selected_model = "codex/gpt-5.4-medium"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-gpt54",
+            "title": "gpt5.4 chat",
+            "model": "codex/gpt-5.4-medium",
+            "turns": [
+                {
+                    "question": "old",
+                    "answer_md": "answer",
+                    "model": "codex/gpt-5.4-medium",
+                }
+            ],
+        }
+    )
+
+    def fake_submit_question(question, **kwargs):
+        captured["call"] = (question, kwargs)
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_message_ui(
+        {
+            "chat_id": "chat-gpt54",
+            "text": "switch and continue",
+            "model": "openai/gpt-5.2",
+            "model_change_mode": "explicit",
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["model"] == "openai/gpt-5.2"
+    assert captured["call"][1]["model"] == "openai/gpt-5.2"
+    assert frame.selected_model == "openai/gpt-5.2"
+
+
+def test_remote_message_rejects_invalid_explicit_model_switch(frame, monkeypatch):
+    called = {"submit": 0}
+
+    frame.active_chat_id = "chat-gpt54"
+    frame.current_chat_id = "chat-gpt54"
+    frame.selected_model = "codex/gpt-5.4-medium"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-gpt54",
+            "title": "gpt5.4 chat",
+            "model": "codex/gpt-5.4-medium",
+            "turns": [],
+        }
+    )
+
+    def fake_submit_question(question, **kwargs):
+        called["submit"] += 1
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+
+    status, body = frame._remote_api_message_ui(
+        {
+            "chat_id": "chat-gpt54",
+            "text": "switch and continue",
+            "model": "not-a-real-model",
+            "model_change_mode": "explicit",
+        }
+    )
+
+    assert status == 400
+    assert body["accepted"] is False
+    assert body["error"] == "invalid_explicit_model"
+    assert called["submit"] == 0
+    assert frame.selected_model == "codex/gpt-5.4-medium"
+    assert frame.active_chat_id == "chat-gpt54"
+    assert frame.current_chat_id == "chat-gpt54"
+
+
+def test_remote_message_rejects_missing_explicit_model_switch(frame, monkeypatch):
+    called = {"submit": 0}
+
+    frame.active_chat_id = "chat-gpt54"
+    frame.current_chat_id = "chat-gpt54"
+    frame.selected_model = "codex/gpt-5.4-medium"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-gpt54",
+            "title": "gpt5.4 chat",
+            "model": "codex/gpt-5.4-medium",
+            "turns": [],
+        }
+    )
+
+    def fake_submit_question(question, **kwargs):
+        called["submit"] += 1
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+
+    status, body = frame._remote_api_message_ui(
+        {
+            "chat_id": "chat-gpt54",
+            "text": "switch and continue",
+            "model_change_mode": "explicit",
+        }
+    )
+
+    assert status == 400
+    assert body["accepted"] is False
+    assert body["error"] == "missing_explicit_model"
+    assert called["submit"] == 0
+    assert frame.selected_model == "codex/gpt-5.4-medium"
+    assert frame.active_chat_id == "chat-gpt54"
+    assert frame.current_chat_id == "chat-gpt54"
+
+
+def test_remote_message_unknown_chat_id_uses_requested_model_for_new_remote_chat(frame, monkeypatch):
+    captured = {}
+
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.selected_model = "codex/main"
+    frame.active_session_turns = [{"question": "old q", "answer_md": "old a", "model": "codex/main"}]
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "current chat",
+            "model": "codex/main",
+            "turns": frame.active_session_turns,
+        }
+    )
+
+    def fake_submit_question(question, **kwargs):
+        captured["call"] = (question, kwargs)
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", fake_submit_question)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(frame, "SetStatusText", lambda *_args, **_kwargs: None)
+
+    status, body = frame._remote_api_message_ui(
+        {"chat_id": "remote-new", "text": "hello", "model": "codex/gpt-5.4-medium"}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["model"] == "codex/gpt-5.4-medium"
+    assert captured["call"][1]["chat_id"] == "remote-new"
+    assert captured["call"][1]["model"] == "codex/gpt-5.4-medium"
+    assert frame.active_chat_id == "remote-new"
+    assert frame.current_chat_id == "remote-new"
+    assert frame._current_chat_state["id"] == "remote-new"
+    assert frame._current_chat_state["model"] == "codex/gpt-5.4-medium"
+    assert any(chat.get("id") == "chat-current" for chat in frame.archived_chats)
+
+
 def test_remote_new_chat_preserves_dynamic_claudecode_model(frame, monkeypatch):
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
