@@ -432,6 +432,43 @@ def test_remote_model_list_returns_visible_combo_order(frame):
     ]
 
 
+def test_remote_common_commands_list_returns_fixture_contract(frame, monkeypatch):
+    fixture = json.loads((Path("tests") / "fixtures" / "common_commands_snapshot.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        frame.common_commands_store,
+        "read_snapshot",
+        lambda: main.CommonCommandsSnapshot.from_dict(fixture),
+    )
+
+    status, body = frame._remote_api_common_commands_list_ui()
+
+    assert status == 200
+    assert body == fixture
+
+
+def test_remote_common_commands_list_read_error_is_deterministic(frame, monkeypatch):
+    monkeypatch.setattr(
+        frame.common_commands_store,
+        "read_snapshot",
+        lambda: (_ for _ in ()).throw(main.CommonCommandsReadError(frame.common_commands_store.path, "broken")),
+    )
+
+    status, body = frame._remote_api_common_commands_list_ui()
+
+    assert status == 500
+    assert body == {"accepted": False, "error": "common_commands_unavailable"}
+
+
+def test_remote_common_commands_payload_matches_frozen_shape(frame):
+    fixture = json.loads((Path("tests") / "fixtures" / "common_commands_snapshot.json").read_text(encoding="utf-8"))
+
+    payload = frame._remote_common_commands_snapshot_payload(
+        main.CommonCommandsSnapshot.from_dict(fixture)
+    )
+
+    assert payload == fixture
+
+
 def test_remote_message_preserves_dynamic_claudecode_model(frame, monkeypatch):
     captured = {}
 

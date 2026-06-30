@@ -38,6 +38,7 @@ class RemoteNatsTransport:
         on_set_speed: Callback | None = None,
         on_clear_context: Callback | None = None,
         on_model_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        on_common_commands_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
         on_notes_changes: Callback | None = None,
@@ -60,6 +61,7 @@ class RemoteNatsTransport:
         self.on_set_speed = on_set_speed
         self.on_clear_context = on_clear_context
         self.on_model_list = on_model_list
+        self.on_common_commands_list = on_common_commands_list
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
         self.on_notes_changes = on_notes_changes
@@ -266,6 +268,8 @@ class RemoteNatsTransport:
             return self.on_state(payload)
         if command_type == "model_list" and callable(self.on_model_list):
             return self.on_model_list()
+        if command_type == "common_commands_list" and callable(self.on_common_commands_list):
+            return self.on_common_commands_list()
         if command_type == "rename_chat" and callable(self.on_rename_chat):
             return self.on_rename_chat(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):

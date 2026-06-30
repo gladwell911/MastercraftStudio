@@ -8102,6 +8102,20 @@ class ChatFrame(wx.Frame):
             ],
         }
 
+    def _remote_common_commands_snapshot_payload(self, snapshot: CommonCommandsSnapshot) -> dict:
+        return {
+            "accepted": True,
+            "revision": int(getattr(snapshot, "revision", 0) or 0),
+            "commands": [dict(command.to_dict()) for command in list(getattr(snapshot, "commands", []) or [])],
+        }
+
+    def _remote_api_common_commands_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        try:
+            snapshot = self.common_commands_store.read_snapshot()
+        except CommonCommandsReadError:
+            return 500, {"accepted": False, "error": "common_commands_unavailable"}
+        return 200, self._remote_common_commands_snapshot_payload(snapshot)
+
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
         cached = getattr(self, "_remote_history_list_cache", None)
         if isinstance(cached, dict):
@@ -9449,6 +9463,7 @@ class ChatFrame(wx.Frame):
                     on_set_speed=lambda payload: self._run_remote_ui_route(self._remote_api_set_speed_ui, payload),
                     on_clear_context=lambda payload: self._run_remote_ui_route(self._remote_api_clear_context_ui, payload),
                     on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
+                    on_common_commands_list=lambda: self._run_remote_ui_route(self._remote_api_common_commands_list_ui),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,

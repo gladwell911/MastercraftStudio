@@ -112,6 +112,30 @@ def test_routes_model_list_command():
     }
 
 
+def test_routes_common_commands_list_command():
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_common_commands_list=lambda: (
+            200,
+            {
+                "accepted": True,
+                "revision": 3,
+                "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+            },
+        ),
+    )
+
+    status, body = transport._route_command({"type": "common_commands_list"})
+
+    assert status == 200
+    assert body == {
+        "accepted": True,
+        "revision": 3,
+        "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+    }
+
+
 def test_routes_speed_options_and_set_speed_commands():
     routed = []
     transport = RemoteNatsTransport(
@@ -211,6 +235,34 @@ def test_transport_routes_notes_changes_command_and_publishes_response():
         _, raw = jetstream.published[0]
         assert b'"request_id":"notes-1"' in raw
         assert b'"last_seq":"7"' in raw
+
+    asyncio.run(run())
+
+
+def test_transport_routes_common_commands_list_and_publishes_response():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(
+            pair_id="default",
+            token="secret",
+            jetstream=jetstream,
+            on_common_commands_list=lambda: (
+                200,
+                {
+                    "accepted": True,
+                    "revision": 7,
+                    "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+                },
+            ),
+        )
+
+        await transport.handle_command({"id": "common-1", "type": "common_commands_list"})
+
+        assert len(jetstream.published) == 1
+        _, raw = jetstream.published[0]
+        assert b'"request_id":"common-1"' in raw
+        assert b'"revision":7' in raw
+        assert b'"commands":[{"id":"cmd-1"' in raw
 
     asyncio.run(run())
 
