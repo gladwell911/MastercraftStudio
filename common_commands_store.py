@@ -55,17 +55,20 @@ class DesktopCommonCommandsStore:
 
     def create_command(self, data: CommonCommandCreate) -> CommonCommand:
         snapshot = self.read_snapshot()
-        for command in snapshot.commands:
-            if command.device_id == data.device_id and command.request_id == data.request_id:
-                return command
+        device_id = str(data.device_id or "")
+        request_id = str(data.request_id or "")
+        if device_id and request_id:
+            for command in snapshot.commands:
+                if command.device_id == device_id and command.request_id == request_id:
+                    return command
         next_revision = snapshot.revision + 1
         content = str(data.content or "")
         created = CommonCommand(
             id=uuid.uuid4().hex,
             title=str(data.title or content),
             content=content,
-            device_id=str(data.device_id or ""),
-            request_id=str(data.request_id or ""),
+            device_id=device_id,
+            request_id=request_id,
             pinned=bool(data.pinned),
             sort_order=self._next_sort_order(snapshot.commands, pinned=bool(data.pinned)),
             version=1,

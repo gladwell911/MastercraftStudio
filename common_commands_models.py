@@ -58,8 +58,8 @@ class CommonCommand:
 
 @dataclass(slots=True, frozen=True)
 class CommonCommandCreate:
-    device_id: str
-    request_id: str
+    device_id: str = ""
+    request_id: str = ""
     title: str = ""
     content: str = ""
     pinned: bool = False

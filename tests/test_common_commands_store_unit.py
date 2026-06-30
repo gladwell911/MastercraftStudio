@@ -109,6 +109,30 @@ def test_create_is_idempotent_per_device_request_id(tmp_path):
     assert snapshot.revision == 1
 
 
+def test_create_without_request_provenance_allows_multiple_commands(tmp_path):
+    store = DesktopCommonCommandsStore(tmp_path / "common_commands.json")
+    store.initialize()
+
+    first = store.create_command(
+        CommonCommandCreate(
+            title="First",
+            content="first",
+        )
+    )
+    second = store.create_command(
+        CommonCommandCreate(
+            title="Second",
+            content="second",
+        )
+    )
+
+    snapshot = store.read_snapshot()
+
+    assert first.id != second.id
+    assert [item.content for item in snapshot.commands] == ["first", "second"]
+    assert snapshot.revision == 2
+
+
 def test_restart_read_round_trip(tmp_path):
     path = tmp_path / "common_commands.json"
     store = DesktopCommonCommandsStore(path)
