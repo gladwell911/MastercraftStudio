@@ -702,6 +702,51 @@ def test_remote_common_commands_delete_returns_snapshot_body(frame):
     assert body == {"accepted": True, "revision": 2, "commands": []}
 
 
+def test_remote_common_commands_pin_returns_snapshot_body(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_pin_ui(
+        {
+            "id": created.id,
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["revision"] == 2
+    assert body["commands"][0]["pinned"] is True
+
+
+def test_remote_common_commands_move_up_returns_section_local_snapshot(frame):
+    first = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    second = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+    third = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Third", content="echo third")
+    )
+    frame.common_commands_store.pin_command(third.id, expected_version=third.version)
+
+    status, body = frame._remote_api_common_commands_move_up_ui(
+        {
+            "id": second.id,
+            "observed_revision": 4,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert [item["title"] for item in body["commands"]] == ["Third", "Second", "First"]
+    assert [item["pinned"] for item in body["commands"]] == [True, False, False]
+
+
 def test_remote_common_commands_create_read_error_is_deterministic(frame, monkeypatch):
     monkeypatch.setattr(
         frame.common_commands_store,

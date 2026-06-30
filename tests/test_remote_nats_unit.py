@@ -164,6 +164,22 @@ def test_routes_common_commands_mutation_commands():
                 "commands": [],
             },
         ),
+        on_common_commands_pin=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 4,
+                "commands": [{"id": payload["id"], "title": "Run Tests", "content": "pytest -q", "pinned": True}],
+            },
+        ),
+        on_common_commands_move_up=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 5,
+                "commands": [{"id": payload["id"], "title": "Run Tests", "content": "pytest -q"}],
+            },
+        ),
     )
 
     create_status, create_body = transport._route_command(
@@ -175,6 +191,12 @@ def test_routes_common_commands_mutation_commands():
     delete_status, delete_body = transport._route_command(
         {"type": "common_commands_delete", "id": "cmd-1"}
     )
+    pin_status, pin_body = transport._route_command(
+        {"type": "common_commands_pin", "id": "cmd-1"}
+    )
+    move_status, move_body = transport._route_command(
+        {"type": "common_commands_move_up", "id": "cmd-1"}
+    )
 
     assert create_status == 200
     assert create_body["commands"][0]["title"] == "List Files"
@@ -182,6 +204,10 @@ def test_routes_common_commands_mutation_commands():
     assert update_body["commands"][0]["title"] == "Run Tests"
     assert delete_status == 200
     assert delete_body == {"accepted": True, "revision": 3, "commands": []}
+    assert pin_status == 200
+    assert pin_body["commands"][0]["pinned"] is True
+    assert move_status == 200
+    assert move_body["commands"][0]["title"] == "Run Tests"
 
 
 def test_routes_speed_options_and_set_speed_commands():

@@ -145,6 +145,18 @@ class DesktopCommonCommandsStore:
         )
         return deleted_command
 
+    def pin_command(self, command_id: str, *, expected_version: int) -> CommonCommand:
+        return self._set_pinned(command_id, expected_version=expected_version, pinned=True)
+
+    def unpin_command(self, command_id: str, *, expected_version: int) -> CommonCommand:
+        return self._set_pinned(command_id, expected_version=expected_version, pinned=False)
+
+    def move_up(self, command_id: str, *, expected_version: int) -> CommonCommand:
+        return self._move(command_id, expected_version=expected_version, direction=-1)
+
+    def move_down(self, command_id: str, *, expected_version: int) -> CommonCommand:
+        return self._move(command_id, expected_version=expected_version, direction=1)
+
     def _write_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self._temp_path()
@@ -170,3 +182,90 @@ class DesktopCommonCommandsStore:
         if not sort_orders:
             return 0
         return max(sort_orders) + 1
+
+    def _set_pinned(self, command_id: str, *, expected_version: int, pinned: bool) -> CommonCommand:
+        snapshot = self.read_snapshot()
+        next_revision = snapshot.revision + 1
+        updated_commands: list[CommonCommand] = []
+        updated_command: CommonCommand | None = None
+        normalized_id = str(command_id or "")
+        target_sort_order = self._next_sort_order(snapshot.commands, pinned=pinned)
+        for command in snapshot.commands:
+            if command.id != normalized_id:
+                updated_commands.append(command)
+                continue
+            if command.version != int(expected_version):
+                raise CommonCommandsVersionConflictError(
+                    expected_version=int(expected_version),
+                    current_version=command.version,
+                )
+            if command.pinned == pinned:
+                return command
+            updated_command = replace(
+                command,
+                pinned=pinned,
+                sort_order=target_sort_order,
+                version=command.version + 1,
+                revision=next_revision,
+            )
+            updated_commands.append(updated_command)
+        if updated_command is None:
+            raise KeyError(normalized_id)
+        self._write_snapshot(
+            CommonCommandsSnapshot(
+                revision=next_revision,
+                commands=self._sorted_commands(updated_commands),
+            )
+        )
+        return updated_command
+
+    def _move(self, command_id: str, *, expected_version: int, direction: int) -> CommonCommand:
+        snapshot = self.read_snapshot()
+        commands = list(snapshot.commands)
+        normalized_id = str(command_id or "")
+        current_command = next((item for item in commands if item.id == normalized_id), None)
+        if current_command is None:
+            raise KeyError(normalized_id)
+        if current_command.version != int(expected_version):
+            raise CommonCommandsVersionConflictError(
+                expected_version=int(expected_version),
+                current_version=current_command.version,
+            )
+        section_commands = [item for item in commands if item.pinned == current_command.pinned]
+        section_index = next((idx for idx, item in enumerate(section_commands) if item.id == normalized_id), -1)
+        if section_index < 0:
+            raise KeyError(normalized_id)
+        neighbor_index = section_index + direction
+        if neighbor_index < 0 or neighbor_index >= len(section_commands):
+            return current_command
+        neighbor = section_commands[neighbor_index]
+        next_revision = snapshot.revision + 1
+        updated_commands: list[CommonCommand] = []
+        for command in commands:
+            if command.id == current_command.id:
+                updated_commands.append(
+                    replace(
+                        command,
+                        sort_order=neighbor.sort_order,
+                        version=command.version + 1,
+                        revision=next_revision,
+                    )
+                )
+                continue
+            if command.id == neighbor.id:
+                updated_commands.append(
+                    replace(
+                        command,
+                        sort_order=current_command.sort_order,
+                    )
+                )
+                continue
+            updated_commands.append(command)
+        moved_command = next(item for item in updated_commands if item.id == current_command.id)
+        self._write_snapshot(
+            CommonCommandsSnapshot(
+                revision=next_revision,
+                commands=self._sorted_commands(updated_commands),
+            )
+        )
+        return moved_command

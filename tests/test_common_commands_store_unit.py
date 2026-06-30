@@ -233,3 +233,49 @@ def test_delete_command_rejects_stale_version(tmp_path):
     assert updated.version == 2
     assert exc_info.value.current_version == 2
     assert exc_info.value.expected_version == 1
+
+
+def test_pin_command_moves_item_to_pinned_tail(tmp_path):
+    store = DesktopCommonCommandsStore(tmp_path / "common_commands.json")
+    store.initialize()
+    first = store.create_command(CommonCommandCreate(title="First", content="first"))
+    second = store.create_command(CommonCommandCreate(title="Second", content="second"))
+
+    pinned = store.pin_command(second.id, expected_version=second.version)
+    snapshot = store.read_snapshot()
+
+    assert pinned.pinned is True
+    assert pinned.sort_order == 0
+    assert pinned.version == 2
+    assert snapshot.revision == 3
+    assert [item.title for item in snapshot.commands] == ["Second", "First"]
+
+    unpinned = store.unpin_command(second.id, expected_version=pinned.version)
+    snapshot = store.read_snapshot()
+
+    assert unpinned.pinned is False
+    assert unpinned.sort_order == 1
+    assert [item.title for item in snapshot.commands] == ["First", "Second"]
+
+
+def test_move_up_and_down_only_reorders_inside_same_section(tmp_path):
+    store = DesktopCommonCommandsStore(tmp_path / "common_commands.json")
+    store.initialize()
+    alpha = store.create_command(CommonCommandCreate(title="Alpha", content="alpha"))
+    beta = store.create_command(CommonCommandCreate(title="Beta", content="beta"))
+    gamma = store.create_command(CommonCommandCreate(title="Gamma", content="gamma"))
+    pinned_gamma = store.pin_command(gamma.id, expected_version=gamma.version)
+
+    moved_beta = store.move_up(beta.id, expected_version=beta.version)
+    snapshot = store.read_snapshot()
+
+    assert moved_beta.version == 2
+    assert [item.title for item in snapshot.commands] == ["Gamma", "Beta", "Alpha"]
+
+    moved_gamma = store.move_down(pinned_gamma.id, expected_version=pinned_gamma.version)
+    snapshot = store.read_snapshot()
+
+    assert moved_gamma.id == pinned_gamma.id
+    assert moved_gamma.version == pinned_gamma.version
+    assert snapshot.revision == 5
+    assert [item.title for item in snapshot.commands] == ["Gamma", "Beta", "Alpha"]
