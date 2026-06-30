@@ -16220,6 +16220,20 @@ def test_alt_m_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
     assert calls == ["open"]
 
 
+def test_common_command_send_returns_false_and_preserves_input_when_send_disabled(frame):
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Send", content="echo send")
+    )
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(0)
+    frame.input_edit.SetValue("keep me")
+    frame.send_button.Enable(False)
+
+    assert frame._send_selected_common_command() is False
+    assert frame.input_edit.GetValue() == "keep me"
+
+
 def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):
     focused = []
     monkeypatch.setattr(frame.notes_notebook_list, "SetFocus", lambda: focused.append("notes_notebook_list"))

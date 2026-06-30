@@ -1819,6 +1819,11 @@ class ChatFrame(wx.Frame):
         command = self._selected_common_command()
         if command is None:
             return False
+        try:
+            if not self.send_button.IsEnabled():
+                return False
+        except Exception:
+            return False
         self.input_edit.SetValue(str(getattr(command, "content", "") or ""))
         self._trigger_send()
         return True

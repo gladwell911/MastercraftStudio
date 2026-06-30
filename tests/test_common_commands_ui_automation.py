@@ -13,11 +13,14 @@ def _activate_frame(frame, wx_app):
 
 
 class _EnterEvent:
+    def __init__(self):
+        self.skipped = 0
+
     def GetKeyCode(self):
         return main.wx.WXK_RETURN
 
     def Skip(self):
-        raise AssertionError("Enter should be handled")
+        self.skipped += 1
 
 
 class _MenuEvent:
@@ -68,10 +71,45 @@ def test_ui_automation_enter_on_selected_command_sends_selected_content(frame, w
     sent = []
     monkeypatch.setattr(frame, "_trigger_send", lambda: sent.append(frame.input_edit.GetValue()))
 
-    frame._on_common_commands_key_down(_EnterEvent())
+    event = _EnterEvent()
+    frame._on_common_commands_key_down(event)
     wx_app.Yield()
 
     assert sent == ["echo send me"]
+    assert event.skipped == 0
+
+
+def test_ui_automation_common_command_send_failure_does_not_overwrite_input(frame, wx_app):
+    _activate_frame(frame, wx_app)
+    _seed_command(frame, title="Send", content="echo send me")
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(0)
+    dialog.common_commands_list.SetFocus()
+    frame.input_edit.SetValue("keep me")
+    frame.send_button.Enable(False)
+
+    assert frame._send_selected_common_command() is False
+
+    assert frame.input_edit.GetValue() == "keep me"
+
+
+def test_ui_automation_common_command_enter_skips_when_send_cannot_run(frame, wx_app):
+    _activate_frame(frame, wx_app)
+    _seed_command(frame, title="Send", content="echo send me")
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(0)
+    dialog.common_commands_list.SetFocus()
+    frame.input_edit.SetValue("keep me")
+    frame.send_button.Enable(False)
+    event = _EnterEvent()
+
+    frame._on_common_commands_key_down(event)
+    wx_app.Yield()
+
+    assert event.skipped == 1
+    assert frame.input_edit.GetValue() == "keep me"
 
 
 def test_ui_automation_menu_key_opens_command_menu_without_disturbing_selection(frame, wx_app, monkeypatch):
