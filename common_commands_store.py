@@ -13,6 +13,13 @@ from common_commands_models import (
 )
 
 
+class CommonCommandsReadError(RuntimeError):
+    def __init__(self, path: Path, message: str, *, cause: Exception | None = None) -> None:
+        super().__init__(f"{message}: {path}")
+        self.path = Path(path)
+        self.cause = cause
+
+
 class CommonCommandsVersionConflictError(RuntimeError):
     def __init__(self, *, expected_version: int, current_version: int) -> None:
         super().__init__(f"stale common command version: expected {expected_version}, current {current_version}")
@@ -32,10 +39,19 @@ class DesktopCommonCommandsStore:
     def read_snapshot(self) -> CommonCommandsSnapshot:
         self.initialize()
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {}
-        return CommonCommandsSnapshot.from_dict(payload)
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CommonCommandsReadError(self.path, "failed to read common commands store", cause=exc) from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CommonCommandsReadError(self.path, "failed to parse common commands store", cause=exc) from exc
+        if not isinstance(payload, dict):
+            raise CommonCommandsReadError(self.path, "common commands store root must be an object")
+        try:
+            return CommonCommandsSnapshot.from_dict(payload)
+        except Exception as exc:
+            raise CommonCommandsReadError(self.path, "common commands store has invalid shape", cause=exc) from exc
 
     def create_command(self, data: CommonCommandCreate) -> CommonCommand:
         snapshot = self.read_snapshot()
@@ -43,11 +59,13 @@ class DesktopCommonCommandsStore:
             if command.device_id == data.device_id and command.request_id == data.request_id:
                 return command
         next_revision = snapshot.revision + 1
+        content = str(data.content or "")
         created = CommonCommand(
             id=uuid.uuid4().hex,
+            title=str(data.title or content),
+            content=content,
             device_id=str(data.device_id or ""),
             request_id=str(data.request_id or ""),
-            command_text=str(data.command_text or ""),
             pinned=bool(data.pinned),
             sort_order=self._next_sort_order(snapshot.commands, pinned=bool(data.pinned)),
             version=1,
@@ -78,9 +96,11 @@ class DesktopCommonCommandsStore:
                     expected_version=int(data.expected_version),
                     current_version=command.version,
                 )
+            next_content = command.content if data.content is None else str(data.content)
             updated_command = replace(
                 command,
-                command_text=command.command_text if data.command_text is None else str(data.command_text),
+                title=command.title if data.title is None else str(data.title),
+                content=next_content,
                 pinned=command.pinned if data.pinned is None else bool(data.pinned),
                 version=command.version + 1,
                 revision=next_revision,
@@ -97,10 +117,21 @@ class DesktopCommonCommandsStore:
         return updated_command
 
     def _write_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
-        self.path.write_text(
-            json.dumps(snapshot.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._temp_path()
+        payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, indent=2)
+        try:
+            temp_path.write_text(payload, encoding="utf-8")
+            self._replace_file(temp_path, self.path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+    def _replace_file(self, source: Path, target: Path) -> None:
+        source.replace(target)
+
+    def _temp_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
 
     def _sorted_commands(self, commands: list[CommonCommand]) -> list[CommonCommand]:
         return sorted(commands, key=lambda item: (0 if item.pinned else 1, item.sort_order, item.id))
