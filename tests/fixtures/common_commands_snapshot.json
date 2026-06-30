@@ -1,0 +1,28 @@
+{
+  "accepted": true,
+  "revision": 7,
+  "commands": [
+    {
+      "id": "cmd-1",
+      "title": "List Files",
+      "content": "dir",
+      "device_id": "desktop-a",
+      "request_id": "req-1",
+      "pinned": false,
+      "sort_order": 0,
+      "version": 2,
+      "revision": 6
+    },
+    {
+      "id": "cmd-2",
+      "title": "Run Tests",
+      "content": "pytest -q",
+      "device_id": "",
+      "request_id": "",
+      "pinned": false,
+      "sort_order": 1,
+      "version": 1,
+      "revision": 7
+    }
+  ]
+}

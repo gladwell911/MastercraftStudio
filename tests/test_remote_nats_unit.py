@@ -112,6 +112,104 @@ def test_routes_model_list_command():
     }
 
 
+def test_routes_common_commands_list_command():
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_common_commands_list=lambda: (
+            200,
+            {
+                "accepted": True,
+                "revision": 3,
+                "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+            },
+        ),
+    )
+
+    status, body = transport._route_command({"type": "common_commands_list"})
+
+    assert status == 200
+    assert body == {
+        "accepted": True,
+        "revision": 3,
+        "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+    }
+
+
+def test_routes_common_commands_mutation_commands():
+    transport = RemoteNatsTransport(
+        pair_id="default",
+        token="token",
+        on_common_commands_create=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 1,
+                "commands": [{"id": "cmd-1", "title": payload["title"], "content": payload["content"]}],
+            },
+        ),
+        on_common_commands_update=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 2,
+                "commands": [{"id": payload["id"], "title": payload["title"], "content": payload["content"]}],
+            },
+        ),
+        on_common_commands_delete=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 3,
+                "commands": [],
+            },
+        ),
+        on_common_commands_pin=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 4,
+                "commands": [{"id": payload["id"], "title": "Run Tests", "content": "pytest -q", "pinned": True}],
+            },
+        ),
+        on_common_commands_move_up=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 5,
+                "commands": [{"id": payload["id"], "title": "Run Tests", "content": "pytest -q"}],
+            },
+        ),
+    )
+
+    create_status, create_body = transport._route_command(
+        {"type": "common_commands_create", "title": "List Files", "content": "dir"}
+    )
+    update_status, update_body = transport._route_command(
+        {"type": "common_commands_update", "id": "cmd-1", "title": "Run Tests", "content": "pytest -q"}
+    )
+    delete_status, delete_body = transport._route_command(
+        {"type": "common_commands_delete", "id": "cmd-1"}
+    )
+    pin_status, pin_body = transport._route_command(
+        {"type": "common_commands_pin", "id": "cmd-1"}
+    )
+    move_status, move_body = transport._route_command(
+        {"type": "common_commands_move_up", "id": "cmd-1"}
+    )
+
+    assert create_status == 200
+    assert create_body["commands"][0]["title"] == "List Files"
+    assert update_status == 200
+    assert update_body["commands"][0]["title"] == "Run Tests"
+    assert delete_status == 200
+    assert delete_body == {"accepted": True, "revision": 3, "commands": []}
+    assert pin_status == 200
+    assert pin_body["commands"][0]["pinned"] is True
+    assert move_status == 200
+    assert move_body["commands"][0]["title"] == "Run Tests"
+
+
 def test_routes_speed_options_and_set_speed_commands():
     routed = []
     transport = RemoteNatsTransport(
@@ -211,6 +309,69 @@ def test_transport_routes_notes_changes_command_and_publishes_response():
         _, raw = jetstream.published[0]
         assert b'"request_id":"notes-1"' in raw
         assert b'"last_seq":"7"' in raw
+
+    asyncio.run(run())
+
+
+def test_transport_routes_common_commands_list_and_publishes_response():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(
+            pair_id="default",
+            token="secret",
+            jetstream=jetstream,
+            on_common_commands_list=lambda: (
+                200,
+                {
+                    "accepted": True,
+                    "revision": 7,
+                    "commands": [{"id": "cmd-1", "title": "List Files", "content": "dir"}],
+                },
+            ),
+        )
+
+        await transport.handle_command({"id": "common-1", "type": "common_commands_list"})
+
+        assert len(jetstream.published) == 1
+        _, raw = jetstream.published[0]
+        assert b'"request_id":"common-1"' in raw
+        assert b'"revision":7' in raw
+        assert b'"commands":[{"id":"cmd-1"' in raw
+
+    asyncio.run(run())
+
+
+def test_transport_routes_common_commands_update_and_publishes_stale_response():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(
+            pair_id="default",
+            token="secret",
+            jetstream=jetstream,
+            on_common_commands_update=lambda payload: (
+                409,
+                {
+                    "accepted": False,
+                    "error": "stale_state",
+                    "current_revision": 2,
+                    "observed_revision": payload.get("observed_revision"),
+                },
+            ),
+        )
+
+        await transport.handle_command(
+            {
+                "id": "common-update-1",
+                "type": "common_commands_update",
+                "observed_revision": 1,
+            }
+        )
+
+        assert len(jetstream.published) == 1
+        _, raw = jetstream.published[0]
+        assert b'"request_id":"common-update-1"' in raw
+        assert b'"status":409' in raw
+        assert b'"error":"stale_state"' in raw
 
     asyncio.run(run())
 

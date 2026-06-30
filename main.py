@@ -29,6 +29,12 @@ import wx
 import wx.adv
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from common_commands_models import CommonCommandCreate, CommonCommandUpdate, CommonCommandsSnapshot
+from common_commands_store import (
+    CommonCommandsReadError,
+    CommonCommandsVersionConflictError,
+    DesktopCommonCommandsStore,
+)
 from chat_store import ChatStore
 from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -1077,6 +1083,113 @@ class CloudflaredOriginProxy:
                 return web.Response(status=response.status, body=response_body, headers=response_headers)
 
 
+class CommonCommandEditDialog(wx.Dialog):
+    def __init__(self, parent, *, dialog_title: str, initial_title: str = "", initial_content: str = ""):
+        super().__init__(parent, title=dialog_title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(panel, label="标题："), 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        self.title_edit = wx.TextCtrl(panel, value=str(initial_title or ""))
+        self.title_edit.SetName("常用命令标题")
+        root.Add(self.title_edit, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(wx.StaticText(panel, label="内容："), 0, wx.LEFT | wx.RIGHT, 10)
+        self.content_edit = wx.TextCtrl(panel, value=str(initial_content or ""), style=wx.TE_MULTILINE)
+        self.content_edit.SetName("常用命令内容")
+        root.Add(self.content_edit, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        buttons = self.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        if buttons is not None:
+            ok_button = self.FindWindowById(wx.ID_OK)
+            if ok_button is not None:
+                ok_button.SetLabel("保存")
+            root.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
+        panel.SetSizer(root)
+        self.SetMinSize((420, 320))
+        self.SetSize((520, 420))
+        self.Bind(wx.EVT_BUTTON, self._on_save, id=wx.ID_OK)
+
+    def _on_save(self, event) -> None:
+        if not str(self.content_edit.GetValue() or "").strip():
+            wx.MessageBox("请输入命令内容。", "提示", wx.OK | wx.ICON_WARNING)
+            self.content_edit.SetFocus()
+            return
+        event.Skip()
+
+    def values(self) -> tuple[str, str]:
+        return (
+            str(self.title_edit.GetValue() or "").strip(),
+            str(self.content_edit.GetValue() or "").strip(),
+        )
+
+
+class CommonCommandsDialog(wx.Dialog):
+    def __init__(self, owner: "ChatFrame"):
+        super().__init__(owner, title="常用命令", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.owner = owner
+        self.common_commands_list_ids: list[str] = []
+        self.common_commands_by_id: dict[str, object] = {}
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(panel, label="常用命令："), 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        self.common_commands_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.common_commands_list.SetName("常用命令")
+        root.Add(self.common_commands_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        button_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.common_commands_add_button = wx.Button(panel, label="添加(&A)")
+        self.common_commands_add_button.SetName("添加常用命令")
+        button_row.Add(self.common_commands_add_button, 0)
+        root.Add(button_row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        panel.SetSizer(root)
+        self.common_commands_list_model = IncrementalListBoxModel(self.common_commands_list)
+        self.SetMinSize((320, 280))
+        self.SetSize((420, 420))
+        self.common_commands_add_button.Bind(wx.EVT_BUTTON, lambda _evt: self.owner._add_common_command())
+        self.common_commands_list.Bind(wx.EVT_KEY_DOWN, self.owner._monitored_ui_handler("common_commands_key_down", self.owner._on_common_commands_key_down))
+        self.common_commands_list.Bind(wx.EVT_CONTEXT_MENU, self.owner._on_common_commands_context)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def _on_close(self, _event) -> None:
+        self.owner.common_commands_dialog = None
+        self.Destroy()
+
+    def selected_command_id(self) -> str:
+        model = getattr(self, "common_commands_list_model", None)
+        if model is None:
+            return ""
+        return str(model.selected_id() or "")
+
+    def selected_command(self):
+        command_id = self.selected_command_id()
+        if not command_id:
+            return None
+        return self.common_commands_by_id.get(command_id)
+
+    def refresh_commands(self, select_id: str | None = None) -> bool:
+        snapshot = self.owner.common_commands_store.read_snapshot()
+        commands = list(snapshot.commands)
+        previous_selection = self.common_commands_list.GetSelection()
+        self.common_commands_by_id = {command.id: command for command in commands}
+        self.common_commands_list_ids = [command.id for command in commands]
+        if not commands:
+            self.common_commands_list_model.replace_visible_page([])
+            return self.owner._replace_listbox_items_if_changed(self.common_commands_list, ["暂无常用命令"], None)
+        target_id = str(select_id or self.selected_command_id() or "")
+        if target_id not in self.common_commands_by_id:
+            fallback_index = min(
+                max(previous_selection, 0),
+                len(commands) - 1,
+            )
+            target_id = commands[fallback_index].id
+        rows = [(command.id, self.owner._common_command_label(command)) for command in commands]
+        changed = self.common_commands_list_model.replace_visible_page(rows, target_id)
+        self.common_commands_list_ids = list(self.common_commands_list_model.visible_ids)
+        return changed
+
+    def focus_default_control(self) -> bool:
+        if self.common_commands_list_ids:
+            return self.owner._focus_control_safely(self.common_commands_list)
+        return self.owner._focus_control_safely(self.common_commands_add_button)
+
+
 class ChatFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_WINDOW_TITLE, size=(1200, 800))
@@ -1100,6 +1213,8 @@ class ChatFrame(wx.Frame):
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
+        self.common_commands_store = DesktopCommonCommandsStore(self.app_data_dir / "common_commands.json")
+        self.common_commands_store.initialize()
         self.chat_db_path = self.app_data_dir / "chat_history.db"
         self.chat_store = ChatStore(self.chat_db_path)
         self.chat_store.initialize()
@@ -1193,6 +1308,7 @@ class ChatFrame(wx.Frame):
         self._context_usage_estimate_keys: set[tuple[str, int]] = set()
         self._alt_menu_armed = False
         self._alt_menu_suppressed = False
+        self.common_commands_dialog = None
         self.active_project_folder = ""
         self.view_mode = "active"
         self.view_history_id = None
@@ -1262,6 +1378,7 @@ class ChatFrame(wx.Frame):
         self._chat_navigation_left_id = wx.NewIdRef()
         self._chat_navigation_right_id = wx.NewIdRef()
         self._clear_context_id = wx.NewIdRef()
+        self._common_commands_menu_id = wx.NewIdRef()
         self._file_manager_menu_id = wx.NewIdRef()
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
@@ -1322,6 +1439,7 @@ class ChatFrame(wx.Frame):
     def _build_ui(self):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
+        app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+M")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -1517,6 +1635,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_common_commands_surface(), id=int(self._common_commands_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_file_manager(), id=int(self._file_manager_menu_id))
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
@@ -1531,6 +1650,7 @@ class ChatFrame(wx.Frame):
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_LEFT, int(self._chat_navigation_left_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_RIGHT, int(self._chat_navigation_right_id)),
                     wx.AcceleratorEntry(wx.ACCEL_ALT, ord("A"), int(self._clear_context_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_ALT, ord("M"), int(self._common_commands_menu_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._notes_move_entry_up_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._notes_move_entry_down_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_HOME, int(self._notes_move_entry_top_id)),
@@ -1563,6 +1683,265 @@ class ChatFrame(wx.Frame):
         self._refresh_file_manager_list()
         self.chat_root_panel.Layout()
         self.file_manager_list.SetFocus()
+
+    def _common_command_label(self, command) -> str:
+        title = str(getattr(command, "title", "") or "").strip()
+        if title:
+            return title
+        content = str(getattr(command, "content", "") or "").strip()
+        return content or "未命名命令"
+
+    def _get_common_commands_dialog(self) -> CommonCommandsDialog:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is not None:
+            try:
+                if dialog.IsBeingDeleted():
+                    dialog = None
+            except Exception:
+                dialog = None
+        if dialog is None:
+            dialog = CommonCommandsDialog(self)
+            self.common_commands_dialog = dialog
+        return dialog
+
+    def _show_common_commands_surface(self) -> bool:
+        try:
+            dialog = self._get_common_commands_dialog()
+            dialog.refresh_commands()
+        except CommonCommandsReadError as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        dialog.Show()
+        dialog.Raise()
+        dialog.focus_default_control()
+        return True
+
+    def _selected_common_command(self):
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return None
+        return dialog.selected_command()
+
+    def _selected_common_command_id(self) -> str:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return ""
+        return dialog.selected_command_id()
+
+    def _restore_common_commands_focus(self, select_id: str | None = None) -> None:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return
+        dialog.refresh_commands(select_id)
+        if select_id and dialog.common_commands_list_ids:
+            dialog.common_commands_list_model.set_selection_by_id(select_id)
+            self._focus_control_safely(dialog.common_commands_list)
+            return
+        dialog.focus_default_control()
+
+    def _write_common_commands_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
+        self.common_commands_store._write_snapshot(snapshot)
+
+    def _add_common_command(self) -> bool:
+        dlg = CommonCommandEditDialog(self, dialog_title="添加常用命令")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title, content = dlg.values()
+        finally:
+            dlg.Destroy()
+        try:
+            command = self.common_commands_store.create_command(CommonCommandCreate(title=title, content=content))
+        except CommonCommandsReadError as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        self._restore_common_commands_focus(command.id)
+        self.SetStatusText("常用命令已保存")
+        return True
+
+    def _edit_selected_common_command(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        dlg = CommonCommandEditDialog(
+            self,
+            dialog_title="编辑常用命令",
+            initial_title=str(getattr(command, "title", "") or ""),
+            initial_content=str(getattr(command, "content", "") or ""),
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            title, content = dlg.values()
+        finally:
+            dlg.Destroy()
+        try:
+            updated = self.common_commands_store.update_command(
+                command.id,
+                CommonCommandUpdate(
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                    title=title,
+                    content=content,
+                ),
+            )
+        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        self._restore_common_commands_focus(updated.id)
+        self.SetStatusText("常用命令已保存")
+        return True
+
+    def _delete_selected_common_command(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        if not self._confirm("确定删除该常用命令吗？"):
+            return False
+        try:
+            self.common_commands_store.delete_command(
+                command.id,
+                expected_version=int(getattr(command, "version", 0) or 0),
+            )
+            snapshot = self.common_commands_store.read_snapshot()
+        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        remaining = list(snapshot.commands)
+        next_id = ""
+        if remaining:
+            next_id = next(
+                (
+                    item.id
+                    for item in remaining
+                    if (0 if item.pinned else 1, item.sort_order, item.id)
+                    >= (0 if command.pinned else 1, command.sort_order, command.id)
+                ),
+                remaining[-1].id,
+            )
+        self._restore_common_commands_focus(next_id or None)
+        self.SetStatusText("常用命令已删除")
+        return True
+
+    def _toggle_selected_common_command_pin(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        try:
+            if bool(getattr(command, "pinned", False)):
+                updated = self.common_commands_store.unpin_command(
+                    command.id,
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                )
+                status = "常用命令已取消置顶"
+            else:
+                updated = self.common_commands_store.pin_command(
+                    command.id,
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                )
+                status = "常用命令已置顶"
+        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        self._restore_common_commands_focus(updated.id)
+        self.SetStatusText(status)
+        return True
+
+    def _move_selected_common_command(self, direction: int) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        try:
+            if direction < 0:
+                updated = self.common_commands_store.move_up(
+                    command.id,
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                )
+            else:
+                updated = self.common_commands_store.move_down(
+                    command.id,
+                    expected_version=int(getattr(command, "version", 0) or 0),
+                )
+        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
+            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        if updated.id != command.id or int(getattr(updated, "version", 0) or 0) != int(getattr(command, "version", 0) or 0):
+            self._restore_common_commands_focus(updated.id)
+            self.SetStatusText("常用命令顺序已更新")
+            return True
+        return False
+
+    def _move_selected_common_command_up(self) -> bool:
+        return self._move_selected_common_command(-1)
+
+    def _move_selected_common_command_down(self) -> bool:
+        return self._move_selected_common_command(1)
+
+    def _send_selected_common_command(self) -> bool:
+        command = self._selected_common_command()
+        if command is None:
+            return False
+        try:
+            if not self.send_button.IsEnabled():
+                return False
+        except Exception:
+            return False
+        self.input_edit.SetValue(str(getattr(command, "content", "") or ""))
+        self._trigger_send()
+        return True
+
+    def _show_common_commands_menu(self) -> bool:
+        dialog = getattr(self, "common_commands_dialog", None)
+        if dialog is None:
+            return False
+        menu = wx.Menu()
+        add_id = wx.NewIdRef()
+        menu.Append(add_id, "添加")
+        self.Bind(wx.EVT_MENU, lambda _evt: self._add_common_command(), id=add_id)
+        if dialog.selected_command() is not None:
+            edit_id = wx.NewIdRef()
+            delete_id = wx.NewIdRef()
+            pin_id = wx.NewIdRef()
+            move_up_id = wx.NewIdRef()
+            move_down_id = wx.NewIdRef()
+            menu.Append(edit_id, "编辑")
+            menu.Append(delete_id, "删除")
+            menu.Append(pin_id, "取消置顶" if bool(getattr(dialog.selected_command(), "pinned", False)) else "置顶")
+            menu.Append(move_up_id, "向上移动")
+            menu.Append(move_down_id, "向下移动")
+            self.Bind(wx.EVT_MENU, lambda _evt: self._edit_selected_common_command(), id=edit_id)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._delete_selected_common_command(), id=delete_id)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_selected_common_command_pin(), id=pin_id)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_up(), id=move_up_id)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_down(), id=move_down_id)
+        dialog.PopupMenu(menu)
+        menu.Destroy()
+        return True
+
+    def _on_common_commands_context(self, _event) -> None:
+        self._show_common_commands_menu()
+
+    def _on_common_commands_key_down(self, event) -> None:
+        if self._on_any_key_down_escape_minimize(event):
+            return
+        self._touch_navigation_quiet_window(event)
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self._send_selected_common_command():
+                return
+        if self._is_context_menu_key(key):
+            if self._show_common_commands_menu():
+                return
+        if key == wx.WXK_DELETE:
+            if self._delete_selected_common_command():
+                return
+        modifiers = event.GetModifiers() if hasattr(event, "GetModifiers") else 0
+        if modifiers == wx.MOD_ALT and key == wx.WXK_UP:
+            if self._move_selected_common_command_up():
+                return
+        if modifiers == wx.MOD_ALT and key == wx.WXK_DOWN:
+            if self._move_selected_common_command_down():
+                return
+        event.Skip()
 
     def _refresh_file_manager_list(self, selected_id: str | None = None) -> bool:
         if hasattr(self.file_library, "sync_storage_dir"):
@@ -7844,6 +8223,370 @@ class ChatFrame(wx.Frame):
             ],
         }
 
+    def _remote_common_commands_snapshot_payload(self, snapshot: CommonCommandsSnapshot) -> dict:
+        return {
+            "accepted": True,
+            "revision": int(getattr(snapshot, "revision", 0) or 0),
+            "commands": [dict(command.to_dict()) for command in list(getattr(snapshot, "commands", []) or [])],
+        }
+
+    def _remote_api_common_commands_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        try:
+            snapshot = self.common_commands_store.read_snapshot()
+        except CommonCommandsReadError:
+            return 500, {"accepted": False, "error": "common_commands_unavailable"}
+        return 200, self._remote_common_commands_snapshot_payload(snapshot)
+
+    def _remote_common_commands_unavailable(self) -> tuple[int, dict]:
+        return 500, {"accepted": False, "error": "common_commands_unavailable"}
+
+    def _remote_common_commands_stale_state(
+        self,
+        *,
+        current_revision: int,
+        observed_revision: int | None = None,
+        current_version: int | None = None,
+        observed_version: int | None = None,
+    ) -> tuple[int, dict]:
+        body = {
+            "accepted": False,
+            "error": "stale_state",
+            "current_revision": int(current_revision),
+        }
+        if observed_revision is not None:
+            body["observed_revision"] = int(observed_revision)
+        if current_version is not None:
+            body["current_version"] = int(current_version)
+        if observed_version is not None:
+            body["observed_version"] = int(observed_version)
+        return 409, body
+
+    def _remote_common_commands_optional_int(self, payload: dict, key: str) -> int | None:
+        value = payload.get(key)
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return int(value)
+
+    def _remote_api_common_commands_create_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        content = str(payload.get("content") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        if not content:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            device_id = str(payload.get("device_id") or "").strip()
+            request_id = str(payload.get("request_id") or "").strip()
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        existing_command = None
+        if device_id and request_id:
+            existing_command = next(
+                (
+                    command
+                    for command in snapshot.commands
+                    if command.device_id == device_id and command.request_id == request_id
+                ),
+                None,
+            )
+        if existing_command is not None:
+            return 200, {
+                **self._remote_common_commands_snapshot_payload(snapshot),
+                "result": "replayed",
+            }
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        try:
+            self.common_commands_store.create_command(
+                CommonCommandCreate(
+                    device_id=device_id,
+                    request_id=request_id,
+                    title=title,
+                    content=content,
+                )
+            )
+            snapshot = self.common_commands_store.read_snapshot()
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, {
+            **self._remote_common_commands_snapshot_payload(snapshot),
+            "result": "created",
+        }
+
+    def _remote_api_common_commands_update_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        title = payload.get("title")
+        content = payload.get("content")
+        if not command_id or (title is None and content is None):
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            self.common_commands_store.update_command(
+                command_id,
+                CommonCommandUpdate(
+                    expected_version=expected_version,
+                    title=None if title is None else str(title),
+                    content=None if content is None else str(content),
+                ),
+            )
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, self._remote_common_commands_snapshot_payload(updated_snapshot)
+
+    def _remote_api_common_commands_delete_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        if not command_id:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            self.common_commands_store.delete_command(
+                command_id,
+                expected_version=expected_version,
+            )
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, self._remote_common_commands_snapshot_payload(updated_snapshot)
+
+    def _remote_api_common_commands_pin_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        return self._remote_api_common_commands_pin_state_ui(payload, pinned=True)
+
+    def _remote_api_common_commands_unpin_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        return self._remote_api_common_commands_pin_state_ui(payload, pinned=False)
+
+    def _remote_api_common_commands_pin_state_ui(
+        self,
+        payload: dict | None,
+        *,
+        pinned: bool,
+    ) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        if not command_id:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            if pinned:
+                self.common_commands_store.pin_command(command_id, expected_version=expected_version)
+            else:
+                self.common_commands_store.unpin_command(command_id, expected_version=expected_version)
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, {
+            **self._remote_common_commands_snapshot_payload(updated_snapshot),
+            "result": "updated",
+        }
+
+    def _remote_api_common_commands_move_up_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        return self._remote_api_common_commands_move_ui(payload, direction="up")
+
+    def _remote_api_common_commands_move_down_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        return self._remote_api_common_commands_move_ui(payload, direction="down")
+
+    def _remote_api_common_commands_move_ui(
+        self,
+        payload: dict | None,
+        *,
+        direction: str,
+    ) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        if not command_id:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            if direction == "up":
+                self.common_commands_store.move_up(command_id, expected_version=expected_version)
+            else:
+                self.common_commands_store.move_down(command_id, expected_version=expected_version)
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, {
+            **self._remote_common_commands_snapshot_payload(updated_snapshot),
+            "result": "updated",
+        }
+
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
         cached = getattr(self, "_remote_history_list_cache", None)
         if isinstance(cached, dict):
@@ -9191,6 +9934,14 @@ class ChatFrame(wx.Frame):
                     on_set_speed=lambda payload: self._run_remote_ui_route(self._remote_api_set_speed_ui, payload),
                     on_clear_context=lambda payload: self._run_remote_ui_route(self._remote_api_clear_context_ui, payload),
                     on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
+                    on_common_commands_list=lambda: self._run_remote_ui_route(self._remote_api_common_commands_list_ui),
+                    on_common_commands_create=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_create_ui, payload),
+                    on_common_commands_update=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_update_ui, payload),
+                    on_common_commands_delete=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_delete_ui, payload),
+                    on_common_commands_pin=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_pin_ui, payload),
+                    on_common_commands_unpin=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_unpin_ui, payload),
+                    on_common_commands_move_up=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_up_ui, payload),
+                    on_common_commands_move_down=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_down_ui, payload),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,

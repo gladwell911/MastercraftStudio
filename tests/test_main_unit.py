@@ -19,6 +19,23 @@ def test_main_does_not_call_respond_tool_request_user_input_directly():
     assert "respond_tool_request_user_input" not in source
 
 
+def test_chat_frame_initializes_common_commands_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
+    monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    monkeypatch.setattr(main.ChatFrame, "_migrate_legacy_state_if_needed", lambda self: None)
+    monkeypatch.setattr(main.ChatFrame, "_merge_legacy_archived_chats", lambda self: None)
+
+    frame = main.ChatFrame()
+    frame.Hide()
+    try:
+        assert frame.common_commands_store is not None
+        assert frame.common_commands_store.path == tmp_path / "common_commands.json"
+        assert frame.common_commands_store.path.exists()
+    finally:
+        frame.Destroy()
+
+
 REQUEST_METADATA_FIELDS = {
     "request_status",
     "request_model",
@@ -413,6 +430,336 @@ def test_remote_model_list_returns_visible_combo_order(frame):
         {"id": model_id, "label": main.model_display_name(model_id)}
         for model_id in main.VISIBLE_MODEL_IDS
     ]
+
+
+def test_remote_common_commands_list_returns_fixture_contract(frame, monkeypatch):
+    fixture = json.loads((Path("tests") / "fixtures" / "common_commands_snapshot.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        frame.common_commands_store,
+        "read_snapshot",
+        lambda: main.CommonCommandsSnapshot.from_dict(fixture),
+    )
+
+    status, body = frame._remote_api_common_commands_list_ui()
+
+    assert status == 200
+    assert body == fixture
+
+
+def test_remote_common_commands_list_read_error_is_deterministic(frame, monkeypatch):
+    monkeypatch.setattr(
+        frame.common_commands_store,
+        "read_snapshot",
+        lambda: (_ for _ in ()).throw(main.CommonCommandsReadError(frame.common_commands_store.path, "broken")),
+    )
+
+    status, body = frame._remote_api_common_commands_list_ui()
+
+    assert status == 500
+    assert body == {"accepted": False, "error": "common_commands_unavailable"}
+
+
+def test_remote_common_commands_payload_matches_frozen_shape(frame):
+    fixture = json.loads((Path("tests") / "fixtures" / "common_commands_snapshot.json").read_text(encoding="utf-8"))
+
+    payload = frame._remote_common_commands_snapshot_payload(
+        main.CommonCommandsSnapshot.from_dict(fixture)
+    )
+
+    assert payload == fixture
+
+
+def test_remote_common_commands_create_is_idempotent_for_same_device_request(frame):
+    payload = {
+        "device_id": "desktop-a",
+        "request_id": "req-a",
+        "title": "List Files",
+        "content": "dir",
+    }
+
+    first_status, first_body = frame._remote_api_common_commands_create_ui(payload)
+    second_status, second_body = frame._remote_api_common_commands_create_ui(payload)
+
+    assert first_status == 200
+    assert second_status == 200
+    assert first_body["accepted"] is True
+    assert first_body["result"] == "created"
+    assert second_body["result"] == "replayed"
+    assert second_body["revision"] == first_body["revision"]
+    assert second_body["commands"] == first_body["commands"]
+    assert first_body["revision"] == 1
+    assert len(first_body["commands"]) == 1
+    assert first_body["commands"][0]["title"] == "List Files"
+
+
+def test_remote_common_commands_create_returns_snapshot_body(frame):
+    status, body = frame._remote_api_common_commands_create_ui(
+        {"title": "Run Tests", "content": "pytest -q", "observed_revision": 0}
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["result"] == "created"
+    assert body["revision"] == 1
+    assert body["commands"][0]["title"] == "Run Tests"
+    assert body["commands"][0]["content"] == "pytest -q"
+
+
+def test_remote_common_commands_create_rejects_stale_revision_with_409(frame):
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Existing", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_create_ui(
+        {
+            "title": "Run Tests",
+            "content": "pytest -q",
+            "observed_revision": 0,
+        }
+    )
+
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 1,
+        "observed_revision": 0,
+    }
+
+
+def test_remote_common_commands_create_replays_duplicate_even_with_stale_observed_revision(frame):
+    first_status, first_body = frame._remote_api_common_commands_create_ui(
+        {
+            "device_id": "desktop-a",
+            "request_id": "req-a",
+            "title": "List Files",
+            "content": "dir",
+            "observed_revision": 0,
+        }
+    )
+
+    second_status, second_body = frame._remote_api_common_commands_create_ui(
+        {
+            "device_id": "desktop-a",
+            "request_id": "req-a",
+            "title": "List Files Changed",
+            "content": "dir /b",
+            "observed_revision": 0,
+        }
+    )
+
+    assert first_status == 200
+    assert second_status == 200
+    assert first_body["result"] == "created"
+    assert second_body["result"] == "replayed"
+    assert second_body["revision"] == 1
+    assert second_body["commands"] == first_body["commands"]
+
+
+def test_remote_common_commands_update_rejects_stale_revision_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_update_ui(
+        {
+            "id": created.id,
+            "title": "List Files Updated",
+            "content": "dir /b",
+            "observed_revision": 0,
+            "observed_version": created.version,
+        }
+    )
+
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 1,
+        "observed_revision": 0,
+    }
+
+
+def test_remote_common_commands_update_rejects_stale_version_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+    updated = frame.common_commands_store.update_command(
+        created.id,
+        main.CommonCommandUpdate(expected_version=created.version, content="dir /b"),
+    )
+
+    status, body = frame._remote_api_common_commands_update_ui(
+        {
+            "id": created.id,
+            "title": "List Files Updated",
+            "content": "dir /a",
+            "observed_revision": 2,
+            "observed_version": created.version,
+        }
+    )
+
+    assert updated.version == 2
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 2,
+        "observed_revision": 2,
+        "current_version": 2,
+        "observed_version": 1,
+    }
+
+
+def test_remote_common_commands_update_returns_snapshot_body(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_update_ui(
+        {
+            "id": created.id,
+            "title": "Run Tests",
+            "content": "pytest -q",
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["revision"] == 2
+    assert body["commands"][0]["title"] == "Run Tests"
+    assert body["commands"][0]["content"] == "pytest -q"
+    assert body["commands"][0]["version"] == 2
+
+
+def test_remote_common_commands_delete_rejects_stale_revision_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_delete_ui(
+        {
+            "id": created.id,
+            "observed_revision": 0,
+            "observed_version": created.version,
+        }
+    )
+
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 1,
+        "observed_revision": 0,
+    }
+
+
+def test_remote_common_commands_delete_rejects_stale_version_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+    updated = frame.common_commands_store.update_command(
+        created.id,
+        main.CommonCommandUpdate(expected_version=created.version, content="dir /b"),
+    )
+
+    status, body = frame._remote_api_common_commands_delete_ui(
+        {
+            "id": created.id,
+            "observed_revision": 2,
+            "observed_version": created.version,
+        }
+    )
+
+    assert updated.version == 2
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 2,
+        "observed_revision": 2,
+        "current_version": 2,
+        "observed_version": 1,
+    }
+
+
+def test_remote_common_commands_delete_returns_snapshot_body(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_delete_ui(
+        {
+            "id": created.id,
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body == {"accepted": True, "revision": 2, "commands": []}
+
+
+def test_remote_common_commands_pin_returns_snapshot_body(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="List Files", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_pin_ui(
+        {
+            "id": created.id,
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["revision"] == 2
+    assert body["commands"][0]["pinned"] is True
+
+
+def test_remote_common_commands_move_up_returns_section_local_snapshot(frame):
+    first = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    second = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+    third = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Third", content="echo third")
+    )
+    frame.common_commands_store.pin_command(third.id, expected_version=third.version)
+
+    status, body = frame._remote_api_common_commands_move_up_ui(
+        {
+            "id": second.id,
+            "observed_revision": 4,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert [item["title"] for item in body["commands"]] == ["Third", "Second", "First"]
+    assert [item["pinned"] for item in body["commands"]] == [True, False, False]
+
+
+def test_remote_common_commands_create_read_error_is_deterministic(frame, monkeypatch):
+    monkeypatch.setattr(
+        frame.common_commands_store,
+        "create_command",
+        lambda _data: (_ for _ in ()).throw(main.CommonCommandsReadError(frame.common_commands_store.path, "broken")),
+    )
+
+    status, body = frame._remote_api_common_commands_create_ui(
+        {"title": "List Files", "content": "dir"}
+    )
+
+    assert status == 500
+    assert body == {"accepted": False, "error": "common_commands_unavailable"}
 
 
 def test_remote_message_preserves_dynamic_claudecode_model(frame, monkeypatch):
@@ -16396,6 +16743,31 @@ def test_window_focus_shortcuts_route_to_expected_controls(frame, monkeypatch):
         "notes_entry_list",
         "execution_list",
     ]
+
+
+def test_alt_m_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
+    calls = []
+    monkeypatch.setattr(frame, "_show_common_commands_surface", lambda: calls.append("open") or True)
+
+    event = main.wx.CommandEvent(main.wx.wxEVT_MENU, int(frame._common_commands_menu_id))
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert calls == ["open"]
+
+
+def test_common_command_send_returns_false_and_preserves_input_when_send_disabled(frame):
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Send", content="echo send")
+    )
+    assert frame._show_common_commands_surface() is True
+    dialog = frame.common_commands_dialog
+    dialog.common_commands_list.SetSelection(0)
+    frame.input_edit.SetValue("keep me")
+    frame.send_button.Enable(False)
+
+    assert frame._send_selected_common_command() is False
+    assert frame.input_edit.GetValue() == "keep me"
 
 
 def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):

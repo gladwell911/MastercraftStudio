@@ -38,6 +38,14 @@ class RemoteNatsTransport:
         on_set_speed: Callback | None = None,
         on_clear_context: Callback | None = None,
         on_model_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        on_common_commands_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        on_common_commands_create: Callback | None = None,
+        on_common_commands_update: Callback | None = None,
+        on_common_commands_delete: Callback | None = None,
+        on_common_commands_pin: Callback | None = None,
+        on_common_commands_unpin: Callback | None = None,
+        on_common_commands_move_up: Callback | None = None,
+        on_common_commands_move_down: Callback | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
         on_notes_changes: Callback | None = None,
@@ -60,6 +68,14 @@ class RemoteNatsTransport:
         self.on_set_speed = on_set_speed
         self.on_clear_context = on_clear_context
         self.on_model_list = on_model_list
+        self.on_common_commands_list = on_common_commands_list
+        self.on_common_commands_create = on_common_commands_create
+        self.on_common_commands_update = on_common_commands_update
+        self.on_common_commands_delete = on_common_commands_delete
+        self.on_common_commands_pin = on_common_commands_pin
+        self.on_common_commands_unpin = on_common_commands_unpin
+        self.on_common_commands_move_up = on_common_commands_move_up
+        self.on_common_commands_move_down = on_common_commands_move_down
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
         self.on_notes_changes = on_notes_changes
@@ -266,6 +282,22 @@ class RemoteNatsTransport:
             return self.on_state(payload)
         if command_type == "model_list" and callable(self.on_model_list):
             return self.on_model_list()
+        if command_type == "common_commands_list" and callable(self.on_common_commands_list):
+            return self.on_common_commands_list()
+        if command_type == "common_commands_create" and callable(self.on_common_commands_create):
+            return self.on_common_commands_create(payload)
+        if command_type == "common_commands_update" and callable(self.on_common_commands_update):
+            return self.on_common_commands_update(payload)
+        if command_type == "common_commands_delete" and callable(self.on_common_commands_delete):
+            return self.on_common_commands_delete(payload)
+        if command_type == "common_commands_pin" and callable(self.on_common_commands_pin):
+            return self.on_common_commands_pin(payload)
+        if command_type == "common_commands_unpin" and callable(self.on_common_commands_unpin):
+            return self.on_common_commands_unpin(payload)
+        if command_type == "common_commands_move_up" and callable(self.on_common_commands_move_up):
+            return self.on_common_commands_move_up(payload)
+        if command_type == "common_commands_move_down" and callable(self.on_common_commands_move_down):
+            return self.on_common_commands_move_down(payload)
         if command_type == "rename_chat" and callable(self.on_rename_chat):
             return self.on_rename_chat(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):
