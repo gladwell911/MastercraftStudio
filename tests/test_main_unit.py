@@ -482,8 +482,11 @@ def test_remote_common_commands_create_is_idempotent_for_same_device_request(fra
 
     assert first_status == 200
     assert second_status == 200
-    assert first_body == second_body
     assert first_body["accepted"] is True
+    assert first_body["result"] == "created"
+    assert second_body["result"] == "replayed"
+    assert second_body["revision"] == first_body["revision"]
+    assert second_body["commands"] == first_body["commands"]
     assert first_body["revision"] == 1
     assert len(first_body["commands"]) == 1
     assert first_body["commands"][0]["title"] == "List Files"
@@ -491,14 +494,66 @@ def test_remote_common_commands_create_is_idempotent_for_same_device_request(fra
 
 def test_remote_common_commands_create_returns_snapshot_body(frame):
     status, body = frame._remote_api_common_commands_create_ui(
-        {"title": "Run Tests", "content": "pytest -q"}
+        {"title": "Run Tests", "content": "pytest -q", "observed_revision": 0}
     )
 
     assert status == 200
     assert body["accepted"] is True
+    assert body["result"] == "created"
     assert body["revision"] == 1
     assert body["commands"][0]["title"] == "Run Tests"
     assert body["commands"][0]["content"] == "pytest -q"
+
+
+def test_remote_common_commands_create_rejects_stale_revision_with_409(frame):
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Existing", content="dir")
+    )
+
+    status, body = frame._remote_api_common_commands_create_ui(
+        {
+            "title": "Run Tests",
+            "content": "pytest -q",
+            "observed_revision": 0,
+        }
+    )
+
+    assert status == 409
+    assert body == {
+        "accepted": False,
+        "error": "stale_state",
+        "current_revision": 1,
+        "observed_revision": 0,
+    }
+
+
+def test_remote_common_commands_create_replays_duplicate_even_with_stale_observed_revision(frame):
+    first_status, first_body = frame._remote_api_common_commands_create_ui(
+        {
+            "device_id": "desktop-a",
+            "request_id": "req-a",
+            "title": "List Files",
+            "content": "dir",
+            "observed_revision": 0,
+        }
+    )
+
+    second_status, second_body = frame._remote_api_common_commands_create_ui(
+        {
+            "device_id": "desktop-a",
+            "request_id": "req-a",
+            "title": "List Files Changed",
+            "content": "dir /b",
+            "observed_revision": 0,
+        }
+    )
+
+    assert first_status == 200
+    assert second_status == 200
+    assert first_body["result"] == "created"
+    assert second_body["result"] == "replayed"
+    assert second_body["revision"] == 1
+    assert second_body["commands"] == first_body["commands"]
 
 
 def test_remote_common_commands_update_rejects_stale_revision_with_409(frame):

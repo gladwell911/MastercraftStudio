@@ -8155,10 +8155,41 @@ class ChatFrame(wx.Frame):
         if not content:
             return 400, {"accepted": False, "error": "invalid_payload"}
         try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            device_id = str(payload.get("device_id") or "").strip()
+            request_id = str(payload.get("request_id") or "").strip()
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        existing_command = None
+        if device_id and request_id:
+            existing_command = next(
+                (
+                    command
+                    for command in snapshot.commands
+                    if command.device_id == device_id and command.request_id == request_id
+                ),
+                None,
+            )
+        if existing_command is not None:
+            return 200, {
+                **self._remote_common_commands_snapshot_payload(snapshot),
+                "result": "replayed",
+            }
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        try:
             self.common_commands_store.create_command(
                 CommonCommandCreate(
-                    device_id=str(payload.get("device_id") or "").strip(),
-                    request_id=str(payload.get("request_id") or "").strip(),
+                    device_id=device_id,
+                    request_id=request_id,
                     title=title,
                     content=content,
                 )
@@ -8168,7 +8199,10 @@ class ChatFrame(wx.Frame):
             return self._remote_common_commands_unavailable()
         except Exception:
             return self._remote_common_commands_unavailable()
-        return 200, self._remote_common_commands_snapshot_payload(snapshot)
+        return 200, {
+            **self._remote_common_commands_snapshot_payload(snapshot),
+            "result": "created",
+        }
 
     def _remote_api_common_commands_update_ui(self, payload: dict | None = None) -> tuple[int, dict]:
         payload = payload or {}
