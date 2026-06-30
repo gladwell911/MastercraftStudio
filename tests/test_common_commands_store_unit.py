@@ -202,3 +202,34 @@ def test_write_snapshot_replaces_target_atomically_with_temp_file_in_same_dir(tm
     assert source.name.endswith(".tmp")
     assert not source.exists()
     assert store.read_snapshot().commands[0].content == "echo atomic"
+
+
+def test_delete_command_removes_item_and_increments_revision(tmp_path):
+    store = DesktopCommonCommandsStore(tmp_path / "common_commands.json")
+    store.initialize()
+    first = store.create_command(CommonCommandCreate(title="First", content="first"))
+    second = store.create_command(CommonCommandCreate(title="Second", content="second"))
+
+    deleted = store.delete_command(second.id, expected_version=second.version)
+    snapshot = store.read_snapshot()
+
+    assert deleted == second
+    assert snapshot.revision == 3
+    assert [item.id for item in snapshot.commands] == [first.id]
+
+
+def test_delete_command_rejects_stale_version(tmp_path):
+    store = DesktopCommonCommandsStore(tmp_path / "common_commands.json")
+    store.initialize()
+    created = store.create_command(CommonCommandCreate(title="First", content="first"))
+    updated = store.update_command(
+        created.id,
+        CommonCommandUpdate(expected_version=created.version, content="updated"),
+    )
+
+    with pytest.raises(CommonCommandsVersionConflictError) as exc_info:
+        store.delete_command(created.id, expected_version=created.version)
+
+    assert updated.version == 2
+    assert exc_info.value.current_version == 2
+    assert exc_info.value.expected_version == 1

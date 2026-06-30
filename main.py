@@ -8116,6 +8116,180 @@ class ChatFrame(wx.Frame):
             return 500, {"accepted": False, "error": "common_commands_unavailable"}
         return 200, self._remote_common_commands_snapshot_payload(snapshot)
 
+    def _remote_common_commands_unavailable(self) -> tuple[int, dict]:
+        return 500, {"accepted": False, "error": "common_commands_unavailable"}
+
+    def _remote_common_commands_stale_state(
+        self,
+        *,
+        current_revision: int,
+        observed_revision: int | None = None,
+        current_version: int | None = None,
+        observed_version: int | None = None,
+    ) -> tuple[int, dict]:
+        body = {
+            "accepted": False,
+            "error": "stale_state",
+            "current_revision": int(current_revision),
+        }
+        if observed_revision is not None:
+            body["observed_revision"] = int(observed_revision)
+        if current_version is not None:
+            body["current_version"] = int(current_version)
+        if observed_version is not None:
+            body["observed_version"] = int(observed_version)
+        return 409, body
+
+    def _remote_common_commands_optional_int(self, payload: dict, key: str) -> int | None:
+        value = payload.get(key)
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return int(value)
+
+    def _remote_api_common_commands_create_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        content = str(payload.get("content") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        if not content:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            self.common_commands_store.create_command(
+                CommonCommandCreate(
+                    device_id=str(payload.get("device_id") or "").strip(),
+                    request_id=str(payload.get("request_id") or "").strip(),
+                    title=title,
+                    content=content,
+                )
+            )
+            snapshot = self.common_commands_store.read_snapshot()
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, self._remote_common_commands_snapshot_payload(snapshot)
+
+    def _remote_api_common_commands_update_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        title = payload.get("title")
+        content = payload.get("content")
+        if not command_id or (title is None and content is None):
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            self.common_commands_store.update_command(
+                command_id,
+                CommonCommandUpdate(
+                    expected_version=expected_version,
+                    title=None if title is None else str(title),
+                    content=None if content is None else str(content),
+                ),
+            )
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, self._remote_common_commands_snapshot_payload(updated_snapshot)
+
+    def _remote_api_common_commands_delete_ui(self, payload: dict | None = None) -> tuple[int, dict]:
+        payload = payload or {}
+        command_id = str(payload.get("id") or "").strip()
+        if not command_id:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        try:
+            observed_revision = self._remote_common_commands_optional_int(payload, "observed_revision")
+            observed_version = self._remote_common_commands_optional_int(payload, "observed_version")
+            snapshot = self.common_commands_store.read_snapshot()
+        except ValueError:
+            return 400, {"accepted": False, "error": "invalid_payload"}
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        if observed_revision is not None and observed_revision != snapshot.revision:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+            )
+        current_command = next((command for command in snapshot.commands if command.id == command_id), None)
+        if current_command is None:
+            return 404, {"accepted": False, "error": "not_found"}
+        expected_version = current_command.version if observed_version is None else observed_version
+        if observed_version is not None and observed_version != current_command.version:
+            return self._remote_common_commands_stale_state(
+                current_revision=snapshot.revision,
+                observed_revision=observed_revision,
+                current_version=current_command.version,
+                observed_version=observed_version,
+            )
+        try:
+            self.common_commands_store.delete_command(
+                command_id,
+                expected_version=expected_version,
+            )
+            updated_snapshot = self.common_commands_store.read_snapshot()
+        except KeyError:
+            return 404, {"accepted": False, "error": "not_found"}
+        except CommonCommandsVersionConflictError as exc:
+            try:
+                latest_snapshot = self.common_commands_store.read_snapshot()
+                current_revision = latest_snapshot.revision
+            except Exception:
+                current_revision = snapshot.revision
+            return self._remote_common_commands_stale_state(
+                current_revision=current_revision,
+                observed_revision=observed_revision,
+                current_version=exc.current_version,
+                observed_version=exc.expected_version,
+            )
+        except CommonCommandsReadError:
+            return self._remote_common_commands_unavailable()
+        except Exception:
+            return self._remote_common_commands_unavailable()
+        return 200, self._remote_common_commands_snapshot_payload(updated_snapshot)
+
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
         cached = getattr(self, "_remote_history_list_cache", None)
         if isinstance(cached, dict):
@@ -9464,6 +9638,9 @@ class ChatFrame(wx.Frame):
                     on_clear_context=lambda payload: self._run_remote_ui_route(self._remote_api_clear_context_ui, payload),
                     on_model_list=lambda: self._run_remote_ui_route(self._remote_api_model_list_ui),
                     on_common_commands_list=lambda: self._run_remote_ui_route(self._remote_api_common_commands_list_ui),
+                    on_common_commands_create=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_create_ui, payload),
+                    on_common_commands_update=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_update_ui, payload),
+                    on_common_commands_delete=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_delete_ui, payload),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,

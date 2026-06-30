@@ -119,6 +119,32 @@ class DesktopCommonCommandsStore:
         )
         return updated_command
 
+    def delete_command(self, command_id: str, *, expected_version: int) -> CommonCommand:
+        snapshot = self.read_snapshot()
+        next_revision = snapshot.revision + 1
+        deleted_command: CommonCommand | None = None
+        updated_commands: list[CommonCommand] = []
+        normalized_id = str(command_id or "")
+        for command in snapshot.commands:
+            if command.id != normalized_id:
+                updated_commands.append(command)
+                continue
+            if command.version != int(expected_version):
+                raise CommonCommandsVersionConflictError(
+                    expected_version=int(expected_version),
+                    current_version=command.version,
+                )
+            deleted_command = command
+        if deleted_command is None:
+            raise KeyError(normalized_id)
+        self._write_snapshot(
+            CommonCommandsSnapshot(
+                revision=next_revision,
+                commands=self._sorted_commands(updated_commands),
+            )
+        )
+        return deleted_command
+
     def _write_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self._temp_path()

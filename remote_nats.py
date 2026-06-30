@@ -39,6 +39,9 @@ class RemoteNatsTransport:
         on_clear_context: Callback | None = None,
         on_model_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_common_commands_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        on_common_commands_create: Callback | None = None,
+        on_common_commands_update: Callback | None = None,
+        on_common_commands_delete: Callback | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
         on_notes_changes: Callback | None = None,
@@ -62,6 +65,9 @@ class RemoteNatsTransport:
         self.on_clear_context = on_clear_context
         self.on_model_list = on_model_list
         self.on_common_commands_list = on_common_commands_list
+        self.on_common_commands_create = on_common_commands_create
+        self.on_common_commands_update = on_common_commands_update
+        self.on_common_commands_delete = on_common_commands_delete
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
         self.on_notes_changes = on_notes_changes
@@ -270,6 +276,12 @@ class RemoteNatsTransport:
             return self.on_model_list()
         if command_type == "common_commands_list" and callable(self.on_common_commands_list):
             return self.on_common_commands_list()
+        if command_type == "common_commands_create" and callable(self.on_common_commands_create):
+            return self.on_common_commands_create(payload)
+        if command_type == "common_commands_update" and callable(self.on_common_commands_update):
+            return self.on_common_commands_update(payload)
+        if command_type == "common_commands_delete" and callable(self.on_common_commands_delete):
+            return self.on_common_commands_delete(payload)
         if command_type == "rename_chat" and callable(self.on_rename_chat):
             return self.on_rename_chat(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):
