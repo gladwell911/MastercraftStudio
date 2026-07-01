@@ -180,6 +180,14 @@ def test_routes_common_commands_mutation_commands():
                 "commands": [{"id": payload["id"], "title": "Run Tests", "content": "pytest -q"}],
             },
         ),
+        on_common_commands_move_down=lambda payload: (
+            200,
+            {
+                "accepted": True,
+                "revision": 6,
+                "commands": [{"id": payload["command_id"], "title": "Run Tests", "content": "pytest -q"}],
+            },
+        ),
     )
 
     create_status, create_body = transport._route_command(
@@ -197,6 +205,9 @@ def test_routes_common_commands_mutation_commands():
     move_status, move_body = transport._route_command(
         {"type": "common_commands_move_up", "id": "cmd-1"}
     )
+    move_down_status, move_down_body = transport._route_command(
+        {"type": "common_commands_move_down", "command_id": "cmd-1"}
+    )
 
     assert create_status == 200
     assert create_body["commands"][0]["title"] == "List Files"
@@ -208,6 +219,8 @@ def test_routes_common_commands_mutation_commands():
     assert pin_body["commands"][0]["pinned"] is True
     assert move_status == 200
     assert move_body["commands"][0]["title"] == "Run Tests"
+    assert move_down_status == 200
+    assert move_down_body["commands"][0]["title"] == "Run Tests"
 
 
 def test_routes_speed_options_and_set_speed_commands():
@@ -372,6 +385,42 @@ def test_transport_routes_common_commands_update_and_publishes_stale_response():
         assert b'"request_id":"common-update-1"' in raw
         assert b'"status":409' in raw
         assert b'"error":"stale_state"' in raw
+
+    asyncio.run(run())
+
+
+def test_transport_routes_common_commands_move_down_and_publishes_response():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(
+            pair_id="default",
+            token="secret",
+            jetstream=jetstream,
+            on_common_commands_move_down=lambda payload: (
+                200,
+                {
+                    "accepted": True,
+                    "revision": 8,
+                    "commands": [{"id": payload["command_id"], "title": "Second", "content": "echo second"}],
+                    "result": "updated",
+                },
+            ),
+        )
+
+        await transport.handle_command(
+            {
+                "id": "common-move-down-1",
+                "type": "common_commands_move_down",
+                "command_id": "cmd-2",
+            }
+        )
+
+        assert len(jetstream.published) == 1
+        _, raw = jetstream.published[0]
+        assert b'"request_id":"common-move-down-1"' in raw
+        assert b'"revision":8' in raw
+        assert b'"result":"updated"' in raw
+        assert b'"commands":[{"id":"cmd-2"' in raw
 
     asyncio.run(run())
 

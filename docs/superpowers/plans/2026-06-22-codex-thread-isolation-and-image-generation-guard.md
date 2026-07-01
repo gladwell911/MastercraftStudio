@@ -1,4 +1,4 @@
-# Codex Thread Isolation And Image Generation Guard Implementation Plan
+﻿# Codex Thread Isolation And Image Generation Guard Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -127,7 +127,7 @@ def test_codex_worker_does_not_reuse_stale_thread_after_new_chat_reset(frame, mo
 
     frame.active_session_turns = [
         {
-            "question": "新问题",
+            "question": "鏂伴棶棰?,
             "answer_md": main.REQUESTING_TEXT,
             "model": "codex/gpt-5.4-medium",
             "created_at": 1.0,
@@ -152,7 +152,7 @@ def test_codex_worker_does_not_reuse_stale_thread_after_new_chat_reset(frame, mo
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
-    frame._run_codex_turn_worker(frame.active_chat_id, 0, "新问题", "codex/gpt-5.4-medium")
+    frame._run_codex_turn_worker(frame.active_chat_id, 0, "鏂伴棶棰?, "codex/gpt-5.4-medium")
 
     assert sent[0]["thread_id"] == ""
 ```
@@ -283,7 +283,7 @@ After starting the app and sending a plain text message in a new `codex gpt5.3sp
 ```bash
 @'
 import sqlite3
-path = r'C:\code\sj\mc\.codex-home\logs_2.sqlite'
+path = r'D:\code\sj\mc\.codex-home\logs_2.sqlite'
 conn = sqlite3.connect(path)
 cur = conn.cursor()
 cur.execute("""
@@ -310,7 +310,7 @@ After starting a new `codex gpt5.4 medium` chat and sending a plain text message
 ```bash
 @'
 import sqlite3
-path = r'C:\code\sj\mc\.codex-home\logs_2.sqlite'
+path = r'D:\code\sj\mc\.codex-home\logs_2.sqlite'
 conn = sqlite3.connect(path)
 cur = conn.cursor()
 cur.execute("""
@@ -342,3 +342,4 @@ git status --short
 ```
 
 Expected: only the intentional `main.py` / `tests/test_main_unit.py` changes remain if no other local work was created during verification.
+

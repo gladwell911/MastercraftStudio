@@ -323,6 +323,22 @@ def main_entry() -> None:
                 frame._remote_api_common_commands_delete_ui,
                 payload,
             ),
+            on_common_commands_pin=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_pin_ui,
+                payload,
+            ),
+            on_common_commands_unpin=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_unpin_ui,
+                payload,
+            ),
+            on_common_commands_move_up=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_move_up_ui,
+                payload,
+            ),
+            on_common_commands_move_down=lambda payload: frame._run_remote_ui_route(
+                frame._remote_api_common_commands_move_down_ui,
+                payload,
+            ),
             on_notes_changes=frame._remote_api_notes_changes,
             on_notes_bulk_docs=frame._remote_api_notes_bulk_docs,
         )
@@ -402,6 +418,9 @@ def main_entry() -> None:
                     "desktop_chat_title": desktop_chat_title,
                     "desktop_note_title": desktop_note_title,
                     "desktop_common_command_title": desktop_common_command_title,
+                    "desktop_common_commands_snapshot": frame._remote_common_commands_snapshot_payload(
+                        frame.common_commands_store.read_snapshot()
+                    ),
                     "mobile_chat_title": mobile_chat_title,
                     "mobile_note_title": mobile_note_title,
                 },

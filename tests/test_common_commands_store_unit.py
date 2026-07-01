@@ -5,6 +5,7 @@ import pytest
 from common_commands_models import CommonCommandCreate, CommonCommandUpdate
 from common_commands_store import (
     CommonCommandsReadError,
+    CommonCommandsWriteError,
     CommonCommandsVersionConflictError,
     DesktopCommonCommandsStore,
 )
@@ -202,6 +203,30 @@ def test_write_snapshot_replaces_target_atomically_with_temp_file_in_same_dir(tm
     assert source.name.endswith(".tmp")
     assert not source.exists()
     assert store.read_snapshot().commands[0].content == "echo atomic"
+
+
+def test_create_wraps_write_failures_in_stable_store_error(tmp_path, monkeypatch):
+    path = tmp_path / "common_commands.json"
+    store = DesktopCommonCommandsStore(path)
+
+    def fail_replace(self, source: Path, target: Path) -> None:
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(DesktopCommonCommandsStore, "_replace_file", fail_replace)
+
+    with pytest.raises(CommonCommandsWriteError) as exc_info:
+        store.create_command(
+            CommonCommandCreate(
+                device_id="desktop-a",
+                request_id="req-a",
+                title="Blocked",
+                content="echo blocked",
+            )
+        )
+
+    assert exc_info.value.path == path
+    assert isinstance(exc_info.value.cause, PermissionError)
+    assert not any(path.parent.glob("common_commands.json.*.tmp"))
 
 
 def test_delete_command_removes_item_and_increments_revision(tmp_path):

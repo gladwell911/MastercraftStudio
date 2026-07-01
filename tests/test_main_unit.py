@@ -747,6 +747,204 @@ def test_remote_common_commands_move_up_returns_section_local_snapshot(frame):
     assert [item["pinned"] for item in body["commands"]] == [True, False, False]
 
 
+def test_remote_common_commands_move_down_returns_section_local_snapshot(frame):
+    first = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    second = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+    third = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Third", content="echo third")
+    )
+    frame.common_commands_store.pin_command(first.id, expected_version=first.version)
+
+    status, body = frame._remote_api_common_commands_move_down_ui(
+        {
+            "id": second.id,
+            "observed_revision": 4,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["result"] == "updated"
+    assert [item["title"] for item in body["commands"]] == ["First", "Third", "Second"]
+    assert [item["pinned"] for item in body["commands"]] == [True, False, False]
+
+
+def test_remote_common_commands_move_up_noop_at_section_top_returns_unchanged_snapshot(frame):
+    first = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+
+    status, body = frame._remote_api_common_commands_move_up_ui(
+        {
+            "id": first.id,
+            "observed_revision": 2,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["result"] == "updated"
+    assert body["revision"] == 2
+    assert [item["title"] for item in body["commands"]] == ["First", "Second"]
+
+
+def test_remote_common_commands_move_down_noop_at_section_bottom_returns_unchanged_snapshot(frame):
+    frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    second = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+
+    status, body = frame._remote_api_common_commands_move_down_ui(
+        {
+            "id": second.id,
+            "observed_revision": 2,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["result"] == "updated"
+    assert body["revision"] == 2
+    assert [item["title"] for item in body["commands"]] == ["First", "Second"]
+
+
+def test_remote_common_commands_move_down_rejects_stale_revision_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+
+    status, body = frame._remote_api_common_commands_move_down_ui(
+        {
+            "id": created.id,
+            "observed_revision": 0,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 409
+    assert body["accepted"] is False
+    assert body["error"] == "stale_state"
+    assert body["current_revision"] == 1
+    assert body["observed_revision"] == 0
+
+
+def test_remote_common_commands_move_down_rejects_stale_version_with_409(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+    updated = frame.common_commands_store.update_command(
+        created.id,
+        main.CommonCommandUpdate(
+            expected_version=created.version,
+            title="Second updated",
+            content="echo second updated",
+        ),
+    )
+
+    status, body = frame._remote_api_common_commands_move_down_ui(
+        {
+            "id": updated.id,
+            "observed_revision": 2,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 409
+    assert body["accepted"] is False
+    assert body["error"] == "stale_state"
+    assert body["current_revision"] == 2
+    assert body["current_version"] == 2
+    assert body["observed_version"] == 1
+
+
+def test_remote_common_commands_move_down_accepts_command_id_payload(frame):
+    first = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+    second = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="Second", content="echo second")
+    )
+
+    status, body = frame._remote_api_common_commands_move_down_ui(
+        {
+            "command_id": first.id,
+            "observed_revision": 2,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert [item["title"] for item in body["commands"]] == ["Second", "First"]
+
+
+def test_remote_common_commands_update_accepts_command_id_payload(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+
+    status, body = frame._remote_api_common_commands_update_ui(
+        {
+            "command_id": created.id,
+            "title": "First edited",
+            "content": "echo first edited",
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["commands"][0]["title"] == "First edited"
+
+
+def test_remote_common_commands_delete_accepts_command_id_payload(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+
+    status, body = frame._remote_api_common_commands_delete_ui(
+        {
+            "command_id": created.id,
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body == {"accepted": True, "revision": 2, "commands": []}
+
+
+def test_remote_common_commands_pin_accepts_command_id_payload(frame):
+    created = frame.common_commands_store.create_command(
+        main.CommonCommandCreate(title="First", content="echo first")
+    )
+
+    status, body = frame._remote_api_common_commands_pin_ui(
+        {
+            "command_id": created.id,
+            "observed_revision": 1,
+            "observed_version": 1,
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert body["commands"][0]["pinned"] is True
+
+
 def test_remote_common_commands_create_read_error_is_deterministic(frame, monkeypatch):
     monkeypatch.setattr(
         frame.common_commands_store,
@@ -9238,6 +9436,52 @@ def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves
             dlg.Destroy()
 
 
+def test_common_command_edit_dialog_constructs_without_parent_assertion(frame):
+    dlg = main.CommonCommandEditDialog(
+        frame,
+        dialog_title="添加常用命令",
+        initial_title="标题",
+        initial_content="echo test",
+    )
+    try:
+        assert dlg.title_edit.GetValue() == "标题"
+        assert dlg.content_edit.GetValue() == "echo test"
+        assert dlg.FindWindowById(wx.ID_OK) is not None
+        assert dlg.FindWindowById(wx.ID_CANCEL) is not None
+    finally:
+        if dlg:
+            dlg.Destroy()
+
+
+def test_common_command_edit_dialog_save_and_cancel_buttons_end_modal(frame, monkeypatch):
+    dlg = main.CommonCommandEditDialog(
+        frame,
+        dialog_title="添加常用命令",
+        initial_content="echo test",
+    )
+    try:
+        closed = []
+        monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda self, code: closed.append(code))
+
+        ok_button = dlg.FindWindowById(wx.ID_OK)
+        cancel_button = dlg.FindWindowById(wx.ID_CANCEL)
+        assert ok_button is not None
+        assert cancel_button is not None
+
+        ok_event = wx.CommandEvent(wx.wxEVT_BUTTON, wx.ID_OK)
+        ok_event.SetEventObject(ok_button)
+        assert ok_button.ProcessEvent(ok_event)
+        assert closed == [wx.ID_OK]
+
+        cancel_event = wx.CommandEvent(wx.wxEVT_BUTTON, wx.ID_CANCEL)
+        cancel_event.SetEventObject(cancel_button)
+        assert cancel_button.ProcessEvent(cancel_event)
+        assert closed == [wx.ID_OK, wx.ID_CANCEL]
+    finally:
+        if dlg:
+            dlg.Destroy()
+
+
 def test_try_open_selected_answer_detail_opens_attachment_path(frame, monkeypatch, tmp_path):
     attachment = tmp_path / "report.txt"
     attachment.write_text("attachment body", encoding="utf-8")
@@ -16745,7 +16989,7 @@ def test_window_focus_shortcuts_route_to_expected_controls(frame, monkeypatch):
     ]
 
 
-def test_alt_m_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
+def test_alt_z_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
     calls = []
     monkeypatch.setattr(frame, "_show_common_commands_surface", lambda: calls.append("open") or True)
 
@@ -16756,7 +17000,16 @@ def test_alt_m_menu_shortcut_opens_common_commands_surface(frame, monkeypatch):
     assert calls == ["open"]
 
 
-def test_common_command_send_returns_false_and_preserves_input_when_send_disabled(frame):
+def test_app_menu_common_commands_item_uses_alt_z_shortcut(frame):
+    menu_bar = frame.GetMenuBar()
+    app_menu = menu_bar.GetMenu(0)
+    menu_item = next(item for item in app_menu.GetMenuItems() if item.GetId() == int(frame._common_commands_menu_id))
+
+    assert menu_item.GetItemLabelText() == "常用命令"
+    assert "\tAlt+Z" in menu_item.GetItemLabel()
+
+
+def test_common_command_send_returns_false_and_preserves_input_when_submit_fails(frame, monkeypatch):
     frame.common_commands_store.create_command(
         main.CommonCommandCreate(title="Send", content="echo send")
     )
@@ -16765,9 +17018,13 @@ def test_common_command_send_returns_false_and_preserves_input_when_send_disable
     dialog.common_commands_list.SetSelection(0)
     frame.input_edit.SetValue("keep me")
     frame.send_button.Enable(False)
+    seen = {}
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: (False, "broken"))
+    monkeypatch.setattr(main.wx, "MessageBox", lambda message, title, flags: seen.update({"message": message, "title": title, "flags": flags}))
 
     assert frame._send_selected_common_command() is False
     assert frame.input_edit.GetValue() == "keep me"
+    assert seen["message"] == "broken"
 
 
 def test_alt_b_focuses_empty_notes_list_placeholder(frame, monkeypatch):

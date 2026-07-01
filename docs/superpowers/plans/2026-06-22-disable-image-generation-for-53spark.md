@@ -1,4 +1,4 @@
-# Disable Image Generation for 5.3 Spark Implementation Plan
+﻿# Disable Image Generation for 5.3 Spark Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -146,7 +146,7 @@ git commit -m "fix: disable image generation for 5.3 spark"
 
 - [ ] **Step 1: Reproduce a `5.3spark` session after the code change**
 
-Run the app locally, select `gpt5.3spark`, start a new chat, and send a plain text message such as `你好`.
+Run the app locally, select `gpt5.3spark`, start a new chat, and send a plain text message such as `浣犲ソ`.
 
 Expected: no `400 invalid_request_error` is shown in the app UI.
 
@@ -157,7 +157,7 @@ Run:
 ```bash
 @'
 import sqlite3
-path = r'C:\code\sj\mc\.codex-home\logs_2.sqlite'
+path = r'D:\code\sj\mc\.codex-home\logs_2.sqlite'
 conn = sqlite3.connect(path)
 cur = conn.cursor()
 cur.execute("""
@@ -184,7 +184,7 @@ Run the app locally, select `gpt5.4`, send a plain text message, then run:
 ```bash
 @'
 import sqlite3
-path = r'C:\code\sj\mc\.codex-home\logs_2.sqlite'
+path = r'D:\code\sj\mc\.codex-home\logs_2.sqlite'
 conn = sqlite3.connect(path)
 cur = conn.cursor()
 cur.execute("""
@@ -211,7 +211,7 @@ Run the app locally, select `gpt5.5`, send a plain text message, then run:
 ```bash
 @'
 import sqlite3
-path = r'C:\code\sj\mc\.codex-home\logs_2.sqlite'
+path = r'D:\code\sj\mc\.codex-home\logs_2.sqlite'
 conn = sqlite3.connect(path)
 cur = conn.cursor()
 cur.execute("""
@@ -279,4 +279,5 @@ Keep these out of this fix:
 - No tool filtering for 5.4 or 5.5
 - No changes to main.py chat submission flow
 ```
+
 

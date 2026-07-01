@@ -32,6 +32,7 @@ from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 from common_commands_models import CommonCommandCreate, CommonCommandUpdate, CommonCommandsSnapshot
 from common_commands_store import (
     CommonCommandsReadError,
+    CommonCommandsWriteError,
     CommonCommandsVersionConflictError,
     DesktopCommonCommandsStore,
 )
@@ -1096,23 +1097,26 @@ class CommonCommandEditDialog(wx.Dialog):
         self.content_edit = wx.TextCtrl(panel, value=str(initial_content or ""), style=wx.TE_MULTILINE)
         self.content_edit.SetName("常用命令内容")
         root.Add(self.content_edit, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        buttons = self.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
-        if buttons is not None:
-            ok_button = self.FindWindowById(wx.ID_OK)
-            if ok_button is not None:
-                ok_button.SetLabel("保存")
-            root.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
+        button_row = wx.BoxSizer(wx.HORIZONTAL)
+        button_row.AddStretchSpacer(1)
+        self.ok_button = wx.Button(panel, wx.ID_OK, "保存")
+        self.cancel_button = wx.Button(panel, wx.ID_CANCEL, "取消")
+        button_row.Add(self.ok_button, 0, wx.RIGHT, 8)
+        button_row.Add(self.cancel_button, 0)
+        root.Add(button_row, 0, wx.EXPAND | wx.ALL, 10)
         panel.SetSizer(root)
         self.SetMinSize((420, 320))
         self.SetSize((520, 420))
-        self.Bind(wx.EVT_BUTTON, self._on_save, id=wx.ID_OK)
+        self.ok_button.SetDefault()
+        self.ok_button.Bind(wx.EVT_BUTTON, self._on_save)
+        self.cancel_button.Bind(wx.EVT_BUTTON, lambda _event: self.EndModal(wx.ID_CANCEL))
 
     def _on_save(self, event) -> None:
         if not str(self.content_edit.GetValue() or "").strip():
             wx.MessageBox("请输入命令内容。", "提示", wx.OK | wx.ICON_WARNING)
             self.content_edit.SetFocus()
             return
-        event.Skip()
+        self.EndModal(wx.ID_OK)
 
     def values(self) -> tuple[str, str]:
         return (
@@ -1144,12 +1148,36 @@ class CommonCommandsDialog(wx.Dialog):
         self.SetSize((420, 420))
         self.common_commands_add_button.Bind(wx.EVT_BUTTON, lambda _evt: self.owner._add_common_command())
         self.common_commands_list.Bind(wx.EVT_KEY_DOWN, self.owner._monitored_ui_handler("common_commands_key_down", self.owner._on_common_commands_key_down))
+        self.common_commands_list.Bind(wx.EVT_CHAR, self.owner._on_common_commands_char)
         self.common_commands_list.Bind(wx.EVT_CONTEXT_MENU, self.owner._on_common_commands_context)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
     def _on_close(self, _event) -> None:
         self.owner.common_commands_dialog = None
         self.Destroy()
+        try:
+            self.owner.Raise()
+        except Exception:
+            pass
+        try:
+            self.owner._focus_input_box()
+        except Exception:
+            pass
+
+    def _on_char_hook(self, event) -> None:
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            try:
+                focus = wx.Window.FindFocus()
+            except Exception:
+                focus = None
+            if focus is self.common_commands_list and self.owner._send_selected_common_command():
+                return
+        event.Skip()
 
     def selected_command_id(self) -> str:
         model = getattr(self, "common_commands_list_model", None)
@@ -1439,7 +1467,7 @@ class ChatFrame(wx.Frame):
     def _build_ui(self):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
-        app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+M")
+        app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+Z")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -1650,7 +1678,7 @@ class ChatFrame(wx.Frame):
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_LEFT, int(self._chat_navigation_left_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_RIGHT, int(self._chat_navigation_right_id)),
                     wx.AcceleratorEntry(wx.ACCEL_ALT, ord("A"), int(self._clear_context_id)),
-                    wx.AcceleratorEntry(wx.ACCEL_ALT, ord("M"), int(self._common_commands_menu_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_ALT, ord("Z"), int(self._common_commands_menu_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._notes_move_entry_up_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._notes_move_entry_down_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_HOME, int(self._notes_move_entry_top_id)),
@@ -1742,6 +1770,9 @@ class ChatFrame(wx.Frame):
     def _write_common_commands_snapshot(self, snapshot: CommonCommandsSnapshot) -> None:
         self.common_commands_store._write_snapshot(snapshot)
 
+    def _show_common_commands_store_error(self, exc: Exception) -> None:
+        wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+
     def _add_common_command(self) -> bool:
         dlg = CommonCommandEditDialog(self, dialog_title="添加常用命令")
         try:
@@ -1752,8 +1783,8 @@ class ChatFrame(wx.Frame):
             dlg.Destroy()
         try:
             command = self.common_commands_store.create_command(CommonCommandCreate(title=title, content=content))
-        except CommonCommandsReadError as exc:
-            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+        except (CommonCommandsReadError, CommonCommandsWriteError) as exc:
+            self._show_common_commands_store_error(exc)
             return False
         self._restore_common_commands_focus(command.id)
         self.SetStatusText("常用命令已保存")
@@ -1784,8 +1815,8 @@ class ChatFrame(wx.Frame):
                     content=content,
                 ),
             )
-        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
-            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+        except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
+            self._show_common_commands_store_error(exc)
             return False
         self._restore_common_commands_focus(updated.id)
         self.SetStatusText("常用命令已保存")
@@ -1803,8 +1834,8 @@ class ChatFrame(wx.Frame):
                 expected_version=int(getattr(command, "version", 0) or 0),
             )
             snapshot = self.common_commands_store.read_snapshot()
-        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
-            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+        except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
+            self._show_common_commands_store_error(exc)
             return False
         remaining = list(snapshot.commands)
         next_id = ""
@@ -1839,8 +1870,8 @@ class ChatFrame(wx.Frame):
                     expected_version=int(getattr(command, "version", 0) or 0),
                 )
                 status = "常用命令已置顶"
-        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
-            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+        except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
+            self._show_common_commands_store_error(exc)
             return False
         self._restore_common_commands_focus(updated.id)
         self.SetStatusText(status)
@@ -1861,8 +1892,8 @@ class ChatFrame(wx.Frame):
                     command.id,
                     expected_version=int(getattr(command, "version", 0) or 0),
                 )
-        except (CommonCommandsReadError, CommonCommandsVersionConflictError) as exc:
-            wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
+        except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
+            self._show_common_commands_store_error(exc)
             return False
         if updated.id != command.id or int(getattr(updated, "version", 0) or 0) != int(getattr(command, "version", 0) or 0):
             self._restore_common_commands_focus(updated.id)
@@ -1880,13 +1911,12 @@ class ChatFrame(wx.Frame):
         command = self._selected_common_command()
         if command is None:
             return False
-        try:
-            if not self.send_button.IsEnabled():
-                return False
-        except Exception:
+        content = str(getattr(command, "content", "") or "")
+        ok, message = self._submit_question(content.strip(), source="local")
+        if not ok:
+            if message:
+                wx.MessageBox(message, "提示", wx.OK | wx.ICON_WARNING)
             return False
-        self.input_edit.SetValue(str(getattr(command, "content", "") or ""))
-        self._trigger_send()
         return True
 
     def _show_common_commands_menu(self) -> bool:
@@ -1896,7 +1926,7 @@ class ChatFrame(wx.Frame):
         menu = wx.Menu()
         add_id = wx.NewIdRef()
         menu.Append(add_id, "添加")
-        self.Bind(wx.EVT_MENU, lambda _evt: self._add_common_command(), id=add_id)
+        menu.Bind(wx.EVT_MENU, lambda _evt: self._add_common_command(), id=add_id)
         if dialog.selected_command() is not None:
             edit_id = wx.NewIdRef()
             delete_id = wx.NewIdRef()
@@ -1908,11 +1938,11 @@ class ChatFrame(wx.Frame):
             menu.Append(pin_id, "取消置顶" if bool(getattr(dialog.selected_command(), "pinned", False)) else "置顶")
             menu.Append(move_up_id, "向上移动")
             menu.Append(move_down_id, "向下移动")
-            self.Bind(wx.EVT_MENU, lambda _evt: self._edit_selected_common_command(), id=edit_id)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._delete_selected_common_command(), id=delete_id)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_selected_common_command_pin(), id=pin_id)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_up(), id=move_up_id)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_down(), id=move_down_id)
+            menu.Bind(wx.EVT_MENU, lambda _evt: self._edit_selected_common_command(), id=edit_id)
+            menu.Bind(wx.EVT_MENU, lambda _evt: self._delete_selected_common_command(), id=delete_id)
+            menu.Bind(wx.EVT_MENU, lambda _evt: self._toggle_selected_common_command_pin(), id=pin_id)
+            menu.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_up(), id=move_up_id)
+            menu.Bind(wx.EVT_MENU, lambda _evt: self._move_selected_common_command_down(), id=move_down_id)
         dialog.PopupMenu(menu)
         menu.Destroy()
         return True
@@ -1940,6 +1970,13 @@ class ChatFrame(wx.Frame):
                 return
         if modifiers == wx.MOD_ALT and key == wx.WXK_DOWN:
             if self._move_selected_common_command_down():
+                return
+        event.Skip()
+
+    def _on_common_commands_char(self, event) -> None:
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self._send_selected_common_command():
                 return
         event.Skip()
 
@@ -8327,7 +8364,7 @@ class ChatFrame(wx.Frame):
 
     def _remote_api_common_commands_update_ui(self, payload: dict | None = None) -> tuple[int, dict]:
         payload = payload or {}
-        command_id = str(payload.get("id") or "").strip()
+        command_id = str(payload.get("command_id") or payload.get("id") or "").strip()
         title = payload.get("title")
         content = payload.get("content")
         if not command_id or (title is None and content is None):
@@ -8390,7 +8427,7 @@ class ChatFrame(wx.Frame):
 
     def _remote_api_common_commands_delete_ui(self, payload: dict | None = None) -> tuple[int, dict]:
         payload = payload or {}
-        command_id = str(payload.get("id") or "").strip()
+        command_id = str(payload.get("command_id") or payload.get("id") or "").strip()
         if not command_id:
             return 400, {"accepted": False, "error": "invalid_payload"}
         try:
@@ -8458,7 +8495,7 @@ class ChatFrame(wx.Frame):
         pinned: bool,
     ) -> tuple[int, dict]:
         payload = payload or {}
-        command_id = str(payload.get("id") or "").strip()
+        command_id = str(payload.get("command_id") or payload.get("id") or "").strip()
         if not command_id:
             return 400, {"accepted": False, "error": "invalid_payload"}
         try:
@@ -8529,7 +8566,7 @@ class ChatFrame(wx.Frame):
         direction: str,
     ) -> tuple[int, dict]:
         payload = payload or {}
-        command_id = str(payload.get("id") or "").strip()
+        command_id = str(payload.get("command_id") or payload.get("id") or "").strip()
         if not command_id:
             return 400, {"accepted": False, "error": "invalid_payload"}
         try:
