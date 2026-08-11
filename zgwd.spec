@@ -28,6 +28,7 @@ a = Analysis(
         'multidict',
         'pyaudio',
         'propcache',
+        'websocket',
         'websockets',
         'yarl',
     ] + nats_hiddenimports,

@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 from pathlib import Path
 
 import wx
@@ -44,3 +44,14 @@ def frame(tmp_path, monkeypatch):
     f.Hide()
     yield f
     f.Destroy()
+    # wx defers real window-handle release to the event loop; without pumping
+    # events, hundreds of frames in one test process exhaust handles and
+    # later fixtures start failing (e.g. Menu.AppendCheckItem returns None).
+    # Some tests monkeypatch wx.GetApp, so resolve it defensively.
+    app = wx.GetApp()
+    yield_fn = getattr(app, "Yield", None)
+    if callable(yield_fn):
+        try:
+            yield_fn()
+        except Exception:
+            pass

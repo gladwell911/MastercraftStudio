@@ -34,6 +34,8 @@ setx OPENROUTER_API_KEY "你的Key"
 
 如果项目目录下存在 `.venv` 或 `.venv311`，打包和测试流程优先使用对应虚拟环境。
 
+如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
+
 ## 数据位置
 
 - 聊天历史和通用应用状态仍按应用数据目录解析；源码运行时通常在项目内的 `dist\history`。
@@ -55,6 +57,7 @@ setx OPENROUTER_API_KEY "你的Key"
 - `codex_client.py`：Codex 客户端封装
 - `claudecode_client.py`：Claude Code 客户端封装
 - `openclaw_client.py`：OpenClaw 客户端封装
+- `kimi_server_client.py`：Kimi Code 本地 server（`kimi web`）客户端封装，支撑 `kimi/` 模型族聊天
 - `nats_runtime.py`、`remote_nats.py`：NATS 相关运行时与远程协作逻辑
 - `tests/`：当前 pytest 测试
 - `docs/README.md`：当前有效文档索引

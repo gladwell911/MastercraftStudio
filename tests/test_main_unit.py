@@ -1,4 +1,4 @@
-﻿import json
+import json
 import copy
 import asyncio
 import subprocess
@@ -314,11 +314,12 @@ def test_clear_context_adds_tail_notice_and_keeps_current_chat_identity(frame, m
 def test_visible_model_order_prioritizes_codex_then_claudecode_then_openclaw():
     visible = list(main.VISIBLE_MODEL_IDS)
 
-    assert visible[:5] == [
+    assert visible[:6] == [
         "codex/main",
         "codex/gpt-5.4-medium",
         "codex/gpt-5.3-codex-spark-high",
         "claudecode/default",
+        "kimi/main",
         "openclaw/main",
     ]
 
@@ -326,11 +327,12 @@ def test_visible_model_order_prioritizes_codex_then_claudecode_then_openclaw():
 def test_model_combo_order_prioritizes_cli_models(frame):
     choices = [frame.model_combo.GetString(idx) for idx in range(frame.model_combo.GetCount())]
 
-    assert choices[:5] == [
+    assert choices[:6] == [
         "codex",
         "codex gpt5.4 medium",
         "codex gpt5.3spark high",
         "claudeCode",
+        "Kimi Code",
         "openclaw",
     ]
 
@@ -4302,7 +4304,7 @@ def test_execution_list_enter_and_double_click_open_execution_detail(frame, monk
     called = {"n": 0}
     monkeypatch.setattr(
         frame,
-        "_try_open_selected_execution_detail",
+        "_open_selected_execution_text_viewer",
         lambda: called.__setitem__("n", called["n"] + 1) or True,
     )
     monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)

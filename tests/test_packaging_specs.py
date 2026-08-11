@@ -42,3 +42,19 @@ def test_package_script_safely_cleans_packaged_output_before_build():
     assert "Remove-Item -LiteralPath $targetPath -Recurse -Force" in script_text
     assert "Remove-BundledRuntimeHistory" in script_text
     assert "_internal" in script_text
+
+
+def test_pyinstaller_specs_bundle_websocket_client_for_kimi_server_client():
+    """kimi_server_client imports websocket-client lazily; keep it in hiddenimports."""
+    root = Path(__file__).resolve().parents[1]
+    for spec_name in ("ZhugeQA_A11y.spec", "zgwd.spec"):
+        text = (root / spec_name).read_text(encoding="utf-8")
+
+        assert "'websocket'" in text, f"{spec_name} must include the websocket hiddenimport"
+
+
+def test_main_imports_kimi_server_client_module():
+    root = Path(__file__).resolve().parents[1]
+    main_text = (root / "main.py").read_text(encoding="utf-8")
+
+    assert "from kimi_server_client import" in main_text

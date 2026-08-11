@@ -1,6 +1,8 @@
-﻿import ctypes
+import ctypes
 import copy
 import asyncio
+import base64
+import functools
 import json
 import os
 import platform
@@ -51,6 +53,14 @@ from codex_client import (
 )
 import codex_worker_protocol
 from codex_worker_client import CodexWorkerClient
+from kimi_server_client import (
+    DEFAULT_KIMI_MODEL,
+    KimiServerClient,
+    event_from_payload as kimi_event_from_payload,
+    event_to_payload as kimi_event_to_payload,
+    is_kimi_model,
+    kimi_model_to_server_alias,
+)
 from context_usage import (
     context_usage_from_dict,
     estimate_turns_tokens,
@@ -196,6 +206,7 @@ MODEL_IDS = [
     "codex/gpt-5.4-medium",
     "codex/gpt-5.3-codex-spark-high",
     "claudecode/default",
+    "kimi/main",
     "openclaw/main",
     "stepfun/step-3.5-flash",
     "meta-llama/llama-3.1-8b-instruct",
@@ -282,8 +293,31 @@ def wx_call_after_if_alive(func, *args, **kwargs) -> bool:
     target = getattr(func, "__self__", None)
     if target is not None and not _wx_target_is_alive(target):
         return False
+
+    def _guarded_call():
+        # wx GUI work is only safe on the main thread. CallAfter callbacks
+        # always run there in production; a non-main thread here means a test
+        # double executed the callback synchronously from a worker thread.
+        if threading.current_thread() is not threading.main_thread():
+            return
+        # Re-check at execution time: the target may have been destroyed while
+        # this callback sat in the pending-event queue (e.g. teardown racing a
+        # background worker thread). RuntimeError covers wxPython wrappers
+        # whose C++ object is already deleted.
+        if target is not None and not _wx_target_is_alive(target):
+            return
+        try:
+            func(*args, **kwargs)
+        except RuntimeError:
+            return
+
     try:
-        wx.CallAfter(func, *args, **kwargs)
+        _guarded_call = functools.wraps(func)(_guarded_call)
+    except Exception:
+        pass
+
+    try:
+        wx.CallAfter(_guarded_call)
         return True
     except Exception:
         return False
@@ -408,6 +442,8 @@ def model_display_name(model_id: str) -> str:
         return "codex"
     if model_id.startswith("claudecode/"):
         return "claudeCode"
+    if model_id.startswith("kimi/"):
+        return "Kimi Code"
     if model_id.startswith("openclaw/"):
         return "openclaw"
     return model_id
@@ -425,6 +461,8 @@ def model_id_from_display_name(display_name: str) -> str:
         return "codex/gpt-5.3-codex-spark-high"
     if display_name == "claudeCode":
         return "claudecode/default"
+    if display_name == "Kimi Code":
+        return "kimi/main"
     if display_name == "openclaw":
         return "openclaw/main"
     return display_name
@@ -433,13 +471,13 @@ def model_id_from_display_name(display_name: str) -> str:
 def normalize_model_id(value: str, *, default: str = DEFAULT_MODEL_ID) -> str:
     """Resolve display labels and accepted dynamic CLI model IDs consistently."""
     resolved = model_id_from_display_name(str(value or "").strip())
-    if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_openclaw_model(resolved):
+    if resolved in MODEL_IDS or is_codex_model(resolved) or is_claudecode_model(resolved) or is_kimi_model(resolved) or is_openclaw_model(resolved):
         return resolved
     return default
 
 
 def is_cli_filtered_model(model_id: str) -> bool:
-    return is_codex_model(model_id) or is_claudecode_model(model_id) or is_openclaw_model(model_id)
+    return is_codex_model(model_id) or is_claudecode_model(model_id) or is_kimi_model(model_id) or is_openclaw_model(model_id)
 
 
 def is_visible_model_id(model_id: str) -> bool:
@@ -1292,6 +1330,15 @@ class ChatFrame(wx.Frame):
         self.active_codex_latest_assistant_phase = ""
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
+        self.active_kimi_session_id = ""
+        self.active_kimi_turn_id = ""
+        self.active_kimi_turn_active = False
+        self.active_kimi_pending_prompt = ""
+        self.active_kimi_request_queue = []
+        self._kimi_client = None
+        self._kimi_client_lock = threading.Lock()
+        self._kimi_active_turns: dict[str, dict] = {}
+        self._kimi_turn_answer_parts: dict[tuple[str, str], list[str]] = {}
         self._codex_clients: dict[str, CodexWorkerClient] = {}
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
@@ -1304,6 +1351,10 @@ class ChatFrame(wx.Frame):
         self._codex_ui_event_lock = threading.Lock()
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
+        self._pending_kimi_ui_events: list[tuple[str, CodexEvent]] = []
+        self._kimi_ui_event_lock = threading.Lock()
+        self._kimi_ui_event_flush_scheduled = False
+        self._kimi_ui_event_drain_timer = None
         self._codex_ui_batch_depth = 0
         self._background_ui_update_depth = 0
         self._background_answer_list_dirty = False
@@ -2942,6 +2993,12 @@ class ChatFrame(wx.Frame):
         self.active_codex_thread_flags = thread_flags if isinstance(thread_flags, list) else []
         self.active_codex_latest_assistant_text = str(data.get("active_codex_latest_assistant_text") or "").strip()
         self.active_codex_latest_assistant_phase = str(data.get("active_codex_latest_assistant_phase") or "").strip()
+        self.active_kimi_session_id = str(data.get("active_kimi_session_id") or "").strip()
+        self.active_kimi_turn_id = str(data.get("active_kimi_turn_id") or "").strip()
+        self.active_kimi_turn_active = bool(data.get("active_kimi_turn_active", False))
+        self.active_kimi_pending_prompt = str(data.get("active_kimi_pending_prompt") or "").strip()
+        kimi_request_queue = data.get("active_kimi_request_queue")
+        self.active_kimi_request_queue = kimi_request_queue if isinstance(kimi_request_queue, list) else []
         self.active_claudecode_session_id = str(data.get("active_claudecode_session_id") or "").strip()
         self.active_session_started_at = float(data.get("active_session_started_at") or 0.0)
         self.realtime_call_role = str(data.get("realtime_call_role") or DEFAULT_REALTIME_CALL_ROLE).strip() or DEFAULT_REALTIME_CALL_ROLE
@@ -3031,6 +3088,11 @@ class ChatFrame(wx.Frame):
             "active_codex_thread_flags": self.active_codex_thread_flags,
             "active_codex_latest_assistant_text": self.active_codex_latest_assistant_text,
             "active_codex_latest_assistant_phase": self.active_codex_latest_assistant_phase,
+            "active_kimi_session_id": self.active_kimi_session_id,
+            "active_kimi_turn_id": self.active_kimi_turn_id,
+            "active_kimi_turn_active": self.active_kimi_turn_active,
+            "active_kimi_pending_prompt": self.active_kimi_pending_prompt,
+            "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
             "active_session_started_at": self.active_session_started_at,
@@ -3831,6 +3893,49 @@ class ChatFrame(wx.Frame):
         return items or [{"type": "text", "text": ""}]
 
     @staticmethod
+    def _kimi_image_media_type(path: str) -> str:
+        suffix = Path(str(path or "")).suffix.lower()
+        return {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }.get(suffix, "image/png")
+
+    def _build_kimi_content_blocks(self, question: str, attachments: list[dict]) -> list[dict]:
+        blocks = []
+        text = str(question or "").strip()
+        file_context = self._build_cli_attachment_context([item for item in attachments or [] if str((item or {}).get("kind") or "") != "image"])
+        if text and file_context:
+            blocks.append({"type": "text", "text": f"{text}\n\n{file_context}"})
+        elif text:
+            blocks.append({"type": "text", "text": text})
+        elif file_context:
+            blocks.append({"type": "text", "text": file_context})
+        for item in attachments or []:
+            if str((item or {}).get("kind") or "") != "image":
+                continue
+            path = str((item or {}).get("path") or "").strip()
+            if not path:
+                continue
+            try:
+                data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+            except OSError:
+                continue
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "kind": "base64",
+                        "media_type": self._kimi_image_media_type(path),
+                        "data": data,
+                    },
+                }
+            )
+        return blocks or [{"type": "text", "text": ""}]
+
+    @staticmethod
     def _parse_codex_local_command(question: str) -> dict | None:
         text = str(question or "").strip()
         if not text.startswith("/") or text == "/":
@@ -3889,6 +3994,45 @@ class ChatFrame(wx.Frame):
         )
 
     @staticmethod
+    def _parse_kimi_local_command(question: str) -> dict | None:
+        return ChatFrame._parse_codex_local_command(question)
+
+    @staticmethod
+    def _kimi_supported_local_commands() -> tuple[tuple[str, str], ...]:
+        return (
+            ("status", "显示模型、会话、turn 和上下文状态"),
+            ("help", "列出本程序支持的 Kimi Code 斜杠命令"),
+            ("new", "开始一个新的本地聊天"),
+            ("clear", "清除当前聊天关联的 Kimi Code 会话状态"),
+            ("stop", "中断当前活跃 Kimi Code turn"),
+        )
+
+    def _build_kimi_help_markdown(self) -> str:
+        lines = [
+            "## Kimi Code 斜杠命令",
+            "",
+            "本程序会识别所有以 `/` 开头的 Kimi Code 输入。以下命令已在桌面端实现：",
+            "",
+        ]
+        lines.extend(f"- `/{name}`：{description}" for name, description in self._kimi_supported_local_commands())
+        lines.extend(
+            [
+                "",
+                "其他 `/...` 命令会被识别为 Kimi Code 斜杠命令，但当前桌面端暂不支持，不会被当成普通聊天发送。",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_kimi_unsupported_command_markdown(command: str, args: str = "") -> str:
+        suffix = f" {args}" if str(args or "").strip() else ""
+        return (
+            "## Kimi Code 斜杠命令暂不支持\n\n"
+            f"`/{command}{suffix}` 已被识别为 Kimi Code 斜杠命令，但当前桌面端还没有对应实现。\n\n"
+            "为避免误操作，这条输入不会作为普通聊天内容发送给 Kimi Code。"
+        )
+
+    @staticmethod
     def _format_codex_account_status(account_resp: dict) -> str:
         account = account_resp.get("account") if isinstance(account_resp, dict) else None
         if not isinstance(account, dict):
@@ -3938,6 +4082,25 @@ class ChatFrame(wx.Frame):
         if chat is self._current_chat_state:
             return str(self.active_codex_turn_id or "").strip()
         return ""
+
+    def _kimi_session_id_for_chat(self, chat: dict | None) -> str:
+        session_id = str((chat or {}).get("kimi_session_id") or "").strip()
+        if session_id:
+            return session_id
+        if chat is self._current_chat_state:
+            return str(self.active_kimi_session_id or "").strip()
+        return ""
+
+    def _kimi_turn_id_for_chat(self, chat: dict | None) -> str:
+        turn_id = str((chat or {}).get("kimi_turn_id") or "").strip()
+        if turn_id:
+            return turn_id
+        if chat is self._current_chat_state:
+            return str(self.active_kimi_turn_id or "").strip()
+        return ""
+
+    def _workspace_dir_for_kimi(self) -> str:
+        return str(Path(__file__).resolve().parent)
 
     def _build_codex_status_markdown(self, client, chat: dict, model: str) -> str:
         thread_id = self._codex_thread_id_for_chat(chat)
@@ -4008,15 +4171,17 @@ class ChatFrame(wx.Frame):
         model_text = str(model or "").strip()
         if is_codex_model(model_text):
             return source == "codex"
+        if is_kimi_model(model_text):
+            return source == "kimi"
         if is_openclaw_model(model_text):
             return source == "openclaw"
         if is_claudecode_model(model_text):
             return source == "claudecode"
-        return source not in {"codex", "openclaw", "claudecode"}
+        return source not in {"codex", "kimi", "openclaw", "claudecode"}
 
     def _is_authoritative_context_usage_model(self, model: str) -> bool:
         text = str(model or "").strip()
-        return is_openclaw_model(text) or is_codex_model(text) or is_claudecode_model(text)
+        return is_openclaw_model(text) or is_codex_model(text) or is_kimi_model(text) or is_claudecode_model(text)
 
     def _turns_require_authoritative_context_usage(self, turns: list[dict]) -> bool:
         for turn in reversed(turns or []):
@@ -7027,7 +7192,7 @@ class ChatFrame(wx.Frame):
         turn["request_last_attempt_at"] = now
         turn["request_attempt_count"] = 1
         turn["request_recoverable"] = True
-        turn["request_recovery_mode"] = "resume" if (is_codex_model(model) or is_claudecode_model(model)) else "retry"
+        turn["request_recovery_mode"] = "resume" if (is_codex_model(model) or is_kimi_model(model) or is_claudecode_model(model)) else "retry"
         turn["request_resume_token"] = self._request_resume_token_for_model(model)
         turn["request_error"] = ""
         turn["request_recovered_after_restart"] = False
@@ -7037,6 +7202,11 @@ class ChatFrame(wx.Frame):
             return {
                 "thread_id": str(self.active_codex_thread_id or "").strip(),
                 "turn_id": str(self.active_codex_turn_id or "").strip(),
+            }
+        if is_kimi_model(model):
+            return {
+                "session_id": str(self.active_kimi_session_id or "").strip(),
+                "turn_id": str(self.active_kimi_turn_id or "").strip(),
             }
         if is_claudecode_model(model):
             return {"session_id": str(self.active_claudecode_session_id or "").strip()}
@@ -7439,6 +7609,319 @@ class ChatFrame(wx.Frame):
                 if (not from_recovery) and (not recovery_context):
                     turn["request_status"] = "pending"
                 self._mark_chat_turns_dirty(None if is_current_target else chat_id, int(turn_idx))
+        self._defer_codex_state_save()
+
+    def _apply_kimi_final_answer_to_turn(self, turn: dict, text: str) -> bool:
+        return self._apply_codex_final_answer_to_turn(turn, text)
+
+    def _build_kimi_history_recovery_prompt(self, history_turns: list[dict], question: str) -> str:
+        clean_question = str(question or "").strip()
+        transcript_parts = []
+        for turn in history_turns or []:
+            if not isinstance(turn, dict):
+                continue
+            prior_question = str(turn.get("question") or "").strip()
+            prior_answer = str(turn.get("answer_md") or "").strip()
+            if prior_answer == REQUESTING_TEXT:
+                prior_answer = ""
+            if prior_question:
+                transcript_parts.append(f"用户：{prior_question}")
+            if prior_answer:
+                transcript_parts.append(f"Kimi Code：{prior_answer}")
+        if not transcript_parts:
+            return clean_question
+        transcript = "\n".join(transcript_parts)
+        return (
+            "下面是当前聊天在本地保存的历史记录，请把它当作本次会话上下文继续：\n"
+            f"{transcript}\n\n"
+            "请基于以上上下文继续回答下面这个新问题：\n"
+            f"{clean_question}"
+        )
+
+    def _kimi_should_steer_turn(self, target_chat: dict, is_current_target: bool) -> bool:
+        if not isinstance(target_chat, dict):
+            return False
+        if bool(target_chat.get("kimi_turn_active")):
+            return True
+        return bool(is_current_target and self.active_kimi_turn_active)
+
+    def _kimi_target_chat(self, chat_id: str) -> tuple[dict | None, bool]:
+        normalized = str(chat_id or "").strip()
+        is_current_target = normalized in {self.active_chat_id, self.current_chat_id, ""}
+        if is_current_target:
+            return self._current_chat_state, True
+        chat = self._find_archived_chat(normalized)
+        return (chat if isinstance(chat, dict) else None), False
+
+    def _ensure_kimi_client(self) -> KimiServerClient:
+        with self._kimi_client_lock:
+            client = self._kimi_client
+            if client is None:
+                client = KimiServerClient(
+                    on_message=self._on_kimi_client_message,
+                    on_exit=self._on_kimi_client_exit,
+                )
+                self._kimi_client = client
+            return client
+
+    def _remember_kimi_active_turn(self, chat_id: str, payload: dict) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        metadata: dict = {}
+        existing = self._kimi_active_turns.get(normalized)
+        if isinstance(existing, dict):
+            metadata = dict(existing)
+        turn_idx = payload.get("turn_idx")
+        if isinstance(turn_idx, int):
+            metadata["turn_idx"] = turn_idx
+        for key in ("turn_id", "session_id", "prompt_id", "model"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                metadata[key] = value
+        if metadata:
+            self._kimi_active_turns[normalized] = metadata
+
+    def _clear_kimi_active_turn(self, chat_id: str, turn_idx=None, turn_id: str | None = None) -> None:
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return
+        metadata = self._kimi_active_turns.get(normalized)
+        if not isinstance(metadata, dict):
+            return
+        if isinstance(turn_idx, int) and metadata.get("turn_idx") != turn_idx:
+            return
+        turn_id_value = str(turn_id or "").strip()
+        if turn_id_value and str(metadata.get("turn_id") or "").strip() != turn_id_value:
+            return
+        self._kimi_active_turns.pop(normalized, None)
+
+    def _start_kimi_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str) -> None:
+        def _worker() -> None:
+            self._run_kimi_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_kimi_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
+        threading.Thread(
+            target=self._run_kimi_local_command_worker,
+            args=(chat_id, turn_idx, command, args, model),
+            daemon=True,
+        ).start()
+
+    def _run_kimi_local_command_worker(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
+        try:
+            chat_id = str(chat_id or "").strip()
+            target_chat, _target_turns, is_current_target = self._chat_target_for_request(chat_id)
+            if not isinstance(target_chat, dict):
+                target_chat = self._current_chat_state if is_current_target else {}
+            normalized_command = str(command or "").strip().lower()
+            if normalized_command == "status":
+                client = None
+                if self._kimi_session_id_for_chat(target_chat):
+                    client = self._ensure_kimi_client()
+                    client.start()
+                answer = self._build_kimi_status_markdown(client, target_chat, model)
+            elif normalized_command == "help":
+                answer = self._build_kimi_help_markdown()
+            elif normalized_command == "new":
+                answer = "## Kimi Code 新聊天\n\n已请求开始新聊天。"
+                self._call_after_if_alive(self._on_new_chat_clicked, None)
+            elif normalized_command == "clear":
+                answer = self._handle_kimi_clear_command(target_chat)
+            elif normalized_command == "stop":
+                client = None
+                if self._kimi_session_id_for_chat(target_chat):
+                    client = self._ensure_kimi_client()
+                    client.start()
+                answer = self._handle_kimi_stop_command(client, target_chat, model=model)
+            else:
+                answer = self._build_kimi_unsupported_command_markdown(normalized_command or command, args)
+            self._call_after_if_alive(self._on_done, turn_idx, answer, "", model, "", chat_id)
+        except Exception as exc:
+            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+
+    def _handle_kimi_clear_command(self, chat: dict) -> str:
+        if isinstance(chat, dict):
+            chat["kimi_session_id"] = ""
+            chat["kimi_turn_id"] = ""
+            chat["kimi_turn_active"] = False
+            chat["kimi_pending_prompt"] = ""
+            chat["kimi_request_queue"] = []
+        if chat is self._current_chat_state:
+            self._reset_active_kimi_session_state()
+        chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        if chat_id:
+            self._kimi_active_turns.pop(chat_id, None)
+        self._save_state()
+        return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
+
+    def _handle_kimi_stop_command(self, client, chat: dict, model: str = "") -> str:
+        session_id = self._kimi_session_id_for_chat(chat)
+        chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        metadata = self._kimi_active_turns.get(chat_id) if chat_id else None
+        if not isinstance(metadata, dict):
+            metadata = {}
+        turn_active = bool((chat or {}).get("kimi_turn_active")) or bool(metadata)
+        if not session_id or not turn_active:
+            return "## Kimi Code 中断\n\n当前没有可中断的 Kimi Code turn。"
+        if client is None or not hasattr(client, "abort"):
+            return "## Kimi Code 中断\n\n当前 Kimi Code 客户端不支持中断。"
+        prompt_id = str(metadata.get("prompt_id") or "").strip()
+        client.abort(session_id, prompt_id)
+        return f"## Kimi Code 中断\n\n已请求中断会话 `{session_id}` 的当前 turn。"
+
+    def _build_kimi_status_markdown(self, client, chat: dict, model: str) -> str:
+        session_id = self._kimi_session_id_for_chat(chat)
+        turn_id = self._kimi_turn_id_for_chat(chat)
+        turn_active = bool((chat or {}).get("kimi_turn_active")) or (chat is self._current_chat_state and bool(self.active_kimi_turn_active))
+        queue = (chat or {}).get("kimi_request_queue")
+        queue_count = len(queue) if isinstance(queue, list) else 0
+        server_status = "未查询"
+        if client is not None and session_id:
+            try:
+                status = client.get_status(session_id)
+                context_tokens = status.get("context_tokens")
+                max_tokens = status.get("max_context_tokens")
+                if isinstance(context_tokens, (int, float)) and isinstance(max_tokens, (int, float)):
+                    server_status = f"已连接，上下文 {int(context_tokens)}/{int(max_tokens)}"
+                else:
+                    server_status = "已连接"
+            except Exception as exc:
+                server_status = f"查询失败：{exc}"
+        usage = format_context_usage_label(context_usage_from_dict((chat or {}).get("context_usage")))
+        lines = [
+            "## Kimi Code 状态",
+            "",
+            f"- 模型：{model_display_name(model) or model or DEFAULT_KIMI_MODEL}",
+            f"- 工作目录：{self._workspace_dir_for_kimi()}",
+            f"- 会话：{session_id or '未创建'}",
+            f"- turn：{turn_id or '无'}（{'活跃' if turn_active else '空闲'}）",
+            f"- 排队请求：{queue_count} 条",
+            f"- 上下文：{usage or '未知'}",
+            f"- 服务器：{server_status}",
+        ]
+        return "\n".join(lines)
+
+    def _run_kimi_turn_worker(self, chat_id: str, turn_idx: int, question: str, model: str, from_recovery: bool = False) -> None:
+        is_current_target = chat_id in {self.active_chat_id, self.current_chat_id, ""}
+        target_chat = self._current_chat_state if is_current_target else self._find_archived_chat(chat_id)
+        if not isinstance(target_chat, dict):
+            if not is_current_target:
+                return
+            target_chat = self._current_chat_state
+        session_id = str(target_chat.get("kimi_session_id") or (self.active_kimi_session_id if is_current_target else "") or "").strip()
+        client_chat_id = str(chat_id or (target_chat.get("id") if isinstance(target_chat, dict) else "") or self.active_chat_id or self.current_chat_id or "").strip()
+        if not client_chat_id:
+            client_chat_id = self._ensure_active_chat_id()
+        try:
+            target_turns = self.active_session_turns if is_current_target else (target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else [])
+            if not isinstance(target_turns, list) or turn_idx < 0 or turn_idx >= len(target_turns):
+                if not is_current_target:
+                    return
+                target_turns = self.active_session_turns
+            turn_attachments = []
+            if 0 <= turn_idx < len(target_turns):
+                maybe_attachments = target_turns[turn_idx].get("attachments") if isinstance(target_turns[turn_idx], dict) else []
+                if isinstance(maybe_attachments, list):
+                    turn_attachments = [item for item in maybe_attachments if str((item or {}).get("status") or "") == "success"]
+            should_steer = self._kimi_should_steer_turn(target_chat, is_current_target)
+            history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+            client = self._ensure_kimi_client()
+            client.start()
+            if session_id and not client.session_exists(session_id):
+                session_id = ""
+            if session_id:
+                client.subscribe([session_id])
+                send_question = str(question or "")
+            else:
+                send_question = self._build_kimi_history_recovery_prompt(history_turns, question) if history_turns else str(question or "")
+                session_id = client.create_session(
+                    cwd=self._workspace_dir_for_kimi(),
+                    model=model,
+                    title=str((target_chat.get("title") if isinstance(target_chat, dict) else "") or "kimi chat"),
+                )
+            content_blocks = self._build_kimi_content_blocks(send_question, turn_attachments)
+            self._remember_kimi_active_turn(
+                client_chat_id,
+                {"turn_idx": int(turn_idx), "session_id": session_id, "model": str(model or "")},
+            )
+            prompt_id = client.submit_prompt(session_id, content_blocks)
+            metadata = self._kimi_active_turns.get(client_chat_id)
+            if isinstance(metadata, dict):
+                metadata["prompt_id"] = str(prompt_id or "").strip()
+            queued_entry = None
+            if should_steer and str(prompt_id or "").strip():
+                if not client.steer_prompts(session_id, [prompt_id]):
+                    queued_entry = {
+                        "prompt_id": str(prompt_id or "").strip(),
+                        "question": str(question or ""),
+                        "turn_idx": int(turn_idx),
+                        "model": str(model or ""),
+                        "queued_at": time.time(),
+                    }
+            self._call_after_if_alive(
+                self._apply_kimi_thread_state,
+                client_chat_id,
+                {
+                    "session_id": session_id,
+                    "prompt_id": str(prompt_id or "").strip(),
+                    "turn_idx": int(turn_idx),
+                    "active": True,
+                    "model": str(model or ""),
+                    "queued_entry": queued_entry,
+                },
+            )
+        except Exception as exc:
+            self._clear_kimi_active_turn(client_chat_id, turn_idx)
+            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+
+    def _apply_kimi_thread_state(self, chat_id: str, payload: dict) -> None:
+        target_chat, is_current_target = self._kimi_target_chat(chat_id)
+        if not isinstance(target_chat, dict):
+            return
+        session_id = str(payload.get("session_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if "session_id" in payload:
+            target_chat["kimi_session_id"] = session_id
+            if is_current_target:
+                self.active_kimi_session_id = session_id
+        if "turn_id" in payload:
+            target_chat["kimi_turn_id"] = turn_id
+            if is_current_target:
+                self.active_kimi_turn_id = turn_id
+        if "active" in payload:
+            active = bool(payload.get("active"))
+            target_chat["kimi_turn_active"] = active
+            if is_current_target:
+                self.active_kimi_turn_active = active
+            if active:
+                self._remember_kimi_active_turn(chat_id, payload)
+            else:
+                self._clear_kimi_active_turn(chat_id)
+        queued_entry = payload.get("queued_entry") if isinstance(payload.get("queued_entry"), dict) else None
+        if queued_entry:
+            queue = target_chat.get("kimi_request_queue")
+            if not isinstance(queue, list):
+                queue = []
+                target_chat["kimi_request_queue"] = queue
+            queue.append(dict(queued_entry))
+            if is_current_target:
+                self.active_kimi_request_queue = queue
+        target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
+        turn_idx = payload.get("turn_idx")
+        if isinstance(target_turns, list) and isinstance(turn_idx, int) and 0 <= turn_idx < len(target_turns):
+            turn = target_turns[turn_idx]
+            if isinstance(turn, dict):
+                if session_id:
+                    turn["kimi_session_id"] = session_id
+                if "turn_id" in payload:
+                    turn["kimi_turn_id"] = turn_id
+                if session_id or turn_id:
+                    turn["request_resume_token"] = {"session_id": session_id, "turn_id": turn_id}
+                self._mark_chat_turns_dirty(None if is_current_target else chat_id, turn_idx)
+        if not is_current_target:
+            self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 
     def _start_claudecode_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, session_id: str) -> None:
@@ -8190,6 +8673,7 @@ class ChatFrame(wx.Frame):
         previous_codex_service_tier = self._current_codex_service_tier()
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
         self._reset_active_codex_session_state()
+        self._reset_active_kimi_session_state()
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
@@ -8225,6 +8709,7 @@ class ChatFrame(wx.Frame):
         self.selected_model = model
         self._current_chat_state["model"] = model
         self._write_active_codex_session_state_to_chat(self._current_chat_state)
+        self._write_active_kimi_session_state_to_chat(self._current_chat_state)
         if is_codex_model(model):
             self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
         if threading.current_thread() is threading.main_thread():
@@ -8982,11 +9467,17 @@ class ChatFrame(wx.Frame):
                     self._flush_pending_background_ui_updates()
                 self._start_execution_step_persist_worker()
             if has_more:
-                self._codex_ui_event_drain_timer = self._call_later_if_alive(
-                    CODEX_UI_EVENT_BATCH_DELAY_MS,
-                    self._drain_codex_ui_events,
-                )
-                if self._codex_ui_event_drain_timer is None and not self._call_after_if_alive(self._drain_codex_ui_events):
+                if self._wx_main_loop_running():
+                    self._codex_ui_event_drain_timer = self._call_later_if_alive(
+                        CODEX_UI_EVENT_BATCH_DELAY_MS,
+                        self._drain_codex_ui_events,
+                    )
+                else:
+                    self._codex_ui_event_drain_timer = None
+                if (
+                    self._codex_ui_event_drain_timer is None
+                    and not self._call_after_if_alive(self._drain_codex_ui_events)
+                ):
                     with self._codex_ui_event_lock:
                         self._codex_ui_event_flush_scheduled = False
             else:
@@ -9289,6 +9780,694 @@ class ChatFrame(wx.Frame):
                         self._update_active_answer_row(target_idx)
                 self._defer_codex_state_save()
             return
+
+    def _on_kimi_client_message(self, message: dict) -> None:
+        if not isinstance(message, dict):
+            return
+        message_type = str(message.get("type") or "").strip()
+        if message_type == "messages_pending":
+            client = self._kimi_client
+            if client is None or not hasattr(client, "drain_pending_messages"):
+                return
+            try:
+                messages = client.drain_pending_messages()
+            except Exception:
+                return
+            for drained in messages:
+                self._on_kimi_client_message(drained)
+            return
+        if message_type == "transport_error":
+            payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+            error_text = str(payload.get("error") or "Kimi Code 连接中断").strip()
+            self._call_after_if_alive(self._apply_kimi_transport_error, error_text)
+            return
+        if message_type != "event":
+            return
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        event_payload = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+        try:
+            kimi_event = kimi_event_from_payload(event_payload)
+        except Exception:
+            return
+        event = CodexEvent(**kimi_event_to_payload(kimi_event))
+        chat_id = self._resolve_kimi_event_chat_id(event)
+        if not chat_id:
+            return
+        self._apply_kimi_event_scope(chat_id, event)
+        self._dispatch_kimi_event_to_ui(chat_id, event)
+
+    def _apply_kimi_transport_error(self, message: str) -> None:
+        for chat_id, metadata in list(self._kimi_active_turns.items()):
+            if not isinstance(metadata, dict):
+                continue
+            self._apply_kimi_error(
+                chat_id,
+                str(message or "Kimi Code 连接中断"),
+                metadata.get("turn_idx"),
+                str(metadata.get("turn_id") or "").strip() or None,
+            )
+
+    def _on_kimi_client_exit(self, returncode) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self._call_after_if_alive(self._on_kimi_client_exit, returncode)
+            return
+        if returncode in {None, 0}:
+            return
+        for chat_id, metadata in list(self._kimi_active_turns.items()):
+            if not isinstance(metadata, dict):
+                continue
+            self._apply_kimi_error(
+                chat_id,
+                f"Kimi Code 服务进程已退出（代码 {returncode}）",
+                metadata.get("turn_idx"),
+                str(metadata.get("turn_id") or "").strip() or None,
+            )
+
+    def _apply_kimi_event_scope(self, chat_id: str, event: CodexEvent) -> None:
+        normalized = str(chat_id or "").strip()
+        metadata = self._kimi_active_turns.get(normalized)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        data = dict(event.data or {}) if isinstance(event.data, dict) else {}
+        event_turn_id = self._event_turn_id(event)
+        meta_turn_id = str(metadata.get("turn_id") or "").strip()
+        if "turn_idx" not in data and isinstance(metadata.get("turn_idx"), int):
+            stamp = not event_turn_id or not meta_turn_id or event_turn_id == meta_turn_id
+            if stamp and event_turn_id:
+                # turn_id 已能定位到另一个本地 turn 时不盖章：
+                # 活跃 turn 的事件不能被归到 turn 进行中又提交的新请求上。
+                target_chat, is_current_target = self._kimi_target_chat(normalized)
+                turns = (
+                    self.active_session_turns
+                    if is_current_target
+                    else ((target_chat or {}).get("turns") if isinstance(target_chat, dict) else [])
+                )
+                for idx, turn in enumerate(turns or []):
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("kimi_turn_id") or "").strip() == event_turn_id and idx != metadata.get("turn_idx"):
+                        stamp = False
+                        break
+            if stamp:
+                data["turn_idx"] = metadata.get("turn_idx")
+        model = str(metadata.get("model") or "").strip()
+        if model and "model" not in data:
+            data["model"] = model
+        if data:
+            event.data = data
+
+    def _known_kimi_event_chat_id(self, event: CodexEvent) -> str:
+        turn_id = self._event_turn_id(event)
+        session_id = self._event_thread_id(event)
+        candidates = []
+        active_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        if active_id:
+            candidates.append(
+                {
+                    "id": active_id,
+                    "kimi_session_id": str(getattr(self, "active_kimi_session_id", "") or "").strip(),
+                    "kimi_turn_id": str(getattr(self, "active_kimi_turn_id", "") or "").strip(),
+                    "turns": self.active_session_turns if isinstance(self.active_session_turns, list) else [],
+                }
+            )
+        if isinstance(getattr(self, "_current_chat_state", None), dict):
+            candidates.append(self._current_chat_state)
+        candidates.extend(chat for chat in (self.archived_chats or []) if isinstance(chat, dict))
+
+        if turn_id:
+            for chat in candidates:
+                chat_id = str(chat.get("id") or "").strip()
+                if not chat_id:
+                    continue
+                if str(chat.get("kimi_turn_id") or "").strip() == turn_id:
+                    return chat_id
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                for turn in turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("kimi_turn_id") or "").strip() == turn_id:
+                        return chat_id
+
+        if session_id:
+            for chat in candidates:
+                chat_id = str(chat.get("id") or "").strip()
+                if not chat_id:
+                    continue
+                if str(chat.get("kimi_session_id") or "").strip() == session_id:
+                    return chat_id
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                for turn in turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("kimi_session_id") or "").strip() == session_id:
+                        return chat_id
+
+        return ""
+
+    def _resolve_kimi_event_chat_id(self, event: CodexEvent) -> str:
+        known_chat_id = self._known_kimi_event_chat_id(event)
+        if known_chat_id:
+            return known_chat_id
+        session_id = self._event_thread_id(event)
+        if session_id:
+            for chat_id, metadata in self._kimi_active_turns.items():
+                if isinstance(metadata, dict) and str(metadata.get("session_id") or "").strip() == session_id:
+                    return str(chat_id or "").strip()
+        if len(self._kimi_active_turns) == 1:
+            return str(next(iter(self._kimi_active_turns)) or "").strip()
+        return ""
+
+    def _kimi_event_is_compatible_with_chat(self, chat: dict | None, event: CodexEvent) -> bool:
+        session_id = self._event_thread_id(event)
+        if not session_id:
+            return True
+        known = str((chat or {}).get("kimi_session_id") or "").strip()
+        if not known and chat is getattr(self, "_current_chat_state", None):
+            known = str(getattr(self, "active_kimi_session_id", "") or "").strip()
+        if not known:
+            return True
+        return session_id == known
+
+    def _kimi_event_scoped_turn_index(self, turns: list, event: CodexEvent) -> int:
+        data_idx = self._event_data_turn_idx_value(event)
+        if isinstance(turns, list) and 0 <= data_idx < len(turns):
+            return data_idx
+        turn_id = self._event_turn_id(event)
+        if turn_id:
+            for idx, turn in enumerate(turns or []):
+                if isinstance(turn, dict) and str(turn.get("kimi_turn_id") or "").strip() == turn_id:
+                    return idx
+        return -1
+
+    def _kimi_event_turn_index(self, turns: list, event: CodexEvent) -> int:
+        scoped_idx = self._kimi_event_scoped_turn_index(turns, event)
+        if scoped_idx >= 0:
+            return scoped_idx
+        return len(turns) - 1 if isinstance(turns, list) and turns else -1
+
+    def _active_kimi_event_target_index(self, event: CodexEvent) -> int:
+        scoped_idx = self._kimi_event_scoped_turn_index(self.active_session_turns, event)
+        if scoped_idx >= 0:
+            return scoped_idx
+        if 0 <= self.active_turn_idx < len(self.active_session_turns):
+            return self.active_turn_idx
+        return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
+
+    def _accumulate_kimi_answer_delta(self, chat_id: str, event: CodexEvent) -> None:
+        text = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
+        if not text:
+            return
+        turn_id = self._event_turn_id(event)
+        if not turn_id:
+            metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
+            if isinstance(metadata, dict):
+                turn_id = str(metadata.get("turn_id") or "").strip()
+        key = (str(chat_id or ""), turn_id)
+        self._kimi_turn_answer_parts.setdefault(key, []).append(text)
+
+    def _pop_kimi_answer_parts(self, chat_id: str, turn_id: str = "") -> str:
+        normalized_chat = str(chat_id or "")
+        normalized_turn = str(turn_id or "").strip()
+        parts: list[str] = []
+        for key in list(self._kimi_turn_answer_parts.keys()):
+            key_chat, key_turn = key
+            if key_chat != normalized_chat:
+                continue
+            if normalized_turn and key_turn and key_turn != normalized_turn:
+                continue
+            values = self._kimi_turn_answer_parts.pop(key, [])
+            parts.extend(str(value or "") for value in values)
+        return "".join(parts).strip()
+
+    def _kimi_context_usage_payload(self, event: CodexEvent) -> dict | None:
+        usage = event.usage if isinstance(getattr(event, "usage", None), dict) else {}
+        used = usage.get("context_tokens")
+        window = usage.get("max_context_tokens")
+        if not isinstance(used, (int, float)) or not isinstance(window, (int, float)):
+            return None
+        model = ""
+        if isinstance(event.data, dict):
+            model = str(event.data.get("model") or "").strip()
+        return {
+            "used_tokens": int(used),
+            "context_window": int(window),
+            "source": "kimi",
+            "exact": True,
+            "fresh": True,
+            "model": model,
+            "updated_at": time.time(),
+        }
+
+    def _apply_kimi_turn_started(self, chat_id: str, target_chat: dict, target_turns: list, event: CodexEvent, is_current_target: bool) -> None:
+        event_turn_id = self._event_turn_id(event)
+        normalized = str(chat_id or "").strip()
+        metadata = self._kimi_active_turns.get(normalized)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+        if event_turn_id:
+            metadata["turn_id"] = event_turn_id
+        queue = target_chat.get("kimi_request_queue") if isinstance(target_chat, dict) else []
+        turn_idx = -1
+        if isinstance(queue, list) and queue:
+            entry = queue.pop(0)
+            if isinstance(entry, dict) and isinstance(entry.get("turn_idx"), int):
+                turn_idx = entry.get("turn_idx")
+                metadata["turn_idx"] = turn_idx
+            if is_current_target:
+                self.active_kimi_request_queue = queue
+        if normalized:
+            self._kimi_active_turns[normalized] = metadata
+        if turn_idx < 0:
+            turn_idx = self._kimi_event_scoped_turn_index(target_turns, event)
+        if turn_idx < 0 and isinstance(metadata.get("turn_idx"), int):
+            turn_idx = metadata.get("turn_idx")
+        session_id = self._event_thread_id(event) or str(metadata.get("session_id") or "").strip()
+        if isinstance(target_chat, dict):
+            if event_turn_id:
+                target_chat["kimi_turn_id"] = event_turn_id
+            target_chat["kimi_turn_active"] = True
+            target_chat["updated_at"] = time.time()
+        if is_current_target:
+            if event_turn_id:
+                self.active_kimi_turn_id = event_turn_id
+            self.active_kimi_turn_active = True
+        if isinstance(target_turns, list) and 0 <= turn_idx < len(target_turns):
+            turn = target_turns[turn_idx]
+            if isinstance(turn, dict):
+                if event_turn_id:
+                    turn["kimi_turn_id"] = event_turn_id
+                if session_id:
+                    turn["kimi_session_id"] = session_id
+                if session_id or event_turn_id:
+                    turn["request_resume_token"] = {"session_id": session_id, "turn_id": event_turn_id}
+                self._mark_chat_turns_dirty(None if is_current_target else normalized, turn_idx)
+
+    def _finalize_kimi_turn_state(self, chat_id: str, target_chat: dict, target_turns: list, target_idx: int, event: CodexEvent) -> list[int]:
+        status = str(getattr(event, "status", "") or "completed").strip() or "completed"
+        event_turn_id = self._event_turn_id(event)
+        final_text = self._pop_kimi_answer_parts(chat_id, event_turn_id)
+        if not final_text:
+            final_text = str(getattr(event, "text", "") or "").strip()
+        queue = target_chat.get("kimi_request_queue") if isinstance(target_chat, dict) else []
+        queued_indices = set()
+        if isinstance(queue, list):
+            for entry in queue:
+                if isinstance(entry, dict) and isinstance(entry.get("turn_idx"), int):
+                    queued_indices.add(entry.get("turn_idx"))
+        covered: list[int] = []
+        if 0 <= target_idx < len(target_turns):
+            covered.append(target_idx)
+        if event_turn_id:
+            for idx, turn in enumerate(target_turns):
+                if idx in covered or not isinstance(turn, dict):
+                    continue
+                if str(turn.get("kimi_turn_id") or "").strip() == event_turn_id:
+                    covered.append(idx)
+        metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
+        if isinstance(metadata, dict) and isinstance(metadata.get("turn_idx"), int):
+            meta_idx = metadata.get("turn_idx")
+            if meta_idx not in covered and 0 <= meta_idx < len(target_turns):
+                covered.append(meta_idx)
+        if isinstance(target_chat, dict):
+            target_chat["kimi_turn_active"] = False
+            target_chat["updated_at"] = time.time()
+        finalized: list[int] = []
+        for idx in covered:
+            if idx in queued_indices:
+                continue
+            turn = target_turns[idx]
+            if not isinstance(turn, dict):
+                continue
+            if status == "completed":
+                turn["request_status"] = "done"
+                turn["request_error"] = ""
+                turn["request_recovered_after_restart"] = False
+                if (
+                    (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
+                    and final_text
+                ):
+                    self._apply_kimi_final_answer_to_turn(turn, final_text)
+            else:
+                error_text = final_text or ("已中断" if status == "interrupted" else "Kimi Code turn 失败")
+                if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT:
+                    turn["answer_md"] = error_text
+                self._mark_turn_request_failed(turn, error_text)
+            finalized.append(idx)
+        self._clear_kimi_active_turn(chat_id)
+        return finalized
+
+    def _apply_kimi_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None) -> None:
+        target_chat, is_current_target = self._kimi_target_chat(chat_id)
+        if not isinstance(target_chat, dict):
+            return
+        target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
+        if not isinstance(target_turns, list):
+            return
+        if isinstance(turn_idx, int):
+            target_idx = turn_idx if 0 <= turn_idx < len(target_turns) else -1
+        else:
+            target_idx = -1
+        if target_idx < 0:
+            turn_id_value = str(turn_id or "").strip()
+            if turn_id_value:
+                for idx, turn in enumerate(target_turns):
+                    if isinstance(turn, dict) and str(turn.get("kimi_turn_id") or "").strip() == turn_id_value:
+                        target_idx = idx
+                        break
+        if target_idx < 0:
+            metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
+            if isinstance(metadata, dict) and isinstance(metadata.get("turn_idx"), int):
+                candidate = metadata.get("turn_idx")
+                if 0 <= candidate < len(target_turns):
+                    target_idx = candidate
+        if target_idx < 0 and is_current_target and 0 <= self.active_turn_idx < len(target_turns):
+            turn = target_turns[self.active_turn_idx]
+            if (
+                isinstance(turn, dict)
+                and str(turn.get("request_status") or "").strip() == "pending"
+                and is_kimi_model(str(turn.get("model") or ""))
+            ):
+                target_idx = self.active_turn_idx
+        if target_idx < 0 or target_idx >= len(target_turns):
+            return
+        turn = target_turns[target_idx]
+        if not isinstance(turn, dict):
+            return
+        self._mark_turn_request_failed(turn, message)
+        if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT:
+            turn["answer_md"] = str(message or "").strip() or "Kimi Code 请求失败"
+        active_count = self._codex_active_request_turn_count(target_turns)
+        target_chat["kimi_turn_active"] = active_count > 0
+        if is_current_target:
+            self.active_kimi_turn_active = active_count > 0
+            if active_count > 0:
+                self.is_running = True
+                self._active_request_count = active_count
+            else:
+                self.is_running = False
+                self._active_request_count = 0
+                self.new_chat_button.Enable()
+                self._set_input_hint_idle()
+        self._clear_kimi_active_turn(chat_id, target_idx, turn.get("kimi_turn_id"))
+        self._mark_chat_turns_dirty(None if is_current_target else chat_id, target_idx)
+        if not is_current_target:
+            self._refresh_visible_history_chat(str(chat_id or "").strip())
+        self._defer_codex_state_save()
+
+    def _handle_kimi_request_dialog(self, request: dict) -> None:
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        session_id = str(request.get("session_id") or "").strip()
+        chat_id = str(request.get("chat_id") or "").strip()
+        approval_id = str(
+            params.get("approvalId") or params.get("approval_id") or params.get("id") or request.get("request_id") or ""
+        ).strip()
+        description = str(
+            params.get("description") or params.get("message") or params.get("title") or params.get("tool") or ""
+        ).strip() or "Kimi Code 请求批准一个操作。"
+        questions = [
+            {
+                "id": "approval",
+                "header": "Kimi Code 批准请求",
+                "question": description,
+                "options": [
+                    {"label": "批准", "value": "approved"},
+                    {"label": "拒绝", "value": "rejected"},
+                ],
+            }
+        ]
+        dlg = CodexUserInputDialog(self, questions)
+        try:
+            accepted = dlg.ShowModal() == wx.ID_OK
+            answers = dlg.get_answers() if accepted else {}
+        finally:
+            dlg.Destroy()
+        decision = "cancelled"
+        if accepted:
+            values = answers.get("approval") if isinstance(answers, dict) else []
+            if isinstance(values, list) and values:
+                decision = str(values[0] or "").strip() or "approved"
+            else:
+                decision = "approved"
+        threading.Thread(
+            target=self._answer_kimi_approval_worker,
+            args=(session_id, approval_id, decision, chat_id),
+            daemon=True,
+        ).start()
+
+    def _answer_kimi_approval_worker(self, session_id: str, approval_id: str, decision: str, chat_id: str) -> None:
+        try:
+            client = self._ensure_kimi_client()
+            client.start()
+            resolved_approval_id = str(approval_id or "").strip()
+            if not resolved_approval_id and session_id:
+                approvals = client.list_approvals(session_id)
+                if approvals:
+                    first = approvals[0]
+                    if isinstance(first, dict):
+                        resolved_approval_id = str(first.get("id") or first.get("approval_id") or "").strip()
+            if not session_id or not resolved_approval_id:
+                return
+            client.answer_approval(session_id, resolved_approval_id, decision)
+        except Exception as exc:
+            self._call_after_if_alive(self._apply_kimi_error, chat_id, f"回复 Kimi Code 批准请求失败：{exc}")
+
+    def _dispatch_kimi_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
+        if not event:
+            return
+        if not self._is_ui_alive():
+            return
+        should_schedule = False
+        with self._kimi_ui_event_lock:
+            self._pending_kimi_ui_events.append((str(chat_id or "").strip(), event))
+            if not self._kimi_ui_event_flush_scheduled:
+                self._kimi_ui_event_flush_scheduled = True
+                should_schedule = True
+        if should_schedule and not self._call_after_if_alive(self._drain_kimi_ui_events):
+            with self._kimi_ui_event_lock:
+                self._kimi_ui_event_flush_scheduled = False
+
+    def _drain_kimi_ui_events(self) -> None:
+        batch_size = self._kimi_ui_event_batch_size()
+        with self._measure_ui_operation("kimi_ui_event_drain", batch_size=batch_size):
+            with self._kimi_ui_event_lock:
+                batch = self._pending_kimi_ui_events[:batch_size]
+                del self._pending_kimi_ui_events[: len(batch)]
+                has_more = bool(self._pending_kimi_ui_events)
+                self._kimi_ui_event_flush_scheduled = has_more
+            self._background_ui_update_depth += 1
+            try:
+                for queued_chat_id, queued_event in batch:
+                    self._on_kimi_event_for_chat(queued_chat_id, queued_event)
+            finally:
+                self._background_ui_update_depth = max(0, self._background_ui_update_depth - 1)
+                self._flush_deferred_execution_list_updates()
+                if not self._navigation_quiet_active():
+                    self._flush_pending_background_ui_updates()
+                self._start_execution_step_persist_worker()
+            if has_more:
+                if self._wx_main_loop_running():
+                    self._kimi_ui_event_drain_timer = self._call_later_if_alive(
+                        CODEX_UI_EVENT_BATCH_DELAY_MS,
+                        self._drain_kimi_ui_events,
+                    )
+                else:
+                    self._kimi_ui_event_drain_timer = None
+                if (
+                    self._kimi_ui_event_drain_timer is None
+                    and not self._call_after_if_alive(self._drain_kimi_ui_events)
+                ):
+                    with self._kimi_ui_event_lock:
+                        self._kimi_ui_event_flush_scheduled = False
+            else:
+                self._kimi_ui_event_drain_timer = None
+
+    def _kimi_ui_event_batch_size(self) -> int:
+        if self._primary_navigation_control_has_focus():
+            return max(1, min(CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE, CODEX_UI_EVENT_BATCH_SIZE))
+        return CODEX_UI_EVENT_BATCH_SIZE
+
+    def _on_kimi_event(self, event: CodexEvent) -> None:
+        chat_id = self._resolve_kimi_event_chat_id(event)
+        if not chat_id:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self._dispatch_kimi_event_to_ui(chat_id, event)
+            return
+        self._on_kimi_event_for_chat(chat_id, event)
+
+    def _on_kimi_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
+        if not isinstance(event, CodexEvent):
+            return
+        chat_id = str(chat_id or "").strip()
+        event_type = str(getattr(event, "type", "") or "").strip()
+        event_turn_id = self._event_turn_id(event)
+        if not chat_id:
+            chat_id = self._resolve_kimi_event_chat_id(event)
+            if not chat_id:
+                return
+        is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
+        identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        if isinstance(identity_chat, dict) and not self._kimi_event_is_compatible_with_chat(identity_chat, event):
+            return
+        silent_notification = (
+            event_type == "notification"
+            and str(getattr(event, "display_kind", "") or "").strip() in {"session", "unmapped"}
+        )
+        execution_entry = None
+        if event_type not in {"agent_message_delta", "thread_status_changed"} and not silent_notification:
+            execution_entry = self._build_execution_entry(event)
+        if event_type == "agent_message_delta" and str(getattr(event, "display_kind", "") or "").strip() == "assistant":
+            self._accumulate_kimi_answer_delta(chat_id, event)
+        context_usage = self._kimi_context_usage_payload(event) if event_type == "thread_status_changed" else None
+        if not is_current_chat:
+            if event_type == "agent_message_delta":
+                self._buffer_execution_delta(chat_id, event)
+                return
+            self._flush_execution_delta(chat_id, event_turn_id or None)
+            target_chat = self._find_archived_chat(chat_id)
+            if not isinstance(target_chat, dict):
+                return
+            target_turns = target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else []
+            target_idx = self._kimi_event_turn_index(target_turns, event)
+            if context_usage is not None and target_idx >= 0:
+                turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
+                completed_turn = str(turn.get("request_status") or "").strip() == "done"
+                if completed_turn:
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, target_idx), None)
+                    changed = self._set_chat_context_usage(target_chat, context_usage)
+                else:
+                    changed = self._set_pending_context_usage_for_turn(target_chat, target_idx, context_usage)
+                if changed and completed_turn:
+                    self._defer_codex_state_save()
+                return
+            if event_type == "thread_status_changed":
+                return
+            if execution_entry:
+                self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
+            if event_type == "turn_started":
+                self._apply_kimi_turn_started(chat_id, target_chat, target_turns, event, is_current_target=False)
+                self._defer_codex_state_save()
+                return
+            if event_type == "server_request" and str(event.method or "") == "approval":
+                target_chat["kimi_turn_active"] = True
+                target_chat["updated_at"] = time.time()
+                if target_idx >= 0:
+                    self._mark_chat_turns_dirty(chat_id, target_idx)
+                self._refresh_visible_history_chat(chat_id)
+                self._defer_codex_state_save()
+                return
+            if event_type == "error":
+                self._apply_kimi_error(chat_id, str(event.text or "Kimi Code 错误"), target_idx if target_idx >= 0 else None, event_turn_id or None)
+                return
+            if target_idx >= 0 and target_idx < len(target_turns):
+                turn = target_turns[target_idx]
+                if isinstance(turn, dict):
+                    if event_type == "turn_completed":
+                        status = str(getattr(event, "status", "") or "completed").strip() or "completed"
+                        self._finalize_kimi_turn_state(chat_id, target_chat, target_turns, target_idx, event)
+                        if status == "completed":
+                            self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_KIMI_MODEL))
+                    elif event_type == "subagent_result":
+                        if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
+                            target_chat["updated_at"] = time.time()
+                if event_type in {"turn_completed", "subagent_result"}:
+                    self._mark_chat_turns_dirty(chat_id, target_idx)
+                    self._refresh_visible_history_chat(chat_id)
+            self._defer_codex_state_save()
+            return
+        if event_type == "agent_message_delta":
+            self._buffer_execution_delta(chat_id, event)
+            return
+        self._flush_execution_delta(chat_id, event_turn_id or None)
+        if execution_entry:
+            self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
+        if context_usage is not None:
+            target_idx = self._active_kimi_event_target_index(event)
+            if target_idx < 0:
+                target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
+            if target_idx >= 0:
+                turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
+                completed_turn = str(turn.get("request_status") or "").strip() == "done"
+                if completed_turn:
+                    self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(self._current_chat_state, target_idx), None)
+                    changed = self._set_chat_context_usage(self._current_chat_state, context_usage)
+                else:
+                    changed = self._set_pending_context_usage_for_turn(self._current_chat_state, target_idx, context_usage)
+                if changed and completed_turn:
+                    self._defer_codex_state_save()
+            return
+        if event_type == "thread_status_changed":
+            return
+        if event_type == "turn_started":
+            self._apply_kimi_turn_started(chat_id, self._current_chat_state, self.active_session_turns, event, is_current_target=True)
+            self._defer_codex_state_save()
+            return
+        if event_type == "server_request":
+            self._play_finish_sound()
+            if str(event.method or "") == "approval":
+                event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+                self._handle_kimi_request_dialog(
+                    {
+                        "chat_id": chat_id,
+                        "session_id": self._event_thread_id(event) or str(event_data.get("session_id") or ""),
+                        "request_id": event.request_id,
+                        "method": event.method,
+                        "params": event.params,
+                    }
+                )
+            self._defer_chat_state_save()
+            return
+        if event_type == "subagent_result":
+            target_idx = self._active_kimi_event_target_index(event)
+            if target_idx >= 0 and target_idx < len(self.active_session_turns):
+                turn = self.active_session_turns[target_idx]
+                if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
+                    if self._background_ui_mutations_blocked():
+                        self._mark_background_answer_list_dirty()
+                    else:
+                        self._update_active_answer_row(target_idx)
+                        if self._find_answer_row_index(target_idx) < 0 and self.view_mode == "active":
+                            self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+                    self._defer_codex_state_save()
+            return
+        if event_type == "error":
+            self._apply_kimi_error(chat_id, str(event.text or "Kimi Code 错误"), None, event_turn_id or None)
+            return
+        if event_type == "turn_completed":
+            status = str(getattr(event, "status", "") or "completed").strip() or "completed"
+            target_idx = self._active_kimi_event_target_index(event)
+            finalized = self._finalize_kimi_turn_state(chat_id, self._current_chat_state, self.active_session_turns, target_idx, event)
+            self.active_kimi_turn_active = False
+            ui_idx = target_idx if target_idx in finalized else (finalized[0] if finalized else target_idx)
+            turn = {}
+            if 0 <= ui_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[ui_idx], dict):
+                turn = self.active_session_turns[ui_idx]
+                if status == "completed":
+                    self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, ui_idx, str(turn.get("model") or DEFAULT_KIMI_MODEL))
+                if self._background_ui_mutations_blocked():
+                    self._mark_background_answer_list_dirty()
+                else:
+                    for finalized_idx in finalized or [ui_idx]:
+                        self._update_active_answer_row(finalized_idx)
+                self._mark_chat_turns_dirty(start_index=ui_idx)
+            self.is_running = False
+            self._active_request_count = 0
+            self.new_chat_button.Enable()
+            self._set_input_hint_idle()
+            self._play_finish_sound()
+            self._defer_chat_state_save()
+            if self.view_mode == "active":
+                if self._background_ui_mutations_blocked():
+                    self._mark_background_answer_list_dirty()
+                elif self._find_answer_row_index(ui_idx) < 0:
+                    if self._append_completed_answer_to_answer_list(ui_idx, turn):
+                        self._focus_latest_answer()
+                    else:
+                        self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
+            return
+        self._defer_codex_state_save()
 
     def _defer_codex_state_save(self) -> None:
         active_idx = self._active_turn_index_value()
@@ -9651,6 +10830,7 @@ class ChatFrame(wx.Frame):
         self.active_codex_thread_flags = []
         self.active_codex_latest_assistant_text = ""
         self.active_codex_latest_assistant_phase = ""
+        self._reset_active_kimi_session_state()
         self._reset_answer_visible_row_limit()
         self._save_state()
 
@@ -10985,6 +12165,15 @@ class ChatFrame(wx.Frame):
             return False
         return True
 
+    def _wx_main_loop_running(self) -> bool:
+        app = wx.GetApp()
+        if app is None:
+            return False
+        try:
+            return bool(app.IsMainLoopRunning())
+        except Exception:
+            return False
+
     def _call_after_if_alive(self, func, *args, **kwargs) -> bool:
         return wx_call_after_if_alive(func, *args, **kwargs)
 
@@ -11145,6 +12334,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
         self._reset_active_codex_session_state()
+        self._reset_active_kimi_session_state()
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
         self._pending_context_usage_by_turn = {}
@@ -11158,6 +12348,7 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["openclaw_last_event_id"] = self.active_openclaw_last_event_id
         self._current_chat_state["openclaw_last_synced_at"] = self.active_openclaw_last_synced_at
         self._write_active_codex_session_state_to_chat(self._current_chat_state)
+        self._write_active_kimi_session_state_to_chat(self._current_chat_state)
         self._current_chat_state["claudecode_session_id"] = self.active_claudecode_session_id
         self._current_chat_state["context_usage"] = None
         self._current_chat_state["execution_steps"] = []
@@ -11218,6 +12409,11 @@ class ChatFrame(wx.Frame):
         chat["codex_thread_flags"] = []
         chat["codex_latest_assistant_text"] = ""
         chat["codex_latest_assistant_phase"] = ""
+        chat["kimi_session_id"] = ""
+        chat["kimi_turn_id"] = ""
+        chat["kimi_turn_active"] = False
+        chat["kimi_pending_prompt"] = ""
+        chat["kimi_request_queue"] = []
         chat["claudecode_session_id"] = ""
         chat["context_usage"] = None
         chat["execution_steps"] = []
@@ -11243,6 +12439,20 @@ class ChatFrame(wx.Frame):
         chat["codex_thread_flags"] = self.active_codex_thread_flags
         chat["codex_latest_assistant_text"] = self.active_codex_latest_assistant_text
         chat["codex_latest_assistant_phase"] = self.active_codex_latest_assistant_phase
+
+    def _reset_active_kimi_session_state(self) -> None:
+        self.active_kimi_session_id = ""
+        self.active_kimi_turn_id = ""
+        self.active_kimi_turn_active = False
+        self.active_kimi_pending_prompt = ""
+        self.active_kimi_request_queue = []
+
+    def _write_active_kimi_session_state_to_chat(self, chat: dict) -> None:
+        chat["kimi_session_id"] = self.active_kimi_session_id
+        chat["kimi_turn_id"] = self.active_kimi_turn_id
+        chat["kimi_turn_active"] = self.active_kimi_turn_active
+        chat["kimi_pending_prompt"] = self.active_kimi_pending_prompt
+        chat["kimi_request_queue"] = self.active_kimi_request_queue
 
     def _prompt_and_create_named_chat(self) -> bool:
         if not self.new_chat_button.IsEnabled():
@@ -11320,7 +12530,7 @@ class ChatFrame(wx.Frame):
             self._current_chat_state["codex_service_tier"] = codex_service_tier
             self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         worker_question = q
-        if success_attachments and not is_codex_model(resolved_model):
+        if success_attachments and not is_codex_model(resolved_model) and not is_kimi_model(resolved_model):
             attachment_context = self._build_cli_attachment_context(success_attachments)
             worker_question = f"{q}\n\n{attachment_context}".strip() if q else attachment_context
         codex_local_command = self._parse_codex_local_command(q) if is_codex_model(resolved_model) and not outgoing_attachments else None
@@ -11365,6 +12575,54 @@ class ChatFrame(wx.Frame):
                     self._render_answer_list()
             if source == "local":
                 self._start_codex_local_command_worker_for_turn(
+                    chat_id or self.active_chat_id or self.current_chat_id or "",
+                    turn_idx,
+                    command_name,
+                    command_args,
+                    resolved_model,
+                )
+            return True, ""
+        kimi_local_command = self._parse_kimi_local_command(q) if is_kimi_model(resolved_model) and not outgoing_attachments else None
+        if kimi_local_command:
+            command_name = str(kimi_local_command.get("name") or "").strip()
+            command_args = str(kimi_local_command.get("args") or "").strip()
+            now = time.time()
+            turn_idx = len(self.active_session_turns)
+            turn = {
+                "question": display_question,
+                "answer_md": REQUESTING_TEXT,
+                "model": resolved_model,
+                "created_at": now,
+                "local_command": command_name,
+                "local_command_args": command_args,
+            }
+            self.active_session_turns.append(turn)
+            self.active_turn_idx = turn_idx
+            self._mark_chat_turns_dirty(start_index=turn_idx)
+            self._reset_answer_visible_row_limit()
+            self._reset_current_turn_execution_view()
+            self._current_chat_state["updated_at"] = now
+            if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._mark_turn_request_pending(turn, resolved_model, command_name)
+            self.is_running = True
+            self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
+            self.input_edit.SetValue("")
+            self.input_edit.SetFocus()
+            self._pending_input_attachments = []
+            self._defer_chat_state_save()
+            self._play_send_sound()
+            self.SetStatusText(f"正在执行 Kimi Code 命令：/{command_name}")
+            self.view_mode = "active"
+            self.view_history_id = None
+            self._active_answer_row_index = -1
+            if not self._append_submitted_question_to_answer_list(turn_idx, turn):
+                if self._detail_panel_mode() == "execution":
+                    self._render_answer_list_compat(refresh_execution=False)
+                else:
+                    self._render_answer_list()
+            if source == "local":
+                self._start_kimi_local_command_worker_for_turn(
                     chat_id or self.active_chat_id or self.current_chat_id or "",
                     turn_idx,
                     command_name,
@@ -11484,6 +12742,8 @@ class ChatFrame(wx.Frame):
                 self._render_answer_list()
         if is_codex_model(resolved_model) and source == "local":
             self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
+        elif is_kimi_model(resolved_model) and source == "local":
+            self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
         elif is_claudecode_model(resolved_model) and source == "local":
             self._start_claudecode_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, worker_question, self.active_claudecode_session_id)
         else:
@@ -12300,6 +13560,11 @@ class ChatFrame(wx.Frame):
             "codex_latest_assistant_text": self.active_codex_latest_assistant_text,
             "codex_latest_assistant_phase": self.active_codex_latest_assistant_phase,
             "codex_service_tier": self._codex_service_tier_for_chat(self._current_chat_state),
+            "kimi_session_id": self.active_kimi_session_id,
+            "kimi_turn_id": self.active_kimi_turn_id,
+            "kimi_turn_active": self.active_kimi_turn_active,
+            "kimi_pending_prompt": self.active_kimi_pending_prompt,
+            "kimi_request_queue": copy.deepcopy(self.active_kimi_request_queue),
             "claudecode_session_id": self.active_claudecode_session_id,
             "detail_panel_mode": str(self._current_chat_state.get("detail_panel_mode") or "").strip() or "answers",
             "execution_steps": (
@@ -12332,6 +13597,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
         self._reset_active_codex_session_state()
+        self._reset_active_kimi_session_state()
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
         self.view_mode = "active"
@@ -12382,6 +13648,7 @@ class ChatFrame(wx.Frame):
             refresh_lifecycle_after_archive=False,
         )
         self._reset_active_codex_session_state()
+        self._reset_active_kimi_session_state()
         self.current_chat_id = ""
         self.active_chat_id = ""
         now = time.time()
@@ -12407,6 +13674,7 @@ class ChatFrame(wx.Frame):
         self.selected_model = model
         self._current_chat_state["model"] = model
         self._write_active_codex_session_state_to_chat(self._current_chat_state)
+        self._write_active_kimi_session_state_to_chat(self._current_chat_state)
         if is_codex_model(model):
             self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
@@ -14776,6 +16044,11 @@ class ChatFrame(wx.Frame):
         if getattr(self, "_codex_client", None) is not None:
             try:
                 self._codex_client.close()
+            except Exception:
+                pass
+        if getattr(self, "_kimi_client", None) is not None:
+            try:
+                self._kimi_client.close()
             except Exception:
                 pass
         try:

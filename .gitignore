@@ -33,5 +33,6 @@ Thumbs.db
 .codex-home-*/
 codex-home-*/
 app_state.json
+tmp/
 .worktrees/
 docs/multi_agent/__pycache__/
