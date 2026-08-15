@@ -30,6 +30,12 @@ class _ExitingProcess:
     def poll(self) -> int | None:
         return self._poll_results.pop(0)
 
+    def terminate(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
 
 def test_write_creates_nats_server_config(tmp_path: Path) -> None:
     config = NatsRuntimeConfig(
@@ -128,3 +134,26 @@ def test_start_raises_before_spawn_when_nats_port_cannot_bind(
 def test_read_nats_info_ready_requires_info_banner() -> None:
     assert _read_nats_info_ready(_FakeConnection(b"INFO {\"server_id\":\"test\"}\r\n")) is True
     assert _read_nats_info_ready(_FakeConnection(b"HELLO\r\n")) is False
+
+
+def test_process_exit_reports_log_tail_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    token = "do-not-leak-this-token"
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token=token))
+    process.config.runtime_dir.mkdir(parents=True)
+    process.log_path.write_text(f"startup failed token={token}\nuseful diagnostic\n", encoding="utf-8")
+    exited = _ExitingProcess()
+    exited._poll_results = [2]
+    process._process = exited  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError) as caught:
+        process._raise_if_process_exited()
+
+    message = str(caught.value)
+    assert "exited with code 2" in message
+    assert str(process.log_path) in message
+    assert "useful diagnostic" in message
+    assert token not in message
+    assert "<redacted>" in message

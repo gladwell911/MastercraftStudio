@@ -1344,6 +1344,7 @@ class ChatFrame(wx.Frame):
         self._remote_nats_process = None
         self._remote_nats_transport = None
         self._managed_cloudflared_process = None
+        self._managed_cloudflared_log_handle = None
         self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
@@ -11531,10 +11532,14 @@ class ChatFrame(wx.Frame):
         command_line = self._managed_cloudflared_command_line(websocket_port)
         if not command_line:
             return False
+        log_path = self._managed_cloudflared_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._close_managed_cloudflared_log()
+        self._managed_cloudflared_log_handle = log_path.open("ab", buffering=0)
         popen_kwargs = {
             "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stdout": self._managed_cloudflared_log_handle,
+            "stderr": self._managed_cloudflared_log_handle,
         }
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -11544,15 +11549,70 @@ class ChatFrame(wx.Frame):
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             self._managed_cloudflared_process = subprocess.Popen(command_line, **popen_kwargs)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if self._managed_cloudflared_process.poll() is not None:
+                    detail = self._managed_cloudflared_diagnostic()
+                    self._set_status_text_safe(f"cloudflared process exited during startup; {detail}")
+                    self._managed_cloudflared_process = None
+                    self._close_managed_cloudflared_log()
+                    return False
+                time.sleep(0.05)
             return True
-        except Exception:
+        except Exception as exc:
             self._managed_cloudflared_process = None
+            detail = self._managed_cloudflared_diagnostic()
+            self._set_status_text_safe(f"cloudflared process failed to start: {exc}; {detail}")
+            self._close_managed_cloudflared_log()
             return False
+
+    def _managed_cloudflared_log_path(self) -> Path:
+        return resolve_app_data_dir() / "cloudflared" / "cloudflared.log"
+
+    def _managed_cloudflared_log_tail(self, max_bytes: int = 4096) -> str:
+        handle = getattr(self, "_managed_cloudflared_log_handle", None)
+        if handle is not None:
+            try:
+                handle.flush()
+            except Exception:
+                pass
+        try:
+            path = self._managed_cloudflared_log_path()
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - max_bytes), os.SEEK_SET)
+                text = stream.read().decode("utf-8", errors="replace")
+        except OSError:
+            return "<unavailable>"
+        token = str(self._read_remote_control_token() or "")
+        if token:
+            text = text.replace(token, "<redacted>")
+        text = re.sub(r"(?i)(--token\s+|[?&]token=|token\s*[:=]\s*)\S+", r"\1<redacted>", text)
+        return " | ".join(text.splitlines()[-20:]).strip() or "<empty>"
+
+    def _managed_cloudflared_diagnostic(self) -> str:
+        process = getattr(self, "_managed_cloudflared_process", None)
+        exit_code = process.poll() if process is not None else None
+        return (
+            f"exit_code={exit_code}; log: {self._managed_cloudflared_log_path()}; "
+            f"tail: {self._managed_cloudflared_log_tail()}"
+        )
+
+    def _close_managed_cloudflared_log(self) -> None:
+        handle = getattr(self, "_managed_cloudflared_log_handle", None)
+        self._managed_cloudflared_log_handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def _stop_managed_cloudflared_process(self) -> None:
         process = getattr(self, "_managed_cloudflared_process", None)
         self._managed_cloudflared_process = None
         if process is None or process.poll() is not None:
+            self._close_managed_cloudflared_log()
             return
         try:
             process.terminate()
@@ -11563,6 +11623,8 @@ class ChatFrame(wx.Frame):
                 process.wait(timeout=5)
             except Exception:
                 pass
+        finally:
+            self._close_managed_cloudflared_log()
 
     def _remote_runtime_probe_host(self) -> str:
         host = str(self.remote_control_host or "127.0.0.1").strip() or "127.0.0.1"
@@ -11690,6 +11752,8 @@ class ChatFrame(wx.Frame):
                     f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
                 )
             return
+        if managed_cloudflared_started:
+            public_detail = f"{public_detail}; {self._managed_cloudflared_diagnostic()}"
         if managed_cloudflared_started:
             raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 进程公网验证失败。"))
         if not self._restart_cloudflared_service():

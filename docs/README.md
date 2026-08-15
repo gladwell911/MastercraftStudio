@@ -6,6 +6,9 @@
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
+- [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`reflection.md`](./reflection.md)：本轮真实纠错记录
+- [`experience.md`](./experience.md)：已经验证、可复用的排障与运行经验
 
 ## 关键当前事实
 
