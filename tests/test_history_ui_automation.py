@@ -444,8 +444,9 @@ def test_ui_automation_history_enter_allows_switch_during_pending_reply(frame, m
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows[:4] == ["我", "history question", "小诸葛", "history answer"]
-    assert frame.answer_meta[0][0] == "user"
+    assert frame.answer_meta[0][0] == "time"
+    assert rows[1:5] == ["我", "history question", "小诸葛", "history answer"]
+    assert frame.answer_meta[1][0] == "user"
     question_rows = [idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "question"]
     assert question_rows
     assert frame.answer_list.GetString(question_rows[0]) == "history question"
@@ -1048,3 +1049,59 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
     rows = list(frame.execution_list.GetStrings())
 
     assert rows == ["我：please fix tests"]
+
+def test_ui_automation_history_execution_list_excludes_active_chat_turn_context(frame, wx_app, monkeypatch):
+    frame.Show()
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+
+    frame.archived_chats = [
+        {
+            "id": "chat-a",
+            "title": "chat a",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "detail_panel_mode": "execution",
+            "turns": [
+                {
+                    "question": "A 的提问",
+                    "answer_md": "A 的回答",
+                    "model": main.DEFAULT_CODEX_MODEL,
+                    "created_at": 1.0,
+                }
+            ],
+            "execution_steps": [
+                {
+                    "display_kind": "commandExecution",
+                    "list_text": "A 的执行步骤",
+                    "detail_text": "A 的执行步骤",
+                    "turn_idx": 0,
+                }
+            ],
+        }
+    ]
+
+    frame._on_new_chat_clicked(None)
+    frame.active_session_turns.append(
+        {
+            "question": "B 的提问",
+            "answer_md": "B 的回答",
+            "model": main.DEFAULT_CODEX_MODEL,
+            "created_at": 2.0,
+        }
+    )
+    frame.active_turn_idx = 0
+
+    assert frame._show_history_chat("chat-a")
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    history_rows = list(frame.execution_list.GetStrings())
+    assert any("A 的提问" in row for row in history_rows)
+    assert not any("B 的提问" in row or "B 的回答" in row for row in history_rows)
+
+    assert frame._show_history_chat(frame.active_chat_id)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    active_rows = list(frame.execution_list.GetStrings())
+    assert any("B 的提问" in row for row in active_rows)

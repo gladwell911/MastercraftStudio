@@ -725,6 +725,19 @@ class NotesStore:
     def move_entry_to_top(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         return self.pin_entry(entry_id, True, record_outbox=record_outbox)
 
+    def move_entry_to_unpinned_top(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
+        current = self.get_entry(entry_id, include_deleted=True)
+        if current is None:
+            raise KeyError(entry_id)
+        entries = [
+            item
+            for item in self.list_entries(current.notebook_id, include_deleted=True)
+            if not item.deleted_at and not item.pinned and item.id != entry_id
+        ]
+        min_sort = min((int(item.sort_order) for item in entries), default=None)
+        sort_order = min_sort - 1 if min_sort is not None else 0
+        return self._update_entry_position(entry_id, sort_order=sort_order, pinned=False, record_outbox=record_outbox)
+
     def move_entry_up(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         return self._move_entry_by_delta(entry_id, -1, record_outbox=record_outbox)
 

@@ -18,6 +18,7 @@ import winsound
 import sys
 from contextlib import contextmanager
 from ctypes import wintypes
+from datetime import datetime
 from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -587,6 +588,34 @@ def sanitize_optimized_text(text: str) -> str:
                 seen_norm.add(norm)
             cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
+
+
+WECHAT_TIME_GAP_SECONDS = 300.0
+
+
+def should_show_time(prev_ts, ts, gap_seconds: float = WECHAT_TIME_GAP_SECONDS) -> bool:
+    if prev_ts is None:
+        return True
+    try:
+        current = float(ts)
+        previous = float(prev_ts)
+    except (TypeError, ValueError):
+        return True
+    return current - previous > float(gap_seconds)
+
+
+def wechat_time_label(ts: float, now: float) -> str:
+    moment = datetime.fromtimestamp(float(ts))
+    reference = datetime.fromtimestamp(float(now))
+    clock = moment.strftime("%H:%M")
+    day_delta = (reference.date() - moment.date()).days
+    if day_delta <= 0:
+        return clock
+    if day_delta == 1:
+        return f"昨天 {clock}"
+    if day_delta <= 7:
+        return f"星期{'一二三四五六日'[moment.weekday()]} {clock}"
+    return f"{moment.year}年{moment.month}月{moment.day}日 {clock}"
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -1714,7 +1743,7 @@ class ChatFrame(wx.Frame):
         self.new_chat_button.Bind(wx.EVT_CHAR, self._on_generic_key_down)
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
-        self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(auto_resend_first=True), id=int(self._clear_context_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_common_commands_surface(), id=int(self._common_commands_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_file_manager(), id=int(self._file_manager_menu_id))
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
@@ -3770,6 +3799,40 @@ class ChatFrame(wx.Frame):
                 self.answer_list.Append(label)
             self.answer_meta.append(meta)
 
+    def _turn_time_row_label(self, turn: dict, prev_turn: dict | None, now_ts: float) -> str:
+        try:
+            ts_value = float((turn or {}).get("created_at"))
+        except (TypeError, ValueError):
+            return ""
+        prev_value = None
+        if prev_turn is not None:
+            try:
+                prev_value = float((prev_turn or {}).get("created_at"))
+            except (TypeError, ValueError):
+                prev_value = None
+        if not should_show_time(prev_value, ts_value):
+            return ""
+        return wechat_time_label(ts_value, now_ts)
+
+    def _maybe_append_time_row_to_answer_list(self, turn_idx: int, turn: dict) -> None:
+        for meta in list(getattr(self, "answer_meta", []) or []):
+            if meta and len(meta) > 1 and meta[0] == "time" and meta[1] == int(turn_idx):
+                return
+        prev_turn = None
+        if turn_idx > 0:
+            turns = self._get_view_turns()
+            if isinstance(turns, list) and 0 <= turn_idx - 1 < len(turns):
+                prev_turn = turns[turn_idx - 1]
+        label = self._turn_time_row_label(turn, prev_turn, time.time())
+        if not label:
+            return
+        meta = ("time", int(turn_idx), label, "")
+        if hasattr(self, "answer_list_model"):
+            self.answer_list_model.append(self._answer_row_id(meta), label)
+        else:
+            self.answer_list.Append(label)
+        self.answer_meta.append(meta)
+
     def _input_attachment_marker_text(self, attachments: list[dict]) -> str:
         names = [str((item or {}).get("name") or "").strip() for item in attachments or [] if str((item or {}).get("name") or "").strip()]
         if not names:
@@ -4420,6 +4483,8 @@ class ChatFrame(wx.Frame):
             turn_idx = int(meta[1] if len(meta) > 1 else -1)
         except Exception:
             turn_idx = -1
+        if kind == "time":
+            return f"time:{turn_idx}"
         if kind in {"user", "question", "ai", "answer", "attachment"}:
             detail = str(meta[3] if len(meta) > 3 else "")
             if kind == "attachment":
@@ -4445,10 +4510,12 @@ class ChatFrame(wx.Frame):
         if selected_meta is None:
             return
         for new_idx, meta in enumerate(self.answer_meta):
-            if selected_meta[0] in {"context_usage", "current_model"}:
+            if selected_meta[0] in {"context_usage", "current_model", "time"}:
                 matched = meta[0] == "context_usage"
                 if selected_meta[0] == "current_model":
                     matched = meta[0] == "current_model"
+                if selected_meta[0] == "time":
+                    matched = meta[0] == "time" and len(meta) > 1 and len(selected_meta) > 1 and meta[1] == selected_meta[1]
             else:
                 matched = meta == selected_meta
             if matched:
@@ -4505,6 +4572,7 @@ class ChatFrame(wx.Frame):
             turn_offset = len(turns) - limit
             visible_turns = turns[turn_offset:]
             force_has_more = True
+        now_ts = time.time()
         for local_i, t in enumerate(visible_turns):
             i = turn_offset + local_i
             q = str(t.get("question") or "")
@@ -4522,6 +4590,13 @@ class ChatFrame(wx.Frame):
                 and bool(a_md.strip())
             )
             should_show_user_label = show_user_rows and ((q.strip() and not attachment_only_summary) or bool(attachments))
+            turn_emits_rows = should_show_user_label or bool(attachments) or show_pending_placeholder or bool(received_attachments)
+            if turn_emits_rows:
+                prev_turn = turns[i - 1] if i > 0 else None
+                time_label = self._turn_time_row_label(t, prev_turn, now_ts)
+                if time_label:
+                    rows.append(time_label)
+                    metas.append(("time", i, time_label, ""))
             if should_show_user_label:
                 rows.append("我")
                 metas.append(("user", i, "我", ""))
@@ -4723,6 +4798,7 @@ class ChatFrame(wx.Frame):
             for row in sorted(empty_rows, reverse=True):
                 del self.answer_meta[row]
 
+        self._maybe_append_time_row_to_answer_list(int(turn_idx), turn)
         meta = ("user", int(turn_idx), "我", "")
         if hasattr(self, "answer_list_model"):
             self.answer_list_model.append(self._answer_row_id(meta), "我")
@@ -4843,6 +4919,7 @@ class ChatFrame(wx.Frame):
         if not answer_text:
             return False
         self._refresh_context_usage_header_rows()
+        self._maybe_append_time_row_to_answer_list(int(turn_idx), turn)
         meta = ("ai", int(turn_idx), "小诸葛", "")
         if hasattr(self, "answer_list_model"):
             self.answer_list_model.append(self._answer_row_id(meta), "小诸葛")
@@ -5057,6 +5134,7 @@ class ChatFrame(wx.Frame):
                 steps = chat.get("execution_steps")
                 if isinstance(steps, list):
                     return steps
+            return []
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
         steps = state.get("execution_steps")
         if not isinstance(steps, list):
@@ -6111,8 +6189,13 @@ class ChatFrame(wx.Frame):
         return self._execution_meta_tuple(-1, step)[2]
 
     def _execution_turn_context_steps(self, steps: list) -> list:
-        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
-        turns = state.get("turns") if isinstance(state.get("turns"), list) else []
+        if getattr(self, "view_mode", "") == "history" and str(getattr(self, "view_history_id", "") or "").strip():
+            viewed_chat = self._hydrate_chat_from_store(self._find_archived_chat(self.view_history_id))
+            viewed_turns = viewed_chat.get("turns") if isinstance(viewed_chat, dict) else []
+            turns = viewed_turns if isinstance(viewed_turns, list) else []
+        else:
+            state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+            turns = state.get("turns") if isinstance(state.get("turns"), list) else []
         if not turns:
             return list(steps or [])
         turn_indices: list[int] = []
@@ -11950,7 +12033,7 @@ class ChatFrame(wx.Frame):
             self._submit_question("继续", source="local")
             return
         if self._is_clear_context_shortcut(key, alt_down):
-            self._clear_context_and_start_new_chat()
+            self._clear_context_and_start_new_chat(auto_resend_first=True)
             return
         if ctrl_down and key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             direction = -1 if key == wx.WXK_LEFT else 1
@@ -12088,7 +12171,7 @@ class ChatFrame(wx.Frame):
             self._trigger_send()
             return
         if self._is_clear_context_shortcut(key, event.AltDown()):
-            self._clear_context_and_start_new_chat()
+            self._clear_context_and_start_new_chat(auto_resend_first=True)
             return
         if self._is_new_chat_shortcut(key, event.AltDown()):
             self._trigger_new_chat()
@@ -12374,7 +12457,7 @@ class ChatFrame(wx.Frame):
             ev.SetEventObject(self.new_chat_button)
             wx.PostEvent(self.new_chat_button, ev)
 
-    def _clear_context_and_start_new_chat(self) -> bool:
+    def _clear_context_and_start_new_chat(self, auto_resend_first: bool = False) -> bool:
         if not self.new_chat_button.IsEnabled():
             return False
         visible_history_id = str(getattr(self, "view_history_id", "") or "").strip()
@@ -12388,6 +12471,14 @@ class ChatFrame(wx.Frame):
             self.active_chat_id = self._ensure_active_chat_id()
         if not self.current_chat_id:
             self.current_chat_id = self.active_chat_id
+        first_question = ""
+        for t in self.active_session_turns or []:
+            if not isinstance(t, dict) or t.get("local_command"):
+                continue
+            q = str(t.get("question") or "").strip()
+            if q:
+                first_question = q
+                break
         self.active_session_turns = []
         self.active_session_started_at = now
         self.active_turn_idx = -1
@@ -12422,7 +12513,10 @@ class ChatFrame(wx.Frame):
         self._defer_chat_state_save()
         self._mark_openclaw_lifecycle_dirty()
         self._push_remote_history_changed(self.active_chat_id)
+        self._push_remote_state(self.active_chat_id)
         self.SetStatusText("已清空上下文")
+        if auto_resend_first and first_question:
+            self._submit_question(first_question, source="local")
         return True
 
     def _clear_context_for_chat_id(self, chat_id: str) -> str:
@@ -15396,8 +15490,13 @@ class ChatFrame(wx.Frame):
             i_up_entry = wx.NewIdRef()
             i_down_entry = wx.NewIdRef()
             i_bottom_entry = wx.NewIdRef()
+            i_unbottom_entry = wx.NewIdRef()
             i_import_file = wx.NewIdRef()
             i_import_clip = wx.NewIdRef()
+            current_entry = self._notes_current_entry()
+            entry_pinned = bool(getattr(current_entry, "pinned", False))
+            visible_entry_ids = [str(item) for item in getattr(self, "_notes_entry_ids", [])]
+            entry_is_last = current_entry is not None and bool(visible_entry_ids) and visible_entry_ids[-1] == str(current_entry.id)
             menu.Append(i_new_entry, "新建笔记条目")
             menu.Append(i_copy_entry, "复制笔记条目")
             menu.Append(i_export_all, "导出所有笔记")
@@ -15406,10 +15505,12 @@ class ChatFrame(wx.Frame):
             menu.Append(i_export_up, "向上导出全部到剪贴板")
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
-            menu.Append(i_pin_entry, "置顶笔记条目")
+            menu.Append(i_pin_entry, "取消置顶笔记条目" if entry_pinned else "置顶笔记条目")
             menu.Append(i_up_entry, "向上移动笔记条目")
             menu.Append(i_down_entry, "向下移动笔记条目")
             menu.Append(i_bottom_entry, "置底笔记条目")
+            menu.Append(i_unbottom_entry, "取消置底笔记条目")
+            menu.Enable(i_unbottom_entry, entry_is_last)
             menu.AppendSeparator()
             menu.Append(i_import_file, "从文件导入")
             menu.Append(i_import_clip, "从剪贴板导入")
@@ -15421,10 +15522,11 @@ class ChatFrame(wx.Frame):
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("up"), id=i_export_up)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
-            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_top(), id=i_pin_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_toggle_entry_pin(), id=i_pin_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=i_up_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=i_down_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_bottom(), id=i_bottom_entry)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_unbottom_entry(), id=i_unbottom_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_file(), id=i_import_file)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_import_from_clipboard(), id=i_import_clip)
         else:
@@ -15678,6 +15780,18 @@ class ChatFrame(wx.Frame):
     def _notes_move_entry_to_bottom(self) -> bool:
         return self._notes_move_selected_entry("bottom")
 
+    def _notes_toggle_entry_pin(self) -> bool:
+        entry = self._notes_current_entry()
+        if entry is not None and bool(getattr(entry, "pinned", False)):
+            return self._notes_unpin_entry()
+        return self._notes_move_selected_entry("top")
+
+    def _notes_unpin_entry(self) -> bool:
+        return self._notes_move_selected_entry("unpin")
+
+    def _notes_unbottom_entry(self) -> bool:
+        return self._notes_move_selected_entry("unbottom")
+
     def _notes_move_selected_entry(self, direction: str) -> bool:
         entry = self._notes_current_entry()
         if entry is None:
@@ -15691,6 +15805,10 @@ class ChatFrame(wx.Frame):
             moved = self.notes_store.move_entry_to_top(entry.id)
         elif direction_key == "bottom":
             moved = self.notes_store.move_entry_to_bottom(entry.id)
+        elif direction_key == "unpin":
+            moved = self.notes_store.pin_entry(entry.id, False)
+        elif direction_key == "unbottom":
+            moved = self.notes_store.move_entry_to_unpinned_top(entry.id)
         else:
             return False
         self._invalidate_notes_projection()
@@ -16209,4 +16327,5 @@ class ChatApp(wx.App):
 if __name__ == "__main__":
     app = ChatApp()
     app.MainLoop()
+
 

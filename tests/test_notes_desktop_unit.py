@@ -1719,6 +1719,130 @@ def test_notes_store_reorders_entries_with_pin_top_bottom_and_step_moves(tmp_pat
     assert [entry.id for entry in store.list_entries(notebook.id)] == [first.id, second.id, fourth.id, third.id]
 
 
+def test_notes_store_move_entry_to_unpinned_top_restores_bottom_entry(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("unbottom notebook")
+    pinned = store.create_entry(notebook.id, "pinned", source="manual", sort_order=10)
+    first = store.create_entry(notebook.id, "first", source="manual", sort_order=20)
+    second = store.create_entry(notebook.id, "second", source="manual", sort_order=30)
+    bottom = store.create_entry(notebook.id, "bottom", source="manual", sort_order=40)
+    store.pin_entry(pinned.id)
+
+    moved = store.move_entry_to_unpinned_top(bottom.id)
+    assert moved.pinned is False
+    assert [entry.id for entry in store.list_entries(notebook.id)] == [pinned.id, bottom.id, first.id, second.id]
+
+    # unpin keeps the entry at its current position
+    unpinned = store.pin_entry(pinned.id, False)
+    assert unpinned.pinned is False
+    assert [entry.id for entry in store.list_entries(notebook.id)][0] == pinned.id
+
+    # no other unpinned entries: falls back to sort_order 0 without moving relative order
+    solo = store.create_notebook("solo notebook")
+    only = store.create_entry(solo.id, "only", source="manual", sort_order=5)
+    moved_solo = store.move_entry_to_unpinned_top(only.id)
+    assert moved_solo.pinned is False
+    assert [entry.id for entry in store.list_entries(solo.id)] == [only.id]
+
+
+def test_notes_entry_menu_unpin_item_toggles_pinned_entry(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("unpin menu notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first", source="manual", sort_order=10)
+    second = frame.notes_store.create_entry(notebook.id, "second", source="manual", sort_order=20)
+    third = frame.notes_store.create_entry(notebook.id, "third", source="manual", sort_order=30)
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(second.id))
+
+    captured = {"items": []}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId(), item.IsEnabled()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+
+    frame._notes_move_entry_to_top()
+    assert frame.notes_store.get_entry(second.id).pinned is True
+
+    frame._show_notes_menu()
+
+    labels = [label for label, _item_id, _enabled in captured["items"]]
+    assert "取消置顶笔记条目" in labels
+    assert "置顶笔记条目" not in labels
+    assert "取消置底笔记条目" in labels
+    unbottom_enabled = next(enabled for label, _item_id, enabled in captured["items"] if label == "取消置底笔记条目")
+    assert unbottom_enabled is False
+
+    unpin_item_id = next(item_id for label, item_id, _enabled in captured["items"] if label == "取消置顶笔记条目")
+    event = wx.CommandEvent(wx.wxEVT_MENU, unpin_item_id)
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert frame.notes_store.get_entry(second.id).pinned is False
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)][0] == second.id
+    assert frame._notes_selected_entry_id() == second.id
+
+
+def test_notes_entry_menu_unbottom_item_moves_last_entry_to_unpinned_top(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("unbottom menu notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first", source="manual", sort_order=10)
+    second = frame.notes_store.create_entry(notebook.id, "second", source="manual", sort_order=20)
+    third = frame.notes_store.create_entry(notebook.id, "third", source="manual", sort_order=30)
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(third.id))
+
+    captured = {"items": []}
+    monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
+    monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
+    monkeypatch.setattr(frame, "PopupMenu", lambda menu: captured.__setitem__(
+        "items",
+        [(item.GetItemLabelText(), item.GetId(), item.IsEnabled()) for item in menu.GetMenuItems() if not item.IsSeparator()],
+    ))
+
+    frame._show_notes_menu()
+
+    labels = [label for label, _item_id, _enabled in captured["items"]]
+    assert "置顶笔记条目" in labels
+    assert "取消置顶笔记条目" not in labels
+    unbottom = next((label, item_id, enabled) for label, item_id, enabled in captured["items"] if label == "取消置底笔记条目")
+    assert unbottom[2] is True
+
+    event = wx.CommandEvent(wx.wxEVT_MENU, unbottom[1])
+    event.SetEventObject(frame)
+    frame.ProcessEvent(event)
+
+    assert frame.notes_store.get_entry(third.id).pinned is False
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [third.id, first.id, second.id]
+    assert frame._notes_selected_entry_id() == third.id
+
+
+def test_notes_sync_entry_payload_round_trips_pinned(tmp_path):
+    from notes_store import EntryDoc
+    from notes_sync import NotesSyncService
+
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("sync pinned notebook")
+    entry = store.create_entry(notebook.id, "sync me", source="manual")
+    store.pin_entry(entry.id)
+
+    service = NotesSyncService(store)
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry.id,)).fetchone()
+    payload = service._entry_to_couch_document(EntryDoc.from_row(dict(row)))
+    assert payload["pinned"] is True
+
+    remote_store = NotesStore(tmp_path / "remote.db", device_id="mobile-test")
+    remote_store.initialize()
+    remote_service = NotesSyncService(remote_store)
+    with remote_store._connect() as conn:
+        remote_service._upsert_remote_entry(conn, payload)
+    synced = remote_store.get_entry(entry.id)
+    assert synced is not None
+    assert synced.pinned is True
+
+
 def test_notes_entry_ctrl_arrow_shortcuts_move_selected_entry(frame, monkeypatch):
     notebook = frame.notes_store.create_notebook("shortcut move notebook")
     first = frame.notes_store.create_entry(notebook.id, "first", source="manual", sort_order=10)

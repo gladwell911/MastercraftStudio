@@ -533,3 +533,32 @@ def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeyp
         ("final_answer", "chat-e2e", "desktop received: hello from emulator"),
         ("history", "chat-e2e"),
     ]
+
+def test_clear_context_active_chat_pushes_history_and_state_events(frame, monkeypatch):
+    frame.active_chat_id = "chat-e2e"
+    frame.current_chat_id = "chat-e2e"
+    frame.active_session_turns = [
+        {"question": "hello", "answer_md": "world", "model": "openai/gpt-5.2", "created_at": 1.0}
+    ]
+    frame._current_chat_state["id"] = "chat-e2e"
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    published = []
+
+    class _FakeNatsTransport:
+        def publish_event_threadsafe(self, payload):
+            published.append(payload)
+            return True
+
+    frame._remote_nats_transport = _FakeNatsTransport()
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+
+    assert frame._clear_context_and_start_new_chat() is True
+
+    event_types = [event["type"] for event in published]
+    assert "history_changed" in event_types
+    assert "state" in event_types
+    state_event = next(event for event in published if event["type"] == "state")
+    assert state_event["chat_id"] == "chat-e2e"
+    assert state_event["body"].get("turns") == []

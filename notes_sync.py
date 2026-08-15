@@ -180,6 +180,7 @@ class NotesSyncService:
             "notebook_id": _couch_doc_id("notebook", doc.notebook_id),
             "content": doc.content,
             "sort_order": doc.sort_order,
+            "pinned": bool(doc.pinned),
             "source": doc.source,
             "created_at": doc.created_at,
             "updated_at": doc.updated_at,
@@ -318,6 +319,7 @@ class NotesSyncService:
             created_at,
             updated_at,
             int(doc.get("sort_order") or 0),
+            int(bool(doc.get("pinned"))),
             int(doc.get("version") or 1),
             str(doc.get("device_id") or ""),
             str(doc.get("last_modified_by") or _modifier_from_device(str(doc.get("device_id") or ""), "mobile")),
@@ -332,10 +334,10 @@ class NotesSyncService:
                 """
                 INSERT INTO entries (
                     id, notebook_id, content, created_at, updated_at,
-                    sort_order, version, device_id, last_modified_by,
+                    sort_order, pinned, version, device_id, last_modified_by,
                     is_conflict_copy, origin_entry_id, source,
                     rev, deleted, dirty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 payload,
             )
@@ -344,7 +346,7 @@ class NotesSyncService:
                 """
                 UPDATE entries
                 SET notebook_id = ?, content = ?, created_at = ?, updated_at = ?,
-                    sort_order = ?, version = ?, device_id = ?, last_modified_by = ?,
+                    sort_order = ?, pinned = ?, version = ?, device_id = ?, last_modified_by = ?,
                     is_conflict_copy = ?, origin_entry_id = ?, source = ?,
                     rev = ?, deleted = ?, dirty = 0
                 WHERE id = ?
@@ -363,6 +365,7 @@ class NotesSyncService:
                     payload[11],
                     payload[12],
                     payload[13],
+                    payload[14],
                     entry_id,
                 ),
             )

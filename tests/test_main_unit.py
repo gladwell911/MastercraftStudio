@@ -144,7 +144,7 @@ def test_char_hook_touches_quiet_window_before_alt_a_clear(frame, monkeypatch):
     frame._current_chat_state = {"id": "chat-a", "turns": []}
     observed = []
 
-    def fake_clear():
+    def fake_clear(**_kwargs):
         observed.append(frame._navigation_quiet_until)
         return True
 
@@ -4914,7 +4914,8 @@ def test_render_answer_list_inserts_context_usage_row_first(frame):
     assert frame.answer_list.GetString(0) == "113k / 272k"
     assert frame.answer_meta[0] == ("context_usage", -1, "113k / 272k", "")
     assert all(meta[0] != "current_model" for meta in frame.answer_meta)
-    assert frame.answer_list.GetString(1) == "我"
+    assert frame.answer_meta[1][0] == "time"
+    assert frame.answer_list.GetString(2) == "我"
 
 
 def test_render_answer_list_keeps_empty_state_below_context_row(frame):
@@ -4951,9 +4952,10 @@ def test_render_answer_list_history_context_fallback_uses_latest_turn_model(fram
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "我"
+    assert frame.answer_meta[0][0] == "time"
+    assert frame.answer_list.GetString(1) == "我"
     assert all(meta[0] != "current_model" for meta in frame.answer_meta)
-    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_list.GetString(2) == "历史问题"
 
 
 def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
@@ -4969,7 +4971,8 @@ def test_render_answer_list_does_not_estimate_openclaw_without_usage(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "我"
+    assert frame.answer_meta[0][0] == "time"
+    assert frame.answer_list.GetString(1) == "我"
     assert all(meta[0] != "context_usage" for meta in frame.answer_meta)
 
 
@@ -5298,8 +5301,9 @@ def test_active_pending_codex_token_count_event_does_not_refresh_context_usage_r
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
-    frame.answer_list.SetSelection(1)
+    frame.answer_list.SetSelection(2)
     assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_meta[1][0] == "time"
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -5308,8 +5312,8 @@ def test_active_pending_codex_token_count_event_does_not_refresh_context_usage_r
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
     assert frame.answer_list.GetString(0) == "暂无"
-    assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "user"
+    assert frame.answer_list.GetSelection() == 2
+    assert frame.answer_meta[2][0] == "user"
 
 
 def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_state(frame, monkeypatch):
@@ -9570,8 +9574,8 @@ def test_render_answer_list_shows_each_uploaded_attachment_on_its_own_line(frame
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "user"
-    assert rows == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
+    assert frame.answer_meta[0][0] == "time"
+    assert rows[1:] == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
 
 
 def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn(frame, tmp_path):
@@ -9600,8 +9604,8 @@ def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
-    assert meta_types == ["user", "attachment", "ai", "answer"]
+    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
+    assert meta_types == ["time", "user", "attachment", "ai", "answer"]
 
 
 def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch, tmp_path):
@@ -9640,8 +9644,9 @@ def test_on_done_keeps_attachment_only_turn_answer_at_bottom(frame, monkeypatch,
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "最终回答"]
-    assert meta_types[1:] == ["user", "attachment", "ai", "answer"]
+    assert meta_types[1] == "time"
+    assert rows[2:] == ["我", "图片上传成功", "小诸葛", "最终回答"]
+    assert meta_types[2:] == ["user", "attachment", "ai", "answer"]
 
 
 def test_codex_image_item_event_records_received_attachment(frame, monkeypatch, tmp_path):
@@ -12491,10 +12496,11 @@ def test_submit_question_appends_new_question_without_refreshing_answer_list(fra
 
     assert ok is True
     assert message == ""
-    assert operations == [("Append", "我"), ("Append", "新问题")]
+    time_label = main.wechat_time_label(frame.active_session_turns[1]["created_at"], time.time())
+    assert operations == [("Append", time_label), ("Append", "我"), ("Append", "新问题")]
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows[-2:] == ["我", "新问题"]
-    assert frame.answer_meta[-2:] == [("user", 1, "我", ""), ("question", 1, "新问题", "")]
+    assert rows[-3:] == [time_label, "我", "新问题"]
+    assert frame.answer_meta[-3:] == [("time", 1, time_label, ""), ("user", 1, "我", ""), ("question", 1, "新问题", "")]
 
 
 def test_notes_projection_reuses_document_snapshot_until_cursor_changes(frame, monkeypatch):
@@ -14506,8 +14512,8 @@ def test_render_answer_list_hides_blank_user_for_assistant_only_turn(frame):
     frame._render_answer_list()
 
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "ai"
-    assert items == ["小诸葛", "只有回答"]
+    assert frame.answer_meta[0][0] == "time"
+    assert items[1:] == ["小诸葛", "只有回答"]
 
 
 def test_codex_answer_filter_menu_label_changes_with_state(frame):
@@ -18293,3 +18299,61 @@ def test_openclaw_offset_only_poll_does_not_save_state(frame, monkeypatch):
     assert frame.active_openclaw_sync_offset == 20
 
 
+
+def test_clear_context_auto_resend_first_question_only_when_requested(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "第一条问题", "answer_md": "回答一", "model": main.DEFAULT_CODEX_MODEL},
+        {"question": "第二条问题", "answer_md": "回答二", "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    submitted = []
+    monkeypatch.setattr(
+        frame,
+        "_submit_question",
+        lambda question, **kwargs: submitted.append((question, kwargs)) or (True, ""),
+    )
+
+    assert frame._clear_context_and_start_new_chat() is True
+    assert submitted == []
+
+    frame.active_session_turns = [
+        {"question": "第一条问题", "answer_md": "回答一", "model": main.DEFAULT_CODEX_MODEL},
+        {"question": "第二条问题", "answer_md": "回答二", "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+
+    assert frame._clear_context_and_start_new_chat(auto_resend_first=True) is True
+    assert frame.active_session_turns == []
+    assert frame._current_chat_state["turns"] == []
+    assert submitted == [("第一条问题", {"source": "local"})]
+
+
+def test_clear_context_auto_resend_skips_local_command_turns(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "本地命令", "local_command": True, "model": main.DEFAULT_CODEX_MODEL},
+        {"question": "真正的问题", "answer_md": "回答", "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
+    submitted = []
+    monkeypatch.setattr(
+        frame,
+        "_submit_question",
+        lambda question, **kwargs: submitted.append(question) or (True, ""),
+    )
+
+    assert frame._clear_context_and_start_new_chat(auto_resend_first=True) is True
+    assert submitted == ["真正的问题"]
