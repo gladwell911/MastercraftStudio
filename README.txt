@@ -51,6 +51,8 @@ setx OPENROUTER_API_KEY "你的Key"
 
 默认使用 `zgwd.spec`，产物输出到 `C:\code\cx\mc\`。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
 
+打包目录同时包含 GUI 程序 `mc.exe` 和后台协议程序 `mc_worker.exe`；两者必须保持同目录。`mc_worker.exe` 专供 `mc.exe` 处理 Codex 的 UTF-8 JSONL 通信，请勿单独作为桌面程序启动。
+
 ## 代码入口
 
 - `main.py`：主界面与大部分应用逻辑

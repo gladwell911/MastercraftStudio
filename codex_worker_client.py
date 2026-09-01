@@ -42,6 +42,8 @@ class CodexWorkerClient:
         self._send_lock = threading.Lock()
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=20)
+        self._ready_event = threading.Event()
         self._closed = False
         self._pending_notification = False
 
@@ -49,7 +51,8 @@ class CodexWorkerClient:
         with self._lifecycle_lock:
             if self.process is not None and self.process.poll() is None:
                 return
-            args = [sys.executable, "-m", self.worker_module]
+            args = self._worker_command()
+            self._stderr_tail.clear()
             if self.process_factory is not None:
                 self.process = self.process_factory(args)
             else:
@@ -67,11 +70,30 @@ class CodexWorkerClient:
                     creationflags=self._creationflags(),
                 )
             self._closed = False
+            self._ready_event.clear()
             if self.start_reader_threads:
                 self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
                 self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
                 self._stdout_thread.start()
                 self._stderr_thread.start()
+            if getattr(sys, "frozen", False) and self.start_reader_threads:
+                if not self._ready_event.wait(timeout=5.0):
+                    failed_process = self.process
+                    returncode = failed_process.poll() if failed_process is not None else None
+                    if failed_process is not None and returncode is None:
+                        try:
+                            failed_process.terminate()
+                            failed_process.wait(timeout=2.0)
+                        except Exception:
+                            try:
+                                failed_process.kill()
+                            except Exception:
+                                pass
+                    self.process = None
+                    raise RuntimeError(
+                        "Codex worker did not become ready"
+                        f" (exit code {returncode}).{self._worker_stderr_detail()}"
+                    )
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -196,7 +218,10 @@ class CodexWorkerClient:
         try:
             for line in stream:
                 try:
-                    self._enqueue_worker_message(decode_worker_line(line))
+                    message = decode_worker_line(line)
+                    if message.get("type") == "ready":
+                        self._ready_event.set()
+                    self._enqueue_worker_message(message)
                 except CodexWorkerProtocolError:
                     continue
                 except Exception:
@@ -210,8 +235,10 @@ class CodexWorkerClient:
         if stream is None:
             return
         try:
-            for _line in stream:
-                pass
+            for line in stream:
+                text = str(line or "").strip()
+                if text:
+                    self._stderr_tail.append(text)
         except Exception:
             pass
 
@@ -220,15 +247,68 @@ class CodexWorkerClient:
             if self._closed and not allow_closed:
                 raise RuntimeError("Codex worker client is closed.")
             proc = self.process
+            if proc is None and allow_closed:
+                return
             if proc is None:
                 raise RuntimeError("Codex worker process is not started.")
-            stdin = getattr(proc, "stdin", None)
-            if stdin is None:
-                raise RuntimeError("Codex worker process has no stdin.")
             line = encode_worker_message(message)
-            with self._send_lock:
-                stdin.write(line)
-                stdin.flush()
+            if proc.poll() is not None:
+                if allow_closed:
+                    return
+                proc = self._restart_after_send_failure(proc)
+            try:
+                self._write_worker_line(proc, line)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                if allow_closed:
+                    return
+                try:
+                    self._restart_after_send_failure(proc, exc)
+                except RuntimeError as restart_error:
+                    raise restart_error from exc
+                raise RuntimeError(
+                    "Codex worker closed while sending the message. It has been restarted; please retry the message."
+                    f"{self._worker_stderr_detail()}"
+                ) from exc
+
+    def _worker_command(self) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [str(Path(sys.executable).with_name("mc_worker.exe"))]
+        return [sys.executable, "-m", self.worker_module]
+
+    def _write_worker_line(self, proc: Any, line: str) -> None:
+        stdin = getattr(proc, "stdin", None)
+        if stdin is None:
+            raise BrokenPipeError("Codex worker process has no stdin.")
+        with self._send_lock:
+            if proc.poll() is not None:
+                raise BrokenPipeError("Codex worker process has exited.")
+            stdin.write(line)
+            stdin.flush()
+
+    def _restart_after_send_failure(self, failed_proc: Any, cause: BaseException | None = None) -> Any:
+        returncode = failed_proc.poll() if failed_proc is not None else None
+        if self.process is failed_proc:
+            self.process = None
+        try:
+            self.start()
+        except Exception as exc:
+            detail = f" (exit code {returncode})" if returncode is not None else ""
+            raise RuntimeError(
+                "Codex worker stopped before the message could be sent"
+                f"{detail}; automatic restart failed. Please retry the message.{self._worker_stderr_detail()}"
+            ) from (cause or exc)
+        proc = self.process
+        if proc is None or proc.poll() is not None:
+            raise RuntimeError(
+                "Codex worker stopped before the message could be sent; automatic restart did not stay running. "
+                f"Please retry the message.{self._worker_stderr_detail()}"
+            ) from cause
+        return proc
+
+    def _worker_stderr_detail(self) -> str:
+        if not self._stderr_tail:
+            return ""
+        return f" Worker diagnostics: {' | '.join(self._stderr_tail)[-1000:]}"
 
     def _notify_exit(self, proc: Any | None = None) -> None:
         if self.on_exit is None:

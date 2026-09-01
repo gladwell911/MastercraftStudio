@@ -101,6 +101,69 @@ def test_copyparty_default_binds_all_interfaces_and_advertises_lan_host(tmp_path
     assert service.local_base_url == "http://127.0.0.1:49233"
 
 
+def test_copyparty_uses_safe_fallback_when_default_port_cannot_bind(tmp_path, monkeypatch):
+    library = DesktopFileLibrary(tmp_path / "storage")
+    service = CopypartyFileService(library, port=3923, wait_for_ready=False)
+    attempted = []
+
+    def can_bind(port):
+        attempted.append(port)
+        return port == 49300
+
+    monkeypatch.setattr(service, "_can_bind_port", can_bind)
+
+    service._select_bindable_port()
+
+    assert attempted[:2] == [3923, 49300]
+    assert service.port == 49300
+    assert service.local_base_url.endswith(":49300")
+
+
+def test_copyparty_bind_probe_rejects_a_real_listening_port(tmp_path):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        occupied_port = int(listener.getsockname()[1])
+        service = CopypartyFileService(
+            DesktopFileLibrary(tmp_path / "storage"),
+            host="127.0.0.1",
+            port=occupied_port,
+        )
+
+        assert service._can_bind_port(occupied_port) is False
+
+
+def test_embedded_file_service_retries_after_actual_bind_race(tmp_path, monkeypatch):
+    attempted = []
+
+    class _FakeServer:
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    def server_factory(address, _handler):
+        attempted.append(address)
+        if address[1] == 3923:
+            raise OSError("port taken after probe")
+        return _FakeServer()
+
+    monkeypatch.setattr(file_transfer, "FILE_SERVICE_FALLBACK_PORTS", (49300,))
+    monkeypatch.setattr(file_transfer, "ThreadingHTTPServer", server_factory)
+    service = CopypartyFileService(DesktopFileLibrary(tmp_path / "storage"), port=3923)
+
+    service.start()
+    try:
+        assert attempted == [("0.0.0.0", 3923), ("0.0.0.0", 49300)]
+        assert service.port == 49300
+    finally:
+        service.stop()
+
+
 def test_copyparty_default_starts_embedded_token_enforcing_service(tmp_path):
     source = tmp_path / "served.txt"
     source.write_text("served-payload", encoding="utf-8")

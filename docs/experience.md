@@ -1,19 +1,18 @@
 # 可复用经验
 
-## 分层诊断 Cloudflare Tunnel
+## 打包的后台 Worker
 
-- 经验：按照“客户端 → Cloudflare 边缘 → connector → origin → 应用认证”逐层验证。
-- 为什么重要：1033 表示边缘找不到健康 connector，请求尚未到达 origin 和应用 token 校验；把它解释成 token 错误会走错方向。
-- 下次怎么用：先确认 HTTP 状态、`cloudflared` 服务/进程，再检查本地 origin 和认证。
+- PyInstaller 冻结后的 GUI 可执行程序不应再用 `sys.executable -m 模块` 启动后台 worker；这会重启 GUI 入口并可能触发单实例退出。应打包独立的控制台 worker，并由主程序调用同目录的 worker EXE。
+- 父子进程间使用 JSON Lines 时，worker 必须在入口处显式将 stdin、stdout 和 stderr 配置为 UTF-8；Windows 控制台代码页不能作为协议编码的依据。
+- 启动时等待 worker 的 `ready` 事件，异常退出时保留 stderr 与退出码，可把模糊的 `Broken pipe` 转化为可诊断的启动错误。
 
-## 识别 Windows 死端口代理
+## 固定域名的 NATS 连通性验收
 
-- 经验：`Get-NetTCPConnection` 显示 LISTEN 仍不足以证明应用存活；同时检查 owning process、`netsh interface portproxy show all` 和转发目标端口。
-- 为什么重要：本轮 `18080` 由 `svchost` 监听，但实际转发到没有监听者的 `19080`，请求会被重置。
-- 下次怎么用：对 portproxy 的监听端口和目标端口分别做健康检查。
+- 仅检测 TCP 端口已监听不足以证明移动端可用。应使用 token 发送 NATS `CONNECT` 和 `PING`，并验证本地与公开域名均返回 `PONG`。
+- 解析探针返回时需容忍服务端的 `INFO`、`+OK`、`PING` 与 `PONG` 在同一次读取中出现；服务端主动 `PING` 时应立即回 `PONG`。
+- Windows 上已有 cloudflared 服务时，应修正并重启该服务，避免再启动一个相同 tunnel 的临时连接器造成流量随机落到旧 origin。
 
-## 子进程启动必须验证健康
+## Windows 端口回退
 
-- 经验：为 NATS 与 `cloudflared` 保留持久化日志，启动后检查 `poll()`/端口/协议健康，失败信息只附带有限且脱敏的日志尾部。
-- 为什么重要：`Popen` 成功只表示进程被创建，不能证明进程仍存活或已经接入 Cloudflare。
-- 下次怎么用：所有关键后台进程都采用“启动、短暂存活确认、协议探测、日志诊断、句柄关闭”的生命周期。
+- 选择默认端口前先考虑系统排除端口范围；文件服务在默认端口不可用时应按确定顺序尝试高位回退端口。
+- Windows socket 绑定使用 `SO_EXCLUSIVEADDRUSE`；真正创建 HTTP server 时仍要捕获 bind 失败并继续尝试下一个候选端口，避免检查与绑定之间的竞争窗口。

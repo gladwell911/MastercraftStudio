@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import threading
 import time
 
@@ -50,6 +51,11 @@ class ReplacingStdout:
         return iter(())
 
 
+class BrokenPipeStdin(io.StringIO):
+    def write(self, _text):
+        raise BrokenPipeError("simulated closed pipe")
+
+
 def test_worker_client_send_start_turn_writes_json_line():
     proc = FakeProcess()
     client = CodexWorkerClient(process_factory=lambda args: proc, start_reader_threads=False)
@@ -72,6 +78,53 @@ def test_worker_client_send_start_turn_writes_json_line():
     assert '"type":"start_turn"' in written
     assert '"chat_id":"chat-c"' in written
     assert '"service_tier":"fast"' in written
+
+
+def test_worker_client_uses_console_worker_executable_when_running_from_frozen_executable(monkeypatch):
+    proc = FakeProcess()
+    commands = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    client = CodexWorkerClient(process_factory=lambda args: commands.append(args) or proc, start_reader_threads=False)
+
+    client.start()
+
+    assert commands == [[str(__import__("pathlib").Path(sys.executable).with_name("mc_worker.exe"))]]
+
+
+def test_frozen_worker_ready_timeout_reaps_failed_process(monkeypatch):
+    proc = FakeProcess()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    client = CodexWorkerClient(process_factory=lambda _args: proc, start_reader_threads=True)
+    monkeypatch.setattr(client._ready_event, "wait", lambda timeout: False)
+
+    try:
+        client.start()
+    except RuntimeError as exc:
+        assert "did not become ready" in str(exc)
+    else:
+        raise AssertionError("a frozen worker without a ready handshake must fail")
+
+    assert proc.terminated is True
+    assert client.process is None
+
+
+def test_worker_client_restarts_after_broken_pipe_without_resending_uncertain_message():
+    failed = FakeProcess()
+    failed.stdin = BrokenPipeStdin()
+    replacement = FakeProcess()
+    processes = iter((failed, replacement))
+    client = CodexWorkerClient(process_factory=lambda _args: next(processes), start_reader_threads=False)
+    client.start()
+
+    try:
+        client.start_turn(chat_id="chat-c")
+    except RuntimeError as exc:
+        assert "restarted; please retry" in str(exc)
+    else:
+        raise AssertionError("a broken write must not resend a potentially delivered turn")
+
+    assert replacement.stdin.getvalue() == ""
+    assert client.process is replacement
 
 
 def test_worker_client_reply_user_input_writes_ipc_message():

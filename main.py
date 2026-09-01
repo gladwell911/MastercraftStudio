@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 import markdown
 import wx
@@ -54,6 +54,7 @@ from codex_client import (
 )
 import codex_worker_protocol
 from codex_worker_client import CodexWorkerClient
+from codex_worker_process import main as codex_worker_main
 from kimi_server_client import (
     DEFAULT_KIMI_MODEL,
     KimiServerClient,
@@ -2181,14 +2182,8 @@ class ChatFrame(wx.Frame):
         if not self._start_cloudflared_origin_proxy():
             return False
         origin_port = self._cloudflared_origin_port()
-        configured, reconfigured = self._ensure_cloudflared_service_url(origin_port)
-        if not configured:
-            if reconfigured:
-                return self._replace_stale_cloudflared_with_managed(origin_port)
-            return self._start_managed_cloudflared_process(origin_port)
-        if reconfigured:
-            return self._restart_cloudflared_service() or self._start_managed_cloudflared_process(origin_port)
-        return self._start_cloudflared_service() or self._start_managed_cloudflared_process(origin_port)
+        ready, _mode, _detail = self._ensure_cloudflared_tunnel(origin_port)
+        return ready
 
     def _file_command_body(self, payload: dict) -> dict:
         body = payload.get("body")
@@ -11492,6 +11487,22 @@ class ChatFrame(wx.Frame):
             return []
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
+    def _query_process_command_line(self, process_id: int) -> str:
+        if os.name != "nt" or int(process_id or 0) <= 0:
+            return ""
+        result = self._run_remote_check_command(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={int(process_id)}\").CommandLine",
+            ],
+            timeout=10.0,
+        )
+        if result is None or result.returncode != 0:
+            return ""
+        return str(result.stdout or "").strip()
+
     def _cloudflared_process_targets_port(self, websocket_port: int) -> bool:
         desired_url = f"http://127.0.0.1:{int(websocket_port)}"
         for command_line in self._query_cloudflared_process_command_lines():
@@ -11504,10 +11515,10 @@ class ChatFrame(wx.Frame):
 
     @staticmethod
     def _replace_cloudflared_service_url(bin_path: str, websocket_port: int) -> tuple[str, bool] | tuple[None, bool]:
-        match = re.search(r"--url\s+(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))", bin_path, flags=re.IGNORECASE)
+        match = re.search(r"--url(?P<separator>\s+|=)(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))", bin_path, flags=re.IGNORECASE)
         if not match:
             return None, False
-        current_url = match.group(1) or match.group(2) or match.group(3)
+        current_url = match.group(2) or match.group(3) or match.group(4)
         desired_url = f"http://127.0.0.1:{int(websocket_port)}"
         same_target = False
         try:
@@ -11520,15 +11531,14 @@ class ChatFrame(wx.Frame):
                 same_target = False
         if same_target:
             return bin_path, False
-        quote = "\"" if match.group(1) is not None else ("'" if match.group(2) is not None else "")
-        replacement = f"--url {quote}{desired_url}{quote}"
+        quote = "\"" if match.group(2) is not None else ("'" if match.group(3) is not None else "")
+        replacement = f"--url{match.group('separator')}{quote}{desired_url}{quote}"
         return f"{bin_path[:match.start()]}{replacement}{bin_path[match.end():]}", True
 
     def _set_cloudflared_service_bin_path(self, bin_path: str) -> bool:
         if not bin_path:
             return False
-        command = f"binPath= {bin_path}"
-        result = self._run_remote_check_command(["sc.exe", "config", "cloudflared", command], timeout=15.0)
+        result = self._run_remote_check_command(["sc.exe", "config", "cloudflared", "binPath=", bin_path], timeout=15.0)
         return bool(result and result.returncode == 0)
 
     def _ensure_cloudflared_service_url(self, websocket_port: int) -> tuple[bool, bool]:
@@ -11543,7 +11553,18 @@ class ChatFrame(wx.Frame):
             return self._cloudflared_process_targets_port(websocket_port), False
         if not changed:
             return True, False
-        return self._set_cloudflared_service_bin_path(rewritten), True
+        if not self._set_cloudflared_service_bin_path(rewritten):
+            return False, True
+        updated_state = self._query_cloudflared_service()
+        updated_bin_path = str(updated_state.get("binary_path") or "").strip()
+        verified, still_stale = self._replace_cloudflared_service_url(updated_bin_path, websocket_port)
+        return bool(verified and not still_stale), True
+
+    def _cloudflared_running_process_targets_origin(self, origin_port: int) -> bool:
+        command_lines = self._query_cloudflared_process_command_lines()
+        if not command_lines:
+            return True
+        return self._cloudflared_process_targets_port(origin_port)
 
     def _start_cloudflared_service(self) -> bool:
         state = self._query_cloudflared_service()
@@ -11585,12 +11606,7 @@ class ChatFrame(wx.Frame):
                 break
             time.sleep(0.2)
         if self._query_cloudflared_service()["running"]:
-            self._kill_cloudflared_processes()
-            deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
-            while time.time() < deadline:
-                if not self._query_cloudflared_service()["running"]:
-                    break
-                time.sleep(0.2)
+            return False
         return self._start_cloudflared_service()
 
     def _managed_cloudflared_command_line(self, websocket_port: int) -> str:
@@ -11648,6 +11664,47 @@ class ChatFrame(wx.Frame):
             self._set_status_text_safe(f"cloudflared process failed to start: {exc}; {detail}")
             self._close_managed_cloudflared_log()
             return False
+
+    def _verify_managed_cloudflared_process(self, origin_port: int) -> tuple[bool, str]:
+        """Verify the tunnel owned by this window, not an unrelated service."""
+        process = getattr(self, "_managed_cloudflared_process", None)
+        if process is None or process.poll() is not None:
+            return False, f"cloudflared 桌面托管进程未运行；{self._managed_cloudflared_diagnostic()}"
+        desired = f"http://127.0.0.1:{int(origin_port)}"
+        command_line = self._query_process_command_line(int(getattr(process, "pid", 0) or 0))
+        if command_line and desired not in command_line:
+            return False, f"cloudflared 桌面托管进程未指向 {desired}；{self._managed_cloudflared_diagnostic()}"
+        if not self._remote_local_listener_ready(origin_port):
+            return False, f"cloudflared origin {desired} 未监听"
+        return True, ""
+
+    def _ensure_cloudflared_tunnel(self, origin_port: int) -> tuple[bool, str, str]:
+        """Start exactly one connector for the fixed domain.
+
+        A named Cloudflare tunnel may load-balance across all connected
+        connectors.  Starting a managed connector while the Windows service
+        is still connected to a stale origin therefore leaves an intermittent
+        502 path.  If the service exists, make it authoritative; use a child
+        process only when no service is installed.
+        """
+        state = self._query_cloudflared_service()
+        if state.get("exists"):
+            configured, reconfigured = self._ensure_cloudflared_service_url(origin_port)
+            if not configured:
+                return (
+                    False,
+                    "service",
+                    "cloudflared 服务仍连接旧 origin，且无法更新；为避免同一 tunnel 同时连接两个不同 origin，未启动桌面托管进程。",
+                )
+            started = self._restart_cloudflared_service() if reconfigured else self._start_cloudflared_service()
+            if not started:
+                return False, "service", "cloudflared 服务未能以当前 origin 启动。"
+            return True, "service", ""
+
+        if not self._start_managed_cloudflared_process(origin_port):
+            return False, "managed", "cloudflared 桌面托管进程启动失败。"
+        managed_ok, managed_detail = self._verify_managed_cloudflared_process(origin_port)
+        return managed_ok, "managed", managed_detail
 
     def _managed_cloudflared_log_path(self) -> Path:
         return resolve_app_data_dir() / "cloudflared" / "cloudflared.log"
@@ -11728,12 +11785,16 @@ class ChatFrame(wx.Frame):
         parsed = urlsplit(websocket_url)
         probe_host = parsed.hostname or self._remote_runtime_probe_host()
         probe_port = int(parsed.port or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
-        probe_url = urlunsplit((parsed.scheme or "ws", f"{probe_host}:{probe_port}", parsed.path or "/nats", "", ""))
+        probe_url = urlunsplit(
+            (parsed.scheme or "ws", f"{probe_host}:{probe_port}", parsed.path or "/nats", f"token={quote(token)}", "")
+        )
         return self._verify_remote_public_ws(probe_url)
 
     async def _verify_remote_public_ws_async(self, url: str) -> tuple[bool, str]:
         timeout = ClientTimeout(total=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
-        path = (urlsplit(str(url or "")).path or "").strip().lower()
+        parsed_url = urlsplit(str(url or ""))
+        path = (parsed_url.path or "").strip().lower()
+        nats_token = str((parse_qs(parsed_url.query).get("token") or [""])[0] or "")
         try:
             async with ClientSession(timeout=timeout) as session:
                 async with session.ws_connect(url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as ws:
@@ -11747,8 +11808,29 @@ class ChatFrame(wx.Frame):
                                 info_text = bytes(message.data or b"").decode("utf-8", errors="replace")
                             except Exception:
                                 info_text = ""
-                        ok = info_text.startswith("INFO ")
-                        return ok, ("" if ok else f"公网 NATS 隧道响应异常：{message.type} {message.data!r}")
+                        if not info_text.startswith("INFO "):
+                            return False, f"公网 NATS 隧道响应异常：{message.type} {message.data!r}"
+                        if not nats_token:
+                            return False, "公网 NATS 隧道认证令牌缺失。"
+                        await ws.send_str(
+                            f"CONNECT {json.dumps({'auth_token': nats_token, 'verbose': False}, separators=(',', ':'))}\r\nPING\r\n"
+                        )
+                        while True:
+                            message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+                            if message.type == WSMsgType.TEXT:
+                                response = str(message.data or "")
+                            elif message.type == WSMsgType.BINARY:
+                                response = bytes(message.data or b"").decode("utf-8", errors="replace")
+                            else:
+                                return False, f"公网 NATS 隧道认证连接关闭：{message.type}"
+                            for protocol_line in response.splitlines():
+                                protocol_line = protocol_line.strip()
+                                if protocol_line == "PONG":
+                                    return True, ""
+                                if protocol_line == "PING":
+                                    await ws.send_str("PONG\r\n")
+                                elif protocol_line.startswith("-ERR"):
+                                    return False, f"公网 NATS 隧道认证失败：{protocol_line}"
                     message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
         except Exception as exc:
             return False, f"公网隧道握手失败：{exc}"
@@ -11800,25 +11882,10 @@ class ChatFrame(wx.Frame):
         if not self._start_cloudflared_origin_proxy():
             raise RuntimeError(self._format_remote_startup_error("cloudflared origin 代理启动失败。"))
         origin_port = self._cloudflared_origin_port()
-        service_configured, service_reconfigured = self._ensure_cloudflared_service_url(origin_port)
-        managed_cloudflared_started = False
-        if not service_configured:
-            if not service_reconfigured or not self._replace_stale_cloudflared_with_managed(origin_port):
-                raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装、配置缺失或无法替换旧映射。"))
-            managed_cloudflared_started = True
-        elif service_reconfigured:
-            if not self._restart_cloudflared_service():
-                if not self._start_managed_cloudflared_process(origin_port):
-                    raise RuntimeError(self._format_remote_startup_error("cloudflared 已更新映射但重启失败。"))
-                managed_cloudflared_started = True
-        elif not self._start_cloudflared_service():
-            if not self._start_managed_cloudflared_process(origin_port):
-                raise RuntimeError(self._format_remote_startup_error("cloudflared 服务未安装或无法启动。"))
-            managed_cloudflared_started = True
-        if managed_cloudflared_started:
-            public_ok, public_detail = self._verify_remote_public_ws_with_retries(published_url)
-        else:
-            public_ok, public_detail = self._verify_remote_public_ws(published_url)
+        tunnel_ok, tunnel_mode, tunnel_detail = self._ensure_cloudflared_tunnel(origin_port)
+        if not tunnel_ok:
+            raise RuntimeError(self._format_remote_startup_error(tunnel_detail))
+        public_ok, public_detail = self._verify_remote_public_ws_with_retries(published_url)
         if public_ok:
             self._set_remote_runtime_status(
                 local_listener_ready=True,
@@ -11826,40 +11893,16 @@ class ChatFrame(wx.Frame):
                 last_remote_error="",
                 published_url=published_url,
             )
-            if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
-                self._set_status_text_safe(
-                    f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程与 rc.tingyou.cc 已验证"
-                )
-            else:
-                self._set_status_text_safe(
-                    f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 与 rc.tingyou.cc 已验证"
-                )
+            connector = "桌面托管进程" if tunnel_mode == "managed" else "系统服务"
+            self._set_status_text_safe(
+                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；"
+                f"cloudflared {connector}与 rc.tingyou.cc 已验证"
+            )
             return
-        if managed_cloudflared_started:
-            public_detail = f"{public_detail}; {self._managed_cloudflared_diagnostic()}"
-        if managed_cloudflared_started:
-            raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 进程公网验证失败。"))
-        if not self._restart_cloudflared_service():
-            if not self._start_managed_cloudflared_process(origin_port):
-                raise RuntimeError(self._format_remote_startup_error(public_detail or "cloudflared 重启失败。"))
-            managed_cloudflared_started = True
-        public_ok, public_detail = self._verify_remote_public_ws(published_url)
-        if not public_ok:
-            raise RuntimeError(self._format_remote_startup_error(public_detail or "rc.tingyou.cc 公网隧道验证失败。"))
-        self._set_remote_runtime_status(
-            local_listener_ready=True,
-            public_ws_ready=True,
-            last_remote_error="",
-            published_url=published_url,
-        )
-        if managed_cloudflared_started or getattr(self, "_managed_cloudflared_process", None) is not None:
-            self._set_status_text_safe(
-                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 进程已恢复 rc.tingyou.cc 连接"
-            )
-        else:
-            self._set_status_text_safe(
-                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；cloudflared 已重启并恢复 rc.tingyou.cc 连接"
-            )
+        detail = public_detail
+        if tunnel_mode == "managed":
+            detail = f"{detail}; {self._managed_cloudflared_diagnostic()}"
+        raise RuntimeError(self._format_remote_startup_error(detail))
 
     def _start_remote_nats_runtime_if_configured(self, *, ensure_connectivity: bool = False) -> None:
         token = self._read_remote_control_token() or self.remote_control_token
@@ -16325,6 +16368,8 @@ class ChatApp(wx.App):
 
 
 if __name__ == "__main__":
+    if "--codex-worker" in sys.argv:
+        raise SystemExit(codex_worker_main())
     app = ChatApp()
     app.MainLoop()
 

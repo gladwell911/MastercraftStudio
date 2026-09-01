@@ -31,6 +31,18 @@ def test_default_pyinstaller_spec_does_not_bundle_runtime_history():
     assert "('dist/history', 'history')" not in spec_text
 
 
+def test_default_pyinstaller_spec_builds_separate_console_worker_executable():
+    root = Path(__file__).resolve().parents[1]
+    spec_text = (root / "zgwd.spec").read_text(encoding="utf-8")
+    launcher_text = (root / "worker_launcher.py").read_text(encoding="utf-8")
+
+    assert "['worker_launcher.py']" in spec_text
+    assert "name='mc_worker'" in spec_text
+    assert "console=True" in spec_text
+    assert "worker_exe," in spec_text
+    assert "from codex_worker_process import main" in launcher_text
+
+
 def test_package_script_safely_cleans_packaged_output_before_build():
     root = Path(__file__).resolve().parents[1]
     script_text = (root / "package_mc.ps1").read_text(encoding="utf-8")

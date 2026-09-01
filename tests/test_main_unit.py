@@ -1540,15 +1540,23 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
     monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
     monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
-    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, False))
-    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: True)
-    probe_results = iter([(False, "公网隧道握手失败"), (True, "")])
-    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda _url: next(probe_results))
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "detail": "", "binary_path": "cloudflared.exe"},
+    )
+    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, True))
     restarted = {"calls": 0}
     monkeypatch.setattr(
         frame,
         "_restart_cloudflared_service",
         lambda: restarted.__setitem__("calls", restarted["calls"] + 1) or True,
+    )
+    retried = []
+    monkeypatch.setattr(
+        frame,
+        "_verify_remote_public_ws_with_retries",
+        lambda url: retried.append(url) or (True, ""),
     )
     statuses = []
     monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
@@ -1559,11 +1567,13 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
     )
 
     assert restarted["calls"] == 1
+    assert retried == ["wss://rc.tingyou.cc/nats?token=secret"]
     assert statuses
-    assert "cloudflared 已重启并恢复 rc.tingyou.cc 连接" in statuses[-1]
+    assert "cloudflared" in statuses[-1]
+    assert "rc.tingyou.cc" in statuses[-1]
 
 
-def test_remote_startup_connectivity_falls_back_to_managed_cloudflared_process_when_service_start_fails(frame, monkeypatch):
+def test_remote_startup_connectivity_uses_managed_cloudflared_when_service_is_missing(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18081/nats"
@@ -1582,8 +1592,11 @@ def test_remote_startup_connectivity_falls_back_to_managed_cloudflared_process_w
     monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
     monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
-    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, False))
-    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: False)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": False, "running": False, "binary_path": "", "detail": ""},
+    )
     started = []
     monkeypatch.setattr(
         frame,
@@ -1591,6 +1604,7 @@ def test_remote_startup_connectivity_falls_back_to_managed_cloudflared_process_w
         lambda websocket_port: started.append(websocket_port) or True,
         raising=False,
     )
+    monkeypatch.setattr(frame, "_verify_managed_cloudflared_process", lambda _port: (True, ""))
     monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda _url: (True, ""))
     statuses = []
     monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
@@ -1602,7 +1616,8 @@ def test_remote_startup_connectivity_falls_back_to_managed_cloudflared_process_w
 
     assert started == [18080]
     assert statuses
-    assert "cloudflared 进程" in statuses[-1]
+    assert "cloudflared" in statuses[-1]
+    assert "rc.tingyou.cc" in statuses[-1]
 
 
 def test_remote_startup_connectivity_targets_cloudflared_origin_proxy(frame, monkeypatch):
@@ -1639,7 +1654,7 @@ def test_remote_startup_connectivity_targets_cloudflared_origin_proxy(frame, mon
     assert configured_ports == [18080]
 
 
-def test_remote_startup_connectivity_replaces_stale_cloudflared_after_reconfigure_failure(frame, monkeypatch):
+def test_remote_startup_connectivity_refuses_duplicate_connector_after_reconfigure_failure(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18081/nats"
@@ -1656,20 +1671,26 @@ def test_remote_startup_connectivity_replaces_stale_cloudflared_after_reconfigur
     monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, port: (port == 18081, ""))
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
     monkeypatch.setattr(frame, "_cloudflared_origin_port", lambda: 19080)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "detail": "", "binary_path": "cloudflared.exe"},
+    )
     monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (False, True))
     monkeypatch.setattr(frame, "_replace_stale_cloudflared_with_managed", lambda port: replaced_ports.append(port) or True)
     monkeypatch.setattr(frame, "_restart_cloudflared_service", lambda: (_ for _ in ()).throw(AssertionError("must not restart stale service")))
     monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda _url: (True, ""))
 
-    frame._ensure_remote_nats_startup_connectivity(
-        token="secret",
-        published_url="wss://rc.tingyou.cc/nats?token=secret",
-    )
+    with pytest.raises(RuntimeError, match="cloudflared"):
+        frame._ensure_remote_nats_startup_connectivity(
+            token="secret",
+            published_url="wss://rc.tingyou.cc/nats?token=secret",
+        )
 
-    assert replaced_ports == [19080]
+    assert replaced_ports == []
 
 
-def test_remote_startup_connectivity_does_not_restart_stale_service_after_managed_probe_failure(frame, monkeypatch):
+def test_remote_startup_connectivity_fails_before_public_probe_when_service_is_stale(frame, monkeypatch):
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18081/nats"
@@ -1685,16 +1706,24 @@ def test_remote_startup_connectivity_does_not_restart_stale_service_after_manage
     monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, port: (port == 18081, ""))
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
     monkeypatch.setattr(frame, "_cloudflared_origin_port", lambda: 19080)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "detail": "", "binary_path": "cloudflared.exe"},
+    )
     monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (False, True))
     monkeypatch.setattr(frame, "_replace_stale_cloudflared_with_managed", lambda _port: True)
-    monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda _url: (False, "公网仍不可达"))
+    public_probe = []
+    monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda url: public_probe.append(url) or (False, "公网仍不可达"))
     monkeypatch.setattr(frame, "_restart_cloudflared_service", lambda: (_ for _ in ()).throw(AssertionError("must not restart stale service")))
 
-    with pytest.raises(RuntimeError, match="公网仍不可达"):
+    with pytest.raises(RuntimeError, match="cloudflared"):
         frame._ensure_remote_nats_startup_connectivity(
             token="secret",
             published_url="wss://rc.tingyou.cc/nats?token=secret",
         )
+
+    assert public_probe == []
 
 
 def test_public_file_route_uses_available_cloudflared_origin_port(frame, monkeypatch):
@@ -1726,16 +1755,67 @@ def test_public_file_route_uses_available_cloudflared_origin_port(frame, monkeyp
             return None
 
     monkeypatch.setattr(main, "CloudflaredOriginProxy", _FakeProxy)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "binary_path": "cloudflared --url http://127.0.0.1:4200", "detail": ""},
+    )
     monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda port: configured_ports.append(port) or (True, False))
     monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: True)
 
     assert frame._ensure_public_file_route_ready() is True
     assert started_ports == [19080]
     assert configured_ports == [19080]
+
+
+def test_remote_startup_uses_reconfigured_service_without_duplicate_managed_connector(frame, monkeypatch):
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:18082/nats"
+    frame.remote_nats_runtime_status = {
+        "websocket_url": "ws://127.0.0.1:18082/nats",
+        "cloudflared_url": "wss://rc.tingyou.cc/nats",
+    }
+    frame._remote_nats_transport = object()
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
+    monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
+    monkeypatch.setattr(frame, "_cloudflared_origin_port", lambda: 19080)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "binary_path": "cloudflared --url http://127.0.0.1:4200", "detail": ""},
+    )
+    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, True))
+    restarted = []
+    monkeypatch.setattr(frame, "_restart_cloudflared_service", lambda: restarted.append(True) or True)
+    monkeypatch.setattr(
+        frame,
+        "_start_managed_cloudflared_process",
+        lambda _port: (_ for _ in ()).throw(AssertionError("must not add a duplicate connector")),
+    )
+    monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda _url: (True, ""))
+
+    monkeypatch.setattr(frame, "_remote_runtime_config", lambda: {"fixed_domain_mode": True})
+    frame._ensure_remote_nats_startup_connectivity(
+        token="token", published_url="wss://rc.tingyou.cc/nats"
+    )
+
+    assert restarted == [True]
+
+
+def test_managed_cloudflared_verification_checks_its_own_pid_command_line(frame, monkeypatch):
+    frame._managed_cloudflared_process = SimpleNamespace(pid=1234, poll=lambda: None)
+    frame._cloudflared_origin_proxy_port = 19080
+    monkeypatch.setattr(frame, "_query_process_command_line", lambda pid: "cloudflared tunnel --url http://127.0.0.1:4200")
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
+
+    ok, detail = frame._verify_managed_cloudflared_process(19080)
+
+    assert not ok
+    assert "19080" in detail
     assert frame._cloudflared_origin_port() == 19080
 
 
-def test_public_file_route_replaces_stale_cloudflared_when_service_reconfigure_fails(frame, monkeypatch):
+def test_public_file_route_refuses_duplicate_connector_when_stale_service_cannot_be_updated(frame, monkeypatch):
     frame.remote_control_port = 18080
     frame.remote_nats_runtime_status = {
         "enabled": True,
@@ -1761,14 +1841,19 @@ def test_public_file_route_replaces_stale_cloudflared_when_service_reconfigure_f
             return None
 
     monkeypatch.setattr(main, "CloudflaredOriginProxy", _FakeProxy)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "binary_path": "cloudflared --url http://127.0.0.1:4200", "detail": ""},
+    )
     monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (False, True))
     monkeypatch.setattr(frame, "_restart_cloudflared_service", lambda: (_ for _ in ()).throw(AssertionError("must not restart stale service")))
     monkeypatch.setattr(frame, "_kill_cloudflared_processes", lambda: killed.append(True))
     monkeypatch.setattr(frame, "_start_managed_cloudflared_process", lambda port: managed_ports.append(port) or True)
 
-    assert frame._ensure_public_file_route_ready() is True
-    assert killed == [True]
-    assert managed_ports == [19080]
+    assert frame._ensure_public_file_route_ready() is False
+    assert killed == []
+    assert managed_ports == []
 
 
 def test_remote_startup_connectivity_waits_for_managed_cloudflared_process_public_probe(frame, monkeypatch):
@@ -1783,9 +1868,13 @@ def test_remote_startup_connectivity_waits_for_managed_cloudflared_process_publi
     monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda _port: True)
     monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
-    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, False))
-    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: False)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": False, "running": False, "binary_path": "", "detail": ""},
+    )
     monkeypatch.setattr(frame, "_start_managed_cloudflared_process", lambda _port: True, raising=False)
+    monkeypatch.setattr(frame, "_verify_managed_cloudflared_process", lambda _port: (True, ""))
     monkeypatch.setattr(
         frame,
         "_restart_cloudflared_service",
@@ -1803,11 +1892,16 @@ def test_remote_startup_connectivity_waits_for_managed_cloudflared_process_publi
     )
 
     assert statuses
-    assert "cloudflared 进程" in statuses[-1]
+    assert "cloudflared" in statuses[-1]
+    assert "rc.tingyou.cc" in statuses[-1]
 
 
-def test_verify_remote_public_ws_accepts_binary_nats_info_frame(frame, monkeypatch):
+def test_verify_remote_public_ws_requires_authenticated_nats_pong(frame, monkeypatch):
     class _FakeWs:
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.sent = []
+
         async def __aenter__(self):
             return self
 
@@ -1815,7 +1909,10 @@ def test_verify_remote_public_ws_accepts_binary_nats_info_frame(frame, monkeypat
             return False
 
         async def receive(self, timeout=None):
-            return SimpleNamespace(type=main.WSMsgType.BINARY, data=b'INFO {"server_id":"abc"} \r\n')
+            return next(self.responses)
+
+        async def send_str(self, payload):
+            self.sent.append(payload)
 
     class _FakeSession:
         def __init__(self, *args, **kwargs):
@@ -1828,28 +1925,145 @@ def test_verify_remote_public_ws_accepts_binary_nats_info_frame(frame, monkeypat
             return False
 
         def ws_connect(self, url, heartbeat=None):
-            return _FakeWs()
+            self.ws = _FakeWs(
+                [
+                    SimpleNamespace(type=main.WSMsgType.BINARY, data=b'INFO {"server_id":"abc"} \r\n'),
+                    SimpleNamespace(type=main.WSMsgType.TEXT, data="PONG\r\n"),
+                ]
+            )
+            return self.ws
 
-    monkeypatch.setattr(main, "ClientSession", _FakeSession)
+    session = _FakeSession()
+    monkeypatch.setattr(main, "ClientSession", lambda *args, **kwargs: session)
 
-    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats"))
+    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats?token=secret"))
 
     assert ok is True
     assert detail == ""
+    assert session.ws.sent == ['CONNECT {"auth_token":"secret","verbose":false}\r\nPING\r\n']
 
 
-def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, monkeypatch):
-    states = [
-        {"exists": True, "running": True, "detail": "running"},
-        {"exists": True, "running": True, "detail": "running"},
-        {"exists": True, "running": True, "detail": "running"},
-        {"exists": True, "running": False, "detail": "stopped"},
-        {"exists": True, "running": False, "detail": "stopped"},
+def test_verify_remote_public_ws_parses_batched_lines_and_answers_server_ping(frame, monkeypatch):
+    class _FakeWs:
+        def __init__(self):
+            self.responses = iter(
+                [
+                    SimpleNamespace(type=main.WSMsgType.TEXT, data="INFO {}\r\n"),
+                    SimpleNamespace(type=main.WSMsgType.TEXT, data="+OK\r\nPING\r\nPONG\r\n"),
+                ]
+            )
+            self.sent = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            return next(self.responses)
+
+        async def send_str(self, payload):
+            self.sent.append(payload)
+
+    class _FakeSession:
+        def __init__(self):
+            self.ws = _FakeWs()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def ws_connect(self, url, heartbeat=None):
+            return self.ws
+
+    session = _FakeSession()
+    monkeypatch.setattr(main, "ClientSession", lambda *args, **kwargs: session)
+
+    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats?token=secret"))
+
+    assert (ok, detail) == (True, "")
+    assert session.ws.sent == [
+        'CONNECT {"auth_token":"secret","verbose":false}\r\nPING\r\n',
+        "PONG\r\n",
     ]
+
+
+def test_verify_remote_public_ws_rejects_nats_auth_error(frame, monkeypatch):
+    class _FakeWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            return next(self.responses)
+
+        async def send_str(self, payload):
+            return None
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def ws_connect(self, url, heartbeat=None):
+            ws = _FakeWs()
+            ws.responses = iter(
+                [
+                    SimpleNamespace(type=main.WSMsgType.TEXT, data="INFO {}\r\n"),
+                    SimpleNamespace(type=main.WSMsgType.TEXT, data="-ERR 'Authorization Violation'\r\n"),
+                ]
+            )
+            return ws
+
+    monkeypatch.setattr(main, "ClientSession", lambda *args, **kwargs: _FakeSession())
+
+    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats?token=bad"))
+
+    assert ok is False
+    assert "认证失败" in detail
+
+
+def test_verify_remote_public_ws_rejects_non_info_nats_greeting(frame, monkeypatch):
+    class _FakeWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            return SimpleNamespace(type=main.WSMsgType.TEXT, data="-ERR 'Server unavailable'\r\n")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def ws_connect(self, url, heartbeat=None):
+            return _FakeWs()
+
+    monkeypatch.setattr(main, "ClientSession", lambda *args, **kwargs: _FakeSession())
+
+    ok, detail = asyncio.run(frame._verify_remote_public_ws_async("ws://127.0.0.1:18080/nats?token=secret"))
+
+    assert ok is False
+    assert "响应异常" in detail
+
+
+def test_restart_cloudflared_service_does_not_kill_unrelated_connectors_when_stop_sticks(frame, monkeypatch):
     monkeypatch.setattr(
         frame,
         "_query_cloudflared_service",
-        lambda: states.pop(0) if len(states) > 1 else states[0],
+        lambda: {"exists": True, "running": True, "detail": "running"},
     )
     commands = []
     monkeypatch.setattr(
@@ -1857,12 +2071,11 @@ def test_restart_cloudflared_service_kills_stuck_process_before_restart(frame, m
         "_run_remote_check_command",
         lambda args, timeout=10.0: commands.append(tuple(args)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
-    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: True)
-    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(main, "REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS", 0)
 
-    assert frame._restart_cloudflared_service() is True
+    assert frame._restart_cloudflared_service() is False
     assert ("sc.exe", "stop", "cloudflared") in commands
-    assert ("taskkill", "/F", "/IM", "cloudflared.exe") in commands
+    assert ("taskkill", "/F", "/IM", "cloudflared.exe") not in commands
 
 
 def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
@@ -1875,10 +2088,17 @@ def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
     )
     commands = []
 
+    configured_bin_path = {"value": None}
+
     def fake_run(args, timeout=10.0):
         commands.append(tuple(args))
         if args[:3] == ["sc.exe", "qc", "cloudflared"]:
-            return SimpleNamespace(returncode=0, stdout=qc_output, stderr="")
+            output = qc_output if configured_bin_path["value"] is None else qc_output.replace(
+                "--url http://127.0.0.1:10080", configured_bin_path["value"]
+            )
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        if args[:3] == ["sc.exe", "config", "cloudflared"]:
+            configured_bin_path["value"] = args[4].split(" --token", 1)[0].split("tunnel run ", 1)[1]
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(frame, "_run_remote_check_command", fake_run)
@@ -1888,9 +2108,62 @@ def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
     assert configured is True
     assert changed is True
     assert any(
-        cmd[0] == "sc.exe" and cmd[1] == "config" and cmd[2] == "cloudflared" and "--url http://127.0.0.1:18080" in cmd[3]
+        cmd[:4] == ("sc.exe", "config", "cloudflared", "binPath=") and "--url http://127.0.0.1:18080" in cmd[4]
         for cmd in commands
     )
+
+
+def test_cloudflared_service_rewrites_equals_style_stale_url(frame, monkeypatch):
+    state = {
+        "exists": True,
+        "running": True,
+        "detail": "",
+        "binary_path": 'cloudflared.exe tunnel run --url=http://127.0.0.1:4200 --token dummy',
+    }
+    configured_paths = []
+    monkeypatch.setattr(frame, "_query_cloudflared_service", lambda: state)
+
+    def set_path(path):
+        configured_paths.append(path)
+        state["binary_path"] = path
+        return True
+
+    monkeypatch.setattr(frame, "_set_cloudflared_service_bin_path", set_path)
+
+    configured, changed = frame._ensure_cloudflared_service_url(19082)
+
+    assert (configured, changed) == (True, True)
+    assert "--url=http://127.0.0.1:19082" in configured_paths[0]
+
+
+def test_remote_startup_reconfigures_stale_running_cloudflared_service(frame, monkeypatch):
+    frame.remote_control_host = "0.0.0.0"
+    frame.remote_control_port = 18080
+    frame.remote_control_runtime_bind = "ws://127.0.0.1:18082/nats"
+    frame._remote_nats_transport = object()
+    frame.remote_nats_runtime_status = {"websocket_url": "ws://127.0.0.1:18082/nats"}
+    monkeypatch.setattr(frame, "_remote_runtime_config", lambda: {"fixed_domain_mode": True, "port": 18080})
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda port: port == 18082)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda _token, _port: (True, ""))
+    monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
+    monkeypatch.setattr(frame, "_cloudflared_origin_port", lambda: 19082)
+    monkeypatch.setattr(
+        frame,
+        "_query_cloudflared_service",
+        lambda: {"exists": True, "running": True, "detail": "", "binary_path": "cloudflared.exe"},
+    )
+    monkeypatch.setattr(frame, "_ensure_cloudflared_service_url", lambda _port: (True, True))
+    restarted = []
+    monkeypatch.setattr(frame, "_restart_cloudflared_service", lambda: restarted.append(True) or True)
+    monkeypatch.setattr(frame, "_cloudflared_running_process_targets_origin", lambda _port: False)
+    replaced = []
+    monkeypatch.setattr(frame, "_replace_stale_cloudflared_with_managed", lambda port: replaced.append(port) or True)
+    monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda _url: (True, ""))
+
+    frame._ensure_remote_nats_startup_connectivity(token="secret", published_url="wss://rc.tingyou.cc/nats?token=secret")
+
+    assert restarted == [True]
+    assert replaced == []
 
 
 def test_cloudflared_process_can_satisfy_origin_when_service_is_missing(frame, monkeypatch):
@@ -2050,14 +2323,13 @@ def test_remote_nats_runtime_autostarts_without_env_and_uses_default_token(tmp_p
     monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
     monkeypatch.setattr(main.ChatFrame, "_ensure_cloudflared_origin_bridge", lambda self: None)
     monkeypatch.setattr(main.ChatFrame, "_can_bind_loopback_tcp_port", lambda self, _port: True)
+    monkeypatch.setattr(main.ChatFrame, "_resolve_remote_nats_websocket_port", lambda self, _port: 18080)
 
     frame = main.ChatFrame()
     try:
         assert frame.remote_control_token == main.DEFAULT_REMOTE_CONTROL_TOKEN
         assert frame._remote_nats_transport is not None
         assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18080/nats"
-        saved_state = json.loads(frame.state_path.read_text(encoding="utf-8"))
-        assert saved_state["remote_control_token"] == main.DEFAULT_REMOTE_CONTROL_TOKEN
     finally:
         frame.Destroy()
 

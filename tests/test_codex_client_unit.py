@@ -6,10 +6,34 @@ from pathlib import Path
 import codex_client
 
 
+class _BrokenAppServerStdin:
+    def write(self, _text):
+        raise BrokenPipeError("closed app-server pipe")
+
+    def flush(self):
+        raise AssertionError("flush must not run after failed write")
+
+
 def test_codex_model_helper():
     assert codex_client.is_codex_model("codex/main")
     assert codex_client.is_codex_model("codex/gpt-5.4-medium")
     assert not codex_client.is_codex_model("openai/gpt-5.2")
+
+
+def test_app_server_broken_pipe_reports_exit_code_and_stderr_tail():
+    client = codex_client.CodexAppServerClient()
+    client._proc = SimpleNamespace(stdin=_BrokenAppServerStdin(), poll=lambda: 17)
+    client._stderr_tail.append("authentication expired")
+
+    try:
+        client._send_json({"method": "initialized"})
+    except RuntimeError as exc:
+        text = str(exc)
+    else:
+        raise AssertionError("closed app-server pipe must be reported as a RuntimeError")
+
+    assert "exit code 17" in text
+    assert "authentication expired" in text
 
 
 def test_codex_model_config_helpers():

@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import tomllib
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -461,6 +462,7 @@ class CodexAppServerClient:
         self._closed = False
         self._codex_home_dir: Path | None = None
         self._owns_codex_home_dir = False
+        self._stderr_tail: deque[str] = deque(maxlen=40)
 
     def close(self) -> None:
         self._closed = True
@@ -726,11 +728,22 @@ class CodexAppServerClient:
     def _send_json(self, payload: dict) -> None:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
-            raise RuntimeError("Codex app-server is not running.")
+            raise RuntimeError(self._app_server_transport_error())
         line = json.dumps(payload, ensure_ascii=False)
         with self._send_lock:
-            proc.stdin.write(line + "\n")
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(line + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                raise RuntimeError(self._app_server_transport_error()) from exc
+
+    def _app_server_transport_error(self) -> str:
+        proc = self._proc
+        exit_code = proc.poll() if proc is not None else None
+        detail = f" (exit code {exit_code})" if exit_code is not None else ""
+        stderr = " | ".join(self._stderr_tail)[-1000:]
+        suffix = f" Stderr: {stderr}" if stderr else ""
+        return f"Codex app-server is not running{detail}.{suffix}"
 
     def _stdout_loop(self) -> None:
         proc = self._proc
@@ -758,6 +771,7 @@ class CodexAppServerClient:
         for raw_line in proc.stderr:
             line = str(raw_line or "").strip()
             if line:
+                self._stderr_tail.append(line)
                 self._emit_event(
                     CodexEvent(
                         type="stderr",

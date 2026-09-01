@@ -23,6 +23,7 @@ DEFAULT_DESKTOP_FILE_STORAGE_DIR = Path("D:/code/file")
 FILE_TRANSFER_TOKEN_QUERY_PARAM = "t"
 DEFAULT_MAX_FILE_TRANSFER_BYTES = 512 * 1024 * 1024
 FILE_TRANSFER_CHUNK_SIZE = 1024 * 1024
+FILE_SERVICE_FALLBACK_PORTS = tuple(range(49300, 49321))
 
 
 def detect_lan_ip() -> str:
@@ -447,6 +448,7 @@ class CopypartyFileService:
         if not self.use_copyparty_process:
             self._start_embedded_http_server()
             return
+        self._select_bindable_port()
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
         kwargs = {
             "stdout": subprocess.DEVNULL,
@@ -470,6 +472,27 @@ class CopypartyFileService:
                         process.kill()
                         process.wait(timeout=3.0)
                 self._start_embedded_http_server()
+
+    def _can_bind_port(self, port: int) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                sock.bind((self.host, int(port)))
+            return True
+        except OSError:
+            return False
+
+    def _select_bindable_port(self) -> None:
+        if self._can_bind_port(self.port):
+            return
+        for candidate in FILE_SERVICE_FALLBACK_PORTS:
+            if self._can_bind_port(candidate):
+                self.port = candidate
+                return
+        raise RuntimeError(
+            f"文件服务端口 {self.port} 不可绑定，且未找到可用回退端口。"
+        )
 
     def stop(self) -> None:
         self._stop_embedded_http_server()
@@ -531,7 +554,19 @@ class CopypartyFileService:
                 return
 
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
-        self._embedded_server = ThreadingHTTPServer((self.host, self.port), Handler)
+        last_error: OSError | None = None
+        candidates = (self.port, *FILE_SERVICE_FALLBACK_PORTS)
+        for candidate in dict.fromkeys(candidates):
+            try:
+                server = ThreadingHTTPServer((self.host, int(candidate)), Handler)
+            except OSError as exc:
+                last_error = exc
+                continue
+            self.port = int(candidate)
+            self._embedded_server = server
+            break
+        if self._embedded_server is None:
+            raise RuntimeError("文件服务没有可绑定端口。") from last_error
         self._embedded_thread = threading.Thread(target=self._embedded_server.serve_forever, daemon=True)
         self._embedded_thread.start()
 
