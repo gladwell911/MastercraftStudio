@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 build_pyinstaller/
+build_repair/
+dist_repair/
 *.egg
 
 # IDE
