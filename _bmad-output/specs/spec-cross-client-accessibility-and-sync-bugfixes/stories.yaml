@@ -1,0 +1,77 @@
+- id: "1"
+  title: 手机文件操作即时进入进度页
+  description: >-
+    实现 CAP-1，使“传输到手机”“打开文件”和“下载文件”先完成页面导航，再在目标页启动耗时工作并呈现全过程状态。
+    验收以 acceptance-criteria.md 中 AC-1.1 和 AC-1.2 为准。
+  spec_checkpoint: true
+  done_checkpoint: false
+- id: "2"
+  title: 传输暂停继续与停止控制
+  description: >-
+    实现 CAP-2，将传输控制统一为暂停/继续切换按钮与停止按钮，并保证所有状态下的无障碍可达性和安全无操作语义。
+    验收以 AC-2.1 和 AC-2.2 为准。
+  spec_checkpoint: false
+  done_checkpoint: true
+- id: "3"
+  title: 推送通知开关与持久化
+  description: >-
+    实现 CAP-3，在手机设置中增加默认开启且可持久化的通知开关，只控制系统通知呈现而不阻断后台回复同步。
+    验收以 AC-3.1 和 AC-3.2 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "4"
+  title: 电脑与手机模型显示同步
+  description: >-
+    实现 CAP-4，使手机菜单从跨端状态中显示电脑端当前实际模型，并正确响应后续模型切换。
+    验收以 AC-4.1 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "5"
+  title: 聊天删除持久化及同步竞态
+  description: >-
+    实现 CAP-6，使手机聊天删除在页面往返、后台刷新、跨端同步和应用重启后持续生效，并阻止过期数据复活删除项。
+    验收以 AC-6.1 和 AC-6.2 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "6"
+  title: 手机文件标签精简与状态显示
+  description: >-
+    实现 CAP-7，使文件标签中的每条记录只显示文件名和一个来自完整处理状态集合的当前状态。
+    验收以 AC-7.1 和 AC-7.2 为准。
+  spec_checkpoint: false
+  done_checkpoint: false
+- id: "7"
+  title: 手机文件路由复位及回答详情按钮布局
+  description: >-
+    实现 CAP-5 的手机端部分和 CAP-12，消费已完成的文件临时路由状态，并统一回答详情与聊天详情的底部操作布局。
+    验收以 AC-5.1 和 AC-12.1 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "8"
+  title: 桌面空格聚焦快捷键及继续返回聊天
+  description: >-
+    实现 CAP-8 和 CAP-5 的桌面端部分，使指定控件中的一次空格等同于 Alt+D，并让回答详情的“继续”返回对应聊天详情。
+    验收以 AC-8.1、AC-8.2 和 AC-5.2 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "9"
+  title: 手机命令系统点击音效
+  description: >-
+    实现 CAP-9，使手机命令按钮中的有效命令点击触发一次平台系统标准点击音效，同时保持原命令行为不变。
+    验收以 AC-9.1 为准。
+  spec_checkpoint: false
+  done_checkpoint: false
+- id: "10"
+  title: 笔记默认文字输入及逐行读屏
+  description: >-
+    实现 CAP-10 和 CAP-11，使笔记详情默认进入文字输入模式，并按原换行向屏幕阅读器提供逐行独立焦点。
+    验收以 AC-10.1 和 AC-11.1 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: "11"
+  title: 回答与执行列表陈旧尾部内容修复
+  description: >-
+    实现 CAP-13，消除回答列表和执行列表在增量更新、聊天切换、刷新及重新进入时出现的旧尾项和重复尾项。
+    验收以 AC-13.1 和 AC-13.2 为准。
+  spec_checkpoint: true
+  done_checkpoint: true
