@@ -68,6 +68,7 @@ def main() -> None:
     phone_upload_name = os.environ.get("FILE_E2E_PHONE_UPLOAD_NAME", "phone-upload.txt")
     phone_upload_content = os.environ.get("FILE_E2E_PHONE_UPLOAD_CONTENT", "phone-to-desktop")
     file_probe_delay_seconds = float(os.environ.get("FILE_E2E_FILE_PROBE_DELAY_SECONDS", "0") or "0")
+    timeout_seconds = float(os.environ.get("FILE_E2E_TIMEOUT_SECONDS", "60") or "60")
 
     work_dir = Path(os.environ.get("FILE_E2E_APP_DATA", tempfile.mkdtemp(prefix="zgwd-file-e2e-")))
     storage_dir = work_dir / "storage"
@@ -96,12 +97,16 @@ def main() -> None:
     stop = threading.Event()
     desktop_download_completed = threading.Event()
     phone_upload_received = threading.Event()
+    phone_upload_completed = threading.Event()
+    phone_upload_record_id = ""
     offer_accepted = threading.Event()
     seen: dict[str, object] = {
         "desktop_file_id": desktop_record.id,
         "desktop_download_completed": False,
         "desktop_download_progress_events": 0,
+        "transfer_controls": [],
         "phone_upload_received": False,
+        "phone_upload_completed": False,
         "phone_upload_name": "",
         "phone_upload_content": "",
         "errors": [],
@@ -114,6 +119,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_signal)
 
     def on_file_command(payload: dict) -> tuple[int, dict]:
+        nonlocal phone_upload_record_id
         command_type = str(payload.get("type") or "")
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
         if command_type == "file_accept":
@@ -128,9 +134,16 @@ def main() -> None:
             if str(body.get("file_id") or "") == desktop_record.id:
                 seen["desktop_download_completed"] = True
                 desktop_download_completed.set()
+            if str(body.get("file_id") or "") == phone_upload_record_id:
+                seen["phone_upload_completed"] = True
+                phone_upload_completed.set()
             return 200, {"ok": True}
         if command_type == "file_error":
             seen["errors"].append(dict(body))
+            return 200, {"ok": True}
+        if command_type in {"file_pause", "file_resume", "file_cancel"}:
+            if str(body.get("file_id") or "") == desktop_record.id:
+                seen["transfer_controls"].append(command_type)
             return 200, {"ok": True}
         if command_type in {"file_probe", "file_download_request"}:
             if file_probe_delay_seconds > 0:
@@ -150,8 +163,10 @@ def main() -> None:
         if command_type == "file_upload_request":
             name = Path(str(body.get("name") or phone_upload_name)).name or phone_upload_name
             upload_record = library.prepare_incoming_upload(name, size_bytes=int(body.get("size_bytes") or 0))
+            phone_upload_record_id = upload_record.id
             return 200, {
                 "ok": True,
+                "file_id": upload_record.id,
                 "upload_url": http_service.upload_url_for(upload_record),
             }
         return 404, {"error": "unsupported_file_command", "type": command_type}
@@ -204,7 +219,7 @@ def main() -> None:
 
         threading.Thread(target=_publish_offer_until_seen, name="file-offer-publisher", daemon=True).start()
 
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline and not stop.wait(0.2):
             matches = sorted(storage_dir.glob(phone_upload_name))
             matches.extend(sorted(storage_dir.glob(f"{Path(phone_upload_name).stem} (*{Path(phone_upload_name).suffix}")))
@@ -215,9 +230,23 @@ def main() -> None:
                     seen["phone_upload_content"] = phone_upload_content
                     phone_upload_received.set()
                     break
-            if desktop_download_completed.is_set() and phone_upload_received.is_set():
+            expected_controls = {"file_pause", "file_resume", "file_cancel"}
+            recorded_controls = set(seen["transfer_controls"])
+            if (
+                desktop_download_completed.is_set()
+                and phone_upload_received.is_set()
+                and phone_upload_completed.is_set()
+                and expected_controls.issubset(recorded_controls)
+            ):
                 break
-        seen["timed_out"] = not (desktop_download_completed.is_set() and phone_upload_received.is_set())
+        seen["timed_out"] = not (
+            desktop_download_completed.is_set()
+            and phone_upload_received.is_set()
+            and phone_upload_completed.is_set()
+            and {"file_pause", "file_resume", "file_cancel"}.issubset(
+                set(seen["transfer_controls"])
+            )
+        )
         result_file.write_text(json.dumps(seen, ensure_ascii=False), encoding="utf-8")
     finally:
         if transport is not None:

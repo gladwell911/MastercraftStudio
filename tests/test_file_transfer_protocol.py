@@ -49,3 +49,17 @@ def test_build_file_event_rejects_unknown_type():
         assert str(exc) == "invalid_file_event_type"
     else:
         raise AssertionError("expected invalid_file_event_type")
+
+
+def test_build_file_control_events_are_protocol_compatible():
+    for event_type in ("file_pause", "file_paused", "file_resume", "file_resumed", "file_cancel", "file_canceled"):
+        event = build_file_command_event(
+            request_id=f"req-{event_type}",
+            event_type=event_type,
+            device_id="phone",
+            body={"file_id": "file-1", "transferred_bytes": "3"},
+        )
+
+        assert event["type"] == event_type
+        assert event["body"]["file_id"] == "file-1"
+        assert event["body"]["transferred_bytes"] == 3

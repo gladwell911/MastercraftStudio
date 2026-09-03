@@ -288,6 +288,67 @@ def test_remote_file_progress_updates_desktop_record(frame, tmp_path, monkeypatc
     assert updated.speed_bytes_per_second == 42
 
 
+def test_remote_file_controls_broadcast_state_and_cancel_is_terminal(frame, tmp_path, monkeypatch):
+    monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
+    source = tmp_path / "controlled.txt"
+    source.write_text("payload", encoding="utf-8")
+    record = frame.file_library.add_local_file(
+        source,
+        status=FileTransferStatus.TRANSFERRING,
+    )
+    published = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda event: published.append(event))
+
+    for command_type, expected_status, expected_event in (
+        ("file_pause", FileTransferStatus.PAUSED, "file_paused"),
+        ("file_resume", FileTransferStatus.TRANSFERRING, "file_resumed"),
+        ("file_cancel", FileTransferStatus.CANCELED, "file_canceled"),
+    ):
+        status, body = frame._remote_api_file_command_ui({
+            "type": command_type,
+            "body": {"file_id": record.id},
+        })
+        assert status == 200
+        assert body["accepted"] is True
+        assert frame.file_library.get_record(record.id).status == expected_status
+        assert published[-1]["type"] == expected_event
+
+    status, body = frame._remote_api_file_command_ui({
+        "type": "file_complete",
+        "body": {"file_id": record.id, "transferred_bytes": 7},
+    })
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert frame.file_library.get_record(record.id).status == FileTransferStatus.CANCELED
+
+    # Delayed control commands against a canceled record are successful
+    # no-ops. They must not publish a state that differs from the stored
+    # terminal status.
+    published_count = len(published)
+    for command_type in ("file_pause", "file_resume", "file_cancel"):
+        status, body = frame._remote_api_file_command_ui({
+            "type": command_type,
+            "body": {"file_id": record.id},
+        })
+        assert status == 200
+        assert body["accepted"] is True
+        assert frame.file_library.get_record(record.id).status == FileTransferStatus.CANCELED
+        assert len(published) == published_count
+
+    # Other inapplicable conversions are likewise harmless and silent.
+    completed = frame.file_library.add_local_file(source)
+    for command_type in ("file_pause", "file_resume", "file_cancel"):
+        status, body = frame._remote_api_file_command_ui({
+            "type": command_type,
+            "body": {"file_id": completed.id},
+        })
+        assert status == 200
+        assert body["accepted"] is True
+        assert frame.file_library.get_record(completed.id).status == FileTransferStatus.COMPLETED
+        assert len(published) == published_count
+
+
 def test_remote_file_probe_existing_path_publishes_offer(frame, tmp_path, monkeypatch):
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "probe.txt"

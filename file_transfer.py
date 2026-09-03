@@ -45,6 +45,7 @@ class FileTransferStatus(StrEnum):
     WAITING_CONFIRMATION = "waiting_confirmation"
     ACCEPTED = "accepted"
     TRANSFERRING = "transferring"
+    PAUSED = "paused"
     COMPLETED = "completed"
     REJECTED = "rejected"
     FAILED = "failed"
@@ -53,6 +54,7 @@ class FileTransferStatus(StrEnum):
     @property
     def label(self) -> str:
         return {
+            FileTransferStatus.PAUSED: "paused",
             FileTransferStatus.WAITING_CONFIRMATION: "等待确认",
             FileTransferStatus.ACCEPTED: "已确认",
             FileTransferStatus.TRANSFERRING: "正在传输",
@@ -324,6 +326,8 @@ class DesktopFileLibrary:
         record = self.get_record(record_id)
         if record is None:
             return None
+        if record.status == FileTransferStatus.CANCELED and status != FileTransferStatus.CANCELED:
+            return record
         allowed = {
             "name",
             "stored_path",

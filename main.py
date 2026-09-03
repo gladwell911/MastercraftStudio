@@ -2257,6 +2257,41 @@ class ChatFrame(wx.Frame):
             )
             self._refresh_file_manager_if_visible(selected_id=file_id)
             return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type in ("file_pause", "file_paused"):
+            record, changed = self._apply_file_transfer_control_state(
+                file_id,
+                allowed_from={FileTransferStatus.ACCEPTED, FileTransferStatus.TRANSFERRING},
+                status=FileTransferStatus.PAUSED,
+            )
+            if changed:
+                self._refresh_file_manager_if_visible(selected_id=file_id)
+                self._broadcast_file_transfer_state("file_paused", record)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type in ("file_resume", "file_resumed"):
+            record, changed = self._apply_file_transfer_control_state(
+                file_id,
+                allowed_from={FileTransferStatus.PAUSED},
+                status=FileTransferStatus.TRANSFERRING,
+            )
+            if changed:
+                self._refresh_file_manager_if_visible(selected_id=file_id)
+                self._broadcast_file_transfer_state("file_resumed", record)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
+        if command_type in ("file_cancel", "file_canceled"):
+            record, changed = self._apply_file_transfer_control_state(
+                file_id,
+                allowed_from={
+                    FileTransferStatus.WAITING_CONFIRMATION,
+                    FileTransferStatus.ACCEPTED,
+                    FileTransferStatus.TRANSFERRING,
+                    FileTransferStatus.PAUSED,
+                },
+                status=FileTransferStatus.CANCELED,
+            )
+            if changed:
+                self._refresh_file_manager_if_visible(selected_id=file_id)
+                self._broadcast_file_transfer_state("file_canceled", record)
+            return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
         if command_type == "file_complete":
             existing = self.file_library.get_record(file_id)
             size = int(body.get("size_bytes") or (existing.size_bytes if existing else 0) or 0)
@@ -2327,6 +2362,45 @@ class ChatFrame(wx.Frame):
             self._refresh_file_manager_if_visible(selected_id=record.id)
             return 200, {"accepted": True, "file_id": record.id, "name": record.name, "size_bytes": record.size_bytes, "upload_url": upload_url}
         return 404, {"accepted": False, "error": "unknown_file_command"}
+
+    def _apply_file_transfer_control_state(
+        self,
+        file_id: str,
+        *,
+        allowed_from: set[FileTransferStatus],
+        status: FileTransferStatus,
+    ) -> tuple[object | None, bool]:
+        """Apply one valid control transition and report whether it changed.
+
+        Commands are intentionally idempotent: a known record in an
+        inapplicable or terminal state is an accepted no-op. This prevents
+        delayed pause/resume/cancel commands from emitting events that claim a
+        state the persisted record never entered.
+        """
+        record = self.file_library.get_record(file_id)
+        if record is None or record.status not in allowed_from:
+            return record, False
+        updated = self.file_library.update_record_status(
+            file_id,
+            status,
+            speed_bytes_per_second=0,
+        )
+        return updated, updated is not None and updated.status == status
+
+    def _broadcast_file_transfer_state(self, event_type: str, record) -> None:
+        self._broadcast_remote_event(
+            build_file_command_event(
+                request_id=f"{event_type}-{uuid.uuid4().hex}",
+                event_type=event_type,
+                device_id=str(getattr(self, "notes_device_id", "desktop") or "desktop"),
+                body={
+                    "file_id": record.id,
+                    "size_bytes": record.size_bytes,
+                    "transferred_bytes": record.transferred_bytes,
+                    "speed_bytes_per_second": record.speed_bytes_per_second,
+                },
+            )
+        )
 
     def _start_file_service_if_configured(self) -> bool:
         if str(os.getenv("DESKTOP_FILE_SERVICE_AUTOSTART", "1")).strip().lower() in {"0", "false", "no"}:
