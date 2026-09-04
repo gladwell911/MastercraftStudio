@@ -14,12 +14,14 @@ def _send_listbox_key(window, key_code):
         main.wx.WXK_DOWN: 0x50,
         main.wx.WXK_HOME: 0x47,
         main.wx.WXK_END: 0x4F,
+        main.wx.WXK_SPACE: 0x39,
     }
     virtual_keys = {
         main.wx.WXK_UP: 0x26,
         main.wx.WXK_DOWN: 0x28,
         main.wx.WXK_HOME: 0x24,
         main.wx.WXK_END: 0x23,
+        main.wx.WXK_SPACE: 0x20,
     }
     scan = scan_codes.get(key_code, 0)
     virtual_key = virtual_keys.get(key_code, int(key_code))
@@ -60,6 +62,36 @@ def test_history_navigation_stays_stable_when_background_chat_title_updates(fram
     assert frame.history_list.GetSelection() == 0
     assert frame.history_ids == ["chat-active", "chat-old"]
     assert frame.history_list.GetString(1)
+
+
+def test_ui_automation_space_from_history_moves_focus_to_input_without_activating_history(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.Raise()
+    ctypes.WinDLL("user32", use_last_error=True).SetForegroundWindow(int(frame.GetHandle()))
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame._current_chat_state = {"id": "chat-active", "title": "active", "turns": []}
+    frame.archived_chats = [{"id": "chat-older", "title": "older", "turns": [], "created_at": 1.0, "updated_at": 1.0}]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame._refresh_history("chat-active")
+    selected_before = frame.history_ids.index("chat-older")
+    frame.history_list.SetSelection(selected_before)
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    for _ in range(6):
+        if _focused_control() is frame.history_list:
+            break
+        assert _focused_control().Navigate(main.wx.NavigationKeyEvent.IsForward)
+        wx_app.Yield()
+    assert _focused_control() is frame.history_list
+    monkeypatch.setattr(frame, "_activate_selected_history", lambda: pytest.fail("Space must not activate history"))
+
+    _send_listbox_key(frame.history_list, main.wx.WXK_SPACE)
+    wx_app.Yield()
+
+    assert _focused_control() is frame.input_edit
+    assert frame.history_list.GetSelection() == selected_before
+    assert frame.view_mode == "active"
 
 
 class _EnterEvent:

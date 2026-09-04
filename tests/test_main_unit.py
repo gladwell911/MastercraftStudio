@@ -9637,20 +9637,219 @@ def test_answer_char_hook_shift_enter_opens_web_detail(frame, monkeypatch):
     assert opened_web == [True]
 
 
-def test_answer_text_viewer_continue_submits_expected_prompt(frame, monkeypatch):
-    submitted = []
-    frame.input_edit.SetValue("")
-    monkeypatch.setattr(frame, "_submit_question", lambda text, source="local": submitted.append((text, source)) or (True, ""))
+class _UnmodifiedSpaceEvent:
+    def __init__(self, *, ctrl=False, alt=False, shift=False):
+        self.ctrl = ctrl
+        self.alt = alt
+        self.shift = shift
+        self.skipped = 0
 
-    frame._continue_from_answer_text_viewer()
+    def GetKeyCode(self):
+        return wx.WXK_SPACE
 
-    assert frame.input_edit.GetValue() == "好的，继续"
-    assert submitted == [("好的，继续", "local")]
+    def ControlDown(self):
+        return self.ctrl
+
+    def AltDown(self):
+        return self.alt
+
+    def ShiftDown(self):
+        return self.shift
+
+    def Skip(self):
+        self.skipped += 1
+
+
+@pytest.mark.parametrize(
+    "control_name",
+    ("notes_notebook_list", "notes_entry_list", "history_list", "answer_list", "model_combo"),
+)
+def test_char_hook_space_from_named_navigation_control_focuses_input_and_consumes(frame, monkeypatch, control_name):
+    control = getattr(frame, control_name)
+    focused = []
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: focused.append(True))
+    control.SetFocus()
+    event = _UnmodifiedSpaceEvent()
+
+    frame._on_char_hook(event)
+
+    assert focused == [True]
+    assert event.skipped == 0
+
+
+def test_char_hook_space_with_disabled_input_is_consumed_without_scheduling_quiet_work(frame, monkeypatch):
+    frame.history_list.SetFocus()
+    monkeypatch.setattr(frame.input_edit, "IsEnabled", lambda: False)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: pytest.fail("disabled input must not receive focus"))
+    monkeypatch.setattr(frame, "_touch_navigation_quiet_window", lambda _event: pytest.fail("recognized Space must not schedule quiet work"))
+    event = _UnmodifiedSpaceEvent()
+
+    frame._on_char_hook(event)
+
+    assert event.skipped == 0
+
+
+@pytest.mark.parametrize(
+    "handler_name,control_name",
+    (
+        ("_on_notes_key_down", "notes_notebook_list"),
+        ("_on_notes_key_down", "notes_entry_list"),
+        ("_on_history_key_down", "history_list"),
+        ("_on_answer_key_down", "answer_list"),
+        ("_on_generic_key_down", "model_combo"),
+    ),
+)
+def test_named_navigation_key_handlers_consume_space_before_default_behavior(frame, monkeypatch, handler_name, control_name):
+    control = getattr(frame, control_name)
+    focused = []
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    control.SetFocus()
+    event = _UnmodifiedSpaceEvent()
+
+    getattr(frame, handler_name)(event)
+
+    assert focused == [True]
+    assert event.skipped == 0
+
+
+@pytest.mark.parametrize(
+    "control_name,event_kwargs",
+    (
+        ("input_edit", {}),
+        ("notes_editor", {}),
+        ("codex_speed_combo", {}),
+        ("answer_list", {"ctrl": True}),
+        ("history_list", {"alt": True}),
+        ("model_combo", {"shift": True}),
+    ),
+)
+def test_char_hook_space_keeps_ordinary_behavior_outside_shortcut_scope(frame, monkeypatch, control_name, event_kwargs):
+    focused = []
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    getattr(frame, control_name).SetFocus()
+    event = _UnmodifiedSpaceEvent(**event_kwargs)
+
+    frame._on_char_hook(event)
+
+    assert focused == []
+    assert event.skipped == 1
+
+
+@pytest.mark.parametrize(
+    "owner_chat_id,is_history",
+    (("chat-active", False), ("chat-archived", True)),
+)
+def test_answer_text_viewer_continue_restores_captured_owner_without_submitting(frame, monkeypatch, owner_chat_id, is_history):
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active", "answer_md": "answer", "model": main.DEFAULT_MODEL_ID}]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-archived",
+            "title": "archived",
+            "turns": [{"question": "archived", "answer_md": "answer", "model": main.DEFAULT_MODEL_ID}],
+        }
+    ]
+    focused = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
+
+    assert frame._continue_from_answer_text_viewer(owner_chat_id) is True
+
+    assert frame.view_mode == ("history" if is_history else "active")
+    assert frame.view_history_id == (owner_chat_id if is_history else None)
+    assert focused == [True]
+
+
+def test_answer_text_viewer_continue_restores_current_state_owner_when_active_ids_are_empty(frame, monkeypatch):
+    frame.active_chat_id = ""
+    frame.current_chat_id = ""
+    frame.active_session_turns = [{"question": "active", "answer_md": "answer", "model": main.DEFAULT_MODEL_ID}]
+    frame._current_chat_state = {"id": "chat-current-state", "turns": frame.active_session_turns}
+    focused = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
+
+    assert frame._continue_from_answer_text_viewer("chat-current-state") is True
+
+    assert frame.view_mode == "active"
+    assert frame.view_history_id is None
+    assert focused == [True]
+
+
+def test_answer_text_viewer_continue_missing_owner_keeps_visible_detail_and_does_not_submit(frame, monkeypatch):
+    focused = []
+    monkeypatch.setattr(frame, "_show_history_chat", lambda *_args, **_kwargs: pytest.fail("missing owner must not switch detail"))
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
+
+    assert frame._continue_from_answer_text_viewer("") is False
+
+    assert focused == []
+
+
+def test_answer_text_viewer_continue_unavailable_owner_keeps_visible_detail_and_does_not_submit(frame, monkeypatch):
+    focused = []
+    monkeypatch.setattr(frame, "_show_history_chat", lambda *_args, **_kwargs: pytest.fail("unavailable owner must not switch detail"))
+    monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
+
+    assert frame._continue_from_answer_text_viewer("chat-deleted") is False
+
+    assert focused == []
+
+
+def test_answer_text_viewer_captures_owner_when_opened(frame, monkeypatch):
+    continued = []
+
+    class _Viewer:
+        def __init__(self, _parent, _title, _text):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def Destroy(self):
+            return None
+
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-owned-by-viewer"
+    monkeypatch.setattr(main, "AnswerTextViewerDialog", _Viewer)
+    monkeypatch.setattr(frame, "_continue_from_answer_text_viewer", lambda owner: continued.append(owner) or True)
+
+    assert frame._open_answer_text_viewer("回答详情", "内容") is True
+    assert continued == ["chat-owned-by-viewer"]
+
+
+def test_answer_text_viewer_modal_ok_captures_active_owner_when_opened(frame, monkeypatch):
+    continued = []
+
+    class _Viewer:
+        def __init__(self, _parent, _title, _text):
+            pass
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def Destroy(self):
+            return None
+
+    frame.view_mode = "active"
+    frame.active_chat_id = "chat-active-owner"
+    frame.current_chat_id = "chat-active-owner"
+    frame._current_chat_state = {"id": "chat-active-owner", "turns": []}
+    monkeypatch.setattr(main, "AnswerTextViewerDialog", _Viewer)
+    monkeypatch.setattr(frame, "_continue_from_answer_text_viewer", lambda owner: continued.append(owner) or True)
+
+    assert frame._open_answer_text_viewer("回答详情", "内容") is True
+    assert continued == ["chat-active-owner"]
 
 
 def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
-    continued = []
-    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "第一段\n\n第二段", on_continue=lambda: continued.append(True))
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "第一段\n\n第二段")
     try:
         closed = []
         dlg._finish = lambda code: closed.append(code)
@@ -9660,7 +9859,6 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
         assert dlg.close_button.GetLabel() == "关闭"
         assert dlg.continue_button.GetLabel() == "继续"
         dlg._on_continue_clicked()
-        assert continued == [True]
         assert closed == [wx.ID_OK]
 
         class E:
@@ -9680,7 +9878,7 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
 def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves_focus(frame, monkeypatch):
     copied = []
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
-    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "原始内容", on_continue=None)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "原始内容")
     try:
         dlg.text_ctrl.SetValue("编辑后的当前内容")
         skipped = []

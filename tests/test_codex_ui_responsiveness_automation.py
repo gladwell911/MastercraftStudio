@@ -278,7 +278,7 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_current
 
     copied = []
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
-    dlg = main.AnswerTextViewerDialog(frame, "回答详情", opened_viewer[0][1], on_continue=None)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", opened_viewer[0][1])
     try:
         dlg.text_ctrl.SetValue("当前编辑框内容")
         tab = main.wx.KeyEvent(main.wx.wxEVT_CHAR_HOOK)

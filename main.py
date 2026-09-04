@@ -888,13 +888,12 @@ class RealtimeCallSettingsDialog(wx.Dialog):
 
 
 class AnswerTextViewerDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, title: str, text: str, on_continue: Callable[[], None] | None = None):
+    def __init__(self, parent: wx.Window, title: str, text: str):
         super().__init__(
             parent,
             title=str(title or "文本查看"),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX,
         )
-        self._on_continue = on_continue
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
         self.text_ctrl = wx.TextCtrl(
@@ -942,8 +941,6 @@ class AnswerTextViewerDialog(wx.Dialog):
                 status("已复制")
 
     def _on_continue_clicked(self, _event=None):
-        if callable(self._on_continue):
-            self._on_continue()
         self._finish(wx.ID_OK)
 
     def _finish(self, code: int) -> None:
@@ -8695,6 +8692,47 @@ class ChatFrame(wx.Frame):
     def _focus_input_box(self) -> bool:
         return self._focus_control_safely(getattr(self, "input_edit", None))
 
+    def _event_shift_down(self, event) -> bool:
+        shift_down = getattr(event, "ShiftDown", None)
+        if callable(shift_down):
+            return bool(shift_down())
+        try:
+            return bool(wx.GetKeyState(wx.WXK_SHIFT))
+        except Exception:
+            return False
+
+    def _is_input_focus_space_shortcut(self, event) -> bool:
+        """Return whether Space should move focus from a named navigation control."""
+        try:
+            if int(event.GetKeyCode()) != wx.WXK_SPACE:
+                return False
+        except Exception:
+            return False
+        if self._event_control_down(event) or self._event_alt_down(event) or self._event_shift_down(event):
+            return False
+        for control_name in (
+            "notes_notebook_list",
+            "notes_entry_list",
+            "history_list",
+            "answer_list",
+            "model_combo",
+        ):
+            control = getattr(self, control_name, None)
+            try:
+                if control is not None and control.HasFocus():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _handle_input_focus_space_shortcut(self, event) -> bool:
+        if not self._is_input_focus_space_shortcut(event):
+            return False
+        # Consume even when input is unavailable so native list/combo Space
+        # behavior cannot run after a recognized shortcut.
+        self._focus_input_box()
+        return True
+
     def _focus_history_list(self) -> bool:
         return self._focus_control_safely(getattr(self, "history_list", None))
 
@@ -12102,6 +12140,8 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
             event.Skip()
             return
+        if self._handle_input_focus_space_shortcut(event):
+            return
         self._touch_navigation_quiet_window(event)
         self._suppress_tools_menu_open()
         if (
@@ -13992,6 +14032,8 @@ class ChatFrame(wx.Frame):
     def _on_answer_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
             return
+        if self._handle_input_focus_space_shortcut(event):
+            return
         self._touch_navigation_quiet_window(event)
         key = event.GetKeyCode()
         ctrl = self._event_control_down(event)
@@ -14256,15 +14298,19 @@ class ChatFrame(wx.Frame):
         return title, text
 
     def _open_answer_text_viewer(self, title: str, text: str) -> bool:
-        dlg = AnswerTextViewerDialog(self, title, text, on_continue=self._continue_from_answer_text_viewer)
+        owner_chat_id = self._visible_answer_owner_chat_id()
+        dlg = AnswerTextViewerDialog(self, title, text)
+        continue_to_owner = False
         try:
             dlg._shown_modally = True
-            dlg.ShowModal()
+            continue_to_owner = dlg.ShowModal() == wx.ID_OK
         finally:
             try:
                 dlg.Destroy()
             except RuntimeError:
                 pass
+        if continue_to_owner:
+            self._continue_from_answer_text_viewer(owner_chat_id)
         return True
 
     def _open_selected_answer_text_viewer(self) -> bool:
@@ -14285,11 +14331,31 @@ class ChatFrame(wx.Frame):
         title, text = content
         return self._open_answer_text_viewer(title, text)
 
-    def _continue_from_answer_text_viewer(self) -> None:
-        prompt = "好的，继续"
-        if hasattr(self, "input_edit") and self.input_edit is not None:
-            self.input_edit.SetValue(prompt)
-        self._submit_question(prompt, source="local")
+    def _visible_answer_owner_chat_id(self) -> str:
+        if self.view_mode == "history":
+            return str(self.view_history_id or "").strip()
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        return str(self.active_chat_id or self.current_chat_id or state.get("id") or "").strip()
+
+    def _continue_from_answer_text_viewer(self, owner_chat_id: str) -> bool:
+        """Return from a detail viewer to its captured chat without submitting."""
+        owner = str(owner_chat_id or "").strip()
+        if not owner:
+            return False
+        current_ids = {
+            str(self.active_chat_id or "").strip(),
+            str(self.current_chat_id or "").strip(),
+            str((self._current_chat_state or {}).get("id") or "").strip()
+            if isinstance(getattr(self, "_current_chat_state", None), dict)
+            else "",
+        }
+        current_ids.discard("")
+        if owner not in current_ids and not isinstance(self._find_archived_chat(owner), dict):
+            return False
+        if not self._show_history_chat(owner, focus_answer_list=False):
+            return False
+        self._focus_input_box()
+        return True
 
     def _try_open_selected_answer_detail(self) -> bool:
         idx = self.answer_list.GetSelection()
@@ -14344,6 +14410,8 @@ class ChatFrame(wx.Frame):
 
     def _on_history_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
+            return
+        if self._handle_input_focus_space_shortcut(event):
             return
         self._touch_navigation_quiet_window(event)
         if self._handle_ctrl_history_navigation(event):
@@ -14406,7 +14474,16 @@ class ChatFrame(wx.Frame):
         if not selected_id:
             return False
         self._flush_relevant_execution_deltas_for_switch()
-        current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
+        current_state_id = (
+            str((self._current_chat_state or {}).get("id") or "").strip()
+            if isinstance(getattr(self, "_current_chat_state", None), dict)
+            else ""
+        )
+        current_ids = {
+            str(self.active_chat_id or "").strip(),
+            str(self.current_chat_id or "").strip(),
+            current_state_id,
+        }
         current_ids.discard("")
         if selected_id in current_ids:
             self.view_mode = "active"
@@ -14895,6 +14972,8 @@ class ChatFrame(wx.Frame):
 
     def _on_generic_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
+            return
+        if self._handle_input_focus_space_shortcut(event):
             return
         self._touch_navigation_quiet_window(event)
         if self._handle_named_new_chat_shortcut(event):
@@ -16149,6 +16228,8 @@ class ChatFrame(wx.Frame):
 
     def _on_notes_key_down(self, event):
         key = event.GetKeyCode()
+        if self._handle_input_focus_space_shortcut(event):
+            return
         if event.ControlDown() and not event.AltDown() and self.notes_entry_list.HasFocus():
             if key == wx.WXK_UP:
                 if self._notes_move_entry_up():
