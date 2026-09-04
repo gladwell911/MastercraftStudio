@@ -1039,6 +1039,57 @@ def test_ui_automation_visible_chat_does_not_receive_late_claudecode_delta_from_
     assert frame.answer_list.HasFocus()
 
 
+def test_ui_automation_execution_reentry_reconciles_stale_tail_and_ignores_old_chat(frame, monkeypatch):
+    frame.Show()
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "current question", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL},
+    ]
+    current_step = {
+        "id": "current-step",
+        "turn_idx": 0,
+        "display_kind": "commentary",
+        "list_text": "current execution",
+        "detail_text": "current execution",
+    }
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "turns": frame.active_session_turns,
+            "detail_panel_mode": "execution",
+            "execution_steps": [current_step],
+        }
+    )
+    frame.archived_chats = [
+        {
+            "id": "chat-old",
+            "turns": [{"question": "old question", "answer_md": "old answer", "model": main.DEFAULT_CODEX_MODEL}],
+            "execution_steps": [],
+        }
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.Append("stale visible tail")
+    frame.execution_meta.append(("execution", 99, "stale visible tail", "stale visible tail"))
+    frame._append_execution_entry_to_chat(
+        "chat-old",
+        {"id": "old-step", "turn_idx": 0, "display_kind": "commentary", "list_text": "old execution", "detail_text": "old execution"},
+    )
+
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+
+    rows = list(frame.execution_list.GetStrings())
+    assert "current execution" in rows
+    assert "stale visible tail" not in rows
+    assert "old execution" not in rows
+    assert len(rows) == len(frame.execution_meta)
+
+
 def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-current"

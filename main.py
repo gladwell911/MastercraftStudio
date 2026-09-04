@@ -4822,11 +4822,48 @@ class ChatFrame(wx.Frame):
     def _on_input_text_changed(self, event) -> None:
         event.Skip()
 
+    def _active_answer_turn_is_authoritative(self, turn_idx: int, turn: dict | None = None) -> bool:
+        """Return whether an answer fast path still targets the visible state.
+
+        Incremental callbacks may arrive after a chat switch or after another
+        turn became active.  The authoritative active-turn list is the only
+        source an answer fast path is allowed to project from.
+        """
+        if self.view_mode != "active":
+            return False
+        try:
+            index = int(turn_idx)
+        except (TypeError, ValueError):
+            return False
+        turns = self.active_session_turns if isinstance(getattr(self, "active_session_turns", None), list) else []
+        if not (0 <= index < len(turns)) or not isinstance(turns[index], dict):
+            return False
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        visible_id = str(self.active_chat_id or self.current_chat_id or state.get("id") or "").strip()
+        state_id = str(state.get("id") or "").strip()
+        if visible_id and state_id and state_id != visible_id:
+            return False
+        # The render projection reads the visible chat state.  Do not replace
+        # legacy callers' local incremental test/setup data unless that state
+        # is the same authoritative turn collection.
+        if state.get("turns") is not turns:
+            return False
+        canonical_turn = turns[index]
+        if turn is not None and turn is not canonical_turn and turn != canonical_turn:
+            return False
+        return True
+
     def _append_submitted_question_to_answer_list(self, turn_idx: int, turn: dict) -> bool:
         if not hasattr(self, "answer_list"):
             return False
         if self.view_mode != "active":
             return False
+        if self._active_answer_turn_is_authoritative(turn_idx, turn):
+            # Reconcile instead of extending a possibly stale visible tail.
+            # replace_visible_page remains a no-op when the projection did not
+            # change, preserving selection, focus, and repaint behaviour.
+            self._render_answer_list(refresh_execution=False)
+            return True
         q = str((turn or {}).get("question") or "")
         attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
         if not q.strip() and not attachments:
@@ -4972,6 +5009,12 @@ class ChatFrame(wx.Frame):
             return False
         if self.view_mode != "active":
             return False
+        if self._active_answer_turn_is_authoritative(turn_idx, turn):
+            answer_md = str((turn or {}).get("answer_md") or "")
+            if not answer_md.strip() or answer_md == REQUESTING_TEXT:
+                return False
+            self._render_answer_list(refresh_execution=False)
+            return self._find_answer_row_index(int(turn_idx)) >= 0
         if self._find_answer_row_index(int(turn_idx)) >= 0:
             return False
         attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
@@ -5014,6 +5057,9 @@ class ChatFrame(wx.Frame):
     def _update_active_answer_row(self, turn_idx: int) -> bool:
         if self.view_mode != "active":
             return False
+        if self._active_answer_turn_is_authoritative(turn_idx):
+            self._render_answer_list(refresh_execution=False)
+            return self._find_answer_row_index(int(turn_idx)) >= 0
         row = self._active_answer_row_index
         if row < 0 or row >= self.answer_list.GetCount():
             row = self._find_answer_row_index(turn_idx)
@@ -5248,6 +5294,7 @@ class ChatFrame(wx.Frame):
             int(getattr(self, "execution_visible_row_limit", EXECUTION_LIST_DEFAULT_VISIBLE_ROWS) or 0),
         )
         chat_id = self._visible_execution_chat_id()
+        in_memory_rows = list(self._current_execution_steps())
         store = getattr(self, "chat_store", None)
         if (
             getattr(self, "_chat_store_enabled", False)
@@ -5262,11 +5309,24 @@ class ChatFrame(wx.Frame):
             try:
                 total, rows = store.load_recent_execution_steps(chat_id, turn_idx=turn_idx, limit=limit)
                 if total > 0 or rows:
-                    return total, rows
+                    # The store can lag a UI batch while the active chat has
+                    # already received its canonical in-memory entries.  Use
+                    # that complete snapshot when available; otherwise merge
+                    # its unsaved tail onto the recent persisted page.
+                    if len(in_memory_rows) >= total:
+                        return len(in_memory_rows), in_memory_rows
+                    merged_rows = list(rows)
+                    signatures = {repr(item) for item in merged_rows}
+                    for item in in_memory_rows:
+                        signature = repr(item)
+                        if signature in signatures:
+                            continue
+                        signatures.add(signature)
+                        merged_rows.append(item)
+                    return max(total, len(merged_rows)), merged_rows
             except Exception:
                 pass
-        rows = list(self._current_execution_steps())
-        return len(rows), rows
+        return len(in_memory_rows), in_memory_rows
 
     @staticmethod
     def _safe_int(value, default: int = 0) -> int:
@@ -5759,6 +5819,25 @@ class ChatFrame(wx.Frame):
             return chat is target_chat
         return target_chat is getattr(self, "_current_chat_state", None)
 
+    def _execution_entry_is_authoritative_and_visible(self, target_chat: dict, step_idx: int, step) -> bool:
+        """Check that an execution fast path still belongs to the visible turn."""
+        if self._visible_execution_chat_state() is not target_chat:
+            return False
+        try:
+            index = int(step_idx)
+        except (TypeError, ValueError):
+            return False
+        steps = target_chat.get("execution_steps") if isinstance(target_chat, dict) else None
+        if not isinstance(steps, list) or not (0 <= index < len(steps)):
+            return False
+        canonical_step = steps[index]
+        if step is not canonical_step and step != canonical_step:
+            return False
+        if self.view_mode == "active" and isinstance(canonical_step, dict) and "turn_idx" in canonical_step:
+            if self._safe_int(canonical_step.get("turn_idx"), -1) != self._active_turn_index_value():
+                return False
+        return True
+
     def _append_visible_execution_entry(self, target_chat: dict, step_idx: int, step) -> bool:
         if not isinstance(target_chat, dict) or not hasattr(self, "execution_list"):
             return False
@@ -5778,6 +5857,17 @@ class ChatFrame(wx.Frame):
             counts["execution"] = int(counts.get("execution", 0)) + 1
             self._deferred_background_ui_counts = counts
             return True
+        if self._execution_entry_is_authoritative_and_visible(target_chat, step_idx, step):
+            # A replay can reuse the same execution identity.  Reconcile
+            # rather than appending metadata a second time; otherwise the
+            # ListBox model and execution_meta can disagree about the tail.
+            row_id = self._execution_row_id(int(step_idx), step)
+            if (
+                hasattr(self, "execution_list_model")
+                and self.execution_list_model.row_for_id(row_id) >= 0
+            ):
+                self._rebuild_execution_list_from_state()
+                return True
         if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
             self._execution_list_pending_turn_reset = False
             try:
@@ -5924,22 +6014,13 @@ class ChatFrame(wx.Frame):
         chat = self._chat_state_for_execution_steps(chat_id)
         if not isinstance(chat, dict):
             return
-        remaining = []
-        for step_idx, step in sorted(pending, key=lambda item: item[0]):
-            try:
-                row_id = self._execution_row_id(int(step_idx), step)
-                if hasattr(self, "execution_list_model") and self.execution_list_model.row_for_id(row_id) >= 0:
-                    continue
-            except Exception:
-                pass
-            if not self._append_visible_execution_entry(chat, int(step_idx), step):
-                remaining.append((int(step_idx), copy.deepcopy(step)))
-        if remaining:
-            pending_by_chat[chat_id] = remaining
-            self._mark_execution_list_dirty()
-        else:
-            pending_by_chat.pop(chat_id, None)
+        # Deferred entries have already been persisted in their owning chat.
+        # Rebuild once from that authoritative owner rather than replaying
+        # append operations that can duplicate or revive an old tail.
+        pending_by_chat.pop(chat_id, None)
         self._pending_execution_tail_appends = pending_by_chat
+        self._rebuild_execution_list_from_state()
+        self._select_latest_execution_row_if_not_focused()
 
     def _restore_execution_selection_if_focused(self, selected_id: str, selected_idx: int) -> None:
         try:
@@ -5986,7 +6067,11 @@ class ChatFrame(wx.Frame):
                 self._select_latest_execution_row_if_not_focused()
             except Exception:
                 pass
-        self._request_listbox_repaint(self.execution_list)
+        # A batch can contain several repeated events.  Reconcile its final
+        # visible state once rather than repainting the last incrementally
+        # appended tail.
+        if self._execution_list_visible_for_updates():
+            self._rebuild_execution_list_from_state()
 
     @staticmethod
     def _execution_step_detail_text(step) -> str:

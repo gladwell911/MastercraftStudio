@@ -18833,6 +18833,94 @@ def test_clear_context_auto_resend_first_question_only_when_requested(frame, mon
     assert submitted == [("第一条问题", {"source": "local"})]
 
 
+def test_answer_reconciliation_removes_stale_physical_tail_and_keeps_meta_aligned(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "current question", "answer_md": "current answer", "model": main.DEFAULT_MODEL_ID},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._render_answer_list()
+
+    frame.answer_list.Append("stale answer tail")
+    frame.answer_meta.append(("answer", 99, "stale answer tail", "stale answer tail"))
+
+    frame._render_answer_list()
+
+    rows = list(frame.answer_list.GetStrings())
+    assert "stale answer tail" not in rows
+    assert len(rows) == len(frame.answer_meta)
+    assert frame.answer_list_model.visible_ids == [frame._answer_row_id(meta) for meta in frame.answer_meta]
+
+
+def test_answer_reconciliation_repairs_same_length_stale_physical_tail(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "current question", "answer_md": "current answer", "model": main.DEFAULT_MODEL_ID},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._render_answer_list()
+    tail_index = frame.answer_list.GetCount() - 1
+    frame.answer_list.SetString(tail_index, "stale answer tail")
+
+    frame._render_answer_list()
+
+    assert frame.answer_list.GetString(tail_index) == "current answer"
+    assert len(frame.answer_list.GetStrings()) == len(frame.answer_meta)
+
+
+def test_repeated_current_answer_completion_reconciles_instead_of_duplicate_append(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"question": "current question", "answer_md": "current answer", "model": main.DEFAULT_MODEL_ID},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._render_answer_list()
+
+    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is True
+    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is True
+
+    rows = list(frame.answer_list.GetStrings())
+    assert rows.count("current answer") == 1
+    assert len(rows) == len(frame.answer_meta)
+    assert frame.answer_list_model.visible_ids == [frame._answer_row_id(meta) for meta in frame.answer_meta]
+
+
+def test_execution_replay_reconciles_stale_tail_without_cross_turn_row(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame.active_session_turns = [
+        {"question": "old question", "answer_md": "old answer", "model": main.DEFAULT_MODEL_ID},
+        {"question": "current question", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID},
+    ]
+    step = {"id": "current-step", "turn_idx": 1, "display_kind": "commentary", "list_text": "current step", "detail_text": "current step"}
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [step],
+    }
+    frame._render_execution_list()
+    frame.execution_list.Append("stale execution tail")
+    frame.execution_meta.append(("execution", 99, "stale execution tail", "stale execution tail"))
+
+    assert frame._append_visible_execution_entry(frame._current_chat_state, 0, step) is True
+
+    rows = list(frame.execution_list.GetStrings())
+    assert "stale execution tail" not in rows
+    assert rows.count("current step") == 1
+    assert len(rows) == len(frame.execution_meta)
+    assert not frame._append_visible_execution_entry(
+        frame._current_chat_state,
+        0,
+        {"id": "old-step", "turn_idx": 0, "display_kind": "commentary", "list_text": "old step", "detail_text": "old step"},
+    )
+    assert "old step" not in list(frame.execution_list.GetStrings())
+
+
 def test_clear_context_auto_resend_skips_local_command_turns(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"

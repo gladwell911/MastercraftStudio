@@ -46,14 +46,23 @@ class IncrementalListBoxModel:
         labels = {item_id: label for item_id, label in normalized_rows}
         current_labels = [self.labels_by_id.get(item_id, "") for item_id in self.visible_ids]
         new_labels = [label for _item_id, label in normalized_rows]
-        if self.visible_ids == ids and current_labels == new_labels:
+        # The model normally owns all list mutations, but an incremental path
+        # can be interrupted by a chat/turn transition.  Treat the control's
+        # actual contents as part of the no-op check so a later authoritative
+        # render repairs a stale physical tail instead of trusting metadata
+        # that happens to look current.
+        try:
+            control_labels = [self.control.GetString(index) for index in range(self.control.GetCount())]
+        except Exception:
+            control_labels = []
+        if self.visible_ids == ids and current_labels == new_labels and control_labels == new_labels:
             if selected_id:
                 self.set_selection_by_id(selected_id)
             return False
-        if self.visible_ids == ids:
+        if self.visible_ids == ids and len(control_labels) == len(new_labels):
             changed = False
             for idx, (item_id, label) in enumerate(normalized_rows):
-                if self.labels_by_id.get(item_id, "") == label:
+                if self.labels_by_id.get(item_id, "") == label and control_labels[idx] == label:
                     continue
                 self.control.SetString(idx, label)
                 self.labels_by_id[item_id] = label
