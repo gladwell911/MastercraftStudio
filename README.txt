@@ -34,7 +34,7 @@ setx OPENROUTER_API_KEY "你的Key"
 
 如果项目目录下存在 `.venv` 或 `.venv311`，打包和测试流程优先使用对应虚拟环境。
 
-如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
+如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。桌面和手机远程请求都会按模型标识进入 Kimi 专用链路，不依赖 `OPENROUTER_API_KEY`。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
 
 ## 数据位置
 
@@ -49,7 +49,7 @@ setx OPENROUTER_API_KEY "你的Key"
 .\package_mc.ps1
 ```
 
-默认使用 `zgwd.spec`，产物输出到 `C:\code\cx\mc\`。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
+默认使用 `zgwd.spec`，产物输出到当前部署目录 `D:\code\cz\mc\`。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行；打包前必须退出正在运行的 `mc.exe`。
 
 打包目录同时包含 GUI 程序 `mc.exe` 和后台协议程序 `mc_worker.exe`；两者必须保持同目录。`mc_worker.exe` 专供 `mc.exe` 处理 Codex 的 UTF-8 JSONL 通信，请勿单独作为桌面程序启动。
 

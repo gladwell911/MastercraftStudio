@@ -16,3 +16,9 @@
 
 - 选择默认端口前先考虑系统排除端口范围；文件服务在默认端口不可用时应按确定顺序尝试高位回退端口。
 - Windows socket 绑定使用 `SO_EXCLUSIVEADDRUSE`；真正创建 HTTP server 时仍要捕获 bind 失败并继续尝试下一个候选端口，避免检查与绑定之间的竞争窗口。
+
+## Provider 分派不能依赖请求来源
+
+- 桌面本地输入和手机 `remote-ws` 只是不同传输入口，不能据此选择模型提供商。应先解析模型，再由 `resolved_model` 决定 Codex、Kimi、Claude Code 或 OpenRouter worker。
+- Kimi 的 OpenRouter 401 文案可能是错误路由的结果，不等于缺少 Kimi 凭据。排查时先核对最终 worker 分派，再检查环境变量。
+- 为每个远程专用模型增加“不会调用通用 OpenRouter worker”的回归断言，可直接防止同类问题复发。
