@@ -5047,11 +5047,37 @@ class ChatFrame(wx.Frame):
         return True
 
     def _on_model_changed(self, _):
+        model = self._resolve_current_model()
+        # The read-only combobox only exposes visible models.  Do not let an
+        # unsupported value (for example, a transient control value) overwrite
+        # the active chat or produce a misleading remote state event.
+        if not is_visible_model_id(model):
+            return
+        current_chat = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else None
+        current_model = str((current_chat or {}).get("model") or "").strip()
+        if self.selected_model == model and current_model == model:
+            try:
+                self._sync_codex_speed_combo_enabled_for_model(model)
+            except Exception:
+                pass
+            return
+        self.selected_model = model
+        if current_chat is None:
+            self._current_chat_state = {}
+            current_chat = self._current_chat_state
+        current_chat["model"] = model
+        self._invalidate_remote_state_cache()
+        self._invalidate_remote_history_list_cache()
         try:
-            self._sync_codex_speed_combo_enabled_for_model(self._resolve_current_model())
+            self._sync_codex_speed_combo_enabled_for_model(model)
         except Exception:
             pass
-        return
+        # Persist asynchronously so a combobox event does not disturb keyboard
+        # focus, then publish the already-compatible authoritative snapshot.
+        self._defer_chat_state_save()
+        chat_id = str(current_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        if chat_id:
+            self._push_remote_state(chat_id)
 
     @staticmethod
     def _codex_service_tier_for_chat(chat: dict | None) -> str:

@@ -17368,43 +17368,71 @@ def test_notes_lists_count_as_primary_navigation_focus(frame, monkeypatch):
 def test_model_changed_noops_without_state_save_when_selection_is_unchanged(frame, monkeypatch):
     frame.selected_model = "codex/main"
     frame.model_combo.SetValue("codex")
-    saves = []
-    lifecycle = []
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(kwargs))
-    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: lifecycle.append(True))
+    frame.active_chat_id = "chat-model-unchanged"
+    frame.current_chat_id = "chat-model-unchanged"
+    frame._current_chat_state = {"id": "chat-model-unchanged", "model": "codex/main"}
+    deferred = []
+    pushes = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: pushes.append((args, kwargs)))
 
     frame._on_model_changed(None)
 
-    assert saves == []
-    assert lifecycle == []
+    assert deferred == []
+    assert pushes == []
 
 
-def test_model_changed_does_not_commit_combo_navigation_or_save_state(frame, monkeypatch):
+def test_model_changed_commits_supported_models_persists_and_pushes_exact_state(frame, monkeypatch):
     frame.selected_model = "codex/main"
-    frame.model_combo.SetValue(main.model_display_name("openai/gpt-5.2"))
-    calls = []
-    lifecycle = []
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: lifecycle.append(True))
+    frame.active_chat_id = "chat-model-selection"
+    frame.current_chat_id = "chat-model-selection"
+    frame._current_chat_state = {
+        "id": "chat-model-selection",
+        "title": "model selection",
+        "model": "codex/main",
+        "turns": frame.active_session_turns,
+    }
+    deferred = []
+    published = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: published.append(payload))
+
+    for model in ("openai/gpt-5.2", "google/gemini-3.1-pro-preview", "codex/main"):
+        frame.model_combo.SetValue(main.model_display_name(model))
+        frame._on_model_changed(None)
+
+        assert frame.selected_model == model
+        assert frame._current_chat_state["model"] == model
+        assert published[-1]["type"] == "state"
+        assert published[-1]["chat_id"] == "chat-model-selection"
+        assert published[-1]["body"]["model"] == model
+
+    assert deferred == [True, True, True]
+    assert len(published) == 3
+
+    frame._on_model_changed(None)
+
+    assert deferred == [True, True, True]
+    assert len(published) == 3
+
+
+def test_model_changed_ignores_unsupported_model_without_persisting_or_pushing(frame, monkeypatch):
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = "chat-model-hidden"
+    frame.current_chat_id = "chat-model-hidden"
+    frame._current_chat_state = {"id": "chat-model-hidden", "model": "codex/main"}
+    deferred = []
+    published = []
+    monkeypatch.setattr(frame, "_resolve_current_model", lambda: "openai/gpt-5.2-codex")
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: published.append(payload))
 
     frame._on_model_changed(None)
 
     assert frame.selected_model == "codex/main"
-    assert calls == []
-    assert lifecycle == []
-
-
-def test_new_chat_commits_model_from_combo_after_deferred_selection(frame, monkeypatch):
-    frame.selected_model = "codex/main"
-    frame.model_combo.SetValue(main.model_display_name("openai/gpt-5.2"))
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
-    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
-
-    frame._on_new_chat_clicked(None)
-
-    assert frame.selected_model == "openai/gpt-5.2"
-    assert frame._current_chat_state["model"] == "openai/gpt-5.2"
+    assert frame._current_chat_state["model"] == "codex/main"
+    assert deferred == []
+    assert published == []
 
 
 def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
