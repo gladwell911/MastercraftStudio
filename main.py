@@ -4994,6 +4994,20 @@ class ChatFrame(wx.Frame):
                 return row
         return -1
 
+    def _answer_list_structure_is_aligned(self) -> bool:
+        if self.answer_list.GetCount() != len(self.answer_meta):
+            return False
+        model = getattr(self, "answer_list_model", None)
+        model_ids = list(getattr(model, "visible_ids", []) or [])
+        if not model_ids:
+            return True
+        if len(model_ids) != len(self.answer_meta):
+            return False
+        return all(
+            model_ids[index] == self._answer_row_id(meta)
+            for index, meta in enumerate(self.answer_meta)
+        )
+
     def _has_visible_answer_turn_rows(self, turn_idx: int) -> bool:
         for meta in list(getattr(self, "answer_meta", []) or []):
             if not meta or len(meta) < 2:
@@ -5013,8 +5027,13 @@ class ChatFrame(wx.Frame):
             answer_md = str((turn or {}).get("answer_md") or "")
             if not answer_md.strip() or answer_md == REQUESTING_TEXT:
                 return False
-            self._render_answer_list(refresh_execution=False)
-            return self._find_answer_row_index(int(turn_idx)) >= 0
+            already_visible = self._find_answer_row_index(int(turn_idx)) >= 0
+            if already_visible or not self._answer_list_structure_is_aligned():
+                self._render_answer_list(refresh_execution=False)
+                return (not already_visible) and self._find_answer_row_index(int(turn_idx)) >= 0
+            # The visible question projection is current and only the newly
+            # completed answer is absent. Use the row-level append below so a
+            # completion does not clear/repaint old rows or disturb focus.
         if self._find_answer_row_index(int(turn_idx)) >= 0:
             return False
         attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
@@ -5058,8 +5077,16 @@ class ChatFrame(wx.Frame):
         if self.view_mode != "active":
             return False
         if self._active_answer_turn_is_authoritative(turn_idx):
-            self._render_answer_list(refresh_execution=False)
-            return self._find_answer_row_index(int(turn_idx)) >= 0
+            # The submitted-question path already reconciles the full
+            # canonical projection. Streaming deltas should update only their
+            # answer row; rebuilding the whole list for every token makes long
+            # conversations progressively slower. Fall back to reconciliation
+            # only when the physical/model/metadata views have drifted.
+            row = self._find_answer_row_index(int(turn_idx))
+            if not self._answer_list_structure_is_aligned() or row < 0:
+                self._render_answer_list(refresh_execution=False)
+                row = self._find_answer_row_index(int(turn_idx))
+            self._active_answer_row_index = row
         row = self._active_answer_row_index
         if row < 0 or row >= self.answer_list.GetCount():
             row = self._find_answer_row_index(turn_idx)
@@ -5096,7 +5123,12 @@ class ChatFrame(wx.Frame):
         # the active chat or produce a misleading remote state event.
         if not is_visible_model_id(model):
             return
-        current_chat = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else None
+        if self.view_mode == "history":
+            current_chat = self._find_archived_chat(self.view_history_id)
+            if not isinstance(current_chat, dict):
+                return
+        else:
+            current_chat = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else None
         current_model = str((current_chat or {}).get("model") or "").strip()
         if self.selected_model == model and current_model == model:
             try:
@@ -5288,6 +5320,31 @@ class ChatFrame(wx.Frame):
             ]
         return steps
 
+    def _execution_merge_identity(self, item) -> tuple:
+        if not isinstance(item, dict):
+            return ("value", self._normalize_execution_text_for_compare(str(item or "")))
+        stable_id = str(item.get("id") or item.get("event_id") or item.get("item_id") or "").strip()
+        if stable_id:
+            return ("id", stable_id)
+        return (
+            "content",
+            self._safe_int(item.get("turn_idx"), -1),
+            str(item.get("created_at") or item.get("ts") or "").strip(),
+            str(item.get("display_kind") or item.get("event_type") or "").strip(),
+            self._normalize_execution_text_for_compare(self._execution_step_detail_text(item)),
+        )
+
+    @staticmethod
+    def _execution_merge_sort_key(item, fallback_index: int) -> tuple:
+        if isinstance(item, dict):
+            try:
+                timestamp = float(item.get("created_at") or item.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            if timestamp > 0:
+                return (0, timestamp, fallback_index)
+        return (1, fallback_index, 0)
+
     def _current_execution_steps_for_render(self) -> tuple[int, list]:
         limit = max(
             EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
@@ -5316,13 +5373,27 @@ class ChatFrame(wx.Frame):
                     if len(in_memory_rows) >= total:
                         return len(in_memory_rows), in_memory_rows
                     merged_rows = list(rows)
-                    signatures = {repr(item) for item in merged_rows}
+                    row_by_identity = {
+                        self._execution_merge_identity(item): index
+                        for index, item in enumerate(merged_rows)
+                    }
                     for item in in_memory_rows:
-                        signature = repr(item)
-                        if signature in signatures:
+                        identity = self._execution_merge_identity(item)
+                        existing_index = row_by_identity.get(identity)
+                        if existing_index is not None:
+                            # The in-memory copy may contain the latest label or
+                            # detail for an event not flushed to the store yet.
+                            merged_rows[existing_index] = item
                             continue
-                        signatures.add(signature)
+                        row_by_identity[identity] = len(merged_rows)
                         merged_rows.append(item)
+                    merged_rows = [
+                        item
+                        for _index, item in sorted(
+                            enumerate(merged_rows),
+                            key=lambda pair: self._execution_merge_sort_key(pair[1], pair[0]),
+                        )
+                    ]
                     return max(total, len(merged_rows)), merged_rows
             except Exception:
                 pass
@@ -5858,16 +5929,11 @@ class ChatFrame(wx.Frame):
             self._deferred_background_ui_counts = counts
             return True
         if self._execution_entry_is_authoritative_and_visible(target_chat, step_idx, step):
-            # A replay can reuse the same execution identity.  Reconcile
-            # rather than appending metadata a second time; otherwise the
-            # ListBox model and execution_meta can disagree about the tail.
-            row_id = self._execution_row_id(int(step_idx), step)
-            if (
-                hasattr(self, "execution_list_model")
-                and self.execution_list_model.row_for_id(row_id) >= 0
-            ):
-                self._rebuild_execution_list_from_state()
-                return True
+            # Both replays and genuinely new rows reconcile from the visible
+            # owner's canonical state. Otherwise a stale physical tail can
+            # survive merely because the incoming row id was not present yet.
+            self._rebuild_execution_list_from_state()
+            return True
         if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
             self._execution_list_pending_turn_reset = False
             try:

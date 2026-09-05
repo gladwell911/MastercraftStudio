@@ -12,3 +12,8 @@
 1. 发送一条新的中文 Codex 消息确认不再乱码。
 2. 在手机端重新连接并发送一条消息完成实机往返。
 3. 再次部署前，退出 `mc.exe` 及其 NATS 子进程；目录可能被残留进程或安全软件锁定。
+## 2026-09-05 cross-client review closeout
+
+- Stories 1-11 remain complete; the blocked Story 12 record was not modified.
+- The desktop review fixes historical-chat targeting, idempotent completion handling, canonical execution-list rebuild/merge ordering, and incremental Codex streaming updates that preserve keyboard focus.
+- `py_compile`, focused unit tests, and UI responsiveness automation passed. Physical cross-client synchronization and screen-reader operation still require a real-device/manual check before release.

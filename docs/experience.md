@@ -16,3 +16,7 @@
 
 - 选择默认端口前先考虑系统排除端口范围；文件服务在默认端口不可用时应按确定顺序尝试高位回退端口。
 - Windows socket 绑定使用 `SO_EXCLUSIVEADDRUSE`；真正创建 HTTP server 时仍要捕获 bind 失败并继续尝试下一个候选端口，避免检查与绑定之间的竞争窗口。
+## Streaming UI reconciliation
+
+- For a screen-reader desktop client, a token stream must update only the changed answer region. Avoid full list replacement, selection changes, or foreground repaint when the canonical model has no visible delta.
+- When persisted history and in-memory events overlap, deduplicate by stable execution identity and sort by persisted timestamp before refreshing the UI.

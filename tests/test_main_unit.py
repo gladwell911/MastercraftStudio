@@ -17633,6 +17633,30 @@ def test_model_changed_ignores_unsupported_model_without_persisting_or_pushing(f
     assert published == []
 
 
+def test_model_changed_in_history_updates_only_the_visible_archived_chat(frame, monkeypatch):
+    active = {"id": "chat-active", "model": "codex/main", "turns": []}
+    archived = {"id": "chat-history", "model": "codex/main", "turns": []}
+    frame._current_chat_state = active
+    frame.archived_chats = [archived]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue(main.model_display_name("openai/gpt-5.2"))
+    saved = []
+    pushed = []
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: saved.append(True))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushed.append(chat_id))
+
+    frame._on_model_changed(None)
+
+    assert active["model"] == "codex/main"
+    assert archived["model"] == "openai/gpt-5.2"
+    assert saved == [True]
+    assert pushed == ["chat-history"]
+
+
 def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):
     frame.selected_model = main.DEFAULT_CODEX_MODEL
     frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
@@ -18879,13 +18903,40 @@ def test_repeated_current_answer_completion_reconciles_instead_of_duplicate_appe
     frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
     frame._render_answer_list()
 
-    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is True
-    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is True
+    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is False
+    assert frame._append_completed_answer_to_answer_list(0, frame.active_session_turns[0]) is False
 
     rows = list(frame.answer_list.GetStrings())
     assert rows.count("current answer") == 1
     assert len(rows) == len(frame.answer_meta)
     assert frame.answer_list_model.visible_ids == [frame._answer_row_id(meta) for meta in frame.answer_meta]
+
+
+def test_authoritative_answer_delta_updates_one_row_without_full_rerender(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "question", "answer_md": "initial answer", "model": main.DEFAULT_MODEL_ID},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._render_answer_list(refresh_execution=False)
+    frame.active_session_turns[0]["answer_md"] = "streamed answer"
+    renders = []
+    original_render = frame._render_answer_list
+    monkeypatch.setattr(
+        frame,
+        "_render_answer_list",
+        lambda *args, **kwargs: renders.append((args, kwargs)) or original_render(*args, **kwargs),
+    )
+    assert frame._find_answer_row_index(0) >= 0
+
+    assert frame._update_active_answer_row(0) is True
+
+    assert renders == []
+    row = frame._find_answer_row_index(0)
+    assert row >= 0
+    assert frame.answer_list.GetString(row) == "streamed answer"
 
 
 def test_execution_replay_reconciles_stale_tail_without_cross_turn_row(frame):
@@ -18919,6 +18970,83 @@ def test_execution_replay_reconciles_stale_tail_without_cross_turn_row(frame):
         {"id": "old-step", "turn_idx": 0, "display_kind": "commentary", "list_text": "old step", "detail_text": "old step"},
     )
     assert "old step" not in list(frame.execution_list.GetStrings())
+
+
+def test_new_authoritative_execution_row_replaces_a_stale_physical_tail(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {"question": "current question", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID},
+    ]
+    step = {
+        "id": "new-step",
+        "turn_idx": 0,
+        "created_at": 2.0,
+        "display_kind": "commentary",
+        "list_text": "new step",
+        "detail_text": "new step",
+    }
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [step],
+    }
+    frame.execution_list.Append("stale execution tail")
+    frame.execution_meta.append(("execution", 99, "stale execution tail", "stale execution tail"))
+
+    assert frame._append_visible_execution_entry(frame._current_chat_state, 0, step) is True
+
+    rows = list(frame.execution_list.GetStrings())
+    assert "stale execution tail" not in rows
+    assert rows.count("new step") == 1
+    assert len(rows) == len(frame.execution_meta)
+
+
+def test_execution_store_merge_uses_stable_identity_and_timestamp_order(frame):
+    old_persisted = {
+        "id": "shared-step",
+        "turn_idx": 0,
+        "created_at": 2.0,
+        "display_kind": "commentary",
+        "list_text": "old label",
+        "detail_text": "same detail",
+    }
+    newer_memory = {
+        "detail_text": "same detail",
+        "list_text": "new label",
+        "display_kind": "commentary",
+        "created_at": 2.0,
+        "turn_idx": 0,
+        "id": "shared-step",
+    }
+    earliest = {
+        "id": "early-step",
+        "turn_idx": 0,
+        "created_at": 1.0,
+        "display_kind": "commentary",
+        "list_text": "early",
+        "detail_text": "early",
+    }
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [{"question": "q", "answer_md": main.REQUESTING_TEXT}],
+        "execution_steps": [newer_memory],
+    }
+    frame._chat_store_enabled = True
+    frame.chat_store = SimpleNamespace(
+        load_recent_execution_steps=lambda *_args, **_kwargs: (3, [old_persisted, earliest]),
+    )
+
+    total, rows = frame._current_execution_steps_for_render()
+
+    assert total == 3
+    assert [row["id"] for row in rows] == ["early-step", "shared-step"]
+    assert rows[1]["list_text"] == "new label"
 
 
 def test_clear_context_auto_resend_skips_local_command_turns(frame, monkeypatch):
