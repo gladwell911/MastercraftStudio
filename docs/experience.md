@@ -20,3 +20,7 @@
 
 - For a screen-reader desktop client, a token stream must update only the changed answer region. Avoid full list replacement, selection changes, or foreground repaint when the canonical model has no visible delta.
 - When persisted history and in-memory events overlap, deduplicate by stable execution identity and sort by persisted timestamp before refreshing the UI.
+## Python virtual-environment recovery
+
+- This desktop project targets Python 3.11. If `.venv/pyvenv.cfg` points to a missing interpreter, install Python 3.11 side by side and recreate `.venv` with `py -3.11 -m venv .venv`; do not retarget the old environment by editing its configuration.
+- Restore both `requirements.txt` and `requirements-dev.txt`, then verify with `.venv\Scripts\python.exe -m pip check` and focused pytest before relying on the repaired environment.
