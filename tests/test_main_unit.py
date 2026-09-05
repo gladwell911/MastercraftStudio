@@ -4924,7 +4924,7 @@ def test_new_chat_from_history_clears_history_view_and_resets_context_usage(fram
     assert frame.view_mode == "active"
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert "暂无" in list(frame.answer_list.GetStrings())
 
 
 @pytest.mark.parametrize("model", ["openai/gpt-5.2", "claudecode/default", "codex/main", "openclaw/main"])
@@ -5829,7 +5829,8 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
 
     assert frame._current_chat_state["context_usage"] == usage
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "44k / 258k"
+    context_row = next(index for index, meta in enumerate(frame.answer_meta) if meta[0] == "context_usage")
+    assert frame.answer_list.GetString(context_row) == "44k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
 
@@ -5920,7 +5921,8 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
 
     assert frame._current_chat_state["context_usage"] == usage
     assert frame._pending_context_usage_by_turn == {}
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_meta[0][0] == "time"
+    assert all(meta[0] != "context_usage" for meta in frame.answer_meta)
 
 
 def test_late_codex_token_count_event_updates_state_without_refreshing_visible_context_usage_row(frame, monkeypatch):
@@ -5951,8 +5953,9 @@ def test_late_codex_token_count_event_updates_state_without_refreshing_visible_c
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     frame._render_answer_list()
+    rows_before = list(frame.answer_list.GetStrings())
     frame.answer_list.SetSelection(0)
-    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_meta[0][0] == "time"
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -5960,9 +5963,9 @@ def test_late_codex_token_count_event_updates_state_without_refreshing_visible_c
     )
 
     assert frame._current_chat_state["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert list(frame.answer_list.GetStrings()) == rows_before
     assert frame.answer_list.GetSelection() == 0
-    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_meta[0][0] == "time"
 
 
 def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(frame, monkeypatch):
@@ -6051,8 +6054,9 @@ def test_late_codex_token_count_event_updates_visible_history_state_without_refr
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
 
     frame._render_answer_list()
+    rows_before = list(frame.answer_list.GetStrings())
     frame.answer_list.SetSelection(0)
-    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_meta[0][0] == "time"
 
     frame._on_codex_event_for_chat(
         "chat-visible",
@@ -6060,9 +6064,9 @@ def test_late_codex_token_count_event_updates_visible_history_state_without_refr
     )
 
     assert frame._find_archived_chat("chat-visible")["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert list(frame.answer_list.GetStrings()) == rows_before
     assert frame.answer_list.GetSelection() == 0
-    assert frame.answer_meta[0][0] == "context_usage"
+    assert frame.answer_meta[0][0] == "time"
 
 
 def test_codex_without_pending_usage_does_not_estimate(frame):
@@ -6095,7 +6099,7 @@ def test_codex_without_pending_usage_clears_stale_context_usage(frame):
     frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
 
     assert "context_usage" not in frame._current_chat_state
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert "暂无" in list(frame.answer_list.GetStrings())
 
 
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):
@@ -6232,7 +6236,7 @@ def test_submit_question_marks_turn_pending_with_recovery_metadata(frame, monkey
 def test_codex_submit_sets_resume_recovery_mode(frame, monkeypatch):
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     class _NoOpThread:
@@ -12256,7 +12260,7 @@ def test_submit_question_allows_attachment_only_send_for_codex(frame, monkeypatc
         }
     ]
     seen = {"render": 0, "worker": []}
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: seen.__setitem__("render", seen["render"] + 1))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: seen.__setitem__("render", seen["render"] + 1))
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
@@ -14281,8 +14285,8 @@ def test_codex_ui_event_drain_yields_after_batch_budget(frame, monkeypatch):
 
     assert len(handled) == main.CODEX_UI_EVENT_BATCH_SIZE
     assert len(frame._pending_codex_ui_events) == 5
-    assert call_after_scheduled == []
-    assert delayed == [(main.CODEX_UI_EVENT_BATCH_DELAY_MS, frame._drain_codex_ui_events, ())]
+    assert delayed == []
+    assert call_after_scheduled == [(frame._drain_codex_ui_events, ())]
 
 
 def test_codex_ui_event_drain_uses_smaller_batch_while_primary_control_has_focus(frame, monkeypatch):
@@ -14291,6 +14295,7 @@ def test_codex_ui_event_drain_uses_smaller_batch_while_primary_control_has_focus
 
     monkeypatch.setattr(frame, "_on_codex_event_for_chat", lambda chat_id, event: handled.append((chat_id, event.type)))
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda delay_ms, fn, *args: delayed.append((delay_ms, fn, args)) or object())
+    monkeypatch.setattr(frame, "_wx_main_loop_running", lambda: True)
     monkeypatch.setattr(frame.input_edit, "HasFocus", lambda: True)
 
     for idx in range(main.CODEX_UI_EVENT_BATCH_SIZE):
@@ -14454,8 +14459,8 @@ def test_codex_ui_event_drain_coalesces_execution_list_repaints(frame, monkeypat
     frame._codex_ui_event_flush_scheduled = True
     frame._drain_codex_ui_events()
 
-    assert frame.execution_list.GetCount() == 5
-    assert repaint_calls == [(frame.execution_list,)]
+    assert frame.execution_list.GetCount() == 6
+    assert repaint_calls.count((frame.execution_list,)) == 1
 
 
 def test_background_execution_step_defers_list_append_during_quiet(frame, monkeypatch):
@@ -14629,7 +14634,7 @@ def test_codex_ui_event_drain_preserves_execution_selection_when_list_has_focus(
     frame._codex_ui_event_flush_scheduled = True
     frame._drain_codex_ui_events()
 
-    assert frame.execution_list.GetCount() == 3
+    assert frame.execution_list.GetCount() == 4
     assert frame.execution_list.GetSelection() == 0
 
 
@@ -16749,7 +16754,7 @@ def test_codex_ui_callbacks_skip_when_frame_is_being_deleted(frame, monkeypatch)
     frame._on_done(0, "完成", "", "codex/main", "", "chat-1")
 
     assert all(item[0] not in {"after", "later"} for item in scheduled)
-    assert scheduled == [("status",), ("remote",), ("save",), ("render",), ("sound",)]
+    assert scheduled == [("status",), ("remote",), ("sound",)]
 
 def test_resolve_app_data_dir_frozen_uses_executable_sibling_history(monkeypatch):
     monkeypatch.setattr(main.sys, "frozen", True, raising=False)
@@ -18937,6 +18942,89 @@ def test_authoritative_answer_delta_updates_one_row_without_full_rerender(frame,
     row = frame._find_answer_row_index(0)
     assert row >= 0
     assert frame.answer_list.GetString(row) == "streamed answer"
+
+
+def test_codex_final_answer_first_visible_response_appends_without_rebuild(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "question",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "codex_thread_id": "thread-current",
+            "codex_turn_id": "turn-current",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers",
+        "execution_steps": [],
+    }
+    monkeypatch.setattr(
+        frame,
+        "_render_answer_list",
+        lambda *args, **kwargs: pytest.fail("a first final answer must append instead of rebuilding the list"),
+    )
+    monkeypatch.setattr(frame, "_focus_latest_answer", lambda: None)
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="item_completed",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            status="agentMessage",
+            phase="final_answer",
+            text="final answer",
+        ),
+    )
+
+    assert frame.active_session_turns[0]["answer_md"] == "final answer"
+    assert "final answer" in list(frame.answer_list.GetStrings())
+
+
+def test_codex_execution_event_appends_after_current_question(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_codex_thread_id = "thread-current"
+    frame.active_codex_turn_id = "turn-current"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [
+        {
+            "question": "question",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL,
+            "codex_thread_id": "thread-current",
+            "codex_turn_id": "turn-current",
+        }
+    ]
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+
+    assert list(frame.execution_list.GetStrings()) == ["我：question"]
+
+    frame._on_codex_event_for_chat(
+        "chat-current",
+        main.CodexEvent(
+            type="plan_updated",
+            thread_id="thread-current",
+            turn_id="turn-current",
+            text="checking files",
+        ),
+    )
+
+    assert list(frame.execution_list.GetStrings()) == ["我：question", "计划：checking files"]
+    assert [meta[0] for meta in frame.execution_meta] == ["execution", "execution"]
 
 
 def test_execution_replay_reconciles_stale_tail_without_cross_turn_row(frame):

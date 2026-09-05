@@ -89,7 +89,8 @@ class _PayloadManager:
         return _UsageResult()
 
 
-def test_claudecode_stream_chat_records_model_usage():
+def test_claudecode_stream_chat_records_model_usage(monkeypatch):
+    monkeypatch.setattr(claudecode_client, "resolve_claudecode_command", lambda: ["fake-claude"])
     client = claudecode_client.ClaudeCodeClient(cli_manager=_UsageManager())
 
     full, session_id = client.stream_chat("修复问题")
@@ -102,7 +103,8 @@ def test_claudecode_stream_chat_records_model_usage():
     assert client.last_context_usage["model"] == "claude-haiku-4-5-20251001"
 
 
-def test_claudecode_stream_chat_parses_wrapped_event_msg():
+def test_claudecode_stream_chat_parses_wrapped_event_msg(monkeypatch):
+    monkeypatch.setattr(claudecode_client, "resolve_claudecode_command", lambda: ["fake-claude"])
     wrapped_payloads = [
         {
             "type": "event_msg",
@@ -155,7 +157,8 @@ def test_claudecode_stream_chat_blank_input_clears_last_context_usage():
     assert client.last_context_usage is None
 
 
-def test_claudecode_stream_chat_ignores_malformed_model_usage():
+def test_claudecode_stream_chat_ignores_malformed_model_usage(monkeypatch):
+    monkeypatch.setattr(claudecode_client, "resolve_claudecode_command", lambda: ["fake-claude"])
     client = claudecode_client.ClaudeCodeClient(
         cli_manager=_PayloadManager(
             [
@@ -188,7 +191,8 @@ def test_claudecode_stream_chat_ignores_malformed_model_usage():
     assert client.last_context_usage is None
 
 
-def test_claudecode_stream_chat_uses_first_valid_model_usage_entry():
+def test_claudecode_stream_chat_uses_first_valid_model_usage_entry(monkeypatch):
+    monkeypatch.setattr(claudecode_client, "resolve_claudecode_command", lambda: ["fake-claude"])
     client = claudecode_client.ClaudeCodeClient(
         cli_manager=_PayloadManager(
             [

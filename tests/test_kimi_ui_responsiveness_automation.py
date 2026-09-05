@@ -226,7 +226,8 @@ def test_quiet_window_batches_events(frame, wx_app, monkeypatch):
     assert not (frame._pending_execution_tail_appends.get("chat-kimi") or [])
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
-    assert len(rows) == 40
+    assert len(rows) == rows_before + 40
+    assert len(rows[rows_before:]) == 40
     assert all(any(f"计划步骤 {idx}" in row for row in rows) for idx in range(40))
     # 最后一次 drain 的事件按序落在尾部
     tail = rows[-last_drain:]
@@ -336,10 +337,10 @@ def test_execution_entries_append_at_tail_outside_quiet_window(frame, wx_app, mo
     assert _yield_until(wx_app, lambda: not frame._pending_kimi_ui_events, timeout=2.0)
 
     rows_after = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
-    assert len(rows_after) == 5
-    assert "新步骤一" in rows_after[2]
-    assert "新步骤二" in rows_after[3]
-    assert "新步骤三" in rows_after[4]
+    assert len(rows_after) == 6
+    assert "新步骤一" in rows_after[3]
+    assert "新步骤二" in rows_after[4]
+    assert "新步骤三" in rows_after[5]
     assert not (frame._pending_execution_tail_appends.get("chat-kimi") or [])
     steps = frame._current_chat_state["execution_steps"]
     tail_texts = [str(step["list_text"]) for step in steps[-3:]]

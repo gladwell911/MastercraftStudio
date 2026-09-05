@@ -5073,7 +5073,7 @@ class ChatFrame(wx.Frame):
             cache[id(self.answer_list)] = tuple(self._listbox_strings(self.answer_list))
         return True
 
-    def _update_active_answer_row(self, turn_idx: int) -> bool:
+    def _update_active_answer_row(self, turn_idx: int, *, rebuild_if_missing: bool = True) -> bool:
         if self.view_mode != "active":
             return False
         if self._active_answer_turn_is_authoritative(turn_idx):
@@ -5084,6 +5084,8 @@ class ChatFrame(wx.Frame):
             # only when the physical/model/metadata views have drifted.
             row = self._find_answer_row_index(int(turn_idx))
             if not self._answer_list_structure_is_aligned() or row < 0:
+                if not rebuild_if_missing:
+                    return False
                 self._render_answer_list(refresh_execution=False)
                 row = self._find_answer_row_index(int(turn_idx))
             self._active_answer_row_index = row
@@ -5932,6 +5934,19 @@ class ChatFrame(wx.Frame):
             # Both replays and genuinely new rows reconcile from the visible
             # owner's canonical state. Otherwise a stale physical tail can
             # survive merely because the incoming row id was not present yet.
+            # A Codex UI drain can receive several such events at once.  The
+            # canonical state already contains each event, so defer one
+            # rebuild until the drain completes instead of rebuilding on each
+            # individual event.
+            if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) > 0:
+                try:
+                    execution_list_has_focus = bool(self.execution_list.HasFocus())
+                except Exception:
+                    execution_list_has_focus = False
+                if not execution_list_has_focus:
+                    self._execution_list_deferred_repaint = True
+                    self._execution_list_deferred_select_latest = True
+                    return True
             self._rebuild_execution_list_from_state()
             return True
         if bool(getattr(self, "_execution_list_pending_turn_reset", False)):
@@ -10123,7 +10138,10 @@ class ChatFrame(wx.Frame):
                     if self._background_ui_mutations_blocked():
                         self._mark_background_answer_list_dirty()
                     else:
-                        self._update_active_answer_row(target_idx)
+                        # A final answer may be the first visible response for
+                        # this turn. Let the completion path append its rows
+                        # below instead of rebuilding the whole answer list.
+                        self._update_active_answer_row(target_idx, rebuild_if_missing=False)
                     self._mark_chat_turns_dirty(start_index=target_idx)
                 self._defer_codex_state_save()
                 self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))

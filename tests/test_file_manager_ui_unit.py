@@ -162,10 +162,9 @@ def test_send_selected_file_to_phone_repairs_public_file_route(frame, tmp_path, 
     monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: calls.append("proxy") or True)
     monkeypatch.setattr(
         frame,
-        "_ensure_cloudflared_service_url",
-        lambda port: calls.append(("service", port)) or (True, False),
+        "_ensure_cloudflared_tunnel",
+        lambda port: calls.append(("tunnel", port)) or (True, "managed", "verified"),
     )
-    monkeypatch.setattr(frame, "_start_cloudflared_service", lambda: calls.append("start") or True)
     monkeypatch.setattr(frame, "_broadcast_remote_event", lambda _payload: None)
 
     frame._show_file_manager()
@@ -173,7 +172,7 @@ def test_send_selected_file_to_phone_repairs_public_file_route(frame, tmp_path, 
 
     assert frame._send_selected_file_to_phone() is True
     assert "proxy" in calls
-    assert ("service", 18080) in calls
+    assert ("tunnel", 18080) in calls
 
 
 def test_file_offer_does_not_fall_back_to_local_file_url_when_public_route_unavailable(frame, tmp_path, monkeypatch):

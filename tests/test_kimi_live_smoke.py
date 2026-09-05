@@ -137,7 +137,7 @@ def test_live_server_shutdown_restart_keeps_session():
         client2.close()
 
 
-def test_live_frame_three_consecutive_chat_rounds(frame, monkeypatch):
+def test_live_frame_three_consecutive_chat_rounds_across_idle_heartbeat(frame, monkeypatch):
     """真实端到端：真实 ChatFrame + 真实 kimi web server，连续三轮问答。
 
     不 mock KimiServerClient、不替换后台线程，走完整 UI 提交链路
@@ -171,6 +171,13 @@ def test_live_frame_three_consecutive_chat_rounds(frame, monkeypatch):
     expected = ["one", "two", "one"]
 
     for round_idx, (question, keyword) in enumerate(zip(questions, expected), start=1):
+        if round_idx == 3:
+            # Kimi 0.38.0 sends JSON pings every 10 seconds and closes after two
+            # missed replies. Cross that window before reusing the same session.
+            idle_deadline = time.monotonic() + 25
+            while time.monotonic() < idle_deadline:
+                app.Yield()
+                time.sleep(0.05)
         turns_before = len(frame.active_session_turns)
         frame.input_edit.SetValue(question)
         frame._on_send_clicked(None)

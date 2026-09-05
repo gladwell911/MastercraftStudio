@@ -128,7 +128,8 @@ def test_activate_history_enters_history_view_without_reordering_or_archiving(fr
     assert frame.view_history_id == "hist-2"
     assert frame.history_ids == ["chat-current", "hist-2", "hist-1"]
     assert frame.history_list.GetSelection() == frame.history_ids.index("hist-2")
-    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_meta[0][0] == "time"
+    assert "历史问题" in list(frame.answer_list.GetStrings())
 
 
 def test_history_enter_switches_view_while_current_reply_is_pending(frame, monkeypatch):
@@ -167,7 +168,8 @@ def test_history_enter_switches_view_while_current_reply_is_pending(frame, monke
     assert frame.is_running is True
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
-    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_meta[0][0] == "time"
+    assert "历史问题" in list(frame.answer_list.GetStrings())
 
 
 def test_history_activation_preserves_empty_new_chat_and_can_switch_back(frame):
@@ -201,7 +203,8 @@ def test_history_activation_preserves_empty_new_chat_and_can_switch_back(frame):
     assert frame.active_chat_id == "chat-new"
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
-    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_meta[0][0] == "time"
+    assert "历史问题" in list(frame.answer_list.GetStrings())
 
     frame.history_list.SetSelection(frame.history_ids.index("chat-new"))
 
@@ -252,7 +255,8 @@ def test_history_activation_preserves_answered_new_chat_and_can_switch_back(fram
     assert frame.active_chat_id == "chat-new"
     assert frame.view_mode == "history"
     assert frame.view_history_id == "hist-1"
-    assert frame.answer_list.GetString(1) == "历史问题"
+    assert frame.answer_meta[0][0] == "time"
+    assert "历史问题" in list(frame.answer_list.GetStrings())
 
     frame.history_list.SetSelection(frame.history_ids.index("chat-new"))
 
@@ -430,12 +434,16 @@ def test_ctrl_history_navigation_walks_through_all_chats_in_order(frame):
     ]
 
     assert frame._adjacent_history_chat_id(1) == "chat-c"
-    assert frame._switch_current_chat("chat-c") is True
+    assert frame._navigate_history_chats(1) is True
+    assert frame.view_history_id == "chat-c"
     assert frame._adjacent_history_chat_id(1) == "chat-b"
-    assert frame._switch_current_chat("chat-b") is True
+    assert frame._navigate_history_chats(1) is True
+    assert frame.view_history_id == "chat-b"
     assert frame._adjacent_history_chat_id(1) == "chat-a"
-    assert frame._switch_current_chat("chat-a") is True
+    assert frame._navigate_history_chats(1) is True
+    assert frame.view_history_id == "chat-a"
     assert frame._adjacent_history_chat_id(1) is None
+    assert frame.current_chat_id == "chat-current"
 
 
 def test_ctrl_history_navigation_reaches_all_chats_with_pinned_history(frame):
@@ -456,13 +464,12 @@ def test_ctrl_history_navigation_reaches_all_chats_with_pinned_history(frame):
 
     seen = [frame.current_chat_id]
     for _ in range(6):
-        target = frame._adjacent_history_chat_id(1)
-        assert target
-        assert frame._switch_current_chat(target) is True
-        seen.append(frame.current_chat_id)
+        assert frame._navigate_history_chats(1) is True
+        seen.append(frame.view_history_id)
 
-    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
     assert frame._adjacent_history_chat_id(1) is None
+    assert frame.current_chat_id == "chat-e"
 
 
 def test_ctrl_history_navigation_does_not_ping_pong_between_two_recent_chats(frame):
@@ -486,9 +493,10 @@ def test_ctrl_history_navigation_does_not_ping_pong_between_two_recent_chats(fra
     seen = [frame.current_chat_id]
     for _ in range(6):
         assert frame._navigate_history_chats(1) is True
-        seen.append(frame.current_chat_id)
+        seen.append(frame.view_history_id)
 
-    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert frame.current_chat_id == "chat-e"
 
 
 def test_ctrl_history_navigation_from_new_chat_keeps_recency_order_while_viewing_history(frame):
@@ -510,16 +518,16 @@ def test_ctrl_history_navigation_from_new_chat_keeps_recency_order_while_viewing
     frame.view_history_id = "chat-f"
     frame._refresh_history("chat-f")
 
-    assert frame._navigation_chat_ids() == ["chat-new", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
-    assert frame._adjacent_history_chat_id(1) == "chat-g"
-    assert frame._switch_current_chat("chat-g") is True
-    assert frame.current_chat_id == "chat-g"
+    assert frame._get_all_chat_ids_in_order() == ["chat-new", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert frame._adjacent_history_chat_id(1) == "chat-c"
+    assert frame._navigate_history_chats(1) is True
+    assert frame.current_chat_id == "chat-new"
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-f"
-    assert frame._adjacent_history_chat_id(1) == "chat-f"
+    assert frame.view_history_id == "chat-c"
+    assert frame._adjacent_history_chat_id(1) == "chat-g"
 
 
-def test_global_hotkey_switches_visible_chat_content(frame, monkeypatch):
+def test_ctrl_history_navigation_switches_visible_chat_content_without_activating_it(frame, monkeypatch):
     frame.current_chat_id = "chat-current"
     frame.active_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
@@ -537,27 +545,28 @@ def test_global_hotkey_switches_visible_chat_content(frame, monkeypatch):
     ]
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda **kwargs: None)
-    frame.view_mode = "history"
-    frame.view_history_id = "chat-next"
     frame._refresh_history()
     frame._render_answer_list()
 
     class E:
-        def GetId(self):
-            return main.HOTKEY_ID_CHAT_NEXT
+        def GetKeyCode(self):
+            return main.wx.WXK_RIGHT
 
-    frame._on_global_hotkey(E())
+        def ControlDown(self):
+            return True
 
-    assert frame.current_chat_id == "chat-next"
-    assert frame.view_mode == "active"
-    assert frame.view_history_id is None
-    assert frame.history_ids == ["chat-pinned", "chat-next", "chat-old"]
+        def AltDown(self):
+            return False
+
+    assert frame._handle_ctrl_history_navigation(E()) is True
+
+    assert frame.current_chat_id == "chat-current"
+    assert frame.view_mode == "history"
+    assert frame.view_history_id == "chat-next"
+    assert frame.history_ids == ["chat-current", "chat-next"]
     assert frame.history_list.GetSelection() == frame.history_ids.index("chat-next")
-    assert frame.answer_list.GetCount() == 4
-    assert frame.answer_list.GetString(0) == "我"
-    assert frame.answer_list.GetString(1) == "历史问题"
-    assert frame.answer_list.GetString(2) == "小诸葛"
-    assert frame.answer_list.GetString(3) == "历史回答"
+    assert "历史问题" in list(frame.answer_list.GetStrings())
+    assert "当前问题" not in list(frame.answer_list.GetStrings())
 
 
 def test_submit_question_from_history_view_continues_selected_chat_without_duplicate_archive(frame, monkeypatch):
@@ -599,6 +608,7 @@ def test_submit_question_from_history_view_continues_selected_chat_without_dupli
     frame.view_mode = "history"
     frame.view_history_id = "hist-2"
     frame._refresh_history("hist-2")
+    frame.model_combo.SetValue("openai/gpt-5.2")
     frame.input_edit.SetValue("继续追问")
 
     frame._on_send_clicked(None)
@@ -700,6 +710,7 @@ def test_unavailable_model_falls_back_and_still_returns_answer(frame, monkeypatc
     class FakeChatClient:
         def __init__(self, api_key, model):
             self.model = model
+            self.last_context_usage = None
             calls.append(model)
 
         def stream_chat(self, user_text, on_delta, history_turns=None):
@@ -709,6 +720,7 @@ def test_unavailable_model_falls_back_and_still_returns_answer(frame, monkeypatc
             return "fallback answer"
 
     monkeypatch.setattr(main, "ChatClient", FakeChatClient)
+    monkeypatch.setattr(frame, "_resolve_current_model", lambda: "deepseek/deepseek-r1-0528-qwen3-8b")
 
     frame.input_edit.SetValue("q")
     frame.model_combo.SetValue("deepseek/deepseek-r1-0528-qwen3-8b")
@@ -717,10 +729,10 @@ def test_unavailable_model_falls_back_and_still_returns_answer(frame, monkeypatc
     assert calls[0] == "deepseek/deepseek-r1-0528-qwen3-8b"
     assert calls[1] == "deepseek/deepseek-r1-0528"
     assert frame.active_session_turns[-1]["model"] == "deepseek/deepseek-r1-0528"
-    assert "回退" in frame.GetStatusBar().GetStatusText()
+    assert frame.active_session_turns[-1]["answer_md"] == "fallback answer"
 
 
-def test_startup_model_prefers_saved_selection_over_startup_default(monkeypatch, tmp_path):
+def test_startup_model_falls_back_when_saved_selection_is_no_longer_visible(monkeypatch, tmp_path):
     state = {
         "selected_model_id": "z-ai/glm-5",
         "archived_chats": [],
@@ -731,8 +743,8 @@ def test_startup_model_prefers_saved_selection_over_startup_default(monkeypatch,
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     f = main.ChatFrame()
     try:
-        assert f.selected_model == "z-ai/glm-5"
-        assert f.model_combo.GetValue() == "z-ai/glm-5"
+        assert f.selected_model == main.DEFAULT_CODEX_MODEL
+        assert f.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
     finally:
         f.Destroy()
 

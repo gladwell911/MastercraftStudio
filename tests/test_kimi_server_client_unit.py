@@ -158,16 +158,23 @@ class HangingProcess(FakeProcess):
 class FakeWebSocket:
     """Mimics the websocket-client send/recv/close surface."""
 
-    def __init__(self, inbound=(), recv_error=None):
+    def __init__(self, inbound=(), recv_error=None, send_results=()):
         self.sent = []
         self._inbound = list(inbound)
         self._recv_error = recv_error
+        self._send_results = list(send_results)
         self.closed = False
+        self.recv_calls = 0
 
     def send(self, line):
+        if self._send_results:
+            result = self._send_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
         self.sent.append(line)
 
     def recv(self):
+        self.recv_calls += 1
         if self._inbound:
             return self._inbound.pop(0)
         if self._recv_error is not None:
@@ -176,6 +183,31 @@ class FakeWebSocket:
 
     def close(self):
         self.closed = True
+
+
+class BlockingWebSocket(FakeWebSocket):
+    """Socket whose reader stays alive until a test feeds or closes it."""
+
+    def __init__(self, *, send_results=()):
+        super().__init__(send_results=send_results)
+        self.recv_started = threading.Event()
+        self._recv_queue = queue.Queue()
+
+    def recv(self):
+        self.recv_calls += 1
+        self.recv_started.set()
+        result = self._recv_queue.get(timeout=5)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def feed(self, result):
+        self._recv_queue.put(result)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.feed(ConnectionError("websocket closed"))
 
 
 def make_client(proc=None, http=None, ws=None, **kwargs):
@@ -589,6 +621,49 @@ def test_session_event_dispatched_as_kimi_event():
     assert event["text"] == "你好"
 
 
+def test_ws_ping_replies_with_exact_nonce_without_ui_event():
+    client, _, _, ws, _ = started_client()
+
+    handled = client._handle_ws_message(
+        {"type": "ping", "payload": {"nonce": 731}},
+        ws=ws,
+    )
+
+    assert handled is True
+    assert sent_ws_messages(ws)[-1] == {"type": "pong", "payload": {"nonce": 731}}
+    assert client.drain_pending_messages(limit=10) == []
+
+
+def test_repeated_ws_ping_cycles_never_enter_ui_queue():
+    client, _, _, ws, _ = started_client()
+
+    for nonce in ("n-1", "n-2", "n-3"):
+        assert client._handle_ws_message(
+            {"type": "ping", "payload": {"nonce": nonce}},
+            ws=ws,
+        ) is True
+
+    pongs = [message for message in sent_ws_messages(ws) if message["type"] == "pong"]
+    assert [message["payload"]["nonce"] for message in pongs] == ["n-1", "n-2", "n-3"]
+    assert client.drain_pending_messages(limit=10) == []
+
+
+def test_ws_ping_send_failure_marks_only_that_socket_stale():
+    ws = FakeWebSocket(send_results=[None, ConnectionError("pong failed")])
+    client, *_ = started_client(ws=ws)
+
+    handled = client._handle_ws_message(
+        {"type": "ping", "payload": {"nonce": 9}},
+        ws=ws,
+    )
+
+    assert handled is False
+    assert client._ws is None
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["type"] for message in drained] == ["transport_error"]
+    assert "pong failed" in drained[0]["payload"]["error"]
+
+
 # ----------------------------------------------------------------------
 # A18-A19: delta coalescing
 
@@ -722,6 +797,147 @@ def test_transport_error_surfaces_event():
     types = [m["type"] for m in drained]
     assert types == ["event", "transport_error"]
     assert "socket dropped" in drained[1]["payload"]["error"]
+
+
+def test_empty_recv_stops_reader_without_spinning():
+    ws = FakeWebSocket(inbound=[""])
+    client, *_ = started_client(ws=ws, start_reader_thread=True)
+
+    client._ws_thread.join(timeout=5)
+
+    assert not client._ws_thread.is_alive()
+    assert ws.recv_calls == 1
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["type"] for message in drained] == ["transport_error"]
+    assert client._ws is None
+
+
+def test_start_reconnects_same_process_and_replays_subscriptions():
+    proc = FakeProcess()
+    http = FakeHttpSession()
+    old_ws = FakeWebSocket()
+    new_ws = FakeWebSocket()
+    sockets = iter((old_ws, new_ws))
+    spawn_calls = []
+    ws_calls = []
+
+    def ws_factory(url, headers):
+        ws_calls.append((url, headers))
+        return next(sockets)
+
+    client = KimiServerClient(
+        process_factory=lambda args: spawn_calls.append(list(args)) or proc,
+        http_session_factory=lambda: http,
+        ws_factory=ws_factory,
+        launch_command=["/fake/kimi"],
+        token="test-token",
+        start_reader_thread=False,
+    )
+    client.start()
+    client.subscribe(["session-2", "session-1"])
+    assert client._invalidate_ws(old_ws, "idle close", notify=False) is True
+
+    client.start()
+
+    assert len(spawn_calls) == 1
+    assert len(ws_calls) == 2
+    assert client.process is proc
+    assert client._ws is new_ws
+    replay = sent_ws_messages(new_ws)
+    assert [message["type"] for message in replay] == ["client_hello", "subscribe"]
+    assert replay[1]["payload"]["session_ids"] == ["session-1", "session-2"]
+
+
+def test_send_failure_reconnects_replays_and_stale_reader_cannot_clear_replacement():
+    proc = FakeProcess()
+    http = FakeHttpSession()
+    old_ws = BlockingWebSocket(
+        send_results=[None, None, ConnectionError("socket is already closed")]
+    )
+    new_ws = BlockingWebSocket()
+    sockets = iter((old_ws, new_ws))
+    spawn_calls = []
+
+    client = KimiServerClient(
+        process_factory=lambda args: spawn_calls.append(list(args)) or proc,
+        http_session_factory=lambda: http,
+        ws_factory=lambda url, headers: next(sockets),
+        launch_command=["/fake/kimi"],
+        token="test-token",
+        start_reader_thread=True,
+    )
+    client.start()
+    assert old_ws.recv_started.wait(timeout=5)
+    client.subscribe(["session-1"])
+
+    client.abort("session-1", "prompt-7")
+    assert new_ws.recv_started.wait(timeout=5)
+
+    assert len(spawn_calls) == 1
+    assert client.process is proc
+    assert client._ws is new_ws
+    replacement_messages = sent_ws_messages(new_ws)
+    assert [message["type"] for message in replacement_messages] == [
+        "client_hello",
+        "subscribe",
+        "abort",
+    ]
+    assert replacement_messages[1]["payload"]["session_ids"] == ["session-1"]
+    assert replacement_messages[2]["payload"] == {
+        "session_id": "session-1",
+        "prompt_id": "prompt-7",
+    }
+
+    deadline = time.monotonic() + 5
+    while old_ws.recv_calls < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.drain_pending_messages(limit=10) == []
+    assert client._ws is new_ws
+    client.close()
+
+
+def test_terminal_send_failure_is_wrapped_and_reported_once():
+    proc = FakeProcess()
+    sockets = iter(
+        (
+            FakeWebSocket(send_results=[None, ConnectionError("first closed")]),
+            FakeWebSocket(send_results=[None, ConnectionError("second closed")]),
+        )
+    )
+    spawn_calls = []
+    client = KimiServerClient(
+        process_factory=lambda args: spawn_calls.append(list(args)) or proc,
+        http_session_factory=FakeHttpSession,
+        ws_factory=lambda url, headers: next(sockets),
+        launch_command=["/fake/kimi"],
+        token="test-token",
+        start_reader_thread=False,
+    )
+    client.start()
+
+    with pytest.raises(KimiServerError, match="second closed"):
+        client.abort("session-1")
+
+    assert len(spawn_calls) == 1
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["type"] for message in drained] == ["transport_error"]
+    assert "second closed" in drained[0]["payload"]["error"]
+
+
+def test_close_during_socket_activity_is_silent_and_idempotent():
+    ws = BlockingWebSocket()
+    client, proc, http, _, _ = started_client(ws=ws, start_reader_thread=True)
+    assert ws.recv_started.wait(timeout=5)
+
+    client.close()
+    client.close()
+    client._ws_thread.join(timeout=5)
+
+    assert not client._ws_thread.is_alive()
+    assert client.drain_pending_messages(limit=10) == []
+    shutdowns = [call for call in http.calls if call["url"].endswith("/api/v1/shutdown")]
+    assert len(shutdowns) == 1
+    assert proc.terminated is False
 
 
 def test_server_process_exit_surfaces_exit_message():

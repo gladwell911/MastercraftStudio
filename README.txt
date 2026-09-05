@@ -34,7 +34,7 @@ setx OPENROUTER_API_KEY "你的Key"
 
 如果项目目录下存在 `.venv` 或 `.venv311`，打包和测试流程优先使用对应虚拟环境。
 
-如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
+如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。客户端会自动回应服务器心跳，空闲后无需手动重启聊天。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
 
 ## 数据位置
 

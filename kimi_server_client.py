@@ -190,13 +190,13 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
 
     The server envelope is flat: ``{"type": <event-type>, "seq": n,
     "session_id": ..., "payload": {"type": <event-type>, ...}}``. Control
-    messages (ack/server_hello/pong) return None. Unknown event types map to a
+    messages (ack/server_hello/ping/pong) return None. Unknown event types map to a
     ``notification`` event flagged ``unmapped`` so nothing is dropped silently.
     """
     if not isinstance(message, dict):
         return None
     event_type = _str(message.get("type"))
-    if not event_type or event_type in ("ack", "server_hello", "pong", "error_ack"):
+    if not event_type or event_type in ("ack", "server_hello", "ping", "pong", "error_ack"):
         return None
     session_id = _str(message.get("session_id"))
     body = _payload_of(message)
@@ -476,6 +476,9 @@ class KimiServerClient:
     def start(self) -> None:
         with self._lifecycle_lock:
             if self._started and self.process is not None and self.process.poll() is None:
+                self._closed = False
+                if not self._ws_is_usable_locked():
+                    self._connect_ws_locked()
                 return
             self._closed = False
             port = self.port or pick_free_port()
@@ -504,7 +507,7 @@ class KimiServerClient:
                 self.token = self._find_token()
             if not self.token:
                 self._abort_start("kimi server token unavailable")
-            self._connect_ws()
+            self._connect_ws_locked()
             self._started = True
 
     def close(self) -> None:
@@ -512,14 +515,9 @@ class KimiServerClient:
             if self._closed:
                 return
             self._closed = True
-            try:
-                if self._ws is not None:
-                    try:
-                        self._ws.close()
-                    except Exception:
-                        pass
-            finally:
-                self._ws = None
+            ws = self._ws
+            self._ws = None
+            self._close_ws_locked(ws)
             proc = self.process
             if proc is None:
                 return
@@ -784,35 +782,113 @@ class KimiServerClient:
         return data if isinstance(data, dict) else ({} if data is None else {"value": data})
 
     def _connect_ws(self) -> None:
+        with self._lifecycle_lock:
+            self._connect_ws_locked()
+
+    def _connect_ws_locked(self) -> None:
+        """Install one authenticated socket while serializing lifecycle changes."""
+        if self._closed:
+            raise KimiServerError("kimi websocket is closing")
+        if self.process is None or self.process.poll() is not None:
+            raise KimiServerError("kimi server process is not running")
+
+        stale_ws = self._ws
+        self._ws = None
+        self._close_ws_locked(stale_ws)
+
         url = f"ws://127.0.0.1:{self.port}{WS_PATH}"
         headers = [f"Authorization: Bearer {self.token}"] if self.token else []
-        if self.ws_factory is not None:
-            self._ws = self.ws_factory(url, headers)
-        else:
-            import websocket
+        candidate = None
+        try:
+            if self.ws_factory is not None:
+                candidate = self.ws_factory(url, headers)
+            else:
+                import websocket
 
-            # Keep the websocket open for long periods without forcing a teardown
-            # on normal idle timeouts; this avoids interpreting harmless recv()
-            # timeouts as transport failures.
-            self._ws = websocket.create_connection(url, header=headers, timeout=None)
-        self._send_ws(
-            {
-                "type": "client_hello",
-                "id": self._next_id(),
-                "payload": {"client_id": "zgwd", "subscriptions": [], "cursors": {}},
-            }
-        )
+                # Keep the websocket open for long periods without forcing a teardown
+                # on normal idle timeouts; this avoids interpreting harmless recv()
+                # timeouts as transport failures.
+                candidate = websocket.create_connection(url, header=headers, timeout=None)
+            self._send_on_socket_locked(
+                candidate,
+                {
+                    "type": "client_hello",
+                    "id": self._next_id(),
+                    "payload": {"client_id": "zgwd", "subscriptions": [], "cursors": {}},
+                },
+            )
+            subscriptions = sorted(self._subscribed_sessions)
+            if subscriptions:
+                self._send_on_socket_locked(
+                    candidate,
+                    {
+                        "type": "subscribe",
+                        "id": self._next_id(),
+                        "payload": {"session_ids": subscriptions},
+                    },
+                )
+        except Exception as exc:
+            self._close_ws_locked(candidate)
+            if isinstance(exc, KimiServerError):
+                raise
+            raise KimiServerError(f"kimi websocket connection failed: {exc}") from exc
+
+        self._ws = candidate
         if self.start_reader_thread:
-            self._ws_thread = threading.Thread(target=self._ws_loop, daemon=True)
+            self._ws_thread = threading.Thread(target=self._ws_loop, args=(candidate,), daemon=True)
             self._ws_thread.start()
 
     def _send_ws(self, message: dict[str, Any]) -> None:
-        ws = self._ws
+        last_error: BaseException | None = None
+        notify_error = ""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise KimiServerError("kimi websocket is closing")
+            for attempt in range(2):
+                try:
+                    if not self._ws_is_usable_locked():
+                        self._connect_ws_locked()
+                    ws = self._ws
+                    if ws is None:  # Defensive: _connect_ws_locked either installs or raises.
+                        raise KimiServerError("kimi websocket is not connected")
+                    self._send_on_socket_locked(ws, message)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    current = self._ws
+                    if current is not None:
+                        self._ws = None
+                        self._close_ws_locked(current)
+                    if attempt == 0 and not self._closed and self.process is not None and self.process.poll() is None:
+                        continue
+                    notify_error = f"kimi websocket transport failed: {exc}"
+                    break
+        if notify_error:
+            self._enqueue_control({"type": "transport_error", "payload": {"error": notify_error}})
+        raise KimiServerError(notify_error or "kimi websocket transport failed") from last_error
+
+    def _send_on_socket_locked(self, ws: Any, message: dict[str, Any]) -> None:
         if ws is None:
             raise KimiServerError("kimi websocket is not connected")
         line = json.dumps(message, ensure_ascii=False)
         with self._send_lock:
             ws.send(line)
+
+    def _close_ws_locked(self, ws: Any) -> None:
+        if ws is None:
+            return
+        with self._send_lock:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _ws_is_usable_locked(self) -> bool:
+        if self._ws is None:
+            return False
+        if not self.start_reader_thread:
+            return True
+        return self._ws_thread is not None and self._ws_thread.is_alive()
 
     def _banner_loop(self) -> None:
         proc = self.process
@@ -827,40 +903,72 @@ class KimiServerClient:
         finally:
             self._notify_exit(proc)
 
-    def _ws_loop(self) -> None:
-        ws = self._ws
+    def _ws_loop(self, ws: Any | None = None) -> None:
+        if ws is None:
+            with self._lifecycle_lock:
+                ws = self._ws
         if ws is None:
             return
-        try:
-            while True:
+        while True:
+            with self._lifecycle_lock:
+                if self._closed or self._ws is not ws:
+                    return
+            try:
+                raw = ws.recv()
+            except Exception as exc:
+                if self._is_ws_timeout(exc):
+                    continue
                 with self._lifecycle_lock:
                     if self._closed:
                         return
-                try:
-                    raw = ws.recv()
-                except Exception as exc:
-                    if self._is_ws_timeout(exc):
-                        continue
-                    with self._lifecycle_lock:
-                        if self._closed:
-                            return
-                    self._enqueue_control({"type": "transport_error", "payload": {"error": str(exc)}})
-                    return
-                if not raw:
-                    continue
-                try:
-                    message = json.loads(raw)
-                except Exception:
-                    continue
-                self._handle_ws_message(message)
-        finally:
-            pass
+                self._invalidate_ws(ws, str(exc), notify=True)
+                return
+            if not raw:
+                self._invalidate_ws(ws, "kimi websocket closed", notify=True)
+                return
+            try:
+                message = json.loads(raw)
+            except Exception:
+                continue
+            if not self._handle_ws_message(message, ws=ws):
+                return
 
-    def _handle_ws_message(self, message: dict[str, Any]) -> None:
+    def _handle_ws_message(self, message: dict[str, Any], *, ws: Any | None = None) -> bool:
+        if isinstance(message, dict) and _str(message.get("type")) == "ping":
+            payload = _payload_of(message)
+            target = ws
+            if target is None:
+                with self._lifecycle_lock:
+                    target = self._ws
+            try:
+                with self._lifecycle_lock:
+                    if self._closed or target is None or self._ws is not target:
+                        return False
+                    self._send_on_socket_locked(
+                        target,
+                        {"type": "pong", "payload": {"nonce": payload.get("nonce")}},
+                    )
+                return True
+            except Exception as exc:
+                self._invalidate_ws(target, str(exc), notify=True)
+                return False
         event = map_session_event(message)
         if event is None:
-            return
+            return True
         self._enqueue_event(event)
+        return True
+
+    def _invalidate_ws(self, ws: Any, error: str, *, notify: bool) -> bool:
+        """Mark only ``ws`` stale; an older reader must not clear its replacement."""
+        invalidated = False
+        with self._lifecycle_lock:
+            if not self._closed and self._ws is ws:
+                self._ws = None
+                self._close_ws_locked(ws)
+                invalidated = True
+        if invalidated and notify:
+            self._enqueue_control({"type": "transport_error", "payload": {"error": str(error)}})
+        return invalidated
 
     def _enqueue_control(self, message: dict[str, Any]) -> None:
         notify = False

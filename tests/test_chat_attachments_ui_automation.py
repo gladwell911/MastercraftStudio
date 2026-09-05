@@ -105,8 +105,8 @@ def test_ui_automation_uploaded_image_uses_single_success_row(frame, tmp_path):
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert len(rows) == 2
-    assert [meta[0] for meta in frame.answer_meta] == ["user", "attachment"]
+    assert len(rows) == 3
+    assert [meta[0] for meta in frame.answer_meta] == ["time", "user", "attachment"]
 
 
 def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, tmp_path):
@@ -135,5 +135,5 @@ def test_ui_automation_attachment_only_turn_keeps_my_and_assistant_rows(frame, t
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert len(rows) == 4
-    assert [meta[0] for meta in frame.answer_meta] == ["user", "attachment", "ai", "answer"]
+    assert len(rows) == 5
+    assert [meta[0] for meta in frame.answer_meta] == ["time", "user", "attachment", "ai", "answer"]

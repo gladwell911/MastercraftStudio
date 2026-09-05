@@ -223,7 +223,7 @@ def test_codex_final_question_sets_pending_prompt_and_updates_answer(frame):
     assert frame.active_session_turns[0]["answer_md"] == "璇锋彁渚涚洰鏍囨枃浠惰矾寰勶紵"
 
 
-def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(frame, monkeypatch):
+def test_codex_final_answer_appends_and_focuses_when_final_answer_arrives(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 0
@@ -260,6 +260,35 @@ def test_codex_final_answer_rerenders_and_focuses_when_final_answer_arrives(fram
     assert frame.active_session_turns[0]["answer_md"] == "done"
     assert rendered["n"] == 0
     assert focused["n"] == 1
+
+
+def test_codex_execution_step_replaces_empty_placeholder(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = []
+    frame.active_turn_idx = -1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [],
+        "detail_panel_mode": "execution",
+        "execution_steps": [],
+    }
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+
+    assert list(frame.execution_list.GetStrings()) == ["暂无执行过程"]
+
+    assert frame._append_execution_entry_to_chat(
+        "chat-current",
+        {
+            "event_type": "plan_updated",
+            "display_kind": "plan",
+            "list_text": "计划：正在检查项目文件",
+            "detail_text": "正在检查项目文件",
+        },
+    )
+
+    assert list(frame.execution_list.GetStrings()) == ["计划：正在检查项目文件"]
+    assert [meta[0] for meta in frame.execution_meta] == ["execution"]
 
 
 

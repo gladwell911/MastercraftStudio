@@ -20,6 +20,12 @@
 
 - For a screen-reader desktop client, a token stream must update only the changed answer region. Avoid full list replacement, selection changes, or foreground repaint when the canonical model has no visible delta.
 - When persisted history and in-memory events overlap, deduplicate by stable execution identity and sort by persisted timestamp before refreshing the UI.
+
+## Kimi Code WebSocket lifecycle
+
+- Kimi Code 0.38 uses an application-level JSON heartbeat rather than relying only on WebSocket transport keepalive: reply to every `ping` with a `pong` carrying the same nonce, without emitting a UI event.
+- Treat an empty WebSocket read or CLOSE as terminal. Invalidate the socket before the next control send, then perform one bounded reconnect that repeats `client_hello` and subscription recovery. This avoids reusing a closed socket after an idle interval.
+- Verify this path with deterministic unit coverage for heartbeat, close, reconnect, and socket-swap races. A release still requires the opt-in live idle smoke test (`KIMI_LIVE_TEST=1`) because server timing is part of the contract.
 ## Python virtual-environment recovery
 
 - This desktop project targets Python 3.11. If `.venv/pyvenv.cfg` points to a missing interpreter, install Python 3.11 side by side and recreate `.venv` with `py -3.11 -m venv .venv`; do not retarget the old environment by editing its configuration.
