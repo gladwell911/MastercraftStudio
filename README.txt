@@ -36,6 +36,8 @@ setx OPENROUTER_API_KEY "你的Key"
 
 如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。客户端会自动回应服务器心跳，空闲后无需手动重启聊天。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。
 
+多个 Kimi Code 聊天可并发运行。Kimi 的 `turn_id` 仅在各自 session 内唯一，客户端以 session 和 turn 的组合隔离事件；不要把不同聊天中同号 turn 的事件视为同一轮回答。
+
 手机端选择 `kimi/*` 后，远端消息同样走电脑端的 Kimi 专用 worker，不读取 `OPENROUTER_API_KEY`。如果 Kimi 消息返回 OpenRouter 401，应优先检查模型分派是否回退，而不是补配 OpenRouter Key。可运行以下无外部凭据回归：
 
 ```powershell
@@ -55,7 +57,7 @@ python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_mode
 .\package_mc.ps1
 ```
 
-默认使用 `zgwd.spec`，产物输出到 `C:\code\cx\mc\`。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
+默认使用 `zgwd.spec`，产物输出到 `C:\code\cx\mc\`。可用 `-DistPath D:\code\cx` 改为当前发布目录；当项目 `.venv` 不可用时，用 `-PythonExe` 显式指定 Python 3.11 解释器。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
 
 打包目录同时包含 GUI 程序 `mc.exe` 和后台协议程序 `mc_worker.exe`；两者必须保持同目录。`mc_worker.exe` 专供 `mc.exe` 处理 Codex 的 UTF-8 JSONL 通信，请勿单独作为桌面程序启动。
 
