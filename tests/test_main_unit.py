@@ -18347,6 +18347,7 @@ def test_submit_question_defers_state_save_after_send(frame, monkeypatch):
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: None)
 
     ok, message = frame._submit_question("hello", source="remote", model=main.DEFAULT_CODEX_MODEL)
 

@@ -8266,7 +8266,16 @@ class ChatFrame(wx.Frame):
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 
-    def _start_claudecode_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, session_id: str) -> None:
+    def _start_claudecode_worker_for_turn(
+        self,
+        chat_id: str,
+        turn_idx: int,
+        question: str,
+        session_id: str,
+        model: str = DEFAULT_CLAUDECODE_MODEL,
+    ) -> None:
+        resolved_model = str(model or DEFAULT_CLAUDECODE_MODEL).strip() or DEFAULT_CLAUDECODE_MODEL
+
         def _worker() -> None:
             try:
                 client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
@@ -8345,10 +8354,10 @@ class ChatFrame(wx.Frame):
                 last_context_usage = getattr(client, "last_context_usage", None)
                 if last_context_usage:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
-                wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", DEFAULT_CLAUDECODE_MODEL, "", chat_id)
+                wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", resolved_model, "", chat_id)
             except Exception as exc:
                 error_msg = str(exc)
-                wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, DEFAULT_CLAUDECODE_MODEL, "", chat_id)
+                wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, resolved_model, "", chat_id)
             finally:
                 # 清除客户端引用
                 if self._active_claudecode_client is client:
@@ -13250,12 +13259,21 @@ class ChatFrame(wx.Frame):
                 self._render_answer_list_compat(refresh_execution=False)
             else:
                 self._render_answer_list()
-        if is_codex_model(resolved_model) and source == "local":
+        # The transport that submitted the turn must not choose its provider.
+        # Remote NATS requests carry the same resolved model IDs as desktop
+        # submissions, so CLI-backed models need their dedicated workers too.
+        if is_codex_model(resolved_model):
             self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
-        elif is_kimi_model(resolved_model) and source == "local":
+        elif is_kimi_model(resolved_model):
             self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
-        elif is_claudecode_model(resolved_model) and source == "local":
-            self._start_claudecode_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, worker_question, self.active_claudecode_session_id)
+        elif is_claudecode_model(resolved_model):
+            self._start_claudecode_worker_for_turn(
+                chat_id or self.active_chat_id or self.current_chat_id or "",
+                turn_idx,
+                worker_question,
+                self.active_claudecode_session_id,
+                resolved_model,
+            )
         else:
             t = threading.Thread(target=self._worker, args=(openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
             t.start()
