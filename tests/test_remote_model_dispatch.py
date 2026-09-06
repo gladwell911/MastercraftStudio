@@ -142,6 +142,85 @@ def test_remote_ws_openrouter_model_keeps_generic_worker(frame, monkeypatch, mod
     assert kwargs["daemon"] is True
 
 
+def test_remote_ws_kimi_message_does_not_enter_another_chats_claude_client(
+    frame, monkeypatch
+):
+    _prepare_remote_ingress(frame, monkeypatch)
+    claude_inputs = []
+    active_claude_client = type(
+        "_ActiveClaudeClient",
+        (),
+        {"send_user_input": lambda _self, text: claude_inputs.append(text)},
+    )()
+    frame._set_active_claudecode_client(active_claude_client, "claude-chat")
+    started = []
+    monkeypatch.setattr(
+        frame,
+        "_start_kimi_worker_for_turn",
+        lambda *args: started.append(args),
+    )
+    monkeypatch.setattr(
+        frame,
+        "_start_claudecode_worker_for_turn",
+        lambda *_args: pytest.fail("Kimi request must not start a Claude worker"),
+    )
+    monkeypatch.setattr(
+        main,
+        "openrouter_api_key_for_app",
+        lambda: pytest.fail("Kimi request must not read the OpenRouter API key"),
+    )
+
+    status, body = frame._remote_api_message_ui(
+        {
+            "chat_id": "remote-chat",
+            "text": "question for kimi",
+            "model": "kimi/main",
+            "model_change_mode": "explicit",
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert claude_inputs == []
+    assert len(started) == 1
+    assert started[0][0] == "remote-chat"
+    assert started[0][2] == "question for kimi"
+    assert frame.active_session_turns[-1]["question"] == "question for kimi"
+    assert frame.active_session_turns[-1]["model"] == "kimi/main"
+
+
+def test_remote_ws_same_chat_message_continues_active_claude_client(
+    frame, monkeypatch
+):
+    _prepare_remote_ingress(frame, monkeypatch)
+    claude_inputs = []
+    active_claude_client = type(
+        "_ActiveClaudeClient",
+        (),
+        {"send_user_input": lambda _self, text: claude_inputs.append(text)},
+    )()
+    frame._set_active_claudecode_client(active_claude_client, "remote-chat")
+    monkeypatch.setattr(
+        frame,
+        "_start_claudecode_worker_for_turn",
+        lambda *_args: pytest.fail("continuation must not start another Claude worker"),
+    )
+
+    status, body = frame._remote_api_message_ui(
+        {
+            "chat_id": "remote-chat",
+            "text": "continue claude",
+            "model": "claudecode/opus",
+            "model_change_mode": "explicit",
+        }
+    )
+
+    assert status == 200
+    assert body["accepted"] is True
+    assert claude_inputs == ["continue claude"]
+    assert frame.active_session_turns == []
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_claudecode_worker_reports_dynamic_model_on_completion(
     frame, monkeypatch, fails
@@ -162,6 +241,8 @@ def test_claudecode_worker_reports_dynamic_model_on_completion(
             pass
 
         def stream_chat(self, *args, **kwargs):
+            assert frame._active_claudecode_client is self
+            assert frame._active_claudecode_chat_id == "remote-chat"
             if fails:
                 raise RuntimeError("claude failed")
             return "claude answer", "session-new"
@@ -174,6 +255,8 @@ def test_claudecode_worker_reports_dynamic_model_on_completion(
         lambda fn, *args, **kwargs: fn(*args, **kwargs),
     )
     monkeypatch.setattr(frame, "_on_done", lambda *args: completed.append(args))
+    frame.active_chat_id = "remote-chat"
+    frame.current_chat_id = "remote-chat"
 
     frame._start_claudecode_worker_for_turn(
         "remote-chat",
@@ -189,3 +272,45 @@ def test_claudecode_worker_reports_dynamic_model_on_completion(
     assert completed[0][2] == ("claude failed" if fails else "")
     assert completed[0][3] == "claudecode/opus"
     assert completed[0][5] == "remote-chat"
+    assert frame._active_claudecode_client is None
+    assert frame._active_claudecode_chat_id == ""
+
+
+def test_claudecode_worker_cleanup_does_not_clear_replacement_client(
+    frame, monkeypatch
+):
+    replacement_client = object()
+
+    class _ImmediateThread:
+        def __init__(self, *, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _ClaudeClient:
+        last_context_usage = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream_chat(self, *args, **kwargs):
+            frame._set_active_claudecode_client(replacement_client, "new-chat")
+            return "claude answer", "session-new"
+
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main, "ClaudeCodeClient", _ClaudeClient)
+    monkeypatch.setattr(main, "wx_call_after_if_alive", lambda *_args, **_kwargs: None)
+    frame.active_chat_id = "remote-chat"
+    frame.current_chat_id = "remote-chat"
+
+    frame._start_claudecode_worker_for_turn(
+        "remote-chat",
+        7,
+        "remote question",
+        "session-old",
+        "claudecode/opus",
+    )
+
+    assert frame._active_claudecode_client is replacement_client
+    assert frame._active_claudecode_chat_id == "new-chat"

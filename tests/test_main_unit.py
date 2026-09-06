@@ -4845,6 +4845,7 @@ def test_new_chat_clears_active_claudecode_client_before_next_submit(frame, monk
 
     stale_client = _ActiveClaudeClient()
     frame._active_claudecode_client = stale_client
+    frame._active_claudecode_chat_id = "chat-old"
     frame.active_claudecode_session_id = "session-old"
     frame.active_chat_id = "chat-old"
     frame.current_chat_id = "chat-old"
@@ -4856,7 +4857,7 @@ def test_new_chat_clears_active_claudecode_client_before_next_submit(frame, monk
     monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
     monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
     monkeypatch.setattr(frame.model_combo, "SetValue", lambda _value: None)
     monkeypatch.setattr(frame, "_resolve_current_model", lambda: "claudecode/default")
@@ -4864,7 +4865,9 @@ def test_new_chat_clears_active_claudecode_client_before_next_submit(frame, monk
     monkeypatch.setattr(
         frame,
         "_start_claudecode_worker_for_turn",
-        lambda chat_id, turn_idx, question, session_id: seen["worker"].append((chat_id, turn_idx, question, session_id)),
+        lambda chat_id, turn_idx, question, session_id, model: seen["worker"].append(
+            (chat_id, turn_idx, question, session_id, model)
+        ),
     )
 
     frame._on_new_chat_clicked(None)
@@ -4875,6 +4878,7 @@ def test_new_chat_clears_active_claudecode_client_before_next_submit(frame, monk
     assert stale_client.inputs == []
     assert seen["worker"]
     assert frame._active_claudecode_client is None
+    assert frame._active_claudecode_chat_id == ""
 
 
 def test_new_chat_from_history_clears_history_view_and_resets_context_usage(frame, monkeypatch):
@@ -6337,7 +6341,7 @@ def test_claudecode_submit_sets_resume_recovery_mode(frame, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
-    monkeypatch.setattr(frame, "_render_answer_list", lambda: None)
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
     class _NoOpThread:

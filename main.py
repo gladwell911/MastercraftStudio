@@ -1357,6 +1357,8 @@ class ChatFrame(wx.Frame):
         self.active_codex_latest_assistant_phase = ""
         self.active_claudecode_session_id = ""
         self._active_claudecode_client = None
+        self._active_claudecode_chat_id = ""
+        self._active_claudecode_client_lock = threading.Lock()
         self.active_kimi_session_id = ""
         self.active_kimi_turn_id = ""
         self.active_kimi_turn_active = False
@@ -8266,6 +8268,27 @@ class ChatFrame(wx.Frame):
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 
+    def _set_active_claudecode_client(self, client, chat_id: str) -> None:
+        with self._active_claudecode_client_lock:
+            self._active_claudecode_client = client
+            self._active_claudecode_chat_id = str(chat_id or "").strip()
+
+    def _clear_active_claudecode_client(self, expected_client=None) -> None:
+        with self._active_claudecode_client_lock:
+            if expected_client is not None and self._active_claudecode_client is not expected_client:
+                return
+            self._active_claudecode_client = None
+            self._active_claudecode_chat_id = ""
+
+    def _send_active_claudecode_input(self, chat_id: str, text: str) -> bool:
+        target_chat_id = str(chat_id or "").strip()
+        with self._active_claudecode_client_lock:
+            client = self._active_claudecode_client
+            if client is None or self._active_claudecode_chat_id != target_chat_id:
+                return False
+            client.send_user_input(text)
+            return True
+
     def _start_claudecode_worker_for_turn(
         self,
         chat_id: str,
@@ -8277,6 +8300,7 @@ class ChatFrame(wx.Frame):
         resolved_model = str(model or DEFAULT_CLAUDECODE_MODEL).strip() or DEFAULT_CLAUDECODE_MODEL
 
         def _worker() -> None:
+            client = None
             try:
                 client = ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
 
@@ -8301,7 +8325,7 @@ class ChatFrame(wx.Frame):
 
                 if is_current_target():
                     # 保存客户端引用，以便在用户发送消息时使用
-                    self._active_claudecode_client = client
+                    self._set_active_claudecode_client(client, chat_id)
 
                 def on_delta(delta):
                     wx_call_after_if_alive(self._on_delta, turn_idx, delta, chat_id)
@@ -8360,8 +8384,8 @@ class ChatFrame(wx.Frame):
                 wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, resolved_model, "", chat_id)
             finally:
                 # 清除客户端引用
-                if self._active_claudecode_client is client:
-                    self._active_claudecode_client = None
+                if client is not None:
+                    self._clear_active_claudecode_client(client)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -9069,7 +9093,7 @@ class ChatFrame(wx.Frame):
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
-        self._active_claudecode_client = None
+        self._clear_active_claudecode_client()
         self.current_chat_id = ""
         self.active_chat_id = ""
         self.active_session_turns = []
@@ -12852,7 +12876,7 @@ class ChatFrame(wx.Frame):
         self._reset_active_codex_session_state()
         self._reset_active_kimi_session_state()
         self.active_claudecode_session_id = ""
-        self._active_claudecode_client = None
+        self._clear_active_claudecode_client()
         self._pending_context_usage_by_turn = {}
         self._current_chat_state["id"] = self.active_chat_id
         self._current_chat_state["turns"] = self.active_session_turns
@@ -13008,10 +13032,10 @@ class ChatFrame(wx.Frame):
         self._answer_list_tail_notice = ""
         self._answer_list_tail_notice_chat_id = ""
 
-        # 检查是否有活跃的 Claude Code 客户端在等待输入
-        if hasattr(self, '_active_claudecode_client') and self._active_claudecode_client is not None:
+        # 检查目标聊天是否有活跃的 Claude Code 客户端在等待输入
+        submit_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        if self._send_active_claudecode_input(submit_chat_id, q):
             # 将消息发送到 Claude Code 的 stdin 队列
-            self._active_claudecode_client.send_user_input(q)
             # 清空输入框
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
@@ -14127,7 +14151,7 @@ class ChatFrame(wx.Frame):
         self._reset_active_codex_session_state()
         self._reset_active_kimi_session_state()
         self.active_claudecode_session_id = ""
-        self._active_claudecode_client = None
+        self._clear_active_claudecode_client()
         self.view_mode = "active"
         self.view_history_id = None
         if save_after_archive:
@@ -14167,7 +14191,7 @@ class ChatFrame(wx.Frame):
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
-        self._active_claudecode_client = None
+        self._clear_active_claudecode_client()
         archived = self._archive_active_session(
             quick_title=True,
             schedule_async_rename=True,
