@@ -264,6 +264,7 @@ def test_remote_nats_server_falls_back_when_default_websocket_port_is_unavailabl
 
 def test_remote_nats_server_starts_fresh_runtime_on_fallback_tcp_port_when_reused_runtime_auth_fails(frame, monkeypatch):
     started = {"ports": [], "transport_urls": []}
+    fallback_port = main.REMOTE_NATS_PORT_FALLBACKS[0]
 
     class _FakeNatsProcess:
         def __init__(self, config, bundled_dir=None):
@@ -305,17 +306,17 @@ def test_remote_nats_server_starts_fresh_runtime_on_fallback_tcp_port_when_reuse
 
     assert started["transport_urls"] == [
         "nats://127.0.0.1:4222",
-        "nats://127.0.0.1:4223",
+        f"nats://127.0.0.1:{fallback_port}",
     ]
-    assert started["started_port"] == 4223
+    assert started["started_port"] == fallback_port
     assert started["ports"] == [
         (4222, 18081),
-        (4223, 18081),
+        (fallback_port, 18081),
     ]
     assert frame._remote_nats_process is not None
     assert frame._remote_nats_transport is not None
     assert frame.remote_nats_runtime_status["enabled"] is True
-    assert frame.remote_nats_runtime_status["tcp_url"] == "nats://127.0.0.1:4223"
+    assert frame.remote_nats_runtime_status["tcp_url"] == f"nats://127.0.0.1:{fallback_port}"
     assert frame.remote_nats_runtime_status["websocket_url"] == "ws://127.0.0.1:18081/nats"
     assert started["bridge"] is True
 

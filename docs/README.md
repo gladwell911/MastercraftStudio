@@ -9,6 +9,7 @@
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
 - [`experience.md`](./experience.md)：已经验证、可复用的排障与运行经验
+- [`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)：2026-09-06 全量非实时测试的历史失败基线与复现范围
 
 ## 关键当前事实
 

@@ -30,3 +30,15 @@
 
 - This desktop project targets Python 3.11. If `.venv/pyvenv.cfg` points to a missing interpreter, install Python 3.11 side by side and recreate `.venv` with `py -3.11 -m venv .venv`; do not retarget the old environment by editing its configuration.
 - Restore both `requirements.txt` and `requirements-dev.txt`, then verify with `.venv\Scripts\python.exe -m pip check` and focused pytest before relying on the repaired environment.
+
+## 远端模型分派与聊天隔离
+
+- 提供方选择必须由规范化模型 ID 决定，不能由 `local`、`remote-ws` 等传输来源决定。否则手机端 `kimi/*` 很容易误落入 OpenRouter，并以 401 掩盖真实的路由错误。
+- 可继续接收用户输入的 CLI 客户端是聊天级状态。保存客户端引用时要同时保存 owner `chat_id`，发送前校验归属，清理时用客户端对象身份防止旧 worker 清掉替换客户端。
+- 远端路由测试至少覆盖“聊天 A 的交互客户端活跃，同时聊天 B 发送消息”，并断言 A 未收到输入、B 创建 turn、目标专用 worker 启动且非目标凭据未读取。
+
+## 自动化测试分层
+
+- 方法级入口测试、进程内协议路由 E2E、真实 NATS Server、Android 模拟器和真实模型服务是不同层级；测试汇报必须逐层说明，不能把前两层表述成真机全链路。
+- 默认 CI 使用无凭据、无网络的稳定 E2E；真实手机与在线服务测试应标记为 opt-in，并在发布前单独执行。
+- 端口优先级测试应引用 `REMOTE_NATS_PORT_FALLBACKS` 等生产常量，而不是复制具体回退端口，避免策略调整后测试仍断言旧值。

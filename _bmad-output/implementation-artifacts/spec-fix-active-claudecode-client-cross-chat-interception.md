@@ -96,6 +96,14 @@ deferred:
 - Given Claude worker 完成或失败, when 后续向任意聊天提交消息, then 已结束客户端及其归属不会截获该消息。
 - Given 修复完成, when 运行新增测试、原远端模型分派测试及相关主模块测试, then 全部通过且 `kimi/main` 不读取 OpenRouter Key。
 
+### Review Findings
+
+- [x] [Review][Defer] 单个全局槽无法保留两个聊天中并行运行的 Claude 客户端 [main.py:8269] — deferred, pre-existing
+- [x] [Review][Defer] 当前聊天检查与 Claude 客户端注册之间存在切换竞态 [main.py:8325] — deferred, pre-existing
+- [x] [Review][Defer] 非当前聊天中启动的 Claude worker 不会登记可续写客户端 [main.py:8324] — deferred, pre-existing
+- [x] [Review][Defer] 无条件聊天重置可能与另一个 Claude 客户端注册发生竞态 [main.py:9093] — deferred, pre-existing
+- [x] [Review][Defer] 同一聊天显式切换非 Claude 模型时仍可能被活跃 Claude 客户端截获 [main.py:13032] — deferred, pre-existing
+
 ## Spec Change Log
 
 ## Review Triage Log

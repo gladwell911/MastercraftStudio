@@ -1,12 +1,21 @@
-# 本轮反思
+# 纠错反思
+
+## 2026-09-06 Kimi 远端路由与 QA
+
+| 修正内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 最初只说明自动化回归通过，没有主动区分方法级测试、进程内 E2E 和真实手机链路，用户随后追问是否真的做了端到端 QA。 | 判断逻辑有问题 | 汇报 QA 时必须明确测试边界：经过哪些真实层、模拟了哪些层、是否使用真机和真实服务。 |
+| 初次远端 CLI 路由修复同时启用了 Claude 远端专用 worker，但未先验证全局活跃 Claude 客户端的聊天归属；CR 才发现可能截获其他 `chat_id`。 | 判断逻辑有问题 | 放宽交互式 CLI 的远端入口时，同时检查后续输入通道的 owner，并加入“聊天 A 活跃、聊天 B 提交”的回归。 |
+
+## 历史纠正
 
 | 修正内容 | 错误归因 | 下次指令建议 |
 |---|---|---|
 | 只修源码、未立即验证目标 EXE。 | 判断逻辑有问题 | 打包桌面问题先检查目标包的真实入口和子进程命令。 |
 | 将 GUI 包复用作 JSONL worker。 | 判断逻辑有问题 | GUI 和标准流 worker 必须使用独立 console EXE，并做真实 IPC 冒烟。 |
 | 未考虑 Windows 保留端口与本地代码页。 | 信息不足 | 端口服务需可验证回退；跨进程 JSONL 两端必须显式 UTF-8。 |
-## 2026-09-05 Review correction
+### 2026-09-05 审查纠正
 
-| Correction | Root cause | Reusable guidance |
+| 修正内容 | 错误归因 | 下次指令建议 |
 |---|---|---|
-| A selected historical chat could receive updates intended for the hidden active chat, while execution refreshes could reintroduce stale physical rows. | View selection and persisted/active state were conflated; reconciliation trusted stale incremental data. | Route mutations through the selected history identity, and rebuild visible execution state from one canonical ordered model before repainting. |
+| 选中的历史聊天可能收到隐藏活动聊天的更新，执行列表刷新还可能重新引入过期物理行。 | 判断逻辑有问题 | 变更必须按选中历史聊天的标识路由；重绘前从单一、有序的规范模型重建可见执行状态。 |
