@@ -1,5 +1,6 @@
 import time
 
+import pytest
 import wx
 
 import main
@@ -264,6 +265,168 @@ def test_delta_then_final_answer_updates_answer_list(frame, monkeypatch):
     steps = frame._current_chat_state.get("execution_steps") or []
     commentary = [step for step in steps if str(step.get("display_kind") or "") == "commentary"]
     assert any("从前有座山。" in str(step.get("detail_text") or "") for step in commentary)
+
+
+def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    current_turn = {
+        "question": "current",
+        "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main",
+        "request_status": "pending",
+    }
+    background_turn = {
+        "question": "background",
+        "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main",
+        "request_status": "pending",
+        "kimi_session_id": "session-background",
+        "kimi_turn_id": "0",
+    }
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [current_turn]
+    frame.active_turn_idx = 0
+    frame.active_kimi_session_id = ""
+    frame.active_kimi_turn_id = ""
+    frame.active_kimi_turn_active = True
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "kimi_turn_active": True,
+    }
+    frame.archived_chats = [{
+        "id": "chat-background",
+        "title": "background",
+        "turns": [background_turn],
+        "kimi_session_id": "session-background",
+        "kimi_turn_id": "0",
+        "kimi_turn_active": True,
+        "execution_steps": [],
+    }]
+    frame._kimi_active_turns = {
+        "chat-current": {"turn_idx": 0, "session_id": "session-current"},
+        "chat-background": {"turn_idx": 0, "turn_id": "0", "session_id": "session-background"},
+    }
+    monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    fake.on_message = frame._on_kimi_client_message
+    frame._kimi_client = fake
+
+    current_started = CodexEvent(type="turn_started", thread_id="session-current", turn_id="0")
+    assert frame._resolve_kimi_event_chat_id(current_started) == "chat-current"
+    fake.push_event(KimiEvent(type="turn_started", thread_id="session-current", turn_id="0"))
+    assert current_turn["kimi_session_id"] == "session-current"
+    assert current_turn["kimi_turn_id"] == "0"
+    assert frame.active_kimi_session_id == "session-current"
+
+    events = [
+        CodexEvent(type="agent_message_delta", thread_id="session-background", turn_id="0", text="background answer", display_kind="assistant"),
+        CodexEvent(type="agent_message_delta", thread_id="session-current", turn_id="0", text="current answer", display_kind="assistant"),
+        CodexEvent(type="turn_completed", thread_id="session-current", turn_id="0", status="completed"),
+        CodexEvent(type="turn_completed", thread_id="session-background", turn_id="0", status="completed"),
+    ]
+    for event in events:
+        frame._on_kimi_event(event)
+
+    assert current_turn["answer_md"] == "current answer"
+    assert current_turn["request_status"] == "done"
+    assert background_turn["answer_md"] == "background answer"
+    assert background_turn["request_status"] == "done"
+    assert frame._resolve_kimi_event_chat_id(CodexEvent(type="turn_completed", turn_id="0")) == ""
+
+
+def test_sessionless_turn_fallback_requires_one_turn_occurrence(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [
+        {"kimi_session_id": "session-a", "kimi_turn_id": "7"},
+        {"kimi_session_id": "session-b", "kimi_turn_id": "7"},
+    ]
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._kimi_active_turns = {"chat-current": {"turn_idx": 1, "session_id": "session-b", "turn_id": "7"}}
+    event = CodexEvent(type="turn_completed", turn_id="7")
+
+    assert frame._kimi_event_scoped_turn_index(frame.active_session_turns, event) == -1
+    assert frame._resolve_kimi_event_chat_id(event) == ""
+
+    frame.active_session_turns[1]["kimi_turn_id"] = "8"
+    frame._kimi_active_turns["chat-current"]["turn_id"] = "8"
+    assert frame._kimi_event_scoped_turn_index(frame.active_session_turns, event) == 0
+    assert frame._resolve_kimi_event_chat_id(event) == "chat-current"
+
+
+def test_same_chat_reused_turn_id_keeps_sessions_isolated(frame, monkeypatch):
+    old_turn = {
+        "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main",
+        "request_status": "pending",
+        "kimi_session_id": "session-old",
+        "kimi_turn_id": "0",
+    }
+    new_turn = {
+        "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main",
+        "request_status": "pending",
+        "kimi_session_id": "session-new",
+        "kimi_turn_id": "0",
+    }
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [old_turn, new_turn]
+    frame.active_turn_idx = 1
+    frame.active_kimi_session_id = "session-new"
+    frame.active_kimi_turn_id = "0"
+    frame.active_kimi_turn_active = True
+    frame.is_running = True
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": frame.active_session_turns,
+        "kimi_session_id": "session-new",
+        "kimi_turn_id": "0",
+        "kimi_turn_active": True,
+    }
+    frame._kimi_active_turns = {
+        "chat-current": {"turn_idx": 1, "session_id": "session-new", "turn_id": "0"}
+    }
+    monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    frame._on_kimi_event(CodexEvent(type="agent_message_delta", thread_id="session-old", turn_id="0", text="old answer", display_kind="assistant"))
+    frame._on_kimi_event(CodexEvent(type="agent_message_delta", thread_id="session-new", turn_id="0", text="new answer", display_kind="assistant"))
+    frame._on_kimi_event(CodexEvent(type="turn_completed", thread_id="session-old", turn_id="0", status="completed"))
+
+    assert old_turn["answer_md"] == "old answer"
+    assert old_turn["request_status"] == "done"
+    assert new_turn["answer_md"] == main.REQUESTING_TEXT
+    assert new_turn["request_status"] == "pending"
+    assert frame._kimi_active_turns["chat-current"]["session_id"] == "session-new"
+    assert frame.active_kimi_turn_active is True
+    assert frame.is_running is True
+
+    frame._on_kimi_event(CodexEvent(type="turn_completed", thread_id="session-new", turn_id="0", status="completed"))
+    assert new_turn["answer_md"] == "new answer"
+    assert new_turn["request_status"] == "done"
+    assert "chat-current" not in frame._kimi_active_turns
+
+
+@pytest.mark.parametrize("empty_answer", [main.REQUESTING_TEXT, "", None])
+def test_completed_without_answer_does_not_mark_placeholder_done(frame, monkeypatch, empty_answer):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *args, **kwargs: None)
+    _submit(frame, "question")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="0"))
+    frame.active_session_turns[-1]["answer_md"] = empty_answer
+
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="0", status="completed"))
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "failed"
+    assert turn["answer_md"] != main.REQUESTING_TEXT
+    assert "未返回任何内容" in turn["request_error"]
 
 
 def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):

@@ -1367,7 +1367,7 @@ class ChatFrame(wx.Frame):
         self._kimi_client = None
         self._kimi_client_lock = threading.Lock()
         self._kimi_active_turns: dict[str, dict] = {}
-        self._kimi_turn_answer_parts: dict[tuple[str, str], list[str]] = {}
+        self._kimi_turn_answer_parts: dict[tuple[str, str, str], list[str]] = {}
         self._codex_clients: dict[str, CodexWorkerClient] = {}
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
@@ -10268,10 +10268,15 @@ class ChatFrame(wx.Frame):
         if not isinstance(metadata, dict):
             metadata = {}
         data = dict(event.data or {}) if isinstance(event.data, dict) else {}
+        event_session_id = self._event_thread_id(event)
         event_turn_id = self._event_turn_id(event)
+        meta_session_id = str(metadata.get("session_id") or "").strip()
         meta_turn_id = str(metadata.get("turn_id") or "").strip()
         if "turn_idx" not in data and isinstance(metadata.get("turn_idx"), int):
-            stamp = not event_turn_id or not meta_turn_id or event_turn_id == meta_turn_id
+            stamp = (
+                (not event_session_id or not meta_session_id or event_session_id == meta_session_id)
+                and (not event_turn_id or not meta_turn_id or event_turn_id == meta_turn_id)
+            )
             if stamp and event_turn_id:
                 # turn_id 已能定位到另一个本地 turn 时不盖章：
                 # 活跃 turn 的事件不能被归到 turn 进行中又提交的新请求上。
@@ -10284,7 +10289,12 @@ class ChatFrame(wx.Frame):
                 for idx, turn in enumerate(turns or []):
                     if not isinstance(turn, dict):
                         continue
-                    if str(turn.get("kimi_turn_id") or "").strip() == event_turn_id and idx != metadata.get("turn_idx"):
+                    turn_session_id = str(turn.get("kimi_session_id") or "").strip()
+                    if (
+                        str(turn.get("kimi_turn_id") or "").strip() == event_turn_id
+                        and (not event_session_id or turn_session_id == event_session_id)
+                        and idx != metadata.get("turn_idx")
+                    ):
                         stamp = False
                         break
             if stamp:
@@ -10313,33 +10323,51 @@ class ChatFrame(wx.Frame):
             candidates.append(self._current_chat_state)
         candidates.extend(chat for chat in (self.archived_chats or []) if isinstance(chat, dict))
 
+        if session_id:
+            session_matches: set[str] = set()
+            session_turn_matches: set[str] = set()
+            for chat in candidates:
+                chat_id = str(chat.get("id") or "").strip()
+                if not chat_id:
+                    continue
+                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+                chat_has_session = str(chat.get("kimi_session_id") or "").strip() == session_id
+                for turn in turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    if str(turn.get("kimi_session_id") or "").strip() == session_id:
+                        chat_has_session = True
+                        if turn_id and str(turn.get("kimi_turn_id") or "").strip() == turn_id:
+                            session_turn_matches.add(chat_id)
+                if chat_has_session:
+                    session_matches.add(chat_id)
+                    if turn_id and str(chat.get("kimi_turn_id") or "").strip() == turn_id:
+                        session_turn_matches.add(chat_id)
+            if turn_id and len(session_turn_matches) == 1:
+                return next(iter(session_turn_matches))
+            event_type = str(getattr(event, "type", "") or "").strip()
+            if (not turn_id or event_type == "turn_started") and len(session_matches) == 1:
+                return next(iter(session_matches))
+            return ""
+
         if turn_id:
+            turn_matches: set[tuple[str, int, str]] = set()
+            root_matches: set[str] = set()
             for chat in candidates:
                 chat_id = str(chat.get("id") or "").strip()
                 if not chat_id:
                     continue
                 if str(chat.get("kimi_turn_id") or "").strip() == turn_id:
-                    return chat_id
+                    root_matches.add(chat_id)
                 turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
-                for turn in turns:
-                    if not isinstance(turn, dict):
-                        continue
-                    if str(turn.get("kimi_turn_id") or "").strip() == turn_id:
-                        return chat_id
-
-        if session_id:
-            for chat in candidates:
-                chat_id = str(chat.get("id") or "").strip()
-                if not chat_id:
-                    continue
-                if str(chat.get("kimi_session_id") or "").strip() == session_id:
-                    return chat_id
-                turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
-                for turn in turns:
-                    if not isinstance(turn, dict):
-                        continue
-                    if str(turn.get("kimi_session_id") or "").strip() == session_id:
-                        return chat_id
+                for idx, turn in enumerate(turns):
+                    if isinstance(turn, dict) and str(turn.get("kimi_turn_id") or "").strip() == turn_id:
+                        turn_matches.add((chat_id, idx, str(turn.get("kimi_session_id") or "").strip()))
+            for chat_id in root_matches:
+                if not any(match_chat_id == chat_id for match_chat_id, _idx, _session_id in turn_matches):
+                    turn_matches.add((chat_id, -1, ""))
+            if len(turn_matches) == 1:
+                return next(iter(turn_matches))[0]
 
         return ""
 
@@ -10349,10 +10377,26 @@ class ChatFrame(wx.Frame):
             return known_chat_id
         session_id = self._event_thread_id(event)
         if session_id:
-            for chat_id, metadata in self._kimi_active_turns.items():
-                if isinstance(metadata, dict) and str(metadata.get("session_id") or "").strip() == session_id:
-                    return str(chat_id or "").strip()
-        if len(self._kimi_active_turns) == 1:
+            event_type = str(getattr(event, "type", "") or "").strip()
+            event_turn_id = self._event_turn_id(event)
+            active_matches = {
+                str(chat_id or "").strip()
+                for chat_id, metadata in self._kimi_active_turns.items()
+                if (
+                    isinstance(metadata, dict)
+                    and str(metadata.get("session_id") or "").strip() == session_id
+                    and (
+                        not event_turn_id
+                        or str(metadata.get("turn_id") or "").strip() == event_turn_id
+                        or (event_type == "turn_started" and not str(metadata.get("turn_id") or "").strip())
+                    )
+                )
+            }
+            active_matches.discard("")
+            if len(active_matches) == 1:
+                return next(iter(active_matches))
+            return ""
+        if not self._event_turn_id(event) and len(self._kimi_active_turns) == 1:
             return str(next(iter(self._kimi_active_turns)) or "").strip()
         return ""
 
@@ -10360,60 +10404,120 @@ class ChatFrame(wx.Frame):
         session_id = self._event_thread_id(event)
         if not session_id:
             return True
-        known = str((chat or {}).get("kimi_session_id") or "").strip()
-        if not known and chat is getattr(self, "_current_chat_state", None):
-            known = str(getattr(self, "active_kimi_session_id", "") or "").strip()
-        if not known:
+        known_sessions = {str((chat or {}).get("kimi_session_id") or "").strip()}
+        turns = (chat or {}).get("turns") if isinstance((chat or {}).get("turns"), list) else []
+        known_sessions.update(
+            str(turn.get("kimi_session_id") or "").strip()
+            for turn in turns
+            if isinstance(turn, dict)
+        )
+        if chat is getattr(self, "_current_chat_state", None):
+            known_sessions.add(str(getattr(self, "active_kimi_session_id", "") or "").strip())
+        known_sessions.discard("")
+        if not known_sessions:
             return True
-        return session_id == known
+        return session_id in known_sessions
 
     def _kimi_event_scoped_turn_index(self, turns: list, event: CodexEvent) -> int:
         data_idx = self._event_data_turn_idx_value(event)
+        session_id = self._event_thread_id(event)
+        turn_id = self._event_turn_id(event)
+        if session_id and turn_id:
+            matches = [
+                idx
+                for idx, turn in enumerate(turns or [])
+                if (
+                    isinstance(turn, dict)
+                    and str(turn.get("kimi_session_id") or "").strip() == session_id
+                    and str(turn.get("kimi_turn_id") or "").strip() == turn_id
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if isinstance(turns, list) and 0 <= data_idx < len(turns):
+                turn = turns[data_idx]
+                if (
+                    isinstance(turn, dict)
+                    and str(turn.get("kimi_session_id") or "").strip() == session_id
+                    and str(turn.get("kimi_turn_id") or "").strip() in {"", turn_id}
+                ):
+                    return data_idx
+            return -1
+        if session_id:
+            matches = [
+                idx
+                for idx, turn in enumerate(turns or [])
+                if isinstance(turn, dict) and str(turn.get("kimi_session_id") or "").strip() == session_id
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if 0 <= data_idx < len(turns or []) and data_idx in matches:
+                return data_idx
+            return -1
+        if turn_id:
+            matches = [
+                idx
+                for idx, turn in enumerate(turns or [])
+                if isinstance(turn, dict) and str(turn.get("kimi_turn_id") or "").strip() == turn_id
+            ]
+            return matches[0] if len(matches) == 1 else -1
         if isinstance(turns, list) and 0 <= data_idx < len(turns):
             return data_idx
-        turn_id = self._event_turn_id(event)
-        if turn_id:
-            for idx, turn in enumerate(turns or []):
-                if isinstance(turn, dict) and str(turn.get("kimi_turn_id") or "").strip() == turn_id:
-                    return idx
         return -1
 
     def _kimi_event_turn_index(self, turns: list, event: CodexEvent) -> int:
         scoped_idx = self._kimi_event_scoped_turn_index(turns, event)
         if scoped_idx >= 0:
             return scoped_idx
-        return len(turns) - 1 if isinstance(turns, list) and turns else -1
+        if not self._event_thread_id(event) and not self._event_turn_id(event):
+            return len(turns) - 1 if isinstance(turns, list) and turns else -1
+        return -1
 
     def _active_kimi_event_target_index(self, event: CodexEvent) -> int:
         scoped_idx = self._kimi_event_scoped_turn_index(self.active_session_turns, event)
         if scoped_idx >= 0:
             return scoped_idx
-        if 0 <= self.active_turn_idx < len(self.active_session_turns):
+        if not self._event_thread_id(event) and not self._event_turn_id(event) and 0 <= self.active_turn_idx < len(self.active_session_turns):
             return self.active_turn_idx
-        return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
+        if not self._event_thread_id(event) and not self._event_turn_id(event):
+            return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
+        return -1
 
     def _accumulate_kimi_answer_delta(self, chat_id: str, event: CodexEvent) -> None:
         text = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
         if not text:
             return
         turn_id = self._event_turn_id(event)
-        if not turn_id:
-            metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
-            if isinstance(metadata, dict):
+        session_id = self._event_thread_id(event)
+        metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
+        if isinstance(metadata, dict):
+            if not turn_id:
                 turn_id = str(metadata.get("turn_id") or "").strip()
-        key = (str(chat_id or ""), turn_id)
+            if not session_id:
+                session_id = str(metadata.get("session_id") or "").strip()
+        key = (str(chat_id or ""), session_id, turn_id)
         self._kimi_turn_answer_parts.setdefault(key, []).append(text)
 
-    def _pop_kimi_answer_parts(self, chat_id: str, turn_id: str = "") -> str:
+    def _pop_kimi_answer_parts(self, chat_id: str, session_id: str = "", turn_id: str = "") -> str:
         normalized_chat = str(chat_id or "")
+        normalized_session = str(session_id or "").strip()
         normalized_turn = str(turn_id or "").strip()
         parts: list[str] = []
+        matching_keys = []
         for key in list(self._kimi_turn_answer_parts.keys()):
-            key_chat, key_turn = key
+            key_chat, key_session, key_turn = key
             if key_chat != normalized_chat:
+                continue
+            if normalized_session and key_session != normalized_session:
                 continue
             if normalized_turn and key_turn and key_turn != normalized_turn:
                 continue
+            matching_keys.append(key)
+        if not normalized_session and normalized_turn:
+            sessions = {key_session for _key_chat, key_session, _key_turn in matching_keys}
+            if len(sessions) > 1:
+                return ""
+        for key in matching_keys:
             values = self._kimi_turn_answer_parts.pop(key, [])
             parts.extend(str(value or "") for value in values)
         return "".join(parts).strip()
@@ -10463,12 +10567,20 @@ class ChatFrame(wx.Frame):
         if turn_idx < 0 and isinstance(metadata.get("turn_idx"), int):
             turn_idx = metadata.get("turn_idx")
         session_id = self._event_thread_id(event) or str(metadata.get("session_id") or "").strip()
+        if session_id:
+            metadata["session_id"] = session_id
+            if normalized:
+                self._kimi_active_turns[normalized] = metadata
         if isinstance(target_chat, dict):
+            if session_id:
+                target_chat["kimi_session_id"] = session_id
             if event_turn_id:
                 target_chat["kimi_turn_id"] = event_turn_id
             target_chat["kimi_turn_active"] = True
             target_chat["updated_at"] = time.time()
         if is_current_target:
+            if session_id:
+                self.active_kimi_session_id = session_id
             if event_turn_id:
                 self.active_kimi_turn_id = event_turn_id
             self.active_kimi_turn_active = True
@@ -10485,8 +10597,9 @@ class ChatFrame(wx.Frame):
 
     def _finalize_kimi_turn_state(self, chat_id: str, target_chat: dict, target_turns: list, target_idx: int, event: CodexEvent) -> list[int]:
         status = str(getattr(event, "status", "") or "completed").strip() or "completed"
+        event_session_id = self._event_thread_id(event)
         event_turn_id = self._event_turn_id(event)
-        final_text = self._pop_kimi_answer_parts(chat_id, event_turn_id)
+        final_text = self._pop_kimi_answer_parts(chat_id, event_session_id, event_turn_id)
         if not final_text:
             final_text = str(getattr(event, "text", "") or "").strip()
         queue = target_chat.get("kimi_request_queue") if isinstance(target_chat, dict) else []
@@ -10495,21 +10608,46 @@ class ChatFrame(wx.Frame):
             for entry in queue:
                 if isinstance(entry, dict) and isinstance(entry.get("turn_idx"), int):
                     queued_indices.add(entry.get("turn_idx"))
-        covered: list[int] = []
-        if 0 <= target_idx < len(target_turns):
-            covered.append(target_idx)
-        if event_turn_id:
-            for idx, turn in enumerate(target_turns):
-                if idx in covered or not isinstance(turn, dict):
-                    continue
-                if str(turn.get("kimi_turn_id") or "").strip() == event_turn_id:
-                    covered.append(idx)
         metadata = self._kimi_active_turns.get(str(chat_id or "").strip())
-        if isinstance(metadata, dict) and isinstance(metadata.get("turn_idx"), int):
+        metadata_owns_event = bool(
+            isinstance(metadata, dict)
+            and (not event_session_id or str(metadata.get("session_id") or "").strip() == event_session_id)
+            and (not event_turn_id or str(metadata.get("turn_id") or "").strip() == event_turn_id)
+        )
+
+        def _turn_matches_event(turn: dict, *, allow_unassigned_turn: bool = False) -> bool:
+            turn_session_id = str(turn.get("kimi_session_id") or "").strip()
+            turn_turn_id = str(turn.get("kimi_turn_id") or "").strip()
+            if event_session_id and turn_session_id != event_session_id:
+                return False
+            if event_turn_id and turn_turn_id != event_turn_id:
+                return bool(allow_unassigned_turn and not turn_turn_id)
+            return bool(event_session_id or event_turn_id)
+
+        covered: list[int] = []
+        for idx, turn in enumerate(target_turns):
+            if isinstance(turn, dict) and _turn_matches_event(turn):
+                covered.append(idx)
+        if (
+            0 <= target_idx < len(target_turns)
+            and target_idx not in covered
+            and isinstance(target_turns[target_idx], dict)
+            and metadata_owns_event
+            and isinstance(metadata, dict)
+            and metadata.get("turn_idx") == target_idx
+            and _turn_matches_event(target_turns[target_idx], allow_unassigned_turn=True)
+        ):
+            covered.append(target_idx)
+        if metadata_owns_event and isinstance(metadata, dict) and isinstance(metadata.get("turn_idx"), int):
             meta_idx = metadata.get("turn_idx")
-            if meta_idx not in covered and 0 <= meta_idx < len(target_turns):
+            if (
+                meta_idx not in covered
+                and 0 <= meta_idx < len(target_turns)
+                and isinstance(target_turns[meta_idx], dict)
+                and _turn_matches_event(target_turns[meta_idx], allow_unassigned_turn=True)
+            ):
                 covered.append(meta_idx)
-        if isinstance(target_chat, dict):
+        if metadata_owns_event and isinstance(target_chat, dict):
             target_chat["kimi_turn_active"] = False
             target_chat["updated_at"] = time.time()
         finalized: list[int] = []
@@ -10520,21 +10658,32 @@ class ChatFrame(wx.Frame):
             if not isinstance(turn, dict):
                 continue
             if status == "completed":
-                turn["request_status"] = "done"
-                turn["request_error"] = ""
-                turn["request_recovered_after_restart"] = False
-                if (
-                    (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
-                    and final_text
-                ):
+                has_final_text = bool(final_text and final_text != REQUESTING_TEXT)
+                current_answer = str(turn.get("answer_md") or "").strip()
+                placeholder_answer = (
+                    current_answer == REQUESTING_TEXT
+                    or self._is_codex_subagent_result_answer(turn)
+                    or (not current_answer and str(turn.get("request_status") or "").strip() == "pending")
+                )
+                if placeholder_answer and has_final_text:
                     self._apply_kimi_final_answer_to_turn(turn, final_text)
+                if placeholder_answer and not has_final_text:
+                    error_text = "Kimi Code 未返回任何内容。"
+                    if not current_answer or current_answer == REQUESTING_TEXT:
+                        turn["answer_md"] = error_text
+                    self._mark_turn_request_failed(turn, error_text)
+                else:
+                    turn["request_status"] = "done"
+                    turn["request_error"] = ""
+                    turn["request_recovered_after_restart"] = False
             else:
                 error_text = final_text or ("已中断" if status == "interrupted" else "Kimi Code turn 失败")
                 if str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT:
                     turn["answer_md"] = error_text
                 self._mark_turn_request_failed(turn, error_text)
             finalized.append(idx)
-        self._clear_kimi_active_turn(chat_id)
+        if metadata_owns_event and isinstance(metadata, dict):
+            self._clear_kimi_active_turn(chat_id, metadata.get("turn_idx"), event_turn_id or None)
         return finalized
 
     def _apply_kimi_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None) -> None:
@@ -10786,7 +10935,7 @@ class ChatFrame(wx.Frame):
                     if event_type == "turn_completed":
                         status = str(getattr(event, "status", "") or "completed").strip() or "completed"
                         self._finalize_kimi_turn_state(chat_id, target_chat, target_turns, target_idx, event)
-                        if status == "completed":
+                        if status == "completed" and str(turn.get("request_status") or "").strip() == "done":
                             self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_KIMI_MODEL))
                     elif event_type == "subagent_result":
                         if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
@@ -10858,12 +11007,13 @@ class ChatFrame(wx.Frame):
             status = str(getattr(event, "status", "") or "completed").strip() or "completed"
             target_idx = self._active_kimi_event_target_index(event)
             finalized = self._finalize_kimi_turn_state(chat_id, self._current_chat_state, self.active_session_turns, target_idx, event)
-            self.active_kimi_turn_active = False
+            still_active = bool(self._current_chat_state.get("kimi_turn_active"))
+            self.active_kimi_turn_active = still_active
             ui_idx = target_idx if target_idx in finalized else (finalized[0] if finalized else target_idx)
             turn = {}
             if 0 <= ui_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[ui_idx], dict):
                 turn = self.active_session_turns[ui_idx]
-                if status == "completed":
+                if status == "completed" and str(turn.get("request_status") or "").strip() == "done":
                     self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, ui_idx, str(turn.get("model") or DEFAULT_KIMI_MODEL))
                 if self._background_ui_mutations_blocked():
                     self._mark_background_answer_list_dirty()
@@ -10871,11 +11021,12 @@ class ChatFrame(wx.Frame):
                     for finalized_idx in finalized or [ui_idx]:
                         self._update_active_answer_row(finalized_idx)
                 self._mark_chat_turns_dirty(start_index=ui_idx)
-            self.is_running = False
-            self._active_request_count = 0
-            self.new_chat_button.Enable()
-            self._set_input_hint_idle()
-            self._play_finish_sound()
+            if not still_active:
+                self.is_running = False
+                self._active_request_count = 0
+                self.new_chat_button.Enable()
+                self._set_input_hint_idle()
+                self._play_finish_sound()
             self._defer_chat_state_save()
             if self.view_mode == "active":
                 if self._background_ui_mutations_blocked():

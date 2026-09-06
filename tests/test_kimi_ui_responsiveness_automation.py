@@ -161,7 +161,7 @@ def test_event_storm_during_navigation_keeps_focus(frame, wx_app, monkeypatch):
         assert frame.answer_list.GetSelection() == 1
 
     _drain_all_kimi_events(frame)
-    parts = frame._kimi_turn_answer_parts.get(("chat-kimi", "turn-1")) or []
+    parts = frame._kimi_turn_answer_parts.get(("chat-kimi", "session-1", "turn-1")) or []
     assert len(parts) == 500
     assert "".join(parts) == "".join(f"增量{idx} " for idx in range(500))
     assert frame.answer_list.GetSelection() == 1
@@ -271,6 +271,10 @@ def test_background_events_do_not_repaint_lists(frame, wx_app, monkeypatch):
     }
     frame._render_answer_list()
     wx_app.Yield()
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    focused_before = main.wx.Window.FindFocus()
+    assert focused_before is frame.input_edit
 
     repaint_calls = []
 
@@ -302,6 +306,7 @@ def test_background_events_do_not_repaint_lists(frame, wx_app, monkeypatch):
     wx_app.Yield()
 
     assert repaint_calls == []
+    assert main.wx.Window.FindFocus() is focused_before
     assert archived_turns[0]["answer_md"] == "后台答案"
     assert archived_turns[0]["request_status"] == "done"
     assert frame.answer_list.GetSelection() == -1 or frame.answer_list.GetStringSelection() != "后台答案"
