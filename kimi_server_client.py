@@ -180,6 +180,11 @@ def _str(value: Any) -> str:
     return str(value).strip()
 
 
+def _text_fragment(value: Any) -> str:
+    """Return streamed text exactly as supplied by the server."""
+    return "" if value is None else str(value)
+
+
 def _payload_of(message: dict[str, Any]) -> dict[str, Any]:
     payload = message.get("payload")
     return payload if isinstance(payload, dict) else {}
@@ -203,23 +208,33 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     body_type = _str(body.get("type")) or event_type
     seq = message.get("seq")
 
-    base: dict[str, Any] = {"thread_id": session_id, "data": {"seq": seq}}
+    base: dict[str, Any] = {
+        "thread_id": session_id,
+        "data": {
+            "seq": seq,
+            "offset": message.get("offset"),
+            "agent_id": _str(body.get("agentId")),
+            "source_kind": body_type,
+        },
+    }
 
     if body_type == "assistant.delta":
+        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
-            text=_str(body.get("delta") or body.get("text")),
-            raw_text=_str(body.get("delta") or body.get("text")),
+            text=delta,
+            raw_text=delta,
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("messageId") or body.get("itemId")),
             display_kind="assistant",
             **base,
         )
     if body_type == "thinking.delta":
+        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
-            text=_str(body.get("delta") or body.get("text")),
-            raw_text=_str(body.get("delta") or body.get("text")),
+            text=delta,
+            raw_text=delta,
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("messageId") or body.get("itemId")),
             display_kind="thinking",
@@ -283,11 +298,12 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
             thread_id=session_id,
         )
     if body_type in ("tool.progress", "shell.output"):
+        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("output") if body.get("output") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("toolCallId") or body.get("callId") or body.get("id")),
-            text=_str(body.get("delta") or body.get("output") or body.get("text")),
+            text=delta,
             display_kind="commentary",
             **base,
         )
@@ -295,6 +311,8 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         # Partial JSON argument fragments; not user-visible, skip.
         return None
     if body_type in ("tool.result", "shell.completed"):
+        display = body.get("display") if isinstance(body.get("display"), dict) else {}
+        kind = _str(display.get("kind") or body.get("kind") or body.get("toolKind"))
         return KimiEvent(
             type="item_completed",
             turn_id=_str(body.get("turnId")),
@@ -304,7 +322,7 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
             exit_code=body.get("exitCode") if isinstance(body.get("exitCode"), int) else None,
             status=_str(body.get("status")) or "completed",
             text=_str(body.get("summary") or body.get("output"))[:2000],
-            display_kind="command" if body_type == "shell.completed" else "tool",
+            display_kind="command" if body_type == "shell.completed" else _TOOL_KIND_DISPLAY.get(kind, kind or "tool"),
             data={**base["data"], "tool": body},
             thread_id=session_id,
         )
@@ -986,15 +1004,33 @@ class KimiServerClient:
         notify = False
         with self._lock:
             if event.type == "agent_message_delta":
-                key = (event.thread_id, event.turn_id, event.item_id, event.display_kind)
+                event_data = event.data if isinstance(event.data, dict) else {}
+                agent_id = _str(event_data.get("agent_id") or event_data.get("agentId"))
+                source_kind = _str(event_data.get("source_kind")).split(".", 1)[0]
+                key = (event.thread_id, event.turn_id, event.item_id, event.display_kind, agent_id, source_kind)
                 last_entry = self._queue[-1] if self._queue else None
                 if last_entry and last_entry.get("kind") == "delta" and last_entry.get("key") == key:
                     merged = deepcopy(last_entry["message"])
                     merged_event = (merged.get("payload") or {}).get("event") or {}
                     existing_text = str(merged_event.get("text") or "")
-                    merged_event["text"] = existing_text + event.text
+                    incoming_text = event.text
+                    existing_data = merged_event.get("data") if isinstance(merged_event.get("data"), dict) else {}
+                    incoming_data = event.data if isinstance(event.data, dict) else {}
+                    start_offset = existing_data.get("offset")
+                    incoming_offset = incoming_data.get("offset")
+                    if isinstance(start_offset, int) and isinstance(incoming_offset, int):
+                        relative_offset = incoming_offset - start_offset
+                        if relative_offset < len(existing_text):
+                            overlap = min(len(existing_text) - relative_offset, len(incoming_text))
+                            if relative_offset >= 0 and existing_text[relative_offset:relative_offset + overlap] == incoming_text[:overlap]:
+                                incoming_text = incoming_text[overlap:]
+                    merged_event["text"] = existing_text + incoming_text
                     if "raw_text" in merged_event or event.raw_text:
-                        merged_event["raw_text"] = str(merged_event.get("raw_text") or "") + event.raw_text
+                        existing_raw_text = str(merged_event.get("raw_text") or "")
+                        raw_text = event.raw_text
+                        if incoming_text != event.text and raw_text == event.text:
+                            raw_text = incoming_text
+                        merged_event["raw_text"] = existing_raw_text + raw_text
                     last_entry["message"] = merged
                 else:
                     self._queue.append({"kind": "delta", "key": key, "message": message})

@@ -1,11 +1,13 @@
+import json
 import time
+from pathlib import Path
 
 import pytest
 import wx
 
 import main
 from codex_client import CodexEvent
-from kimi_server_client import KimiEvent, event_to_payload
+from kimi_server_client import KimiEvent, event_to_payload, map_session_event
 
 TEST_SESSION_ID = "session-test-1"
 TEST_TURN_ID = "1"
@@ -261,10 +263,114 @@ def test_delta_then_final_answer_updates_answer_list(frame, monkeypatch):
     turn = frame.active_session_turns[-1]
     assert turn["answer_md"] == "从前有座山。"
     assert turn["request_status"] == "done"
-    # assistant delta 也应作为 commentary 进入执行过程列表
+    # assistant delta 仅用于最终回答，不能把原始文本暴露为执行过程。
     steps = frame._current_chat_state.get("execution_steps") or []
-    commentary = [step for step in steps if str(step.get("display_kind") or "") == "commentary"]
-    assert any("从前有座山。" in str(step.get("detail_text") or "") for step in commentary)
+    assert not any("从前有座山。" in str(step.get("detail_text") or "") for step in steps)
+
+
+def test_thinking_status_interleaving_creates_one_chinese_execution_step(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "分析一下")
+    session_id = fake.created_sessions[0]["session_id"]
+    source_data = {"source_kind": "thinking.delta", "agent_id": "main", "offset": 0}
+
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="The", raw_text="The", display_kind="thinking", data=source_data))
+    fake.push_event(KimiEvent(type="thread_status_changed", thread_id=session_id, turn_id=TEST_TURN_ID, status="streaming"))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="The", raw_text="The", display_kind="thinking", data=source_data))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="progress", raw_text="progress", display_kind="commentary", data={"source_kind": "tool.progress", "agent_id": "main"}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="答案", raw_text="答案", display_kind="assistant", data={"source_kind": "assistant.delta", "offset": 0}))
+
+    steps = frame._current_chat_state.get("execution_steps") or []
+    summaries = [step.get("list_text") for step in steps if step.get("kimi_summary")]
+    assert summaries == ["正在分析问题", "正在处理任务", "正在整理回答"]
+    assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["正在分析问题", "progress", "正在整理回答"]
+    assert not frame._execution_delta_buffer
+    assert frame._kimi_turn_answer_parts[(_active_chat_id(frame), session_id, TEST_TURN_ID)] == ["答案"]
+
+
+def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "执行任务")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    events = [
+        ("search", "Search source tree", "Glob"),
+        ("file", "Read README.md", "Read"),
+        ("command", "Run tests", "Shell"),
+        ("agent", "Delegate review", "Agent"),
+    ]
+    for idx, (kind, title, name) in enumerate(events):
+        fake.push_event(
+            KimiEvent(
+                type="item_started",
+                thread_id=session_id,
+                turn_id=TEST_TURN_ID,
+                item_id=f"tool-{idx}",
+                title=title,
+                command="pytest -q" if kind == "command" else "",
+                display_kind=kind,
+                data={"source_kind": "subagent.started" if kind == "agent" else "tool.call.started", "tool": {"name": name}},
+            )
+        )
+
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
+    assert [step["list_text"] for step in steps] == ["正在搜索内容", "正在读取文件", "正在执行测试", "正在调用子任务"]
+    assert [step["detail_text"] for step in steps] == ["开始执行：Search source tree", "开始执行：Read README.md", "开始执行：Run tests\n命令：pytest -q", "开始执行：Delegate review"]
+
+
+def test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_steps(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "读取 fixture")
+    session_id = fake.created_sessions[0]["session_id"]
+    fixture_path = Path(__file__).parent / "fixtures" / "kimi_server_events.jsonl"
+    messages = [json.loads(line)["msg"] for line in fixture_path.read_text(encoding="utf-8").splitlines()]
+    selected = []
+    for message in messages:
+        body = message.get("payload") or {}
+        if body.get("turnId") != 1 or message.get("type") not in {"thinking.delta", "agent.status.updated", "tool.call.started", "tool.result"}:
+            continue
+        copied = json.loads(json.dumps(message))
+        copied["session_id"] = session_id
+        copied["payload"]["sessionId"] = session_id
+        event = map_session_event(copied)
+        if event is not None:
+            frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(event)))
+        if message.get("type") == "tool.result":
+            break
+
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
+    assert [step["list_text"] for step in steps] == ["正在分析问题", "正在搜索内容"]
+    assert "Searching *.md" in steps[-1]["detail_text"]
+
+
+def test_mapped_assistant_delta_whitespace_is_preserved_in_answer_and_execution_summary(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "保留空格")
+    session_id = fake.created_sessions[0]["session_id"]
+    frame._on_kimi_event_for_chat(
+        _active_chat_id(frame), main.CodexEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID)
+    )
+    for offset, delta in ((0, " leading"), (8, " trailing ")):
+        event = map_session_event(
+            {
+                "type": "assistant.delta",
+                "session_id": session_id,
+                "offset": offset,
+                "payload": {"type": "assistant.delta", "turnId": TEST_TURN_ID, "agentId": "main", "delta": delta},
+            }
+        )
+        frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(event)))
+    frame._on_kimi_event_for_chat(
+        _active_chat_id(frame), main.CodexEvent(type="turn_completed", thread_id=session_id, turn_id=TEST_TURN_ID, status="completed")
+    )
+
+    assert frame.active_session_turns[-1]["answer_md"] == " leading trailing "
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
+    assert [step["list_text"] for step in steps] == ["正在整理回答"]
+    assert [step["detail_text"] for step in steps] == ["正在整理回答"]
 
 
 def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
@@ -738,6 +844,18 @@ def test_events_for_non_visible_chat_do_not_repaint(frame, monkeypatch):
     fake.on_message = frame._on_kimi_client_message
     frame._kimi_client = fake
     fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id="session-bg",
+            turn_id="bg-turn",
+            text="The",
+            raw_text="The",
+            display_kind="thinking",
+            data={"source_kind": "thinking.delta", "offset": 0},
+        )
+    )
+    fake.push_event(KimiEvent(type="thread_status_changed", thread_id="session-bg", turn_id="bg-turn", status="streaming"))
+    fake.push_event(
         KimiEvent(type="agent_message_delta", thread_id="session-bg", turn_id="bg-turn", text="后台答案", display_kind="assistant")
     )
     fake.push_event(
@@ -746,8 +864,15 @@ def test_events_for_non_visible_chat_do_not_repaint(frame, monkeypatch):
 
     assert archived_turns[0]["answer_md"] == "后台答案"
     assert archived_turns[0]["request_status"] == "done"
+    background_steps = frame.archived_chats[0]["execution_steps"]
+    assert [step["list_text"] for step in background_steps if step.get("kimi_summary")] == ["正在分析问题"]
     assert rendered["n"] == 0
     assert refreshed["n"] == 0
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-bg"
+    frame._current_chat_state["detail_panel_mode"] = "execution"
+    frame._rebuild_execution_list_from_state()
+    assert "正在分析问题" in [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
 
 
 def test_help_excludes_compact_and_compact_is_unsupported(frame, monkeypatch):

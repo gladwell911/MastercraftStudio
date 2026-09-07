@@ -131,6 +131,22 @@ def test_thinking_delta_maps_to_agent_message_delta_with_thinking_kind():
     assert event.display_kind == "thinking"
 
 
+def test_delta_preserves_whitespace_and_stream_identity_metadata():
+    event = map_session_event(
+        {
+            "type": "thinking.delta",
+            "seq": 9,
+            "offset": 3,
+            "session_id": "session-x",
+            "payload": {"type": "thinking.delta", "turnId": 0, "agentId": "main", "delta": " user"},
+        }
+    )
+
+    assert event.text == " user"
+    assert event.raw_text == " user"
+    assert event.data == {"seq": 9, "offset": 3, "agent_id": "main", "source_kind": "thinking.delta"}
+
+
 # ----------------------------------------------------------------------
 # B3-B4: turn lifecycle
 

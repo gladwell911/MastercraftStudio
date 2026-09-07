@@ -5751,6 +5751,8 @@ class ChatFrame(wx.Frame):
                 if text and text not in {header, command}:
                     lines.append(text)
                 return "\n".join(line for line in lines if str(line or "").strip())
+            if title and self._kimi_protocol_event(event):
+                return f"{prefix}{title}"
             if summary:
                 return f"{prefix}{summary}"
             fallback = self._codex_execution_step_fallback(event)
@@ -5803,13 +5805,53 @@ class ChatFrame(wx.Frame):
         summary = " ".join(parts).strip()
         return f"命令：{summary}" if summary else "命令：commandExecution"
 
+    @staticmethod
+    def _kimi_protocol_event(event: CodexEvent) -> bool:
+        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        return str(data.get("source_kind") or "").startswith(("thinking.", "assistant.", "tool.", "shell.", "subagent."))
+
+    @staticmethod
+    def _kimi_execution_summary(event: CodexEvent) -> str:
+        """Return the stable Chinese F1 label for a Kimi protocol event."""
+        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        if not ChatFrame._kimi_protocol_event(event):
+            return ""
+        event_type = str(getattr(event, "type", "") or "").strip()
+        display_kind = str(getattr(event, "display_kind", "") or "").strip()
+        if display_kind == "thinking":
+            return "正在分析问题"
+        if display_kind == "assistant":
+            return "正在整理回答"
+        if event_type == "subagent_result" or display_kind == "agent":
+            return "正在调用子任务"
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        tool_name = " ".join(
+            str(tool.get(key) or "") for key in ("name", "title", "description", "kind", "toolKind")
+        ).lower()
+        if display_kind == "search" or any(name in tool_name for name in ("search", "grep", "glob", "find")):
+            return "正在搜索内容"
+        if display_kind in {"file", "diff"} or any(name in tool_name for name in ("read", "cat", "write", "edit", "patch")):
+            return "正在修改文件" if display_kind == "diff" or any(name in tool_name for name in ("write", "edit", "patch")) else "正在读取文件"
+        command = str(getattr(event, "command", "") or tool.get("command") or "").lower()
+        if "test" in command or "pytest" in command:
+            return "正在执行测试"
+        if display_kind in {"command", "tool"} or any(name in tool_name for name in ("shell", "bash", "command", "powershell")):
+            return "正在执行命令"
+        if display_kind == "skill":
+            return "正在调用工具"
+        return "正在处理任务"
+
     def _build_execution_entry(self, event: CodexEvent) -> dict | None:
         if not isinstance(event, CodexEvent):
             return None
         detail_text = self._execution_detail_text_from_event(event)
-        if not detail_text:
-            return None
         display_kind = self._execution_display_kind(event)
+        kimi_summary = self._kimi_execution_summary(event)
+        if not detail_text and not kimi_summary:
+            return None
+        event_type = str(getattr(event, "type", "") or "").strip()
+        if self._kimi_protocol_event(event) and display_kind == "tool" and event_type == "item_completed":
+            return None
         if display_kind == "error":
             detail_text = self._sanitize_execution_error_text(detail_text)
             if not detail_text:
@@ -5825,10 +5867,13 @@ class ChatFrame(wx.Frame):
         except (TypeError, ValueError):
             exit_code = None
         subtype = str(getattr(event, "subtype", "") or item.get("type") or "").strip()
-        event_type = str(getattr(event, "type", "") or "").strip()
         phase = str(getattr(event, "phase", "") or "").strip()
         command_fallback = subtype or str(getattr(event, "status", "") or "").strip() or event_type
-        if event_type == "diff_updated":
+        if kimi_summary and display_kind in {"thinking", "assistant"}:
+            detail_text = kimi_summary
+        if kimi_summary:
+            list_text = kimi_summary
+        elif event_type == "diff_updated":
             list_text = "已生成代码变更"
         elif event_type == "item_completed" and phase == "final_answer":
             list_text = "已生成最终回答"
@@ -5852,8 +5897,12 @@ class ChatFrame(wx.Frame):
             "thread_id": self._event_thread_id(event),
             "turn_id": self._event_turn_id(event),
             "item_id": str(getattr(event, "item_id", "") or "").strip(),
+            "agent_id": str(item.get("agent_id") or item.get("agentId") or "").strip(),
+            "source_kind": str(item.get("source_kind") or "").strip(),
             "created_at": time.time(),
         }
+        if kimi_summary:
+            entry["kimi_summary"] = kimi_summary
         turn_idx = self._event_data_turn_idx_value(event)
         if turn_idx >= 0:
             entry["turn_idx"] = turn_idx
@@ -6193,6 +6242,22 @@ class ChatFrame(wx.Frame):
             return False
         previous_kind = str(previous_step.get("display_kind") or "").strip()
         next_kind = str(next_step.get("display_kind") or "").strip()
+        if (
+            previous_step.get("kimi_summary")
+            and previous_step.get("kimi_summary") == next_step.get("kimi_summary")
+            and previous_step.get("turn_id") == next_step.get("turn_id")
+            and previous_kind == next_kind
+            and previous_step.get("agent_id") == next_step.get("agent_id")
+            and previous_step.get("source_kind") == next_step.get("source_kind")
+            and (
+                previous_kind in {"thinking", "assistant"}
+                or (
+                    str(previous_step.get("item_id") or "").strip()
+                    and previous_step.get("item_id") == next_step.get("item_id")
+                )
+            )
+        ):
+            return True
         if previous_kind != "commentary" or next_kind != "commentary":
             return False
         previous_detail = self._normalize_execution_text_for_compare(self._execution_step_detail_text(previous_step))
@@ -6353,31 +6418,54 @@ class ChatFrame(wx.Frame):
     def _buffer_execution_delta(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
-        key = (str(chat_id or ""), self._event_turn_id(event), str(getattr(event, "item_id", "") or "").strip())
-        state = self._execution_delta_buffer.setdefault(key, {"parts": [], "event": event, "last_event_at": 0.0})
-        state["parts"].append(str(getattr(event, "text", "") or getattr(event, "raw_text", "") or ""))
+        display_kind = str(getattr(event, "display_kind", "") or "").strip()
+        event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        agent_id = str(event_data.get("agent_id") or event_data.get("agentId") or "").strip()
+        source_kind = str(event_data.get("source_kind") or "").strip().split(".", 1)[0]
+        key = (str(chat_id or ""), self._event_turn_id(event), str(getattr(event, "item_id", "") or "").strip(), display_kind, agent_id, source_kind)
+        offset = event_data.get("offset")
+        state = self._execution_delta_buffer.setdefault(
+            key,
+            {"parts": [], "event": event, "last_event_at": 0.0, "start_offset": offset},
+        )
+        fragment = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
+        start_offset = state.get("start_offset")
+        if isinstance(offset, int) and isinstance(start_offset, int):
+            existing_text = "".join(str(part or "") for part in state["parts"])
+            relative_offset = offset - start_offset
+            if 0 <= relative_offset < len(existing_text):
+                overlap = min(len(existing_text) - relative_offset, len(fragment))
+                if existing_text[relative_offset:relative_offset + overlap] == fragment[:overlap]:
+                    fragment = fragment[overlap:]
+        if fragment:
+            state["parts"].append(fragment)
         state["event"] = event
         state["last_event_at"] = time.time()
 
-    def _flush_execution_delta(self, chat_id: str, turn_id: str | None = None, item_id: str | None = None) -> bool:
+    def _flush_execution_delta(
+        self, chat_id: str, turn_id: str | None = None, item_id: str | None = None, display_kind: str | None = None
+    ) -> bool:
         flushed = False
         normalized_chat_id = str(chat_id or "")
         normalized_turn_id = None if turn_id is None else str(turn_id or "").strip()
         normalized_item_id = None if item_id is None else str(item_id or "").strip()
+        normalized_display_kind = None if display_kind is None else str(display_kind or "").strip()
         for key in list(self._execution_delta_buffer.keys()):
-            buf_chat_id, buf_turn_id, buf_item_id = key
+            buf_chat_id, buf_turn_id, buf_item_id, buf_display_kind, _buf_agent_id, _buf_source_kind = key
             if buf_chat_id != normalized_chat_id:
                 continue
             if normalized_turn_id is not None and buf_turn_id != normalized_turn_id:
                 continue
             if normalized_item_id is not None and buf_item_id != normalized_item_id:
                 continue
+            if normalized_display_kind is not None and buf_display_kind != normalized_display_kind:
+                continue
             state = self._execution_delta_buffer.pop(key, None)
             if not isinstance(state, dict):
                 continue
-            text = "".join(str(part or "") for part in (state.get("parts") or [])).strip()
+            text = "".join(str(part or "") for part in (state.get("parts") or []))
             base_event = state.get("event")
-            if not text or not isinstance(base_event, CodexEvent):
+            if not text.strip() or not isinstance(base_event, CodexEvent):
                 continue
             base_data = dict(base_event.data or {}) if isinstance(getattr(base_event, "data", None), dict) else {}
             merged_event = CodexEvent(
@@ -6390,7 +6478,7 @@ class ChatFrame(wx.Frame):
                 phase=str(getattr(base_event, "phase", "") or "").strip(),
                 status=str(getattr(base_event, "status", "") or "").strip(),
                 subtype=str(getattr(base_event, "subtype", "") or "").strip() or "agentMessageDelta",
-                display_kind="commentary",
+                display_kind=buf_display_kind or "commentary",
                 data=base_data,
             )
             entry = self._build_execution_entry(merged_event)
@@ -6566,6 +6654,8 @@ class ChatFrame(wx.Frame):
         phase = str(step.get("phase") or "").strip()
         list_text = str(step.get("list_text") or "").strip()
         detail_text = self._execution_step_detail_text(step)
+        if str(step.get("kimi_summary") or "").strip():
+            return True
         if display_kind == "error":
             return False
         hidden_status_texts = {"开始处理本轮请求", "本轮处理结束", "active", "idle"}
@@ -10520,7 +10610,7 @@ class ChatFrame(wx.Frame):
         for key in matching_keys:
             values = self._kimi_turn_answer_parts.pop(key, [])
             parts.extend(str(value or "") for value in values)
-        return "".join(parts).strip()
+        return "".join(parts)
 
     def _kimi_context_usage_payload(self, event: CodexEvent) -> dict | None:
         usage = event.usage if isinstance(getattr(event, "usage", None), dict) else {}
@@ -10886,14 +10976,27 @@ class ChatFrame(wx.Frame):
         execution_entry = None
         if event_type not in {"agent_message_delta", "thread_status_changed"} and not silent_notification:
             execution_entry = self._build_execution_entry(event)
-        if event_type == "agent_message_delta" and str(getattr(event, "display_kind", "") or "").strip() == "assistant":
+        delta_kind = str(getattr(event, "display_kind", "") or "").strip()
+        if event_type == "agent_message_delta" and delta_kind == "assistant":
+            # Final answer starts a separate, summarized execution phase.
+            # Flush every Kimi stream in this turn before it, including tool
+            # progress, so no residual fragment crosses the boundary.
+            if self._kimi_protocol_event(event):
+                self._flush_execution_delta(chat_id, event_turn_id or None)
+                execution_entry = self._build_execution_entry(event)
+            else:
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking")
             self._accumulate_kimi_answer_delta(chat_id, event)
         context_usage = self._kimi_context_usage_payload(event) if event_type == "thread_status_changed" else None
         if not is_current_chat:
             if event_type == "agent_message_delta":
-                self._buffer_execution_delta(chat_id, event)
+                if delta_kind != "assistant":
+                    self._buffer_execution_delta(chat_id, event)
+                elif execution_entry:
+                    self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
                 return
-            self._flush_execution_delta(chat_id, event_turn_id or None)
+            if event_type != "thread_status_changed" and not silent_notification:
+                self._flush_execution_delta(chat_id, event_turn_id or None)
             target_chat = self._find_archived_chat(chat_id)
             if not isinstance(target_chat, dict):
                 return
@@ -10946,9 +11049,13 @@ class ChatFrame(wx.Frame):
             self._defer_codex_state_save()
             return
         if event_type == "agent_message_delta":
-            self._buffer_execution_delta(chat_id, event)
+            if delta_kind != "assistant":
+                self._buffer_execution_delta(chat_id, event)
+            elif execution_entry:
+                self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
             return
-        self._flush_execution_delta(chat_id, event_turn_id or None)
+        if event_type != "thread_status_changed" and not silent_notification:
+            self._flush_execution_delta(chat_id, event_turn_id or None)
         if execution_entry:
             self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
         if context_usage is not None:

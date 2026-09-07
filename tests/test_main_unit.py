@@ -8652,7 +8652,7 @@ def test_agent_message_delta_buffers_without_immediate_execution_step(frame, mon
     )
 
     assert frame._current_chat_state["execution_steps"] == []
-    buffered = frame._execution_delta_buffer[("chat-current", "turn-current", "msg-1")]
+    buffered = frame._execution_delta_buffer[("chat-current", "turn-current", "msg-1", "", "", "")]
     assert buffered["parts"] == ["stream"]
     assert buffered["event"].type == "agent_message_delta"
     assert buffered["event"].item_id == "msg-1"
@@ -8688,6 +8688,57 @@ def test_execution_delta_buffer_flushes_into_single_commentary_item(frame, monke
     assert frame._current_chat_state["execution_steps"][0]["event_type"] == "agent_message_delta"
     assert frame._current_chat_state["execution_steps"][0]["display_kind"] == "commentary"
     assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "先检查 main.py。再处理 codex_client.py。"
+
+
+def test_execution_delta_flush_preserves_fragment_edge_whitespace(frame, monkeypatch):
+    frame._current_chat_state = {"id": "chat-1", "turns": [], "execution_steps": []}
+    captured = []
+    monkeypatch.setattr(frame, "_build_execution_entry", lambda event: captured.append(event) or None)
+
+    frame._buffer_execution_delta(
+        "chat-1",
+        main.CodexEvent(type="agent_message_delta", turn_id="turn-1", text=" leading"),
+    )
+    frame._buffer_execution_delta(
+        "chat-1",
+        main.CodexEvent(type="agent_message_delta", turn_id="turn-1", text=" trailing "),
+    )
+
+    assert frame._flush_execution_delta("chat-1", "turn-1") is False
+    assert len(captured) == 1
+    assert captured[0].text == " leading trailing "
+    assert captured[0].raw_text == " leading trailing "
+
+
+def test_kimi_execution_delta_buffer_separates_agent_and_source_streams(frame):
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame._current_chat_state = {"id": "chat-1", "turns": [], "execution_steps": []}
+    for text, kind, agent, source in (
+        ("think-a", "thinking", "agent-a", "thinking.delta"),
+        ("think-b", "thinking", "agent-b", "thinking.delta"),
+        ("tool-a", "commentary", "agent-a", "tool.progress"),
+    ):
+        frame._buffer_execution_delta(
+            "chat-1",
+            main.CodexEvent(
+                type="agent_message_delta",
+                turn_id="turn-1",
+                text=text,
+                display_kind=kind,
+                data={"agent_id": agent, "source_kind": source},
+            ),
+        )
+
+    assert len(frame._execution_delta_buffer) == 3
+    assert frame._flush_execution_delta("chat-1", "turn-1") is True
+    assert [step["list_text"] for step in frame._current_chat_state["execution_steps"]] == ["正在分析问题", "正在分析问题", "正在处理任务"]
+
+
+def test_non_kimi_item_title_keeps_existing_execution_summary_behavior(frame):
+    event = main.CodexEvent(type="item_started", title="Provider title")
+
+    assert frame._execution_detail_text_from_event(event) == "开始执行：步骤"
 
 
 def test_append_execution_entry_to_chat_dedupes_adjacent_identical_commentary(frame, monkeypatch):

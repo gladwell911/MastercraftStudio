@@ -243,7 +243,7 @@ def sent_ws_messages(ws):
     return [json.loads(line) for line in ws.sent]
 
 
-def _delta(text, *, thread="s", turn="t", item="i", kind="assistant"):
+def _delta(text, *, thread="s", turn="t", item="i", kind="assistant", data=None):
     return KimiEvent(
         type="agent_message_delta",
         thread_id=thread,
@@ -252,6 +252,7 @@ def _delta(text, *, thread="s", turn="t", item="i", kind="assistant"):
         display_kind=kind,
         text=text,
         raw_text=text,
+        data=dict(data or {}),
     )
 
 
@@ -700,6 +701,17 @@ def test_delta_not_merged_across_items_or_sessions():
     assert texts == ["a", "b", "cd", "ef"]
 
 
+def test_delta_not_merged_across_kimi_agent_or_source_identity():
+    client, *_ = started_client()
+
+    client._enqueue_event(_delta("think-a", item="", kind="thinking", data={"agent_id": "a", "source_kind": "thinking.delta"}))
+    client._enqueue_event(_delta("think-b", item="", kind="thinking", data={"agent_id": "b", "source_kind": "thinking.delta"}))
+    client._enqueue_event(_delta("tool-a", item="", kind="commentary", data={"agent_id": "a", "source_kind": "tool.progress"}))
+
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["payload"]["event"]["text"] for message in drained] == ["think-a", "think-b", "tool-a"]
+
+
 def test_delta_not_merged_across_non_delta_entries():
     client, *_ = started_client()
 
@@ -709,6 +721,19 @@ def test_delta_not_merged_across_non_delta_entries():
 
     drained = client.drain_pending_messages(limit=10)
     assert [m["payload"]["event"]["text"] for m in drained] == ["A", "step", "B"]
+
+
+def test_delta_coalescing_preserves_spaces_and_ignores_offset_replay():
+    client, *_ = started_client()
+
+    client._enqueue_event(_delta("The", kind="thinking", data={"offset": 0}))
+    client._enqueue_event(_delta(" user", kind="thinking", data={"offset": 3}))
+    client._enqueue_event(_delta(" user", kind="thinking", data={"offset": 3}))
+    client._enqueue_event(_delta("The", kind="thinking", data={"offset": 0}))
+
+    drained = client.drain_pending_messages(limit=10)
+    assert len(drained) == 1
+    assert drained[0]["payload"]["event"]["text"] == "The user"
 
 
 # ----------------------------------------------------------------------

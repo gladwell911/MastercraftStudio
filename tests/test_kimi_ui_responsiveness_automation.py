@@ -352,6 +352,70 @@ def test_execution_entries_append_at_tail_outside_quiet_window(frame, wx_app, mo
     assert all(text.endswith(expected) for text, expected in zip(tail_texts, ("新步骤一", "新步骤二", "新步骤三")))
 
 
+def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    _setup_active_kimi_chat(
+        frame,
+        monkeypatch,
+        detail_panel_mode="execution",
+        execution_steps=[
+            {"event_type": "plan_updated", "display_kind": "plan", "list_text": "已有步骤", "detail_text": "已有步骤", "turn_idx": 0},
+        ],
+    )
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetSelection(1)
+    frame.input_edit.SetFocusFromKbd()
+    wx_app.Yield()
+    repaint_count = {"n": 0}
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda _control: repaint_count.__setitem__("n", repaint_count["n"] + 1))
+
+    frame._dispatch_kimi_event_to_ui("chat-kimi", main.CodexEvent(type="thread_status_changed", thread_id="session-1", turn_id="turn-1", status="streaming"))
+    _drain_all_kimi_events(frame)
+    assert repaint_count["n"] == 0
+    assert frame.input_edit.HasFocus()
+    assert frame.execution_list.GetSelection() == 1
+
+    source = {"source_kind": "thinking.delta", "offset": 0}
+    for event in (
+        main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text="The", raw_text="The", display_kind="thinking", data=source),
+        main.CodexEvent(type="thread_status_changed", thread_id="session-1", turn_id="turn-1", status="streaming"),
+        main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text=" user", raw_text=" user", display_kind="thinking", data={**source, "offset": 3}),
+        main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text="答案", raw_text="答案", display_kind="assistant", data={"source_kind": "assistant.delta", "offset": 0}),
+    ):
+        frame._dispatch_kimi_event_to_ui("chat-kimi", event)
+    _drain_all_kimi_events(frame)
+
+    rows = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert rows.count("正在分析问题") == 1
+    assert frame.input_edit.HasFocus()
+    assert frame.execution_list.GetSelection() == 1
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    frame.execution_list.SetSelection(rows.index("正在分析问题"))
+
+    class _CopyEvent:
+        def GetKeyCode(self):
+            return ord("C")
+
+        def ControlDown(self):
+            return True
+
+        def AltDown(self):
+            return False
+
+        def ShiftDown(self):
+            return False
+
+        def StopPropagation(self):
+            pass
+
+        def Skip(self):
+            raise AssertionError("Ctrl+C should be handled")
+
+    frame._on_execution_key_down(_CopyEvent())
+    assert copied == ["正在分析问题"]
+
+
 # D5 — 活跃 turn 中关闭 frame：close 在超时内完成且 client.close() 恰好调用一次
 def test_frame_close_with_active_kimi_turn_does_not_hang(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
