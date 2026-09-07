@@ -2,59 +2,41 @@
 
 ## 快照（2026-09-07）
 
-当前分支为 `fix/mobile-kimicode-routing`。最新本地提交
-`38968450ff1c8d6e354ecf4d95652b5a16ca4f52`（`完善 Kimi 执行步骤中文显示`）已完成
-Kimi Code 的 F1 执行过程中文化与流式步骤归并。本分支没有 Git upstream；按收尾规则，
-不要修改 remote 或 upstream，也不要以裸 `git push` 推送。
+当前分支为 `fix/mobile-kimicode-routing`。本轮完成 Kimi Code 的权威完成判定、回答延迟展示和同一应用内多聊天并发恢复：F1 继续显示本地化的执行摘要，而回答列表只在主代理的最终回答被权威确认后更新。
 
 ## 已完成
 
-- Kimi 原始事件由 `kimi_server_client.py` 保留来源、代理、序列/offset 与文本片段边界；
-  重放片段会去重，来源不同的流不会混合。
-- `main.py` 根据 Kimi 的结构化事件生成“正在分析问题”“正在搜索内容”“正在读取文件”
-  “正在修改文件”“正在执行命令/测试”“正在整理回答”等中文 F1 主要步骤。
-- 英文 `thinking.delta`、assistant 增量和工具流原文不再直接作为 F1 列表标题；状态、
-  usage 与静默通知不会切断一段流式文本。原始诊断仍保留在详情数据中。
-- 已保持多聊天事件隔离、后台批量交付、无可见变化不重绘、焦点和当前选择不被后台事件
-  改动的无障碍约束。
-- 用户入口说明和文档索引已同步：`README.txt` 说明 F1 的中文主要步骤，
-  `docs/README.md` 链接验收规格。
+- `kimi_server_client.py` 为 WebSocket/REST 恢复保留 session、epoch、stream、offset 与订阅边界；进程重启会重新发现 token，订阅拒绝隔离到单个 session，恢复在握手和订阅确认后才报告成功。
+- `main.py` 以 `(chat_id, session_id, prompt_id)` 隔离 Kimi owner、排队请求、alias、早到事件、增量正文和恢复状态。切换聊天、`/clear`、恢复和进程退出不会让旧状态复活或串到其他聊天。
+- 最终回答须有主代理身份、匹配 owner、完整正文和权威终态；失败/中断不会播放完成音。子代理的过程信息仅进入 F1。
+- README 与文档索引已同步这项用户可见行为；用户级 `C:\Users\gladwell\.kimi-code\AGENTS.md` 已确认包含简体中文规则（仓库外文件，未纳入本仓库）。
 
 ## 已验证
 
 ```powershell
-py -3.11 -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_integration.py -q
-# 91 passed
+py -3.11 -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py -q
+# 132 passed
 
-py -3.11 -m pytest tests/test_kimi_ui_responsiveness_automation.py -q
-# 6 passed
+py -3.11 -m pytest tests/test_kimi_integration.py tests/test_kimi_ui_responsiveness_automation.py -q
+# 79 passed
 
-py -3.11 -m pytest tests/test_kimi_server_client_unit.py tests/test_main_unit.py -q -k "kimi or execution"
-# 141 passed, 15 failed, 636 deselected
+py -3.11 -m pytest tests/test_main_unit.py -q -k "kimi or execution or switch_current_chat"
+# 99 passed, 15 failed, 631 deselected
 
-py -3.11 -m compileall -q main.py kimi_server_client.py tests/test_kimi_event_mapping_unit.py tests/test_kimi_integration.py tests/test_kimi_server_client_unit.py tests/test_kimi_ui_responsiveness_automation.py tests/test_main_unit.py
+py -3.11 -m compileall -q main.py kimi_server_client.py tests/test_kimi_event_mapping_unit.py tests/test_kimi_integration.py tests/test_kimi_live_smoke.py tests/test_kimi_server_client_unit.py tests/test_kimi_ui_responsiveness_automation.py
 git diff --check
 ```
 
-第三条命令的 15 项失败与
-[`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)
-记录的通用执行列表分页、导航、增量追加失败集合一致；本次新增的 Kimi 断言均通过，
-不应把这批基线失败当作本功能回归。
+主逻辑筛选中的 15 项失败逐项等同于 [2026-09-06 冻结基线](./non-live-regression-baseline-2026-09-06.md)，均为通用执行列表分页、导航和增量追加断言，不是新增 Kimi 回归。`tests/test_kimi_live_smoke.py` 在默认环境为 `5 skipped`；需已登录的 Kimi CLI 并显式设置 `KIMI_LIVE_TEST=1` 才会创建真实外部任务。
 
 ## 当前风险与下一步
 
-- 未识别的未来 Kimi 工具类别会退化显示为“正在处理任务”；若 Kimi 协议新增常用类别，
-  应补充中文摘要映射和 fixture 回归。
-- 当前验证未连接真实已登录的 Kimi CLI 服务。具备环境时可运行
-  `KIMI_LIVE_TEST=1 py -3.11 -m pytest tests/test_kimi_live_smoke.py` 做真实链路冒烟。
-- 若要处理 15 项通用执行列表基线，应另立任务，先确认其现行无障碍与分页产品契约，
-  不要为旧断言回退本次的 Kimi 流式归并或焦点保护。
+- 本地提交完成后，分支仍未配置 Git upstream；收尾流程禁止自行修改 remote/upstream，因此本轮不能推送。需要维护者先建立明确的 GitHub 上游后再推送该提交。
+- Kimi 协议新增未知工具类别时会回退为“正在处理任务”；新增常见类别应补充中文摘要映射与 fixture。
+- 若处理 15 项通用 execution-list 基线，应另建任务，不要为了旧断言回退本轮的 owner 隔离、流完整性或焦点保护。
 
 ## 不应重复尝试
 
-- 不要按“是否含英文字母”过滤 F1 行，也不要依赖中文提示词来控制模型内部 thinking；
-  应继续以结构化协议事件生成稳定摘要。
-- 不要把 status、usage 或静默 session 通知当作文本 flush 边界，也不要让 thinking、
-  assistant 与 tool progress 共用一个流缓冲键。
-- 不要把 `turn_id` 当作跨 Kimi session 的全局唯一标识；携带 session 时不得跨 session
-  回退。
+- 不要按英文字符过滤 F1，也不要把原始 thinking/tool 文本直接当作 F1 标题；应使用结构化事件生成中文阶段摘要。
+- 不要只用 `turn_id` 跨 session 路由；Kimi 的身份、缓存、完成和恢复均需要聊天和 session 边界。
+- 不要把 `status`、`usage` 或静默通知当作文本 flush 边界，也不要让不完整的增量正文覆盖 REST 对账得到的完整最终答案。

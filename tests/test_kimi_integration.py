@@ -7,7 +7,7 @@ import wx
 
 import main
 from codex_client import CodexEvent
-from kimi_server_client import KimiEvent, event_to_payload, map_session_event
+from kimi_server_client import KimiEvent, KimiServerError, event_to_payload, map_session_event
 
 TEST_SESSION_ID = "session-test-1"
 TEST_TURN_ID = "1"
@@ -47,6 +47,7 @@ class FakeKimiServerClient:
         self.approval_answers = []
         self.list_approval_calls = 0
         self.status_by_session = {}
+        self.messages_by_session = {}
         self.session_exists_result = True
         self.pending_messages = []
         self._prompt_counter = 0
@@ -97,6 +98,9 @@ class FakeKimiServerClient:
     def get_status(self, session_id):
         return dict(self.status_by_session.get(session_id) or {"context_tokens": 128, "max_context_tokens": 2048})
 
+    def list_messages(self, session_id):
+        return list(self.messages_by_session.get(session_id) or [])
+
     def list_approvals(self, session_id):
         self.list_approval_calls += 1
         return [{"id": "approval-from-list"}]
@@ -136,6 +140,7 @@ def _setup_kimi_frame(frame, monkeypatch):
     frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
     frame._play_send_sound = lambda: None
     frame._schedule_first_question_auto_title = lambda *a, **k: None
+    frame._kimi_reconcile_backoff = 0
     frame.model_combo.SetValue("Kimi Code")
     frame.selected_model = "kimi/main"
     return fake
@@ -180,6 +185,24 @@ def test_submit_routes_kimi_model_to_kimi_path(frame, monkeypatch):
     assert turn["kimi_session_id"] == fake.created_sessions[0]["session_id"]
     assert frame.active_kimi_session_id == fake.created_sessions[0]["session_id"]
     assert frame.is_running is True
+
+
+def test_initial_kimi_client_start_failure_is_retried_before_failing_turn(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    calls = {"n": 0}
+
+    def flaky_start():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("first startup failure")
+
+    fake.start = flaky_start
+
+    _submit(frame, "retry startup")
+
+    assert calls["n"] == 2
+    assert fake.submitted
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
 
 
 def test_start_turn_creates_session_once_per_chat(frame, monkeypatch):
@@ -411,9 +434,17 @@ def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
         "execution_steps": [],
     }]
     frame._kimi_active_turns = {
-        "chat-current": {"turn_idx": 0, "session_id": "session-current"},
-        "chat-background": {"turn_idx": 0, "turn_id": "0", "session_id": "session-background"},
+        "chat-current": {"turn_idx": 0, "session_id": "session-current", "prompt_id": "prompt-current"},
+        "chat-background": {"turn_idx": 0, "turn_id": "0", "session_id": "session-background", "prompt_id": "prompt-background"},
     }
+    frame._register_kimi_prompt_owner({
+        "chat_id": "chat-current", "session_id": "session-current", "prompt_id": "prompt-current",
+        "owner_prompt_id": "prompt-current", "turn_idx": 0, "role": "active", "landed": True,
+    })
+    frame._register_kimi_prompt_owner({
+        "chat_id": "chat-background", "session_id": "session-background", "prompt_id": "prompt-background",
+        "owner_prompt_id": "prompt-background", "turn_idx": 0, "turn_id": "0", "role": "active", "landed": True,
+    })
     monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
     monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
@@ -422,7 +453,7 @@ def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
 
     current_started = CodexEvent(type="turn_started", thread_id="session-current", turn_id="0")
     assert frame._resolve_kimi_event_chat_id(current_started) == "chat-current"
-    fake.push_event(KimiEvent(type="turn_started", thread_id="session-current", turn_id="0"))
+    fake.push_event(KimiEvent(type="turn_started", thread_id="session-current", turn_id="0", data={"prompt_id": "prompt-current"}))
     assert current_turn["kimi_session_id"] == "session-current"
     assert current_turn["kimi_turn_id"] == "0"
     assert frame.active_kimi_session_id == "session-current"
@@ -519,7 +550,7 @@ def test_same_chat_reused_turn_id_keeps_sessions_isolated(frame, monkeypatch):
 
 
 @pytest.mark.parametrize("empty_answer", [main.REQUESTING_TEXT, "", None])
-def test_completed_without_answer_does_not_mark_placeholder_done(frame, monkeypatch, empty_answer):
+def test_completed_without_answer_stays_recoverable_and_does_not_mark_done(frame, monkeypatch, empty_answer):
     fake = _setup_kimi_frame(frame, monkeypatch)
     monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *args, **kwargs: None)
     _submit(frame, "question")
@@ -530,9 +561,9 @@ def test_completed_without_answer_does_not_mark_placeholder_done(frame, monkeypa
     fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="0", status="completed"))
 
     turn = frame.active_session_turns[-1]
-    assert turn["request_status"] == "failed"
-    assert turn["answer_md"] != main.REQUESTING_TEXT
-    assert "未返回任何内容" in turn["request_error"]
+    assert turn["request_status"] == "pending"
+    assert turn.get("answer_md") == empty_answer
+    assert not turn.get("request_error")
 
 
 def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):
@@ -557,6 +588,486 @@ def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):
     assert played["n"] == 1
     assert frame.active_kimi_turn_active is False
     assert frame.active_session_turns[-1]["answer_md"] == "答案"
+
+
+def test_out_of_order_absolute_offsets_are_assembled_before_publish(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "offsets")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="4"))
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="4",
+            item_id="answer-1",
+            text="world",
+            display_kind="assistant",
+            data={"agent_id": "main", "offset": 6},
+        )
+    )
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="4",
+            item_id="answer-1",
+            text="hello ",
+            display_kind="assistant",
+            data={"agent_id": "main", "offset": 0},
+        )
+    )
+    fake.push_event(
+        KimiEvent(type="turn_completed", thread_id=session_id, turn_id="4", status="completed")
+    )
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "hello world"
+
+
+def test_transport_interruption_blocks_partial_stream_completion_until_rest(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    _submit(frame, "must be complete")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="5"))
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="5",
+            item_id="answer-1",
+            text="partial",
+            display_kind="assistant",
+            data={"agent_id": "main", "offset": 0},
+        )
+    )
+    frame._on_kimi_client_message(
+        {"type": "transport_error", "payload": {"error": "reset", "session_ids": [session_id]}}
+    )
+    fake.push_event(
+        KimiEvent(type="turn_completed", thread_id=session_id, turn_id="5", status="completed")
+    )
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_subagent_terminal_never_publishes_answer_or_finish_sound(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = {"n": 0}
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="7", data={"agent_id": "main"}))
+
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id="7", text="sub answer", display_kind="assistant", data={"agent_id": "agent-1", "source_kind": "assistant.delta"}))
+    fake.push_event(KimiEvent(type="error", thread_id=session_id, turn_id="7", text="sub failed", data={"agent_id": "agent-1", "source_kind": "error"}))
+    fake.push_event(KimiEvent(type="subagent_result", thread_id=session_id, turn_id="7", text="sub done", data={"agent_id": "agent-1"}))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="7", status="completed", data={"agent_id": "agent-1", "source_kind": "turn.ended"}))
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+    assert played["n"] == 0
+
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id="7", text="final", display_kind="assistant", data={"agent_id": "main", "source_kind": "assistant.delta"}))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="7", status="completed", data={"agent_id": "main", "source_kind": "turn.ended"}))
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "final"
+    assert played["n"] == 1
+
+
+def test_subagent_event_cannot_claim_or_stamp_main_owner_turn(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+
+    fake.push_event(
+        KimiEvent(
+            type="item_started",
+            thread_id=session_id,
+            turn_id="subagent-turn",
+            data={"agent_id": "agent-1", "prompt_id": prompt_id},
+        )
+    )
+
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner["turn_id"] == ""
+    assert not frame.active_session_turns[-1].get("kimi_turn_id")
+
+
+def test_promptless_early_event_with_multiple_intents_replays_by_turn_join(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "owner")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    frame._kimi_pending_submissions[session_id] = [
+        {"submission_intent_id": "i1"},
+        {"submission_intent_id": "i2"},
+    ]
+
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="44",
+            item_id="answer-1",
+            text="early",
+            display_kind="assistant",
+            data={"agent_id": "main", "offset": 0},
+        )
+    )
+    assert (session_id, "__turn__:44") in frame._kimi_early_events
+
+    fake.push_event(
+        KimiEvent(
+            type="turn_started",
+            thread_id=session_id,
+            turn_id="44",
+            data={"agent_id": "main", "prompt_id": prompt_id},
+        )
+    )
+
+    assert (session_id, "__turn__:44") not in frame._kimi_early_events
+    assert frame._kimi_answer_parts(_active_chat_id(frame), session_id, prompt_id) == "early"
+
+
+def test_unfinalized_current_completion_does_not_touch_answer_list(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "keep hidden")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="7"))
+    answer_rows = [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    assert frame._find_answer_row_index(len(frame.active_session_turns) - 1) < 0
+    updated = []
+    dirtied = []
+    monkeypatch.setattr(frame, "_update_active_answer_row", updated.append)
+    monkeypatch.setattr(frame, "_mark_background_answer_list_dirty", lambda: dirtied.append(True))
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+
+    fake.push_event(
+        KimiEvent(
+            type="turn_completed",
+            thread_id=session_id,
+            turn_id="7",
+            status="completed",
+            data={"agent_id": "agent-1", "source_kind": "turn.ended"},
+        )
+    )
+    fake.push_event(
+        KimiEvent(
+            type="turn_completed",
+            thread_id=session_id,
+            status="completed",
+            data={"agent_id": "main", "source_kind": "prompt.completed", "prompt_id": prompt_id},
+        )
+    )
+
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
+    assert [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())] == answer_rows
+    assert frame._find_answer_row_index(len(frame.active_session_turns) - 1) < 0
+    assert updated == []
+    assert dirtied == []
+
+
+def test_unfinalized_background_completion_does_not_refresh_answer_state(frame, monkeypatch):
+    _setup_kimi_frame(frame, monkeypatch)
+    turn = {
+        "question": "background",
+        "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main",
+        "request_status": "pending",
+        "kimi_session_id": "session-bg",
+        "kimi_turn_id": "turn-bg",
+        "kimi_prompt_id": "prompt-bg",
+    }
+    chat = {
+        "id": "chat-bg",
+        "turns": [turn],
+        "kimi_session_id": "session-bg",
+        "kimi_turn_id": "turn-bg",
+        "kimi_turn_active": True,
+        "execution_steps": [],
+    }
+    frame.archived_chats = [chat]
+    owner = {
+        "chat_id": "chat-bg",
+        "session_id": "session-bg",
+        "turn_id": "turn-bg",
+        "turn_idx": 0,
+        "prompt_id": "prompt-bg",
+        "owner_prompt_id": "prompt-bg",
+        "role": "active",
+        "question": "background",
+        "landed": True,
+    }
+    frame._kimi_prompt_owners = {"prompt-bg": owner}
+    frame._kimi_active_turns = {"chat-bg": owner}
+    refreshed = []
+    dirtied = []
+    monkeypatch.setattr(frame, "_append_execution_entry_to_chat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_visible_history_chat", refreshed.append)
+    monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *args, **kwargs: dirtied.append((args, kwargs)))
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    frame._on_kimi_event_for_chat(
+        "chat-bg",
+        CodexEvent(
+            type="turn_completed",
+            thread_id="session-bg",
+            turn_id="turn-bg",
+            status="completed",
+            data={"agent_id": "agent-1", "source_kind": "turn.ended", "prompt_id": "prompt-bg"},
+        ),
+    )
+
+    assert turn["request_status"] == "pending"
+    assert refreshed == []
+    assert dirtied == []
+
+
+def test_prompt_completed_fallback_waits_for_verified_idle_and_is_exactly_once(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = {"n": 0}
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    _submit(frame, "fallback")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="8", data={"agent_id": "main"}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id="8", text="whole answer", display_kind="assistant", data={"agent_id": "main", "source_kind": "assistant.delta"}))
+    completion = KimiEvent(type="turn_completed", thread_id=session_id, status="completed", data={"agent_id": "main", "source_kind": "prompt.completed", "prompt_id": prompt_id})
+
+    fake.push_event(completion)
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
+    assert played["n"] == 0
+
+    fake.push_event(KimiEvent(type="notification", thread_id=session_id, subtype="event.session.work_changed", display_kind="session", data={"agent_id": "main", "protocol": {"busy": False}}))
+    fake.push_event(completion)
+    fake.push_event(completion)
+    assert frame.active_session_turns[-1]["request_status"] == "done"
+    assert frame.active_session_turns[-1]["answer_md"] == "whole answer"
+    assert played["n"] == 1
+
+
+def test_first_turn_scoped_event_claims_unique_pending_owner_without_turn_started(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "missing start")
+    session_id = fake.created_sessions[0]["session_id"]
+
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id="99", text="recovered answer", display_kind="assistant", data={"agent_id": "main", "source_kind": "assistant.delta"}))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="99", status="completed", data={"agent_id": "main", "source_kind": "turn.ended"}))
+
+    turn = frame.active_session_turns[-1]
+    assert turn["kimi_turn_id"] == "99"
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "recovered answer"
+
+
+def test_rest_transcript_boundary_uses_prompt_user_message_not_last_assistant(frame):
+    messages = [
+        {"id": "p-old", "role": "user", "created_at": "2026-01-01T00:00:00Z", "content": [{"type": "text", "text": "old"}]},
+        {"id": "a-old", "role": "assistant", "created_at": "2026-01-01T00:00:01Z", "content": [{"type": "text", "text": "old answer"}]},
+        {"id": "p-target", "role": "user", "created_at": "2026-01-01T00:00:02Z", "content": [{"type": "text", "text": "target"}]},
+        {"id": "a-target", "role": "assistant", "created_at": "2026-01-01T00:00:03Z", "content": [{"type": "text", "text": "target answer"}]},
+        {"id": "p-next", "role": "user", "created_at": "2026-01-01T00:00:04Z", "content": [{"type": "text", "text": "next"}]},
+        {"id": "a-next", "role": "assistant", "created_at": "2026-01-01T00:00:05Z", "content": [{"type": "text", "text": "next answer"}]},
+    ]
+    assert frame._kimi_rest_answer_for_prompt(list(reversed(messages)), "p-target") == "target answer"
+
+
+def test_transport_recovery_busy_is_event_driven_and_keeps_exact_owner_pending(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "recover me")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    calls = {"status": 0}
+
+    def status(_session_id):
+        calls["status"] += 1
+        return {"busy": calls["status"] < 3}
+
+    fake.get_status = status
+    fake.messages_by_session[session_id] = [
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z", "content": [{"type": "text", "text": "recover me"}]},
+        {"id": "assistant-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z", "content": [{"type": "text", "text": "recovered"}]},
+    ]
+
+    frame._on_kimi_client_message({"type": "transport_error", "payload": {"error": "socket reset"}})
+
+    turn = frame.active_session_turns[-1]
+    assert calls["status"] == 1
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_transport_recovery_healthy_busy_does_not_use_short_cutoff(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._kimi_reconcile_attempts = 3
+    _submit(frame, "will fail")
+    fake.get_status = lambda _session_id: {"busy": True}
+
+    frame._on_kimi_client_message({"type": "transport_error", "payload": {"error": "original socket reset"}})
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "pending"
+    assert not turn.get("request_error")
+
+
+def test_resync_busy_never_publishes_partial_rest_answer_or_fails_long_task(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._kimi_reconcile_attempts = 2
+    _submit(frame, "still running")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.get_status = lambda _session_id: {"busy": True}
+    fake.messages_by_session[session_id] = [
+        {"id": prompt_id, "role": "user", "content": "still running"},
+        {"id": "partial", "role": "assistant", "content": "unfinished fragment"},
+    ]
+
+    frame._on_kimi_client_message(
+        {"type": "resync_required", "payload": {"session_ids": [session_id]}}
+    )
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] != "unfinished fragment"
+    assert not turn.get("request_error")
+
+
+def test_rest_terminal_proof_does_not_forge_idle_and_failed_status_wins_over_partial(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "terminal proof")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    fake.get_status = lambda _session_id: {"status": "completed"}
+    fake.messages_by_session[session_id] = [
+        {"id": prompt_id, "role": "user", "content": "terminal proof"},
+        {"id": "final", "role": "assistant", "content": "final answer"},
+    ]
+    reconciled = []
+    original_on_kimi_event = frame._on_kimi_event
+    monkeypatch.setattr(frame, "_on_kimi_event", reconciled.append)
+
+    frame._reconcile_kimi_owner_worker(owner)
+
+    assert len(reconciled) == 1
+    assert reconciled[0].data["terminal_verified"] is True
+    assert reconciled[0].data["idle_verified"] is False
+
+    monkeypatch.setattr(frame, "_on_kimi_event", original_on_kimi_event)
+    # Reuse the still-pending owner and prove that a failed REST terminal
+    # cannot publish the assistant fragment as a successful final answer.
+    fake.get_status = lambda _session_id: {"status": "failed", "error": "server terminal failure"}
+    fake.messages_by_session[session_id] = [
+        {"id": prompt_id, "role": "user", "content": "terminal proof"},
+        {"id": "partial", "role": "assistant", "content": "partial output"},
+    ]
+    frame._kimi_recovery_workers.clear()
+    frame._on_kimi_client_message(
+        {"type": "transport_error", "payload": {"error": "socket reset"}}
+    )
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "failed"
+    assert turn["answer_md"] != "partial output"
+    assert turn["request_error"] == "socket reset"
+
+
+def test_transport_recovery_enumerates_active_and_queued_prompt_owners(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10"))
+    _submit(frame, "queued")
+    expected = {entry["prompt_id"] for entry in fake.submitted}
+    reconciled = []
+    monkeypatch.setattr(
+        frame,
+        "_reconcile_kimi_owner_worker",
+        lambda owner, original_error="": reconciled.append(
+            (owner["prompt_id"], owner["role"], original_error)
+        ),
+    )
+
+    frame._on_kimi_client_message(
+        {"type": "transport_error", "payload": {"error": "socket reset"}}
+    )
+
+    assert {prompt_id for prompt_id, _role, _error in reconciled} == expected
+    assert {role for _prompt_id, role, _error in reconciled} == {"active", "queued"}
+    assert {error for _prompt_id, _role, error in reconciled} == {"socket reset"}
+
+    frame._kimi_recovery_workers.clear()
+    reconciled.clear()
+    frame._on_kimi_client_message(
+        {"type": "resync_required", "payload": {"session_ids": [session_id]}}
+    )
+    assert {prompt_id for prompt_id, _role, _error in reconciled} == expected
+    assert {error for _prompt_id, _role, error in reconciled} == {"socket reset"}
+
+    frame._kimi_recovery_workers.clear()
+    reconciled.clear()
+    frame._on_kimi_client_exit(9)
+    assert {prompt_id for prompt_id, _role, _error in reconciled} == expected
+    assert all("代码 9" in error for _prompt_id, _role, error in reconciled)
+
+
+def test_prompt_events_buffer_until_owner_is_persisted_then_replay_in_order(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    deferred = []
+    original_call_after = frame._call_after_if_alive
+
+    def defer_owner_landing(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "_apply_kimi_thread_state":
+            deferred.append((fn, args, kwargs))
+            return None
+        return original_call_after(fn, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", defer_owner_landing)
+    _submit(frame, "early events")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    assert len(deferred) == 1
+
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="77",
+            text="early answer",
+            display_kind="assistant",
+            data={"agent_id": "main", "prompt_id": prompt_id},
+        )
+    )
+    fake.push_event(
+        KimiEvent(
+            type="turn_completed",
+            thread_id=session_id,
+            turn_id="77",
+            status="completed",
+            data={"agent_id": "main", "source_kind": "turn.ended", "prompt_id": prompt_id},
+        )
+    )
+    assert len(frame._kimi_early_events[(session_id, prompt_id)]) == 2
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
+
+    fn, args, kwargs = deferred.pop()
+    fn(*args, **kwargs)
+
+    turn = frame.active_session_turns[-1]
+    assert turn["kimi_turn_id"] == "77"
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "early answer"
+    assert (session_id, prompt_id) not in frame._kimi_early_events
 
 
 def test_interrupt_via_stop_command(frame, monkeypatch):
@@ -674,7 +1185,7 @@ def test_steer_rejected_queues_and_flushes_on_next_turn(frame, monkeypatch):
     assert len(frame._current_chat_state.get("kimi_request_queue") or []) == 1
 
     # 服务端开始执行排队 prompt：队列冲刷，turn 归属到本地 turn 1
-    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="11"))
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="11", data={"prompt_id": queue[0]["prompt_id"]}))
     assert not frame._current_chat_state.get("kimi_request_queue")
     assert frame.active_session_turns[1]["kimi_turn_id"] == "11"
 
@@ -686,6 +1197,168 @@ def test_steer_rejected_queues_and_flushes_on_next_turn(frame, monkeypatch):
     )
     assert frame.active_session_turns[1]["answer_md"] == "答案二"
     assert frame.active_session_turns[1]["request_status"] == "done"
+
+
+def test_completed_active_owner_plays_sound_once_while_queue_remains(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    played = {"n": 0}
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10"))
+    _submit(frame, "queued")
+
+    fake.push_event(
+        KimiEvent(
+            type="agent_message_delta",
+            thread_id=session_id,
+            turn_id="10",
+            text="answer",
+            display_kind="assistant",
+        )
+    )
+    completion = KimiEvent(
+        type="turn_completed", thread_id=session_id, turn_id="10", status="completed"
+    )
+    fake.push_event(completion)
+    fake.push_event(completion)
+
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert frame.active_session_turns[1]["request_status"] == "pending"
+    assert len(frame._current_chat_state.get("kimi_request_queue") or []) == 1
+    assert frame.is_running is True
+    assert played["n"] == 1
+
+
+def test_ambiguous_submit_preserves_unresolved_owner_for_rest_reconciliation(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+
+    def ambiguous_submit(_session_id, _content_blocks):
+        raise KimiServerError("response lost", result_unknown=True)
+
+    fake.submit_prompt = ambiguous_submit
+    _submit(frame, "possibly accepted")
+
+    turn = frame.active_session_turns[-1]
+    assert turn["request_status"] == "pending"
+    assert turn["kimi_prompt_role"] == "unresolved"
+    assert turn["kimi_unresolved_submission"] is True
+    assert not turn.get("request_error")
+    assert len(frame._kimi_pending_owners()) == 1
+
+
+def test_unknown_steer_result_is_unresolved_and_never_guessed_as_queued(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10"))
+    fake.steer_result = None
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+
+    _submit(frame, "ambiguous steer")
+
+    prompt_id = fake.submitted[-1]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner["role"] == "unresolved"
+    assert frame.active_session_turns[-1]["kimi_prompt_role"] == "unresolved"
+    assert not frame._current_chat_state.get("kimi_request_queue")
+
+
+def test_two_queued_prompts_activate_and_complete_by_exact_prompt_text(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    _submit(frame, "active question")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10", text="active question"))
+    _submit(frame, "queued one")
+    _submit(frame, "queued two")
+
+    assert [entry["question"] for entry in frame._current_chat_state["kimi_request_queue"]] == [
+        "queued one",
+        "queued two",
+    ]
+    assert [frame._find_kimi_prompt_owner(item["prompt_id"], session_id=session_id)["question"] for item in fake.submitted] == [
+        "active question",
+        "queued one",
+        "queued two",
+    ]
+    assert [turn["kimi_prompt_question"] for turn in frame.active_session_turns] == [
+        "active question",
+        "queued one",
+        "queued two",
+    ]
+
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="10", status="completed", text="active answer"))
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="11", text="queued one"))
+    assert frame.active_session_turns[1]["kimi_turn_id"] == "11"
+    assert not frame.active_session_turns[2].get("kimi_turn_id")
+    assert [entry["question"] for entry in frame._current_chat_state["kimi_request_queue"]] == ["queued two"]
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="11", status="completed", text="answer one"))
+
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="12", text="queued two"))
+    assert frame.active_session_turns[2]["kimi_turn_id"] == "12"
+    assert frame._current_chat_state["kimi_request_queue"] == []
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="12", status="completed", text="answer two"))
+
+    assert [turn["answer_md"] for turn in frame.active_session_turns] == [
+        "active answer",
+        "answer one",
+        "answer two",
+    ]
+    assert [turn["request_status"] for turn in frame.active_session_turns] == ["done", "done", "done"]
+
+
+def test_duplicate_queued_prompt_text_does_not_guess_owner(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    _submit(frame, "active question")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="20", text="active question"))
+    _submit(frame, "same queued text")
+    _submit(frame, "same queued text")
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="20", status="completed", text="active answer"))
+
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="21", text="same queued text"))
+
+    assert [turn.get("kimi_turn_id", "") for turn in frame.active_session_turns[1:]] == ["", ""]
+    assert [entry["question"] for entry in frame._current_chat_state["kimi_request_queue"]] == [
+        "same queued text",
+        "same queued text",
+    ]
+
+
+def test_exact_queued_prompt_terminal_removes_only_its_queue_entry(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10"))
+    _submit(frame, "queued")
+    queued_prompt = fake.submitted[-1]["prompt_id"]
+
+    fake.push_event(
+        KimiEvent(
+            type="turn_completed",
+            thread_id=session_id,
+            text="queued answer",
+            status="completed",
+            data={
+                "agent_id": "main",
+                "source_kind": "rest.reconciled",
+                "prompt_id": queued_prompt,
+                "idle_verified": True,
+                "owner_generation": frame._find_kimi_prompt_owner(queued_prompt, session_id=session_id)["generation"],
+            },
+        )
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame.active_session_turns[1]["request_status"] == "done"
+    assert frame.active_session_turns[1]["answer_md"] == "queued answer"
+    assert frame._current_chat_state.get("kimi_request_queue") == []
+    assert frame.active_kimi_turn_active is True
 
 
 def test_approval_request_opens_dialog_and_replies(frame, monkeypatch):
@@ -750,6 +1423,87 @@ def test_state_persists_kimi_fields(frame, monkeypatch):
     matches = [chat for chat in frame.archived_chats if chat.get("id") == chat_id]
     assert any(chat.get("kimi_session_id") == session_id for chat in matches)
     assert any(chat.get("kimi_turn_id") == TEST_TURN_ID for chat in matches)
+
+
+def test_load_state_rebuilds_pending_owner_and_starts_recovery(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "resume after restart")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    frame.archived_chats.append(
+        {
+            "id": "chat-archived-pending",
+            "title": "archived pending",
+            "kimi_session_id": "session-archived",
+            "kimi_turn_active": True,
+            "turns": [
+                {
+                    "question": "restore archived too",
+                    "answer_md": main.REQUESTING_TEXT,
+                    "model": "kimi/main",
+                    "request_status": "pending",
+                    "kimi_session_id": "session-archived",
+                    "kimi_prompt_id": "prompt-archived",
+                }
+            ],
+            "execution_steps": [],
+        }
+    )
+    frame._save_state()
+    frame._kimi_client = None
+    frame._kimi_prompt_owners = {}
+    frame._kimi_active_turns = {}
+    recovered = []
+    monkeypatch.setattr(
+        frame,
+        "_recover_kimi_pending_owners",
+        lambda **kwargs: recovered.append((frame._kimi_pending_owners(), kwargs)),
+    )
+
+    frame._load_state()
+
+    assert len(recovered) == 1
+    owners, kwargs = recovered[0]
+    assert kwargs == {}
+    assert {
+        (owner["chat_id"], owner["session_id"], owner["prompt_id"], owner["role"])
+        for owner in owners
+    } == {
+        (_active_chat_id(frame), session_id, prompt_id, "active"),
+        ("chat-archived-pending", "session-archived", "prompt-archived", "active"),
+    }
+
+
+def test_switch_current_chat_restores_all_five_kimi_runtime_fields(frame, monkeypatch):
+    _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [{"question": "a", "answer_md": "done", "model": "kimi/main", "request_status": "done"}]
+    frame._current_chat_state = {"id": "chat-a", "title": "A", "turns": frame.active_session_turns}
+    frame.archived_chats = [
+        {
+            "id": "chat-b",
+            "title": "B",
+            "model": "kimi/main",
+            "turns": [{"question": "b", "answer_md": main.REQUESTING_TEXT, "model": "kimi/main", "request_status": "pending"}],
+            "kimi_session_id": "session-b",
+            "kimi_turn_id": "turn-b",
+            "kimi_turn_active": True,
+            "kimi_pending_prompt": "pending-b",
+            "kimi_request_queue": [{"prompt_id": "queued-b", "turn_idx": 0}],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        }
+    ]
+
+    assert frame._switch_current_chat("chat-b") is True
+
+    assert frame.active_kimi_session_id == "session-b"
+    assert frame.active_kimi_turn_id == "turn-b"
+    assert frame.active_kimi_turn_active is True
+    assert frame.active_kimi_pending_prompt == "pending-b"
+    assert frame.active_kimi_request_queue == [{"prompt_id": "queued-b", "turn_idx": 0}]
 
 
 def test_session_not_found_recovery_primes_history(frame, monkeypatch):
@@ -945,3 +1699,416 @@ def test_messages_pending_drains_through_client(frame, monkeypatch):
     assert turn["request_status"] == "done"
     assert turn["answer_md"] == "完成"
     assert frame.active_kimi_turn_id == TEST_TURN_ID
+
+
+def test_prompt_owner_key_is_isolated_by_chat_and_session(frame):
+    for chat_id, session_id, turn_idx in (("chat-a", "session-a", 0), ("chat-b", "session-b", 1)):
+        frame._register_kimi_prompt_owner({
+            "chat_id": chat_id, "session_id": session_id, "prompt_id": "same-prompt",
+            "owner_prompt_id": "same-prompt", "turn_idx": turn_idx,
+            "role": "active", "landed": True,
+        })
+
+    assert len([key for key in frame._kimi_prompt_owners if key[2] == "same-prompt"]) == 2
+    assert frame._find_kimi_prompt_owner("same-prompt") is None
+    assert frame._find_kimi_prompt_owner("same-prompt", session_id="session-a")["chat_id"] == "chat-a"
+    assert frame._find_kimi_prompt_owner("same-prompt", session_id="session-b")["chat_id"] == "chat-b"
+
+
+def test_rebuild_merges_unlanded_owner_from_another_chat(frame):
+    frame._register_kimi_prompt_owner({
+        "chat_id": "chat-b", "session_id": "session-b", "prompt_id": "pending-submit",
+        "owner_prompt_id": "pending-submit", "turn_idx": 0,
+        "role": "active", "landed": False,
+    })
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "chat-a", "turns": []}
+    frame.archived_chats = []
+
+    frame._rebuild_kimi_runtime_state()
+
+    assert frame._find_kimi_prompt_owner(
+        "pending-submit", session_id="session-b", chat_id="chat-b", include_unlanded=True
+    )["landed"] is False
+
+
+def test_new_submission_clears_previous_owner_idle_proof(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    _submit(frame, "first")
+    session_id = fake.created_sessions[0]["session_id"]
+    first_prompt = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="1"))
+    fake.push_event(KimiEvent(
+        type="notification", thread_id=session_id, subtype="event.session.work_changed",
+        display_kind="session", data={"protocol": {"busy": False}},
+    ))
+    first_owner = frame._find_kimi_prompt_owner(first_prompt, session_id=session_id)
+    assert frame._kimi_idle_proofs[frame._kimi_owner_key_for(first_owner)] == first_owner["generation"]
+
+    _submit(frame, "steered follow-up")
+
+    assert frame._kimi_owner_key_for(first_owner) not in frame._kimi_idle_proofs
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, status="completed", text="partial",
+        data={"agent_id": "main", "source_kind": "prompt.completed", "prompt_id": first_prompt},
+    ))
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+
+
+def test_late_prompt_completed_is_blocked_by_owner_tombstone(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = {"count": 0}
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("count", played["count"] + 1))
+    _submit(frame, "answer once")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="1"))
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, turn_id="1", text="authoritative",
+        status="completed", data={"agent_id": "main", "source_kind": "turn.ended", "prompt_id": prompt_id},
+    ))
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, text="late fallback", status="completed",
+        data={"agent_id": "main", "source_kind": "prompt.completed", "prompt_id": prompt_id,
+              "idle_verified": True, "owner_generation": owner["generation"]},
+    ))
+
+    assert frame.active_session_turns[0]["answer_md"] == "authoritative"
+    assert played["count"] == 1
+
+
+def test_duplicate_queued_questions_are_not_claimed_without_prompt_id(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.steer_result = False
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="1"))
+    _submit(frame, "duplicate")
+    _submit(frame, "duplicate")
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="1", text="done", status="completed"))
+
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="2", text="duplicate"))
+
+    assert len(frame._current_chat_state["kimi_request_queue"]) == 2
+    assert all(turn["request_status"] == "pending" for turn in frame.active_session_turns[1:])
+
+
+def test_early_answer_fragments_are_not_truncated_at_legacy_bucket_limit(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    deferred = []
+    original_call_after = frame._call_after_if_alive
+
+    def defer_landing(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "_apply_kimi_thread_state":
+            deferred.append((fn, args, kwargs))
+            return None
+        return original_call_after(fn, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", defer_landing)
+    _submit(frame, "long early stream")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    for idx in range(40):
+        fake.push_event(KimiEvent(
+            type="agent_message_delta", thread_id=session_id, turn_id="9", text=str(idx),
+            display_kind="assistant", data={"agent_id": "main", "prompt_id": prompt_id},
+        ))
+    assert len(frame._kimi_early_events[(session_id, prompt_id)]) == 40
+
+    fn, args, kwargs = deferred.pop()
+    fn(*args, **kwargs)
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, turn_id="9", status="completed",
+        data={"agent_id": "main", "source_kind": "turn.ended", "prompt_id": prompt_id},
+    ))
+
+    assert frame.active_session_turns[0]["answer_md"] == "".join(str(idx) for idx in range(40))
+
+
+def test_recovery_uses_one_coordinator_per_session(frame, monkeypatch):
+    created = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, args=None, kwargs=None, daemon=None):
+            created.append((target, args or (), kwargs or {}, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _DeferredThread)
+    for chat_id, prompt_id in (("chat-a", "prompt-a"), ("chat-b", "prompt-b")):
+        frame._register_kimi_prompt_owner(
+            {
+                "chat_id": chat_id,
+                "session_id": "shared-session",
+                "prompt_id": prompt_id,
+                "owner_prompt_id": prompt_id,
+                "turn_idx": 0,
+                "role": "active",
+                "landed": False,
+            }
+        )
+
+    frame._recover_kimi_pending_owners(
+        session_ids={"shared-session"}, original_error="socket reset"
+    )
+    frame._recover_kimi_pending_owners(
+        session_ids={"shared-session"}, original_error="socket reset again"
+    )
+
+    assert len(created) == 1
+    assert created[0][0] == frame._reconcile_kimi_session_worker
+    assert created[0][1] == ("shared-session",)
+    assert frame._kimi_recovery_workers == {"shared-session"}
+    assert frame._kimi_recovery_intents["shared-session"] == "socket reset again"
+
+
+def test_authoritative_error_atomically_cleans_alias_state(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "active")
+    session_id = fake.created_sessions[0]["session_id"]
+    first_prompt = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10"))
+    _submit(frame, "steered alias")
+    second_prompt = fake.submitted[1]["prompt_id"]
+    owner_keys = {
+        frame._kimi_owner_key_for(
+            frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+        )
+        for prompt_id in (first_prompt, second_prompt)
+    }
+    frame._current_chat_state["kimi_request_queue"] = [
+        {"prompt_id": second_prompt, "turn_idx": 1}
+    ]
+    frame.active_kimi_request_queue = frame._current_chat_state["kimi_request_queue"]
+    for key in owner_keys:
+        frame._kimi_idle_proofs[key] = frame._kimi_prompt_owners[key]["generation"]
+        frame._kimi_early_events[(key[1], key[2])] = [CodexEvent(type="agent_message_delta")]
+    frame._kimi_recovery_intents[session_id] = "socket reset"
+
+    frame._apply_kimi_error(
+        _active_chat_id(frame), "authoritative failure", turn_idx=0, prompt_id=first_prompt
+    )
+
+    assert [turn["request_status"] for turn in frame.active_session_turns] == ["failed", "failed"]
+    assert [turn["answer_md"] for turn in frame.active_session_turns] == [
+        "authoritative failure",
+        "authoritative failure",
+    ]
+    assert owner_keys <= frame._kimi_terminal_tombstones
+    assert all(key not in frame._kimi_prompt_owners for key in owner_keys)
+    assert all(key not in frame._kimi_idle_proofs for key in owner_keys)
+    assert all((key[1], key[2]) not in frame._kimi_early_events for key in owner_keys)
+    assert frame._current_chat_state["kimi_request_queue"] == []
+    assert session_id not in frame._kimi_recovery_intents
+
+
+def test_legacy_owner_migration_uses_time_to_disambiguate_repeated_question(frame):
+    frame.active_chat_id = "chat-legacy"
+    frame.current_chat_id = "chat-legacy"
+    frame.active_session_turns = [
+        {
+            "question": "repeated",
+            "answer_md": main.REQUESTING_TEXT,
+            "model": "kimi/main",
+            "request_status": "pending",
+            "created_at": 1000.0,
+            "kimi_session_id": "session-legacy",
+        }
+    ]
+    frame._current_chat_state = {"id": "chat-legacy", "turns": frame.active_session_turns}
+    owner = {
+        "chat_id": "chat-legacy",
+        "session_id": "session-legacy",
+        "prompt_id": "__legacy__:chat-legacy:0",
+        "owner_prompt_id": "__legacy__:chat-legacy:0",
+        "turn_idx": 0,
+        "question": "repeated",
+        "created_at": 1000.0,
+        "role": "active",
+        "landed": True,
+        "legacy": True,
+    }
+    frame._register_kimi_prompt_owner(owner)
+
+    assert frame._migrate_legacy_kimi_owner(
+        owner,
+        [
+            {"id": "prompt-before", "role": "user", "content": "repeated", "created_at": 999.0},
+            {"id": "prompt-after", "role": "user", "content": "repeated", "created_at": 1001.0},
+        ],
+    ) is None
+
+    migrated = frame._migrate_legacy_kimi_owner(
+        owner,
+        [
+            {"id": "prompt-old", "role": "user", "content": "repeated", "created_at": 800.0},
+            {"id": "prompt-exact", "role": "user", "content": "repeated", "created_at": 1002.0},
+        ],
+    )
+
+    assert migrated["prompt_id"] == "prompt-exact"
+    assert migrated["legacy"] is False
+    assert frame.active_session_turns[0]["kimi_prompt_id"] == "prompt-exact"
+    assert frame._find_kimi_prompt_owner(
+        "prompt-exact", session_id="session-legacy", chat_id="chat-legacy"
+    )["turn_idx"] == 0
+
+
+def test_subagent_assistant_delta_is_kept_in_execution_progress(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(
+        type="agent_message_delta", thread_id=session_id, turn_id="7",
+        text="subagent prose", display_kind="assistant",
+        data={"agent_id": "agent-1", "source_kind": "assistant.delta"},
+    ))
+
+    assert any(
+        "subagent prose" in str(step)
+        for step in frame._current_chat_state.get("execution_steps", [])
+    )
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_non_main_idle_does_not_authorize_prompt_completed(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    recoveries = []
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **kwargs: recoveries.append(kwargs))
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(
+        type="notification", thread_id=session_id,
+        subtype="event.session.work_changed", display_kind="session",
+        data={"agent_id": "agent-1", "protocol": {"busy": False}},
+    ))
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, text="partial", status="completed",
+        data={"agent_id": "main", "source_kind": "prompt.completed", "prompt_id": prompt_id},
+    ))
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert recoveries
+
+
+def test_failed_terminal_never_plays_finish_sound(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="9", data={"agent_id": "main", "prompt_id": prompt_id}))
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, turn_id="9", text="failed",
+        status="failed", data={"agent_id": "main", "source_kind": "turn.ended", "prompt_id": prompt_id},
+    ))
+
+    assert frame.active_session_turns[0]["request_status"] == "failed"
+    assert played == []
+
+
+def test_answer_streams_use_first_seen_order_and_gap_blocks_completion(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="10", data={"agent_id": "main", "prompt_id": prompt_id}))
+    for item_id, offset, text in (("z-stream", 0, "first"), ("a-stream", 2, "gap")):
+        fake.push_event(KimiEvent(
+            type="agent_message_delta", thread_id=session_id, turn_id="10",
+            item_id=item_id, text=text, display_kind="assistant",
+            data={"agent_id": "main", "source_kind": "assistant.delta", "prompt_id": prompt_id, "offset": offset},
+        ))
+    fake.push_event(KimiEvent(
+        type="turn_completed", thread_id=session_id, turn_id="10", status="completed",
+        data={"agent_id": "main", "source_kind": "turn.ended", "prompt_id": prompt_id},
+    ))
+
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    assert frame._kimi_answer_parts(_active_chat_id(frame), session_id, prompt_id).startswith("first")
+
+
+def test_clear_removes_owner_buffers_and_recovery_state(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "main task")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    chat_id = _active_chat_id(frame)
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    key = frame._kimi_owner_key_for(owner)
+    frame._kimi_early_events[(session_id, prompt_id)] = []
+    frame._kimi_recovery_intents[session_id] = "recover"
+    frame._kimi_turn_answer_parts[(chat_id, session_id, prompt_id, "main")] = ["partial"]
+
+    frame._handle_kimi_clear_command(frame._current_chat_state)
+
+    assert key not in frame._kimi_prompt_owners
+    assert (session_id, prompt_id) not in frame._kimi_early_events
+    assert session_id not in frame._kimi_recovery_intents
+    assert not any(key_[0] == chat_id for key_ in frame._kimi_turn_answer_parts)
+
+
+@pytest.mark.parametrize(
+    ("between", "expected_role", "expected_owner"),
+    [
+        ([], "alias", "active-prompt"),
+        ([{"id": "answer-1", "role": "assistant", "content": "done", "created_at": "2026-01-01T00:00:01Z"}], "queued", "follow-up"),
+    ],
+)
+def test_ambiguous_steer_migration_resolves_alias_or_queue(frame, between, expected_role, expected_owner):
+    owner = {
+        "chat_id": _active_chat_id(frame), "session_id": "session-1",
+        "prompt_id": "follow-up", "owner_prompt_id": "active-prompt",
+        "turn_idx": 0, "question": "follow up", "role": "unresolved",
+        "candidate_alias": True, "landed": True, "generation": 8,
+        "created_at": "2026-01-01T00:00:02Z",
+    }
+    frame._register_kimi_prompt_owner(owner)
+    messages = [
+        {"id": "active-prompt", "role": "user", "content": "first", "created_at": "2026-01-01T00:00:00Z"},
+        *between,
+        {"id": "follow-up", "role": "user", "content": "follow up", "created_at": "2026-01-01T00:00:02Z"},
+    ]
+
+    migrated = frame._migrate_legacy_kimi_owner(owner, messages)
+
+    assert migrated["role"] == expected_role
+    assert migrated["owner_prompt_id"] == expected_owner
+
+
+def test_late_recovery_failure_generation_cannot_overwrite_done_turn(frame):
+    frame.active_session_turns = [{
+        "question": "done", "answer_md": "final", "model": "kimi/main",
+        "request_status": "done", "kimi_session_id": "session-1",
+        "kimi_prompt_id": "prompt-1",
+    }]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+
+    frame._apply_kimi_error(
+        _active_chat_id(frame), "late failure", 0, None, "prompt-1", 7,
+    )
+
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert frame.active_session_turns[0]["answer_md"] == "final"
+
+
+def test_recovery_deadline_helper_passes_remaining_budget(frame, monkeypatch):
+    observed = []
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+
+    result = frame._kimi_call_with_deadline(
+        lambda value, timeout=None: observed.append(timeout) or value,
+        "ok",
+        deadline=12.5,
+    )
+
+    assert result == "ok"
+    assert observed == [2.5]

@@ -61,6 +61,20 @@ def _events_of(messages, event_type: str):
     return out
 
 
+def _is_authoritative_terminal(event):
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    if event.get("type") != "turn_completed" or str(data.get("agent_id") or "main") != "main":
+        return False
+    source_kind = str(data.get("source_kind") or "")
+    if source_kind == "turn.ended":
+        return True
+    return bool(
+        source_kind == "rest.reconciled"
+        and data.get("stream_complete") is True
+        and str(event.get("text") or "").strip()
+    )
+
+
 def test_live_prompt_roundtrip(live_client):
     session_id = live_client.create_session(
         cwd=os.getcwd(),
@@ -77,7 +91,7 @@ def test_live_prompt_roundtrip(live_client):
 
     messages = _drain_until(
         live_client,
-        lambda ms: any(e.get("status") == "completed" for e in _events_of(ms, "turn_completed")),
+        lambda ms: any(e.get("status") == "completed" and _is_authoritative_terminal(e) for e in _events_of(ms, "turn_completed")),
     )
     deltas = _events_of(messages, "agent_message_delta")
     answer_text = "".join(e.get("text") or "" for e in deltas if e.get("display_kind") == "assistant")
@@ -107,10 +121,10 @@ def test_live_abort(live_client):
     live_client.abort(session_id, prompt_id)
     messages = _drain_until(
         live_client,
-        lambda ms: bool(_events_of(ms, "turn_completed")),
+        lambda ms: any(_is_authoritative_terminal(event) for event in _events_of(ms, "turn_completed")),
         timeout=90,
     )
-    assert _events_of(messages, "turn_completed"), "turn did not finish after abort"
+    assert any(_is_authoritative_terminal(event) for event in _events_of(messages, "turn_completed")), "turn did not finish after abort"
 
 
 def test_live_server_shutdown_restart_keeps_session():

@@ -38,6 +38,8 @@ setx OPENROUTER_API_KEY "你的Key"
 
 多个 Kimi Code 聊天可并发运行。Kimi 的 `turn_id` 仅在各自 session 内唯一，客户端以 session 和 turn 的组合隔离事件；不要把不同聊天中同号 turn 的事件视为同一轮回答。
 
+Kimi 的回答列表只在主代理最终正文获得权威完成确认后更新；执行过程、子代理消息、不完整流片段和失败终态不会提前显示为回答，也不会播放“回答完毕”音效。
+
 手机端选择 `kimi/*` 后，远端消息同样走电脑端的 Kimi 专用 worker，不读取 `OPENROUTER_API_KEY`。如果 Kimi 消息返回 OpenRouter 401，应优先检查模型分派是否回退，而不是补配 OpenRouter Key。可运行以下无外部凭据回归：
 
 ```powershell

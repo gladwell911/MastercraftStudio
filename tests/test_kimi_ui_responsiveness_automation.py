@@ -161,7 +161,7 @@ def test_event_storm_during_navigation_keeps_focus(frame, wx_app, monkeypatch):
         assert frame.answer_list.GetSelection() == 1
 
     _drain_all_kimi_events(frame)
-    parts = frame._kimi_turn_answer_parts.get(("chat-kimi", "session-1", "turn-1")) or []
+    parts = frame._kimi_turn_answer_parts.get(("chat-kimi", "session-1", "turn-1", "main")) or []
     assert len(parts) == 500
     assert "".join(parts) == "".join(f"增量{idx} " for idx in range(500))
     assert frame.answer_list.GetSelection() == 1

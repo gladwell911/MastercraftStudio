@@ -144,7 +144,7 @@ def test_delta_preserves_whitespace_and_stream_identity_metadata():
 
     assert event.text == " user"
     assert event.raw_text == " user"
-    assert event.data == {"seq": 9, "offset": 3, "agent_id": "main", "source_kind": "thinking.delta"}
+    assert event.data == {"seq": 9, "offset": 3, "agent_id": "main", "agent_scope": "main", "source_kind": "thinking.delta"}
 
 
 # ----------------------------------------------------------------------
@@ -183,6 +183,29 @@ def test_turn_ended_failed_carries_error_message():
     assert event.status == "failed"
     assert event.text == "model exploded"
     assert event.turn_id == "3"
+
+
+@pytest.mark.parametrize("agent_id", ["agent-researcher", "subagent-2", "other-agent"])
+def test_non_main_turn_ended_never_maps_to_authoritative_completion(agent_id):
+    event = map_session_event(
+        make_msg("turn.ended", {"turnId": 3, "agentId": agent_id, "reason": "completed"})
+    )
+
+    assert event.type == "item_completed"
+    assert event.display_kind == "agent"
+    assert event.data["authoritative"] is False
+
+
+def test_subagent_turn_started_is_progress_not_main_lifecycle():
+    event = map_session_event(
+        make_msg("turn.started", {"turnId": 77, "agentId": "agent-researcher", "prompt": "调查"})
+    )
+
+    assert event.type == "item_started"
+    assert event.turn_id == "77"
+    assert event.display_kind == "agent"
+    assert event.data["agent_scope"] == "subagent"
+    assert event.data["authoritative"] is False
 
 
 # ----------------------------------------------------------------------
@@ -341,6 +364,16 @@ def test_prompt_completed_maps_to_turn_completed():
     assert event.type == "turn_completed"
     assert event.status == "completed"
     assert event.data.get("prompt_id") == msg["payload"]["promptId"]
+    assert event.data["fallback"] is True
+
+
+def test_subagent_prompt_completed_is_progress_only():
+    event = map_session_event(
+        make_msg("prompt.completed", {"turnId": 5, "agentId": "agent-review", "promptId": "p-1"})
+    )
+
+    assert event.type == "item_completed"
+    assert event.data["authoritative"] is False
 
 
 def test_prompt_aborted_maps_to_interrupted_turn_completed():

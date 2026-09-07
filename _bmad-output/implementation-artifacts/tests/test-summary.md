@@ -39,3 +39,17 @@
 - [x] 测试描述清晰，无硬编码等待或顺序依赖。
 - [x] 本场景没有浏览器/GUI 元素定位器，语义定位项不适用。
 - [x] 测试与总结已保存到项目约定目录，并记录覆盖指标。
+
+## 2026-09-07 — Kimi 权威完成与并发恢复
+
+- `py -3.11 -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py tests/test_kimi_integration.py tests/test_kimi_ui_responsiveness_automation.py -q`：CR6 收尾定向回归最终 `211 passed`。
+- `py -3.11 -m pytest tests/test_main_unit.py -q -k "kimi or execution or switch_current_chat" --tb=no`：`99 passed, 15 failed, 631 deselected`；15 项失败与规格冻结的 execution-list 基线逐项一致，没有新增 Kimi 失败。
+- `py -3.11 -m compileall -q main.py kimi_server_client.py tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py tests/test_kimi_integration.py tests/test_kimi_ui_responsiveness_automation.py tests/test_main_unit.py tests/test_kimi_live_smoke.py`：通过。
+- Kimi 用户级 `C:\Users\gladwell\.kimi-code\AGENTS.md` 第 2 条中文规则：精确内容检查通过。
+- `tests/test_kimi_live_smoke.py` 已收紧权威终态条件；真实服务 live smoke 未运行，因为它会创建/中断真实外部任务，保持 opt-in。
+
+### CR6 新增覆盖
+
+- 已覆盖省略 epoch 继承、同 seq 无 offset volatile phase、坏订阅隔离、HTTP 200 应用层 5xx 的 POST 结果未知，以及恢复成功仅报告一次实际 session 集合。
+- 已覆盖子代理 assistant 正文进入 F1、非 main idle 不授权 fallback、失败终态不响铃、offset 缺口阻止发布、stream 首次出现顺序，以及 `/clear` 清理 owner/buffer/recovery 状态。
+- 已覆盖同一 client 的服务进程重启换 token、ambiguous steer 的 alias/queued 双分支、迟到失败 generation 不覆盖完成结果，以及共享 deadline 剩余预算传递。

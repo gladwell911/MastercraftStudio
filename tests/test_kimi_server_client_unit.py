@@ -517,6 +517,22 @@ def test_create_session_body():
     assert subscribes[-1]["payload"]["session_ids"] == ["session-1"]
 
 
+def test_create_session_keeps_created_id_when_first_subscribe_send_fails(monkeypatch):
+    client, _, http, _, _ = started_client()
+    http.routes[("POST", "/api/v1/sessions")] = FakeResponse(
+        200, {"code": 0, "data": {"id": "session-created"}}
+    )
+
+    def failed_subscribe(session_ids):
+        client._subscribed_sessions.update(session_ids)
+        raise KimiServerError("temporary websocket send failure")
+
+    monkeypatch.setattr(client, "subscribe", failed_subscribe)
+
+    assert client.create_session(cwd="D:/work") == "session-created"
+    assert client._subscribed_sessions == {"session-created"}
+
+
 def test_submit_prompt_content_blocks():
     client, _, http, _, _ = started_client()
     http.routes[("POST", "/api/v1/sessions/session-1/prompts")] = FakeResponse(
@@ -533,6 +549,17 @@ def test_submit_prompt_content_blocks():
     call = [c for c in http.calls if c["url"].endswith("/api/v1/sessions/session-1/prompts")][-1]
     assert call["method"] == "POST"
     assert call["json"] == {"content": blocks}
+
+
+@pytest.mark.parametrize("data", [{}, {"unrelated": "value"}])
+def test_submit_prompt_requires_authoritative_prompt_handle(data):
+    client, _, http, _, _ = started_client()
+    http.routes[("POST", "/api/v1/sessions/session-1/prompts")] = FakeResponse(
+        200, {"code": 0, "data": data}
+    )
+
+    with pytest.raises(KimiServerError, match="missing prompt_id/user_message_id"):
+        client.submit_prompt("session-1", [{"type": "text", "text": "hello"}])
 
 
 def test_steer_prompts_body():
@@ -554,6 +581,15 @@ def test_steer_prompts_returns_false_on_server_error():
     assert client.steer_prompts("session-1", ["p1"]) is False
 
 
+def test_steer_prompts_returns_unknown_for_ambiguous_server_failure():
+    client, _, http, _, _ = started_client()
+    http.routes[("POST", "/api/v1/sessions/session-1/prompts:steer")] = FakeResponse(
+        503, text="upstream timed out after accepting request"
+    )
+
+    assert client.steer_prompts("session-1", ["p1"]) is None
+
+
 def test_rest_error_raises_with_context():
     client, _, http, _, _ = started_client()
     http.routes[("GET", "/api/v1/sessions/session-1/status")] = FakeResponse(500, text="boom internal")
@@ -565,6 +601,16 @@ def test_rest_error_raises_with_context():
     assert "500" in message
     assert "boom internal" in message
     assert "/api/v1/sessions/session-1/status" in message
+
+
+def test_session_exists_only_converts_explicit_404_to_false():
+    client, _, http, _, _ = started_client()
+    http.routes[("GET", "/api/v1/sessions/missing")] = FakeResponse(404, text="not found")
+    http.routes[("GET", "/api/v1/sessions/broken")] = FakeResponse(503, text="offline")
+
+    assert client.session_exists("missing") is False
+    with pytest.raises(KimiServerError, match="503"):
+        client.session_exists("broken")
 
 
 def test_answer_approval_and_question_bodies():
@@ -598,6 +644,119 @@ def test_ws_hello_and_subscribe_sent():
 
     subscribes = [m for m in sent_ws_messages(ws) if m["type"] == "subscribe"]
     assert subscribes[0]["payload"]["session_ids"] == ["session-9"]
+
+
+def test_cursor_is_sent_on_reconnect_and_is_monotonic_per_session():
+    old_ws = FakeWebSocket()
+    new_ws = FakeWebSocket()
+    sockets = iter((old_ws, new_ws))
+    client, *_ = make_client(ws=old_ws)
+    client.ws_factory = lambda _url, _headers: next(sockets)
+    client.start()
+    client._handle_ws_message(
+        {"type": "turn.started", "session_id": "s1", "epoch": "e1", "seq": 4, "payload": {"type": "turn.started", "turnId": 1}}
+    )
+    client._handle_ws_message(
+        {"type": "turn.started", "session_id": "s2", "epoch": "e2", "seq": 9, "payload": {"type": "turn.started", "turnId": 2}}
+    )
+    assert client._invalidate_ws(old_ws, "drop", notify=False)
+
+    client.start()
+
+    hello = sent_ws_messages(new_ws)[0]
+    assert hello["payload"]["cursors"] == {
+        "s1": {"epoch": "e1", "seq": 4},
+        "s2": {"epoch": "e2", "seq": 9},
+    }
+
+
+def test_old_stable_replay_is_dropped_but_same_seq_volatile_offsets_survive():
+    client, *_ = started_client()
+    stable = lambda seq: {
+        "type": "turn.started", "session_id": "s", "epoch": "e", "seq": seq,
+        "payload": {"type": "turn.started", "turnId": seq},
+    }
+    assert client._handle_ws_message(stable(5))
+    assert client._handle_ws_message(stable(4))
+    for offset, text in ((0, "A"), (1, "B")):
+        client._handle_ws_message(
+            {
+                "type": "assistant.delta", "session_id": "s", "epoch": "e", "seq": 5, "offset": offset,
+                "payload": {"type": "assistant.delta", "turnId": 5, "delta": text, "agentId": "main"},
+            }
+        )
+
+    events = [message["payload"]["event"] for message in client.drain_pending_messages(10)]
+    assert [event["type"] for event in events] == ["turn_started", "agent_message_delta"]
+    assert events[-1]["text"] == "AB"
+
+
+def test_exact_volatile_offset_replay_is_dropped_across_queue_drains():
+    client, *_ = started_client()
+    delta = {
+        "type": "assistant.delta",
+        "session_id": "s",
+        "epoch": "e",
+        "seq": 5,
+        "offset": 0,
+        "payload": {
+            "type": "assistant.delta",
+            "turnId": 5,
+            "messageId": "answer-1",
+            "delta": "A",
+            "agentId": "main",
+        },
+    }
+
+    assert client._handle_ws_message(delta)
+    assert len(client.drain_pending_messages(10)) == 1
+    assert client._handle_ws_message(delta)
+    assert client.drain_pending_messages(10) == []
+
+    next_offset = dict(delta, offset=1)
+    next_offset["payload"] = dict(delta["payload"], delta="B")
+    assert client._handle_ws_message(next_offset)
+    event = client.drain_pending_messages(10)[0]["payload"]["event"]
+    assert event["text"] == "B"
+
+
+def test_ack_resync_required_emits_explicit_control_message():
+    client, *_ = started_client()
+
+    client._handle_ws_message(
+        {
+            "type": "ack",
+            "payload": {
+                "resync_required": ["s1"],
+                "cursors": {"s1": {"epoch": "e1", "seq": 8}},
+            },
+        }
+    )
+
+    assert client.drain_pending_messages(10) == [
+        {"type": "resync_required", "payload": {"session_ids": ["s1"]}}
+    ]
+
+
+def test_subscribe_ack_rejection_invalidates_socket_and_enters_recovery(monkeypatch):
+    client, _, _, ws, _ = started_client()
+    recoveries = []
+    monkeypatch.setattr(client, "_request_recovery", recoveries.append)
+    client.subscribe(["s1"])
+    subscribe = [message for message in sent_ws_messages(ws) if message["type"] == "subscribe"][-1]
+
+    assert not client._handle_ws_message(
+        {
+            "type": "ack",
+            "id": subscribe["id"],
+            "payload": {"code": 0, "accepted": [], "not_found": ["s1"]},
+        },
+        ws=ws,
+        generation=client._ws_generation,
+    )
+
+    assert client._ws is None
+    assert recoveries and "subscribe rejected" in recoveries[0]
 
 
 def test_session_event_dispatched_as_kimi_event():
@@ -734,6 +893,17 @@ def test_delta_coalescing_preserves_spaces_and_ignores_offset_replay():
     drained = client.drain_pending_messages(limit=10)
     assert len(drained) == 1
     assert drained[0]["payload"]["event"]["text"] == "The user"
+
+
+def test_delta_coalescing_preserves_offset_gap_for_owner_completeness_check():
+    client, *_ = started_client()
+
+    client._enqueue_event(_delta("abc", kind="assistant", data={"offset": 0}))
+    client._enqueue_event(_delta("F", kind="assistant", data={"offset": 5}))
+
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["payload"]["event"]["text"] for message in drained] == ["abc", "F"]
+    assert [message["payload"]["event"]["data"]["offset"] for message in drained] == [0, 5]
 
 
 # ----------------------------------------------------------------------
@@ -949,6 +1119,44 @@ def test_terminal_send_failure_is_wrapped_and_reported_once():
     assert "second closed" in drained[0]["payload"]["error"]
 
 
+def test_recovery_exhaustion_uses_bounded_exponential_backoff(monkeypatch):
+    client, _, _, old_ws, _ = started_client(
+        recovery_attempts=3,
+        recovery_backoff=0.25,
+    )
+    sleeps = []
+    monkeypatch.setattr(kimi_server_client.time, "sleep", lambda seconds: sleeps.append(seconds))
+    client.ws_factory = lambda _url, _headers: (_ for _ in ()).throw(ConnectionError("still down"))
+    assert client._invalidate_ws(old_ws, "reader down", notify=False)
+
+    client._recovery_generation += 1
+    client._recovery_loop(client._recovery_generation, "reader down")
+
+    assert sleeps == [0.25, 0.5]
+    drained = client.drain_pending_messages(limit=10)
+    assert [message["type"] for message in drained] == ["transport_error"]
+    assert "recovery exhausted" in drained[0]["payload"]["error"]
+
+
+def test_recovery_hands_off_when_replacement_reader_fails_during_worker(monkeypatch):
+    client, _, _, old_ws, _ = started_client(recovery_attempts=1, recovery_backoff=0)
+    assert client._invalidate_ws(old_ws, "reader down", notify=False)
+    handoffs = []
+
+    def replacement_fails():
+        client._recovery_requested = True
+        raise ConnectionError("replacement reader failed")
+
+    monkeypatch.setattr(client, "_connect_ws_locked", replacement_fails)
+    monkeypatch.setattr(client, "_request_recovery", handoffs.append)
+    client._recovery_generation += 1
+
+    client._recovery_loop(client._recovery_generation, "reader down")
+
+    assert handoffs == ["replacement reader failed"]
+    assert client.drain_pending_messages(limit=10) == []
+
+
 def test_close_during_socket_activity_is_silent_and_idempotent():
     ws = BlockingWebSocket()
     client, proc, http, _, _ = started_client(ws=ws, start_reader_thread=True)
@@ -1021,3 +1229,107 @@ def test_module_does_not_import_wx():
 
     assert "import wx" not in source
     assert "from wx" not in source
+
+
+def test_sequenced_frame_without_epoch_inherits_confirmed_epoch():
+    client, *_ = started_client()
+    client._session_cursors["session-1"] = {"epoch": "epoch-a", "seq": 4}
+    client._stable_event_cursors["session-1"] = ("epoch-a", 4)
+
+    accepted = client._accept_session_event({
+        "type": "event",
+        "session_id": "session-1",
+        "seq": 5,
+        "payload": {"type": "turn.started", "turnId": "t1"},
+    })
+
+    assert accepted is True
+    assert client._session_cursors["session-1"] == {"epoch": "epoch-a", "seq": 5}
+    assert client._stable_event_cursors["session-1"] == ("epoch-a", 5)
+
+
+def test_same_seq_offsetless_volatile_state_keeps_distinct_phases():
+    client, *_ = started_client()
+    base = {"type": "event", "session_id": "session-1", "epoch": "e", "seq": 7, "volatile": True}
+    first = {**base, "payload": {"type": "agent.status.updated", "phase": {"kind": "thinking"}}}
+    second = {**base, "payload": {"type": "agent.status.updated", "phase": {"kind": "tool"}}}
+
+    assert client._accept_session_event(first) is True
+    assert client._accept_session_event(second) is True
+    assert client._accept_session_event(dict(first)) is False
+
+
+def test_rejected_subscription_is_quarantined_before_recovery():
+    client, *_ = started_client()
+    client._subscribed_sessions.update({"good", "bad"})
+    client._subscribe_requests["req"] = {"good", "bad"}
+
+    with pytest.raises(KimiServerError, match="bad"):
+        client._handle_ack({
+            "type": "ack", "id": "req",
+            "payload": {"accepted": ["good"], "not_found": ["bad"]},
+        })
+
+    assert client._subscribed_sessions == {"good"}
+
+
+def test_http_200_application_5xx_post_is_result_unknown():
+    client, _, http, _, _ = started_client()
+    http.routes[("POST", "/api/v1/sessions/session-1/prompts")] = FakeResponse(
+        200, {"code": 50001, "msg": "internal", "data": None}
+    )
+
+    with pytest.raises(KimiServerError) as caught:
+        client.submit_prompt("session-1", [{"type": "text", "text": "hello"}])
+
+    assert caught.value.result_unknown is True
+
+
+def test_successful_recovery_reports_actual_sessions_once(monkeypatch):
+    client, _, _, old_ws, _ = started_client(recovery_attempts=1)
+    client._subscribed_sessions.update({"session-b", "session-a"})
+    client._invalidate_ws(old_ws, "reader reset", recover=False)
+
+    def reconnect():
+        with client._lifecycle_lock:
+            client._ws = FakeWebSocket()
+            ready = client._transport_ready_events.setdefault(client._ws_generation, threading.Event())
+            ready.set()
+
+    monkeypatch.setattr(client, "_connect_ws_locked", reconnect)
+    client._recovery_generation += 1
+    client._recovery_loop(client._recovery_generation, "reader reset")
+
+    recovered = [
+        message for message in client.drain_pending_messages(limit=10)
+        if message.get("type") == "transport_recovered"
+    ]
+    assert recovered == [{
+        "type": "transport_recovered",
+        "payload": {"session_ids": ["session-a", "session-b"]},
+    }]
+
+
+def test_same_client_process_restart_rediscovers_token(monkeypatch):
+    processes = iter((FakeProcess(), FakeProcess()))
+    tokens = iter(("token-a", "token-b"))
+    sockets = []
+    client = KimiServerClient(
+        process_factory=lambda _args: next(processes),
+        http_session_factory=FakeHttpSession,
+        ws_factory=lambda _url, headers: sockets.append(list(headers)) or FakeWebSocket(),
+        launch_command=["/fake/kimi"],
+        token=None,
+        start_reader_thread=False,
+    )
+    monkeypatch.setattr(client, "_find_token", lambda: next(tokens))
+
+    client.start()
+    first_process = client.process
+    assert client.token == "token-a"
+    first_process.returncode = 1
+    client.start()
+
+    assert client.process is not first_process
+    assert client.token == "token-b"
+    assert sockets[-1] == ["Authorization: Bearer token-b"]
