@@ -10,6 +10,7 @@
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
 - [`experience.md`](./experience.md)：已经验证、可复用的排障与运行经验
 - [`../_bmad-output/implementation-artifacts/spec-fix-concurrent-kimi-session-event-routing.md`](../_bmad-output/implementation-artifacts/spec-fix-concurrent-kimi-session-event-routing.md)：Kimi 并发 session 事件路由修复的验收规格
+- [`../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md`](../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md)：Kimi F1 执行过程中文化与流式步骤归并的验收规格
 - [`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)：2026-09-06 全量非实时测试的历史失败基线与复现范围
 
 ## 关键当前事实
@@ -17,6 +18,7 @@
 - 笔记数据库不再跟随通用应用数据目录；当前固定使用 `D:\code\note\notes.db`。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
+- Kimi 的 F1 执行过程列表以协议事件生成中文主要步骤；不要把原始英文 `thinking.delta`、状态通知或工具流片段直接作为列表行。
 
 ## 历史归档
 
