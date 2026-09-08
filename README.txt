@@ -1,4 +1,4 @@
-神匠工坊（`mc`）是一个基于 `wxPython` 的 Windows 桌面客户端，当前主要用于统一接入 Codex、Claude Code、OpenClaw 等模型工作流，并管理本地聊天历史、上下文使用量和远程运行时。
+神匠工坊（`mc`）是一个基于 `wxPython` 的 Windows 桌面客户端，当前主要用于统一接入 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，并管理本地聊天历史、上下文使用量和远程运行时。
 
 ## 快速开始
 
@@ -46,6 +46,14 @@ Kimi 的回答列表只在主代理最终正文获得权威完成确认后更新
 python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_model_dispatch.py -q
 ```
 
+## 执行过程与键盘浏览
+
+- F1 在回答与执行过程之间切换；进入执行过程时定位最新项。若历史页尚在加载，会显示“正在加载执行过程”；加载期间切到其他控件，完成后不会抢回焦点。
+- 初始显示最新 100 个内容行（包含问题/最终回答上下文），“更多”不计入这 100 行，可向上展开。后台更新保留仍在页内的所选内容；选中项离页后回退到有效邻近行，不自动追尾。
+- 执行列表支持 Tab / Shift+Tab 单步导航、Enter / Shift+Enter 打开详情、Ctrl+C 复制完整正文。跨聊天加载时不会继续打开或复制上一聊天正文。
+- 导航后的 3 秒静默窗口会延迟后台可见更新；用户主动切换视图仍即时处理。长历史继续扫描在后台进行，但初始最多两次有限页 SQLite 查询仍同步，单次慢读尚可能阻塞。
+- 当前验证与未覆盖范围见 `docs/handoff.md`；真实读屏的 loading→内容播报顺序尚未人工验收。
+
 ## 数据位置
 
 - 聊天历史和通用应用状态仍按应用数据目录解析；源码运行时通常在项目内的 `dist\history`。
@@ -78,4 +86,4 @@ python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_mode
 
 - 把 `README.txt` 视为项目主入口文档。
 - `docs/` 第一层只放当前仍有效的说明文档。
-- 历史设计和计划文档统一放在 `docs/archive/`，默认不作为日常上下文输入。
+- `docs/archive/` 与仍保留在 `docs/superpowers/` 的带日期设计/计划用于历史追溯，不是当前实施清单；当前行为和验收以 `docs/README.md` 指向的规格及交接为准。

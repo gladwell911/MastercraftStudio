@@ -7,21 +7,9 @@
 - The `kimi/` model family chats through a spawned local `kimi web` server; `kimi_server_client.py` owns the process, REST calls, and the WebSocket event stream. Like the codex path, inbound events must be coalesced in the background and handed to the UI in batches (`drain_pending_messages`), never one callback per delta.
 - Provider dispatch must follow the normalized model id, not the transport source: remote `kimi/*`, `codex/*`, and `claudecode/*` messages use their dedicated workers and must not fall through to OpenRouter.
 - Any interactive CLI client reference that can consume later user input must carry its owning `chat_id`. Only matching-chat input may be forwarded to that client; add a cross-chat regression whenever this routing changes.
+- Execution-page changes must preserve the applied chat/turn owner across labels, metadata, selection and detail actions, including pending/error states. Keep bounded foreground reads, generation-checked background results, and automatic retry without interrupting provider drains. See the current execution specification linked from `docs/README.md`.
+- Run wx GUI suites serially. Tests enabling real timers must own cleanup from frame construction through teardown, stopping their timers/scans before destroying the frame; do not disable production drains or relax navigation thresholds to hide cross-test contamination.
 
+## Durable project context
 
-<claude-mem-context>
-# Memory Context
-
-# claude-mem status
-
-This project has no memory yet. The current session will seed it; subsequent sessions will receive auto-injected context for relevant past work.
-
-Memory injection starts on your second session in a project.
-
-`/learn-codebase` is available if the user wants to front-load the entire repo into memory in a single pass (~5 minutes on a typical repo, optional). Otherwise memory builds passively as work happens.
-
-Live activity: http://localhost:37777
-How it works: `/how-it-works`
-
-This message disappears once the first observation lands.
-</claude-mem-context>
+Start with `README.txt` and `docs/README.md`; `docs/handoff.md` is the current snapshot. Dated plans and frozen regression baselines are historical evidence, not proof of current failures or full-suite success. Keep project facts here and in project docs, not in global agent configuration.
