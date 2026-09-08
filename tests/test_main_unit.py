@@ -4113,7 +4113,7 @@ def test_apply_detail_panel_mode_only_rebuilds_when_entering_execution_mode(fram
         "execution_steps": [{"step": "第一步"}],
     }
     render_count = {"n": 0}
-    monkeypatch.setattr(frame, "_render_execution_list", lambda: render_count.__setitem__("n", render_count["n"] + 1))
+    monkeypatch.setattr(frame, "_render_execution_list", lambda **kwargs: render_count.__setitem__("n", render_count["n"] + 1))
 
     frame._apply_detail_panel_mode("execution")
     frame._apply_detail_panel_mode("answers")
@@ -4377,7 +4377,8 @@ def test_append_execution_step_refreshes_visible_execution_list_without_stealing
 
     frame._append_execution_step_to_chat("chat-1", "计划更新：整理步骤")
 
-    assert frame._current_chat_state["execution_steps"] == [{"step": "计划更新：整理步骤"}]
+    assert [step["step"] for step in frame._current_chat_state["execution_steps"]] == ["计划更新：整理步骤"]
+    assert frame._current_chat_state["execution_steps"][0]["id"]
     assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["计划更新：整理步骤"]
     assert frame.execution_list.GetSelection() == 0
     assert clear_count["n"] == 0
@@ -4417,7 +4418,7 @@ def test_append_execution_entry_does_not_steal_focus_from_foreground_control(fra
     assert focus_count["execution"] == 0
 
 
-def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, monkeypatch):
+def test_append_execution_entry_preserves_unfocused_selection_and_appends_at_end(frame, monkeypatch):
     frame.active_chat_id = "chat-1"
     frame.current_chat_id = "chat-1"
     frame._current_chat_state = {
@@ -4457,7 +4458,7 @@ def test_append_execution_entry_preserves_selection_and_appends_at_end(frame, mo
         },
     )
 
-    assert frame.execution_list.GetSelection() == 2
+    assert frame.execution_list.GetSelection() == 0  # Background additions do not move the user's reading position.
     assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["第一步", "第二步", "计划：第三步"]
     assert frame.execution_meta[-1] == ("execution", 2, "计划：第三步", "第三步")
     assert clear_count["n"] == 0
@@ -5839,7 +5840,7 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
     assert frame.answer_meta[0][0] == "context_usage"
 
 
-def test_active_turn_completed_in_execution_mode_does_not_rebuild_execution_list(frame, monkeypatch):
+def test_active_turn_completed_in_execution_mode_preserves_question_and_adds_answer(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 0
@@ -5883,7 +5884,7 @@ def test_active_turn_completed_in_execution_mode_does_not_rebuild_execution_list
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
     assert execution_rebuilds["n"] == 0
     assert frame.active_session_turns[0]["request_status"] == "done"
-    assert rows == ["暂无执行过程"]
+    assert rows == ["我：q", "小诸葛：done"]
 
 
 def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypatch):
@@ -9294,7 +9295,7 @@ def test_final_answer_replaces_temporary_subagent_result(frame, monkeypatch):
     assert frame.active_session_turns[0].get("answer_origin") != "codex-subagent-result"
 
 
-def test_final_answer_live_event_in_execution_mode_does_not_rebuild_execution_list(frame, monkeypatch):
+def test_final_answer_live_event_in_execution_mode_preserves_question_and_adds_answer(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_codex_thread_id = "thread-current"
@@ -9337,7 +9338,7 @@ def test_final_answer_live_event_in_execution_mode_does_not_rebuild_execution_li
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
     answer_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert execution_rebuilds["n"] == 0
-    assert rows == ["暂无执行过程"]
+    assert rows == ["我：q", "小诸葛：最终回答"]
     assert "最终回答" in answer_rows
 
 
@@ -10923,7 +10924,7 @@ def test_f1_focuses_latest_execution_item(frame, monkeypatch):
     assert frame.execution_list.GetStringSelection() == "第二步"
 
 
-def test_f1_switch_to_execution_defers_full_execution_render_when_rows_are_current(frame, monkeypatch):
+def test_f1_switch_to_execution_writes_no_rows_when_projection_is_current(frame, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-f1-fast"
     frame.current_chat_id = "chat-f1-fast"
@@ -10937,11 +10938,9 @@ def test_f1_switch_to_execution_defers_full_execution_render_when_rows_are_curre
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     frame._apply_detail_panel_mode("answers", refresh_execution=False)
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        frame,
-        "_rebuild_execution_list_from_state",
-        lambda *args, **kwargs: pytest.fail("F1 must not force a full execution list rebuild when rows are current"),
-    )
+    for method in ("Clear", "Append", "Insert", "Delete", "SetString"):
+        monkeypatch.setattr(frame.execution_list, method,
+                            lambda *args: pytest.fail("F1 must not rewrite an unchanged page"))
 
     class F1Event:
         def GetKeyCode(self):
@@ -14544,7 +14543,7 @@ def test_background_execution_step_defers_list_append_during_quiet(frame, monkey
     assert frame._pending_execution_tail_appends["chat-active"]
 
 
-def test_pending_execution_steps_append_after_quiet_in_order(frame, monkeypatch):
+def test_pending_execution_steps_sync_canonical_page_after_quiet_in_order(frame, monkeypatch):
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"
     frame.active_turn_idx = 1
@@ -14558,14 +14557,16 @@ def test_pending_execution_steps_append_after_quiet_in_order(frame, monkeypatch)
             (1, {"turn_idx": 1, "display_kind": "commentary", "list_text": "step 2", "detail_text": "step 2"}),
         ]
     }
+    # Deferred entries are notifications; their owner already holds the data.
+    frame._current_chat_state["execution_steps"] = [entry for _, entry in frame._pending_execution_tail_appends["chat-active"]]
     appended = []
-    original_append = frame.execution_list_model.append
+    original_append = frame.execution_list.Append
 
-    def record_append(row_id, row_text):
+    def record_append(row_text):
         appended.append(row_text)
-        return original_append(row_id, row_text)
+        return original_append(row_text)
 
-    monkeypatch.setattr(frame.execution_list_model, "append", record_append)
+    monkeypatch.setattr(frame.execution_list, "Append", record_append)
 
     frame._flush_pending_background_ui_updates()
 
@@ -14596,7 +14597,7 @@ def test_pending_execution_flush_skips_rows_already_rendered_from_store(frame, m
     assert frame.execution_meta == [("execution", 0, "step 1", "step 1")]
 
 
-def test_pending_execution_flush_keeps_unappendable_rows(frame, monkeypatch):
+def test_pending_execution_flush_consumes_old_turn_notification_without_reviving_row(frame, monkeypatch):
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"
     frame.active_turn_idx = 2
@@ -14608,8 +14609,8 @@ def test_pending_execution_flush_keeps_unappendable_rows(frame, monkeypatch):
 
     frame._flush_pending_background_ui_updates()
 
-    assert frame._pending_execution_tail_appends["chat-active"][0][1]["list_text"] == "step 1"
-    assert frame._execution_list_dirty is True
+    assert frame._pending_execution_tail_appends == {}
+    assert frame.execution_list.GetString(0) == "暂无执行过程"
 
 
 def test_background_history_answer_dirty_flushes_visible_history_answer_after_quiet(frame, monkeypatch):
@@ -17212,7 +17213,7 @@ def test_submit_question_resets_answer_list_visible_limit(frame, monkeypatch):
     assert frame.answer_visible_row_limit == 100
 
 
-def test_active_execution_list_shows_only_current_turn_steps(frame):
+def test_active_execution_list_shows_current_turn_question_and_steps(frame):
     frame.active_session_turns = [
         {"question": "old", "answer_md": "old answer", "model": "codex/main"},
         {"question": "new", "answer_md": main.REQUESTING_TEXT, "model": "codex/main"},
@@ -17231,10 +17232,10 @@ def test_active_execution_list_shows_only_current_turn_steps(frame):
     frame._render_execution_list()
 
     visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
-    assert visible == ["new process"]
+    assert visible == ["我：new", "new process"]
 
 
-def test_execution_list_defaults_to_latest_100_rows_and_shows_more_at_top(frame):
+def test_execution_list_defaults_to_latest_100_content_rows_including_answer(frame):
     frame.active_turn_idx = 1
     frame._current_chat_state = {
         "id": "chat-current",
@@ -17254,7 +17255,7 @@ def test_execution_list_defaults_to_latest_100_rows_and_shows_more_at_top(frame)
     visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert visible[0] == "更多"
     assert "process 0" not in visible
-    assert "process 20" in visible
+    assert visible == ["更多"] + [f"process {idx}" for idx in range(21, 120)] + ["小诸葛：a"]
     assert "process 119" in visible
     assert frame.execution_meta[0] == ("more", -1, "更多", "")
     assert frame.execution_list.GetCount() == 101
@@ -17284,7 +17285,7 @@ def test_execution_list_does_not_show_more_when_filtered_visible_rows_are_under_
     assert frame.execution_total_content_rows == 75
 
 
-def test_execution_list_uses_recent_store_page_without_full_step_load(frame, tmp_path, monkeypatch):
+def test_execution_list_recent_store_page_counts_answer_without_full_step_load(frame, tmp_path, monkeypatch):
     frame.chat_db_path = tmp_path / "chat_history.db"
     frame.chat_store = main.ChatStore(frame.chat_db_path, max_execution_steps_per_turn=1000)
     frame.chat_store.initialize()
@@ -17320,7 +17321,7 @@ def test_execution_list_uses_recent_store_page_without_full_step_load(frame, tmp
     visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert visible[0] == "更多"
     assert "process 149" not in visible
-    assert "process 150" in visible
+    assert visible == ["更多"] + [f"process {idx}" for idx in range(151, 250)] + ["小诸葛：a"]
     assert "process 249" in visible
     assert frame.execution_list.GetCount() == 101
 
@@ -17372,7 +17373,7 @@ def test_open_selected_execution_detail_with_summary_does_not_hydrate_all_steps(
     assert opened[1] == ("open", "detail.html")
 
 
-def test_execution_list_more_item_expands_upward_and_hides_when_all_visible(frame):
+def test_execution_list_more_expands_all_steps_and_context_without_duplicates(frame):
     frame.active_turn_idx = 1
     frame._current_chat_state = {
         "id": "chat-current",
@@ -17392,18 +17393,18 @@ def test_execution_list_more_item_expands_upward_and_hides_when_all_visible(fram
     assert frame._try_open_selected_execution_detail() is True
     visible_after_one = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert visible_after_one[0] == "更多"
-    assert "process 20" in visible_after_one
+    assert visible_after_one == ["更多"] + [f"process {idx}" for idx in range(21, 220)] + ["小诸葛：a"]
     assert "process 0" not in visible_after_one
     assert frame.execution_list.GetCount() == 201
 
     assert frame._try_open_selected_execution_detail() is True
     visible_after_two = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
-    assert visible_after_two[0] == "process 0"
+    assert visible_after_two == ["我：q"] + [f"process {idx}" for idx in range(220)] + ["小诸葛：a"]
     assert "更多" not in visible_after_two
-    assert frame.execution_list.GetCount() == 220
+    assert frame.execution_list.GetCount() == 222
 
 
-def test_appending_execution_entry_keeps_latest_100_rows_with_more_at_top(frame, monkeypatch):
+def test_appending_execution_entry_keeps_latest_100_content_rows_including_answer(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 1
@@ -17430,8 +17431,7 @@ def test_appending_execution_entry_keeps_latest_100_rows_with_more_at_top(frame,
     visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert visible[0] == "更多"
     assert "process 0" not in visible
-    assert "process 1" in visible
-    assert visible[-1] == "process 100"
+    assert visible == ["更多"] + [f"process {idx}" for idx in range(2, 101)] + ["小诸葛：a"]
     assert frame.execution_list.GetCount() == 101
 
 
@@ -18782,10 +18782,12 @@ def test_idle_execution_flush_renders_when_user_is_idle(frame, monkeypatch):
     assert frame._execution_list_dirty is False
 
 
-def test_deferred_execution_repaint_waits_for_idle_when_primary_control_has_focus(frame, monkeypatch):
+def test_deferred_execution_repaint_waits_while_primary_navigation_is_quiet(frame, monkeypatch):
     frame._current_chat_state = {"id": "chat-current", "turns": [], "detail_panel_mode": "execution", "execution_steps": []}
     frame._execution_list_deferred_repaint = True
     frame._execution_list_deferred_select_latest = True
+    # Focus alone must not suppress changed content after quiet ends.
+    frame._navigation_quiet_until = time.monotonic() + main.NAVIGATION_QUIET_SECONDS
     delayed = []
     monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
     monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: pytest.fail("focused controls should not repaint execution list immediately"))
@@ -19188,7 +19190,7 @@ def test_execution_store_merge_uses_stable_identity_and_timestamp_order(frame):
 
     total, rows = frame._current_execution_steps_for_render()
 
-    assert total == 3
+    assert total == 2  # Available merged rows, rather than unread raw status rows.
     assert [row["id"] for row in rows] == ["early-step", "shared-step"]
     assert rows[1]["list_text"] == "new label"
 
@@ -19215,3 +19217,571 @@ def test_clear_context_auto_resend_skips_local_command_turns(frame, monkeypatch)
 
     assert frame._clear_context_and_start_new_chat(auto_resend_first=True) is True
     assert submitted == ["真正的问题"]
+
+
+@pytest.mark.parametrize("count", [99, 100, 101])
+def test_execution_content_page_boundaries_include_question_and_answer(frame, count):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-current", "detail_panel_mode": "execution",
+        "turns": [{"question": "q", "answer_md": "a"}],
+        "execution_steps": [{"step": f"step {i}", "turn_idx": 0} for i in range(count - 2)],
+    }
+    frame._render_execution_list()
+    expected = ["我：q"] + [f"step {i}" for i in range(count - 2)] + ["小诸葛：a"]
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == (
+        ["更多"] + expected[-100:] if count > 100 else expected
+    )
+    assert len(frame.execution_meta) == len(frame.execution_list_model.visible_ids) == frame.execution_list.GetCount()
+
+
+@pytest.mark.parametrize("question,answer,expected", [
+    ("", "", ["暂无执行过程"]), ("q", "", ["我：q"]), ("", "a", ["小诸葛：a"]),
+])
+def test_execution_empty_turn_context_rows(frame, question, answer, expected):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution",
+                                 "turns": [{"question": question, "answer_md": answer}], "execution_steps": []}
+    frame._render_execution_list()
+    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == expected
+
+
+def test_execution_selection_identity_survives_context_insert_and_page_slide(frame, monkeypatch):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution",
+        "turns": [{"question": "", "answer_md": ""}],
+        "execution_steps": [{"step": f"step {i}", "turn_idx": 0} for i in range(99)]}
+    frame._render_execution_list()
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
+    frame.execution_list.SetSelection(20)
+    selected_id = frame.execution_list_model.selected_id()
+    frame._current_chat_state["turns"][0]["question"] = "q"
+    frame._rebuild_execution_list_from_state()
+    assert frame.execution_list.GetSelection() == 21
+    assert frame.execution_list_model.selected_id() == selected_id
+    frame._current_chat_state["execution_steps"].extend({"step": f"step {i}", "turn_idx": 0} for i in range(99, 110))
+    frame._rebuild_execution_list_from_state()
+    assert frame.execution_list.GetStringSelection() == "step 20"
+    assert frame.execution_list_model.selected_id() == selected_id
+    frame.execution_list.SetSelection(1)
+    frame._current_chat_state["execution_steps"].append({"step": "step 110", "turn_idx": 0})
+    frame._rebuild_execution_list_from_state()
+    assert frame.execution_list.GetSelection() == 1
+    assert frame.execution_list.GetStringSelection() == "step 11"
+
+
+def test_execution_same_state_replay_has_zero_control_operations(frame, monkeypatch):
+    frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution", "turns": [],
+                                 "execution_steps": [{"step": "same"}, {"step": "same"}]}
+    frame._render_execution_list()
+    assert len(set(frame.execution_list_model.visible_ids)) == 2
+    for method in ("Clear", "Append", "Insert", "Delete", "SetString", "SetSelection"):
+        monkeypatch.setattr(frame.execution_list, method, lambda *args: pytest.fail("unchanged execution wrote control"))
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *args: pytest.fail("unchanged execution repainted"))
+    frame._append_visible_execution_entry(frame._current_chat_state, 1, frame._current_chat_state["execution_steps"][1])
+
+
+def test_execution_quiet_sync_failure_automatically_retries_notification(frame, monkeypatch, wx_app):
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution", "turns": [],
+                                 "execution_steps": [{"step": "canonical"}]}
+    frame._render_execution_list()
+    frame._pending_execution_tail_appends = {"chat-current": [(0, {"step": "stale"})], "other-chat": [(0, {})]}
+    original = frame.execution_list_model.replace_visible_page
+    attempts = []
+    def flaky(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary failure")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(frame.execution_list_model, "replace_visible_page", flaky)
+    monkeypatch.setattr(frame, "_primary_navigation_control_is_recently_active", lambda: False)
+    frame._flush_pending_execution_tail_appends()
+    assert "chat-current" in frame._pending_execution_tail_appends
+    assert frame._execution_list_dirty
+    deadline = time.monotonic() + 2
+    while frame._execution_list_dirty and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert len(attempts) == 2, (frame._idle_ui_refresh_scheduled, frame._idle_ui_refresh_timer, frame._execution_list_dirty, frame._execution_retry_after, time.monotonic())
+    assert frame.execution_list.GetString(0) == "canonical"
+    assert len(attempts) == 2
+    assert set(frame._pending_execution_tail_appends) == {"other-chat"}
+
+
+def test_execution_history_bounded_pages_merge_unsaved_tail_and_skip_hidden_rows(frame, tmp_path, monkeypatch, wx_app):
+    store = main.ChatStore(tmp_path / "execution.db", max_execution_steps_per_turn=1000)
+    store.initialize()
+    store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
+    store.replace_turns("history", [{"question": "q", "answer_md": "a"}])
+    for i in range(350):
+        store.append_execution_step("history", {"id": str(i), "turn_idx": 0, "created_at": i + 1,
+            "display_kind": "command" if i >= 120 else "commentary", "list_text": f"step {i}"})
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.archived_chats = [{"id": "history"}]
+    frame.view_mode = "history"
+    frame.view_history_id = "history"
+    monkeypatch.setattr(store, "load_execution_steps", lambda *a, **kw: pytest.fail("full history execution read"))
+    reads = []
+    original = store.load_recent_execution_steps
+    def read_page(*args, **kwargs):
+        reads.append(kwargs)
+        result = original(*args, **kwargs)
+        assert len(result[1]) <= kwargs["limit"]
+        return result
+    monkeypatch.setattr(store, "load_recent_execution_steps", read_page)
+    frame._render_execution_list(force=True)
+    deadline = time.monotonic() + 2
+    while frame._execution_list_dirty and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert len(reads) == 4
+    assert all(read["limit"] == 100 for read in reads)
+    chat = frame._find_archived_chat("history")
+    chat["execution_steps"] = [{"id": "tail", "turn_idx": 0, "created_at": 400, "step": "unsaved tail"}]
+    frame._mark_execution_list_dirty()
+    frame._render_execution_list(force=True)
+    deadline = time.monotonic() + 2
+    while frame._execution_list_dirty and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert frame.execution_list.GetString(frame.execution_list.GetCount() - 2) == "unsaved tail"
+    frame.execution_visible_row_limit = 200
+    frame._render_execution_list(force=True)
+    labels = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    assert labels == ["我：q"] + [f"step {i}" for i in range(120)] + ["unsaved tail", "小诸葛：a"]
+    assert "更多" not in labels
+
+
+def test_execution_history_duplicate_legacy_rows_keep_identity_when_page_expands(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "duplicates.db")
+    store.initialize()
+    store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
+    store.replace_turns("history", [])
+    for i in range(250):
+        store.append_execution_step("history", {"item_id": "reused-provider-id", "turn_idx": 0, "step": "same", "created_at": 1})
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.archived_chats = [{"id": "history"}]
+    frame.view_mode = "history"
+    frame.view_history_id = "history"
+    frame._render_execution_list(force=True)
+    monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
+    frame.execution_list.SetSelection(20)
+    selected_id = frame.execution_list_model.selected_id()
+    assert len(set(frame.execution_list_model.visible_ids)) == 101
+    frame.execution_visible_row_limit = 200
+    frame._render_execution_list(force=True)
+    assert frame.execution_list_model.selected_id() == selected_id
+    assert frame.execution_list.GetSelection() == 120
+    assert len(set(frame.execution_list_model.visible_ids)) == 201
+
+
+def test_execution_history_memory_overrides_hidden_rows_before_more_decision(frame, tmp_path):
+    store = main.ChatStore(tmp_path / "overrides.db", max_execution_steps_per_turn=1000)
+    store.initialize()
+    store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
+    store.replace_turns("history", [{"question": "old q", "answer_md": "old a"},
+                                    {"question": "new q", "answer_md": "new a"}])
+    for i in range(230):
+        store.append_execution_step("history", {"id": str(i), "turn_idx": int(i >= 100),
+                                                "created_at": i + 1, "step": f"step {i}"})
+    memory = [dict(row, display_kind="command") for row in store.load_recent_execution_steps("history", limit=50)[1]]
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.archived_chats = [{"id": "history", "turns": store.load_chat("history")["turns"],
+                             "detail_panel_mode": "execution", "execution_steps": memory}]
+    frame.view_mode, frame.view_history_id = "history", "history"
+    frame._render_execution_list(force=True)
+    labels = list(frame.execution_list.GetStrings())
+    assert labels == ["更多"] + [f"step {i}" for i in range(81, 180)] + ["小诸葛：new a"]
+    assert "小诸葛：old a" not in labels
+    frame.execution_list.SetSelection(20)
+    selected = frame.execution_list_model.selected_id()
+    # Loading the same records fully must preserve both row IDs and selection.
+    full = store.load_execution_steps("history")
+    full[-50:] = memory
+    frame.archived_chats[0]["execution_steps"] = full
+    frame._render_execution_list(force=True)
+    assert list(frame.execution_list.GetStrings()) == labels
+    assert frame.execution_list_model.selected_id() == selected
+    assert frame.execution_list.GetSelection() == 20
+
+
+def test_execution_new_row_identity_survives_persistence(frame, tmp_path):
+    store = main.ChatStore(tmp_path / "identity.db")
+    store.initialize()
+    frame.current_chat_id = frame.active_chat_id = "identity"
+    frame._current_chat_state = {"id": "identity", "turns": [], "detail_panel_mode": "execution", "execution_steps": []}
+    frame._append_execution_entry_to_chat("identity", {"item_id": "provider", "step": "new"}, save_state=False)
+    selected = frame.execution_list_model.selected_id()
+    store.upsert_chat({"id": "identity"})
+    store.append_execution_step("identity", frame._current_chat_state["execution_steps"][0])
+    frame._current_chat_state["execution_steps"] = store.load_execution_steps("identity")
+    frame._render_execution_list(force=True)
+    assert frame.execution_list_model.selected_id() == selected
+    assert frame.execution_list.GetStringSelection() == "new"
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi"])
+def test_execution_drain_projection_failure_retries_and_keeps_queue_and_persistence(frame, monkeypatch, wx_app, provider):
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    monkeypatch.setattr(frame, "_primary_navigation_control_is_recently_active", lambda: False)
+    monkeypatch.setattr(frame, "_navigation_quiet_active", lambda: False)
+    frame.current_chat_id = frame.active_chat_id = "drain"
+    frame._current_chat_state = {"id": "drain", "turns": [], "detail_panel_mode": "execution", "execution_steps": []}
+    monkeypatch.setattr(frame, f"_{provider}_ui_event_batch_size", lambda: 1)
+    def event(chat_id, value):
+        frame._current_chat_state["execution_steps"].append({"step": value.text})
+        frame._request_execution_list_sync(frame._current_chat_state)
+    monkeypatch.setattr(frame, f"_on_{provider}_event_for_chat", event)
+    persisted = []
+    monkeypatch.setattr(frame, "_start_execution_step_persist_worker", lambda: persisted.append(1))
+    projection = frame._execution_page_projection
+    attempts = []
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("one read failed")
+        return projection()
+    monkeypatch.setattr(frame, "_execution_page_projection", flaky)
+    setattr(frame, f"_pending_{provider}_ui_events", [
+        ("drain", main.CodexEvent(type="plan_updated", text=str(i))) for i in range(3)])
+    getattr(frame, f"_drain_{provider}_ui_events")()
+    assert persisted == [1]
+    assert frame._execution_list_dirty
+    deadline = time.monotonic() + 3
+    while (frame._execution_list_dirty or getattr(frame, f"_pending_{provider}_ui_events")) and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert list(frame.execution_list.GetStrings()) == ["0", "1", "2"]
+    assert len(persisted) == 3
+    assert not getattr(frame, f"_pending_{provider}_ui_events")
+    assert not frame._execution_list_dirty
+
+
+def test_execution_kimi_changed_batch_projects_and_repaints_once(frame, monkeypatch):
+    frame.current_chat_id = frame.active_chat_id = "kimi-batch"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [{"question": "q", "answer_md": main.REQUESTING_TEXT, "model": "kimi/kimi-for-coding"}]
+    frame._current_chat_state = {"id": "kimi-batch", "turns": frame.active_session_turns,
+                                 "detail_panel_mode": "execution", "execution_steps": []}
+    monkeypatch.setattr(frame, "_save_state", lambda *a, **kw: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_navigation_quiet_active", lambda: False)
+    frame._render_execution_list(force=True)
+    syncs, repaints = [], []
+    original = frame.execution_list_model.replace_visible_page
+    def sync(*args, **kwargs):
+        syncs.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(frame.execution_list_model, "replace_visible_page", sync)
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda control: repaints.append(control))
+    frame._pending_kimi_ui_events = [("kimi-batch", main.CodexEvent(
+        type="plan_updated", text=f"plan {i}", data={"turn_idx": 0})) for i in range(4)]
+    frame._drain_kimi_ui_events()
+    assert len(syncs) == 1
+    assert repaints.count(frame.execution_list) == 1
+    assert len(frame._current_chat_state["execution_steps"]) == 4
+    assert frame.execution_list.GetCount() == 5
+
+
+def test_execution_idle_store_failure_automatically_recovers(frame, monkeypatch, tmp_path, wx_app):
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    monkeypatch.setattr(frame, "_primary_navigation_control_is_recently_active", lambda: False)
+    store = main.ChatStore(tmp_path / "retry.db")
+    store.initialize()
+    store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
+    store.append_execution_step("history", {"step": "recovered"})
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "history"}]
+    frame.view_mode, frame.view_history_id = "history", "history"
+    frame._current_execution_steps()  # Hydrate only metadata before the timer.
+    original, attempts = store.load_recent_execution_steps, []
+    def flaky(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("database transiently unavailable")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", flaky)
+    frame._mark_execution_list_dirty()
+    frame._flush_idle_ui_refreshes()
+    assert frame._execution_list_dirty and len(attempts) == 1
+    deadline = time.monotonic() + 3
+    while frame._execution_list_dirty and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert list(frame.execution_list.GetStrings()) == ["recovered"]
+    assert len(attempts) == 2
+    assert not frame._execution_list_dirty
+
+
+@pytest.mark.parametrize("change", ["chat", "clear", "event", "answers", "close"])
+def test_execution_history_scan_discards_stale_completion(frame, monkeypatch, tmp_path, wx_app, change):
+    store = main.ChatStore(tmp_path / "cancel.db", max_execution_steps_per_turn=1000)
+    store.initialize()
+    store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
+    for i in range(310):
+        store.append_execution_step("history", {"step": f"old {i}", "display_kind": "command" if i > 10 else ""})
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "history"}]
+    frame.view_mode, frame.view_history_id = "history", "history"
+    blocked, release, exited = threading.Event(), threading.Event(), threading.Event()
+    original = store.load_recent_execution_steps
+    def read(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            blocked.set()
+            assert release.wait(5)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                exited.set()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    try:
+        frame._render_execution_list(force=True)
+        assert blocked.wait(1)
+        before = list(frame.execution_list.GetStrings())
+        if change == "chat":
+            frame.view_history_id = "other"
+        elif change == "answers":
+            frame._apply_detail_panel_mode("answers")
+        elif change == "clear":
+            frame._reset_execution_visible_row_limit()
+        elif change == "event":
+            frame._mark_execution_list_dirty()
+        else:
+            destroy = frame.Destroy
+            monkeypatch.setattr(frame, "Destroy", lambda: None)  # Fixture owns the same frame.
+            destroy()
+        release.set()
+        assert exited.wait(1)
+        # Drain the actual posted completion, which must not touch any list.
+        if change != "close":
+            monkeypatch.setattr(frame.execution_list_model, "replace_visible_page",
+                                lambda *a, **kw: pytest.fail("stale scan updated list"))
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            wx_app.Yield()
+        if change != "close":
+            assert list(frame.execution_list.GetStrings()) == before
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("step", ["same string", {"step": "same dictionary"}])
+def test_execution_repeated_object_occurrences_preserve_second_selection(frame, step):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {"id": "repeated", "detail_panel_mode": "execution",
+        "turns": [{"question": "", "answer_md": ""}], "execution_steps": [step, step]}
+    frame._render_execution_list()
+    assert len(set(frame.execution_list_model.visible_ids)) == 2
+    frame.execution_list.SetSelection(1)
+    selected = frame.execution_list_model.selected_id()
+    frame._render_execution_list()
+    assert frame.execution_list.GetSelection() == 1
+    assert frame.execution_list_model.selected_id() == selected
+    frame._current_chat_state["turns"][0]["question"] = "q"
+    frame._render_execution_list()
+    assert frame.execution_list.GetSelection() == 2
+    assert frame.execution_list_model.selected_id() == selected
+
+
+def test_execution_legacy_partial_overlap_matches_occurrences_without_dropping_rows(frame):
+    step = {"step": "same", "turn_idx": 0, "created_at": 1}
+    persisted = [dict(step, _store_step_index=i) for i in range(3)]
+    merged = frame._merge_execution_page(persisted, [dict(step), dict(step), {"step": "unsaved", "created_at": 2}])
+    assert len(merged) == 4
+    assert [row["_store_step_index"] for row in merged[:3]] == [0, 1, 2]
+    assert merged[-1]["step"] == "unsaved"
+    provider_rows = [dict(step, item_id="reused", _store_step_index=i) for i in range(3)]
+    assert len(frame._merge_execution_page(provider_rows, [dict(step, item_id="reused")] * 2)) == 3
+    distinct = [dict(step, item_id="reused", step="first", _store_step_index=0),
+                dict(step, item_id="reused", step="second", _store_step_index=1)]
+    tail = dict(step, item_id="reused", step="second")
+    assert [row["step"] for row in frame._merge_execution_page(distinct, [tail])] == ["first", "second"]
+
+
+def test_execution_legacy_provider_source_switch_restores_content_not_index(frame):
+    frame._current_chat_state = {"id": "legacy", "detail_panel_mode": "execution", "turns": [],
+        "execution_steps": [{"item_id": "a", "step": "a"}, {"item_id": "b", "step": "selected b"}]}
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(1)
+    frame._current_chat_state["execution_steps"] = [
+        {"item_id": "earlier", "step": "earlier", "_store_step_index": 0},
+        {"item_id": "a", "step": "a", "_store_step_index": 1},
+        {"item_id": "b", "step": "selected b", "_store_step_index": 2}]
+    frame._render_execution_list()
+    assert frame.execution_list.GetSelection() == 2
+    assert frame.execution_list.GetStringSelection() == "selected b"
+    assert frame.execution_list_model.selected_id().endswith(":store:2")
+
+
+def _prepare_execution_async_history(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "async-followup.db", max_execution_steps_per_turn=2000)
+    store.initialize()
+    store.upsert_chat({"id": "async", "detail_panel_mode": "answers"})
+    store.replace_turns("async", [{"question": "B question", "answer_md": "B answer"}])
+    for i in range(650):
+        store.append_execution_step("async", {"step": f"B step {i}", "turn_idx": 0,
+            "created_at": i + 1, "display_kind": "command" if i >= 120 else ""})
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "async"}]
+    frame.view_mode, frame.view_history_id = "history", "async"
+    frame._current_execution_steps()
+    monkeypatch.setattr(frame, "_primary_navigation_control_is_recently_active", lambda: False)
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    monkeypatch.setattr(frame, "_save_state", lambda *a, **kw: None)
+    return store
+
+
+@pytest.mark.parametrize("leave", [False, True])
+def test_execution_async_f1_consumes_latest_intent_without_recapturing_focus(frame, monkeypatch, tmp_path, wx_app, leave):
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    frame.Show()
+    wx_app.Yield()
+    store = _prepare_execution_async_history(frame, tmp_path, monkeypatch)
+    blocked, release = threading.Event(), threading.Event()
+    original = store.load_recent_execution_steps
+    def read(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            blocked.set()
+            assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    try:
+        event = wx.KeyEvent(wx.wxEVT_CHAR_HOOK)
+        event.SetKeyCode(wx.WXK_F1)
+        frame._on_char_hook(event)
+        assert blocked.wait(1)
+        assert frame.execution_list.HasFocus()
+        assert frame._execution_latest_intent is not None
+        if leave:
+            frame.input_edit.SetFocus()
+        release.set()
+        deadline = time.monotonic() + 3
+        while frame._execution_list_dirty and time.monotonic() < deadline:
+            wx_app.Yield()
+        assert not frame._execution_list_dirty
+        assert frame._execution_latest_intent is None
+        if leave:
+            assert frame.input_edit.HasFocus()
+        else:
+            assert frame.execution_list.HasFocus()
+            assert frame.execution_list.GetStringSelection() == "小诸葛：B answer"
+    finally:
+        release.set()
+
+
+def test_execution_background_scan_error_automatically_retries(frame, monkeypatch, tmp_path, wx_app):
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    store = _prepare_execution_async_history(frame, tmp_path, monkeypatch)
+    original, failed = store.load_recent_execution_steps, threading.Event()
+    def read(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread() and not failed.is_set():
+            failed.set()
+            raise OSError("third page temporarily failed")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    deadline = time.monotonic() + 3
+    while frame._execution_list_dirty and time.monotonic() < deadline:
+        wx_app.Yield()
+    assert failed.is_set()
+    assert not frame._execution_list_dirty
+    assert frame._execution_scan_pending is None
+    assert frame.execution_list.GetString(frame.execution_list.GetCount() - 1) == "小诸葛：B answer"
+
+
+def test_execution_changed_page_size_discards_blocked_old_scan(frame, monkeypatch, tmp_path, wx_app):
+    store = _prepare_execution_async_history(frame, tmp_path, monkeypatch)
+    original = store.load_recent_execution_steps
+    blocked, release, exited = threading.Event(), threading.Event(), threading.Event()
+    def read(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread() and kwargs["limit"] == 100:
+            blocked.set()
+            assert release.wait(5)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                exited.set()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    try:
+        frame._apply_detail_panel_mode("execution", refresh_execution=True)
+        assert blocked.wait(1)
+        frame.execution_visible_row_limit = 200
+        frame._render_execution_list(force=True)
+        deadline = time.monotonic() + 2
+        while frame._execution_list_dirty and time.monotonic() < deadline:
+            wx_app.Yield()
+        assert not frame._execution_list_dirty
+        labels = list(frame.execution_list.GetStrings())
+        assert labels == ["我：B question"] + [f"B step {i}" for i in range(120)] + ["小诸葛：B answer"]
+        release.set()
+        assert exited.wait(1)
+        wx_app.Yield()
+        assert list(frame.execution_list.GetStrings()) == labels
+        assert frame._execution_scan_pending is None
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("failure", ["read", "retry_after", "loading_write"])
+def test_execution_owner_change_failure_blocks_old_details_and_clipboard(frame, monkeypatch, failure):
+    frame.current_chat_id = frame.active_chat_id = "A"
+    frame._current_chat_state = {"id": "A", "turns": [], "detail_panel_mode": "execution",
+                                 "execution_steps": [{"step": "private A"}]}
+    frame._render_execution_list()
+    frame.execution_list.SetSelection(0)
+    frame.current_chat_id = frame.active_chat_id = "B"
+    frame._current_chat_state = {"id": "B", "turns": [], "detail_panel_mode": "execution",
+                                 "execution_steps": [{"step": "B"}]}
+    monkeypatch.setattr(frame, "_execution_page_projection", lambda: (_ for _ in ()).throw(OSError("read error")))
+    if failure == "retry_after":
+        frame._execution_retry_after = time.monotonic() + 1
+    if failure == "loading_write":
+        monkeypatch.setattr(frame.execution_list_model, "replace_visible_page",
+                            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("native write error")))
+    frame._rebuild_execution_list_from_state()
+    assert frame._selected_execution_text_viewer_content() is None
+    assert frame._try_open_selected_execution_detail() is False
+    assert frame.execution_meta == [("info", -1, "", "")]
+    if failure != "loading_write":
+        assert list(frame.execution_list.GetStrings()) == ["正在加载执行过程"]
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    event = SimpleNamespace(GetKeyCode=lambda: ord("C"), ControlDown=lambda: True, AltDown=lambda: False,
+                            ShiftDown=lambda: False, Skip=lambda: None, StopPropagation=lambda: None)
+    frame._on_execution_key_down(event)
+    assert all("private A" not in text for text in copied)
+
+
+def test_execution_idle_timer_after_destroy_does_not_access_controls(frame, monkeypatch, wx_app):
+    event_loop = wx.GUIEventLoop()
+    activator = wx.EventLoopActivator(event_loop)
+    invoked = []
+    original = frame._flush_idle_ui_refreshes
+    def callback():
+        invoked.append(1)
+        original()
+    monkeypatch.setattr(frame, "_refresh_history", lambda *a: pytest.fail("destroyed frame touched history control"))
+    monkeypatch.setattr(frame, "_render_execution_list", lambda **kw: pytest.fail("destroyed frame touched execution control"))
+    frame._history_list_dirty = frame._execution_list_dirty = True
+    timer = wx.CallLater(1, callback)
+    destroy = frame.Destroy
+    monkeypatch.setattr(frame, "Destroy", lambda: None)
+    destroy()
+    try:
+        deadline = time.monotonic() + 1
+        while not invoked and time.monotonic() < deadline:
+            wx_app.Yield()
+        assert invoked == [1]
+    finally:
+        timer.Stop()
+        del activator

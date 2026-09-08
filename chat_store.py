@@ -333,7 +333,7 @@ class ChatStore:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT payload_json, turn_idx, event_type, display_kind, list_text, detail_text
+                SELECT step_index, payload_json, turn_idx, event_type, display_kind, list_text, detail_text
                 FROM execution_steps
                 WHERE {where}
                 ORDER BY step_index
@@ -343,6 +343,7 @@ class ChatStore:
         out: list[dict[str, Any]] = []
         for row in rows:
             payload = self._json_dict(row["payload_json"])
+            payload["_store_step_index"] = int(row["step_index"])
             payload.setdefault("turn_idx", row["turn_idx"])
             payload.setdefault("event_type", str(row["event_type"] or ""))
             payload.setdefault("display_kind", str(row["display_kind"] or ""))
@@ -357,6 +358,8 @@ class ChatStore:
         *,
         turn_idx: int | None = None,
         limit: int = 100,
+        before_step_index: int | None = None,
+        include_total: bool = True,
     ) -> tuple[int, list[dict[str, Any]]]:
         normalized = str(chat_id or "").strip()
         if not normalized:
@@ -366,15 +369,18 @@ class ChatStore:
         if turn_idx is not None:
             where += " AND turn_idx = ?"
             params.append(int(turn_idx))
+        if before_step_index is not None:
+            where += " AND step_index < ?"
+            params.append(int(before_step_index))
         row_limit = max(1, int(limit or 1))
         with self._connect() as conn:
             total_row = conn.execute(
                 f"SELECT COUNT(*) AS total FROM execution_steps WHERE {where}",
                 tuple(params),
-            ).fetchone()
+            ).fetchone() if include_total else None
             rows = conn.execute(
                 f"""
-                SELECT payload_json, turn_idx, event_type, display_kind, list_text, detail_text
+                SELECT step_index, payload_json, turn_idx, event_type, display_kind, list_text, detail_text
                 FROM execution_steps
                 WHERE {where}
                 ORDER BY step_index DESC
@@ -385,6 +391,7 @@ class ChatStore:
         out: list[dict[str, Any]] = []
         for row in reversed(rows):
             payload = self._json_dict(row["payload_json"])
+            payload["_store_step_index"] = int(row["step_index"])
             payload.setdefault("turn_idx", row["turn_idx"])
             payload.setdefault("event_type", str(row["event_type"] or ""))
             payload.setdefault("display_kind", str(row["display_kind"] or ""))

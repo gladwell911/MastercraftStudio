@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 from chat_store import ChatStore
 
@@ -127,6 +128,7 @@ def test_chat_store_appends_and_loads_execution_steps(tmp_path):
 
     assert store.load_execution_steps("chat-1", turn_idx=0) == [
         {
+            "_store_step_index": 0,
             "turn_idx": 0,
             "event_type": "plan_updated",
             "display_kind": "plan",
@@ -178,6 +180,20 @@ def test_chat_store_loads_recent_execution_steps_with_total_count(tmp_path):
     assert [row["list_text"] for row in rows] == [f"step {idx}" for idx in range(140, 150)]
 
 
+def test_chat_store_execution_pages_keep_duplicate_rows_distinct(tmp_path):
+    store = ChatStore(tmp_path / "execution.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat"})
+    for _ in range(5):
+        store.append_execution_step("chat", {"turn_idx": 0, "step": "same"})
+    total, tail = store.load_recent_execution_steps("chat", limit=2)
+    assert total == 5
+    remaining, previous = store.load_recent_execution_steps("chat", limit=2, before_step_index=tail[0]["_store_step_index"])
+    assert remaining == 3
+    assert [row["_store_step_index"] for row in previous + tail] == [1, 2, 3, 4]
+    assert all(row["step"] == "same" for row in previous + tail)
+
+
 def test_chat_store_concurrent_execution_step_appends_get_unique_indexes(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()
@@ -215,3 +231,25 @@ def test_chat_store_replace_execution_steps_and_meta_round_trip(tmp_path):
 
     assert [step["list_text"] for step in store.load_execution_steps("chat-1")] == ["old", "new"]
     assert store.get_meta("legacy_json_migration_complete") == "1"
+
+
+def test_execution_cursor_avoids_repeated_count_and_shares_full_loader_identity(tmp_path, monkeypatch):
+    store = ChatStore(tmp_path / "cursor.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat"})
+    for i in range(5):
+        store.append_execution_step("chat", {"item_id": "repeated", "step": str(i)})
+    full = store.load_execution_steps("chat")
+    sql = []
+    connect = store._connect
+    def traced():
+        with connect() as conn:
+            conn.set_trace_callback(sql.append)
+            yield conn
+    monkeypatch.setattr(store, "_connect", contextmanager(traced))
+    _total, tail = store.load_recent_execution_steps("chat", limit=2, include_total=False)
+    _total, previous = store.load_recent_execution_steps(
+        "chat", limit=2, before_step_index=tail[0]["_store_step_index"], include_total=False)
+    assert [row["_store_step_index"] for row in previous + tail] == [row["_store_step_index"] for row in full[1:]]
+    assert not any("COUNT(" in statement.upper() for statement in sql)
+    assert len(tail) == len(previous) == 2

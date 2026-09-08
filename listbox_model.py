@@ -70,13 +70,38 @@ class IncrementalListBoxModel:
             if selected_id:
                 self.set_selection_by_id(selected_id)
             return changed
-        self.control.Clear()
-        self.visible_ids = []
-        self.labels_by_id = {}
-        for item_id, label in normalized_rows:
-            self.control.Append(label)
-            self.visible_ids.append(item_id)
-            self.labels_by_id[item_id] = label
+        # Preserve surviving native rows (and their accessibility objects).
+        # If external code changed the physical row count, first repair it
+        # positionally; otherwise only delete/insert identities that changed.
+        if len(control_labels) == len(self.visible_ids):
+            working_ids = list(self.visible_ids)
+            wanted = set(ids)
+            for idx in range(len(working_ids) - 1, -1, -1):
+                if working_ids[idx] not in wanted:
+                    self.control.Delete(idx)
+                    del working_ids[idx]
+            for idx, (item_id, label) in enumerate(normalized_rows):
+                if idx < len(working_ids) and working_ids[idx] == item_id:
+                    continue
+                if item_id in working_ids:
+                    old_idx = working_ids.index(item_id)
+                    self.control.Delete(old_idx)
+                    del working_ids[old_idx]
+                if idx == len(working_ids):
+                    self.control.Append(label)
+                else:
+                    self.control.Insert(label, idx)
+                working_ids.insert(idx, item_id)
+        else:
+            while self.control.GetCount() > len(ids):
+                self.control.Delete(self.control.GetCount() - 1)
+            while self.control.GetCount() < len(ids):
+                self.control.Append(new_labels[self.control.GetCount()])
+        for idx, label in enumerate(new_labels):
+            if self.control.GetString(idx) != label:
+                self.control.SetString(idx, label)
+        self.visible_ids = ids
+        self.labels_by_id = labels
         if selected_id:
             self.set_selection_by_id(selected_id)
         return True

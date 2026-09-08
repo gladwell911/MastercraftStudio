@@ -1,5 +1,8 @@
 import ctypes
 import time
+import threading
+
+import pytest
 
 import main
 
@@ -8,7 +11,7 @@ def _send_listbox_key(window, key_code):
     _send_window_key(window, key_code)
 
 
-def _send_window_key(window, key_code):
+def _send_window_key(window, key_code, *, shift=False):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     wm_keydown = 0x0100
     wm_keyup = 0x0101
@@ -35,8 +38,24 @@ def _send_window_key(window, key_code):
     down_lparam = 1 | (scan << 16)
     up_lparam = 1 | (scan << 16) | (1 << 30) | (1 << 31)
     hwnd = int(window.GetHandle())
-    user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
-    user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
+    original_keys = (ctypes.c_ubyte * 256)()
+    if not user32.GetKeyboardState(original_keys):
+        raise ctypes.WinError(ctypes.get_last_error())
+    keys = (ctypes.c_ubyte * 256)(*original_keys)
+    # SendMessage reads the sending UI thread's keyboard state. Do not inherit
+    # a physical modifier held by the user, or change global keyboard state.
+    for modifier in (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+        keys[modifier] = 0
+    if shift:
+        keys[0x10] = keys[0xA0] = 0x80
+    try:
+        if not user32.SetKeyboardState(keys):
+            raise ctypes.WinError(ctypes.get_last_error())
+        user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
+        user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
+    finally:
+        if not user32.SetKeyboardState(original_keys):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _activate_frame(frame, wx_app):
@@ -62,10 +81,183 @@ def _send_foreground_key(key_code, wx_app):
     wx_app.Yield()
 
 
+def _track_ui_timers_for_test(monkeypatch):
+    timers = []
+    original = main.wx_call_later_if_alive
+    def call_later(*args, **kwargs):
+        timer = original(*args, **kwargs)
+        if timer is not None:
+            timers.append(timer)
+        return timer
+    monkeypatch.setattr(main, "wx_call_later_if_alive", call_later)
+    def cleanup(frame):
+        frame._invalidate_execution_scan()
+        for timer in timers:
+            stop = getattr(timer, "Stop", None)
+            if callable(stop):
+                stop()
+    return cleanup
+
+
+@pytest.fixture
+def _tracked_ui_timers(monkeypatch):
+    # Install before frame construction, which can itself schedule saves.
+    return _track_ui_timers_for_test(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_test_ui_timers(_tracked_ui_timers, frame):
+    # Depending on frame makes this teardown run before the frame is destroyed.
+    yield
+    _tracked_ui_timers(frame)
+
+
+def test_real_ui_execution_native_tab_and_shift_tab_remain_single_hops_during_bursts(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = frame.current_chat_id = "chat-execution-native"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [{"question": "q", "answer_md": main.REQUESTING_TEXT,
+                                  "model": main.DEFAULT_CODEX_MODEL, "codex_turn_id": "turn-native"}]
+    frame._current_chat_state = {"id": "chat-execution-native", "turns": frame.active_session_turns,
+        "detail_panel_mode": "answers", "execution_steps": [{"step": f"step {i}", "turn_idx": 0} for i in range(30)]}
+    monkeypatch.setattr(frame, "_save_state", lambda *a, **kw: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda *a, **kw: None)
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda *a, **kw: None)
+    frame.input_edit.SetFocusFromKbd()
+    wx_app.Yield()
+    _dispatch_frame_key(frame, main.wx.WXK_F1)
+    assert _yield_until(wx_app, lambda: frame.execution_list.HasFocus(), timeout=2.0)
+    syncs = []
+    original_sync = frame.execution_list_model.replace_visible_page
+    def sync(*args, **kwargs):
+        syncs.append(1)
+        return original_sync(*args, **kwargs)
+    monkeypatch.setattr(frame.execution_list_model, "replace_visible_page", sync)
+    monkeypatch.setattr(frame.execution_list, "Clear", lambda: (_ for _ in ()).throw(AssertionError("normal burst cleared list")))
+    def shift_tab():
+        _send_window_key(main.wx.Window.FindFocus(), main.wx.WXK_TAB, shift=True)
+        wx_app.Yield()
+    durations = []
+    for iteration in range(10):
+        frame.execution_list.SetFocusFromKbd()
+        frame.execution_list.SetSelection(15)
+        wx_app.Yield()
+        selected = frame.execution_list_model.selected_id()
+        frame._navigation_quiet_until = 0.0
+        start = time.perf_counter()
+        before_syncs = len(syncs)
+        frame._pending_codex_ui_events = [("chat-execution-native", main.CodexEvent(
+            type="plan_updated", turn_id="turn-native", text=f"burst {iteration}-{i}", data={"turn_idx": 0},
+        )) for i in range(4)]
+        main.wx.CallAfter(frame._drain_codex_ui_events)
+        # Put the native key behind the pending drain, measuring time from
+        # enqueue rather than only timing an already-completed handler.
+        main.wx.CallAfter(_send_window_key, frame.execution_list, main.wx.WXK_TAB)
+        assert _yield_until(wx_app, lambda: frame.input_edit.HasFocus(), timeout=0.5), (iteration, main.wx.Window.FindFocus().GetName())
+        assert len(syncs) - before_syncs == 1
+        assert frame.execution_list_model.selected_id() == selected
+        assert frame.input_edit.HasFocus(), (main.wx.Window.FindFocus().GetName(), iteration)
+        shift_tab()
+        assert frame.execution_list.HasFocus()
+        shift_tab()
+        assert frame.history_list.HasFocus()
+        elapsed = time.perf_counter() - start
+        durations.append(elapsed)
+        assert elapsed < 0.5
+    print(f"execution native navigation: samples=10, events=40, syncs={len(syncs)}, "
+          f"median_ms={sorted(durations)[5] * 1000:.2f}, max_ms={max(durations) * 1000:.2f}")
+
+
 def _dispatch_frame_key(frame, key_code):
     event = main.wx.KeyEvent(main.wx.wxEVT_CHAR_HOOK)
     event.SetKeyCode(key_code)
     frame.ProcessEvent(event)
+
+
+def test_real_ui_execution_hidden_history_scan_releases_navigation_before_read_finishes(frame, wx_app, monkeypatch, tmp_path):
+    event_loop = main.wx.GUIEventLoop()
+    activator = main.wx.EventLoopActivator(event_loop)
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    _activate_frame(frame, wx_app)
+    frame.current_chat_id = frame.active_chat_id = "owner-a"
+    frame._current_chat_state = {"id": "owner-a", "detail_panel_mode": "execution", "turns": [],
+                                 "execution_steps": [{"step": "private owner A text"}]}
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetSelection(0)
+    store = main.ChatStore(tmp_path / "hidden.db", max_execution_steps_per_turn=1000)
+    store.initialize()
+    store.upsert_chat({"id": "hidden", "detail_panel_mode": "execution"})
+    store.replace_turns("hidden", [{"question": "q", "answer_md": "a"}])
+    for i in range(450):
+        store.append_execution_step("hidden", {"turn_idx": 0, "created_at": i + 1,
+            "display_kind": "command" if i >= 120 else "commentary", "list_text": f"step {i}"})
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "hidden"}]
+    frame.view_mode, frame.view_history_id = "history", "hidden"
+    blocked, release, finished = threading.Event(), threading.Event(), threading.Event()
+    reads = []
+    original = store.load_recent_execution_steps
+    def read(*args, **kwargs):
+        if args[0] != "hidden":
+            return original(*args, **kwargs)
+        reads.append((threading.current_thread() is threading.main_thread(), kwargs))
+        if len(reads) == 3:
+            blocked.set()
+            assert release.wait(5), "test did not release background query"
+        result = original(*args, **kwargs)
+        if len(reads) >= 5:
+            finished.set()
+        return result
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    monkeypatch.setattr(store, "load_execution_steps", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("full loader")))
+    try:
+        frame._apply_detail_panel_mode("execution", refresh_execution=True)
+        assert _yield_until(wx_app, blocked.is_set)
+        assert [on_ui for on_ui, _ in reads] == [True, True, False]
+        assert list(frame.execution_list.GetStrings()) == ["正在加载执行过程"]
+        assert frame._selected_execution_text_viewer_content() is None
+        assert frame._try_open_selected_execution_detail() is False
+        copied = []
+        monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+        class CopyEvent:
+            def GetKeyCode(self): return ord("C")
+            def ControlDown(self): return True
+            def AltDown(self): return False
+            def ShiftDown(self): return False
+            def Skip(self): pass
+            def StopPropagation(self): pass
+        frame._on_execution_key_down(CopyEvent())
+        assert all("private owner A text" not in text for text in copied)
+        frame.execution_list.SetFocusFromKbd()
+        wx_app.Yield()
+        started = time.perf_counter()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        main.wx.CallAfter(_send_window_key, frame.execution_list, main.wx.WXK_TAB)
+        assert _yield_until(wx_app, lambda: frame.input_edit.HasFocus(), timeout=0.5)
+        elapsed = time.perf_counter() - started
+        assert not release.is_set() and not finished.is_set()
+        assert elapsed < 0.5
+        release.set()
+        assert _yield_until(wx_app, lambda: getattr(frame, "_execution_scan_result", None) is not None, timeout=1)
+        assert frame._navigation_quiet_active()
+        assert frame._execution_list_dirty
+        assert list(frame.execution_list.GetStrings()) == ["正在加载执行过程"]
+        # Expire only the quiet clock: the existing timer must publish the
+        # completed scan without a manual render or a longer recovery budget.
+        frame._navigation_quiet_until = time.monotonic() - 1
+        assert _yield_until(wx_app, lambda: not frame._execution_list_dirty, timeout=3), (
+            frame._execution_scan_pending, frame._execution_scan_key(),
+            getattr(frame, "_execution_scan_result", None) is not None,
+            frame._idle_ui_refresh_scheduled, frame._detail_panel_mode(), len(reads))
+        assert frame.input_edit.HasFocus()
+        assert list(frame.execution_list.GetStrings()) == ["更多"] + [f"step {i}" for i in range(21, 120)] + ["小诸葛：a"]
+        assert len(reads) == 5
+        assert all(kwargs["limit"] == 100 for _, kwargs in reads)
+        assert all(kwargs.get("include_total") is False for _, kwargs in reads[1:])
+        print(f"execution blocked history: ui_queries=2, total_queries={len(reads)}, native_tab_ms={elapsed * 1000:.2f}")
+    finally:
+        release.set()
+        del activator
 
 
 def _send_listbox_ctrl_c(window, wx_app):
@@ -977,18 +1169,40 @@ def test_real_ui_primary_controls_stay_responsive_while_codex_events_are_pending
                 ),
             )
         )
-    frame._codex_ui_event_flush_scheduled = True
-    frame._drain_codex_ui_events()
-    assert frame._pending_codex_ui_events
-
-    frame.execution_list.SetSelection(0)
-    frame.execution_list.SetFocusFromKbd()
-    wx_app.Yield()
-    started = time.perf_counter()
-    _send_listbox_key(frame.execution_list, main.wx.WXK_DOWN)
-    wx_app.Yield()
-    assert time.perf_counter() - started < 0.5
-    assert frame.execution_list.GetSelection() == 1
+    navigation_errors = []
+    def press_execution_down():
+        try:
+            assert frame._pending_codex_ui_events
+            before = frame.execution_list.GetSelection()
+            next_id = frame.execution_list_model.visible_ids[before + 1]
+            started = time.perf_counter()
+            _send_listbox_key(frame.execution_list, main.wx.WXK_DOWN)
+            wx_app.Yield()
+            assert time.perf_counter() - started < 0.5
+            assert frame.execution_list.GetSelection() == before + 1
+            assert frame.execution_list_model.selected_id() == next_id
+            assert frame.execution_list.HasFocus()
+        except BaseException as exc:
+            navigation_errors.append(exc)
+        finally:
+            wx_app.ExitMainLoop()
+    def start_execution_navigation():
+        try:
+            frame._codex_ui_event_flush_scheduled = True
+            frame._drain_codex_ui_events()
+            assert frame._codex_ui_event_drain_timer is not None
+            frame.execution_list.SetSelection(0)
+            frame.execution_list.SetFocusFromKbd()
+            main.wx.CallAfter(press_execution_down)
+        except BaseException as exc:
+            navigation_errors.append(exc)
+            wx_app.ExitMainLoop()
+    # Run the production batch-timer path; CallAfter delivers the native key
+    # while further batches remain scheduled, instead of exhausting them in Yield.
+    main.wx.CallAfter(start_execution_navigation)
+    wx_app.MainLoop()
+    if navigation_errors:
+        raise navigation_errors[0]
 
     frame._apply_detail_panel_mode("answers", refresh_execution=False)
     answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "question")
