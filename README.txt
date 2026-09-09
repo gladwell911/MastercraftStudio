@@ -67,7 +67,7 @@ python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_mode
 .\package_mc.ps1
 ```
 
-默认使用 `zgwd.spec`，产物输出到 `C:\code\cx\mc\`。可用 `-DistPath D:\code\cx` 改为当前发布目录；当项目 `.venv` 不可用时，用 `-PythonExe` 显式指定 Python 3.11 解释器。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
+默认使用 `zgwd.spec`，产物输出到当前发布目录 `D:\code\cx\mc\`。`-DistPath` 接收产物的父目录，脚本会在其下生成 `mc\`；如需输出到其他位置，可显式指定该参数。当项目 `.venv` 不可用时，用 `-PythonExe` 显式指定 Python 3.11 解释器。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
 
 打包目录同时包含 GUI 程序 `mc.exe` 和后台协议程序 `mc_worker.exe`；两者必须保持同目录。`mc_worker.exe` 专供 `mc.exe` 处理 Codex 的 UTF-8 JSONL 通信，请勿单独作为桌面程序启动。
 

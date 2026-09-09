@@ -1,5 +1,5 @@
 param(
-    [string]$DistPath = "C:\code\cx",
+    [string]$DistPath = "D:\code\cx",
     [string]$WorkPath = "build_pyinstaller",
     [string]$SpecPath = "zgwd.spec",
     [string]$PythonExe = ".venv\Scripts\python.exe"
