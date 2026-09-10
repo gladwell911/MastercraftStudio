@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import time
 import threading
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2396,7 +2397,7 @@ def test_remote_api_state_includes_remote_runtime_status(frame):
     assert body["remote_runtime_url"] == ""
 
 
-def test_char_hook_alt_c_submits_continue_from_any_focus(frame):
+def test_char_hook_alt_c_does_not_continue_from_unrelated_focus(frame):
     seen = {}
     frame._submit_question = lambda question, **kwargs: seen.setdefault("call", (question, kwargs)) or (True, "")
     frame.history_list.SetFocus()
@@ -2412,12 +2413,12 @@ def test_char_hook_alt_c_submits_continue_from_any_focus(frame):
             return True
 
         def Skip(self):
-            raise AssertionError("should not skip")
+            seen["skipped"] = True
 
     frame._on_char_hook(E())
 
-    assert seen["call"][0] == "继续"
-    assert seen["call"][1]["source"] == "local"
+    assert "call" not in seen
+    assert seen["skipped"] is True
 
 
 def test_answer_list_ctrl_c_still_copies_answer_text(frame, monkeypatch):
@@ -2440,6 +2441,7 @@ def test_answer_list_ctrl_c_still_copies_answer_text(frame, monkeypatch):
     monkeypatch.setattr(frame, "_on_any_key_down_escape_minimize", lambda _event: False)
 
     frame.answer_meta = [("answer", 0, "plain answer", "rich answer")]
+    frame.active_session_turns = [{"question": "q", "answer_md": "rich answer", "model": main.DEFAULT_MODEL_ID}]
     frame.answer_list.Clear()
     frame.answer_list.Append("answer row")
     frame.answer_list.SetSelection(0)
@@ -2487,6 +2489,7 @@ def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, mon
         ("question", 0, "first question", ""),
         ("answer", 0, "plain answer", "rich answer"),
     ]
+    frame.active_session_turns = [{"question": "first question", "answer_md": "rich answer", "model": main.DEFAULT_MODEL_ID}]
     frame.answer_list.Clear()
     frame.answer_list.Append("first question")
     frame.answer_list.Append("answer row")
@@ -2511,7 +2514,7 @@ def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, mon
     assert frame.answer_list.GetSelection() == 1
 
 
-def test_answer_list_ctrl_c_copies_plain_text_without_markdown_for_any_model(frame, monkeypatch):
+def test_answer_list_ctrl_c_copies_canonical_markdown_for_any_model(frame, monkeypatch):
     copied = []
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
     for model in [main.DEFAULT_CODEX_MODEL, main.DEFAULT_CLAUDECODE_MODEL, "openclaw/main", "openai/gpt-5.2"]:
@@ -2531,7 +2534,7 @@ def test_answer_list_ctrl_c_copies_plain_text_without_markdown_for_any_model(fra
 
         assert frame._copy_selected_answer_to_clipboard() is True
 
-    assert copied == ["标题\n\n第一段 加粗。\n\n第二段"] * 4
+    assert copied == ["## 标题\n\n第一段 **加粗**。\n\n- 第二段"] * 4
 
 
 def test_execution_list_ctrl_c_copies_plain_text_without_markdown(frame, monkeypatch):
@@ -9557,7 +9560,7 @@ def test_answer_enter_opens_plain_text_viewer_instead_of_web_detail(frame, monke
     frame.answer_list.SetSelection(answer_row)
     opened_viewer = []
     opened_web = []
-    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text, *args: opened_viewer.append((title, text)) or True)
     monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
 
     class E:
@@ -9579,7 +9582,7 @@ def test_answer_enter_opens_plain_text_viewer_instead_of_web_detail(frame, monke
     frame._on_answer_key_down(E())
 
     assert opened_web == []
-    assert opened_viewer == [("回答详情", "标题\n\n第一段 加粗。\n\n第二段")]
+    assert opened_viewer == [("回答详情", "## 标题\n\n第一段 **加粗**。\n\n第二段")]
 
 
 def test_answer_text_viewer_preserves_ordered_list_markers(frame):
@@ -9799,7 +9802,7 @@ def test_char_hook_space_keeps_ordinary_behavior_outside_shortcut_scope(frame, m
     "owner_chat_id,is_history",
     (("chat-active", False), ("chat-archived", True)),
 )
-def test_answer_text_viewer_continue_restores_captured_owner_without_submitting(frame, monkeypatch, owner_chat_id, is_history):
+def test_answer_text_viewer_continue_rejects_legacy_chat_only_owner(frame, monkeypatch, owner_chat_id, is_history):
     frame.active_chat_id = "chat-active"
     frame.current_chat_id = "chat-active"
     frame.active_session_turns = [{"question": "active", "answer_md": "answer", "model": main.DEFAULT_MODEL_ID}]
@@ -9816,11 +9819,8 @@ def test_answer_text_viewer_continue_restores_captured_owner_without_submitting(
     monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
     monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
 
-    assert frame._continue_from_answer_text_viewer(owner_chat_id) is True
-
-    assert frame.view_mode == ("history" if is_history else "active")
-    assert frame.view_history_id == (owner_chat_id if is_history else None)
-    assert focused == [True]
+    assert frame._continue_from_answer_text_viewer(owner_chat_id) is False
+    assert focused == []
 
 
 def test_answer_text_viewer_continue_restores_current_state_owner_when_active_ids_are_empty(frame, monkeypatch):
@@ -9833,11 +9833,8 @@ def test_answer_text_viewer_continue_restores_current_state_owner_when_active_id
     monkeypatch.setattr(frame, "_focus_input_box", lambda: focused.append(True) or True)
     monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("Continue must not submit a question"))
 
-    assert frame._continue_from_answer_text_viewer("chat-current-state") is True
-
-    assert frame.view_mode == "active"
-    assert frame.view_history_id is None
-    assert focused == [True]
+    assert frame._continue_from_answer_text_viewer("chat-current-state") is False
+    assert focused == []
 
 
 def test_answer_text_viewer_continue_missing_owner_keeps_visible_detail_and_does_not_submit(frame, monkeypatch):
@@ -9866,7 +9863,7 @@ def test_answer_text_viewer_captures_owner_when_opened(frame, monkeypatch):
     continued = []
 
     class _Viewer:
-        def __init__(self, _parent, _title, _text):
+        def __init__(self, _parent, _title, _text, **_kwargs):
             pass
 
         def ShowModal(self):
@@ -9881,14 +9878,14 @@ def test_answer_text_viewer_captures_owner_when_opened(frame, monkeypatch):
     monkeypatch.setattr(frame, "_continue_from_answer_text_viewer", lambda owner: continued.append(owner) or True)
 
     assert frame._open_answer_text_viewer("回答详情", "内容") is True
-    assert continued == ["chat-owned-by-viewer"]
+    assert continued == []
 
 
 def test_answer_text_viewer_modal_ok_captures_active_owner_when_opened(frame, monkeypatch):
     continued = []
 
     class _Viewer:
-        def __init__(self, _parent, _title, _text):
+        def __init__(self, _parent, _title, _text, **_kwargs):
             pass
 
         def ShowModal(self):
@@ -9905,21 +9902,27 @@ def test_answer_text_viewer_modal_ok_captures_active_owner_when_opened(frame, mo
     monkeypatch.setattr(frame, "_continue_from_answer_text_viewer", lambda owner: continued.append(owner) or True)
 
     assert frame._open_answer_text_viewer("回答详情", "内容") is True
-    assert continued == ["chat-active-owner"]
+    assert continued == []
 
 
 def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
-    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "第一段\n\n第二段")
+    payload = main.AnswerViewerPayload("chat", 0, "turn", "", main.DEFAULT_MODEL_ID, "第一段\n\n第二段")
+    continued = []
+    dlg = main.AnswerTextViewerDialog(
+        frame, "回答详情", payload=payload, on_continue=lambda owner: continued.append(owner) or True
+    )
     try:
+        dlg.Show()
         closed = []
         dlg._finish = lambda code: closed.append(code)
         assert dlg.GetTitle() == "回答详情"
-        assert dlg.text_ctrl.GetValue() == "第一段\n\n第二段"
-        assert dlg.text_ctrl.IsEditable()
+        assert dlg.text_ctrl.GetValue() == "\n第一段\n\n第二段"
+        assert not dlg.text_ctrl.IsEditable()
         assert dlg.close_button.GetLabel() == "关闭"
         assert dlg.continue_button.GetLabel() == "继续"
         dlg._on_continue_clicked()
         assert closed == [wx.ID_OK]
+        assert continued == [payload]
 
         class E:
             def GetKeyCode(self):
@@ -9965,11 +9968,303 @@ def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves
         assert skipped == [True]
         assert dlg.copy_button.GetLabel() == "复制"
         dlg._on_copy_clicked()
-        assert copied == ["编辑后的当前内容"]
+        assert copied == ["原始内容"]
         assert dlg.text_ctrl.GetWindowStyleFlag() & wx.TE_DONTWRAP
     finally:
         if dlg:
             dlg.Destroy()
+
+
+@pytest.mark.parametrize("canonical", ["", "answer", "\nanswer", "\r\n\nanswer"])
+def test_answer_text_viewer_normalizes_only_display_leading_newlines(frame, canonical):
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", canonical)
+    try:
+        assert dlg.canonical_text == canonical
+        assert dlg.text_ctrl.GetValue() == "\n" + canonical.lstrip("\r\n")
+    finally:
+        dlg.Destroy()
+
+
+def test_answer_text_viewer_payload_captures_historical_codex_turn_owner(frame):
+    turn = {
+        "question": "q",
+        "answer_md": "\n**canonical** 😀 C:/work/tool.py",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_thread_id": "thread-selected",
+        "codex_turn_id": "turn-selected",
+    }
+    frame.archived_chats = [{"id": "chat-owner", "model": main.DEFAULT_CODEX_MODEL, "turns": [turn]}]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-owner"
+    frame.answer_meta = [("answer", 0, "lossy", "mutable")]
+    frame.answer_list.Clear()
+    frame.answer_list.Append("answer")
+    frame.answer_list.SetSelection(0)
+
+    payload = frame._selected_answer_viewer_payload()
+
+    assert payload == main.AnswerViewerPayload(
+        "chat-owner", 0, "turn-selected", "thread-selected", main.DEFAULT_CODEX_MODEL, turn["answer_md"]
+    )
+
+
+def test_answer_text_viewer_continue_dispatches_once_to_captured_owner(frame, monkeypatch):
+    model = "openai/gpt-5.2"
+    turn = {"question": "q", "answer_md": "canonical", "model": model, "turn_id": "turn-stable"}
+    frame.archived_chats = [{"id": "chat-owner", "model": model, "turns": [turn]}]
+    payload = main.AnswerViewerPayload("chat-owner", 0, "turn-stable", "", model, "canonical")
+    submitted = []
+    monkeypatch.setattr(
+        frame,
+        "_submit_question",
+        lambda question, **kwargs: submitted.append((question, kwargs)) or (True, ""),
+    )
+
+    assert frame._continue_from_answer_text_viewer(payload) is True
+    assert submitted == [("继续", {"source": "local", "model": model, "chat_id": "chat-owner"})]
+
+
+def test_answer_text_viewer_continue_rejects_stale_canonical_owner(frame, monkeypatch):
+    model = "openai/gpt-5.2"
+    frame.archived_chats = [{
+        "id": "chat-owner",
+        "model": model,
+        "turns": [{"question": "q", "answer_md": "replaced", "model": model, "turn_id": "turn-stable"}],
+    }]
+    payload = main.AnswerViewerPayload("chat-owner", 0, "turn-stable", "", model, "captured")
+    monkeypatch.setattr(frame, "_submit_question", lambda *_a, **_k: pytest.fail("stale owner must not dispatch"))
+
+    assert frame._continue_from_answer_text_viewer(payload) is False
+
+
+@pytest.mark.parametrize(
+    "model,session_key,turn_key",
+    ((main.DEFAULT_CODEX_MODEL, "codex_thread_id", "codex_turn_id"),
+     (main.DEFAULT_KIMI_MODEL, "kimi_session_id", "kimi_turn_id")),
+)
+def test_answer_viewer_current_provider_adopts_captured_active_ids(frame, monkeypatch, model, session_key, turn_key):
+    turn = {"question": "q", "answer_md": "canonical", "model": model, session_key: "captured-session", turn_key: "captured-turn"}
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "chat-current", "model": model, "turns": frame.active_session_turns, session_key: "latest-session", turn_key: "latest-turn"}
+    frame._active_request_count = 0
+    frame.active_codex_turn_active = frame.active_kimi_turn_active = False
+    frame.active_codex_thread_id = frame.active_kimi_session_id = "active-wrong-session"
+    frame.active_codex_turn_id = frame.active_kimi_turn_id = "active-wrong-turn"
+    payload = main.AnswerViewerPayload("chat-current", 0, "captured-turn", "captured-session", model, "canonical")
+    seen = []
+
+    def submit(*_args, **_kwargs):
+        if main.is_codex_model(model):
+            seen.append((frame.active_codex_thread_id, frame.active_codex_turn_id))
+        else:
+            seen.append((frame.active_kimi_session_id, frame.active_kimi_turn_id))
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", submit)
+    assert frame._continue_from_answer_text_viewer(payload) is True
+    assert seen == [("captured-session", "captured-turn")]
+
+
+@pytest.mark.parametrize("model", [main.DEFAULT_CODEX_MODEL, main.DEFAULT_KIMI_MODEL])
+def test_answer_viewer_historical_provider_turn_without_ids_disables_continue(frame, model):
+    turn = {"question": "q", "answer_md": "canonical", "model": model}
+    chat = {"id": "chat-history", "model": model, "turns": [turn]}
+    if main.is_codex_model(model):
+        chat.update(codex_thread_id="latest-thread", codex_turn_id="latest-turn")
+    else:
+        chat.update(kimi_session_id="latest-session", kimi_turn_id="latest-turn")
+    frame.archived_chats = [chat]
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-history"
+    frame.answer_meta = [("answer", 0, "plain", "detail")]
+    frame.answer_list.Set(["answer"])
+    frame.answer_list.SetSelection(0)
+
+    assert frame._selected_answer_text_viewer_content() == ("回答详情", "canonical")
+    assert frame._selected_answer_viewer_payload() is None
+
+
+def test_answer_viewer_claudecode_rejects_unrelated_active_client(frame, monkeypatch):
+    model = main.DEFAULT_CLAUDECODE_MODEL
+    turn = {"question": "q", "answer_md": "canonical", "model": model, "turn_id": "turn", "claudecode_session_id": "session"}
+    frame.archived_chats = [{"id": "chat-owner", "model": model, "turns": [turn], "claudecode_session_id": "session"}]
+    frame._active_claudecode_client = object()
+    frame._active_claudecode_chat_id = "chat-other"
+    payload = main.AnswerViewerPayload("chat-owner", 0, "turn", "session", model, "canonical")
+    monkeypatch.setattr(frame, "_submit_question", lambda *_a, **_k: pytest.fail("must not inject"))
+    assert frame._continue_from_answer_text_viewer(payload) is False
+
+
+def test_answer_viewer_claudecode_routes_captured_historical_session_when_idle(frame, monkeypatch):
+    model = main.DEFAULT_CLAUDECODE_MODEL
+    turn = {"question": "q", "answer_md": "canonical", "model": model, "turn_id": "turn", "claudecode_session_id": "captured-session"}
+    chat = {"id": "chat-owner", "model": model, "turns": [turn], "claudecode_session_id": "latest-session"}
+    frame.archived_chats = [chat]
+    frame.active_claudecode_session_id = "unrelated-active-session"
+    seen = []
+    monkeypatch.setattr(
+        frame, "_submit_question",
+        lambda question, **kwargs: seen.append((question, kwargs, frame.active_claudecode_session_id, chat["claudecode_session_id"])) or (True, ""),
+    )
+    payload = main.AnswerViewerPayload("chat-owner", 0, "turn", "captured-session", model, "canonical")
+    assert frame._continue_from_answer_text_viewer(payload) is True
+    assert seen[0][2:] == ("captured-session", "captured-session")
+
+
+@pytest.mark.parametrize("outcome", ["false", "exception"])
+def test_answer_viewer_submit_failure_is_atomic(frame, monkeypatch, outcome):
+    model = main.DEFAULT_CODEX_MODEL
+    turn = {"question": "q", "answer_md": "canonical", "model": model, "codex_thread_id": "captured-thread", "codex_turn_id": "captured-turn"}
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "chat-current", "model": model, "turns": frame.active_session_turns, "codex_thread_id": "latest-thread", "codex_turn_id": "latest-turn"}
+    frame.active_codex_thread_id = "active-thread"
+    frame.active_codex_turn_id = "active-turn"
+    before = (copy.deepcopy(frame._current_chat_state), frame.active_codex_thread_id, frame.active_codex_turn_id, frame.view_mode, frame.input_edit.GetValue())
+
+    def fail(*_args, **_kwargs):
+        frame._current_chat_state["model"] = "mutated"
+        frame.active_session_turns.append({"answer_md": "mutated"})
+        frame.view_mode = "history"
+        frame.input_edit.SetValue("mutated")
+        if outcome == "exception":
+            raise RuntimeError("boom")
+        return False, "failed"
+
+    monkeypatch.setattr(frame, "_submit_question", fail)
+    payload = main.AnswerViewerPayload("chat-current", 0, "captured-turn", "captured-thread", model, "canonical")
+    assert frame._continue_from_answer_text_viewer(payload) is False
+    assert (frame._current_chat_state, frame.active_codex_thread_id, frame.active_codex_turn_id, frame.view_mode, frame.input_edit.GetValue()) == before
+
+
+def test_answer_viewer_identical_content_replacement_without_stable_id_is_stale(frame, monkeypatch):
+    model = "openai/gpt-5.2"
+    frame.archived_chats = [{"id": "chat", "model": model, "turns": [{"question": "new", "answer_md": "same", "model": model}]}]
+    payload = main.AnswerViewerPayload("chat", 0, "turn:0", "", model, "same")
+    monkeypatch.setattr(frame, "_submit_question", lambda *_a, **_k: pytest.fail("synthetic identity must not dispatch"))
+    assert frame._continue_from_answer_text_viewer(payload) is False
+
+
+@pytest.mark.parametrize("signal", ["pending", "codex_active", "kimi_active", "kimi_queue", "frame_active", "claude_active"])
+def test_answer_viewer_busy_signals_are_noops(frame, monkeypatch, signal):
+    if signal.startswith("kimi"):
+        model, session_key, turn_key = main.DEFAULT_KIMI_MODEL, "kimi_session_id", "kimi_turn_id"
+    elif signal == "claude_active":
+        model, session_key, turn_key = main.DEFAULT_CLAUDECODE_MODEL, "claudecode_session_id", "turn_id"
+    else:
+        model, session_key, turn_key = main.DEFAULT_CODEX_MODEL, "codex_thread_id", "codex_turn_id"
+    turn = {"question": "q", "answer_md": "canonical", "model": model, session_key: "session", turn_key: "turn"}
+    chat = {"id": "chat", "model": model, "turns": [turn], session_key: "session"}
+    frame.archived_chats = [chat]
+    if signal == "pending": turn["request_status"] = "pending"
+    elif signal == "codex_active": chat["codex_turn_active"] = True
+    elif signal == "kimi_active": chat["kimi_turn_active"] = True
+    elif signal == "kimi_queue": chat["kimi_request_queue"] = [{}]
+    elif signal == "frame_active":
+        frame.active_chat_id = frame.current_chat_id = "chat"
+        frame._current_chat_state = chat
+        frame.active_session_turns = chat["turns"]
+        frame._active_request_count = 1
+    else:
+        frame._active_claudecode_client = object()
+        frame._active_claudecode_chat_id = "chat"
+    before = copy.deepcopy(chat)
+    monkeypatch.setattr(frame, "_submit_question", lambda *_a, **_k: pytest.fail("busy owner must not submit"))
+    payload = main.AnswerViewerPayload("chat", 0, "turn", "session", model, "canonical")
+    assert frame._continue_from_answer_text_viewer(payload) is False
+    assert chat == before
+
+
+def test_selected_answer_open_passes_full_payload_and_enables_continue(frame, monkeypatch):
+    turn = {"question": "q", "answer_md": "canonical", "model": main.DEFAULT_CODEX_MODEL,
+            "codex_thread_id": "thread", "codex_turn_id": "turn"}
+    frame.active_chat_id = frame.current_chat_id = "chat"
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "chat", "model": main.DEFAULT_CODEX_MODEL, "turns": frame.active_session_turns}
+    frame.answer_meta = [("answer", 0, "plain", "detail")]
+    frame.answer_list.Set(["answer"])
+    frame.answer_list.SetSelection(0)
+    opened = []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text, payload: opened.append((title, text, payload)) or True)
+
+    assert frame._open_selected_answer_text_viewer() is True
+    assert opened[0][1] == "canonical"
+    assert opened[0][2] == main.AnswerViewerPayload("chat", 0, "turn", "thread", main.DEFAULT_CODEX_MODEL, "canonical")
+
+
+def test_answer_viewer_duplicate_guard_is_owner_scoped_and_allows_different_answer(frame):
+    frame.active_chat_id = "chat"
+    frame.answer_meta = [("answer", 0, "a", "a"), ("answer", 1, "b", "b")]
+    frame.answer_list.Set(["a", "b"])
+    frame.answer_list.SetSelection(0)
+    frame._answer_viewer_duplicate_owner = frame._answer_viewer_selection_signature()
+    frame._answer_viewer_duplicate_until = time.monotonic() + 1
+    frame._answer_viewer_duplicate_events = 2
+    assert frame._consume_answer_viewer_duplicate_event() is True
+    frame.answer_list.SetSelection(1)
+    assert frame._consume_answer_viewer_duplicate_event() is False
+
+
+def test_answer_viewer_open_overlap_and_modal_exception_recover(frame, monkeypatch):
+    frame._answer_viewer_open = True
+    assert frame._open_answer_text_viewer("title", "one") is False
+    frame._answer_viewer_open = False
+
+    class Broken:
+        def __init__(self, *_a, **_k): pass
+        def ShowModal(self): raise RuntimeError("modal failed")
+        def Destroy(self): pass
+
+    monkeypatch.setattr(main, "AnswerTextViewerDialog", Broken)
+    assert frame._open_answer_text_viewer("title", "one") is False
+    assert frame._answer_viewer_open is False
+
+
+def test_answer_viewer_dialog_callback_false_then_success_and_exception(frame):
+    payload = main.AnswerViewerPayload("chat", 0, "turn", "session", main.DEFAULT_CODEX_MODEL, "canonical")
+    outcomes = [False, RuntimeError("boom"), True]
+
+    def callback(_payload):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    dlg = main.AnswerTextViewerDialog(frame, "title", payload=payload, on_continue=callback)
+    try:
+        dlg.Show()
+        dlg._finish = lambda _code: None
+        assert dlg._request_continue() is False
+        assert dlg.continue_button.IsEnabled()
+        assert dlg._request_continue() is False
+        assert dlg.continue_button.IsEnabled()
+        assert dlg._request_continue() is True
+        assert not dlg.continue_button.IsEnabled()
+    finally:
+        dlg.Destroy()
+
+
+@pytest.mark.parametrize("composition,candidates", [(True, False), (False, True)])
+def test_native_ime_helper_detects_composition_or_candidates(frame, monkeypatch, composition, candidates):
+    class Imm32:
+        def ImmGetContext(self, _hwnd): return 1
+        def ImmReleaseContext(self, *_args): return 1
+        def ImmGetCompositionStringW(self, *_args): return 2 if composition else 0
+        def ImmGetCandidateListCountW(self, _himc, count, length):
+            count._obj.value = 1 if candidates else 0
+            length._obj.value = 24 if candidates else 0
+            return 1
+        def ImmGetCandidateListW(self, _himc, _idx, buf, _size):
+            if buf is None:
+                return 24
+            raw = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32))
+            raw[0] = 24
+            raw[2] = 1
+            return 24
+
+    monkeypatch.setattr(main.ctypes, "windll", SimpleNamespace(imm32=Imm32()))
+    assert frame._has_native_ime_composition(frame.input_edit) is True
 
 
 def test_common_command_edit_dialog_constructs_without_parent_assertion(frame):
@@ -12336,7 +12631,7 @@ def test_submit_question_allows_attachment_only_send_for_codex(frame, monkeypatc
     assert seen["worker"] == [(frame.active_chat_id or frame.current_chat_id or "", 0, "", main.DEFAULT_CODEX_MODEL)]
 
 
-def test_char_hook_alt_c_suppresses_tools_menu_and_submits_continue(frame):
+def test_char_hook_alt_c_outside_viewer_does_not_submit_continue(frame):
     seen = {"opened": 0, "submitted": 0}
     frame._alt_menu_armed = True
     frame._alt_menu_suppressed = False
@@ -12354,12 +12649,13 @@ def test_char_hook_alt_c_suppresses_tools_menu_and_submits_continue(frame):
             return True
 
         def Skip(self):
-            raise AssertionError("should not skip")
+            seen["skipped"] = True
 
     frame._on_char_hook(E())
 
     assert seen["opened"] == 0
-    assert seen["submitted"] == 1
+    assert seen["submitted"] == 0
+    assert seen["skipped"] is True
     assert frame._alt_menu_armed is True
     assert frame._alt_menu_suppressed is True
 
@@ -15132,7 +15428,7 @@ def test_answer_detail_html_filters_cli_models(frame, model):
 
 
 @pytest.mark.parametrize("model", ["codex/main", "claudecode/default", "openclaw/main"])
-def test_remote_turn_payload_filters_cli_models(frame, model):
+def test_remote_turn_payload_preserves_canonical_answer_for_all_models(frame, model):
     frame.codex_answer_english_filter_enabled = True
     codex_turn = {
         "question": "测试",
@@ -15150,11 +15446,8 @@ def test_remote_turn_payload_filters_cli_models(frame, model):
     codex_payload = frame._remote_turn_payload(codex_turn)
     other_payload = frame._remote_turn_payload(other_turn)
 
-    assert "[文件路径]" in codex_payload["answer"]
-    assert "main.py" not in codex_payload["answer"]
-    assert "test_remote_turn_payload_filters_cli_models" not in codex_payload["answer"]
-    assert "main.py" in other_payload["answer"]
-    assert "test_remote_turn_payload_filters_cli_models" in other_payload["answer"]
+    assert codex_payload["answer"] == codex_turn["answer_md"]
+    assert other_payload["answer"] == other_turn["answer_md"]
 
 
 def test_codex_answer_filter_preserves_plain_english_sentences(frame):
@@ -18206,7 +18499,7 @@ def test_remote_state_archived_store_uses_turn_page_without_full_hydration(frame
     assert body["oldest_cursor"] == "498"
 
 
-def test_remote_turn_payload_reuses_plain_answer_cache(frame, monkeypatch):
+def test_remote_turn_payload_reuses_canonical_answer_cache(frame, monkeypatch):
     turn = {"question": "q", "answer_md": "**cached**", "model": main.DEFAULT_MODEL_ID}
     calls = []
     original = main.md_to_plain
@@ -18221,7 +18514,8 @@ def test_remote_turn_payload_reuses_plain_answer_cache(frame, monkeypatch):
     second = frame._remote_turn_payload(turn)
 
     assert first == second
-    assert calls == [frame._answer_markdown_for_output("**cached**", main.DEFAULT_MODEL_ID)]
+    assert calls == []
+    assert first["answer"] == "**cached**"
 
 
 def test_remote_state_reuses_snapshot_when_chat_has_not_changed(frame, monkeypatch):

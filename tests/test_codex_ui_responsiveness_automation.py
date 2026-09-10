@@ -406,7 +406,7 @@ def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail
     frame._current_chat_state = {"id": "chat-answer-viewer", "turns": frame.active_session_turns}
     opened_viewer = []
     opened_web = []
-    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text, *args: opened_viewer.append((title, text)) or True)
     monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: opened_web.append(True) or True)
 
     frame._render_answer_list()
@@ -418,7 +418,7 @@ def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail
     _send_window_key(frame.answer_list, main.wx.WXK_RETURN)
     wx_app.Yield()
 
-    assert opened_viewer == [("回答详情", "标题\n\n第一段\n\n第二段")]
+    assert opened_viewer == [("回答详情", "## 标题\n\n第一段\n\n第二段")]
     assert opened_web == []
     assert frame.answer_list.HasFocus()
 
@@ -431,7 +431,7 @@ def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail
     assert opened_web == [True]
 
 
-def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_current_editor_text(frame, wx_app, monkeypatch):
+def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_canonical_text(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-answer-viewer-tab-copy"
     frame.current_chat_id = "chat-answer-viewer-tab-copy"
@@ -451,7 +451,7 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_current
     ]
     frame._current_chat_state = {"id": frame.active_chat_id, "turns": frame.active_session_turns}
     opened_viewer = []
-    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text: opened_viewer.append((title, text)) or True)
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda title, text, *args: opened_viewer.append((title, text)) or True)
 
     frame._render_answer_list()
     second_answer_row = next(idx for idx, meta in enumerate(frame.answer_meta) if meta[0] == "answer" and meta[1] == 1)
@@ -480,11 +480,109 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_current
         assert copied == []
         assert dlg.copy_button.GetLabel() == "复制"
         dlg._on_copy_clicked()
-        assert copied == ["当前编辑框内容"]
+        assert copied == ["1. 第一项\n2. 第二项"]
         assert dlg.text_ctrl.GetWindowStyleFlag() & main.wx.TE_DONTWRAP
     finally:
         if dlg:
             dlg.Destroy()
+
+
+def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
+    _activate_frame(frame, wx_app)
+    payload = main.AnswerViewerPayload(
+        "chat-owner", 0, "turn-owner", "thread-owner", main.DEFAULT_CODEX_MODEL, "\r\ncanonical"
+    )
+    dispatched = []
+    dlg = main.AnswerTextViewerDialog(
+        frame, "回答详情", payload=payload, on_continue=lambda owner: dispatched.append(owner) or True
+    )
+    try:
+        dlg.Show()
+        wx_app.Yield()
+        dlg._finish = lambda _code: None
+        dlg._on_continue_clicked()
+        dlg._on_continue_clicked()
+
+        assert dispatched == [payload]
+        assert dlg.text_ctrl.GetValue() == "\ncanonical"
+        assert not dlg.continue_button.IsEnabled()
+    finally:
+        dlg.Destroy()
+
+
+def test_real_ui_answer_viewer_alt_c_respects_ime_modal_and_disabled_boundaries(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    payload = main.AnswerViewerPayload(
+        "chat-owner", 0, "turn-owner", "thread-owner", main.DEFAULT_CODEX_MODEL, "canonical"
+    )
+    dispatched = []
+    dlg = main.AnswerTextViewerDialog(
+        frame, "回答详情", payload=payload, on_continue=lambda owner: dispatched.append(owner) or True
+    )
+
+    class _AltC:
+        def IsAutoRepeat(self):
+            return False
+
+    try:
+        dlg.Show()
+        dlg.text_ctrl.SetFocusFromKbd()
+        wx_app.Yield()
+        monkeypatch.setattr(frame, "_has_native_ime_composition", lambda _window: True)
+        assert dlg._request_continue(from_shortcut=True, event=_AltC()) is False
+
+        monkeypatch.setattr(frame, "_has_native_ime_composition", lambda _window: False)
+        other = main.wx.Dialog(frame, title="other modal")
+        try:
+            monkeypatch.setattr(main.wx, "GetActiveWindow", lambda: other)
+            assert dlg._request_continue(from_shortcut=True, event=_AltC()) is False
+        finally:
+            other.Destroy()
+
+        dlg.continue_button.Disable()
+        assert dlg._request_continue() is False
+        assert dispatched == []
+        assert dlg.text_ctrl.HasFocus()
+    finally:
+        dlg.Destroy()
+
+
+def test_real_ui_answer_viewer_alt_c_key_path_rejects_repeat_then_dispatches(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    payload = main.AnswerViewerPayload(
+        "chat-owner", 0, "turn-owner", "thread-owner", main.DEFAULT_CODEX_MODEL, "canonical"
+    )
+    dispatched = []
+    dlg = main.AnswerTextViewerDialog(
+        frame, "回答详情", payload=payload, on_continue=lambda owner: dispatched.append(owner) or True
+    )
+
+    class AltC:
+        def __init__(self, repeat): self.repeat, self.skipped = repeat, 0
+        def GetKeyCode(self): return ord("C")
+        def AltDown(self): return True
+        def ControlDown(self): return False
+        def IsAutoRepeat(self): return self.repeat
+        def Skip(self): self.skipped += 1
+
+    try:
+        dlg.Show()
+        dlg.text_ctrl.SetFocusFromKbd()
+        wx_app.Yield()
+        monkeypatch.setattr(main.wx, "GetActiveWindow", lambda: dlg)
+        monkeypatch.setattr(frame, "_has_native_ime_composition", lambda _window: False)
+        repeated = AltC(True)
+        dlg._on_char_hook(repeated)
+        assert dispatched == []
+        assert repeated.skipped == 1
+
+        dlg._finish = lambda _code: None
+        first = AltC(False)
+        dlg._on_char_hook(first)
+        assert dispatched == [payload]
+        assert first.skipped == 0
+    finally:
+        dlg.Destroy()
 
 
 def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame, wx_app, monkeypatch):

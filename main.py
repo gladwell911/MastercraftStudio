@@ -16,6 +16,7 @@ import uuid
 import webbrowser
 import winsound
 import sys
+from dataclasses import dataclass
 from collections import deque
 from contextlib import contextmanager
 from ctypes import wintypes
@@ -888,8 +889,26 @@ class RealtimeCallSettingsDialog(wx.Dialog):
         ).normalized()
 
 
+@dataclass(frozen=True)
+class AnswerViewerPayload:
+    chat_id: str
+    turn_idx: int
+    turn_id: str
+    provider_session_id: str
+    model: str
+    answer_md: str
+
+
 class AnswerTextViewerDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, title: str, text: str):
+    def __init__(
+        self,
+        parent: wx.Window,
+        title: str,
+        text: str = "",
+        *,
+        payload: AnswerViewerPayload | None = None,
+        on_continue: Callable[[AnswerViewerPayload], bool] | None = None,
+    ):
         super().__init__(
             parent,
             title=str(title or "文本查看"),
@@ -897,10 +916,16 @@ class AnswerTextViewerDialog(wx.Dialog):
         )
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
+        self.payload = payload
+        self.canonical_text = payload.answer_md if payload is not None else str(text or "")
+        self._continue_callback = on_continue
+        self._continue_requested = False
+        self._closing = False
+        display_text = "\n" + self.canonical_text.lstrip("\r\n")
         self.text_ctrl = wx.TextCtrl(
             panel,
-            value=str(text or ""),
-            style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL,
+            value=display_text,
+            style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL | wx.TE_READONLY,
         )
         self.text_ctrl.SetName("文本内容")
         root.Add(self.text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
@@ -930,19 +955,53 @@ class AnswerTextViewerDialog(wx.Dialog):
         except Exception:
             pass
         self.text_ctrl.SetFocus()
+        self.continue_button.Enable(payload is not None and callable(on_continue))
 
     def _on_close(self, _event=None):
+        self._closing = True
         self._finish(wx.ID_CLOSE)
 
     def _on_copy_clicked(self, _event=None):
         setter = getattr(self.GetParent(), "_set_clipboard_text", None)
-        if callable(setter) and setter(self.text_ctrl.GetValue()):
+        if callable(setter) and setter(self.canonical_text):
             status = getattr(self.GetParent(), "SetStatusText", None)
             if callable(status):
                 status("已复制")
 
     def _on_continue_clicked(self, _event=None):
+        self._request_continue()
+
+    def _request_continue(self, *, from_shortcut: bool = False, event=None) -> bool:
+        if self._continue_requested or self.payload is None or not callable(self._continue_callback):
+            return False
+        if self._closing or not self.continue_button.IsEnabled() or not self.IsShown() or self.IsBeingDeleted():
+            return False
+        if from_shortcut:
+            try:
+                if wx.GetTopLevelParent(wx.Window.FindFocus()) is not self or wx.GetActiveWindow() is not self:
+                    return False
+            except Exception:
+                return False
+            if event is not None and bool(getattr(event, "IsAutoRepeat", lambda: False)()):
+                return False
+            ime_check = getattr(self.GetParent(), "_has_native_ime_composition", None)
+            if callable(ime_check) and ime_check(wx.Window.FindFocus()):
+                return False
+        # Acquire the latch before the callback can close the modal or post work.
+        self._continue_requested = True
+        self.continue_button.Disable()
+        try:
+            accepted = bool(self._continue_callback(self.payload))
+        except Exception:
+            accepted = False
+        if not accepted:
+            self._continue_requested = False
+            if not self.IsBeingDeleted():
+                self.continue_button.Enable()
+            return False
+        self._closing = True
         self._finish(wx.ID_OK)
+        return True
 
     def _finish(self, code: int) -> None:
         if self.IsModal() or bool(getattr(self, "_shown_modally", False)):
@@ -957,6 +1016,11 @@ class AnswerTextViewerDialog(wx.Dialog):
         if event.GetKeyCode() == wx.WXK_ESCAPE:
             self._on_close()
             return
+        alt_down = bool(getattr(event, "AltDown", lambda: False)())
+        ctrl_down = bool(getattr(event, "ControlDown", lambda: False)())
+        if alt_down and not ctrl_down and event.GetKeyCode() in (ord("C"), ord("c")):
+            if self._request_continue(from_shortcut=True, event=event):
+                return
         event.Skip()
 
 
@@ -9267,7 +9331,7 @@ class ChatFrame(wx.Frame):
         cached = cache.get(cache_key)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
             return dict(cached[1])
-        answer = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(md_to_plain(self._answer_markdown_for_output(answer_md, model)))
+        answer = answer_md
         payload = {
             "question": question,
             "answer": answer,
@@ -14200,9 +14264,6 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_F1 and not ctrl_down and not alt_down:
             self._toggle_detail_panel_mode(focus_detail=True)
             return
-        if self._is_continue_shortcut(key, alt_down):
-            self._submit_question("继续", source="local")
-            return
         if self._is_clear_context_shortcut(key, alt_down):
             self._clear_context_and_start_new_chat(auto_resend_first=True)
             return
@@ -14361,8 +14422,8 @@ class ChatFrame(wx.Frame):
                 return
         event.Skip()
 
-    def _has_input_ime_candidates(self) -> bool:
-        hwnd = self.input_edit.GetHandle() if self.input_edit else 0
+    def _has_native_ime_composition(self, window: wx.Window | None) -> bool:
+        hwnd = window.GetHandle() if window else 0
         if not hwnd:
             return False
         try:
@@ -14371,8 +14432,11 @@ class ChatFrame(wx.Frame):
             if not himc:
                 return False
             try:
-                # Only when IME candidate list is present should Enter be
-                # handled by IME (commit/select candidate) instead of send.
+                # GCS_COMPSTR: composition without a candidate window still
+                # owns keyboard input and must not leak into app shortcuts.
+                get_composition = getattr(imm32, "ImmGetCompositionStringW", None)
+                if callable(get_composition) and int(get_composition(himc, 0x0008, None, 0)) > 0:
+                    return True
                 list_count = wintypes.DWORD(0)
                 buf_len = wintypes.DWORD(0)
                 if not imm32.ImmGetCandidateListCountW(himc, ctypes.byref(list_count), ctypes.byref(buf_len)):
@@ -14405,6 +14469,9 @@ class ChatFrame(wx.Frame):
                 imm32.ImmReleaseContext(wintypes.HWND(hwnd), himc)
         except Exception:
             return False
+
+    def _has_input_ime_candidates(self) -> bool:
+        return self._has_native_ime_composition(self.input_edit)
 
     def _on_global_ctrl_keyup(self, combo_used: bool, side: str) -> None:
         self._voice_input.on_ctrl_keyup(combo_used=combo_used, side=side)
@@ -16059,8 +16126,12 @@ class ChatFrame(wx.Frame):
             self._show_answer_menu()
             return
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            signature = self._answer_viewer_selection_signature()
             handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
             if handled:
+                self._answer_viewer_duplicate_owner = signature
+                self._answer_viewer_duplicate_until = time.monotonic() + 0.25
+                self._answer_viewer_duplicate_events = 2
                 return
         event.Skip()
 
@@ -16071,11 +16142,13 @@ class ChatFrame(wx.Frame):
         item_type, _turn_idx, plain, detail = self.answer_meta[idx]
         if item_type not in ("question", "answer"):
             return False
-        source_text = detail if item_type == "answer" and detail else plain
-        cleaned_text = self._plain_text_for_clipboard(source_text)
-        if not cleaned_text:
+        turns = self._get_view_turns()
+        turn = turns[_turn_idx] if 0 <= _turn_idx < len(turns) and isinstance(turns[_turn_idx], dict) else {}
+        canonical_value = turn.get("answer_md") if item_type == "answer" else turn.get("question")
+        source_text = canonical_value if isinstance(canonical_value, str) else ""
+        if not source_text:
             return False
-        if not self._set_clipboard_text(cleaned_text):
+        if not self._set_clipboard_text(source_text):
             return False
         self.SetStatusText("已复制")
         return True
@@ -16116,6 +16189,8 @@ class ChatFrame(wx.Frame):
     def _on_answer_char(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self._consume_answer_viewer_duplicate_event():
+                return
             shift = bool(getattr(event, "ShiftDown", lambda: False)())
             handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
             if handled:
@@ -16126,7 +16201,27 @@ class ChatFrame(wx.Frame):
         event.Skip()
 
     def _on_answer_activate(self, _event):
+        if self._consume_answer_viewer_duplicate_event():
+            return
         self._open_selected_answer_text_viewer()
+
+    def _answer_viewer_selection_signature(self) -> tuple[str, str, int] | None:
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
+            return None
+        meta = self.answer_meta[idx]
+        return (self._visible_answer_owner_chat_id(), str(meta[0]), int(meta[1]))
+
+    def _consume_answer_viewer_duplicate_event(self) -> bool:
+        if time.monotonic() > float(getattr(self, "_answer_viewer_duplicate_until", 0.0) or 0.0):
+            return False
+        if getattr(self, "_answer_viewer_duplicate_owner", None) != self._answer_viewer_selection_signature():
+            return False
+        remaining = int(getattr(self, "_answer_viewer_duplicate_events", 0) or 0)
+        if remaining <= 0:
+            return False
+        self._answer_viewer_duplicate_events = remaining - 1
+        return True
 
     def _on_execution_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -16287,31 +16382,40 @@ class ChatFrame(wx.Frame):
             answer_md = str((turn or {}).get("answer_md") or detail or plain or "")
             if not answer_md or answer_md == REQUESTING_TEXT:
                 return None
-            model = str((turn or {}).get("model") or self.selected_model or "")
-            source = self._answer_markdown_for_output(answer_md, model)
+            source = answer_md
             title = "回答详情"
-        text = remove_emojis(md_to_plain_preserving_paragraphs(source)).strip()
-        if not text:
-            text = remove_emojis(str(detail or plain or "")).strip()
-        if not text:
+        text = str(source)
+        if not text and item_type != "answer":
             return None
         return title, text
 
-    def _open_answer_text_viewer(self, title: str, text: str) -> bool:
-        owner_chat_id = self._visible_answer_owner_chat_id()
-        dlg = AnswerTextViewerDialog(self, title, text)
-        continue_to_owner = False
+    def _open_answer_text_viewer(
+        self, title: str, text: str, payload: AnswerViewerPayload | None = None
+    ) -> bool:
+        if bool(getattr(self, "_answer_viewer_open", False)):
+            return False
+        dlg = AnswerTextViewerDialog(
+            self,
+            title,
+            text,
+            payload=payload,
+            on_continue=self._continue_from_answer_text_viewer if payload is not None else None,
+        )
+        self._answer_viewer_open = True
+        shown = False
         try:
             dlg._shown_modally = True
-            continue_to_owner = dlg.ShowModal() == wx.ID_OK
+            dlg.ShowModal()
+            shown = True
+        except Exception:
+            shown = False
         finally:
+            self._answer_viewer_open = False
             try:
                 dlg.Destroy()
             except RuntimeError:
                 pass
-        if continue_to_owner:
-            self._continue_from_answer_text_viewer(owner_chat_id)
-        return True
+        return shown
 
     def _open_selected_answer_text_viewer(self) -> bool:
         idx = self.answer_list.GetSelection()
@@ -16329,7 +16433,8 @@ class ChatFrame(wx.Frame):
         if not content:
             return False
         title, text = content
-        return self._open_answer_text_viewer(title, text)
+        payload = self._selected_answer_viewer_payload()
+        return self._open_answer_text_viewer(title, text, payload)
 
     def _visible_answer_owner_chat_id(self) -> str:
         if self.view_mode == "history":
@@ -16337,25 +16442,197 @@ class ChatFrame(wx.Frame):
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
         return str(self.active_chat_id or self.current_chat_id or state.get("id") or "").strip()
 
-    def _continue_from_answer_text_viewer(self, owner_chat_id: str) -> bool:
-        """Return from a detail viewer to its captured chat without submitting."""
-        owner = str(owner_chat_id or "").strip()
-        if not owner:
+    def _selected_answer_viewer_payload(self) -> AnswerViewerPayload | None:
+        idx = self.answer_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
+            return None
+        item_type, turn_idx, _plain, _detail = self.answer_meta[idx]
+        if item_type != "answer":
+            return None
+        turns = self._get_view_turns()
+        if not (0 <= turn_idx < len(turns)) or not isinstance(turns[turn_idx], dict):
+            return None
+        turn = turns[turn_idx]
+        answer_md = str(turn.get("answer_md") or "")
+        if not answer_md or answer_md == REQUESTING_TEXT:
+            return None
+        chat_id = self._visible_answer_owner_chat_id()
+        if not chat_id:
+            return None
+        chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return None
+        model = normalize_model_id(str(turn.get("model") or chat.get("model") or ""))
+        if is_codex_model(model):
+            session_id = str(turn.get("codex_thread_id") or chat.get("codex_thread_id") or "").strip()
+            turn_id = str(turn.get("codex_turn_id") or turn.get("turn_id") or "").strip()
+        elif is_kimi_model(model):
+            session_id = str(turn.get("kimi_session_id") or chat.get("kimi_session_id") or "").strip()
+            turn_id = str(turn.get("kimi_turn_id") or turn.get("turn_id") or "").strip()
+        elif is_claudecode_model(model):
+            session_id = str(turn.get("claudecode_session_id") or chat.get("claudecode_session_id") or "").strip()
+            turn_id = str(turn.get("turn_id") or turn.get("id") or "").strip()
+        else:
+            session_id = ""
+            turn_id = str(turn.get("turn_id") or turn.get("id") or turn.get("answer_external_event_id") or "").strip()
+        if not turn_id or ((is_codex_model(model) or is_kimi_model(model) or is_claudecode_model(model)) and not session_id):
+            return None
+        return AnswerViewerPayload(chat_id, int(turn_idx), turn_id, session_id, model, answer_md)
+
+    def _continue_from_answer_text_viewer(self, payload: AnswerViewerPayload) -> bool:
+        if (
+            not isinstance(payload, AnswerViewerPayload)
+            or not payload.chat_id
+            or bool(getattr(self, "_closing", False))
+            or not _wx_target_is_alive(self)
+        ):
             return False
-        current_ids = {
-            str(self.active_chat_id or "").strip(),
-            str(self.current_chat_id or "").strip(),
-            str((self._current_chat_state or {}).get("id") or "").strip()
-            if isinstance(getattr(self, "_current_chat_state", None), dict)
-            else "",
-        }
-        current_ids.discard("")
-        if owner not in current_ids and not isinstance(self._find_archived_chat(owner), dict):
+        current = self._current_chat_state if payload.chat_id in {
+            str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip(),
+            str((self._current_chat_state or {}).get("id") or "").strip(),
+        } else None
+        chat = current if isinstance(current, dict) else self._find_archived_chat(payload.chat_id)
+        if not isinstance(chat, dict):
             return False
-        if not self._show_history_chat(owner, focus_answer_list=False):
+        chat = self._hydrate_chat_from_store(chat, include_execution_steps=False) or chat
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        if not (0 <= payload.turn_idx < len(turns)) or not isinstance(turns[payload.turn_idx], dict):
             return False
-        self._focus_input_box()
+        turn = turns[payload.turn_idx]
+        if str(turn.get("answer_md") or "") != payload.answer_md:
+            return False
+        if normalize_model_id(str(turn.get("model") or chat.get("model") or "")) != payload.model:
+            return False
+        if any(str(item.get("request_status") or "").strip() == "pending" for item in turns if isinstance(item, dict)):
+            return False
+        if bool(chat.get("codex_turn_active")) or bool(chat.get("kimi_turn_active")) or bool(chat.get("kimi_request_queue")):
+            return False
+        if chat is self._current_chat_state and (
+            bool(getattr(self, "active_codex_turn_active", False))
+            or bool(getattr(self, "active_kimi_turn_active", False))
+            or int(getattr(self, "_active_request_count", 0) or 0) > 0
+        ):
+            return False
+        if is_claudecode_model(payload.model):
+            with self._active_claudecode_client_lock:
+                if self._active_claudecode_client is not None:
+                    return False
+        fresh = self._answer_viewer_identity_for_turn(turn, chat, payload.turn_idx, payload.model)
+        if fresh != (payload.turn_id, payload.provider_session_id):
+            return False
+        snapshot = self._capture_answer_continue_state()
+        if is_codex_model(payload.model):
+            for key, value in (
+                ("codex_thread_id", payload.provider_session_id),
+                ("codex_turn_id", payload.turn_id),
+            ):
+                chat[key] = value
+        elif is_kimi_model(payload.model):
+            for key, value in (
+                ("kimi_session_id", payload.provider_session_id),
+                ("kimi_turn_id", payload.turn_id),
+            ):
+                chat[key] = value
+        elif is_claudecode_model(payload.model):
+            chat["claudecode_session_id"] = payload.provider_session_id
+        if is_codex_model(payload.model):
+            self.active_codex_thread_id = payload.provider_session_id
+            self.active_codex_turn_id = payload.turn_id
+        elif is_kimi_model(payload.model):
+            self.active_kimi_session_id = payload.provider_session_id
+            self.active_kimi_turn_id = payload.turn_id
+        elif is_claudecode_model(payload.model):
+            self.active_claudecode_session_id = payload.provider_session_id
+        try:
+            ok, _message = self._submit_question("继续", source="local", model=payload.model, chat_id=payload.chat_id)
+        except Exception:
+            ok = False
+        if not ok:
+            self._restore_answer_continue_state(snapshot)
+            return False
         return True
+
+    def _capture_answer_continue_state(self) -> dict:
+        focus = wx.Window.FindFocus()
+        state_graph = copy.deepcopy({
+            "active_session_turns": self.active_session_turns,
+            "current_chat_state": self._current_chat_state,
+            "archived_chats": self.archived_chats,
+        })
+        return {
+            **state_graph,
+            "active_chat_id": self.active_chat_id,
+            "current_chat_id": self.current_chat_id,
+            "view_mode": self.view_mode,
+            "view_history_id": self.view_history_id,
+            "active_turn_idx": self.active_turn_idx,
+            "selected_model": self.selected_model,
+            "active_codex_thread_id": self.active_codex_thread_id,
+            "active_codex_turn_id": self.active_codex_turn_id,
+            "active_kimi_session_id": self.active_kimi_session_id,
+            "active_kimi_turn_id": self.active_kimi_turn_id,
+            "active_claudecode_session_id": self.active_claudecode_session_id,
+            "active_request_count": self._active_request_count,
+            "is_running": self.is_running,
+            "pending_input_attachments": copy.deepcopy(self._pending_input_attachments),
+            "input_value": self.input_edit.GetValue(),
+            "model_value": self.model_combo.GetValue(),
+            "answer_strings": list(self.answer_list.GetStrings()),
+            "answer_meta": copy.deepcopy(self.answer_meta),
+            "answer_selection": self.answer_list.GetSelection(),
+            "history_selection": self.history_list.GetSelection(),
+            "history_strings": list(self.history_list.GetStrings()),
+            "history_ids": list(self.history_ids),
+            "focus": focus,
+        }
+
+    def _restore_answer_continue_state(self, snapshot: dict) -> None:
+        self.active_session_turns = snapshot["active_session_turns"]
+        self._current_chat_state = snapshot["current_chat_state"]
+        self.archived_chats = snapshot["archived_chats"]
+        for key in (
+            "active_chat_id", "current_chat_id", "view_mode", "view_history_id", "active_turn_idx",
+            "selected_model", "active_codex_thread_id", "active_codex_turn_id",
+            "active_kimi_session_id", "active_kimi_turn_id", "active_claudecode_session_id",
+            "is_running",
+        ):
+            setattr(self, key, snapshot[key])
+        self._active_request_count = snapshot["active_request_count"]
+        self._pending_input_attachments = snapshot["pending_input_attachments"]
+        self.input_edit.SetValue(snapshot["input_value"])
+        self.model_combo.SetValue(snapshot["model_value"])
+        self.answer_meta = snapshot["answer_meta"]
+        self.answer_list.Set(snapshot["answer_strings"])
+        answer_selection = snapshot["answer_selection"]
+        if answer_selection != wx.NOT_FOUND and answer_selection < self.answer_list.GetCount():
+            self.answer_list.SetSelection(answer_selection)
+        self.history_ids = snapshot["history_ids"]
+        self.history_list.Set(snapshot["history_strings"])
+        history_selection = snapshot["history_selection"]
+        if history_selection != wx.NOT_FOUND and history_selection < self.history_list.GetCount():
+            self.history_list.SetSelection(history_selection)
+        focus = snapshot.get("focus")
+        if _wx_target_is_alive(focus):
+            focus.SetFocus()
+
+    @staticmethod
+    def _answer_viewer_identity_for_turn(turn: dict, chat: dict, turn_idx: int, model: str) -> tuple[str, str]:
+        if is_codex_model(model):
+            return (
+                str(turn.get("codex_turn_id") or turn.get("turn_id") or "").strip(),
+                str(turn.get("codex_thread_id") or chat.get("codex_thread_id") or "").strip(),
+            )
+        if is_kimi_model(model):
+            return (
+                str(turn.get("kimi_turn_id") or turn.get("turn_id") or "").strip(),
+                str(turn.get("kimi_session_id") or chat.get("kimi_session_id") or "").strip(),
+            )
+        if is_claudecode_model(model):
+            return (
+                str(turn.get("turn_id") or turn.get("id") or "").strip(),
+                str(turn.get("claudecode_session_id") or chat.get("claudecode_session_id") or "").strip(),
+            )
+        return (str(turn.get("turn_id") or turn.get("id") or turn.get("answer_external_event_id") or "").strip(), "")
 
     def _try_open_selected_answer_detail(self) -> bool:
         idx = self.answer_list.GetSelection()
@@ -18448,6 +18725,7 @@ class ChatFrame(wx.Frame):
 
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
+        self._closing = True
         self._invalidate_execution_scan()
         self._flush_chat_state_save()
         self._flush_execution_step_persists_sync()
