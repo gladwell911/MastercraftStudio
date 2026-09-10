@@ -192,6 +192,29 @@ class ChatStore:
             conn.execute("UPDATE v2_chat_state SET revision=? WHERE chat_id=?", (revision, owner))
             return revision
 
+    def get_clear_reconciliation_authority(self, chat_id: str) -> dict[str, Any]:
+        """Return content-free revision and latest clear authority for one owner."""
+        owner = self.normalize_chat_id(chat_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT s.revision state_revision,o.operation_id,o.revision operation_revision,o.state "
+                "FROM v2_chat_state s LEFT JOIN clear_operations o ON o.operation_id=("
+                "SELECT operation_id FROM clear_operations WHERE chat_id=s.chat_id "
+                "ORDER BY revision DESC,created_at DESC LIMIT 1) WHERE s.chat_id=?", (owner,)
+            ).fetchone()
+        state_revision = int(row["state_revision"]) if row else 0
+        operation_revision = int(row["operation_revision"]) if row and row["operation_id"] else 0
+        if operation_revision > state_revision:
+            raise RuntimeError("CLEAR_REVISION_AHEAD_OF_CHAT")
+        return {
+            "revision": state_revision,
+            "clear_operation": ({
+                "operation_id": str(row["operation_id"]),
+                "revision": operation_revision,
+                "state": str(row["state"]),
+            } if row is not None and row["operation_id"] else None),
+        }
+
     @staticmethod
     def _eligible_clear_payload(payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict) or payload.get("local_command") or payload.get("deleted") or payload.get("is_deleted"):

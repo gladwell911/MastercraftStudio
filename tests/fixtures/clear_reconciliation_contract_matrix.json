@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "cases": [
+    {"id":"ordered_clear","given":{"owner":"a","revision":1,"turns":["old"]},"events":[{"kind":"clear_context","revision":2,"operation_id":"op2","state":"requested"}],"expected":{"revision":2,"turns":[],"send_enabled":false}},
+    {"id":"resend_before_clear","given":{"owner":"a","revision":1},"events":[{"kind":"status","revision":2,"text":"after clear"},{"kind":"clear_context","revision":2,"operation_id":"op2","state":"requested"}],"expected":{"buffered_before_clear":1,"status":"after clear","send_enabled":false}},
+    {"id":"higher_revision_gap","given":{"owner":"a","revision":1},"events":[{"kind":"status","revision":3,"text":"gap"}],"actions":[{"type":"request_state","single_flight":true}],"expected":{"sync_state":"recovering","preserve_projection":true}},
+    {"id":"stale_data","given":{"owner":"a","revision":2,"operation_id":"op2","state":"requested"},"actions":[{"type":"apply_snapshot","revision":1,"turns":["stale"]}],"expected":{"revision":2,"turns":[]}},
+    {"id":"duplicate_lifecycle","given":{"owner":"a","revision":2,"operation_id":"op2","state":"requested"},"events":[{"kind":"clear_context","revision":2,"operation_id":"op2","state":"requested"},{"kind":"clear_context","revision":2,"operation_id":"op2","state":"requested"}],"expected":{"operation_id":"op2","projection_count":1,"send_enabled":false}},
+    {"id":"terminal_outcomes","given":{"owner":"a","revision":2,"operation_id":"op2"},"actions":[{"type":"apply_states","states":["completed_with_resend","completed_clear_only","completed_no_message","superseded","resend_blocked"]}],"expected":{"terminal_send_enabled":true,"blocked_send_enabled":false}},
+    {"id":"supersession","given":{"owner":"a","revision":3,"operation_id":"new","state":"requested"},"events":[{"kind":"clear_context","revision":3,"operation_id":"old","state":"superseded"}],"expected":{"operation_id":"new","send_enabled":false}},
+    {"id":"other_owner","given":{"owner":"a","revision":1},"events":[{"kind":"clear_context","owner":"b","revision":2,"operation_id":"b-op","state":"requested"}],"expected":{"owner":"a","revision":1,"focus_unchanged":true}},
+    {"id":"stale_reconnect_history","given":{"owner":"a","revision":2,"operation_id":"op2","state":"requested"},"actions":[{"type":"hydrate_history","revision":1,"turns":["stale"]}],"expected":{"revision":2,"turns":[],"preserve_projection":true}},
+    {"id":"buffer_capacity_timeout","given":{"owner":"a","revision":1,"capacity":100,"timeout_ms":3000,"max_attempts":3},"actions":[{"type":"overflow"},{"type":"timeout"},{"type":"fail_consistency","count":3}],"expected":{"single_flight":true,"sync_state":"manualRetry","attempts":3}},
+    {"id":"cosmetic_empty_history","given":{"owner":"a","revision":1,"turns":["keep"]},"actions":[{"type":"hydrate_history","turn_count":0,"turns":[]}],"expected":{"turns":["keep"],"clear_operation_id":""}},
+    {"id":"invalid_clear_contract","given":{"owner":"a","revision":1,"turns":["keep"]},"events":[{"kind":"clear_context","owner":"","revision":2,"operation_id":"","state":"invalid","canonical_hash":"bad"}],"expected":{"quarantine_reason":"INVALID_CLEAR_CONTRACT","revision":1,"turns":["keep"],"partial_clear":false}}
+  ]
+}

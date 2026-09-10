@@ -8,6 +8,45 @@ from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
 
+def test_clear_reconciliation_fixture_is_shared_byte_for_byte():
+    local = Path(__file__).parent / "fixtures" / "clear_reconciliation_contract_matrix.json"
+    remote = Path(__file__).parents[2] / "rc" / "test" / "fixtures" / "clear_reconciliation_contract_matrix.json"
+    assert local.read_bytes() == remote.read_bytes()
+    matrix = json.loads(local.read_text(encoding="utf-8"))
+    assert matrix["version"] == 2
+    for case in matrix["cases"]:
+        assert isinstance(case["given"], dict) and case["given"]["owner"] == "a"
+        assert case.get("events") or case.get("actions")
+        assert isinstance(case["expected"], dict) and case["expected"]
+    assert {case["id"] for case in matrix["cases"]} == {
+        "ordered_clear", "resend_before_clear", "higher_revision_gap", "stale_data",
+        "duplicate_lifecycle", "terminal_outcomes", "supersession", "other_owner",
+        "stale_reconnect_history", "buffer_capacity_timeout",
+        "cosmetic_empty_history", "invalid_clear_contract",
+    }
+
+
+def test_clear_reconciliation_authority_is_content_free_and_revision_consistent(tmp_path):
+    store = ChatStore(tmp_path / "authority.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner-a", "title": "A", "model": "codex/main",
+                       "created_at": 1.0, "updated_at": 1.0, "turns": []})
+    operation = store.begin_clear_operation(
+        "owner-a", idempotency_key="request-a", operation_id="operation-a"
+    )
+    authority = store.get_clear_reconciliation_authority("owner-a")
+    assert authority == {
+        "revision": operation["revision"],
+        "clear_operation": {
+            "operation_id": "operation-a",
+            "revision": operation["revision"],
+            "state": "completed_no_message",
+        },
+    }
+    encoded = json.dumps(authority)
+    assert "snapshot" not in encoded and "attachments" not in encoded and "path" not in encoded
+
+
 def test_chat_store_initializes_schema_and_lists_summaries(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()

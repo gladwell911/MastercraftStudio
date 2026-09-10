@@ -9536,7 +9536,7 @@ class ChatFrame(wx.Frame):
         pending_request = chat.get("codex_pending_request")
         request_kind = "user_input" if isinstance(pending_request, dict) and pending_request else ""
         current_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        return {
+        snapshot = {
             "chat_id": chat_id,
             "title": title,
             "model": model,
@@ -9554,6 +9554,13 @@ class ChatFrame(wx.Frame):
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
             **self._codex_speed_payload_for_chat(chat),
         }
+        store = getattr(self, "chat_store", None)
+        if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
+            try:
+                snapshot.update(store.get_clear_reconciliation_authority(chat_id))
+            except (ValueError, RuntimeError):
+                pass
+        return snapshot
 
     def _remote_execution_step_payload(self, chat: dict, *, include_execution_steps: bool = False) -> tuple[list, int]:
         steps = chat.get("execution_steps") if isinstance(chat.get("execution_steps"), list) else []
@@ -9594,7 +9601,7 @@ class ChatFrame(wx.Frame):
         pending_request = chat.get("codex_pending_request")
         request_kind = "user_input" if isinstance(pending_request, dict) and pending_request else ""
         current_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        return {
+        snapshot = {
             "chat_id": chat_id,
             "title": title,
             "model": model,
@@ -9615,6 +9622,13 @@ class ChatFrame(wx.Frame):
             "turns": [self._remote_turn_payload(turn) for turn in turns if isinstance(turn, dict)],
             **self._codex_speed_payload_for_chat(chat),
         }
+        store = getattr(self, "chat_store", None)
+        if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
+            try:
+                snapshot.update(store.get_clear_reconciliation_authority(chat_id))
+            except (ValueError, RuntimeError):
+                pass
+        return snapshot
 
     def _remote_chat_snapshot_page(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
         payload = payload or {}
@@ -10547,12 +10561,20 @@ class ChatFrame(wx.Frame):
         include_execution_steps = bool(payload.get("include_execution_steps"))
         raw_limit = payload.get("limit", REMOTE_STATE_DEFAULT_TURN_LIMIT)
         raw_before = payload.get("before_turn_index")
+        authority_signature = None
+        store = getattr(self, "chat_store", None)
+        if chat_id and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
+            try:
+                authority_signature = store.get_clear_reconciliation_authority(chat_id)
+            except (ValueError, RuntimeError):
+                authority_signature = None
         cache_key = (
             chat_id,
             include_execution_steps,
             str(raw_limit),
             str(raw_before),
             int(getattr(self, "_remote_state_cache_revision", 0) or 0),
+            json.dumps(authority_signature, sort_keys=True),
         )
         cache = getattr(self, "_remote_state_cache", None)
         if isinstance(cache, dict) and cache.get("key") == cache_key and isinstance(cache.get("body"), dict):
@@ -10783,7 +10805,11 @@ class ChatFrame(wx.Frame):
                 "chat_id": chat_id,
                 "error": "clear_context_unavailable",
             }
-        return 200, {"accepted": True, "chat_id": chat_id}
+        body = {"accepted": True, "chat_id": chat_id}
+        store = getattr(self, "chat_store", None)
+        if store is not None and hasattr(store, "get_clear_reconciliation_authority"):
+            body.update(store.get_clear_reconciliation_authority(chat_id))
+        return 200, body
 
     def _handle_remote_pending_request_reply(self, text: str) -> tuple[bool, str]:
         pending = self.active_codex_pending_request

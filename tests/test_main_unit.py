@@ -13796,7 +13796,14 @@ def test_remote_api_clear_context_uses_desktop_clear_context_command(frame, monk
     status, body = frame._remote_api_clear_context_ui({"chat_id": "chat-current"})
 
     assert status == 200
-    assert body == {"accepted": True, "chat_id": "chat-current"}
+    assert body["accepted"] is True
+    assert body["chat_id"] == "chat-current"
+    assert isinstance(body["revision"], int)
+    clear = body["clear_operation"]
+    if clear is not None:
+        assert set(clear) == {"operation_id", "revision", "state"}
+        assert clear["revision"] <= body["revision"]
+    assert not ({"snapshot", "attachments", "path"} & set(body))
     assert calls == ["clear"]
 
 
@@ -13987,7 +13994,13 @@ def test_remote_api_clear_context_clears_requested_archived_chat_without_touchin
 
     archived = frame._find_archived_chat("chat-b")
     assert status == 200
-    assert body == {"accepted": True, "chat_id": "chat-b"}
+    assert body["accepted"] is True
+    assert body["chat_id"] == "chat-b"
+    assert isinstance(body["revision"], int)
+    assert set(body["clear_operation"]) == {"operation_id", "revision", "state"}
+    assert body["clear_operation"]["revision"] == body["revision"]
+    assert body["clear_operation"]["operation_id"] == archived["turns"][0]["clear_operation_id"]
+    assert not ({"snapshot", "attachments", "path"} & set(body))
     assert frame.active_chat_id == "chat-a"
     assert frame.current_chat_id == "chat-a"
     assert frame.active_session_turns[0]["question"] == "A 正在执行"
