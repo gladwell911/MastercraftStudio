@@ -3293,6 +3293,97 @@ def test_input_enter_without_ime_candidates_sends(frame):
     assert sent["n"] == 1
 
 
+class _Story13KeyEvent:
+    def __init__(self, key=wx.WXK_RETURN, *, ctrl=False, alt=False, shift=False, repeat=False):
+        self.key, self.ctrl, self.alt, self.shift, self.repeat = key, ctrl, alt, shift, repeat
+        self.skipped = 0
+
+    def GetKeyCode(self): return self.key
+    def ControlDown(self): return self.ctrl
+    def AltDown(self): return self.alt
+    def ShiftDown(self): return self.shift
+    def IsAutoRepeat(self): return self.repeat
+    def Skip(self): self.skipped += 1
+
+
+@pytest.mark.parametrize("modifier", ["shift", "ctrl", "alt"])
+def test_input_key_down_story_1_3_modified_enter_is_native_and_never_sends(frame, modifier):
+    event = _Story13KeyEvent(**{modifier: True})
+    sent = []
+    frame._has_input_ime_candidates = lambda: False
+    frame._trigger_send = lambda: sent.append(True)
+    frame._on_input_key_down(event)
+    assert event.skipped == 1
+    assert sent == []
+
+
+def test_input_key_down_story_1_3_repeat_is_consumed_without_send(frame):
+    event = _Story13KeyEvent(repeat=True)
+    sent = []
+    frame._has_input_ime_candidates = lambda: False
+    frame._trigger_send = lambda: sent.append(True)
+    frame._on_input_key_down(event)
+    assert event.skipped == 0
+    assert sent == []
+
+
+@pytest.mark.parametrize("enabled,value", [(False, "question"), (True, "  ")])
+def test_story_1_3_question_rejection_preserves_exact_value_selection_and_focus(frame, enabled, value):
+    frame.Show()
+    frame.input_edit.SetValue(value)
+    frame.input_edit.SetSelection(0, min(1, len(value)))
+    frame.input_edit.SetFocus()
+    frame.send_button.Enable(enabled)
+    before = (frame.input_edit.GetValue(), frame.input_edit.GetSelection())
+    assert frame._request_question_submit() is False
+    assert (frame.input_edit.GetValue(), frame.input_edit.GetSelection()) == before
+    assert frame.input_edit.HasFocus()
+
+
+@pytest.mark.parametrize("outcome", [(False, "rejected"), RuntimeError("boom")])
+def test_story_1_3_false_or_exception_restores_and_allows_retry(frame, monkeypatch, outcome):
+    frame.Show()
+    frame.input_edit.SetValue("  exact question  ")
+    frame.input_edit.SetSelection(2, 7)
+    frame.input_edit.SetFocus()
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *a, **k: wx.ID_OK)
+    calls = []
+    def submit(value, **_kwargs):
+        calls.append(value)
+        if isinstance(outcome, Exception): raise outcome
+        return outcome
+    frame._submit_question = submit
+    assert frame._request_question_submit() is False
+    assert frame.input_edit.GetValue() == "  exact question  "
+    assert frame.input_edit.GetSelection() == (2, 7)
+    assert frame.input_edit.HasFocus()
+    frame._submit_question = lambda value, **_kwargs: calls.append(value) or (True, "")
+    assert frame._request_question_submit() is True
+    assert calls == ["exact question", "exact question"]
+
+
+def test_story_1_3_question_latch_blocks_recursive_duplicate(frame):
+    frame.Show(); frame.input_edit.SetValue("once"); frame.input_edit.SetFocus()
+    calls = []
+    def submit(value, **_kwargs):
+        calls.append(value)
+        assert frame._request_question_submit() is False
+        return True, ""
+    frame._submit_question = submit
+    assert frame._request_question_submit() is True
+    assert calls == ["once"]
+
+
+@pytest.mark.parametrize("candidate_state", ["composition", "candidate"])
+def test_story_1_3_input_ime_composition_or_candidate_owns_enter(frame, candidate_state):
+    event = _Story13KeyEvent()
+    sent = []
+    frame._has_input_ime_candidates = lambda: True
+    frame._trigger_send = lambda: sent.append(True)
+    frame._on_input_key_down(event)
+    assert event.skipped == 1 and sent == []
+
+
 def test_send_click_empty_input_shows_message(frame, monkeypatch):
     seen = {}
     monkeypatch.setattr(main.wx, "MessageBox", lambda message, title, flags: seen.update({"message": message, "title": title}))
@@ -10307,10 +10398,174 @@ def test_common_command_edit_dialog_save_and_cancel_buttons_end_modal(frame, mon
         cancel_event = wx.CommandEvent(wx.wxEVT_BUTTON, wx.ID_CANCEL)
         cancel_event.SetEventObject(cancel_button)
         assert cancel_button.ProcessEvent(cancel_event)
-        assert closed == [wx.ID_OK, wx.ID_CANCEL]
+        assert closed == [wx.ID_OK]
     finally:
         if dlg:
             dlg.Destroy()
+
+
+@pytest.mark.parametrize("shift", [False, True])
+def test_common_command_edit_dialog_title_enter_focuses_content(frame, monkeypatch, shift):
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add")
+    try:
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.title_edit)
+        dlg._has_ime_composition = lambda: False
+        focused = []
+        monkeypatch.setattr(dlg.content_edit, "SetFocus", lambda: focused.append(True))
+        event = _Story13KeyEvent(shift=shift)
+        dlg._on_char_hook(event)
+        assert focused == [True] and event.skipped == 0
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("shift", [False, True])
+def test_common_command_edit_dialog_content_enter_is_native(frame, monkeypatch, shift):
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add")
+    try:
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.content_edit)
+        dlg._has_ime_composition = lambda: False
+        event = _Story13KeyEvent(shift=shift)
+        dlg._on_char_hook(event)
+        assert event.skipped == 1
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("kind", ["ctrl_enter", "alt_s", "button"])
+def test_common_command_edit_dialog_save_paths_share_once_latch(frame, monkeypatch, kind):
+    calls, closed = [], []
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="echo", on_save=lambda *v: calls.append(v) or True)
+    try:
+        monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda self, code: closed.append(code))
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.content_edit)
+        dlg._has_ime_composition = lambda: False
+        if kind == "ctrl_enter": dlg._on_char_hook(_Story13KeyEvent(ctrl=True))
+        elif kind == "alt_s": dlg._on_char_hook(_Story13KeyEvent(ord("S"), alt=True))
+        else: dlg._on_save()
+        dlg._on_save()
+        assert len(calls) == 1 and closed == [wx.ID_OK]
+    finally: dlg.Destroy()
+
+
+def test_common_command_edit_dialog_validation_and_exception_are_retryable(frame, monkeypatch):
+    outcomes = [RuntimeError("write failed"), True]
+    calls = []
+    def save(*values):
+        calls.append(values); result = outcomes.pop(0)
+        if isinstance(result, Exception): raise result
+        return result
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add", on_save=save)
+    try:
+        monkeypatch.setattr(main.wx, "MessageBox", lambda *a, **k: wx.ID_OK)
+        closed = []; monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda self, code: closed.append(code))
+        dlg.content_edit.SetValue("   "); dlg._on_save(); assert calls == [] and closed == []
+        dlg.content_edit.SetValue(" exact "); dlg.content_edit.SetSelection(1, 4); dlg._on_save()
+        assert dlg.content_edit.GetValue() == " exact " and dlg.content_edit.GetSelection() == (1, 4) and closed == []
+        dlg._on_save(); assert len(calls) == 2 and closed == [wx.ID_OK]
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("action", ["escape", "cancel", "close"])
+@pytest.mark.parametrize("dirty,answer,closes", [(False, wx.NO, True), (True, wx.NO, False), (True, wx.YES, True)])
+def test_common_command_edit_dialog_cancel_matrix(frame, monkeypatch, action, dirty, answer, closes):
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="initial")
+    try:
+        if dirty: dlg.content_edit.SetValue("changed")
+        monkeypatch.setattr(main.wx, "MessageBox", lambda *a, **k: answer)
+        closed = []; monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda self, code: closed.append(code))
+        if action == "escape": dlg._has_ime_composition=lambda: False; dlg._on_char_hook(_Story13KeyEvent(wx.WXK_ESCAPE))
+        elif action == "cancel": dlg._on_cancel()
+        else:
+            class Close:
+                def Veto(self): pass
+            dlg._on_close(Close())
+        assert bool(closed) is closes
+    finally: dlg.Destroy()
+
+
+def test_common_command_edit_dialog_ime_and_ordinary_keys_are_isolated(frame, monkeypatch):
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="x")
+    try:
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.content_edit)
+        dlg._has_ime_composition=lambda: True
+        ime = _Story13KeyEvent(); dlg._on_char_hook(ime); assert ime.skipped == 1
+        dlg._has_ime_composition=lambda: False
+        ordinary = _Story13KeyEvent(ord("A")); dlg._on_char_hook(ordinary); assert ordinary.skipped == 1
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("control_name", ["title_edit", "content_edit"])
+def test_common_command_edit_dialog_delegates_ime_for_focused_text_control(frame, monkeypatch, control_name):
+    dlg = main.CommonCommandEditDialog(frame, dialog_title="Add")
+    try:
+        control = getattr(dlg, control_name); seen = []
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: control)
+        monkeypatch.setattr(frame, "_has_native_ime_composition", lambda target: seen.append(target) or True)
+        assert dlg._has_ime_composition() is True
+        assert seen == [control]
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("event", [_Story13KeyEvent(ctrl=True, repeat=True), _Story13KeyEvent(ord("S"), alt=True, repeat=True)])
+def test_common_command_edit_dialog_repeated_save_shortcut_is_noop(frame, monkeypatch, event):
+    calls=[]; dlg=main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="x", on_save=lambda *v: calls.append(v) or True)
+    try:
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.content_edit)
+        dlg._has_ime_composition=lambda: False; dlg._on_char_hook(event); assert calls == []
+    finally: dlg.Destroy()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_common_command_edit_dialog_endmodal_exception_recovers_latches(frame, monkeypatch, cancel):
+    dlg=main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="x", on_save=lambda *v: True)
+    try:
+        monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda *_a: (_ for _ in ()).throw(RuntimeError("close failed")))
+        monkeypatch.setattr(main.wx, "MessageBox", lambda *a, **k: wx.YES)
+        if cancel: assert dlg._request_cancel() is False
+        else: dlg._on_save()
+        assert dlg._closing is False
+        assert dlg._save_in_progress is False
+    finally: dlg.Destroy()
+
+
+def test_common_command_edit_dialog_callback_false_then_success_retains_state(frame, monkeypatch):
+    outcomes=[False, True]; calls=[]
+    dlg=main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="original", on_save=lambda *v: calls.append(v) or outcomes.pop(0))
+    try:
+        dlg.content_edit.SetValue(" exact "); dlg.content_edit.SetSelection(1, 4); dlg.content_edit.SetFocus()
+        closed=[]; monkeypatch.setattr(main.wx.Dialog, "EndModal", lambda self, code: closed.append(code))
+        dlg._on_save()
+        assert dlg.content_edit.GetValue()==" exact " and dlg.content_edit.GetSelection()==(1,4)
+        assert not dlg._save_in_progress and not dlg._closing and closed==[]
+        dlg._on_save(); assert len(calls)==2 and closed==[wx.ID_OK]
+    finally: dlg.Destroy()
+
+
+def test_common_command_edit_dialog_declined_close_confirms_once_and_vetoes(frame, monkeypatch):
+    dlg=main.CommonCommandEditDialog(frame, dialog_title="Add", initial_content="original")
+    try:
+        dlg.content_edit.SetValue("dirty"); confirmations=[]
+        monkeypatch.setattr(main.wx, "MessageBox", lambda *a, **k: confirmations.append(True) or wx.NO)
+        class Close:
+            def __init__(self): self.vetoes=0
+            def Veto(self): self.vetoes += 1
+        event=Close(); dlg._on_close(event)
+        assert confirmations==[True] and event.vetoes==1 and not dlg._closing
+    finally: dlg.Destroy()
+
+
+def test_story_1_3_attachment_only_keyboard_and_button_admission(frame, monkeypatch):
+    frame.Show(); frame.input_edit.SetValue(""); frame._pending_input_attachments=[{"path":"x"}]
+    calls=[]; frame._submit_question=lambda value, **kw: calls.append(value) or (True, "")
+    frame.input_edit.SetFocus(); assert frame._request_question_submit() is True
+    frame._pending_input_attachments=[{"path":"x"}]
+    assert frame._request_question_submit(require_focus=False) is True
+    assert calls == ["", ""]
+
+
+@pytest.mark.parametrize("event", [_Story13KeyEvent(), _Story13KeyEvent(ord("S"), alt=True)])
+def test_story_1_3_frame_char_hook_never_submits_from_non_input(frame, monkeypatch, event):
+    calls=[]; monkeypatch.setattr(frame, "_trigger_send", lambda: calls.append(True))
+    frame.history_list.SetFocus(); frame._on_char_hook(event); assert calls == []
 
 
 def test_try_open_selected_answer_detail_opens_attachment_path(frame, monkeypatch, tmp_path):
@@ -12680,7 +12935,7 @@ def test_input_key_up_alt_does_not_open_tools_menu_after_continue_shortcut(frame
     assert frame._alt_menu_suppressed is False
 
 
-def test_input_key_down_alt_s_shortcut_suppresses_tools_menu_and_triggers_send(frame):
+def test_input_key_down_alt_s_does_not_submit_from_question_input(frame):
     seen = {"send": 0}
     frame._alt_menu_armed = True
     frame._alt_menu_suppressed = False
@@ -12701,7 +12956,7 @@ def test_input_key_down_alt_s_shortcut_suppresses_tools_menu_and_triggers_send(f
 
     frame._on_input_key_down(E())
 
-    assert seen["send"] == 1
+    assert seen["send"] == 0
     assert frame._alt_menu_suppressed is True
 
 

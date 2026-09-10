@@ -1215,16 +1215,21 @@ class CloudflaredOriginProxy:
 
 
 class CommonCommandEditDialog(wx.Dialog):
-    def __init__(self, parent, *, dialog_title: str, initial_title: str = "", initial_content: str = ""):
+    def __init__(self, parent, *, dialog_title: str, initial_title: str = "", initial_content: str = "", on_save=None):
         super().__init__(parent, title=dialog_title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self._initial_title = str(initial_title or "")
+        self._initial_content = str(initial_content or "")
+        self._save_callback = on_save
+        self._save_in_progress = False
+        self._closing = False
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
         root.Add(wx.StaticText(panel, label="标题："), 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
-        self.title_edit = wx.TextCtrl(panel, value=str(initial_title or ""))
+        self.title_edit = wx.TextCtrl(panel, value=self._initial_title)
         self.title_edit.SetName("常用命令标题")
         root.Add(self.title_edit, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(wx.StaticText(panel, label="内容："), 0, wx.LEFT | wx.RIGHT, 10)
-        self.content_edit = wx.TextCtrl(panel, value=str(initial_content or ""), style=wx.TE_MULTILINE)
+        self.content_edit = wx.TextCtrl(panel, value=self._initial_content, style=wx.TE_MULTILINE)
         self.content_edit.SetName("常用命令内容")
         root.Add(self.content_edit, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         button_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -1239,14 +1244,104 @@ class CommonCommandEditDialog(wx.Dialog):
         self.SetSize((520, 420))
         self.ok_button.SetDefault()
         self.ok_button.Bind(wx.EVT_BUTTON, self._on_save)
-        self.cancel_button.Bind(wx.EVT_BUTTON, lambda _event: self.EndModal(wx.ID_CANCEL))
+        self.cancel_button.Bind(wx.EVT_BUTTON, self._on_cancel)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
 
-    def _on_save(self, event) -> None:
+    def _has_ime_composition(self) -> bool:
+        focus = wx.Window.FindFocus()
+        if focus not in (self.title_edit, self.content_edit):
+            return False
+        checker = getattr(self.GetParent(), "_has_native_ime_composition", None)
+        return bool(callable(checker) and checker(focus))
+
+    def _is_dirty(self) -> bool:
+        return (str(self.title_edit.GetValue() or "") != self._initial_title
+                or str(self.content_edit.GetValue() or "") != self._initial_content)
+
+    def _request_cancel(self) -> bool:
+        if self._closing:
+            return False
+        if self._is_dirty():
+            answer = wx.MessageBox("Discard changes?", "Confirm discard",
+                                   wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, parent=self)
+            if answer != wx.YES:
+                return False
+        self._closing = True
+        try:
+            self.EndModal(wx.ID_CANCEL)
+        except Exception:
+            self._closing = False
+            return False
+        return True
+
+    def _on_cancel(self, _event=None) -> None:
+        self._request_cancel()
+
+    def _on_close(self, event) -> None:
+        if not self._request_cancel():
+            veto = getattr(event, "Veto", None)
+            if callable(veto):
+                veto()
+            else:
+                skip = getattr(event, "Skip", None)
+                if callable(skip):
+                    skip(False)
+
+    def _on_char_hook(self, event) -> None:
+        key = event.GetKeyCode()
+        ctrl = bool(getattr(event, "ControlDown", lambda: False)())
+        alt = bool(getattr(event, "AltDown", lambda: False)())
+        focus = wx.Window.FindFocus()
+        if self._has_ime_composition():
+            event.Skip()
+            return
+        if key == wx.WXK_ESCAPE and not ctrl and not alt:
+            self._request_cancel()
+            return
+        if bool(getattr(event, "IsAutoRepeat", lambda: False)()) and (
+            (ctrl and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER))
+            or (alt and not ctrl and key in (ord("S"), ord("s")))
+        ):
+            return
+        if alt and not ctrl and key in (ord("S"), ord("s")):
+            self._on_save(event)
+            return
+        if key not in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            event.Skip()
+            return
+        if bool(getattr(event, "IsAutoRepeat", lambda: False)()):
+            return
+        if focus is self.title_edit and not ctrl and not alt:
+            self.content_edit.SetFocus()
+            return
+        if focus is self.content_edit:
+            if ctrl and not alt:
+                self._on_save(event)
+                return
+            event.Skip()
+            return
+        event.Skip()
+
+    def _on_save(self, event=None) -> None:
+        if self._save_in_progress or self._closing:
+            return
         if not str(self.content_edit.GetValue() or "").strip():
             wx.MessageBox("请输入命令内容。", "提示", wx.OK | wx.ICON_WARNING)
             self.content_edit.SetFocus()
             return
-        self.EndModal(wx.ID_OK)
+        self._save_in_progress = True
+        try:
+            if callable(self._save_callback) and not self._save_callback(*self.values()):
+                return
+            self._closing = True
+            self.EndModal(wx.ID_OK)
+        except Exception as exc:
+            self._closing = False
+            wx.MessageBox(str(exc), "Error", wx.OK | wx.ICON_WARNING, parent=self)
+        finally:
+            if not self._closing:
+                self._save_in_progress = False
 
     def values(self) -> tuple[str, str]:
         return (
@@ -1947,17 +2042,25 @@ class ChatFrame(wx.Frame):
         wx.MessageBox(str(exc), "提示", wx.OK | wx.ICON_WARNING)
 
     def _add_common_command(self) -> bool:
-        dlg = CommonCommandEditDialog(self, dialog_title="添加常用命令")
+        saved = {}
+
+        def save(title, content):
+            try:
+                saved["command"] = self.common_commands_store.create_command(CommonCommandCreate(title=title, content=content))
+                return True
+            except (CommonCommandsReadError, CommonCommandsWriteError) as exc:
+                self._show_common_commands_store_error(exc)
+                return False
+
+        dlg = CommonCommandEditDialog(self, dialog_title="添加常用命令", on_save=save)
         try:
             if dlg.ShowModal() != wx.ID_OK:
                 return False
             title, content = dlg.values()
         finally:
             dlg.Destroy()
-        try:
-            command = self.common_commands_store.create_command(CommonCommandCreate(title=title, content=content))
-        except (CommonCommandsReadError, CommonCommandsWriteError) as exc:
-            self._show_common_commands_store_error(exc)
+        command = saved.get("command")
+        if command is None:
             return False
         self._restore_common_commands_focus(command.id)
         self.SetStatusText("常用命令已保存")
@@ -1967,11 +2070,29 @@ class ChatFrame(wx.Frame):
         command = self._selected_common_command()
         if command is None:
             return False
+        saved = {}
+
+        def save(title, content):
+            try:
+                saved["command"] = self.common_commands_store.update_command(
+                    command.id,
+                    CommonCommandUpdate(
+                        expected_version=int(getattr(command, "version", 0) or 0),
+                        title=title,
+                        content=content,
+                    ),
+                )
+                return True
+            except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
+                self._show_common_commands_store_error(exc)
+                return False
+
         dlg = CommonCommandEditDialog(
             self,
             dialog_title="编辑常用命令",
             initial_title=str(getattr(command, "title", "") or ""),
             initial_content=str(getattr(command, "content", "") or ""),
+            on_save=save,
         )
         try:
             if dlg.ShowModal() != wx.ID_OK:
@@ -1979,17 +2100,8 @@ class ChatFrame(wx.Frame):
             title, content = dlg.values()
         finally:
             dlg.Destroy()
-        try:
-            updated = self.common_commands_store.update_command(
-                command.id,
-                CommonCommandUpdate(
-                    expected_version=int(getattr(command, "version", 0) or 0),
-                    title=title,
-                    content=content,
-                ),
-            )
-        except (CommonCommandsReadError, CommonCommandsWriteError, CommonCommandsVersionConflictError) as exc:
-            self._show_common_commands_store_error(exc)
+        updated = saved.get("command")
+        if updated is None:
             return False
         self._restore_common_commands_focus(updated.id)
         self.SetStatusText("常用命令已保存")
@@ -14271,12 +14383,6 @@ class ChatFrame(wx.Frame):
             direction = -1 if key == wx.WXK_LEFT else 1
             if self._navigate_history_chats(direction):
                 return
-        if self._is_send_shortcut(key, ctrl_down, alt_down):
-            if self.input_edit.HasFocus():
-                event.Skip()
-                return
-            self._trigger_send()
-            return
         if self._is_new_chat_shortcut(key, alt_down):
             self._trigger_new_chat()
             return
@@ -14396,10 +14502,19 @@ class ChatFrame(wx.Frame):
         if event.ControlDown() and key in (ord("V"), ord("v")) and self.input_edit.HasFocus():
             if self._try_paste_clipboard_attachments_to_input():
                 return
-        if self._is_send_shortcut(key, event.ControlDown(), event.AltDown()) and self._has_input_ime_candidates():
+        ctrl_down = self._event_control_down(event)
+        alt_down = self._event_alt_down(event)
+        shift_down = bool(getattr(event, "ShiftDown", lambda: False)())
+        is_enter = key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+        if is_enter and self._has_input_ime_candidates():
             event.Skip()
             return
-        if self._is_send_shortcut(key, event.ControlDown(), event.AltDown()):
+        if is_enter:
+            if alt_down or ctrl_down or shift_down:
+                event.Skip()
+                return
+            if bool(getattr(event, "IsAutoRepeat", lambda: False)()):
+                return
             self._trigger_send()
             return
         if self._is_clear_context_shortcut(key, event.AltDown()):
@@ -14679,8 +14794,38 @@ class ChatFrame(wx.Frame):
         event.Skip()
 
     def _trigger_send(self):
-        if self.send_button.IsEnabled():
-            self._post_send_click()
+        return self._request_question_submit()
+
+    def _request_question_submit(self, *, require_focus: bool = True, show_empty_warning: bool = False) -> bool:
+        if getattr(self, "_question_submit_in_progress", False):
+            return False
+        focus = wx.Window.FindFocus()
+        if require_focus and not self.input_edit.HasFocus() and focus is not self.send_button:
+            return False
+        if not self.input_edit.IsEnabled() or not self.send_button.IsEnabled():
+            return False
+        raw_value = str(self.input_edit.GetValue() or "")
+        if not raw_value.strip() and not list(getattr(self, "_pending_input_attachments", []) or []):
+            if show_empty_warning:
+                wx.MessageBox("请输入问题，输入框内容为空", "提示", wx.OK | wx.ICON_WARNING)
+            return False
+        snapshot = self._capture_answer_continue_state()
+        snapshot["input_selection"] = self.input_edit.GetSelection()
+        self._question_submit_in_progress = True
+        try:
+            ok, message = self._submit_question(raw_value.strip(), source="local")
+        except Exception as exc:
+            ok, message = False, str(exc)
+        finally:
+            self._question_submit_in_progress = False
+        if ok:
+            return True
+        self._restore_answer_continue_state(snapshot)
+        self.input_edit.ChangeValue(raw_value)
+        self.input_edit.SetSelection(*snapshot["input_selection"])
+        if message:
+            wx.MessageBox(message, "Error", wx.OK | wx.ICON_WARNING)
+        return False
 
     def _post_send_click(self):
         if not self.send_button.IsEnabled():
@@ -14867,11 +15012,7 @@ class ChatFrame(wx.Frame):
         return True
 
     def _on_send_clicked(self, _):
-        q = self.input_edit.GetValue().strip()
-        ok, message = self._submit_question(q, source="local")
-        if not ok and message:
-            wx.MessageBox(message, "提示", wx.OK | wx.ICON_WARNING)
-            return
+        return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
         raw_question = str(question or "")
@@ -16554,6 +16695,12 @@ class ChatFrame(wx.Frame):
 
     def _capture_answer_continue_state(self) -> dict:
         focus = wx.Window.FindFocus()
+        provider_fields = (
+            "active_codex_turn_active", "active_codex_pending_prompt", "active_codex_request_queue",
+            "active_kimi_turn_active", "active_kimi_pending_prompt", "active_kimi_request_queue",
+            "active_openclaw_session_key", "active_openclaw_session_id", "active_openclaw_session_file",
+            "active_openclaw_sync_offset", "active_openclaw_last_event_id", "active_openclaw_last_synced_at",
+        )
         state_graph = copy.deepcopy({
             "active_session_turns": self.active_session_turns,
             "current_chat_state": self._current_chat_state,
@@ -16576,6 +16723,7 @@ class ChatFrame(wx.Frame):
             "is_running": self.is_running,
             "pending_input_attachments": copy.deepcopy(self._pending_input_attachments),
             "input_value": self.input_edit.GetValue(),
+            "input_selection": self.input_edit.GetSelection(),
             "model_value": self.model_combo.GetValue(),
             "answer_strings": list(self.answer_list.GetStrings()),
             "answer_meta": copy.deepcopy(self.answer_meta),
@@ -16584,6 +16732,7 @@ class ChatFrame(wx.Frame):
             "history_strings": list(self.history_list.GetStrings()),
             "history_ids": list(self.history_ids),
             "focus": focus,
+            "provider_state": {name: copy.deepcopy(getattr(self, name, None)) for name in provider_fields},
         }
 
     def _restore_answer_continue_state(self, snapshot: dict) -> None:
@@ -16599,7 +16748,10 @@ class ChatFrame(wx.Frame):
             setattr(self, key, snapshot[key])
         self._active_request_count = snapshot["active_request_count"]
         self._pending_input_attachments = snapshot["pending_input_attachments"]
-        self.input_edit.SetValue(snapshot["input_value"])
+        for name, value in snapshot.get("provider_state", {}).items():
+            setattr(self, name, value)
+        self.input_edit.ChangeValue(snapshot["input_value"])
+        self.input_edit.SetSelection(*snapshot.get("input_selection", (0, 0)))
         self.model_combo.SetValue(snapshot["model_value"])
         self.answer_meta = snapshot["answer_meta"]
         self.answer_list.Set(snapshot["answer_strings"])

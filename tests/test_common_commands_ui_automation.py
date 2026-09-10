@@ -357,9 +357,10 @@ def test_ui_automation_save_after_add_edit_restores_focus_and_selection(frame, w
 
     class _AddDialog:
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.on_save = _kwargs["on_save"]
 
         def ShowModal(self):
+            assert self.on_save("Added", "echo added") is True
             return main.wx.ID_OK
 
         def values(self):
@@ -379,9 +380,10 @@ def test_ui_automation_save_after_add_edit_restores_focus_and_selection(frame, w
 
     class _EditDialog:
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.on_save = _kwargs["on_save"]
 
         def ShowModal(self):
+            assert self.on_save("Edited", "echo edited") is True
             return main.wx.ID_OK
 
         def values(self):
@@ -409,10 +411,11 @@ def test_ui_automation_add_save_failure_shows_message_and_keeps_dialog_open(fram
 
     class _AddDialog:
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.on_save = _kwargs["on_save"]
 
         def ShowModal(self):
-            return main.wx.ID_OK
+            assert self.on_save("Added", "echo added") is False
+            return main.wx.ID_CANCEL
 
         def values(self):
             return ("Added", "echo added")

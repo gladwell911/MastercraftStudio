@@ -11,7 +11,7 @@ def _send_listbox_key(window, key_code):
     _send_window_key(window, key_code)
 
 
-def _send_window_key(window, key_code, *, shift=False):
+def _send_window_key(window, key_code, *, shift=False, ctrl=False, alt=False):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     wm_keydown = 0x0100
     wm_keyup = 0x0101
@@ -48,11 +48,22 @@ def _send_window_key(window, key_code, *, shift=False):
         keys[modifier] = 0
     if shift:
         keys[0x10] = keys[0xA0] = 0x80
+    if ctrl:
+        keys[0x11] = keys[0xA2] = 0x80
+    if alt:
+        keys[0x12] = keys[0xA4] = 0x80
     try:
         if not user32.SetKeyboardState(keys):
             raise ctypes.WinError(ctypes.get_last_error())
-        user32.SendMessageW(hwnd, wm_keydown, virtual_key, down_lparam)
-        user32.SendMessageW(hwnd, wm_keyup, virtual_key, up_lparam)
+        down_message = 0x0104 if alt else wm_keydown
+        up_message = 0x0105 if alt else wm_keyup
+        if alt:
+            down_lparam |= 1 << 29
+            up_lparam |= 1 << 29
+        user32.SendMessageW(hwnd, down_message, virtual_key, down_lparam)
+        if key_code in (main.wx.WXK_RETURN, main.wx.WXK_NUMPAD_ENTER) and (shift or ctrl):
+            user32.SendMessageW(hwnd, 0x0102, 13, 1)
+        user32.SendMessageW(hwnd, up_message, virtual_key, up_lparam)
     finally:
         if not user32.SetKeyboardState(original_keys):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -64,6 +75,46 @@ def _activate_frame(frame, wx_app):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.SetForegroundWindow(int(frame.GetHandle()))
     wx_app.Yield()
+
+
+def test_real_ui_story_1_3_question_enter_and_native_modifiers(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    calls = []
+    monkeypatch.setattr(frame, "_submit_question", lambda value, **kwargs: calls.append(value) or (True, ""))
+    monkeypatch.setattr(frame, "_has_input_ime_candidates", lambda: False)
+    frame.input_edit.SetValue("question")
+    frame.input_edit.SetInsertionPointEnd()
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+
+    _send_window_key(frame.input_edit, main.wx.WXK_RETURN)
+    wx_app.Yield()
+    assert calls == ["question"]
+    assert frame.input_edit.HasFocus()
+
+    for modifiers in ({"shift": True}, {"ctrl": True}):
+        probe = type("ModifierProbe", (), {
+            "GetKeyCode": lambda self: main.wx.WXK_RETURN,
+            "ShiftDown": lambda self: bool(modifiers.get("shift")),
+            "ControlDown": lambda self: bool(modifiers.get("ctrl")),
+            "AltDown": lambda self: False,
+            "Skip": lambda self: setattr(self, "skipped", getattr(self, "skipped", 0) + 1),
+        })()
+        frame._on_input_key_down(probe)
+        assert probe.skipped == 1  # WM_CHAR below is valid only because the app delegated keydown.
+        before = frame.input_edit.GetValue()
+        frame.input_edit.SetInsertionPointEnd()
+        _send_window_key(frame.input_edit, main.wx.WXK_RETURN, **modifiers)
+        wx_app.Yield()
+        assert frame.input_edit.GetValue() == before + "\n"
+        assert calls == ["question"]
+        assert frame.input_edit.HasFocus()
+
+    before = frame.input_edit.GetValue()
+    _send_window_key(frame.input_edit, main.wx.WXK_RETURN, alt=True)
+    wx_app.Yield()
+    assert frame.input_edit.GetValue() == before
+    assert calls == ["question"]
 
 
 def _send_foreground_key(key_code, wx_app):
