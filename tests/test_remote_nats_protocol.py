@@ -1,4 +1,6 @@
 from dataclasses import FrozenInstanceError
+import json
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,8 @@ from remote_nats_protocol import (
     encode_payload,
     make_event_id,
     normalize_pair_id,
+    validate_v2_durable,
+    validate_v2_ephemeral,
 )
 
 
@@ -88,3 +92,19 @@ def test_make_event_id_returns_unique_prefixed_ids():
     assert first.startswith("state-")
     assert second.startswith("state-")
     assert first != second
+
+
+def test_shared_v2_contract_matrix_matches_python_validator():
+    matrix = json.loads((Path(__file__).parent / "fixtures" / "remote_protocol_v2_contract_matrix.json").read_text(encoding="utf-8"))
+    for row in matrix["durable"]:
+        if row["valid"]:
+            assert validate_v2_durable(row["payload"])["chat_id"]
+        else:
+            with pytest.raises(ValueError, match=row["error"]):
+                validate_v2_durable(row["payload"])
+    for row in matrix["ephemeral"]:
+        if row["valid"]:
+            assert validate_v2_ephemeral(row["payload"], expected_epoch="epoch-1")["request_id"]
+        else:
+            with pytest.raises(ValueError, match=row["error"]):
+                validate_v2_ephemeral(row["payload"], expected_epoch="epoch-1")

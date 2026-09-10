@@ -9306,6 +9306,57 @@ class ChatFrame(wx.Frame):
             pass
 
     def _broadcast_remote_event(self, payload: dict) -> None:
+        transport = getattr(self, "_remote_nats_transport", None)
+        store = getattr(self, "chat_store", None)
+        if (
+            transport is not None
+            and int(getattr(transport, "protocol_version", 1) or 1) >= 2
+            and store is not None
+            and getattr(store, "v2_writes_enabled", False)
+        ):
+            chat_id = str(payload.get("chat_id") or "").strip()
+            if not chat_id:
+                try:
+                    store.quarantine("MISSING_OWNER", payload, str(payload.get("event_id") or ""))
+                except Exception:
+                    pass
+                return
+            event_id = str(payload.get("event_id") or "").strip() or f"event-{uuid.uuid4().hex}"
+            kind = str(payload.get("type") or payload.get("kind") or "event").strip() or "event"
+            body = {key: copy.deepcopy(value) for key, value in payload.items()
+                    if key not in {"type", "kind", "event_id", "chat_id"}}
+            try:
+                store.commit_durable_fact(
+                    pair_id=transport.subjects.pair_id,
+                    domain="files" if kind.startswith("file_") else "events",
+                    envelope={"event_id": event_id, "kind": kind, "chat_id": chat_id, "body": body},
+                    execution=kind == "execution_entry",
+                )
+                loop = getattr(transport, "_loop", None)
+                if loop is not None and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
+                return
+            except ValueError as exc:
+                if str(exc) in {"EVENT_ID_CONFLICT", "STALE_REVISION"}:
+                    return
+            except Exception:
+                pending = getattr(self, "_pending_v2_remote_facts", None)
+                if not isinstance(pending, list):
+                    pending = []
+                    self._pending_v2_remote_facts = pending
+                if len(pending) < 1000:
+                    retry_payload = copy.deepcopy(payload)
+                    pending.append(retry_payload)
+                    def retry() -> None:
+                        try:
+                            pending.remove(retry_payload)
+                        except ValueError:
+                            return
+                        self._broadcast_remote_event(retry_payload)
+                    timer = threading.Timer(0.25, retry)
+                    timer.daemon = True
+                    timer.start()
+                return
         self._publish_remote_nats_event(payload)
 
     def _push_remote_status(self, status: str, request_kind: str = "") -> None:
@@ -13545,6 +13596,7 @@ class ChatFrame(wx.Frame):
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
                     on_file_command=lambda payload: self._run_remote_ui_route(self._remote_api_file_command_ui, payload),
+                    durable_store=getattr(self, "chat_store", None),
                 )
                 transport.start_threaded(tcp_url)
             except Exception as exc:

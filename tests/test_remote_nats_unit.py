@@ -1,4 +1,5 @@
 import asyncio
+from chat_store import ChatStore
 
 from remote_nats import RemoteNatsTransport
 
@@ -567,3 +568,80 @@ def test_transport_routes_file_commands_to_file_callback():
     assert status == 200
     assert body == {"accepted": True}
     assert seen == [{"type": "file_accept", "body": {"file_id": "file-1"}}]
+
+
+def test_outbox_ack_loss_retries_identical_bytes_poison_blocks_and_repair_resumes(tmp_path):
+    class AckLossJetStream(FakeJetStream):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        async def publish(self, subject, payload):
+            self.published.append((subject, payload))
+            if self.fail:
+                raise RuntimeError("ack lost")
+            return {"stream": "ok"}
+
+    async def run():
+        store = ChatStore(tmp_path / "outbox.db")
+        store.initialize()
+        first = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"first","kind":"status","chat_id":"chat","body":{"n":1}})
+        second = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"second","kind":"status","chat_id":"chat","body":{"n":2}})
+        jetstream = AckLossJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
+
+        for _ in range(5):
+            assert await transport.drain_outbox() == 0
+        assert len(jetstream.published) == 5
+        assert len({raw for _, raw in jetstream.published}) == 1
+        assert b'"event_id":"first"' in jetstream.published[0][1]
+        assert all(b'"event_id":"second"' not in raw for _, raw in jetstream.published)
+        assert store.get_checkpoint("publisher:default", "events") == 0
+        rows = store.pending_outbox(pair_id="default")
+        assert rows[0]["blocked_reason"] == "ack lost"
+
+        jetstream.fail = False
+        assert await transport.drain_outbox() == 0
+        assert len(jetstream.published) == 5
+        transport.repair_outbox_row(first["sync_sequence"])
+        assert await transport.drain_outbox() == 2
+        assert b'"event_id":"first"' in jetstream.published[5][1]
+        assert b'"event_id":"second"' in jetstream.published[6][1]
+        assert store.get_checkpoint("publisher:default", "events") == second["sync_sequence"]
+        assert store.pending_outbox(pair_id="default") == []
+
+    asyncio.run(run())
+
+
+def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch():
+    async def run():
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream)
+        await transport.handle_command({
+            "id": "mobile-session-hello-1", "type": "hello", "device_id": "mobile",
+            "protocol_versions": [2, 1], "session_id": "mobile-session",
+            "body": {"protocol_versions": [2, 1], "session_id": "mobile-session"},
+        })
+        hello = __import__("json").loads(jetstream.published[-1][1])
+        assert hello["body"]["protocol_version"] == 2
+        epoch = hello["body"]["epoch"]
+        assert epoch
+
+        await transport.handle_command({
+            "id": "bad-1", "request_id": "bad-1", "type": "state",
+            "device_id": "mobile", "session_id": "mobile-session", "chat_id": "chat",
+            "protocol_version": 2, "epoch": "wrong", "body": {},
+        })
+        error = __import__("json").loads(jetstream.published[-1][1])
+        assert error["protocol_version"] == 2
+        assert error["epoch"] == epoch
+        assert error["request_id"] == "bad-1"
+        assert error["chat_id"] == "chat"
+        assert error["body"]["error"] == "STALE_EPOCH"
+
+        # An unrelated session remains v1 and is not subjected to mobile-session's epoch.
+        await transport.handle_command({"id":"legacy-1","type":"state","device_id":"other","session_id":"other","chat_id":"chat"})
+        legacy = __import__("json").loads(jetstream.published[-1][1])
+        assert "protocol_version" not in legacy
+
+    asyncio.run(run())

@@ -5,6 +5,7 @@ from collections.abc import Callable
 import contextlib
 import json
 import threading
+import uuid
 from typing import Any
 
 from remote_nats_protocol import (
@@ -14,6 +15,7 @@ from remote_nats_protocol import (
     build_response_event,
     encode_payload,
     make_event_id,
+    validate_v2_ephemeral,
 )
 
 
@@ -53,6 +55,7 @@ class RemoteNatsTransport:
         on_file_command: Callback | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
         invoke_callback: CallbackInvoker | None = None,
+        durable_store: Any | None = None,
     ) -> None:
         self.subjects = NatsSubjects.from_pair_id(pair_id)
         self.token = token
@@ -82,6 +85,12 @@ class RemoteNatsTransport:
         self.on_notes_bulk_docs = on_notes_bulk_docs
         self.on_file_command = on_file_command
         self._invoke_callback = invoke_callback
+        self.durable_store = durable_store
+        self.protocol_version = 1
+        self.connection_epoch = uuid.uuid4().hex
+        self._sessions: dict[tuple[str, str], tuple[int, str]] = {}
+        self._outbox_lock: asyncio.Lock | None = None
+        self._outbox_retry_task: asyncio.Task | None = None
         self._nats_client: Any | None = None
         self._command_subscription: Any | None = None
         self._thread: threading.Thread | None = None
@@ -129,6 +138,7 @@ class RemoteNatsTransport:
             manual_ack=True,
             cb=self._handle_nats_message,
         )
+        await self.drain_outbox()
 
     def start_threaded(self, url: str = "nats://127.0.0.1:4222", timeout: float = 10) -> None:
         if self._thread and self._thread.is_alive():
@@ -182,7 +192,29 @@ class RemoteNatsTransport:
     async def handle_command(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("id") or "")
         chat_id = str(payload.get("chat_id") or "")
+        body_payload = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+        device_id = str(payload.get("device_id") or body_payload.get("device_id") or "").strip()
+        session_id = str(payload.get("session_id") or body_payload.get("session_id") or "").strip()
+        session_key = (device_id, session_id)
+        negotiated_version, negotiated_epoch = self._sessions.get(session_key, (1, ""))
         try:
+            if str(payload.get("type") or "").lower() == "hello":
+                offered = payload.get("protocol_versions", body_payload.get("protocol_versions", []))
+                negotiated_version = 2 if device_id and session_id and isinstance(offered, list) and 2 in offered else 1
+                negotiated_epoch = uuid.uuid4().hex if negotiated_version == 2 else ""
+                self._sessions[session_key] = (negotiated_version, negotiated_epoch)
+                self.protocol_version = max((state[0] for state in self._sessions.values()), default=1)
+                event = build_response_event(request_id=request_id, status=200, body={
+                    "accepted": True, "protocol_version": negotiated_version,
+                    "capabilities": ["canonical-owner", "durable-outbox", "replay"],
+                    "epoch": negotiated_epoch,
+                }, chat_id=chat_id)
+                await self.publish_event(event)
+                return
+            if negotiated_version == 2 and payload.get("epoch") != negotiated_epoch:
+                raise ValueError("STALE_EPOCH")
+            if negotiated_version == 2:
+                validate_v2_ephemeral(payload, expected_epoch=negotiated_epoch)
             status, body = await asyncio.to_thread(self._invoke_route_command, payload)
             event = build_response_event(
                 request_id=request_id,
@@ -190,8 +222,15 @@ class RemoteNatsTransport:
                 body=body,
                 chat_id=chat_id,
             )
+            if negotiated_version == 2:
+                event.update({"protocol_version": 2, "epoch": negotiated_epoch,
+                              "request_id": request_id, "chat_id": chat_id, "body": body})
         except Exception as exc:
             event = build_error_response(request_id, 500, str(exc) or "error")
+            if negotiated_version == 2:
+                event.update({"protocol_version": 2, "epoch": negotiated_epoch,
+                              "request_id": request_id, "chat_id": chat_id,
+                              "body": {"error": str(exc) or "error"}})
         await self.publish_event(event)
 
     async def publish_event(self, payload: dict[str, Any]) -> None:
@@ -204,6 +243,52 @@ class RemoteNatsTransport:
             event["event_id"] = make_event_id(event_type)
         subject = self.subjects.files if event_type.startswith("file_") else self.subjects.events
         await self.jetstream.publish(subject, encode_payload(event))
+
+    async def drain_outbox(self) -> int:
+        """Publish serially. A failed/poison row prevents all later rows bypassing it."""
+        if self.jetstream is None or self.durable_store is None:
+            return 0
+        if self._outbox_lock is None:
+            self._outbox_lock = asyncio.Lock()
+        if self._outbox_lock.locked():
+            return 0
+        published = 0
+        async with self._outbox_lock:
+          for row in self.durable_store.pending_outbox(pair_id=self.subjects.pair_id):
+            if row.get("blocked_reason"):
+                break
+            subject = self.subjects.files if row["subject_domain"] == "files" else self.subjects.events
+            try:
+                ack = await self.jetstream.publish(subject, bytes(row["payload"]))
+                # JetStream publish completion is the server ACK boundary.
+                if ack is None and type(self.jetstream).__module__.startswith("nats"):
+                    raise RuntimeError("missing_publish_ack")
+                self.durable_store.mark_outbox_acked(
+                    row["sync_sequence"], pair_id=row["pair_id"], domain=row["domain"],
+                    consumer_id=f"publisher:{row['pair_id']}",
+                )
+                published += 1
+            except Exception as exc:
+                self.durable_store.record_outbox_failure(row["sync_sequence"], str(exc), pair_id=row["pair_id"], domain=row["domain"])
+                latest = self.durable_store.pending_outbox(1, pair_id=self.subjects.pair_id)
+                if latest and not latest[0].get("blocked_reason"):
+                    self._schedule_outbox_retry()
+                break
+        return published
+
+    def _schedule_outbox_retry(self) -> None:
+        if self._outbox_retry_task is not None and not self._outbox_retry_task.done():
+            return
+        async def retry() -> None:
+            await asyncio.sleep(0.25)
+            await self.drain_outbox()
+        self._outbox_retry_task = asyncio.create_task(retry())
+
+    def repair_outbox_row(self, sync_sequence: int) -> None:
+        if self.durable_store is None:
+            return
+        with self.durable_store._connect() as conn:
+            conn.execute("UPDATE publication_outbox SET attempts=0,blocked_reason=NULL WHERE pair_id=? AND sync_sequence=?", (self.subjects.pair_id,int(sync_sequence)))
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -221,6 +306,9 @@ class RemoteNatsTransport:
         self._thread = None
 
     async def _close_async(self) -> None:
+        if self._outbox_retry_task is not None:
+            self._outbox_retry_task.cancel()
+            self._outbox_retry_task = None
         subscription = self._command_subscription
         self._command_subscription = None
         if subscription is not None:

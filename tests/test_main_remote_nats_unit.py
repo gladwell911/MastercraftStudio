@@ -3,6 +3,66 @@ from types import SimpleNamespace
 import main
 
 
+def test_v2_broadcast_commits_owner_fact_to_outbox_instead_of_direct_publish(frame, monkeypatch):
+    committed = []
+    direct = []
+    frame.chat_store = SimpleNamespace(
+        v2_writes_enabled=True,
+        commit_durable_fact=lambda **kwargs: committed.append(kwargs),
+        quarantine=lambda *args: None,
+    )
+    frame._remote_nats_transport = SimpleNamespace(
+        protocol_version=2,
+        subjects=SimpleNamespace(pair_id="pair"),
+        _loop=None,
+    )
+    monkeypatch.setattr(frame, "_publish_remote_nats_event", direct.append)
+
+    frame._broadcast_remote_event({"type": "status", "event_id": "evt", "chat_id": "off-screen", "text": "ok"})
+
+    assert not direct
+    assert committed[0]["pair_id"] == "pair"
+    assert committed[0]["envelope"]["chat_id"] == "off-screen"
+    assert committed[0]["envelope"]["body"]["text"] == "ok"
+
+
+def test_v2_broadcast_quarantines_missing_owner_without_selected_chat_fallback(frame, monkeypatch):
+    quarantined = []
+    frame.chat_store = SimpleNamespace(
+        v2_writes_enabled=True,
+        commit_durable_fact=lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not commit")),
+        quarantine=lambda *args: quarantined.append(args),
+    )
+    frame._remote_nats_transport = SimpleNamespace(protocol_version=2, subjects=SimpleNamespace(pair_id="pair"), _loop=None)
+    monkeypatch.setattr(frame, "_publish_remote_nats_event", lambda payload: (_ for _ in ()).throw(AssertionError("must not publish")))
+
+    frame._broadcast_remote_event({"type": "status", "event_id": "missing", "text": "no owner"})
+
+    assert quarantined[0][0] == "MISSING_OWNER"
+
+
+def test_v2_broadcast_transient_commit_failure_is_retried(frame, monkeypatch):
+    attempts = []
+    def commit(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise OSError("database busy")
+    frame.chat_store = SimpleNamespace(v2_writes_enabled=True, commit_durable_fact=commit, quarantine=lambda *args: None)
+    frame._remote_nats_transport = SimpleNamespace(protocol_version=2, subjects=SimpleNamespace(pair_id="pair"), _loop=None)
+    monkeypatch.setattr(frame, "_publish_remote_nats_event", lambda payload: (_ for _ in ()).throw(AssertionError("no direct fallback")))
+    class ImmediateTimer:
+        daemon = False
+        def __init__(self, _delay, callback): self.callback = callback
+        def start(self): self.callback()
+    monkeypatch.setattr(main.threading, "Timer", ImmediateTimer)
+
+    frame._broadcast_remote_event({"type":"status","event_id":"retry","chat_id":"owner","text":"kept"})
+
+    assert len(attempts) == 2
+    assert attempts[1]["envelope"]["event_id"] == "retry"
+    assert frame._pending_v2_remote_facts == []
+
+
 def test_can_bind_loopback_tcp_port_returns_false_when_port_accepts_connections(frame, monkeypatch):
     class _ConnectedSocket:
         def __enter__(self):

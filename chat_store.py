@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
+MAX_INT64 = (1 << 63) - 1
+V2_MIGRATION_KEY = "identity_v2_migration_phase"
 
 
 class ChatStore:
@@ -61,8 +65,243 @@ class ChatStore:
                     ON turns(chat_id, turn_index);
                 CREATE INDEX IF NOT EXISTS idx_execution_chat_turn
                     ON execution_steps(chat_id, turn_idx, step_index);
+                CREATE TABLE IF NOT EXISTS canonical_turns (
+                    turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,
+                    legacy_turn_index INTEGER, provider_kind TEXT NOT NULL DEFAULT '',
+                    provider_session_id TEXT NOT NULL DEFAULT '', provider_turn_id TEXT NOT NULL DEFAULT '',
+                    UNIQUE(chat_id, legacy_turn_index)
+                );
+                CREATE TABLE IF NOT EXISTS canonical_messages (
+                    message_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES canonical_turns(turn_id),
+                    chat_id TEXT NOT NULL, role TEXT NOT NULL, provider_kind TEXT NOT NULL DEFAULT '',
+                    provider_message_id TEXT NOT NULL DEFAULT '', legacy_turn_index INTEGER,
+                    UNIQUE(chat_id, legacy_turn_index, role)
+                );
+                CREATE TABLE IF NOT EXISTS v2_chat_state (
+                    chat_id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision BETWEEN 0 AND 9223372036854775807),
+                    execution_sequence INTEGER NOT NULL DEFAULT 0 CHECK(execution_sequence BETWEEN 0 AND 9223372036854775807)
+                );
+                CREATE TABLE IF NOT EXISTS v2_feed_state (
+                    pair_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL DEFAULT 0
+                        CHECK(sync_sequence BETWEEN 0 AND 9223372036854775807),
+                    retained_from INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(pair_id, domain)
+                );
+                CREATE TABLE IF NOT EXISTS durable_facts (
+                    event_id TEXT PRIMARY KEY, canonical_hash TEXT NOT NULL, kind TEXT NOT NULL,
+                    pair_id TEXT NOT NULL, domain TEXT NOT NULL, chat_id TEXT NOT NULL, turn_id TEXT, revision INTEGER NOT NULL, sync_sequence INTEGER NOT NULL,
+                    execution_sequence INTEGER, envelope_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch()),
+                    UNIQUE(pair_id, domain, sync_sequence)
+                );
+                CREATE TABLE IF NOT EXISTS publication_outbox (
+                    pair_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE REFERENCES durable_facts(event_id),
+                    subject_domain TEXT NOT NULL, payload BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    published_at REAL, blocked_reason TEXT, PRIMARY KEY(pair_id, domain, sync_sequence)
+                );
+                CREATE TABLE IF NOT EXISTS v2_checkpoints (
+                    pair_id TEXT NOT NULL, consumer_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL,
+                    PRIMARY KEY(pair_id, consumer_id, domain)
+                );
+                CREATE TABLE IF NOT EXISTS identity_quarantine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL, event_id TEXT,
+                    payload_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch())
+                );
                 """
             )
+            self._advance_v2_migration(conn)
+
+    def _advance_v2_migration(self, conn: sqlite3.Connection) -> None:
+        """Restartable additive migration. V2 is enabled only after validation."""
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (V2_MIGRATION_KEY,)).fetchone()
+        phase = str(row["value"] if row else "schema")
+        if phase in {"schema", "backfill"}:
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) SELECT id FROM chats")
+            legacy_rows = conn.execute(
+                "SELECT chat_id,turn_index,payload_json FROM turns ORDER BY chat_id,turn_index"
+            ).fetchall()
+            for legacy in legacy_rows:
+                payload = self._json_dict(legacy["payload_json"])
+                conn.execute(
+                    "INSERT OR IGNORE INTO canonical_turns(turn_id,chat_id,legacy_turn_index,provider_kind,provider_session_id,provider_turn_id) VALUES(?,?,?,?,?,?)",
+                    (
+                        f"turn-{uuid.uuid4().hex}",
+                        str(legacy["chat_id"]),
+                        int(legacy["turn_index"]),
+                        str(payload.get("provider") or payload.get("model") or ""),
+                        str(payload.get("session_id") or payload.get("thread_id") or ""),
+                        str(payload.get("turn_id") or ""),
+                    ),
+                )
+                self._backfill_canonical_turns_conn(
+                    conn, str(legacy["chat_id"]), [payload], int(legacy["turn_index"])
+                )
+            phase = "validate"
+        if phase == "validate":
+            invalid = conn.execute("SELECT COUNT(*) n FROM chats WHERE trim(id)='' OR id IS NULL").fetchone()["n"]
+            phase = "read-only-recovery" if invalid else "enable-v2"
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (V2_MIGRATION_KEY, phase))
+
+    @property
+    def v2_writes_enabled(self) -> bool:
+        return self.get_meta(V2_MIGRATION_KEY) == "enable-v2"
+
+    def allocate_chat_revision(self, chat_id: str) -> int:
+        owner = self.normalize_chat_id(chat_id)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
+            current = int(conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()["revision"])
+            if current >= MAX_INT64:
+                raise OverflowError("CHAT_REVISION_OVERFLOW")
+            revision = current + 1
+            conn.execute("UPDATE v2_chat_state SET revision=? WHERE chat_id=?", (revision, owner))
+            return revision
+
+    def update_checkpoint(self, consumer_id: str, domain: str, sync_sequence: int, *, pair_id: str = "default") -> None:
+        if int(sync_sequence) < 0 or int(sync_sequence) > MAX_INT64:
+            raise ValueError("INVALID_SYNC_SEQUENCE")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO v2_checkpoints(pair_id,consumer_id,domain,sync_sequence) VALUES(?,?,?,?) "
+                "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=MAX(sync_sequence,excluded.sync_sequence)",
+                (str(pair_id), str(consumer_id), str(domain), int(sync_sequence)),
+            )
+
+    def get_checkpoint(self, consumer_id: str, domain: str, *, pair_id: str = "default") -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT sync_sequence FROM v2_checkpoints WHERE pair_id=? AND consumer_id=? AND domain=?", (str(pair_id),str(consumer_id),str(domain))).fetchone()
+        return int(row["sync_sequence"] if row else 0)
+
+    @staticmethod
+    def normalize_chat_id(chat_id: Any) -> str:
+        value = str(chat_id or "").strip()
+        if not value or "\x00" in value:
+            raise ValueError("INVALID_CHAT_ID")
+        return value
+
+    def canonical_turn_id(self, chat_id: str, *, legacy_turn_index: int | None = None,
+                          provider_kind: str = "", provider_session_id: str = "",
+                          provider_turn_id: str = "") -> str:
+        if not self.v2_writes_enabled:
+            raise RuntimeError("V2_READ_ONLY_RECOVERY")
+        owner = self.normalize_chat_id(chat_id)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if legacy_turn_index is not None:
+                row = conn.execute("SELECT turn_id FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (owner, int(legacy_turn_index))).fetchone()
+                if row: return str(row["turn_id"])
+            turn_id = f"turn-{uuid.uuid4().hex}"
+            conn.execute("INSERT INTO canonical_turns(turn_id,chat_id,legacy_turn_index,provider_kind,provider_session_id,provider_turn_id) VALUES(?,?,?,?,?,?)",
+                         (turn_id, owner, legacy_turn_index, provider_kind, provider_session_id, provider_turn_id))
+            return turn_id
+
+    def commit_durable_fact(self, *, pair_id: str, domain: str, envelope: dict[str, Any],
+                            execution: bool = False) -> dict[str, Any]:
+        """Atomically store an immutable fact and its byte-stable publication row."""
+        if not self.v2_writes_enabled:
+            raise RuntimeError("V2_READ_ONLY_RECOVERY")
+        owner = self.normalize_chat_id(envelope.get("chat_id"))
+        normalized_pair = str(pair_id or "").strip()
+        normalized_domain = str(domain or "").strip()
+        if not normalized_pair or not normalized_domain or "\x00" in normalized_pair + normalized_domain:
+            raise ValueError("INVALID_FEED_SCOPE")
+        if any(key in envelope for key in ("epoch", "delivery_attempt", "delivered_at")):
+            raise ValueError("FORBIDDEN_DURABLE_METADATA")
+        event_id = str(envelope.get("event_id") or f"event-{uuid.uuid4().hex}").strip()
+        kind = str(envelope.get("kind") or envelope.get("type") or "").strip()
+        if not event_id or not kind or "\x00" in event_id + kind or not isinstance(envelope.get("body"), dict):
+            raise ValueError("INVALID_DURABLE_FACT")
+        for key in ("revision", "sync_sequence", "execution_sequence"):
+            minimum = 0 if key == "revision" else 1
+            if key in envelope and (isinstance(envelope[key], bool) or not isinstance(envelope[key], int) or not minimum <= envelope[key] <= MAX_INT64):
+                raise ValueError(f"INVALID_{key.upper()}")
+        try:
+            json.dumps(envelope, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("INVALID_CANONICAL_VALUE") from exc
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT canonical_hash,envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?", (event_id,)).fetchone()
+            if existing:
+                original = json.loads(existing["envelope_json"])
+                comparable = {k: v for k, v in envelope.items() if k != "canonical_hash"}
+                if existing["pair_id"] != normalized_pair or existing["domain"] != normalized_domain or any(original.get(k) != v for k, v in comparable.items()):
+                    self._quarantine_conn(conn, "EVENT_ID_CONFLICT", envelope, event_id)
+                    conn.commit()
+                    raise ValueError("EVENT_ID_CONFLICT")
+                return original
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
+            state = conn.execute("SELECT revision,execution_sequence FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            revision = int(envelope.get("revision", state["revision"]))
+            if revision != int(state["revision"]): raise ValueError("STALE_REVISION")
+            conn.execute("INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)", (str(pair_id), "__pair__"))
+            feed = conn.execute("SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'", (str(pair_id),)).fetchone()
+            if int(feed["sync_sequence"]) >= MAX_INT64: raise OverflowError("SYNC_SEQUENCE_OVERFLOW")
+            sync = int(feed["sync_sequence"]) + 1
+            execution_seq = None
+            if execution:
+                if int(state["execution_sequence"]) >= MAX_INT64: raise OverflowError("EXECUTION_SEQUENCE_OVERFLOW")
+                execution_seq = int(state["execution_sequence"]) + 1
+            normalized = {**envelope, "protocol_version": 2, "event_id": event_id, "kind": kind,
+                          "chat_id": owner, "domain": str(domain), "revision": revision, "sync_sequence": sync}
+            normalized.pop("canonical_hash", None)
+            if execution_seq is not None: normalized["execution_sequence"] = execution_seq
+            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            normalized["canonical_hash"] = digest
+            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            conn.execute("UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'", (sync, str(pair_id)))
+            if execution_seq is not None: conn.execute("UPDATE v2_chat_state SET execution_sequence=? WHERE chat_id=?", (execution_seq, owner))
+            payload = canonical.encode("utf-8")
+            conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (event_id,digest,kind,str(pair_id),str(domain),owner,normalized.get("turn_id"),revision,sync,execution_seq,canonical))
+            conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)", (str(pair_id),str(domain),sync,event_id,str(domain),payload))
+            return normalized
+
+    def _quarantine_conn(self, conn: sqlite3.Connection, reason: str, payload: Any, event_id: str = "") -> None:
+        conn.execute("INSERT INTO identity_quarantine(reason,event_id,payload_json) VALUES(?,?,?)", (reason,event_id,json.dumps(payload,ensure_ascii=False,sort_keys=True)))
+        conn.execute("DELETE FROM identity_quarantine WHERE id NOT IN (SELECT id FROM identity_quarantine ORDER BY id DESC LIMIT 1000)")
+
+    def quarantine(self, reason: str, payload: Any, event_id: str = "") -> None:
+        with self._connect() as conn: self._quarantine_conn(conn, reason, payload, event_id)
+
+    def pending_outbox(self, limit: int = 100, *, pair_id: str | None = None, domain: str | None = None) -> list[dict[str, Any]]:
+        where, args = "published_at IS NULL", []
+        if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
+        if domain is not None: where += " AND domain=?"; args.append(str(domain))
+        with self._connect() as conn:
+            rows=conn.execute(f"SELECT * FROM publication_outbox WHERE {where} ORDER BY sync_sequence LIMIT ?", tuple(args+[max(1,int(limit))])).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_outbox_acked(self, sync_sequence: int, *, pair_id: str | None = None,
+                          domain: str | None = None, consumer_id: str | None = None) -> None:
+        where, args = "sync_sequence=?", [int(sync_sequence)]
+        if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
+        if domain is not None: where += " AND domain=?"; args.append(str(domain))
+        with self._connect() as conn:
+            conn.execute(f"UPDATE publication_outbox SET published_at=unixepoch() WHERE {where} AND published_at IS NULL", tuple(args))
+            if consumer_id is not None and domain is not None:
+                conn.execute(
+                    "INSERT INTO v2_checkpoints(pair_id,consumer_id,domain,sync_sequence) VALUES(?,?,?,?) "
+                    "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=MAX(sync_sequence,excluded.sync_sequence)",
+                    (str(pair_id or "default"), str(consumer_id), str(domain), int(sync_sequence)),
+                )
+
+    def record_outbox_failure(self, sync_sequence: int, reason: str, *, pair_id: str | None = None, domain: str | None = None) -> None:
+        where, args = "sync_sequence=?", [int(sync_sequence)]
+        if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
+        if domain is not None: where += " AND domain=?"; args.append(str(domain))
+        with self._connect() as conn:
+            conn.execute(f"UPDATE publication_outbox SET attempts=attempts+1, blocked_reason=CASE WHEN attempts+1>=5 THEN ? ELSE blocked_reason END WHERE {where}", tuple([str(reason)]+args))
+
+    def replay_after(self, *, domain: str, sync_sequence: int, pair_id: str = "default", limit: int = 100) -> list[bytes]:
+        with self._connect() as conn:
+            state=conn.execute("SELECT retained_from n FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'", (pair_id,)).fetchone()
+            if state is None:
+                return []
+            retained=int(state["n"] or 1)
+            if int(sync_sequence)+1 < retained: raise ValueError("SNAPSHOT_REQUIRED")
+            rows=conn.execute("SELECT envelope_json FROM durable_facts WHERE pair_id=? AND domain=? AND sync_sequence>? ORDER BY sync_sequence LIMIT ?", (pair_id,domain,int(sync_sequence),max(1,int(limit)))).fetchall()
+        return [str(r["envelope_json"]).encode("utf-8") for r in rows]
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -167,6 +406,9 @@ class ChatStore:
         if not normalized:
             return
         with self._connect() as conn:
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
+            conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
+            conn.execute("DELETE FROM v2_chat_state WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM execution_steps WHERE chat_id = ?", (normalized,))
             conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
             conn.execute("DELETE FROM chats WHERE id = ?", (normalized,))
@@ -177,6 +419,9 @@ class ChatStore:
         if not normalized_ids:
             return
         with self._connect() as conn:
+            conn.executemany("DELETE FROM canonical_messages WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
+            conn.executemany("DELETE FROM canonical_turns WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
+            conn.executemany("DELETE FROM v2_chat_state WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM execution_steps WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM turns WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM chats WHERE id = ?", [(chat_id,) for chat_id in normalized_ids])
@@ -186,6 +431,8 @@ class ChatStore:
         if not normalized:
             return
         with self._connect() as conn:
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
+            conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
             conn.executemany(
                 "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
@@ -195,6 +442,7 @@ class ChatStore:
                     if isinstance(turn, dict)
                 ],
             )
+            self._backfill_canonical_turns_conn(conn, normalized, turns or [], 0)
 
     def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *, start_index: int = 0) -> None:
         normalized = str(chat_id or "").strip()
@@ -203,6 +451,8 @@ class ChatStore:
         start = max(0, self._int_or(start_index, 0))
         suffix = turns or []
         with self._connect() as conn:
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,start))
+            conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,start))
             conn.execute("DELETE FROM turns WHERE chat_id = ? AND turn_index >= ?", (normalized, start))
             conn.executemany(
                 "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
@@ -212,6 +462,36 @@ class ChatStore:
                     if isinstance(turn, dict)
                 ],
             )
+            self._backfill_canonical_turns_conn(conn, normalized, suffix, start)
+
+    def _backfill_canonical_turns_conn(self, conn: sqlite3.Connection, chat_id: str,
+                                       turns: list[dict[str, Any]], start: int) -> None:
+        for offset, payload in enumerate(turns):
+            if not isinstance(payload, dict):
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO canonical_turns(turn_id,chat_id,legacy_turn_index,provider_kind,provider_session_id,provider_turn_id) VALUES(?,?,?,?,?,?)",
+                (f"turn-{uuid.uuid4().hex}", chat_id, start + offset,
+                 str(payload.get("provider") or payload.get("model") or ""),
+                 str(payload.get("session_id") or payload.get("thread_id") or ""),
+                str(payload.get("turn_id") or "")),
+            )
+            canonical = conn.execute(
+                "SELECT turn_id FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?",
+                (chat_id, start + offset),
+            ).fetchone()
+            if canonical is None:
+                continue
+            provider = str(payload.get("provider") or payload.get("model") or "")
+            for role, provider_key in (("user", "provider_user_message_id"), ("assistant", "provider_message_id")):
+                content_key = "question" if role == "user" else "answer_md"
+                if payload.get(content_key) is None:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO canonical_messages(message_id,turn_id,chat_id,role,provider_kind,provider_message_id,legacy_turn_index) VALUES(?,?,?,?,?,?,?)",
+                    (f"message-{uuid.uuid4().hex}", str(canonical["turn_id"]), chat_id, role,
+                     provider, str(payload.get(provider_key) or ""), start + offset),
+                )
 
     def count_turns(self, chat_id: str) -> int:
         normalized = str(chat_id or "").strip()

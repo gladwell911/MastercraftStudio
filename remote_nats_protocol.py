@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
 import re
 import time
 import uuid
 
 
 DEFAULT_PAIR_ID = "default"
+PROTOCOL_V2 = 2
+MAX_SIGNED_64 = (1 << 63) - 1
 
 
 def normalize_pair_id(value: str) -> str:
@@ -62,6 +65,70 @@ def decode_payload(data: bytes) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("invalid_payload")
     return payload
+
+
+def canonical_durable_bytes(payload: dict) -> bytes:
+    """Canonical immutable representation; transport delivery metadata is excluded."""
+    immutable = {k: v for k, v in payload.items() if k not in {"canonical_hash", "delivery_attempt", "delivered_at"}}
+    try:
+        return json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("INVALID_CANONICAL_VALUE") from exc
+
+
+def canonical_durable_hash(payload: dict) -> str:
+    return hashlib.sha256(canonical_durable_bytes(payload)).hexdigest()
+
+
+def _required_text(payload: dict, key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError(f"INVALID_{key.upper()}")
+    return value.strip()
+
+
+def _int64(payload: dict, key: str, *, minimum: int = 0) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > MAX_SIGNED_64:
+        raise ValueError(f"INVALID_{key.upper()}")
+    return value
+
+
+def validate_v2_durable(payload: dict, *, verify_hash: bool = True) -> dict:
+    if not isinstance(payload, dict) or payload.get("protocol_version") != PROTOCOL_V2:
+        raise ValueError("INVALID_PROTOCOL_VERSION")
+    if "epoch" in payload:
+        raise ValueError("DURABLE_EPOCH_FORBIDDEN")
+    _required_text(payload, "event_id")
+    _required_text(payload, "kind")
+    _required_text(payload, "chat_id")
+    _required_text(payload, "domain")
+    _int64(payload, "revision")
+    _int64(payload, "sync_sequence", minimum=1)
+    if "execution_sequence" in payload:
+        _int64(payload, "execution_sequence", minimum=1)
+    if not isinstance(payload.get("body"), dict):
+        raise ValueError("INVALID_BODY")
+    supplied = payload.get("canonical_hash")
+    if not isinstance(supplied, str) or not supplied.strip():
+        raise ValueError("INVALID_CANONICAL_HASH")
+    expected = canonical_durable_hash(payload)
+    if verify_hash and supplied != expected:
+        raise ValueError("CANONICAL_HASH_MISMATCH")
+    return {**payload, "canonical_hash": expected}
+
+
+def validate_v2_ephemeral(payload: dict, *, expected_epoch: str | None = None) -> dict:
+    if not isinstance(payload, dict) or payload.get("protocol_version") != PROTOCOL_V2:
+        raise ValueError("INVALID_PROTOCOL_VERSION")
+    _required_text(payload, "request_id")
+    _required_text(payload, "chat_id")
+    epoch = _required_text(payload, "epoch")
+    if expected_epoch is not None and epoch != expected_epoch:
+        raise ValueError("STALE_EPOCH")
+    if not isinstance(payload.get("body"), dict):
+        raise ValueError("INVALID_BODY")
+    return dict(payload)
 
 
 def build_response_event(

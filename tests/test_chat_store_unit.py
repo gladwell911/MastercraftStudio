@@ -1,7 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+import json
+from pathlib import Path
+import pytest
 
 from chat_store import ChatStore
+from chat_store import MAX_INT64, V2_MIGRATION_KEY
 
 
 def test_chat_store_initializes_schema_and_lists_summaries(tmp_path):
@@ -253,3 +257,108 @@ def test_execution_cursor_avoids_repeated_count_and_shares_full_loader_identity(
     assert [row["_store_step_index"] for row in previous + tail] == [row["_store_step_index"] for row in full[1:]]
     assert not any("COUNT(" in statement.upper() for statement in sql)
     assert len(tail) == len(previous) == 2
+
+
+def test_v2_identity_replay_conflict_outbox_and_retention(tmp_path):
+    store = ChatStore(tmp_path / "v2.db")
+    store.initialize()
+    fact = {"event_id": "stable", "kind": "future_kind", "chat_id": "off-screen", "body": {"value": 1}}
+    first = store.commit_durable_fact(pair_id="pair", domain="events", envelope=fact)
+    assert store.commit_durable_fact(pair_id="pair", domain="events", envelope=fact) == first
+    assert len(store.pending_outbox(pair_id="pair")) == 1
+    with pytest.raises(ValueError, match="EVENT_ID_CONFLICT"):
+        store.commit_durable_fact(pair_id="pair", domain="events", envelope={**fact, "body": {"value": 2}})
+    with store._connect() as conn:
+        assert conn.execute("SELECT reason FROM identity_quarantine").fetchone()["reason"] == "EVENT_ID_CONFLICT"
+        conn.execute("UPDATE v2_feed_state SET retained_from=3 WHERE pair_id='pair' AND domain='__pair__'")
+    with pytest.raises(ValueError, match="SNAPSHOT_REQUIRED"):
+        store.replay_after(pair_id="pair", domain="events", sync_sequence=0)
+
+
+def test_shared_v2_identity_matrix_matches_store(tmp_path):
+    matrix = json.loads((Path(__file__).parent / "fixtures" / "remote_protocol_v2_contract_matrix.json").read_text(encoding="utf-8"))
+    store = ChatStore(tmp_path / "matrix.db")
+    store.initialize()
+    for row in matrix["identity"]:
+        store.commit_durable_fact(pair_id="pair", domain="events", envelope=row["first"])
+        if row["result"] == "exact":
+            store.commit_durable_fact(pair_id="pair", domain="events", envelope=row["second"])
+        else:
+            with pytest.raises(ValueError, match="EVENT_ID_CONFLICT"):
+                store.commit_durable_fact(pair_id="pair", domain="events", envelope=row["second"])
+
+
+def test_v2_migration_restarts_backfill_then_enters_read_only_recovery_on_validation_failure(tmp_path):
+    path = tmp_path / "restart.db"
+    store = ChatStore(path)
+    store.initialize()
+    store.upsert_chat({"id": "legacy", "title": "Legacy"})
+    store.replace_turns("legacy", [{"question": "q", "answer_md": "a", "session_id": "provider-session", "turn_id": "provider-turn"}])
+    with store._connect() as conn:
+        conn.execute("DELETE FROM canonical_messages")
+        conn.execute("DELETE FROM canonical_turns")
+        conn.execute("UPDATE meta SET value='backfill' WHERE key=?", (V2_MIGRATION_KEY,))
+    ChatStore(path).initialize()
+    with store._connect() as conn:
+        turn = conn.execute("SELECT * FROM canonical_turns").fetchone()
+        messages = conn.execute("SELECT role,message_id FROM canonical_messages ORDER BY role").fetchall()
+    assert turn["provider_session_id"] == "provider-session"
+    assert turn["provider_turn_id"] == "provider-turn"
+    assert {row["role"] for row in messages} == {"user", "assistant"}
+    assert store.v2_writes_enabled
+
+    with store._connect() as conn:
+        conn.execute("INSERT INTO chats(id) VALUES('')")
+        conn.execute("UPDATE meta SET value='validate' WHERE key=?", (V2_MIGRATION_KEY,))
+    ChatStore(path).initialize()
+    assert store.get_meta(V2_MIGRATION_KEY) == "read-only-recovery"
+    assert not store.v2_writes_enabled
+    with pytest.raises(RuntimeError, match="V2_READ_ONLY_RECOVERY"):
+        store.commit_durable_fact(pair_id="pair", domain="events", envelope={"event_id":"blocked","kind":"status","chat_id":"legacy","body":{}})
+
+
+def test_v2_signed_int64_sync_and_execution_overflow_roll_back_both_halves(tmp_path):
+    store = ChatStore(tmp_path / "overflow.db")
+    store.initialize()
+    with store._connect() as conn:
+        conn.execute("INSERT INTO v2_feed_state(pair_id,domain,sync_sequence) VALUES('pair','__pair__',?)", (MAX_INT64,))
+    with pytest.raises(OverflowError, match="SYNC_SEQUENCE_OVERFLOW"):
+        store.commit_durable_fact(pair_id="pair", domain="events", envelope={"event_id":"sync-overflow","kind":"status","chat_id":"chat","body":{}})
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) n FROM durable_facts").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM publication_outbox").fetchone()["n"] == 0
+        conn.execute("UPDATE v2_feed_state SET sync_sequence=0 WHERE pair_id='pair'")
+        conn.execute("INSERT INTO v2_chat_state(chat_id,execution_sequence) VALUES('chat',?)", (MAX_INT64,))
+    with pytest.raises(OverflowError, match="EXECUTION_SEQUENCE_OVERFLOW"):
+        store.commit_durable_fact(pair_id="pair", domain="events", execution=True, envelope={"event_id":"execution-overflow","kind":"execution_entry","chat_id":"chat","body":{}})
+    with store._connect() as conn:
+        assert conn.execute("SELECT sync_sequence FROM v2_feed_state WHERE pair_id='pair'").fetchone()["sync_sequence"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM durable_facts").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM publication_outbox").fetchone()["n"] == 0
+
+
+def test_v2_replay_scope_validation_unknown_feed_and_identity_reconciliation(tmp_path):
+    store = ChatStore(tmp_path / "scope.db")
+    store.initialize()
+    assert store.replay_after(pair_id="unknown", domain="events", sync_sequence=0) == []
+    fact = {"event_id":"scoped","kind":"status","chat_id":"chat","body":{}}
+    store.commit_durable_fact(pair_id="pair-a", domain="events", envelope=fact)
+    with pytest.raises(ValueError, match="EVENT_ID_CONFLICT"):
+        store.commit_durable_fact(pair_id="pair-b", domain="events", envelope=fact)
+    with pytest.raises(ValueError, match="FORBIDDEN_DURABLE_METADATA"):
+        store.commit_durable_fact(pair_id="pair-a", domain="events", envelope={"event_id":"epoch","kind":"status","chat_id":"chat","epoch":"x","body":{}})
+    with pytest.raises(ValueError, match="INVALID_CANONICAL_VALUE"):
+        store.commit_durable_fact(pair_id="pair-a", domain="events", envelope={"event_id":"nan","kind":"status","chat_id":"chat","body":{"value":float("nan")}})
+    store.replace_turns("chat", [{"question":"old","answer_md":"answer"}])
+    with store._connect() as conn:
+        old_ids = {r["message_id"] for r in conn.execute("SELECT message_id FROM canonical_messages WHERE chat_id='chat'")}
+    store.replace_turns("chat", [{"question":"new","answer_md":"answer"}])
+    with store._connect() as conn:
+        new_ids = {r["message_id"] for r in conn.execute("SELECT message_id FROM canonical_messages WHERE chat_id='chat'")}
+    assert old_ids.isdisjoint(new_ids)
+    store.delete_chat("chat")
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) n FROM canonical_turns WHERE chat_id='chat'").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM v2_chat_state WHERE chat_id='chat'").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM durable_facts WHERE event_id='scoped'").fetchone()["n"] == 1
+    assert store.replay_after(pair_id="pair-a", domain="events", sync_sequence=0)
