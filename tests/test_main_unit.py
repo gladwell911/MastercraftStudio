@@ -13994,7 +13994,9 @@ def test_remote_api_clear_context_clears_requested_archived_chat_without_touchin
     assert frame.active_codex_thread_id == "thread-a"
     assert frame.active_codex_turn_active is True
     assert frame._current_chat_state["execution_steps"] == [{"list_text": "A 执行过程"}]
-    assert archived["turns"] == []
+    assert len(archived["turns"]) == 1
+    assert archived["turns"][0]["question"].startswith("B ")
+    assert archived["turns"][0]["clear_operation_id"]
     assert archived["codex_thread_id"] == ""
     assert archived["codex_turn_id"] == ""
     assert archived["codex_turn_active"] is False
@@ -19466,7 +19468,7 @@ def test_clear_context_auto_resend_first_question_only_when_requested(frame, mon
     assert frame._clear_context_and_start_new_chat(auto_resend_first=True) is True
     assert frame.active_session_turns == []
     assert frame._current_chat_state["turns"] == []
-    assert submitted == [("第一条问题", {"source": "local"})]
+    assert submitted == [("第一条问题", {"source": "local", "model": main.DEFAULT_CODEX_MODEL, "chat_id": "chat-current"})]
 
 
 def test_answer_reconciliation_removes_stale_physical_tail_and_keeps_meta_aligned(frame):
@@ -20334,3 +20336,115 @@ def test_execution_idle_timer_after_destroy_does_not_access_controls(frame, monk
     finally:
         timer.Stop()
         del activator
+def test_offscreen_clear_resend_dispatches_once_without_active_chat_or_focus_change(frame, monkeypatch):
+    archived = {"id": "chat-archived", "model": main.DEFAULT_CODEX_MODEL, "turns": []}
+    frame.archived_chats = [archived]
+    frame.active_chat_id = "chat-active"
+    frame.current_chat_id = "chat-active"
+    frame._current_chat_state = {"id": "chat-active", "turns": [{"question": "active stays"}]}
+    frame.active_session_turns = frame._current_chat_state["turns"]
+    claims = []
+    transitions = []
+    frame.chat_store = SimpleNamespace(
+        claim_clear_resend_dispatch=lambda op: claims.append(op) or ({"operation_id": op} if len(claims) == 1 else None),
+        transition_clear_operation=lambda op, state, **kw: transitions.append((op, state, kw)),
+    )
+    starts = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: starts.append(args))
+    monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    operation = {"operation_id": "op-1", "chat_id": "chat-archived", "revision": 2}
+    payload = {"question": "archived first", "model": main.DEFAULT_CODEX_MODEL}
+
+    assert frame._dispatch_clear_operation_resend(operation, payload) is True
+    assert frame._dispatch_clear_operation_resend(operation, payload) is False
+    assert starts == [("chat-archived", 0, "archived first", main.DEFAULT_CODEX_MODEL)]
+    assert archived["turns"][0]["clear_operation_id"] == "op-1"
+    assert frame.active_chat_id == frame.current_chat_id == "chat-active"
+    assert frame.active_session_turns == [{"question": "active stays"}]
+    assert transitions == []
+
+
+def test_remote_offscreen_clear_uses_operation_snapshot_and_preserves_active_owner(frame, monkeypatch):
+    archived = {"id": "chat-archived", "turns": [{"question": "old memory"}]}
+    frame.archived_chats = [archived]
+    frame.active_chat_id = frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active"}]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    operation = {"operation_id": "op-remote", "chat_id": "chat-archived", "revision": 3,
+                 "snapshot": {"question": "durable first", "model": main.DEFAULT_CODEX_MODEL}}
+    begin_calls = []
+    dispatches = []
+    monkeypatch.setattr(frame, "_begin_durable_clear_operation",
+                        lambda owner, request_id: begin_calls.append((owner, request_id)) or operation)
+    monkeypatch.setattr(frame, "_dispatch_clear_operation_resend",
+                        lambda op, payload: dispatches.append((op, payload)) or True)
+    monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *a, **k: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *a: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *a: None)
+    frame._chat_store_enabled = False
+
+    assert frame._clear_context_for_chat_id("chat-archived", auto_resend_first=True, request_id="request-remote") == "cleared"
+    assert begin_calls == [("chat-archived", "request-remote")]
+    assert dispatches == [(operation, operation["snapshot"])]
+    assert frame.active_chat_id == frame.current_chat_id == "chat-active"
+    assert frame.active_session_turns == [{"question": "active"}]
+
+
+def test_remote_offscreen_clear_real_store_stable_request_dispatches_exactly_once(frame, monkeypatch):
+    archived = {"id": "route-owner", "model": main.DEFAULT_CODEX_MODEL,
+                "turns": [{"question": "first payload", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}]}
+    frame.archived_chats = [archived]
+    frame.active_chat_id = frame.current_chat_id = "active-owner"
+    frame.active_session_turns = [{"question": "active payload"}]
+    frame._current_chat_state = {"id": "active-owner", "turns": frame.active_session_turns}
+    starts = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: starts.append(args))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *a: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *a: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+
+    payload = {"chat_id": "route-owner", "request_id": "stable-route-request"}
+    assert frame._remote_api_clear_context_ui(payload)[0] == 200
+    assert frame._remote_api_clear_context_ui(payload)[0] == 200
+
+    assert starts == [("route-owner", 0, "first payload", main.DEFAULT_CODEX_MODEL)]
+    assert frame.active_chat_id == frame.current_chat_id == "active-owner"
+    assert frame.active_session_turns == [{"question": "active payload"}]
+    with frame.chat_store._connect() as conn:
+        rows = conn.execute("SELECT operation_id,revision FROM clear_operations WHERE chat_id='route-owner'").fetchall()
+    assert len(rows) == 1
+
+
+def test_clear_recovery_choices_and_post_claim_failure_use_real_operations(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "ui-recovery.db")
+    store.initialize()
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    calls = []
+    monkeypatch.setattr(frame, "_dispatch_clear_operation_resend",
+                        lambda op, payload, text_only=False: calls.append((op["operation_id"], text_only)) or True)
+    operations = {}
+    for choice in ("retry", "text-only", "cancel"):
+        owner = f"choice-{choice}"
+        store.upsert_chat({"id": owner})
+        store.replace_turns(owner, [{"question": "payload"}])
+        op = store.begin_clear_operation(owner, idempotency_key=choice)
+        store.transition_clear_operation(op["operation_id"], "resend_blocked", failure_code="TIMEOUT")
+        operations[choice] = op
+        assert frame.recover_clear_operation(op["operation_id"], choice)
+    assert calls == [(operations["retry"]["operation_id"], False),
+                     (operations["text-only"]["operation_id"], True)]
+    assert store.get_clear_operation(operations["cancel"]["operation_id"])["state"] == "completed_clear_only"
+
+    missing = tmp_path / "missing.txt"
+    store.upsert_chat({"id": "missing"})
+    store.replace_turns("missing", [{"question": "with file", "attachments": [{"path": str(missing)}]}])
+    op = store.begin_clear_operation("missing", idempotency_key="missing")
+    # Exercise the production dispatcher, not the recovery spy.
+    monkeypatch.undo()
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    assert frame._dispatch_clear_operation_resend(op, op["snapshot"]) is False
+    assert store.get_clear_operation(op["operation_id"])["state"] == "resend_blocked"

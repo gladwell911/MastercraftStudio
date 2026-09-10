@@ -276,7 +276,9 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
     assert frame.active_session_turns[0]["question"] == "A running question"
     assert frame.active_codex_thread_id == "thread-a"
     assert frame.active_codex_turn_active is True
-    assert archived["turns"] == []
+    assert len(archived["turns"]) == 1
+    assert archived["turns"][0]["question"] == "B old question"
+    assert archived["turns"][0]["clear_operation_id"]
     assert archived["codex_thread_id"] == ""
     assert archived["codex_turn_active"] is False
     assert archived["execution_steps"] == []

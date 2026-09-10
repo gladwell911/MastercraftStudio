@@ -4,6 +4,7 @@ import json
 import hashlib
 import sqlite3
 import uuid
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -12,6 +13,13 @@ from typing import Any, Iterator
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
 MAX_INT64 = (1 << 63) - 1
 V2_MIGRATION_KEY = "identity_v2_migration_phase"
+CLEAR_OPERATION_STATES = frozenset({
+    "requested", "clear_acknowledged", "resend_dispatched", "resend_blocked",
+    "completed_with_resend", "completed_clear_only", "completed_no_message", "superseded",
+})
+CLEAR_TERMINAL_STATES = frozenset({
+    "completed_with_resend", "completed_clear_only", "completed_no_message", "superseded",
+})
 
 
 class ChatStore:
@@ -105,8 +113,36 @@ class ChatStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL, event_id TEXT,
                     payload_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch())
                 );
+                CREATE TABLE IF NOT EXISTS clear_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision BETWEEN 0 AND 9223372036854775807),
+                    idempotency_key TEXT NOT NULL,
+                    pair_id TEXT NOT NULL DEFAULT 'default',
+                    domain TEXT NOT NULL DEFAULT 'events',
+                    state TEXT NOT NULL CHECK(state IN (
+                        'requested','clear_acknowledged','resend_dispatched','resend_blocked',
+                        'completed_with_resend','completed_clear_only','completed_no_message','superseded'
+                    )),
+                    snapshot_json TEXT,
+                    source_turn_id TEXT,
+                    source_message_id TEXT,
+                    dispatch_claimed_at REAL,
+                    failure_code TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(chat_id, idempotency_key),
+                    UNIQUE(chat_id, revision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_clear_operations_owner_state
+                    ON clear_operations(chat_id, state, revision DESC);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(clear_operations)")}
+            if "pair_id" not in columns:
+                conn.execute("ALTER TABLE clear_operations ADD COLUMN pair_id TEXT NOT NULL DEFAULT 'default'")
+            if "domain" not in columns:
+                conn.execute("ALTER TABLE clear_operations ADD COLUMN domain TEXT NOT NULL DEFAULT 'events'")
             self._advance_v2_migration(conn)
 
     def _advance_v2_migration(self, conn: sqlite3.Connection) -> None:
@@ -155,6 +191,244 @@ class ChatStore:
             revision = current + 1
             conn.execute("UPDATE v2_chat_state SET revision=? WHERE chat_id=?", (revision, owner))
             return revision
+
+    @staticmethod
+    def _eligible_clear_payload(payload: dict[str, Any]) -> bool:
+        if not isinstance(payload, dict) or payload.get("local_command") or payload.get("deleted") or payload.get("is_deleted"):
+            return False
+        role = str(payload.get("role") or "user").strip().lower()
+        if role not in {"", "user", "human"}:
+            return False
+        if str(payload.get("question") or payload.get("text") or "").strip():
+            return True
+        if isinstance(payload.get("attachments"), list) and payload["attachments"]:
+            return True
+        return any(payload.get(key) not in (None, "", False, [], {}) for key in (
+            "voice", "voice_metadata", "audio", "audio_path", "import_metadata", "import_source"
+        ))
+
+    @staticmethod
+    def _canonical_clear_snapshot(payload: dict[str, Any], turn_id: str | None,
+                                  message_id: str | None) -> dict[str, Any]:
+        allowed = {
+            "question", "text", "model", "attachments", "voice", "voice_metadata", "audio", "audio_path",
+            "import_metadata", "import_source", "origin", "question_origin", "provider", "provider_kind",
+            "provider_message_id", "created_at", "codex_service_tier",
+        }
+        snapshot = {key: payload[key] for key in allowed if key in payload}
+        snapshot["canonical_turn_id"] = turn_id
+        snapshot["canonical_message_id"] = message_id
+        return snapshot
+
+    def begin_clear_operation(self, chat_id: str, *, idempotency_key: str,
+                              pair_id: str = "default", domain: str = "events",
+                              operation_id: str | None = None) -> dict[str, Any]:
+        """Atomically snapshot the first eligible payload, reset the chat and publish clear."""
+        if not self.v2_writes_enabled:
+            raise RuntimeError("V2_READ_ONLY_RECOVERY")
+        owner = self.normalize_chat_id(chat_id)
+        key = str(idempotency_key or "").strip()
+        if not key or "\x00" in key:
+            raise ValueError("INVALID_IDEMPOTENCY_KEY")
+        pair = str(pair_id or "").strip()
+        event_domain = str(domain or "").strip()
+        if not pair or not event_domain:
+            raise ValueError("INVALID_FEED_SCOPE")
+        if operation_id is not None:
+            candidate_operation_id = str(operation_id).strip()
+            if not candidate_operation_id or "\x00" in candidate_operation_id:
+                raise ValueError("INVALID_OPERATION_ID")
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            duplicate = conn.execute(
+                "SELECT * FROM clear_operations WHERE chat_id=? AND idempotency_key=?", (owner, key)
+            ).fetchone()
+            if duplicate:
+                replay = self._decode_clear_operation(duplicate)
+                replay["idempotent_replay"] = True
+                return replay
+            chat = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (owner,)).fetchone()
+            if chat is None:
+                raise KeyError("CHAT_NOT_FOUND")
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
+            state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            current_revision = int(state["revision"])
+            if current_revision >= MAX_INT64:
+                raise OverflowError("CHAT_REVISION_OVERFLOW")
+            revision = current_revision + 1
+            superseded = conn.execute(
+                "SELECT operation_id,revision,pair_id,domain FROM clear_operations WHERE chat_id=? AND state NOT IN "
+                "('completed_with_resend','completed_clear_only','completed_no_message','superseded')", (owner,)
+            ).fetchall()
+            for prior in superseded:
+                conn.execute("UPDATE clear_operations SET state='superseded',updated_at=? WHERE operation_id=?", (now, prior["operation_id"]))
+                self._insert_clear_fact_conn(conn, prior["pair_id"], prior["domain"], prior["operation_id"], owner,
+                                             int(prior["revision"]), "superseded")
+            source = None
+            source_index = None
+            for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)):
+                candidate = self._json_dict(row["payload_json"])
+                if self._eligible_clear_payload(candidate):
+                    source, source_index = candidate, int(row["turn_index"])
+                    break
+            source_turn_id = source_message_id = None
+            if source_index is not None:
+                identity = conn.execute(
+                    "SELECT ct.turn_id,cm.message_id FROM canonical_turns ct "
+                    "LEFT JOIN canonical_messages cm ON cm.turn_id=ct.turn_id AND cm.role='user' "
+                    "WHERE ct.chat_id=? AND ct.legacy_turn_index=?", (owner, source_index)
+                ).fetchone()
+                if identity:
+                    source_turn_id, source_message_id = identity["turn_id"], identity["message_id"]
+            snapshot = None
+            if source is not None:
+                snapshot = self._canonical_clear_snapshot(source, source_turn_id, source_message_id)
+            op_id = str(operation_id or f"clear-{uuid.uuid4().hex}").strip()
+            initial_state = "clear_acknowledged" if snapshot is not None else "completed_no_message"
+            conn.execute("UPDATE v2_chat_state SET revision=?,execution_sequence=0 WHERE chat_id=?", (revision, owner))
+            metadata = self._json_dict(chat["metadata_json"])
+            metadata.update({
+                "openclaw_session_key": "openclaw/main", "openclaw_session_id": "", "openclaw_session_file": "",
+                "openclaw_sync_offset": 0, "openclaw_last_event_id": "", "openclaw_last_synced_at": 0.0,
+                "codex_thread_id": "", "codex_turn_id": "", "codex_turn_active": False,
+                "codex_pending_prompt": "", "codex_pending_request": None, "codex_request_queue": [],
+                "codex_thread_flags": [], "codex_latest_assistant_text": "", "codex_latest_assistant_phase": "",
+                "kimi_session_id": "", "kimi_turn_id": "", "kimi_turn_active": False,
+                "kimi_pending_prompt": "", "kimi_request_queue": [], "claudecode_session_id": "", "context_usage": None,
+            })
+            conn.execute("UPDATE chats SET updated_at=?,metadata_json=? WHERE id=?", (now, json.dumps(metadata, ensure_ascii=False), owner))
+            conn.execute("DELETE FROM turns WHERE chat_id=?", (owner,))
+            conn.execute("DELETE FROM execution_steps WHERE chat_id=?", (owner,))
+            try:
+                conn.execute(
+                    "INSERT INTO clear_operations(operation_id,chat_id,revision,idempotency_key,pair_id,domain,state,snapshot_json,source_turn_id,source_message_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (op_id, owner, revision, key, pair, event_domain, "requested",
+                     json.dumps(snapshot, ensure_ascii=False, sort_keys=True) if snapshot is not None else None,
+                     source_turn_id, source_message_id, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("OPERATION_ID_CONFLICT") from exc
+            self._insert_clear_fact_conn(conn, pair, event_domain, op_id, owner, revision, "requested")
+            conn.execute("UPDATE clear_operations SET state=?,updated_at=? WHERE operation_id=?",
+                         (initial_state, now, op_id))
+            self._insert_clear_fact_conn(conn, pair, event_domain, op_id, owner, revision, initial_state)
+            created = self._decode_clear_operation(conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (op_id,)).fetchone())
+            created["idempotent_replay"] = False
+            return created
+
+    def _insert_clear_fact_conn(self, conn: sqlite3.Connection, pair_id: str, domain: str,
+                                operation_id: str, chat_id: str, revision: int, state: str) -> None:
+        conn.execute("INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)", (pair_id, "__pair__"))
+        feed = conn.execute("SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'", (pair_id,)).fetchone()
+        if int(feed["sync_sequence"]) >= MAX_INT64:
+            raise OverflowError("SYNC_SEQUENCE_OVERFLOW")
+        sync = int(feed["sync_sequence"]) + 1
+        event_base = f"clear-event-{operation_id}-{state}"
+        occurrence = int(conn.execute(
+            "SELECT COUNT(*) n FROM durable_facts WHERE event_id=? OR event_id LIKE ?",
+            (event_base, f"{event_base}-%"),
+        ).fetchone()["n"])
+        event_id = event_base if occurrence == 0 else f"{event_base}-{occurrence + 1}"
+        envelope = {"protocol_version": 2, "event_id": event_id, "kind": "clear_context", "chat_id": chat_id,
+                    "domain": domain, "revision": revision, "sync_sequence": sync,
+                    "body": {"operation_id": operation_id, "state": state}}
+        canonical = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        envelope["canonical_hash"] = digest
+        payload = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        conn.execute("UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'", (sync, pair_id))
+        conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,revision,sync_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (event_id, digest, "clear_context", pair_id, domain, chat_id, revision, sync, payload))
+        conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)",
+                     (pair_id, domain, sync, event_id, domain, payload.encode("utf-8")))
+
+    @staticmethod
+    def _decode_clear_operation(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["snapshot"] = json.loads(result.pop("snapshot_json")) if result.get("snapshot_json") else None
+        result["terminal"] = result["state"] in CLEAR_TERMINAL_STATES
+        return result
+
+    def get_clear_operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone()
+        return self._decode_clear_operation(row) if row else None
+
+    def active_clear_operation(self, chat_id: str) -> dict[str, Any] | None:
+        owner = self.normalize_chat_id(chat_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM clear_operations WHERE chat_id=? AND state NOT IN "
+                "('completed_with_resend','completed_clear_only','completed_no_message','superseded') ORDER BY revision DESC LIMIT 1", (owner,)
+            ).fetchone()
+        return self._decode_clear_operation(row) if row else None
+
+    def recoverable_clear_operations(self) -> list[dict[str, Any]]:
+        """Return unfinished operations; indeterminate dispatched work is explicitly blocked."""
+        with self._connect() as conn:
+            ids = [str(row["operation_id"]) for row in conn.execute(
+                "SELECT operation_id FROM clear_operations WHERE state NOT IN "
+                "('completed_with_resend','completed_clear_only','completed_no_message','superseded') ORDER BY created_at"
+            )]
+        recovered = []
+        for operation_id in ids:
+            operation = self.get_clear_operation(operation_id)
+            if operation and operation["state"] == "resend_dispatched":
+                operation = self.transition_clear_operation(
+                    operation_id, "resend_blocked", failure_code="DELIVERY_OUTCOME_UNCERTAIN"
+                )
+            if operation:
+                recovered.append(operation)
+        return recovered
+
+    def claim_clear_resend_dispatch(self, operation_id: str) -> dict[str, Any] | None:
+        """Persist the at-most-once boundary before any provider call."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone()
+            if not row or row["state"] not in {"requested", "clear_acknowledged"}:
+                return None
+            now = time.time()
+            changed = conn.execute(
+                "UPDATE clear_operations SET state='resend_dispatched',dispatch_claimed_at=?,updated_at=? "
+                "WHERE operation_id=? AND state IN ('requested','clear_acknowledged')", (now, now, str(operation_id))
+            ).rowcount
+            if not changed:
+                return None
+            self._insert_clear_fact_conn(conn, row["pair_id"], row["domain"], str(operation_id),
+                                         row["chat_id"], int(row["revision"]), "resend_dispatched")
+            return self._decode_clear_operation(conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone())
+
+    def transition_clear_operation(self, operation_id: str, state: str, *, failure_code: str = "") -> dict[str, Any]:
+        target = str(state or "").strip()
+        if target not in CLEAR_OPERATION_STATES:
+            raise ValueError("INVALID_CLEAR_STATE")
+        allowed = {
+            "requested": {"clear_acknowledged", "completed_no_message", "superseded"},
+            "clear_acknowledged": {"resend_dispatched", "resend_blocked", "completed_clear_only", "superseded"},
+            "resend_dispatched": {"completed_with_resend", "resend_blocked", "superseded"},
+            "resend_blocked": {"clear_acknowledged", "completed_clear_only", "resend_dispatched", "superseded"},
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone()
+            if not row:
+                raise KeyError("CLEAR_OPERATION_NOT_FOUND")
+            current = str(row["state"])
+            if current == target:
+                return self._decode_clear_operation(row)
+            if target not in allowed.get(current, set()):
+                raise ValueError("INVALID_CLEAR_TRANSITION")
+            safe_code = str(failure_code or "").strip()[:120]
+            if any(sep in safe_code for sep in ("/", "\\")):
+                safe_code = "PROVIDER_OR_ATTACHMENT_FAILURE"
+            conn.execute("UPDATE clear_operations SET state=?,failure_code=?,updated_at=? WHERE operation_id=?",
+                         (target, safe_code, time.time(), str(operation_id)))
+            self._insert_clear_fact_conn(conn, row["pair_id"], row["domain"], str(operation_id),
+                                         row["chat_id"], int(row["revision"]), target)
+            return self._decode_clear_operation(conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone())
 
     def update_checkpoint(self, consumer_id: str, domain: str, sync_sequence: int, *, pair_id: str = "default") -> None:
         if int(sync_sequence) < 0 or int(sync_sequence) > MAX_INT64:

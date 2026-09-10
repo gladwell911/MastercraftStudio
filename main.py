@@ -1697,6 +1697,7 @@ class ChatFrame(wx.Frame):
         self._migrate_legacy_state_if_needed()
         self._migrate_legacy_chat_json_if_needed()
         self._load_state()
+        self._pending_clear_recoveries = self.chat_store.recoverable_clear_operations()
         self._realtime_call.update_settings(
             RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate)
         )
@@ -10766,7 +10767,10 @@ class ChatFrame(wx.Frame):
                 "chat_id": "",
                 "error": "missing_chat_id",
             }
-        result = self._clear_context_for_chat_id(chat_id)
+        request_id = str((payload or {}).get("request_id") or (payload or {}).get("idempotency_key") or "").strip()
+        result = self._clear_context_for_chat_id(
+            chat_id, auto_resend_first=True, request_id=request_id or f"remote-{uuid.uuid4().hex}"
+        )
         if result == "not_found":
             return 404, {
                 "accepted": False,
@@ -10986,6 +10990,9 @@ class ChatFrame(wx.Frame):
                     if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
                         target_chat["updated_at"] = time.time()
                 elif event_type == "turn_completed":
+                    if not self._accept_clear_operation_result(turn, chat_id):
+                        self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
+                        return
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
                     self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
@@ -10996,6 +11003,7 @@ class ChatFrame(wx.Frame):
                         self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                    self._complete_clear_operation_turn(turn, failed=False)
                 self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
@@ -11060,6 +11068,9 @@ class ChatFrame(wx.Frame):
             turn = {}
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
+                if not self._accept_clear_operation_result(turn, chat_id or self.active_chat_id):
+                    self._clear_codex_worker_active_turn(chat_id or self.active_chat_id, target_idx, event_turn_id)
+                    return
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
                 self._clear_codex_worker_active_turn(chat_id or self.active_chat_id or self.current_chat_id, target_idx, event_turn_id)
@@ -11069,6 +11080,7 @@ class ChatFrame(wx.Frame):
                 ):
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                self._complete_clear_operation_turn(turn, failed=False)
                 if self._background_ui_mutations_blocked():
                     self._mark_background_answer_list_dirty()
                 else:
@@ -14892,7 +14904,7 @@ class ChatFrame(wx.Frame):
             ev.SetEventObject(self.new_chat_button)
             wx.PostEvent(self.new_chat_button, ev)
 
-    def _clear_context_and_start_new_chat(self, auto_resend_first: bool = False) -> bool:
+    def _clear_context_and_start_new_chat(self, auto_resend_first: bool = False, *, request_id: str = "") -> bool:
         if not self.new_chat_button.IsEnabled():
             return False
         visible_history_id = str(getattr(self, "view_history_id", "") or "").strip()
@@ -14900,20 +14912,38 @@ class ChatFrame(wx.Frame):
             current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
             current_ids.discard("")
             if visible_history_id not in current_ids:
-                return self._clear_context_for_chat_id(visible_history_id) == "cleared"
+                return self._clear_context_for_chat_id(
+                    visible_history_id, auto_resend_first=auto_resend_first, request_id=request_id
+                ) == "cleared"
         now = time.time()
         if not self.active_chat_id:
             self.active_chat_id = self._ensure_active_chat_id()
         if not self.current_chat_id:
             self.current_chat_id = self.active_chat_id
         first_question = ""
+        first_payload = None
         for t in self.active_session_turns or []:
             if not isinstance(t, dict) or t.get("local_command"):
                 continue
             q = str(t.get("question") or "").strip()
-            if q:
+            attachments = t.get("attachments") if isinstance(t.get("attachments"), list) else []
+            if q or attachments:
                 first_question = q
+                first_payload = copy.deepcopy(t)
                 break
+        try:
+            clear_operation = self._begin_durable_clear_operation(
+                self.active_chat_id, request_id=request_id or f"local-{uuid.uuid4().hex}"
+            )
+        except Exception:
+            self.SetStatusText("Unable to clear context safely")
+            return False
+        if clear_operation is not None and clear_operation.get("idempotent_replay"):
+            self._reconcile_clear_operation_projection(clear_operation)
+            return True
+        if clear_operation is not None:
+            first_payload = copy.deepcopy(clear_operation.get("snapshot"))
+            first_question = str((first_payload or {}).get("question") or (first_payload or {}).get("text") or "")
         self.active_session_turns = []
         self.active_session_started_at = now
         self.active_turn_idx = -1
@@ -14950,21 +14980,255 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
         self._push_remote_state(self.active_chat_id)
         self.SetStatusText("已清空上下文")
-        if auto_resend_first and first_question:
-            self._submit_question(first_question, source="local")
+        if auto_resend_first and first_payload:
+            dispatched = self._dispatch_clear_operation_resend(clear_operation, first_payload)
+            if not dispatched and clear_operation is not None:
+                self._offer_clear_operation_recovery(clear_operation["operation_id"])
         return True
 
-    def _clear_context_for_chat_id(self, chat_id: str) -> str:
+    def _begin_durable_clear_operation(self, chat_id: str, *, request_id: str) -> dict | None:
+        store = getattr(self, "chat_store", None)
+        if not (getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "begin_clear_operation")):
+            return None
+        transport = getattr(self, "_remote_nats_transport", None)
+        pair_id = str(getattr(getattr(transport, "subjects", None), "pair_id", "default") or "default")
+        if hasattr(store, "load_chat"):
+            target, turns, _is_current = self._chat_target_for_request(chat_id)
+            if not isinstance(target, dict):
+                raise KeyError("CHAT_NOT_FOUND")
+            store.upsert_chat(target)
+            store.replace_turns(chat_id, turns)
+        return store.begin_clear_operation(chat_id, idempotency_key=request_id, pair_id=pair_id)
+
+    def _reconcile_clear_operation_projection(self, operation: dict) -> None:
+        if not isinstance(operation, dict) or operation.get("state") == "superseded":
+            return
+        owner = str(operation.get("chat_id") or "").strip()
+        target, turns, is_current = self._chat_target_for_request(owner)
+        if not isinstance(target, dict):
+            return
+        revision = operation.get("revision")
+        owned = [turn for turn in turns if isinstance(turn, dict)
+                 and turn.get("clear_operation_id") == operation.get("operation_id")
+                 and turn.get("clear_revision") == revision]
+        self._clear_context_chat_state(target, owner, time.time())
+        target["turns"] = owned
+        if is_current:
+            self.active_session_turns = owned
+            self.active_turn_idx = len(owned) - 1
+            self._current_chat_state["turns"] = owned
+
+    @staticmethod
+    def _clear_snapshot_missing_attachment(payload: dict) -> bool:
+        for attachment in (payload or {}).get("attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            path = str(attachment.get("path") or attachment.get("local_path") or "").strip()
+            if path and not Path(path).is_file():
+                return True
+        return False
+
+    def _dispatch_clear_operation_resend(self, operation: dict | None, payload: dict, *, text_only: bool = False) -> bool:
+        store = getattr(self, "chat_store", None)
+        op_id = str((operation or {}).get("operation_id") or "").strip()
+        snapshot = copy.deepcopy(payload or {})
+        if operation is None:
+            previous = list(getattr(self, "_pending_input_attachments", []) or [])
+            try:
+                self._pending_input_attachments = [] if text_only else copy.deepcopy(snapshot.get("attachments") or [])
+                ok, _message = self._submit_question(
+                    str(snapshot.get("question") or snapshot.get("text") or ""), source="local",
+                    model=str(snapshot.get("model") or "") or None,
+                )
+                return bool(ok)
+            finally:
+                self._pending_input_attachments = previous
+        owner = str(operation.get("chat_id") or "").strip()
+        if owner and owner not in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}:
+            return self._submit_clear_snapshot_offscreen(operation, snapshot, text_only=text_only)
+        if self._clear_snapshot_missing_attachment(snapshot) and not text_only:
+            if op_id and store is not None:
+                store.transition_clear_operation(op_id, "resend_blocked", failure_code="ATTACHMENT_UNAVAILABLE")
+            return False
+        if op_id and store is not None and store.claim_clear_resend_dispatch(op_id) is None:
+            return False
+        previous_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
+        previous_operation = str(getattr(self, "_clear_resend_operation_id", "") or "")
+        ok = False
+        try:
+            self._clear_resend_operation_id = op_id
+            self._pending_input_attachments = [] if text_only else copy.deepcopy(snapshot.get("attachments") or [])
+            ok, _message = self._submit_question(
+                str(snapshot.get("question") or snapshot.get("text") or ""), source="local",
+                model=str(snapshot.get("model") or "") or None,
+                chat_id=str((operation or {}).get("chat_id") or ""),
+            )
+            if ok:
+                owner = str((operation or {}).get("chat_id") or self.active_chat_id or "").strip()
+                target = self._current_chat_state if owner in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(owner)
+                turns = (target or {}).get("turns") if isinstance(target, dict) else None
+                if isinstance(turns, list) and turns and isinstance(turns[-1], dict):
+                    turns[-1]["clear_operation_id"] = op_id
+                    turns[-1]["clear_revision"] = (operation or {}).get("revision")
+        except Exception:
+            if op_id and store is not None:
+                store.transition_clear_operation(op_id, "resend_blocked", failure_code="PROVIDER_REJECTED")
+            return False
+        finally:
+            self._pending_input_attachments = previous_attachments
+            self._clear_resend_operation_id = previous_operation
+        if not ok and op_id and store is not None:
+            store.transition_clear_operation(op_id, "resend_blocked", failure_code="PROVIDER_REJECTED")
+        return bool(ok)
+
+    def _submit_clear_snapshot_offscreen(self, operation: dict, snapshot: dict, *, text_only: bool = False) -> bool:
+        """Dispatch for an archived owner without changing selection, focus, or active input."""
+        owner = str(operation.get("chat_id") or "").strip()
+        op_id = str(operation.get("operation_id") or "").strip()
+        store = getattr(self, "chat_store", None)
+        target = self._find_archived_chat(owner)
+        if not owner or not op_id or store is None:
+            return False
+        if not isinstance(target, dict):
+            store.transition_clear_operation(op_id, "resend_blocked", failure_code="OWNER_UNAVAILABLE")
+            return False
+        if self._clear_snapshot_missing_attachment(snapshot) and not text_only:
+            store.transition_clear_operation(op_id, "resend_blocked", failure_code="ATTACHMENT_UNAVAILABLE")
+            return False
+        if store.claim_clear_resend_dispatch(op_id) is None:
+            return False
+        question = str(snapshot.get("question") or snapshot.get("text") or "")
+        model = normalize_model_id(snapshot.get("model") or target.get("model") or DEFAULT_MODEL_ID)
+        requested = [] if text_only else copy.deepcopy(snapshot.get("attachments") or [])
+        attachments, failed = self._normalize_outgoing_attachments(requested)
+        if failed and not text_only:
+            store.transition_clear_operation(op_id, "resend_blocked", failure_code="ATTACHMENT_UNAVAILABLE")
+            return False
+        turn = copy.deepcopy(snapshot)
+        turn.update({"question": question, "answer_md": REQUESTING_TEXT, "model": model,
+                     "attachments": attachments, "created_at": time.time(),
+                     "clear_operation_id": op_id, "clear_revision": operation.get("revision")})
+        turns = target.setdefault("turns", [])
+        if not isinstance(turns, list):
+            turns = []
+            target["turns"] = turns
+        turn_idx = len(turns)
+        turns.append(turn)
+        self._mark_turn_request_pending(turn, model, question)
+        target["updated_at"] = time.time()
+        self._mark_chat_turns_dirty(owner, turn_idx)
+        self._defer_chat_state_save()
+        worker_question = question
+        if attachments and not is_codex_model(model) and not is_kimi_model(model):
+            context = self._build_cli_attachment_context(attachments)
+            worker_question = f"{question}\n\n{context}".strip() if question else context
+        try:
+            if is_codex_model(model):
+                self._start_codex_worker_for_turn(owner, turn_idx, question, model)
+            elif is_kimi_model(model):
+                self._start_kimi_worker_for_turn(owner, turn_idx, question, model)
+            elif is_claudecode_model(model):
+                self._start_claudecode_worker_for_turn(owner, turn_idx, worker_question, model)
+            else:
+                threading.Thread(target=self._worker,
+                                 args=(openrouter_api_key_for_app(), turn_idx, worker_question, model, False, owner),
+                                 daemon=True).start()
+        except Exception:
+            if 0 <= turn_idx < len(turns) and turns[turn_idx] is turn:
+                turns.pop(turn_idx)
+                self._mark_chat_turns_dirty(owner, turn_idx)
+                self._defer_chat_state_save()
+            store.transition_clear_operation(op_id, "resend_blocked", failure_code="PROVIDER_REJECTED")
+            return False
+        return True
+
+    def recover_clear_operation(self, operation_id: str, choice: str) -> bool:
+        store = getattr(self, "chat_store", None)
+        operation = store.get_clear_operation(operation_id) if store is not None else None
+        if not operation or operation.get("state") != "resend_blocked":
+            return False
+        normalized = str(choice or "").strip().lower()
+        if normalized == "cancel":
+            store.transition_clear_operation(operation_id, "completed_clear_only")
+            return True
+        if normalized not in {"retry", "text-only", "text_only"}:
+            return False
+        store.transition_clear_operation(operation_id, "clear_acknowledged")
+        return self._dispatch_clear_operation_resend(
+            operation, operation.get("snapshot") or {}, text_only=normalized != "retry"
+        )
+
+    def _accept_clear_operation_result(self, turn: dict, chat_id: str) -> bool:
+        operation_id = str((turn or {}).get("clear_operation_id") or "").strip()
+        if not operation_id:
+            return True
+        store = getattr(self, "chat_store", None)
+        operation = store.get_clear_operation(operation_id) if store is not None else None
+        if operation and operation.get("state") != "superseded" and operation.get("revision") == turn.get("clear_revision"):
+            return True
+        if store is not None:
+            store.quarantine("SUPERSEDED_CLEAR_RESULT", {"operation_id": operation_id, "chat_id": str(chat_id or "")})
+        return False
+
+    def _complete_clear_operation_turn(self, turn: dict, *, failed: bool) -> None:
+        operation_id = str((turn or {}).get("clear_operation_id") or "").strip()
+        store = getattr(self, "chat_store", None)
+        if operation_id and store is not None:
+            try:
+                store.transition_clear_operation(operation_id, "resend_blocked" if failed else "completed_with_resend",
+                                                 failure_code="PROVIDER_FAILURE" if failed else "")
+            except (KeyError, ValueError):
+                pass
+
+    def _offer_clear_operation_recovery(self, operation_id: str) -> None:
+        """Accessible modal recovery boundary: Retry / text-only / Cancel."""
+        focus = wx.Window.FindFocus()
+        dialog = wx.MessageDialog(
+            self,
+            "The first message could not be resent. Retry after restoring files, resend text only, or cancel the resend?",
+            "Clear context resend recovery",
+            wx.YES_NO | wx.CANCEL | wx.ICON_WARNING,
+        )
+        if hasattr(dialog, "SetYesNoCancelLabels"):
+            dialog.SetYesNoCancelLabels("Retry", "Text only", "Cancel resend")
+        try:
+            result = dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+            if focus is not None and hasattr(focus, "SetFocus"):
+                focus.SetFocus()
+        choice = "retry" if result == wx.ID_YES else "text-only" if result == wx.ID_NO else "cancel"
+        self.recover_clear_operation(operation_id, choice)
+
+    def _clear_context_for_chat_id(self, chat_id: str, *, auto_resend_first: bool = False,
+                                   request_id: str = "") -> str:
         target_id = str(chat_id or "").strip()
         if not target_id:
             return "missing"
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
         if target_id in current_ids:
-            return "cleared" if self._clear_context_and_start_new_chat() else "unavailable"
+            try:
+                cleared = self._clear_context_and_start_new_chat(
+                    auto_resend_first=auto_resend_first, request_id=request_id
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                cleared = self._clear_context_and_start_new_chat()
+            return "cleared" if cleared else "unavailable"
         target_chat = self._find_archived_chat(target_id)
         if not isinstance(target_chat, dict):
             return "not_found"
+        try:
+            operation = self._begin_durable_clear_operation(
+                target_id, request_id=request_id or f"clear-{uuid.uuid4().hex}"
+            )
+        except Exception:
+            return "unavailable"
+        if operation is not None and operation.get("idempotent_replay"):
+            self._reconcile_clear_operation_projection(operation)
+            return "cleared"
         self._clear_context_chat_state(target_chat, target_id, time.time())
         self._mark_chat_turns_dirty(target_id, 0)
         if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
@@ -14981,6 +15245,10 @@ class ChatFrame(wx.Frame):
             self._answer_list_tail_notice_chat_id = target_id
             self._render_answer_list()
         self.SetStatusText("已清空上下文")
+        if auto_resend_first and operation is not None and operation.get("snapshot"):
+            dispatched = self._dispatch_clear_operation_resend(operation, operation["snapshot"])
+            if not dispatched and str(getattr(self, "view_history_id", "") or "").strip() == target_id:
+                self._offer_clear_operation_recovery(operation["operation_id"])
         return "cleared"
 
     def _clear_context_chat_state(self, chat: dict, chat_id: str, updated_at: float) -> None:
@@ -15067,6 +15335,14 @@ class ChatFrame(wx.Frame):
         return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
+        submit_owner = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
+        store = getattr(self, "chat_store", None)
+        if (
+            submit_owner and not str(getattr(self, "_clear_resend_operation_id", "") or "")
+            and getattr(self, "_chat_store_enabled", False) and store is not None
+            and hasattr(store, "active_clear_operation") and store.active_clear_operation(submit_owner) is not None
+        ):
+            return False, "Clear/resend recovery is still pending for this chat."
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
@@ -15888,6 +16164,22 @@ class ChatFrame(wx.Frame):
         if not is_current_chat:
             should_render = False
         if 0 <= turn_idx < len(target_turns):
+            callback_operation_id = str(target_turns[turn_idx].get("clear_operation_id") or "").strip()
+            if callback_operation_id:
+                store = getattr(self, "chat_store", None)
+                operation = store.get_clear_operation(callback_operation_id) if store is not None and hasattr(store, "get_clear_operation") else None
+                expected_revision = target_turns[turn_idx].get("clear_revision")
+                if (
+                    not operation or operation.get("state") == "superseded"
+                    or int(operation.get("revision") or -1) != int(expected_revision or -2)
+                ):
+                    if store is not None and hasattr(store, "quarantine"):
+                        store.quarantine("SUPERSEDED_CLEAR_RESULT", {
+                            "operation_id": callback_operation_id,
+                            "chat_id": str(chat_id or ""),
+                        })
+                    return
+            clear_operation_id = str(target_turns[turn_idx].get("clear_operation_id") or "").strip()
             if used_model:
                 target_turns[turn_idx]["model"] = used_model
             if err:
@@ -15909,6 +16201,16 @@ class ChatFrame(wx.Frame):
                     self._mark_turn_request_failed(target_turns[turn_idx], err)
                 else:
                     self._mark_turn_request_done(target_turns[turn_idx])
+            if clear_operation_id:
+                store = getattr(self, "chat_store", None)
+                if store is not None and hasattr(store, "transition_clear_operation"):
+                    try:
+                        store.transition_clear_operation(
+                            clear_operation_id, "resend_blocked" if err else "completed_with_resend",
+                            failure_code="PROVIDER_FAILURE" if err else "",
+                        )
+                    except (KeyError, ValueError):
+                        pass
             if not err:
                 for attachment in self._extract_existing_file_attachments_from_text(str(target_turns[turn_idx].get("answer_md") or ""), str(used_model or "")):
                     self._record_received_attachment(target_turns[turn_idx], attachment)

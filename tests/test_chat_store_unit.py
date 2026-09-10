@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from chat_store import ChatStore
-from chat_store import MAX_INT64, V2_MIGRATION_KEY
+from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
 
 def test_chat_store_initializes_schema_and_lists_summaries(tmp_path):
@@ -362,3 +362,128 @@ def test_v2_replay_scope_validation_unknown_feed_and_identity_reconciliation(tmp
         assert conn.execute("SELECT COUNT(*) n FROM v2_chat_state WHERE chat_id='chat'").fetchone()["n"] == 0
         assert conn.execute("SELECT COUNT(*) n FROM durable_facts WHERE event_id='scoped'").fetchone()["n"] == 1
     assert store.replay_after(pair_id="pair-a", domain="events", sync_sequence=0)
+
+
+def test_clear_operation_is_atomic_idempotent_and_private(tmp_path):
+    store = ChatStore(tmp_path / "clear.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat", "codex_thread_id": "private-thread"})
+    store.replace_turns("chat", [
+        {"question": "/status", "local_command": "status"},
+        {"question": "current edited text", "model": "codex/gpt-5", "attachments": [{"path": "secret/file.txt"}]},
+    ])
+    store.append_execution_step("chat", {"turn_idx": 1, "list_text": "private execution"})
+
+    operation = store.begin_clear_operation("chat", idempotency_key="request-1", pair_id="pair")
+    duplicate = store.begin_clear_operation("chat", idempotency_key="request-1", pair_id="pair")
+
+    assert duplicate["operation_id"] == operation["operation_id"]
+    assert operation["state"] == "clear_acknowledged"
+    assert operation["snapshot"]["question"] == "current edited text"
+    assert operation["snapshot"]["attachments"] == [{"path": "secret/file.txt"}]
+    assert store.load_turns("chat") == []
+    assert store.load_execution_steps("chat") == []
+    outbox = store.pending_outbox(pair_id="pair")
+    assert len(outbox) == 2
+    assert b"current edited text" not in outbox[0]["payload"]
+    assert b"secret/file.txt" not in outbox[0]["payload"]
+
+
+def test_clear_operation_dispatch_claim_and_recovery_transitions(tmp_path):
+    store = ChatStore(tmp_path / "claim.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat"})
+    store.replace_turns("chat", [{"question": "hello"}])
+    operation = store.begin_clear_operation("chat", idempotency_key="request")
+    assert store.claim_clear_resend_dispatch(operation["operation_id"])["state"] == "resend_dispatched"
+    assert store.claim_clear_resend_dispatch(operation["operation_id"]) is None
+    assert store.transition_clear_operation(operation["operation_id"], "resend_blocked", failure_code="TIMEOUT")["state"] == "resend_blocked"
+    assert store.transition_clear_operation(operation["operation_id"], "completed_clear_only")["terminal"] is True
+    lifecycle = [json.loads(row["payload"])["body"]["state"] for row in store.pending_outbox()]
+    assert lifecycle == ["requested", "clear_acknowledged", "resend_dispatched", "resend_blocked", "completed_clear_only"]
+    assert all("hello" not in row["payload"].decode("utf-8") for row in store.pending_outbox())
+
+
+def test_clear_operation_no_message_and_revision_overflow_are_safe(tmp_path):
+    store = ChatStore(tmp_path / "empty.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat"})
+    store.replace_turns("chat", [{"question": "/help", "local_command": True}])
+    operation = store.begin_clear_operation("chat", idempotency_key="empty")
+    assert operation["state"] == "completed_no_message"
+    with store._connect() as conn:
+        conn.execute("UPDATE v2_chat_state SET revision=? WHERE chat_id='chat'", (MAX_INT64,))
+        before = conn.execute("SELECT COUNT(*) n FROM clear_operations").fetchone()["n"]
+    with pytest.raises(OverflowError, match="CHAT_REVISION_OVERFLOW"):
+        store.begin_clear_operation("chat", idempotency_key="overflow")
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) n FROM clear_operations").fetchone()["n"] == before
+
+
+def test_clear_operation_contract_fixture_every_row_is_executable(tmp_path):
+    matrix = json.loads((Path(__file__).parent / "fixtures" / "clear_operation_contract_matrix.json").read_text(encoding="utf-8"))
+    assert set(matrix["states"]) == CLEAR_OPERATION_STATES
+    for case in matrix["payload_cases"]:
+        assert ChatStore._eligible_clear_payload(case["payload"]) is case["eligible"]
+
+    store = ChatStore(tmp_path / "matrix-clear.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat"})
+    store.replace_turns("chat", [{"question": "private current payload"}])
+    first = store.begin_clear_operation("chat", idempotency_key="stable", pair_id="pair")
+    assert store.claim_clear_resend_dispatch(first["operation_id"])
+    assert store.transition_clear_operation(first["operation_id"], "resend_blocked", failure_code="TIMEOUT")["state"] == "resend_blocked"
+    restarted = ChatStore(store.db_path)
+    restarted.initialize()
+    replay = restarted.begin_clear_operation("chat", idempotency_key="stable", pair_id="pair")
+    assert replay["operation_id"] == first["operation_id"] and replay["idempotent_replay"]
+    assert restarted.claim_clear_resend_dispatch(first["operation_id"]) is None
+    restarted.upsert_chat({"id": "chat", "updated_at": 1})
+    restarted.replace_turns("chat", [{"question": "new clear"}])
+    newer = restarted.begin_clear_operation("chat", idempotency_key="newer", pair_id="pair")
+    assert restarted.get_clear_operation(first["operation_id"])["state"] == "superseded"
+    assert newer["revision"] > first["revision"]
+    payloads = b"".join(row["payload"] for row in restarted.pending_outbox(pair_id="pair"))
+    assert b"private current payload" not in payloads
+    observed = {
+        "provider_timeout": "resend_blocked",
+        "concurrent_supersession": restarted.get_clear_operation(first["operation_id"])["state"],
+        "privacy": "private_payload_excluded" if b"private current payload" not in payloads else "leaked",
+        "restart_reconnect": "same_operation_no_redispatch" if replay["operation_id"] == first["operation_id"] else "duplicate",
+    }
+    for name, code in (("missing_attachment", "ATTACHMENT_UNAVAILABLE"), ("provider_reject", "PROVIDER_REJECTED")):
+        chat_id = f"chat-{name}"
+        restarted.upsert_chat({"id": chat_id})
+        restarted.replace_turns(chat_id, [{"question": name}])
+        op = restarted.begin_clear_operation(chat_id, idempotency_key=name, pair_id="pair")
+        observed[name] = restarted.transition_clear_operation(op["operation_id"], "resend_blocked", failure_code=code)["state"]
+    overflow_store = ChatStore(tmp_path / "matrix-overflow.db")
+    overflow_store.initialize()
+    overflow_store.upsert_chat({"id": "overflow"})
+    with overflow_store._connect() as conn:
+        conn.execute("INSERT INTO v2_chat_state(chat_id,revision) VALUES('overflow',?)", (MAX_INT64,))
+    with pytest.raises(OverflowError, match="CHAT_REVISION_OVERFLOW"):
+        overflow_store.begin_clear_operation("overflow", idempotency_key="overflow")
+    observed["revision_overflow"] = "CHAT_REVISION_OVERFLOW"
+    assert observed == {row["name"]: row["outcome"] for row in matrix["lifecycle_cases"]}
+
+
+def test_clear_snapshot_sanitizes_runtime_fields_and_operation_id_collision(tmp_path):
+    store = ChatStore(tmp_path / "sanitize-clear.db")
+    store.initialize()
+    store.upsert_chat({"id": "one"})
+    store.replace_turns("one", [{"question": "send", "model": "codex/main", "origin": "import",
+                                  "answer_md": "private answer", "request_error": "private failure",
+                                  "codex_thread_id": "private session", "attachments": []}])
+    operation = store.begin_clear_operation("one", idempotency_key="one", operation_id="fixed")
+    assert operation["snapshot"]["question"] == "send"
+    assert operation["snapshot"]["origin"] == "import"
+    assert not ({"answer_md", "request_error", "codex_thread_id"} & operation["snapshot"].keys())
+    for invalid in ("", "bad\x00id"):
+        store.upsert_chat({"id": f"invalid-{len(invalid)}"})
+        with pytest.raises(ValueError, match="INVALID_OPERATION_ID"):
+            store.begin_clear_operation(f"invalid-{len(invalid)}", idempotency_key="invalid", operation_id=invalid)
+    store.upsert_chat({"id": "two"})
+    store.replace_turns("two", [{"question": "other"}])
+    with pytest.raises(ValueError, match="OPERATION_ID_CONFLICT"):
+        store.begin_clear_operation("two", idempotency_key="two", operation_id="fixed")

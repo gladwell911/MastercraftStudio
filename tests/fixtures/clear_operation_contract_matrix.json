@@ -1,0 +1,29 @@
+{
+  "states": [
+    "requested",
+    "clear_acknowledged",
+    "resend_dispatched",
+    "resend_blocked",
+    "completed_with_resend",
+    "completed_clear_only",
+    "completed_no_message",
+    "superseded"
+  ],
+  "payload_cases": [
+    {"name": "edited_text", "payload": {"question": "current edit", "model": "codex/gpt-5"}, "eligible": true},
+    {"name": "local_command", "payload": {"question": "/status", "local_command": "status"}, "eligible": false},
+    {"name": "deleted", "payload": {"question": "deleted", "deleted": true}, "eligible": false},
+    {"name": "attachment_only", "payload": {"question": "", "attachments": [{"name": "input.png", "path": "durable/input.png"}]}, "eligible": true},
+    {"name": "voice", "payload": {"question": "", "voice_metadata": {"format": "wav"}}, "eligible": true},
+    {"name": "empty", "payload": {"question": ""}, "eligible": false}
+  ],
+  "lifecycle_cases": [
+    {"name": "missing_attachment", "outcome": "resend_blocked"},
+    {"name": "provider_reject", "outcome": "resend_blocked"},
+    {"name": "provider_timeout", "outcome": "resend_blocked"},
+    {"name": "concurrent_supersession", "outcome": "superseded"},
+    {"name": "revision_overflow", "outcome": "CHAT_REVISION_OVERFLOW"},
+    {"name": "privacy", "outcome": "private_payload_excluded"},
+    {"name": "restart_reconnect", "outcome": "same_operation_no_redispatch"}
+  ]
+}
