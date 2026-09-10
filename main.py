@@ -74,7 +74,7 @@ from listbox_model import IncrementalListBoxModel
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_backup import export_notes_backup, restore_notes_backup
 from notes_projection import DesktopNotesProjection
-from notes_store import NotesStore
+from notes_store import NotesPlacementConflict, NotesStore
 from notes_sync import NotesSyncService
 from notes_ui import DesktopNotesController
 from openclaw_client import (
@@ -17720,9 +17720,7 @@ class ChatFrame(wx.Frame):
             i_import_file = wx.NewIdRef()
             i_import_clip = wx.NewIdRef()
             current_entry = self._notes_current_entry()
-            entry_pinned = bool(getattr(current_entry, "pinned", False))
-            visible_entry_ids = [str(item) for item in getattr(self, "_notes_entry_ids", [])]
-            entry_is_last = current_entry is not None and bool(visible_entry_ids) and visible_entry_ids[-1] == str(current_entry.id)
+            entry_placement = str(getattr(current_entry, "placement", "normal") or "normal")
             menu.Append(i_new_entry, "新建笔记条目")
             menu.Append(i_copy_entry, "复制笔记条目")
             menu.Append(i_export_all, "导出所有笔记")
@@ -17731,12 +17729,14 @@ class ChatFrame(wx.Frame):
             menu.Append(i_export_up, "向上导出全部到剪贴板")
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
-            menu.Append(i_pin_entry, "取消置顶笔记条目" if entry_pinned else "置顶笔记条目")
+            menu.Append(i_pin_entry, "取消置顶笔记条目" if entry_placement == "top" else "置顶笔记条目")
             menu.Append(i_up_entry, "向上移动笔记条目")
             menu.Append(i_down_entry, "向下移动笔记条目")
             menu.Append(i_bottom_entry, "置底笔记条目")
             menu.Append(i_unbottom_entry, "取消置底笔记条目")
-            menu.Enable(i_unbottom_entry, entry_is_last)
+            menu.Enable(i_pin_entry, current_entry is not None and entry_placement != "bottom")
+            menu.Enable(i_bottom_entry, current_entry is not None and entry_placement != "bottom")
+            menu.Enable(i_unbottom_entry, current_entry is not None and entry_placement == "bottom")
             menu.AppendSeparator()
             menu.Append(i_import_file, "从文件导入")
             menu.Append(i_import_clip, "从剪贴板导入")
@@ -17976,12 +17976,18 @@ class ChatFrame(wx.Frame):
         if not self._confirm("确定删除该条目吗？"):
             return False
         notebook_id = entry.notebook_id
+        visible_ids = list(getattr(self, "_notes_entry_ids", []))
+        try:
+            old_index = visible_ids.index(entry.id)
+        except ValueError:
+            old_index = 0
         self.notes_store.delete_entry(entry.id)
-        self.notes_controller.active_entry_id = ""
+        survivors = [item for item in visible_ids if item != entry.id]
+        self.notes_controller.active_entry_id = survivors[min(old_index, len(survivors) - 1)] if survivors else ""
         self.notes_controller.notes_view = "note_detail"
         self.notes_controller.entry_editor_dirty = False
         self._current_notes_state = self.notes_controller.to_state_dict()
-        self._notes_refresh_entries(notebook_id)
+        self._notes_refresh_entries(notebook_id, self.notes_controller.active_entry_id)
         self._notes_after_local_mutation()
         return True
 
@@ -18008,7 +18014,7 @@ class ChatFrame(wx.Frame):
 
     def _notes_toggle_entry_pin(self) -> bool:
         entry = self._notes_current_entry()
-        if entry is not None and bool(getattr(entry, "pinned", False)):
+        if entry is not None and str(getattr(entry, "placement", "normal")) == "top":
             return self._notes_unpin_entry()
         return self._notes_move_selected_entry("top")
 
@@ -18027,24 +18033,25 @@ class ChatFrame(wx.Frame):
             moved = self.notes_store.move_entry_up(entry.id)
         elif direction_key == "down":
             moved = self.notes_store.move_entry_down(entry.id)
-        elif direction_key == "top":
-            moved = self.notes_store.move_entry_to_top(entry.id)
-        elif direction_key == "bottom":
-            moved = self.notes_store.move_entry_to_bottom(entry.id)
-        elif direction_key == "unpin":
-            moved = self.notes_store.pin_entry(entry.id, False)
-        elif direction_key == "unbottom":
-            moved = self.notes_store.move_entry_to_unpinned_top(entry.id)
+        elif direction_key in {"top", "bottom", "unpin", "unbottom"}:
+            target = direction_key if direction_key in {"top", "bottom"} else "normal"
+            try:
+                moved = self.notes_store.place_entry(
+                    entry.id,
+                    target,
+                    expected_version=entry.version,
+                    expected_rev=getattr(entry, "rev", ""),
+                )
+            except (NotesPlacementConflict, KeyError):
+                self._invalidate_notes_projection()
+                self._notes_refresh_entries(entry.notebook_id, entry.id)
+                return False
         else:
             return False
         self._invalidate_notes_projection()
         self.notes_controller.active_entry_id = moved.id
         self._current_notes_state = self.notes_controller.to_state_dict()
         self._notes_refresh_entries(moved.notebook_id, moved.id)
-        try:
-            self.notes_entry_list.SetFocus()
-        except Exception:
-            pass
         self._notes_after_local_mutation()
         return True
 
@@ -18234,17 +18241,23 @@ class ChatFrame(wx.Frame):
         key = event.GetKeyCode()
         if self._handle_input_focus_space_shortcut(event):
             return
-        if event.ControlDown() and not event.AltDown() and self.notes_entry_list.HasFocus():
-            if key == wx.WXK_UP:
+        native_focus = wx.Window.FindFocus()
+        try:
+            entry_list_owns_focus = bool(native_focus) and int(native_focus.GetHandle()) == int(self.notes_entry_list.GetHandle())
+        except (AttributeError, TypeError, ValueError):
+            entry_list_owns_focus = native_focus is self.notes_entry_list
+        repeat = bool(getattr(event, "IsAutoRepeat", lambda: False)())
+        if event.ControlDown() and not event.AltDown():
+            if key == wx.WXK_UP and self.notes_entry_list.HasFocus():
                 if self._notes_move_entry_up():
                     return
-            elif key == wx.WXK_DOWN:
+            elif key == wx.WXK_DOWN and self.notes_entry_list.HasFocus():
                 if self._notes_move_entry_down():
                     return
-            elif key == wx.WXK_HOME:
+            elif key == wx.WXK_HOME and entry_list_owns_focus and not repeat:
                 if self._notes_move_entry_to_top():
                     return
-            elif key == wx.WXK_END:
+            elif key == wx.WXK_END and entry_list_owns_focus and not repeat:
                 if self._notes_move_entry_to_bottom():
                     return
         if self._handle_ctrl_history_navigation(event):

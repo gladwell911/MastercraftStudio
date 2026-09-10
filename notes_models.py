@@ -96,6 +96,10 @@ class EntryDoc:
     updated_at: str
     sort_order: int
     pinned: bool = False
+    placement: str = "normal"
+    region_order: int = 0
+    normal_predecessor_id: str | None = None
+    normal_successor_id: str | None = None
     version: int = 1
     device_id: str = ""
     last_modified_by: str = "desktop"
@@ -108,6 +112,9 @@ class EntryDoc:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "EntryDoc":
+        placement = str(row.get("placement") or ("top" if _as_bool(row.get("pinned")) else "normal"))
+        if placement not in {"top", "normal", "bottom"}:
+            placement = "normal"
         return cls(
             id=str(row["id"]),
             notebook_id=str(row.get("notebook_id") or ""),
@@ -115,7 +122,11 @@ class EntryDoc:
             created_at=str(row.get("created_at") or ""),
             updated_at=str(row.get("updated_at") or ""),
             sort_order=_as_int(row.get("sort_order")),
-            pinned=_as_bool(row.get("pinned")),
+            pinned=placement == "top",
+            placement=placement,
+            region_order=_as_int(row.get("region_order"), _as_int(row.get("sort_order"))),
+            normal_predecessor_id=str(row["normal_predecessor_id"]) if row.get("normal_predecessor_id") else None,
+            normal_successor_id=str(row["normal_successor_id"]) if row.get("normal_successor_id") else None,
             version=_as_int(row.get("version"), 1),
             device_id=str(row.get("device_id") or ""),
             last_modified_by=str(row.get("last_modified_by") or "desktop"),
@@ -135,7 +146,11 @@ class EntryDoc:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "sort_order": self.sort_order,
-            "pinned": int(self.pinned),
+            "pinned": int(self.placement == "top"),
+            "placement": self.placement,
+            "region_order": self.region_order,
+            "normal_predecessor_id": self.normal_predecessor_id,
+            "normal_successor_id": self.normal_successor_id,
             "version": self.version,
             "device_id": self.device_id,
             "last_modified_by": self.last_modified_by,
@@ -156,7 +171,11 @@ class EntryDoc:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "sort_order": self.sort_order,
-            "pinned": self.pinned,
+            "pinned": self.placement == "top",
+            "placement": self.placement,
+            "region_order": self.region_order,
+            "normal_predecessor_id": self.normal_predecessor_id,
+            "normal_successor_id": self.normal_successor_id,
             "version": self.version,
             "device_id": self.device_id,
             "last_modified_by": self.last_modified_by,
@@ -249,9 +268,17 @@ class NoteEntry:
     is_conflict_copy: bool
     source: str
     origin_entry_id: str | None = None
+    placement: str = "normal"
+    region_order: int = 0
+    normal_predecessor_id: str | None = None
+    normal_successor_id: str | None = None
+    rev: str = ""
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "NoteEntry":
+        placement = str(row.get("placement") or ("top" if _as_bool(row.get("pinned")) else "normal"))
+        if placement not in {"top", "normal", "bottom"}:
+            placement = "normal"
         return cls(
             id=str(row["id"]),
             notebook_id=str(row.get("notebook_id") or ""),
@@ -259,7 +286,7 @@ class NoteEntry:
             created_at=str(row.get("created_at") or ""),
             updated_at=str(row.get("updated_at") or ""),
             deleted_at=str(row["deleted_at"]) if row.get("deleted_at") else None,
-            pinned=_as_bool(row.get("pinned")),
+            pinned=placement == "top",
             sort_order=_as_int(row.get("sort_order")),
             version=_as_int(row.get("version"), 1),
             device_id=str(row.get("device_id") or ""),
@@ -267,6 +294,11 @@ class NoteEntry:
             is_conflict_copy=_as_bool(row.get("is_conflict_copy")),
             source=str(row.get("source") or "manual"),
             origin_entry_id=str(row["origin_entry_id"]) if row.get("origin_entry_id") else None,
+            placement=placement,
+            region_order=_as_int(row.get("region_order"), _as_int(row.get("sort_order"))),
+            normal_predecessor_id=str(row["normal_predecessor_id"]) if row.get("normal_predecessor_id") else None,
+            normal_successor_id=str(row["normal_successor_id"]) if row.get("normal_successor_id") else None,
+            rev=str(row.get("rev") or ""),
         )
 
     @classmethod
@@ -285,7 +317,7 @@ class NoteEntry:
             created_at=doc.created_at,
             updated_at=doc.updated_at,
             deleted_at=doc.updated_at if doc.deleted else None,
-            pinned=doc.pinned,
+            pinned=doc.placement == "top",
             sort_order=doc.sort_order,
             version=doc.version,
             device_id=doc.device_id or device_id,
@@ -293,6 +325,11 @@ class NoteEntry:
             is_conflict_copy=doc.is_conflict_copy,
             source=doc.source or source,
             origin_entry_id=doc.origin_entry_id,
+            placement=doc.placement,
+            region_order=doc.region_order,
+            normal_predecessor_id=doc.normal_predecessor_id,
+            normal_successor_id=doc.normal_successor_id,
+            rev=doc.rev,
         )
 
     def to_dict(self) -> dict[str, Any]:

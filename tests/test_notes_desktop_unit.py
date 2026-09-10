@@ -59,6 +59,10 @@ def test_notes_store_creates_document_cache_schema(tmp_path):
         "updated_at",
         "sort_order",
         "pinned",
+        "placement",
+        "region_order",
+        "normal_predecessor_id",
+        "normal_successor_id",
         "version",
         "device_id",
         "last_modified_by",
@@ -160,7 +164,9 @@ def test_notes_store_upgrades_may_document_cache_schema_without_marker_without_d
     assert entry is not None
     assert entry.notebook_id == "may-nb"
     assert entry.content == "May entry body"
-    assert entry.sort_order == 7
+    assert entry.sort_order == 0
+    assert entry.region_order == 0
+    assert entry.placement == "normal"
     assert entry.pinned is False
     assert store.current_cursor() == "42"
 
@@ -179,6 +185,24 @@ def test_notes_store_upgrades_may_document_cache_schema_with_marker_without_data
     assert entry is not None
     assert entry.content == "May entry body"
     assert entry.pinned is False
+
+
+def test_preplacement_pinned_and_normal_migrate_in_relative_order_and_reopen(tmp_path):
+    db_path = tmp_path / "notes.db"
+    _create_may_document_cache_notes_db(db_path, migration_marker=False)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE entries SET id='normal-2', sort_order=20")
+        conn.execute("INSERT INTO entries (id,notebook_id,content,created_at,updated_at,sort_order,version,device_id,last_modified_by,is_conflict_copy,origin_entry_id,source,rev,deleted,dirty,pinned) SELECT 'top-2',notebook_id,'top two',created_at,updated_at,20,version,device_id,last_modified_by,0,NULL,source,'',0,1,1 FROM entries LIMIT 1")
+        conn.execute("INSERT INTO entries (id,notebook_id,content,created_at,updated_at,sort_order,version,device_id,last_modified_by,is_conflict_copy,origin_entry_id,source,rev,deleted,dirty,pinned) SELECT 'top-1',notebook_id,'top one',created_at,updated_at,10,version,device_id,last_modified_by,0,NULL,source,'',0,1,1 FROM entries LIMIT 1")
+        conn.execute("INSERT INTO entries (id,notebook_id,content,created_at,updated_at,sort_order,version,device_id,last_modified_by,is_conflict_copy,origin_entry_id,source,rev,deleted,dirty,pinned) SELECT 'normal-1',notebook_id,'normal one',created_at,updated_at,10,version,device_id,last_modified_by,0,NULL,source,'',0,1,0 FROM entries LIMIT 1")
+        conn.commit()
+    store = NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    expected = [("top-1", "top", 0), ("top-2", "top", 1), ("normal-1", "normal", 0), ("normal-2", "normal", 1)]
+    assert [(item.id, item.placement, item.region_order) for item in store.list_entries("may-nb")] == expected
+    store.initialize()
+    assert [(item.id, item.placement, item.region_order) for item in store.list_entries("may-nb")] == expected
     assert store.current_cursor() == "42"
 
 
@@ -1729,11 +1753,13 @@ def test_notes_store_move_entry_to_unpinned_top_restores_bottom_entry(tmp_path):
     bottom = store.create_entry(notebook.id, "bottom", source="manual", sort_order=40)
     store.pin_entry(pinned.id)
 
+    store.move_entry_to_bottom(bottom.id)
     moved = store.move_entry_to_unpinned_top(bottom.id)
     assert moved.pinned is False
-    assert [entry.id for entry in store.list_entries(notebook.id)] == [pinned.id, bottom.id, first.id, second.id]
+    assert moved.placement == "normal"
+    assert [entry.id for entry in store.list_entries(notebook.id)] == [pinned.id, first.id, second.id, bottom.id]
 
-    # unpin keeps the entry at its current position
+    # Unpin restores beside its surviving saved normal successor.
     unpinned = store.pin_entry(pinned.id, False)
     assert unpinned.pinned is False
     assert [entry.id for entry in store.list_entries(notebook.id)][0] == pinned.id
@@ -1780,7 +1806,7 @@ def test_notes_entry_menu_unpin_item_toggles_pinned_entry(frame, monkeypatch):
     frame.ProcessEvent(event)
 
     assert frame.notes_store.get_entry(second.id).pinned is False
-    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)][0] == second.id
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [first.id, second.id, third.id]
     assert frame._notes_selected_entry_id() == second.id
 
 
@@ -1791,6 +1817,7 @@ def test_notes_entry_menu_unbottom_item_moves_last_entry_to_unpinned_top(frame, 
     third = frame.notes_store.create_entry(notebook.id, "third", source="manual", sort_order=30)
     frame._notes_select_notebook(notebook.id, view="note_detail")
     frame.notes_entry_list.SetSelection(frame._notes_entry_ids.index(third.id))
+    frame._notes_move_entry_to_bottom()
 
     captured = {"items": []}
     monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
@@ -1813,8 +1840,146 @@ def test_notes_entry_menu_unbottom_item_moves_last_entry_to_unpinned_top(frame, 
     frame.ProcessEvent(event)
 
     assert frame.notes_store.get_entry(third.id).pinned is False
-    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [third.id, first.id, second.id]
+    assert frame.notes_store.get_entry(third.id).placement == "normal"
+    assert [entry.id for entry in frame.notes_store.list_entries(notebook.id)] == [first.id, second.id, third.id]
     assert frame._notes_selected_entry_id() == third.id
+
+
+def test_notes_placement_matrix_anchors_regions_restore_and_restart(tmp_path):
+    db_path = tmp_path / "notes.db"
+    store = main.NotesStore(db_path, device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("placement matrix")
+    first = store.create_entry(notebook.id, "first")
+    middle = store.create_entry(notebook.id, "middle")
+    last = store.create_entry(notebook.id, "last")
+
+    middle = store.place_entry(middle.id, "top", expected_version=middle.version)
+    assert (middle.normal_predecessor_id, middle.normal_successor_id) == (first.id, last.id)
+    middle = store.place_entry(middle.id, "bottom", expected_version=middle.version)
+    assert (middle.normal_predecessor_id, middle.normal_successor_id) == (first.id, last.id)
+    assert [item.placement for item in store.list_entries(notebook.id)] == ["normal", "normal", "bottom"]
+
+    middle = store.place_entry(middle.id, "normal", expected_version=middle.version)
+    assert [item.id for item in store.list_entries(notebook.id)] == [first.id, middle.id, last.id]
+    middle = store.place_entry(middle.id, "bottom", expected_version=middle.version)
+
+    # With only the successor surviving, restoration is immediately before it.
+    store.delete_entry(first.id)
+    middle = store.get_entry(middle.id)
+    restored = store.place_entry(middle.id, "normal", expected_version=middle.version)
+    assert [item.id for item in store.list_entries(notebook.id)] == [middle.id, last.id]
+    assert restored.placement == "normal"
+
+    # Multiple special entries append stably and survive a fresh store instance.
+    extra_top = store.create_entry(notebook.id, "extra top")
+    extra_bottom = store.create_entry(notebook.id, "extra bottom")
+    extra_top = store.place_entry(extra_top.id, "top", expected_version=extra_top.version)
+    extra_bottom = store.get_entry(extra_bottom.id)
+    extra_bottom = store.place_entry(extra_bottom.id, "bottom", expected_version=extra_bottom.version)
+    reopened = main.NotesStore(db_path, device_id="desktop-test")
+    reopened.initialize()
+    rows = reopened.list_entries(notebook.id)
+    assert [(item.id, item.placement) for item in rows] == [
+        (extra_top.id, "top"), (middle.id, "normal"), (last.id, "normal"), (extra_bottom.id, "bottom")
+    ]
+
+
+def test_direct_pinned_creation_uses_distinct_zero_based_top_orders(tmp_path):
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("direct top")
+    first = store.create_entry(notebook.id, "one", pinned=True)
+    second = store.create_entry(notebook.id, "two", pinned=True)
+    assert [(item.id, item.region_order) for item in store.list_entries(notebook.id)] == [(first.id, 0), (second.id, 1)]
+
+
+def test_step_move_updates_both_rows_and_outbox_atomically(tmp_path):
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("step atomic")
+    first = store.create_entry(notebook.id, "one")
+    second = store.create_entry(notebook.id, "two")
+    before = {item.id: item.version for item in store.list_entries(notebook.id)}
+    before_count = len(store.list_outbox_ops())
+    store.move_entry_up(second.id)
+    after = store.list_entries(notebook.id)
+    assert [item.id for item in after] == [second.id, first.id]
+    assert all(item.version == before[item.id] + 1 for item in after)
+    new_ops = store.list_outbox_ops()[before_count:]
+    assert {op.entity_id for op in new_ops} == {first.id, second.id}
+
+
+def test_step_move_concurrent_neighbor_change_rolls_back_both_rows_and_outbox(tmp_path):
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("step conflict")
+    first = store.create_entry(notebook.id, "one")
+    second = store.create_entry(notebook.id, "two")
+    before = [(item.id, item.region_order, item.version) for item in store.list_entries(notebook.id)]
+    before_ops = [op.to_dict() for op in store.list_outbox_ops()]
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(f"CREATE TRIGGER force_neighbor_conflict AFTER UPDATE OF region_order ON entries WHEN NEW.id='{second.id}' BEGIN UPDATE entries SET version=version+1 WHERE id='{first.id}'; END")
+        conn.commit()
+    with pytest.raises(main.NotesPlacementConflict):
+        store.move_entry_up(second.id)
+    assert [(item.id, item.region_order, item.version) for item in store.list_entries(notebook.id)] == before
+    assert [op.to_dict() for op in store.list_outbox_ops()] == before_ops
+
+
+def test_partial_v2_migration_normalizes_each_legacy_row_and_reopens(tmp_path):
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("partial")
+    normal = store.create_entry(notebook.id, "normal")
+    pinned = store.create_entry(notebook.id, "legacy pinned")
+    bottom = store.create_entry(notebook.id, "already bottom")
+    bottom = store.place_entry(bottom.id, "bottom", expected_version=bottom.version)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DELETE FROM sync_state WHERE key='entry_placement_v2'")
+        conn.execute("UPDATE entries SET pinned=1, placement='normal', region_order=99 WHERE id=?", (pinned.id,))
+        conn.commit()
+    store.initialize()
+    rows = store.list_entries(notebook.id)
+    assert [(item.id, item.placement) for item in rows] == [(pinned.id, "top"), (normal.id, "normal"), (bottom.id, "bottom")]
+    store.initialize()
+    assert [(item.id, item.placement) for item in store.list_entries(notebook.id)] == [(pinned.id, "top"), (normal.id, "normal"), (bottom.id, "bottom")]
+
+
+def test_notes_placement_matrix_stale_and_duplicate_are_atomic(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("placement conflicts")
+    first = store.create_entry(notebook.id, "first")
+    second = store.create_entry(notebook.id, "second")
+    observed = store.get_entry(second.id)
+    store.update_entry(second.id, "changed concurrently")
+    before = [(item.id, item.placement, item.region_order, item.version) for item in store.list_entries(notebook.id)]
+    before_ops = [op.to_dict() for op in store.list_outbox_ops()]
+    with pytest.raises(main.NotesPlacementConflict):
+        store.place_entry(second.id, "top", expected_version=observed.version, expected_rev=observed.rev)
+    assert [(item.id, item.placement, item.region_order, item.version) for item in store.list_entries(notebook.id)] == before
+    assert [op.to_dict() for op in store.list_outbox_ops()] == before_ops
+
+    current = store.get_entry(first.id)
+    unchanged = store.place_entry(first.id, "normal", expected_version=current.version, expected_rev=current.rev)
+    assert unchanged.version == current.version
+
+
+def test_notes_placement_restore_with_no_surviving_anchors_appends_to_normal_end(tmp_path):
+    store = main.NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("no anchors")
+    first = store.create_entry(notebook.id, "first")
+    target = store.create_entry(notebook.id, "target")
+    last = store.create_entry(notebook.id, "last")
+    target = store.place_entry(target.id, "top", expected_version=target.version)
+    store.delete_entry(first.id)
+    store.delete_entry(last.id)
+    survivor = store.create_entry(notebook.id, "new normal")
+    target = store.get_entry(target.id)
+    target = store.place_entry(target.id, "normal", expected_version=target.version)
+    assert [item.id for item in store.list_entries(notebook.id)] == [survivor.id, target.id]
 
 
 def test_notes_sync_entry_payload_round_trips_pinned(tmp_path):
@@ -1832,6 +1997,10 @@ def test_notes_sync_entry_payload_round_trips_pinned(tmp_path):
         row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry.id,)).fetchone()
     payload = service._entry_to_couch_document(EntryDoc.from_row(dict(row)))
     assert payload["pinned"] is True
+    assert payload["placement"] == "top"
+    assert "region_order" in payload
+    assert "normal_predecessor_id" in payload
+    assert "normal_successor_id" in payload
 
     remote_store = NotesStore(tmp_path / "remote.db", device_id="mobile-test")
     remote_store.initialize()
@@ -1841,6 +2010,76 @@ def test_notes_sync_entry_payload_round_trips_pinned(tmp_path):
     synced = remote_store.get_entry(entry.id)
     assert synced is not None
     assert synced.pinned is True
+    assert synced.placement == "top"
+
+
+def test_notes_sync_old_document_preserves_existing_placement_v2(tmp_path):
+    from notes_sync import NotesSyncService
+
+    store = NotesStore(tmp_path / "notes.db", device_id="desktop-test")
+    store.initialize()
+    notebook = store.create_notebook("mixed peer")
+    entry = store.create_entry(notebook.id, "body")
+    entry = store.place_entry(entry.id, "bottom", expected_version=entry.version)
+    service = NotesSyncService(store)
+    with store._connect() as conn:
+        service._upsert_remote_entry(conn, {
+            "_id": f"entry:{entry.id}", "notebook_id": f"notebook:{notebook.id}",
+            "content": "old peer update", "sort_order": 99, "pinned": False,
+            "version": entry.version + 1,
+        })
+    updated = store.get_entry(entry.id)
+    assert updated.content == "old peer update"
+    assert updated.placement == "bottom"
+    assert updated.region_order == entry.region_order
+
+
+def test_bottom_sync_round_trip_restores_between_synced_anchors(tmp_path):
+    from notes_models import EntryDoc
+    from notes_sync import NotesSyncService
+
+    source = NotesStore(tmp_path / "source.db", device_id="desktop")
+    source.initialize()
+    notebook = source.create_notebook("roundtrip", notebook_id="nb")
+    first = source.create_entry(notebook.id, "first", entry_id="first")
+    target = source.create_entry(notebook.id, "target", entry_id="target")
+    last = source.create_entry(notebook.id, "last", entry_id="last")
+    target = source.place_entry(target.id, "bottom", expected_version=target.version)
+    service = NotesSyncService(source)
+    with source._connect() as conn:
+        payload = service._entry_to_couch_document(EntryDoc.from_row(dict(conn.execute("SELECT * FROM entries WHERE id='target'").fetchone())))
+
+    remote = NotesStore(tmp_path / "remote.db", device_id="mobile")
+    remote.initialize()
+    remote.create_notebook("roundtrip", notebook_id="nb")
+    remote.create_entry("nb", "first", entry_id="first")
+    remote.create_entry("nb", "last", entry_id="last")
+    with remote._connect() as conn:
+        NotesSyncService(remote)._upsert_remote_entry(conn, payload)
+    synced = remote.get_entry("target")
+    assert (synced.placement, synced.normal_predecessor_id, synced.normal_successor_id) == ("bottom", "first", "last")
+    restored = remote.place_entry("target", "normal", expected_version=synced.version, expected_rev=synced.rev)
+    assert [item.id for item in remote.list_entries("nb")] == ["first", restored.id, "last"]
+
+
+@pytest.mark.parametrize("bad_order", [None, "nope", -1, 2_147_483_648])
+@pytest.mark.parametrize("bad_placement", [None, "future-region"])
+def test_sync_invalid_v2_metadata_preserves_existing_fields(tmp_path, bad_order, bad_placement):
+    from notes_sync import NotesSyncService
+    store = NotesStore(tmp_path / f"{bad_order}-{bad_placement}.db", device_id="desktop")
+    store.initialize()
+    notebook = store.create_notebook("defensive")
+    entry = store.create_entry(notebook.id, "old")
+    entry = store.place_entry(entry.id, "bottom", expected_version=entry.version)
+    with store._connect() as conn:
+        NotesSyncService(store)._upsert_remote_entry(conn, {
+            "_id": f"entry:{entry.id}", "notebook_id": f"notebook:{notebook.id}",
+            "content": "accepted", "placement": bad_placement, "region_order": bad_order,
+            "version": entry.version + 1,
+        })
+    updated = store.get_entry(entry.id)
+    assert updated.content == "accepted"
+    assert (updated.placement, updated.region_order, updated.sort_order) == (entry.placement, entry.region_order, entry.region_order)
 
 
 def test_notes_entry_ctrl_arrow_shortcuts_move_selected_entry(frame, monkeypatch):
@@ -2129,6 +2368,20 @@ def test_notes_prompt_search_applies_query_and_returns_focus_to_notebook_list(fr
     assert frame._notes_search_query == "alpha"
     assert frame.notes_notebook_list.GetCount() == 1
     assert seen["focused"] == 1
+
+
+@pytest.mark.parametrize(("delete_index", "expected_index"), [(0, 0), (1, 1), (2, 1)])
+def test_delete_entry_selects_nearest_survivor(frame, monkeypatch, delete_index, expected_index):
+    notebook = frame.notes_store.create_notebook(f"delete {delete_index}")
+    entries = [frame.notes_store.create_entry(notebook.id, str(i)) for i in range(3)]
+    frame._notes_select_notebook(notebook.id, entries[delete_index].id, view="note_detail")
+    frame.notes_entry_list.SetSelection(delete_index)
+    monkeypatch.setattr(frame, "_confirm", lambda *_args, **_kwargs: True)
+    assert frame._notes_delete_entry()
+    survivors = [entry.id for i, entry in enumerate(entries) if i != delete_index]
+    expected = survivors[expected_index]
+    assert frame.notes_controller.active_entry_id == expected
+    assert frame._notes_selected_entry_id() == expected
 
 
 def test_remote_conflict_copy_uses_semantic_last_modified_by(tmp_path):

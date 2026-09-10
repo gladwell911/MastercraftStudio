@@ -14,6 +14,8 @@ LEGACY_MIGRATION_STATE_KEY = "legacy_notes_migration_complete"
 LEGACY_MIGRATION_STATE_VALUE = "complete"
 LAST_CURSOR_STATE_KEY = "last_cursor"
 COMPAT_OUTBOX_STATE_KEY = "compat_outbox"
+PLACEMENT_MIGRATION_STATE_KEY = "entry_placement_v2"
+PLACEMENT_MIGRATION_STATE_VALUE = "complete"
 
 NOTEBOOK_COLUMNS = {
     "id",
@@ -37,6 +39,10 @@ ENTRY_COLUMNS = {
     "updated_at",
     "sort_order",
     "pinned",
+    "placement",
+    "region_order",
+    "normal_predecessor_id",
+    "normal_successor_id",
     "version",
     "device_id",
     "last_modified_by",
@@ -47,7 +53,12 @@ ENTRY_COLUMNS = {
     "deleted",
     "dirty",
 }
-MAY_DOCUMENT_CACHE_ENTRY_COLUMNS = ENTRY_COLUMNS - {"pinned"}
+PRE_PLACEMENT_ENTRY_COLUMNS = ENTRY_COLUMNS - {"placement", "region_order", "normal_predecessor_id", "normal_successor_id"}
+MAY_DOCUMENT_CACHE_ENTRY_COLUMNS = PRE_PLACEMENT_ENTRY_COLUMNS - {"pinned"}
+
+
+class NotesPlacementConflict(RuntimeError):
+    """The selected entry changed before its placement mutation committed."""
 
 
 def _utc_now() -> str:
@@ -70,6 +81,7 @@ class NotesStore:
                 self._set_sync_state(conn, LEGACY_MIGRATION_STATE_KEY, LEGACY_MIGRATION_STATE_VALUE)
             else:
                 self._create_document_cache_schema(conn)
+            self._migrate_entry_placement(conn)
 
     @contextmanager
     def _connect(self):
@@ -109,7 +121,7 @@ class NotesStore:
             return True
         if "entries" in tables:
             entry_columns = self._table_columns(conn, "entries")
-            if entry_columns not in (ENTRY_COLUMNS, MAY_DOCUMENT_CACHE_ENTRY_COLUMNS):
+            if entry_columns not in (ENTRY_COLUMNS, PRE_PLACEMENT_ENTRY_COLUMNS, MAY_DOCUMENT_CACHE_ENTRY_COLUMNS):
                 return True
         return False
 
@@ -138,6 +150,10 @@ class NotesStore:
                 updated_at TEXT NOT NULL,
                 sort_order INTEGER NOT NULL,
                 pinned INTEGER NOT NULL DEFAULT 0,
+                placement TEXT NOT NULL DEFAULT 'normal' CHECK (placement IN ('top', 'normal', 'bottom')),
+                region_order INTEGER NOT NULL DEFAULT 0,
+                normal_predecessor_id TEXT,
+                normal_successor_id TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
                 device_id TEXT NOT NULL DEFAULT '',
                 last_modified_by TEXT NOT NULL DEFAULT 'desktop',
@@ -156,12 +172,40 @@ class NotesStore:
         )
         if "pinned" not in self._table_columns(conn, "entries"):
             conn.execute("ALTER TABLE entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        columns = self._table_columns(conn, "entries")
+        if "placement" not in columns:
+            conn.execute("ALTER TABLE entries ADD COLUMN placement TEXT NOT NULL DEFAULT 'normal'")
+        if "region_order" not in columns:
+            conn.execute("ALTER TABLE entries ADD COLUMN region_order INTEGER NOT NULL DEFAULT 0")
+        if "normal_predecessor_id" not in columns:
+            conn.execute("ALTER TABLE entries ADD COLUMN normal_predecessor_id TEXT")
+        if "normal_successor_id" not in columns:
+            conn.execute("ALTER TABLE entries ADD COLUMN normal_successor_id TEXT")
+        conn.execute("DROP INDEX IF EXISTS idx_entries_notebook_sort")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_entries_notebook_sort
-            ON entries (notebook_id, pinned, sort_order, created_at)
+            ON entries (notebook_id, placement, region_order, id)
             """
         )
+
+    def _migrate_entry_placement(self, conn: sqlite3.Connection) -> None:
+        marker = conn.execute("SELECT value FROM sync_state WHERE key = ?", (PLACEMENT_MIGRATION_STATE_KEY,)).fetchone()
+        invalid = conn.execute("SELECT 1 FROM entries WHERE placement IS NULL OR placement NOT IN ('top','normal','bottom') OR region_order < 0 OR pinned != CASE WHEN placement='top' THEN 1 ELSE 0 END LIMIT 1").fetchone()
+        if marker is not None and str(marker["value"]) == PLACEMENT_MIGRATION_STATE_VALUE and invalid is None:
+            return
+        # Normalize every row independently; partially migrated databases are valid input.
+        conn.execute("UPDATE entries SET placement = CASE WHEN pinned != 0 THEN 'top' ELSE 'normal' END WHERE placement IS NULL OR placement NOT IN ('top','normal','bottom') OR (pinned != 0 AND placement = 'normal' AND normal_predecessor_id IS NULL AND normal_successor_id IS NULL)")
+        rows = conn.execute(
+            "SELECT id, notebook_id, placement, region_order FROM entries ORDER BY notebook_id, CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, sort_order, created_at, id"
+        ).fetchall()
+        counters: dict[tuple[str, str], int] = {}
+        for row in rows:
+            key = (str(row["notebook_id"]), str(row["placement"]))
+            order = counters.get(key, 0)
+            conn.execute("UPDATE entries SET region_order = ?, sort_order = ?, pinned = ? WHERE id = ?", (order, order, int(key[1] == "top"), row["id"]))
+            counters[key] = order + 1
+        self._set_sync_state(conn, PLACEMENT_MIGRATION_STATE_KEY, PLACEMENT_MIGRATION_STATE_VALUE)
 
     def _drop_notes_tables(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -217,6 +261,9 @@ class NotesStore:
                     created_at=str(row["created_at"] or ""),
                     updated_at=str(row["updated_at"] or row["created_at"] or ""),
                     sort_order=int(row["sort_order"] or 0),
+                    pinned=bool(row["pinned"]),
+                    placement="top" if bool(row["pinned"]) else "normal",
+                    region_order=int(row["sort_order"] or 0),
                     version=int(row["version"] or 1),
                     device_id=str(row["device_id"] or ""),
                     last_modified_by=str(row["last_modified_by"] or "desktop"),
@@ -267,9 +314,10 @@ class NotesStore:
             INSERT INTO entries (
                 id, notebook_id, content, created_at, updated_at,
                 sort_order, pinned, version, device_id, last_modified_by,
+                placement, region_order, normal_predecessor_id, normal_successor_id,
                 is_conflict_copy, origin_entry_id, source,
                 rev, deleted, dirty
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 doc.id,
@@ -282,6 +330,10 @@ class NotesStore:
                 doc.version,
                 doc.device_id,
                 doc.last_modified_by,
+                doc.placement,
+                doc.region_order,
+                doc.normal_predecessor_id,
+                doc.normal_successor_id,
                 int(doc.is_conflict_copy),
                 doc.origin_entry_id,
                 doc.source,
@@ -381,7 +433,7 @@ class NotesStore:
             entry_rows = conn.execute(
                 """
                 SELECT * FROM entries
-                ORDER BY notebook_id ASC, sort_order ASC, created_at ASC, id ASC
+                ORDER BY notebook_id ASC, CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order ASC, id ASC
                 """
             ).fetchall()
         return NotesSnapshot(
@@ -402,7 +454,7 @@ class NotesStore:
                 """
                 SELECT * FROM entries
                 WHERE dirty = 1
-                ORDER BY notebook_id ASC, sort_order ASC, created_at ASC, id ASC
+                ORDER BY notebook_id ASC, CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order ASC, id ASC
                 """
             ).fetchall()
         return NotesSnapshot(
@@ -421,8 +473,8 @@ class NotesStore:
 
     def _next_entry_sort_order(self, conn: sqlite3.Connection, notebook_id: str) -> int:
         row = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) AS value FROM entries WHERE notebook_id = ?",
-            (notebook_id,),
+            "SELECT COALESCE(MAX(region_order), -1) AS value FROM entries WHERE notebook_id = ? AND placement = ?",
+            (notebook_id, "normal"),
         ).fetchone()
         return int(row["value"] if row is not None else 0) + 1
 
@@ -562,14 +614,22 @@ class NotesStore:
             raise KeyError(notebook_id)
         now = _utc_now()
         with self._connect() as conn:
+            target_placement = "top" if pinned else "normal"
+            if sort_order is None:
+                order_row = conn.execute("SELECT COALESCE(MAX(region_order), -1) AS value FROM entries WHERE notebook_id=? AND placement=?", (notebook_id, target_placement)).fetchone()
+                initial_order = int(order_row["value"]) + 1
+            else:
+                initial_order = int(sort_order)
             doc = EntryDoc(
                 id=str(entry_id or uuid.uuid4().hex),
                 notebook_id=notebook_id,
                 content=str(content or ""),
                 created_at=str(created_at or now),
                 updated_at=str(updated_at or created_at or now),
-                sort_order=int(sort_order) if sort_order is not None else self._next_entry_sort_order(conn, notebook_id),
+                sort_order=initial_order,
                 pinned=bool(pinned) if pinned is not None else False,
+                placement=target_placement,
+                region_order=initial_order,
                 version=int(version) if version is not None else 1,
                 device_id=str(device_id or self.device_id),
                 last_modified_by=str(last_modified_by or "desktop"),
@@ -603,7 +663,7 @@ class NotesStore:
         sql = "SELECT * FROM entries WHERE notebook_id = ?"
         if not include_deleted:
             sql += " AND deleted = 0"
-        sql += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql, (notebook_id,)).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -612,7 +672,7 @@ class NotesStore:
         sql = "SELECT * FROM entries"
         if not include_deleted:
             sql += " WHERE deleted = 0"
-        sql += " ORDER BY notebook_id ASC, pinned DESC, sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY notebook_id ASC, CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -622,7 +682,7 @@ class NotesStore:
         params: list[object] = [notebook_id, f"%{str(query or '').strip()}%"]
         if not include_deleted:
             sql += " AND deleted = 0"
-        sql += " ORDER BY pinned DESC, sort_order ASC, created_at ASC, id ASC"
+        sql += " ORDER BY CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order ASC, id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._project_entry(EntryDoc.from_row(dict(row))) for row in rows]
@@ -683,6 +743,8 @@ class NotesStore:
                     updated_at=now,
                     sort_order=next_sort_order,
                     pinned=False,
+                    placement="normal",
+                    region_order=next_sort_order,
                     version=1,
                     device_id=self.device_id,
                     last_modified_by="desktop",
@@ -705,22 +767,14 @@ class NotesStore:
         current = self.get_entry(entry_id, include_deleted=True)
         if current is None:
             raise KeyError(entry_id)
-        next_pinned = True if pinned is None else bool(pinned)
-        if next_pinned:
-            entries = self.list_entries(current.notebook_id, include_deleted=True)
-            min_sort = min((int(item.sort_order) for item in entries), default=0)
-            sort_order = min_sort - 1
-        else:
-            sort_order = current.sort_order
-        return self._update_entry_position(entry_id, sort_order=sort_order, pinned=next_pinned, record_outbox=record_outbox)
+        target = "top" if pinned is None or bool(pinned) else "normal"
+        return self.place_entry(entry_id, target, expected_version=current.version, expected_rev=current.rev, record_outbox=record_outbox)
 
     def move_entry_to_bottom(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         current = self.get_entry(entry_id, include_deleted=True)
         if current is None:
             raise KeyError(entry_id)
-        entries = [item for item in self.list_entries(current.notebook_id, include_deleted=True) if not item.deleted_at]
-        max_sort = max((int(item.sort_order) for item in entries), default=0)
-        return self._update_entry_position(entry_id, sort_order=max_sort + 1, pinned=False, record_outbox=record_outbox)
+        return self.place_entry(entry_id, "bottom", expected_version=current.version, expected_rev=current.rev, record_outbox=record_outbox)
 
     def move_entry_to_top(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         return self.pin_entry(entry_id, True, record_outbox=record_outbox)
@@ -729,14 +783,57 @@ class NotesStore:
         current = self.get_entry(entry_id, include_deleted=True)
         if current is None:
             raise KeyError(entry_id)
-        entries = [
-            item
-            for item in self.list_entries(current.notebook_id, include_deleted=True)
-            if not item.deleted_at and not item.pinned and item.id != entry_id
-        ]
-        min_sort = min((int(item.sort_order) for item in entries), default=None)
-        sort_order = min_sort - 1 if min_sort is not None else 0
-        return self._update_entry_position(entry_id, sort_order=sort_order, pinned=False, record_outbox=record_outbox)
+        return self.place_entry(entry_id, "normal", expected_version=current.version, expected_rev=current.rev, record_outbox=record_outbox)
+
+    def place_entry(self, entry_id: str, placement: str, *, expected_version: int, expected_rev: str = "", record_outbox: bool = True) -> NoteEntry:
+        target = str(placement or "").lower()
+        if target not in {"top", "normal", "bottom"}:
+            raise ValueError(placement)
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM entries WHERE id = ? AND deleted = 0", (entry_id,)).fetchone()
+            if row is None:
+                raise KeyError(entry_id)
+            current = EntryDoc.from_row(dict(row))
+            if current.version != int(expected_version) or (expected_rev and current.rev != str(expected_rev)):
+                raise NotesPlacementConflict(entry_id)
+            if current.placement == target:
+                return self._project_entry(current)
+            rows = conn.execute("SELECT * FROM entries WHERE notebook_id=? AND deleted=0 ORDER BY CASE placement WHEN 'top' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, region_order, id", (current.notebook_id,)).fetchall()
+            docs = [EntryDoc.from_row(dict(item)) for item in rows]
+            regions = {name: [doc for doc in docs if doc.placement == name and doc.id != entry_id] for name in ("top", "normal", "bottom")}
+            pred, succ = current.normal_predecessor_id, current.normal_successor_id
+            if current.placement == "normal" and target != "normal":
+                normals = [doc for doc in docs if doc.placement == "normal"]
+                idx = next(i for i, doc in enumerate(normals) if doc.id == entry_id)
+                pred = normals[idx - 1].id if idx else None
+                succ = normals[idx + 1].id if idx + 1 < len(normals) else None
+            if target == "normal":
+                normals = regions["normal"]
+                ids = [doc.id for doc in normals]
+                if pred in ids:
+                    insert_at = ids.index(pred) + 1
+                elif succ in ids:
+                    insert_at = ids.index(succ)
+                else:
+                    insert_at = len(normals)
+                normals.insert(insert_at, current)
+            else:
+                regions[target].append(current)
+            now = _utc_now()
+            changed: list[tuple[EntryDoc, str, int]] = []
+            for region in ("top", "normal", "bottom"):
+                for order, doc in enumerate(regions[region]):
+                    if doc.id == entry_id or doc.region_order != order:
+                        changed.append((doc, region, order))
+            for doc, region, order in changed:
+                cursor = conn.execute("UPDATE entries SET placement=?,region_order=?,sort_order=?,pinned=?,normal_predecessor_id=?,normal_successor_id=?,updated_at=?,version=version+1,device_id=?,last_modified_by='desktop',dirty=1 WHERE id=? AND version=?", (region, order, order, int(region == "top"), pred if doc.id == entry_id else doc.normal_predecessor_id, succ if doc.id == entry_id else doc.normal_successor_id, now, self.device_id, doc.id, doc.version))
+                if cursor.rowcount != 1:
+                    raise NotesPlacementConflict(doc.id)
+                updated = EntryDoc.from_row(dict(conn.execute("SELECT * FROM entries WHERE id=?", (doc.id,)).fetchone()))
+                if record_outbox:
+                    self._record_compat_op(conn, entity_type="entry", entity_id=doc.id, action="update", payload=NoteEntry.from_doc(updated).to_dict(), base_version=doc.version)
+            result = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+            return self._project_entry(EntryDoc.from_row(dict(result)))
 
     def move_entry_up(self, entry_id: str, *, record_outbox: bool = True) -> NoteEntry:
         return self._move_entry_by_delta(entry_id, -1, record_outbox=record_outbox)
@@ -745,39 +842,41 @@ class NotesStore:
         return self._move_entry_by_delta(entry_id, 1, record_outbox=record_outbox)
 
     def _move_entry_by_delta(self, entry_id: str, delta: int, *, record_outbox: bool = True) -> NoteEntry:
-        current = self.get_entry(entry_id, include_deleted=True)
-        if current is None:
-            raise KeyError(entry_id)
-        entries = [item for item in self.list_entries(current.notebook_id, include_deleted=True) if not item.deleted_at]
-        ids = [item.id for item in entries]
-        try:
-            old_idx = ids.index(entry_id)
-        except ValueError:
-            raise KeyError(entry_id)
-        new_idx = max(0, min(old_idx + int(delta), len(entries) - 1))
-        if new_idx == old_idx:
-            return current
-        neighbor = entries[new_idx]
         with self._connect() as conn:
+            selected_row = conn.execute("SELECT * FROM entries WHERE id=? AND deleted=0", (entry_id,)).fetchone()
+            if selected_row is None:
+                raise KeyError(entry_id)
+            current_doc = EntryDoc.from_row(dict(selected_row))
+            rows = conn.execute("SELECT * FROM entries WHERE notebook_id=? AND placement=? AND deleted=0 ORDER BY region_order,id", (current_doc.notebook_id, current_doc.placement)).fetchall()
+            docs = [EntryDoc.from_row(dict(row)) for row in rows]
+            old_idx = next((i for i, doc in enumerate(docs) if doc.id == entry_id), -1)
+            if old_idx < 0:
+                raise KeyError(entry_id)
+            new_idx = max(0, min(old_idx + int(delta), len(docs) - 1))
+            if new_idx == old_idx:
+                return self._project_entry(current_doc)
+            neighbor_doc = docs[new_idx]
             now = _utc_now()
-            conn.execute(
+            first = conn.execute(
                 """
                 UPDATE entries
-                SET sort_order = ?, pinned = ?, updated_at = ?, version = version + 1,
+                SET sort_order = ?, region_order = ?, pinned = ?, placement = ?, updated_at = ?, version = version + 1,
                     device_id = ?, last_modified_by = ?, dirty = 1
-                WHERE id = ?
+                WHERE id = ? AND version = ? AND rev = ?
                 """,
-                (neighbor.sort_order, int(neighbor.pinned), now, self.device_id, "desktop", current.id),
+                (neighbor_doc.region_order, neighbor_doc.region_order, int(current_doc.placement == "top"), current_doc.placement, now, self.device_id, "desktop", current_doc.id, current_doc.version, current_doc.rev),
             )
-            conn.execute(
+            second = conn.execute(
                 """
                 UPDATE entries
-                SET sort_order = ?, pinned = ?, updated_at = ?, version = version + 1,
+                SET sort_order = ?, region_order = ?, pinned = ?, placement = ?, updated_at = ?, version = version + 1,
                     device_id = ?, last_modified_by = ?, dirty = 1
-                WHERE id = ?
+                WHERE id = ? AND version = ? AND rev = ?
                 """,
-                (current.sort_order, int(current.pinned), now, self.device_id, "desktop", neighbor.id),
+                (current_doc.region_order, current_doc.region_order, int(neighbor_doc.placement == "top"), neighbor_doc.placement, now, self.device_id, "desktop", neighbor_doc.id, neighbor_doc.version, neighbor_doc.rev),
             )
+            if first.rowcount != 1 or second.rowcount != 1:
+                raise NotesPlacementConflict(entry_id)
             row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
             assert row is not None
             updated_doc = EntryDoc.from_row(dict(row))
@@ -788,8 +887,10 @@ class NotesStore:
                     entity_id=entry_id,
                     action="update",
                     payload=NoteEntry.from_doc(updated_doc).to_dict(),
-                    base_version=current.version,
+                    base_version=current_doc.version,
                 )
+                neighbor_updated = EntryDoc.from_row(dict(conn.execute("SELECT * FROM entries WHERE id=?", (neighbor_doc.id,)).fetchone()))
+                self._record_compat_op(conn, entity_type="entry", entity_id=neighbor_doc.id, action="update", payload=NoteEntry.from_doc(neighbor_updated).to_dict(), base_version=neighbor_doc.version)
         return self._project_entry(updated_doc, source=updated_doc.source)
 
     def _set_entry_sort_order(self, entry_id: str, sort_order: int, *, pinned: bool | None = None, record_outbox: bool = True) -> NoteEntry:

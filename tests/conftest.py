@@ -40,6 +40,7 @@ def frame(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
+    assert Path(main.resolve_notes_data_dir()).resolve() != Path(r"D:\code\note").resolve()
     f = main.ChatFrame()
     f.Hide()
     yield f

@@ -181,6 +181,10 @@ class NotesSyncService:
             "content": doc.content,
             "sort_order": doc.sort_order,
             "pinned": bool(doc.pinned),
+            "placement": doc.placement,
+            "region_order": doc.region_order,
+            "normal_predecessor_id": _couch_doc_id("entry", doc.normal_predecessor_id) if doc.normal_predecessor_id else None,
+            "normal_successor_id": _couch_doc_id("entry", doc.normal_successor_id) if doc.normal_successor_id else None,
             "source": doc.source,
             "created_at": doc.created_at,
             "updated_at": doc.updated_at,
@@ -311,15 +315,44 @@ class NotesSyncService:
         created_at = str(doc.get("created_at") or doc.get("updated_at") or "")
         updated_at = str(doc.get("updated_at") or created_at or "")
         deleted = bool(doc.get("_deleted") or doc.get("deleted"))
-        row = conn.execute("SELECT id FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        existing = EntryDoc.from_row(dict(row)) if row is not None else None
+        supplied_placement = doc.get("placement")
+        if supplied_placement in {"top", "normal", "bottom"}:
+            placement = str(supplied_placement)
+        elif existing is not None:
+            # Mixed-version full documents must not erase placement-v2 metadata.
+            placement = existing.placement
+        else:
+            placement = "top" if bool(doc.get("pinned")) else "normal"
+        fallback_order = existing.region_order if existing is not None else 0
+        supplied_order = doc.get("region_order")
+        try:
+            candidate_order = int(supplied_order)
+            if supplied_order is None or candidate_order < 0 or candidate_order > 2_147_483_647:
+                raise ValueError
+            region_order = candidate_order
+        except (TypeError, ValueError, OverflowError):
+            if existing is None and "region_order" not in doc:
+                try:
+                    fallback_order = max(0, min(int(doc.get("sort_order") or 0), 2_147_483_647))
+                except (TypeError, ValueError, OverflowError):
+                    fallback_order = 0
+            region_order = fallback_order
+        predecessor = (_local_doc_id("entry", doc.get("normal_predecessor_id")) if doc.get("normal_predecessor_id") else None) if "normal_predecessor_id" in doc else (existing.normal_predecessor_id if existing else None)
+        successor = (_local_doc_id("entry", doc.get("normal_successor_id")) if doc.get("normal_successor_id") else None) if "normal_successor_id" in doc else (existing.normal_successor_id if existing else None)
         payload = (
             entry_id,
             notebook_id,
             str(doc.get("content") or ""),
             created_at,
             updated_at,
-            int(doc.get("sort_order") or 0),
-            int(bool(doc.get("pinned"))),
+            region_order,
+            int(placement == "top"),
+            placement,
+            region_order,
+            predecessor,
+            successor,
             int(doc.get("version") or 1),
             str(doc.get("device_id") or ""),
             str(doc.get("last_modified_by") or _modifier_from_device(str(doc.get("device_id") or ""), "mobile")),
@@ -334,10 +367,10 @@ class NotesSyncService:
                 """
                 INSERT INTO entries (
                     id, notebook_id, content, created_at, updated_at,
-                    sort_order, pinned, version, device_id, last_modified_by,
+                    sort_order, pinned, placement, region_order, normal_predecessor_id, normal_successor_id, version, device_id, last_modified_by,
                     is_conflict_copy, origin_entry_id, source,
                     rev, deleted, dirty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 payload,
             )
@@ -346,7 +379,7 @@ class NotesSyncService:
                 """
                 UPDATE entries
                 SET notebook_id = ?, content = ?, created_at = ?, updated_at = ?,
-                    sort_order = ?, pinned = ?, version = ?, device_id = ?, last_modified_by = ?,
+                    sort_order = ?, pinned = ?, placement = ?, region_order = ?, normal_predecessor_id = ?, normal_successor_id = ?, version = ?, device_id = ?, last_modified_by = ?,
                     is_conflict_copy = ?, origin_entry_id = ?, source = ?,
                     rev = ?, deleted = ?, dirty = 0
                 WHERE id = ?
@@ -365,7 +398,7 @@ class NotesSyncService:
                     payload[11],
                     payload[12],
                     payload[13],
-                    payload[14],
+                    payload[14], payload[15], payload[16], payload[17], payload[18],
                     entry_id,
                 ),
             )
