@@ -1,5 +1,12 @@
 # 可复用经验
 
+## 权威清空与乱序对账
+
+- clear authority 必须随真实 state/history 快照传递，缓存键也要包含 authority 签名；只修改列表摘要无法支持恢复。
+- 移动端主动发起 clear 时应在发布命令前按 owner 进入 `awaitingAuthority`，只有匹配的权威终态才能解除普通发送封锁。
+- 陈旧或冲突 clear 不得取消恢复、清空较新缓冲或标记 ready；`revision == current` 且尚无 clear identity 的首次 clear 仍可能是权威事件。
+- 跨语言矩阵应保持字节一致，并为每行编码 given/events/actions/expected，使协议、Store、Service 和 UI 都能基于同一数据契约验证。
+
 ## Kimi 流式完成的验证边界
 
 将 Kimi 最终答案的发布条件建模为 owner、主代理身份、流完整性和权威终态的交集；音效与同一 finalized owner 绑定为 exactly-once。这样同聊天仍有排队任务时，已完成的回答可正常结算，而失败、子代理消息和不完整 delta 不会误触发完成。
