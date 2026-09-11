@@ -1,0 +1,10 @@
+{"version":2,"cases":[
+{"id":"complete_projection","given":{"owner":"a","kinds":["reasoning","command","tool","status","error","question","final","future-kind"]},"actions":["commit","page"],"expected":{"count":8,"canonical_references":true,"unknown_readable":true}},
+{"id":"initial_and_older_paging","given":{"owner":"a","rows":105,"concurrent_append":1},"actions":["tail_100","older_cursor"],"expected":{"tail_sequences":[6,105],"older_sequences":[1,5],"frozen_high":105}},
+{"id":"history_live_overlap","given":{"owner":"a","page_ids":["e1","e2"],"live_ids":["e2","e3"]},"actions":["merge"],"expected":{"ids":["e1","e2","e3"],"order":"execution_sequence"}},
+{"id":"sequence_gap","given":{"owner":"a","sequences":[1,3]},"actions":["backfill_2","drain_3"],"expected":{"sequences":[1,2,3]}},
+{"id":"recovery_exhaustion","given":{"owner":"a","valid_ids":["e1"],"failures":3},"actions":["auto_retry"],"expected":{"valid_ids":["e1"],"sync_state":"manualRetry","attempts":3}},
+{"id":"cross_owner_delivery","given":{"owner":"a","offscreen_owner":"b","ids":{"a":["a1"],"b":["b1"]}},"actions":["deliver_b_while_a_visible"],"expected":{"a":["a1"],"b":["b1"],"focus_owner":"a"}},
+{"id":"clear_revision_race","given":{"owner":"a","revision":2,"delayed_revision":1},"actions":["clear","deliver_stale"],"expected":{"revision":2,"stale_ignored":true}},
+{"id":"event_id_conflict","given":{"owner":"a","event_id":"same","contents":["first","changed"]},"actions":["merge"],"expected":{"retained":"first","quarantine_reason":"EVENT_ID_CONFLICT"}}
+]}

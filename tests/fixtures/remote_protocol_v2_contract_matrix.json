@@ -1,6 +1,6 @@
 {
   "durable": [
-    {"name":"known fact","valid":true,"payload":{"canonical_hash":"e9f5419e8ca86b586e4d9b9448673f74a403f02a226fdf148b0383e6217c54c9","protocol_version":2,"event_id":"evt-1","kind":"execution_entry","chat_id":"chat-a","domain":"events","revision":1,"sync_sequence":1,"execution_sequence":1,"body":{"title":"work"}}},
+    {"name":"known fact","valid":true,"payload":{"canonical_hash":"602b9448341791f4dbbbcb35056f71a2912cad17087522fc8a1bbddf73e6d2c4","protocol_version":2,"event_id":"evt-1","kind":"execution_entry","chat_id":"chat-a","domain":"events","revision":1,"sync_sequence":1,"execution_sequence":1,"body":{"kind":"reasoning","title":"work"}}},
     {"name":"unknown fact remains open","valid":true,"payload":{"canonical_hash":"d84464c694e7336037dda17713f11f11ee987d099a56532042b43d983ca67f5b","protocol_version":2,"event_id":"evt-2","kind":"future_kind","chat_id":"chat-b","domain":"events","revision":0,"sync_sequence":9223372036854775807,"body":{"future":true}}},
     {"name":"missing canonical hash","valid":false,"error":"INVALID_CANONICAL_HASH","payload":{"protocol_version":2,"event_id":"evt-hash","kind":"status","chat_id":"chat-a","domain":"events","revision":1,"sync_sequence":2,"body":{}}},
     {"name":"missing owner","valid":false,"error":"INVALID_CHAT_ID","payload":{"protocol_version":2,"event_id":"evt-3","kind":"status","domain":"events","revision":1,"sync_sequence":2,"body":{}}},

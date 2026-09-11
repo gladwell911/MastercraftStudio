@@ -109,6 +109,8 @@ def validate_v2_durable(payload: dict, *, verify_hash: bool = True) -> dict:
         _int64(payload, "execution_sequence", minimum=1)
     if not isinstance(payload.get("body"), dict):
         raise ValueError("INVALID_BODY")
+    if payload.get("kind") == "execution_entry":
+        validate_execution_body(payload["body"])
     supplied = payload.get("canonical_hash")
     if not isinstance(supplied, str) or not supplied.strip():
         raise ValueError("INVALID_CANONICAL_HASH")
@@ -116,6 +118,20 @@ def validate_v2_durable(payload: dict, *, verify_hash: bool = True) -> dict:
     if verify_hash and supplied != expected:
         raise ValueError("CANONICAL_HASH_MISMATCH")
     return {**payload, "canonical_hash": expected}
+
+
+def validate_execution_body(body: dict) -> dict:
+    if not isinstance(body, dict):
+        raise ValueError("INVALID_EXECUTION_BODY")
+    kind = _required_text(body, "kind")
+    for key in ("title", "detail"):
+        if key in body and not isinstance(body[key], str):
+            raise ValueError(f"INVALID_EXECUTION_{key.upper()}")
+    if kind in {"question", "final"}:
+        _required_text(body, "message_id")
+    elif not str(body.get("title") or body.get("detail") or "").strip():
+        raise ValueError("UNREADABLE_EXECUTION_BODY")
+    return dict(body)
 
 
 def validate_v2_ephemeral(payload: dict, *, expected_epoch: str | None = None) -> dict:

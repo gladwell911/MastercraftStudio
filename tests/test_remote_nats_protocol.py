@@ -108,3 +108,29 @@ def test_shared_v2_contract_matrix_matches_python_validator():
         else:
             with pytest.raises(ValueError, match=row["error"]):
                 validate_v2_ephemeral(row["payload"], expected_epoch="epoch-1")
+def test_execution_routes_delegate_to_authority_and_structure_errors():
+    from remote_nats import RemoteNatsTransport
+
+    class Store:
+        def __init__(self): self.calls = []
+        def load_execution_page(self, **kwargs):
+            self.calls.append(("page", kwargs))
+            return {"entries": [], "revision": 1, "sequence_domain": "events", "snapshot_high": 0}
+        def load_execution_range(self, **kwargs):
+            self.calls.append(("range", kwargs))
+            return {"entries": [], "revision": 1}
+
+    store = Store()
+    transport = RemoteNatsTransport(pair_id="pair", token="secret", durable_store=store)
+    for command in ("execution_tail", "execution_history", "execution_snapshot"):
+        status, body = transport._route_command({"type": command, "chat_id": "chat", "limit": 10,
+                                                  "cursor": "opaque"})
+        assert status == 200 and body["revision"] == 1
+    status, body = transport._route_command({"type": "execution_backfill", "chat_id": "chat",
+                                              "revision": 1, "from_sequence": 2, "to_sequence": 3})
+    assert status == 200 and body["revision"] == 1
+    assert [call[0] for call in store.calls] == ["page", "page", "page", "range"]
+
+    status, body = transport._route_command({"type": "execution_backfill", "chat_id": "chat",
+                                              "revision": {}, "from_sequence": 2, "to_sequence": 3})
+    assert status == 409 and body["recovery"] == "SNAPSHOT_REQUIRED"

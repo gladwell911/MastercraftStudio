@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import base64
+import hmac
 import sqlite3
 import uuid
 import time
@@ -100,6 +102,8 @@ class ChatStore:
                     execution_sequence INTEGER, envelope_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch()),
                     UNIQUE(pair_id, domain, sync_sequence)
                 );
+                CREATE INDEX IF NOT EXISTS idx_durable_execution_owner
+                    ON durable_facts(pair_id, domain, chat_id, revision, execution_sequence);
                 CREATE TABLE IF NOT EXISTS publication_outbox (
                     pair_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE REFERENCES durable_facts(event_id),
                     subject_domain TEXT NOT NULL, payload BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -144,6 +148,17 @@ class ChatStore:
             if "domain" not in columns:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN domain TEXT NOT NULL DEFAULT 'events'")
             self._advance_v2_migration(conn)
+            try:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_execution_sequence "
+                    "ON durable_facts(pair_id,domain,chat_id,revision,execution_sequence) "
+                    "WHERE execution_sequence IS NOT NULL"
+                )
+            except sqlite3.IntegrityError:
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (V2_MIGRATION_KEY, "read-only-recovery"),
+                )
 
     def _advance_v2_migration(self, conn: sqlite3.Connection) -> None:
         """Restartable additive migration. V2 is enabled only after validation."""
@@ -517,6 +532,18 @@ class ChatStore:
             raise ValueError("INVALID_CANONICAL_VALUE") from exc
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if event_id.startswith("projection:"):
+                message_id = str((envelope.get("body") or {}).get("message_id") or "").strip()
+                projection_kind = str((envelope.get("body") or {}).get("kind") or "").strip()
+                expected_role = {"question": "user", "final": "assistant"}.get(projection_kind)
+                projection = conn.execute(
+                    "SELECT chat_id,role,turn_id FROM canonical_messages WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if (projection is None or str(projection["chat_id"]) != owner or str(projection["role"]) != expected_role
+                        or str(envelope.get("turn_id") or "") != str(projection["turn_id"])):
+                    self._quarantine_conn(conn, "STALE_CANONICAL_PROJECTION", envelope, event_id)
+                    raise ValueError("STALE_CANONICAL_PROJECTION")
             existing = conn.execute("SELECT canonical_hash,envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?", (event_id,)).fetchone()
             if existing:
                 original = json.loads(existing["envelope_json"])
@@ -599,6 +626,183 @@ class ChatStore:
             if int(sync_sequence)+1 < retained: raise ValueError("SNAPSHOT_REQUIRED")
             rows=conn.execute("SELECT envelope_json FROM durable_facts WHERE pair_id=? AND domain=? AND sync_sequence>? ORDER BY sync_sequence LIMIT ?", (pair_id,domain,int(sync_sequence),max(1,int(limit)))).fetchall()
         return [str(r["envelope_json"]).encode("utf-8") for r in rows]
+
+    @staticmethod
+    def _execution_cursor_token(payload: dict[str, Any], secret: str | bytes) -> str:
+        key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+        if not key:
+            raise ValueError("CURSOR_SECRET_UNAVAILABLE")
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signature = hmac.new(key, raw, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(raw + signature).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_execution_cursor(token: str, secret: str | bytes) -> dict[str, Any]:
+        key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+        if not key:
+            raise ValueError("CURSOR_SECRET_UNAVAILABLE")
+        try:
+            encoded = str(token or "").strip()
+            packed = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            raw, supplied = packed[:-32], packed[-32:]
+            expected = hmac.new(key, raw, hashlib.sha256).digest()
+            if len(raw) == 0 or not hmac.compare_digest(supplied, expected):
+                raise ValueError
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError
+            return value
+        except Exception as exc:
+            raise ValueError("INVALID_EXECUTION_CURSOR") from exc
+
+    def load_execution_page(self, *, pair_id: str, domain: str, chat_id: str,
+                            secret: str | bytes, limit: int = 100, cursor: str = "",
+                            now: float | None = None, cursor_ttl: int = 900) -> dict[str, Any]:
+        """Return a revision-bound frozen page of authoritative execution facts."""
+        owner = self.normalize_chat_id(chat_id)
+        pair, sequence_domain = str(pair_id or "").strip(), str(domain or "").strip()
+        if not pair or not sequence_domain:
+            raise ValueError("INVALID_FEED_SCOPE")
+        page_limit = min(100, max(1, int(limit)))
+        current_time = int(time.time() if now is None else now)
+        expires_at = current_time + max(1, int(cursor_ttl))
+        with self._connect() as conn:
+            state = conn.execute("SELECT revision,execution_sequence FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            revision = int(state["revision"]) if state else 0
+            snapshot_high = int(state["execution_sequence"]) if state else 0
+            exclusive_before = snapshot_high + 1
+            if cursor:
+                decoded = self._decode_execution_cursor(cursor, secret)
+                required = {"pair": pair, "domain": sequence_domain, "chat": owner, "revision": revision}
+                if any(decoded.get(key) != value for key, value in required.items()):
+                    raise ValueError("EXECUTION_CURSOR_SCOPE_MISMATCH")
+                if int(decoded.get("expires_at") or 0) < current_time:
+                    raise ValueError("EXECUTION_CURSOR_EXPIRED")
+                snapshot_high = int(decoded.get("snapshot_high") or 0)
+                exclusive_before = int(decoded.get("exclusive_before") or 0)
+                expires_at = int(decoded.get("expires_at") or 0)
+                if snapshot_high < 0 or exclusive_before < 1 or exclusive_before > snapshot_high + 1:
+                    raise ValueError("INVALID_EXECUTION_CURSOR")
+            rows = conn.execute(
+                "SELECT envelope_json,execution_sequence FROM durable_facts "
+                "WHERE pair_id=? AND domain=? AND chat_id=? AND revision=? "
+                "AND execution_sequence IS NOT NULL AND execution_sequence<=? AND execution_sequence<? "
+                "ORDER BY execution_sequence DESC LIMIT ?",
+                (pair, sequence_domain, owner, revision, snapshot_high, exclusive_before, page_limit + 1),
+            ).fetchall()
+        has_more = len(rows) > page_limit
+        selected = rows[:page_limit]
+        entries = [json.loads(str(row["envelope_json"])) for row in reversed(selected)]
+        next_cursor = ""
+        if has_more and selected:
+            next_cursor = self._execution_cursor_token({
+                "v": 1, "pair": pair, "domain": sequence_domain, "chat": owner,
+                "revision": revision, "snapshot_high": snapshot_high,
+                "exclusive_before": int(selected[-1]["execution_sequence"]),
+                "expires_at": expires_at,
+            }, secret)
+        return {"entries": entries, "has_more": has_more, "cursor": next_cursor,
+                "oldest_cursor": next_cursor, "revision": revision,
+                "sequence_domain": sequence_domain, "snapshot_high": snapshot_high}
+
+    def load_execution_range(self, *, pair_id: str, domain: str, chat_id: str,
+                             revision: int, start_sequence: int, end_sequence: int) -> dict[str, Any]:
+        owner = self.normalize_chat_id(chat_id)
+        start, end = int(start_sequence), int(end_sequence)
+        if start < 1 or end < start or end > MAX_INT64 or end - start + 1 > 100:
+            raise ValueError("INVALID_EXECUTION_RANGE")
+        with self._connect() as conn:
+            state = conn.execute("SELECT revision,execution_sequence FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            current_revision = int(state["revision"]) if state else 0
+            if int(revision) != current_revision:
+                raise ValueError("SNAPSHOT_REQUIRED")
+            rows = conn.execute(
+                "SELECT envelope_json FROM durable_facts WHERE pair_id=? AND domain=? AND chat_id=? "
+                "AND revision=? AND execution_sequence BETWEEN ? AND ? ORDER BY execution_sequence",
+                (str(pair_id), str(domain), owner, current_revision, start, end),
+            ).fetchall()
+        if len(rows) != end - start + 1:
+            raise ValueError("SNAPSHOT_REQUIRED")
+        return {"entries": [json.loads(str(row["envelope_json"])) for row in rows],
+                "revision": current_revision, "sequence_domain": str(domain),
+                "snapshot_high": int(state["execution_sequence"]) if state else 0,
+                "has_more": False, "from_sequence": start, "to_sequence": end}
+
+    def commit_message_execution_projection(self, *, pair_id: str, domain: str,
+                                            chat_id: str, message_id: str,
+                                            projection_kind: str) -> dict[str, Any]:
+        """Commit a content-free deterministic question/final timeline projection."""
+        owner = self.normalize_chat_id(chat_id)
+        canonical_message = str(message_id or "").strip()
+        kind = str(projection_kind or "").strip().lower()
+        expected_role = {"question": "user", "final": "assistant"}.get(kind)
+        if not canonical_message or expected_role is None:
+            raise ValueError("INVALID_MESSAGE_PROJECTION")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index FROM canonical_messages cm WHERE cm.message_id=?",
+                (canonical_message,),
+            ).fetchone()
+        if row is None or str(row["chat_id"]) != owner or str(row["role"]).lower() != expected_role:
+            raise ValueError("AMBIGUOUS_CANONICAL_MESSAGE")
+        projection_name = "user-question" if kind == "question" else "assistant-final"
+        return self.commit_durable_fact(
+            pair_id=pair_id,
+            domain=domain,
+            execution=True,
+            envelope={
+                "event_id": f"projection:{canonical_message}:{projection_name}",
+                "kind": "execution_entry",
+                "chat_id": owner,
+                "turn_id": str(row["turn_id"]),
+                "body": {
+                    "kind": kind,
+                    "message_id": canonical_message,
+                    "turn_index": int(row["legacy_turn_index"]),
+                    "title": "我：" if kind == "question" else "小助理：",
+                    "detail": "",
+                },
+            },
+        )
+
+    def resolve_canonical_message_by_content(self, chat_id: str, *, role: str,
+                                             content: str) -> str:
+        """Resolve only an unambiguous current canonical message; never guess by position."""
+        owner = self.normalize_chat_id(chat_id)
+        normalized_role = str(role or "").strip().lower()
+        content_key = "question" if normalized_role == "user" else "answer_md"
+        if normalized_role not in {"user", "assistant"}:
+            raise ValueError("INVALID_MESSAGE_ROLE")
+        wanted = str(content or "")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cm.message_id,t.payload_json FROM canonical_messages cm "
+                "JOIN turns t ON t.chat_id=cm.chat_id AND t.turn_index=cm.legacy_turn_index "
+                "WHERE cm.chat_id=? AND cm.role=?", (owner, normalized_role),
+            ).fetchall()
+        matches = [
+            str(row["message_id"]) for row in rows
+            if str(self._json_dict(row["payload_json"]).get(content_key) or "") == wanted
+        ]
+        if len(matches) != 1:
+            raise ValueError("AMBIGUOUS_CANONICAL_MESSAGE")
+        return matches[0]
+
+    def resolve_canonical_message_by_turn(self, chat_id: str, *, role: str,
+                                          turn_index: int) -> str:
+        """Resolve a projection reference by its canonical owner and turn."""
+        owner = self.normalize_chat_id(chat_id)
+        normalized_role = str(role or "").strip().lower()
+        if normalized_role not in {"user", "assistant"} or int(turn_index) < 0:
+            raise ValueError("INVALID_MESSAGE_PROJECTION")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT message_id FROM canonical_messages WHERE chat_id=? AND role=? "
+                "AND legacy_turn_index=?", (owner, normalized_role, int(turn_index)),
+            ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("AMBIGUOUS_CANONICAL_MESSAGE")
+        return str(rows[0]["message_id"])
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -727,19 +931,26 @@ class ChatStore:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
+        incoming = [turn for turn in (turns or []) if isinstance(turn, dict)]
         with self._connect() as conn:
-            conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
-            conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
+            existing = {int(row["turn_index"]): self._json_dict(row["payload_json"])
+                        for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
+            for index, turn in enumerate(incoming):
+                old = existing.get(index)
+                if old is not None and not self._same_canonical_turn(old, turn):
+                    conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+                    conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
+            conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
             conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
             conn.executemany(
                 "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
                 [
                     (normalized, idx, json.dumps(turn, ensure_ascii=False))
-                    for idx, turn in enumerate(turns or [])
-                    if isinstance(turn, dict)
+                    for idx, turn in enumerate(incoming)
                 ],
             )
-            self._backfill_canonical_turns_conn(conn, normalized, turns or [], 0)
+            self._backfill_canonical_turns_conn(conn, normalized, incoming, 0)
 
     def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *, start_index: int = 0) -> None:
         normalized = str(chat_id or "").strip()
@@ -748,8 +959,17 @@ class ChatStore:
         start = max(0, self._int_or(start_index, 0))
         suffix = turns or []
         with self._connect() as conn:
-            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,start))
-            conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,start))
+            existing = {int(row["turn_index"]): self._json_dict(row["payload_json"])
+                        for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=? AND turn_index>=?", (normalized,start))}
+            for offset, turn in enumerate(suffix):
+                index = start + offset
+                old = existing.get(index)
+                if isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
+                    conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+                    conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+            end = start + len(suffix)
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,end))
+            conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,end))
             conn.execute("DELETE FROM turns WHERE chat_id = ? AND turn_index >= ?", (normalized, start))
             conn.executemany(
                 "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
@@ -760,6 +980,12 @@ class ChatStore:
                 ],
             )
             self._backfill_canonical_turns_conn(conn, normalized, suffix, start)
+
+    @staticmethod
+    def _same_canonical_turn(old: dict[str, Any], new: dict[str, Any]) -> bool:
+        return all(str(old.get(key) or "") == str(new.get(key) or "") for key in (
+            "question", "model", "provider", "provider_kind", "provider_user_message_id"
+        ))
 
     def _backfill_canonical_turns_conn(self, conn: sqlite3.Connection, chat_id: str,
                                        turns: list[dict[str, Any]], start: int) -> None:

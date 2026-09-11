@@ -526,3 +526,53 @@ def test_clear_snapshot_sanitizes_runtime_fields_and_operation_id_collision(tmp_
     store.replace_turns("two", [{"question": "other"}])
     with pytest.raises(ValueError, match="OPERATION_ID_CONFLICT"):
         store.begin_clear_operation("two", idempotency_key="two", operation_id="fixed")
+def test_execution_timeline_contract_matrix_and_authenticated_pages(tmp_path):
+    import json
+    from pathlib import Path
+    matrix = json.loads((Path(__file__).parent / "fixtures" / "execution_timeline_contract_matrix.json").read_text(encoding="utf-8"))
+    assert {case["id"] for case in matrix["cases"]} == {
+        "complete_projection", "initial_and_older_paging", "history_live_overlap",
+        "sequence_gap", "recovery_exhaustion", "cross_owner_delivery",
+        "clear_revision_race", "event_id_conflict",
+    }
+    store = ChatStore(tmp_path / "timeline.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner-a"})
+    store.upsert_chat({"id": "owner-b"})
+    for index in range(105):
+        store.commit_durable_fact(pair_id="pair", domain="events", execution=True,
+            envelope={"event_id": f"a-{index}", "kind": "execution_entry",
+                      "chat_id": "owner-a", "body": {"kind": "future-kind", "title": str(index)}})
+    store.commit_durable_fact(pair_id="pair", domain="events", execution=True,
+        envelope={"event_id": "b-1", "kind": "execution_entry", "chat_id": "owner-b",
+                  "body": {"kind": "status", "title": "off screen"}})
+    tail = store.load_execution_page(pair_id="pair", domain="events", chat_id="owner-a",
+                                     secret="secret", limit=100, now=10)
+    assert len(tail["entries"]) == 100
+    assert [row["execution_sequence"] for row in tail["entries"]] == list(range(6, 106))
+    older = store.load_execution_page(pair_id="pair", domain="events", chat_id="owner-a",
+                                      secret="secret", cursor=tail["cursor"], now=11)
+    assert [row["event_id"] for row in older["entries"]] == [f"a-{i}" for i in range(5)]
+    assert store.load_execution_page(pair_id="pair", domain="events", chat_id="owner-b",
+                                     secret="secret")["entries"][0]["event_id"] == "b-1"
+    with pytest.raises(ValueError, match="INVALID_EXECUTION_CURSOR"):
+        store.load_execution_page(pair_id="pair", domain="events", chat_id="owner-a",
+                                  secret="forged", cursor=tail["cursor"], now=11)
+def test_repeated_turn_save_preserves_canonical_ids_and_projection_is_idempotent(tmp_path):
+    store = ChatStore(tmp_path / "stable-projection.db")
+    store.initialize()
+    store.upsert_chat({"id":"chat","turns":[]})
+    pending = {"question":"q","answer_md":"璇锋眰涓?..","model":"codex/main"}
+    store.replace_turns("chat", [pending])
+    question_id = store.resolve_canonical_message_by_turn("chat", role="user", turn_index=0)
+    assistant_id = store.resolve_canonical_message_by_turn("chat", role="assistant", turn_index=0)
+    first = store.commit_message_execution_projection(pair_id="p",domain="events",chat_id="chat",
+                                                       message_id=question_id,projection_kind="question")
+    store.replace_turns("chat", [{**pending,"answer_md":"done"}])
+    assert store.resolve_canonical_message_by_turn("chat", role="user", turn_index=0) == question_id
+    assert store.resolve_canonical_message_by_turn("chat", role="assistant", turn_index=0) == assistant_id
+    again = store.commit_message_execution_projection(pair_id="p",domain="events",chat_id="chat",
+                                                       message_id=question_id,projection_kind="question")
+    assert again["event_id"] == first["event_id"]
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) n FROM durable_facts WHERE event_id=?", (first["event_id"],)).fetchone()["n"] == 1

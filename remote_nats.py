@@ -360,6 +360,36 @@ class RemoteNatsTransport:
 
     def _route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         command_type = str(payload.get("type") or "").strip().lower()
+        if command_type in {"execution_tail", "execution_history", "execution_snapshot"}:
+            if self.durable_store is None:
+                return 503, {"error": "execution_authority_unavailable"}
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+            try:
+                return 200, self.durable_store.load_execution_page(
+                    pair_id=self.subjects.pair_id,
+                    domain=str(body.get("sequence_domain") or "events"),
+                    chat_id=str(payload.get("chat_id") or body.get("chat_id") or ""),
+                    secret=self.token,
+                    limit=int(body.get("limit") or 100),
+                    cursor="" if command_type in {"execution_tail", "execution_snapshot"} else str(body.get("cursor") or ""),
+                )
+            except (TypeError, ValueError) as exc:
+                return 409, {"error": str(exc), "recovery": "SNAPSHOT_REQUIRED"}
+        if command_type == "execution_backfill":
+            if self.durable_store is None:
+                return 503, {"error": "execution_authority_unavailable"}
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+            try:
+                return 200, self.durable_store.load_execution_range(
+                    pair_id=self.subjects.pair_id,
+                    domain=str(body.get("sequence_domain") or "events"),
+                    chat_id=str(payload.get("chat_id") or body.get("chat_id") or ""),
+                    revision=int(body.get("revision") or 0),
+                    start_sequence=int(body.get("from_sequence") or 0),
+                    end_sequence=int(body.get("to_sequence") or 0),
+                )
+            except (TypeError, ValueError) as exc:
+                return 409, {"error": str(exc), "recovery": "SNAPSHOT_REQUIRED"}
         if command_type == "message" and callable(self.on_message):
             return self.on_message(payload)
         if command_type == "new_chat" and callable(self.on_new_chat):

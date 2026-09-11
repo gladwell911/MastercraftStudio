@@ -3177,6 +3177,32 @@ class ChatFrame(wx.Frame):
             replace_from(normalized, list(turns or [])[start_index:], start_index=start_index)
         else:
             store.replace_turns(normalized, turns or [])
+        # Canonical message rows now exist. Deterministic event IDs make this safe
+        # across repeated saves and ensure every provider path projects exactly once.
+        transport = getattr(self, "_remote_nats_transport", None)
+        if (transport is not None and int(getattr(transport, "protocol_version", 1) or 1) >= 2
+                and getattr(store, "v2_writes_enabled", False)):
+            for index in range(start_index, len(turns or [])):
+                turn = turns[index] if isinstance(turns[index], dict) else {}
+                for role, kind, content_key in (("user", "question", "question"),
+                                                ("assistant", "final", "answer_md")):
+                    content = str(turn.get(content_key) or "")
+                    if not content or (role == "assistant" and content == REQUESTING_TEXT):
+                        continue
+                    try:
+                        message_id = store.resolve_canonical_message_by_turn(
+                            normalized, role=role, turn_index=index)
+                        store.commit_message_execution_projection(
+                            pair_id=transport.subjects.pair_id, domain="events",
+                            chat_id=normalized, message_id=message_id,
+                            projection_kind=kind)
+                    except ValueError as exc:
+                        if str(exc) != "EVENT_ID_CONFLICT":
+                            store.quarantine(str(exc), {"chat_id": normalized,
+                                                       "turn_index": index, "role": role})
+            loop = getattr(transport, "_loop", None)
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
         self._chat_turn_dirty_from.pop(normalized, None)
 
     def _chat_summary_by_id(self, chat_id: str) -> dict | None:
@@ -6423,7 +6449,11 @@ class ChatFrame(wx.Frame):
         title = str(entry.get("list_text") or entry.get("step") or entry.get("text") or "").strip()
         detail = str(entry.get("detail_text") or entry.get("detail") or title).strip()
         kind = str(entry.get("display_kind") or entry.get("event_type") or "info").strip() or "info"
-        event_id = str(entry.get("event_id") or "").strip() or f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = str(
+            entry.get("event_id") or entry.get("id") or entry.get("_execution_uid") or ""
+        ).strip()
+        if not event_id:
+            raise ValueError("MISSING_EXECUTION_EVENT_ID")
         try:
             ts = float(entry.get("ts") or entry.get("created_at") or time.time())
         except (TypeError, ValueError):
@@ -6460,7 +6490,7 @@ class ChatFrame(wx.Frame):
             entry = dict(entry, id=uuid.uuid4().hex)
         entry = dict(entry, _execution_uid=uuid.uuid4().hex)
         steps.append(copy.deepcopy(entry))
-        resolved_chat_id = str(chat_id or target_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
+        resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
         if resolved_chat_id:
             self._persist_execution_step_or_queue(resolved_chat_id, steps[-1])
         self._prune_cached_execution_steps_for_turn(target_chat, steps[-1])
@@ -9326,6 +9356,8 @@ class ChatFrame(wx.Frame):
             kind = str(payload.get("type") or payload.get("kind") or "event").strip() or "event"
             body = {key: copy.deepcopy(value) for key, value in payload.items()
                     if key not in {"type", "kind", "event_id", "chat_id"}}
+            if kind == "execution_entry":
+                body["kind"] = str(payload.get("kind") or "info").strip() or "info"
             try:
                 store.commit_durable_fact(
                     pair_id=transport.subjects.pair_id,
@@ -9387,10 +9419,10 @@ class ChatFrame(wx.Frame):
             }
         )
 
-    def _push_remote_final_answer(self, chat_id: str, text: str) -> None:
-        resolved_chat_id = chat_id if chat_id not in {"", None} else self.current_chat_id
-        if resolved_chat_id in {"", None}:
-            resolved_chat_id = self.active_chat_id if self.active_chat_id not in {"", None} else None
+    def _push_remote_final_answer(self, chat_id: str, text: str, *, turn_index: int | None = None) -> None:
+        resolved_chat_id = str(chat_id or "").strip()
+        if not resolved_chat_id:
+            return
         payload = {
             "type": "final_answer",
             "chat_id": resolved_chat_id,
@@ -9399,6 +9431,38 @@ class ChatFrame(wx.Frame):
             "ts": time.time(),
         }
         self._broadcast_remote_event(payload)
+        transport = getattr(self, "_remote_nats_transport", None)
+        store = getattr(self, "chat_store", None)
+        if (
+            resolved_chat_id
+            and transport is not None
+            and int(getattr(transport, "protocol_version", 1) or 1) >= 2
+            and store is not None
+            and getattr(store, "v2_writes_enabled", False)
+        ):
+            try:
+                message_id = (store.resolve_canonical_message_by_turn(
+                    resolved_chat_id, role="assistant", turn_index=turn_index
+                ) if turn_index is not None else store.resolve_canonical_message_by_content(
+                    resolved_chat_id, role="assistant", content=str(text or "")))
+                store.commit_message_execution_projection(
+                    pair_id=transport.subjects.pair_id,
+                    domain="events",
+                    chat_id=resolved_chat_id,
+                    message_id=message_id,
+                    projection_kind="final",
+                )
+                loop = getattr(transport, "_loop", None)
+                if loop is not None and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
+            except ValueError as exc:
+                if str(exc) != "EVENT_ID_CONFLICT":
+                    try:
+                        store.quarantine(
+                            str(exc), {"chat_id": resolved_chat_id, "role": "assistant"}
+                        )
+                    except Exception:
+                        pass
 
     def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
         self._invalidate_remote_history_list_cache()
@@ -11083,7 +11147,7 @@ class ChatFrame(wx.Frame):
                         self._update_active_answer_row(target_idx)
                         if self._find_answer_row_index(target_idx) < 0 and self.view_mode == "active":
                             self._refresh_answer_list_preserving_selection(refresh_execution=self._detail_panel_mode() != "execution")
-                    self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(turn.get("answer_md") or ""))
+                    self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(turn.get("answer_md") or ""), turn_index=target_idx)
                     self._defer_codex_state_save()
             return
         if event_type == "turn_completed":
@@ -11173,7 +11237,7 @@ class ChatFrame(wx.Frame):
                     self._mark_chat_turns_dirty(start_index=target_idx)
                     self._request_execution_list_sync(self._current_chat_state)
                 self._defer_codex_state_save()
-                self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""))
+                self._push_remote_final_answer(chat_id or self.active_chat_id or self.current_chat_id or "", str(event.text or ""), turn_index=target_idx)
                 if self._background_ui_mutations_blocked():
                     self._mark_background_answer_list_dirty()
                 elif self._append_completed_answer_to_answer_list(target_idx, self.active_session_turns[target_idx] if 0 <= target_idx < len(self.active_session_turns) else {}):
@@ -16271,7 +16335,7 @@ class ChatFrame(wx.Frame):
             if not err and 0 <= turn_idx < len(target_turns):
                 final_text = str(target_turns[turn_idx].get("answer_md") or "").strip()
                 if final_text and final_text != REQUESTING_TEXT:
-                    self._push_remote_final_answer(resolved_chat_id, final_text)
+                    self._push_remote_final_answer(resolved_chat_id, final_text, turn_index=turn_idx)
             self._push_remote_history_changed(resolved_chat_id)
         self._defer_chat_state_save()
         if self._is_ui_alive():

@@ -574,7 +574,7 @@ def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeyp
     monkeypatch.setattr(
         frame,
         "_push_remote_final_answer",
-        lambda chat_id, text: pushed.append(("final_answer", chat_id, text)),
+        lambda chat_id, text, **_kwargs: pushed.append(("final_answer", chat_id, text)),
     )
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id=None: pushed.append(("history", chat_id)))
 
@@ -623,3 +623,37 @@ def test_clear_context_active_chat_pushes_history_and_state_events(frame, monkey
     state_event = next(event for event in published if event["type"] == "state")
     assert state_event["chat_id"] == "chat-e2e"
     assert state_event["body"].get("turns") == []
+def test_execution_authority_routes_and_structured_errors():
+    from remote_nats import RemoteNatsTransport
+
+    class Store:
+        def __init__(self): self.calls = []
+        def load_execution_page(self, **kwargs):
+            self.calls.append(("page", kwargs))
+            if kwargs["cursor"] == "bad": raise ValueError("INVALID_EXECUTION_CURSOR")
+            return {"entries": [], "revision": 2, "sequence_domain": "events", "snapshot_high": 9}
+        def load_execution_range(self, **kwargs):
+            self.calls.append(("range", kwargs))
+            if kwargs["revision"] != 2: raise ValueError("SNAPSHOT_REQUIRED")
+            return {"entries": [], "revision": 2, "from_sequence": kwargs["start_sequence"],
+                    "to_sequence": kwargs["end_sequence"]}
+
+    store = Store()
+    transport = RemoteNatsTransport(pair_id="pair", token="secret", durable_store=store)
+    assert transport._route_command({"type":"execution_tail","chat_id":"chat","limit":100})[0] == 200
+    assert transport._route_command({"type":"execution_history","chat_id":"chat","cursor":"opaque"})[0] == 200
+    assert store.calls[-1][1]["cursor"] == "opaque"
+    assert transport._route_command({"type":"execution_snapshot","chat_id":"chat"})[0] == 200
+    status, body = transport._route_command({"type":"execution_backfill","chat_id":"chat",
+                                              "revision":2,"from_sequence":4,"to_sequence":6})
+    assert status == 200 and (body["from_sequence"], body["to_sequence"]) == (4, 6)
+    for payload in (
+        {"type":"execution_history","chat_id":"chat","cursor":"bad"},
+        {"type":"execution_backfill","chat_id":"chat","revision":1,"from_sequence":4,"to_sequence":6},
+        {"type":"execution_backfill","chat_id":"chat","revision":{},"from_sequence":4,"to_sequence":6},
+    ):
+        status, body = transport._route_command(payload)
+        assert status == 409 and body["recovery"] == "SNAPSHOT_REQUIRED"
+    unavailable = RemoteNatsTransport(pair_id="pair", token="secret")
+    assert unavailable._route_command({"type":"execution_tail","chat_id":"chat"}) == (
+        503, {"error":"execution_authority_unavailable"})
