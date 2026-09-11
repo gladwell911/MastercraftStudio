@@ -384,7 +384,7 @@ class RemoteNatsTransport:
                     pair_id=self.subjects.pair_id,
                     domain=str(body.get("sequence_domain") or "events"),
                     chat_id=str(payload.get("chat_id") or body.get("chat_id") or ""),
-                    revision=int(body.get("revision") or 0),
+                    revision=int(body.get("revision")),
                     start_sequence=int(body.get("from_sequence") or 0),
                     end_sequence=int(body.get("to_sequence") or 0),
                 )

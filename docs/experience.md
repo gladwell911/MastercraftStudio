@@ -1,5 +1,14 @@
 # 可复用经验
 
+## 权威执行时间线与分页恢复
+
+- 经验：远程执行投影与 durable fact、revision 和每聊天执行序号必须在同一事务中提交；canonical 问题/最终回答只保存稳定消息引用，不复制正文。
+- 为什么重要：这同时避免重复投影、半提交状态、跨 owner 混入及消息正文分叉。
+- 下次怎么用：以全局 event ID 去重、以权威 execution sequence 排序；known kind 严格校验，unknown kind 保留可读摘要和详情。
+- 经验：tail、older、live、backfill 和 snapshot 必须进入同一个 owner/revision reconciler；分页游标应绑定完整 scope 和首次签发的到期时间。
+- 为什么重要：历史与实时重叠、游标重放或保留窗口丢失时，单独处理任何一路都会造成覆盖、遗漏或顺序漂移。
+- 下次怎么用：精确回补缺口并保留触发缺口的事件；无法回补时应用权威快照，最多自动重启三次，始终保留有效行和显式手动重试。
+
 ## 权威清空与乱序对账
 
 - clear authority 必须随真实 state/history 快照传递，缓存键也要包含 authority 签名；只修改列表摘要无法支持恢复。
