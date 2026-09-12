@@ -26,7 +26,7 @@ python main.py
 
 ## 常用配置
 
-Story 4 connected E2E 不提供远程凭据默认值。运行前必须显式设置 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN` 和本轮唯一且非 `default` 的 `NATS_E2E_PAIR_ID`；禁止把真实 token 写入脚本、夹具或日志。
+Story 4 connected E2E 内置测试服务器、测试令牌和专用配对码，可直接运行。需要切换测试环境时，可用 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN` 和 `NATS_E2E_PAIR_ID` 覆盖默认值。
 
 如需使用 OpenRouter，配置 `OPENROUTER_API_KEY`：
 

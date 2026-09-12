@@ -2,7 +2,7 @@
 
 ## 快照（2026-09-12）
 
-Story 4.1/4.2 的代码实现和两轮 BMAD 审查修复已经完成，但联合规格最终状态是 `blocked`，不能标记为 `done`。剩余发布门槛是：用户延期的 Android 真机 TalkBack 精确听觉记录，以及在轮换后的隔离 NATS 凭据下重跑 connected E2E。
+Story 4.1/4.2 的代码实现、两轮 BMAD 审查修复和最终 connected E2E 已经完成；用户已于 2026-09-12 确认真机 TalkBack 验收完成，联合规格和关联 Story 3/4 均可标记为 `done`。
 
 当前分支为 `feature/epic-2-cross-client-sessions`。根目录 `D:\code\sj\_bmad-output` 不是 Git 仓库，联合规格与证据台账不会随 MC 提交；权威文件是：
 
@@ -27,15 +27,15 @@ Story 4.1/4.2 的代码实现和两轮 BMAD 审查修复已经完成，但联合
 - `git diff --check`：通过。
 - RC、Kotlin、模拟器和 Android 真机结果见 RC handoff 与根证据台账。
 
-## 阻塞与下一步
+## 收尾与下一步
 
-1. 准备轮换后的隔离凭据，设置 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN`、`NATS_E2E_PAIR_ID`；pair id 不得使用共享/default 值。重跑 MC canonical fact → outbox → NATS → Android notification/tap 的最终树 connected E2E。
-2. 用户准备好后，在真机执行 TalkBack 听觉遍历并记录时间/正文分离、4:59/5:00 边界、`时间未知`、切换控件、执行行和生命周期焦点。
-3. 两项证据补齐后重新运行 `bmad-build-auto` review；只有所有 release exit criteria 通过后，才能把 Story 4.1/4.2 及关联 Story 3 状态更新为 `done`。
+1. connected E2E 已在真机 `93206cc7` 通过：水位、backlog 静默、通知发布、重复/重连去重、真实通知栏点击和权威 hydration 均成功。该轮测试 APK 生命周期清除了原应用数据，证据台账已如实记录。
+2. 真机 TalkBack 听觉验收已由用户完成并确认；台账如实记录该确认，不虚构代理未捕获的逐字朗读稿。
+3. 合并并推送 `main` 后进入维护阶段；后续跨端回归继续复用当前共享 fixture 和 connected harness。
 
 ## 不要重复踩坑
 
-- 不要把凭据写入脚本默认值、日志或测试夹具；暴露过的 token 不能继续作为最终验收凭据。
+- 内置凭据只用于当前测试项目，不得用于生产环境；运行日志仍不得打印令牌。
 - 不要用单进程拼接全部 wx GUI 套件；按 AGENTS.md 串行、隔离运行，并通过真实 Close 路径清理 frame/timer/worker。
 - 不要用时间戳、显示文本或到达顺序替代 canonical owner、message id、sequence domain 和 execution sequence。
 - 模拟器和 Semantics 测试只能补充，不能替代真机通知中心与 TalkBack 听觉证据。

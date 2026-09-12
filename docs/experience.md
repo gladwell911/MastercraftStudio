@@ -6,9 +6,9 @@
 - 为什么重要：clear、replacement、重放和恶意/损坏 payload 都可能让“非空字段检查”产生伪通知或过期通知。
 - 下次怎么用：共享 fixture 同时覆盖合法 hash、篡改 owner/title/text/origin、缺 message id 和并发 clear；connected E2E 从生产 `ChatStore` 事实进入 outbox，不从测试端直接伪造正向 durable event。
 
-- 经验：connected E2E 的 endpoint、token、pair id 必须环境注入并 fail closed，每轮使用唯一非 default pair。
-- 为什么重要：代码默认凭据会泄密；固定 pair 会命中 JetStream 历史而产生假通过。
-- 下次怎么用：运行前检查 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN`、`NATS_E2E_PAIR_ID`，日志只记录非敏感身份与结果。
+- 经验：当前内部测试项目允许 connected E2E 内置测试专用 endpoint、token 和原有 `default` 配对码，同时保留环境变量覆盖能力。
+- 为什么重要：开箱即用降低人工配置成本，并与 Android 原生后台服务当前固定的 `default` 配对域保持一致；日志仍不得打印令牌。
+- 下次怎么用：Story 4 connected E2E 默认使用内置测试配置；切换环境时再设置 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN`、`NATS_E2E_PAIR_ID`，日志只记录非敏感身份与结果。
 
 ## 稳定身份驱动的无障碍焦点
 

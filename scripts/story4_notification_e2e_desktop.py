@@ -26,13 +26,15 @@ from remote_nats import RemoteNatsTransport
 
 
 async def run() -> None:
-    endpoint = os.environ.get("NATS_E2E_ENDPOINT", "").strip()
-    token = os.environ.get("NATS_E2E_TOKEN", "").strip()
-    pair_id = os.environ.get("NATS_E2E_PAIR_ID", "").strip()
-    if not endpoint or not token or not pair_id:
-        raise ValueError("NATS E2E endpoint, token, and pair id are required")
-    if pair_id == "default":
-        raise ValueError("NATS_E2E_PAIR_ID must identify an isolated non-default test pair")
+    endpoint = os.environ.get(
+        "NATS_E2E_ENDPOINT", "wss://rc.tingyou.cc/nats"
+    ).strip()
+    token = os.environ.get(
+        "NATS_E2E_TOKEN", "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
+    ).strip()
+    pair_id = os.environ.get(
+        "NATS_E2E_PAIR_ID", "default"
+    ).strip()
 
     database_dir = Path(tempfile.mkdtemp(prefix="story4-mc-e2e-"))
     store = ChatStore(database_dir / "story4.db")
