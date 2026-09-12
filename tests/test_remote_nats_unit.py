@@ -613,10 +613,14 @@ def test_outbox_ack_loss_retries_identical_bytes_poison_blocks_and_repair_resume
     asyncio.run(run())
 
 
-def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch():
+def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch(tmp_path):
     async def run():
         jetstream = FakeJetStream()
-        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream)
+        store = ChatStore(tmp_path / "handshake.db")
+        store.initialize()
+        transport = RemoteNatsTransport(
+            pair_id="default", token="secret", jetstream=jetstream, durable_store=store
+        )
         await transport.handle_command({
             "id": "mobile-session-hello-1", "type": "hello", "device_id": "mobile",
             "protocol_versions": [2, 1], "session_id": "mobile-session",
@@ -624,6 +628,8 @@ def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch():
         })
         hello = __import__("json").loads(jetstream.published[-1][1])
         assert hello["body"]["protocol_version"] == 2
+        assert hello["body"]["sequence_domain"] == "events"
+        assert hello["body"]["high_sync_sequence"] == 0
         epoch = hello["body"]["epoch"]
         assert epoch
 

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import functools
 import json
+import math
 import os
 import platform
 import re
@@ -594,22 +595,68 @@ def sanitize_optimized_text(text: str) -> str:
 
 
 WECHAT_TIME_GAP_SECONDS = 300.0
+UNKNOWN_TIME_LABEL = "\u65f6\u95f4\u672a\u77e5"
+
+
+def _finite_timestamp(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _execution_timestamp(item) -> float | None:
+    if not isinstance(item, dict):
+        return None
+    created_at = _finite_timestamp(item.get("created_at"))
+    return created_at if created_at is not None else _finite_timestamp(item.get("ts"))
+
+
+def compact_markdown_summary(md_text: str) -> str:
+    """Remove semantic ordered-list markers without changing source Markdown."""
+    output = []
+    fenced = False
+    fence_char = ""
+    fence_length = 0
+    for line in str(md_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.lstrip()
+        fence = re.match(r"^(`{3,}|~{3,})", stripped)
+        if fence:
+            marker = fence.group(1)
+            if not fenced:
+                fenced, fence_char, fence_length = True, marker[0], len(marker)
+            elif (marker[0] == fence_char and len(marker) >= fence_length
+                  and not stripped[len(marker):].strip()):
+                fenced, fence_char, fence_length = False, "", 0
+            output.append(line)
+            continue
+        if not fenced and not line.startswith(("    ", "\t")):
+            line = re.sub(r"^(\s*(?:>\s*)*)\d+[.)](\s+)", r"\1", line)
+        output.append(line)
+    return "\n".join(output)
 
 
 def should_show_time(prev_ts, ts, gap_seconds: float = WECHAT_TIME_GAP_SECONDS) -> bool:
-    if prev_ts is None:
+    current = _finite_timestamp(ts)
+    previous = _finite_timestamp(prev_ts)
+    if previous is None or current is None:
         return True
-    try:
-        current = float(ts)
-        previous = float(prev_ts)
-    except (TypeError, ValueError):
-        return True
-    return current - previous > float(gap_seconds)
+    return current - previous >= float(gap_seconds)
 
 
 def wechat_time_label(ts: float, now: float) -> str:
-    moment = datetime.fromtimestamp(float(ts))
-    reference = datetime.fromtimestamp(float(now))
+    timestamp = _finite_timestamp(ts)
+    reference_timestamp = _finite_timestamp(now)
+    if timestamp is None:
+        return UNKNOWN_TIME_LABEL
+    try:
+        moment = datetime.fromtimestamp(timestamp)
+        reference = datetime.fromtimestamp(reference_timestamp if reference_timestamp is not None else time.time())
+    except (ValueError, OSError, OverflowError):
+        return UNKNOWN_TIME_LABEL
     clock = moment.strftime("%H:%M")
     day_delta = (reference.date() - moment.date()).days
     if day_delta <= 0:
@@ -1596,6 +1643,7 @@ class ChatFrame(wx.Frame):
         self._execution_step_persist_lock = threading.Lock()
         self._execution_step_persist_scheduled = False
         self._execution_step_persist_worker_running = False
+        self._execution_step_persist_thread = None
         self._chat_turn_dirty_from: dict[str, int] = {}
         self._remote_turn_payload_cache: dict[int, tuple[tuple, dict]] = {}
         self._context_usage_estimate_lock = threading.Lock()
@@ -1899,6 +1947,7 @@ class ChatFrame(wx.Frame):
         self.history_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.Bind(wx.EVT_SHOW, self._on_show_sync_tray_state)
+        self.Bind(wx.EVT_ACTIVATE, self._on_application_activate)
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_SHOW)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL)
@@ -1913,6 +1962,8 @@ class ChatFrame(wx.Frame):
         self.execution_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.execution_list.Bind(wx.EVT_CHAR, self._on_execution_char)
         self.execution_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_execution_activate)
+        self.execution_list.Bind(wx.EVT_LISTBOX, self._on_execution_selection_changed)
+        self.execution_list.Bind(wx.EVT_KILL_FOCUS, self._on_execution_focus_lost)
         self.file_manager_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("file_manager_key_down", self._on_file_manager_key_down))
         self.file_manager_list.Bind(wx.EVT_CONTEXT_MENU, self._on_file_manager_context)
         self.file_manager_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._open_selected_file_manager_record())
@@ -3182,6 +3233,12 @@ class ChatFrame(wx.Frame):
         transport = getattr(self, "_remote_nats_transport", None)
         if (transport is not None and int(getattr(transport, "protocol_version", 1) or 1) >= 2
                 and getattr(store, "v2_writes_enabled", False)):
+            chat_summary = (
+                self._current_chat_state
+                if str((self._current_chat_state or {}).get("id") or "").strip() == normalized
+                else self._chat_summary_by_id(normalized)
+            )
+            chat_title = str((chat_summary or {}).get("title") or "").strip()
             for index in range(start_index, len(turns or [])):
                 turn = turns[index] if isinstance(turns[index], dict) else {}
                 for role, kind, content_key in (("user", "question", "question"),
@@ -3196,6 +3253,17 @@ class ChatFrame(wx.Frame):
                             pair_id=transport.subjects.pair_id, domain="events",
                             chat_id=normalized, message_id=message_id,
                             projection_kind=kind)
+                        if role == "user" and str(turn.get("question_origin") or "").strip() == "mc":
+                            store.commit_message_notification_fact(
+                                pair_id=transport.subjects.pair_id,
+                                domain="events",
+                                chat_id=normalized,
+                                message_id=message_id,
+                                notification_kind="user_message",
+                                text=content,
+                                chat_title=chat_title,
+                                origin_client="mc",
+                            )
                     except ValueError as exc:
                         if str(exc) != "EVENT_ID_CONFLICT":
                             store.quarantine(str(exc), {"chat_id": normalized,
@@ -3842,6 +3910,8 @@ class ChatFrame(wx.Frame):
                 title = ""
             if title:
                 compact = self._compact_first_question_title(title, 12)
+                if re.search(r"(?:是一个|是一种|是指|指的是)", compact):
+                    compact = self._compact_first_question_title(prompt, 12)
                 return compact or title
         return ""
 
@@ -4108,16 +4178,10 @@ class ChatFrame(wx.Frame):
             self.answer_meta.append(meta)
 
     def _turn_time_row_label(self, turn: dict, prev_turn: dict | None, now_ts: float) -> str:
-        try:
-            ts_value = float((turn or {}).get("created_at"))
-        except (TypeError, ValueError):
-            return ""
+        ts_value = _finite_timestamp((turn or {}).get("created_at"))
         prev_value = None
         if prev_turn is not None:
-            try:
-                prev_value = float((prev_turn or {}).get("created_at"))
-            except (TypeError, ValueError):
-                prev_value = None
+            prev_value = _finite_timestamp((prev_turn or {}).get("created_at"))
         if not should_show_time(prev_value, ts_value):
             return ""
         return wechat_time_label(ts_value, now_ts)
@@ -5103,12 +5167,12 @@ class ChatFrame(wx.Frame):
             return False
         if self.view_mode != "active":
             return False
-        if self._active_answer_turn_is_authoritative(turn_idx, turn):
-            # Reconcile instead of extending a possibly stale visible tail.
-            # replace_visible_page remains a no-op when the projection did not
-            # change, preserving selection, focus, and repaint behaviour.
-            self._render_answer_list(refresh_execution=False)
-            return True
+        # Incremental projection is safe only for the canonical visible turn.
+        # A stale callback must fall back to its caller's reconciliation path;
+        # rebuilding here would turn the normal send path into a foreground
+        # list refresh and disturb screen-reader position.
+        if not self._active_answer_turn_is_authoritative(turn_idx, turn):
+            return False
         q = str((turn or {}).get("question") or "")
         attachments = (turn or {}).get("attachments") if isinstance((turn or {}).get("attachments"), list) else []
         if not q.strip() and not attachments:
@@ -5343,7 +5407,7 @@ class ChatFrame(wx.Frame):
         if not (0 <= turn_idx < len(self.active_session_turns)):
             return False
         answer_md = str(self.active_session_turns[turn_idx].get("answer_md") or "")
-        text = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(md_to_plain(answer_md))
+        text = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(md_to_plain(compact_markdown_summary(answer_md)))
         item_type, idx, current_meta_text, current_meta_md = self.answer_meta[row]
         if current_meta_text == text and current_meta_md == answer_md:
             return True
@@ -5725,13 +5789,13 @@ class ChatFrame(wx.Frame):
     @staticmethod
     def _execution_merge_sort_key(item, fallback_index: int) -> tuple:
         if isinstance(item, dict):
-            try:
-                timestamp = float(item.get("created_at") or item.get("ts") or 0.0)
-            except (TypeError, ValueError):
-                timestamp = 0.0
-            if timestamp > 0:
-                return (0, timestamp, fallback_index)
-        return (1, fallback_index, 0)
+            sequence = ChatFrame._safe_int(item.get("execution_sequence"), 0)
+            if sequence > 0:
+                return (0, ChatFrame._safe_int(item.get("revision"), 0), sequence, fallback_index)
+            timestamp = _execution_timestamp(item)
+            if timestamp is not None:
+                return (1, timestamp, fallback_index)
+        return (2, fallback_index, 0)
 
 
     @staticmethod
@@ -6454,19 +6518,18 @@ class ChatFrame(wx.Frame):
         ).strip()
         if not event_id:
             raise ValueError("MISSING_EXECUTION_EVENT_ID")
-        try:
-            ts = float(entry.get("ts") or entry.get("created_at") or time.time())
-        except (TypeError, ValueError):
-            ts = time.time()
-        return {
+        ts = _execution_timestamp(entry)
+        payload = {
             "type": "execution_entry",
             "chat_id": str(chat_id or ""),
             "event_id": event_id,
             "kind": kind,
             "title": title,
             "detail": detail,
-            "ts": ts,
         }
+        if ts is not None:
+            payload["ts"] = ts
+        return payload
 
     def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True) -> bool:
         if not isinstance(entry, dict):
@@ -6488,6 +6551,11 @@ class ChatFrame(wx.Frame):
             return False
         if not any(entry.get(key) for key in ("id", "event_id", "item_id")):
             entry = dict(entry, id=uuid.uuid4().hex)
+        if "created_at" not in entry and "ts" not in entry:
+            # Locally-created live entries have an authoritative creation
+            # moment. Preserve explicit null/malformed remote timestamps as
+            # unknown instead of silently replacing those protocol values.
+            entry = dict(entry, ts=time.time())
         entry = dict(entry, _execution_uid=uuid.uuid4().hex)
         steps.append(copy.deepcopy(entry))
         resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
@@ -6520,6 +6588,12 @@ class ChatFrame(wx.Frame):
     def _queue_execution_step_persist(self, chat_id: str, step: dict) -> None:
         with self._execution_step_persist_lock:
             self._pending_execution_step_persists.append((str(chat_id or ""), copy.deepcopy(step)))
+            # The close path drains this queue synchronously after producer
+            # services have stopped. Starting another daemon here would let
+            # SQLite work escape the lifetime of the frame (and, in tests,
+            # the wx.App itself).
+            if bool(getattr(self, "_closing", False)):
+                return
             if self._execution_step_persist_scheduled or self._execution_step_persist_worker_running:
                 return
             self._execution_step_persist_scheduled = True
@@ -6530,19 +6604,27 @@ class ChatFrame(wx.Frame):
     def _start_execution_step_persist_worker(self) -> None:
         with self._execution_step_persist_lock:
             self._execution_step_persist_scheduled = False
-            if self._execution_step_persist_worker_running or not self._pending_execution_step_persists:
+            if (
+                bool(getattr(self, "_closing", False))
+                or self._execution_step_persist_worker_running
+                or not self._pending_execution_step_persists
+            ):
                 return
             self._execution_step_persist_worker_running = True
-        threading.Thread(target=self._execution_step_persist_worker, daemon=True).start()
+            worker = threading.Thread(target=self._execution_step_persist_worker, daemon=True)
+            self._execution_step_persist_thread = worker
+            # Start while holding the lock so shutdown can never observe a
+            # registered thread that has not started yet.
+            worker.start()
 
     def _execution_step_persist_worker(self) -> None:
+        current_thread = threading.current_thread()
         try:
             while True:
                 with self._execution_step_persist_lock:
                     batch = list(self._pending_execution_step_persists)
                     self._pending_execution_step_persists.clear()
                     if not batch:
-                        self._execution_step_persist_worker_running = False
                         return
                 store = getattr(self, "chat_store", None)
                 if store is None:
@@ -6553,23 +6635,56 @@ class ChatFrame(wx.Frame):
                     except Exception:
                         continue
         finally:
+            restart = False
             with self._execution_step_persist_lock:
-                if not self._pending_execution_step_persists:
+                if self._execution_step_persist_thread is current_thread:
+                    self._execution_step_persist_thread = None
                     self._execution_step_persist_worker_running = False
+                    restart = bool(
+                        self._pending_execution_step_persists
+                        and not bool(getattr(self, "_closing", False))
+                    )
+                    if restart:
+                        self._execution_step_persist_scheduled = True
+            if restart:
+                self._start_execution_step_persist_worker()
 
-    def _flush_execution_step_persists_sync(self) -> None:
+    def _flush_execution_step_persists_sync(self, *, worker_timeout: float = 5.0) -> bool:
+        with self._execution_step_persist_lock:
+            worker = self._execution_step_persist_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, float(worker_timeout)))
+            if bool(getattr(worker, "is_alive", lambda: False)()):
+                # Do not drain or release the backing store while the worker
+                # can still be inside SQLite. The close path retries later.
+                return False
         with self._execution_step_persist_lock:
             batch = list(self._pending_execution_step_persists)
             self._pending_execution_step_persists.clear()
             self._execution_step_persist_scheduled = False
         store = getattr(self, "chat_store", None)
         if store is None:
-            return
+            return True
         for chat_id, step in batch:
             try:
                 store.append_execution_step(chat_id, step)
             except Exception:
                 continue
+        return True
+
+    def _defer_close_for_persistence_worker(self) -> None:
+        if bool(getattr(self, "_persistence_close_retry_scheduled", False)):
+            return
+        self._persistence_close_retry_scheduled = True
+
+        def retry_close():
+            self._persistence_close_retry_scheduled = False
+            try:
+                self.Close()
+            except Exception:
+                pass
+
+        wx.CallLater(100, retry_close)
 
     def _prune_cached_execution_steps_for_turn(self, chat: dict, latest_step: dict) -> None:
         if not isinstance(chat, dict) or not isinstance(latest_step, dict):
@@ -6903,7 +7018,7 @@ class ChatFrame(wx.Frame):
             row_text = str(meta[2] or "").strip()
             if not row_text:
                 continue
-            visible_items.append((row_text, meta))
+            visible_items.append((row_text, meta, step, source_positions[idx]))
         self.execution_total_content_rows = len(visible_items)
         limit = max(
             EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
@@ -6920,14 +7035,21 @@ class ChatFrame(wx.Frame):
         if not visible_items:
             return [("__execution_info__", "暂无执行过程")], [("info", -1, "", "")]
         row_ids = ["__execution_more__"] if has_more else []
-        for row_text, meta in visible_items:
+        previous_timestamp = None
+        for row_text, meta, step, source_position in visible_items:
+            timestamp = _execution_timestamp(step)
+            if should_show_time(previous_timestamp, timestamp):
+                anchor_id = self._execution_row_id(source_position, step)
+                rows.append(wechat_time_label(timestamp, time.time()))
+                metas.append(("time", meta[1], "", ""))
+                row_ids.append(f"execution:time:{anchor_id}")
             rows.append(row_text)
             metas.append(meta)
-            step = steps[meta[1]]
-            row_id = self._execution_row_id(source_positions[meta[1]], step)
+            row_id = self._execution_row_id(source_position, step)
             row_ids.append(row_id)
             if not isinstance(step, dict) or not step.get("_execution_uid"):
                 self._execution_projection_legacy_keys[row_id] = self._execution_legacy_key(step)
+            previous_timestamp = timestamp
         return list(zip(row_ids, rows)), metas
 
     def _show_execution_loading_for_new_owner(self) -> None:
@@ -6981,6 +7103,22 @@ class ChatFrame(wx.Frame):
             selected_idx = None
         if hasattr(self, "execution_list_model"):
             selected_id = self.execution_list_model.selected_id()
+            lease = getattr(self, "_execution_focus_lease", None)
+            if self._execution_focus_lease_matches_owner(lease):
+                # The live native selection is authoritative while the same
+                # owner is still projected. This captures keyboard movement
+                # that happens after F1 acquires the focus lease, including
+                # while a provider batch is already queued. The lease remains
+                # the fallback while a new-owner loading row is visible.
+                if (
+                    selected_id
+                    and getattr(self, "_execution_applied_owner", None)
+                    == self._execution_scan_key()[:3]
+                ):
+                    lease["row_id"] = selected_id
+                    lease["row_index"] = self.execution_list.GetSelection()
+                else:
+                    selected_id = str(lease.get("row_id") or selected_id)
             if selected_id not in row_ids and getattr(self, "_execution_applied_owner", None) == self._execution_scan_key()[:3]:
                 legacy_key = getattr(self, "_execution_applied_legacy_keys", {}).get(selected_id)
                 aliases = [row_id for row_id, key in getattr(self, "_execution_projection_legacy_keys", {}).items()
@@ -6993,6 +7131,9 @@ class ChatFrame(wx.Frame):
                 selected_idx = max(1 if has_more else 0, selected_idx or 0)
                 selected_id = row_ids[selected_idx]
             changed = self.execution_list_model.replace_visible_page(list(zip(row_ids, rows)), selected_id=selected_id)
+            if self._execution_focus_lease_matches_owner(lease):
+                lease["row_id"] = self.execution_list_model.selected_id()
+                lease["row_index"] = self.execution_list.GetSelection()
         else:
             changed = self._replace_listbox_items_if_changed(self.execution_list, rows, selected_idx)
         self.execution_meta = metas
@@ -7005,12 +7146,67 @@ class ChatFrame(wx.Frame):
             self.execution_list.SetSelection(len(rows) - 1)
         if changed:
             self._request_listbox_repaint(self.execution_list)
+        if self._execution_focus_lease_can_restore():
+            try:
+                if not self.execution_list.HasFocus():
+                    self.execution_list.SetFocus()
+            except Exception:
+                pass
         self._execution_list_dirty = False
         self._execution_list_pending_turn_reset = False
         self._execution_list_deferred_repaint = False
         self._execution_list_deferred_select_latest = False
         self._pending_execution_tail_appends.pop(self._visible_execution_chat_id(), None)
         return changed
+
+    def _execution_focus_owner(self) -> tuple:
+        return tuple(self._execution_scan_key()[:3])
+
+    def _execution_focus_lease_matches_owner(self, lease=None) -> bool:
+        lease = lease if isinstance(lease, dict) else getattr(self, "_execution_focus_lease", None)
+        return bool(lease and lease.get("active") and not lease.get("suspended")
+                    and tuple(lease.get("owner") or ()) == self._execution_focus_owner()
+                    and self._detail_panel_mode() == "execution")
+
+    def _execution_focus_lease_can_restore(self) -> bool:
+        if not self._execution_focus_lease_matches_owner() or bool(getattr(self, "_closing", False)):
+            return False
+        if not bool(getattr(self, "_application_active", True)):
+            return False
+        try:
+            for window in wx.GetTopLevelWindows():
+                if window is self:
+                    continue
+                if isinstance(window, wx.Dialog) and window.IsShown() and window.IsModal():
+                    self._release_execution_focus_lease()
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def _acquire_execution_focus_lease(self) -> None:
+        row_id = self.execution_list_model.selected_id() if hasattr(self, "execution_list_model") else ""
+        self._execution_focus_lease = {
+            "active": True, "suspended": False, "owner": self._execution_focus_owner(),
+            "view": "execution", "row_id": row_id, "row_index": self.execution_list.GetSelection(),
+        }
+
+    def _release_execution_focus_lease(self) -> None:
+        lease = getattr(self, "_execution_focus_lease", None)
+        if isinstance(lease, dict):
+            lease["active"] = False
+            lease["suspended"] = True
+
+    def _on_execution_focus_lost(self, event) -> None:
+        self._release_execution_focus_lease()
+        event.Skip()
+
+    def _on_application_activate(self, event) -> None:
+        active = bool(event.GetActive())
+        self._application_active = active
+        if not active:
+            self._release_execution_focus_lease()
+        event.Skip()
 
     def _execution_list_visible_for_updates(self) -> bool:
         if not hasattr(self, "execution_list"):
@@ -7181,7 +7377,9 @@ class ChatFrame(wx.Frame):
         if focus_detail:
             if next_mode == "execution":
                 self._focus_latest_execution_item()
+                self._acquire_execution_focus_lease()
             elif hasattr(self, "answer_list"):
+                self._release_execution_focus_lease()
                 self._focus_latest_answer()
         self._save_state()
         return next_mode
@@ -7861,7 +8059,8 @@ class ChatFrame(wx.Frame):
                 err = str((turn or {}).get("request_error") or "").strip()
                 return "", err or "上次未完成回答恢复失败，可手动继续"
             return "", ""
-        return answer_md, remove_emojis(md_to_plain(self._answer_markdown_for_output(answer_md, model)))
+        compact = compact_markdown_summary(self._answer_markdown_for_output(answer_md, model))
+        return answer_md, remove_emojis(md_to_plain(compact))
 
     def _build_answer_detail_html(self, answer_md: str, model: str = "") -> str:
         filtered = self._answer_markdown_for_output(answer_md, model)
@@ -9355,14 +9554,20 @@ class ChatFrame(wx.Frame):
             event_id = str(payload.get("event_id") or "").strip() or f"event-{uuid.uuid4().hex}"
             kind = str(payload.get("type") or payload.get("kind") or "event").strip() or "event"
             body = {key: copy.deepcopy(value) for key, value in payload.items()
-                    if key not in {"type", "kind", "event_id", "chat_id"}}
+                    if key not in {"type", "kind", "event_id", "chat_id", "origin_client"}}
             if kind == "execution_entry":
                 body["kind"] = str(payload.get("kind") or "info").strip() or "info"
             try:
                 store.commit_durable_fact(
                     pair_id=transport.subjects.pair_id,
                     domain="files" if kind.startswith("file_") else "events",
-                    envelope={"event_id": event_id, "kind": kind, "chat_id": chat_id, "body": body},
+                    envelope={
+                        "event_id": event_id,
+                        "kind": kind,
+                        "chat_id": chat_id,
+                        "origin_client": str(payload.get("origin_client") or "mc").strip(),
+                        "body": body,
+                    },
                     execution=kind == "execution_entry",
                 )
                 loop = getattr(transport, "_loop", None)
@@ -9423,14 +9628,6 @@ class ChatFrame(wx.Frame):
         resolved_chat_id = str(chat_id or "").strip()
         if not resolved_chat_id:
             return
-        payload = {
-            "type": "final_answer",
-            "chat_id": resolved_chat_id,
-            "text": str(text or ""),
-            "event_id": f"evt-{uuid.uuid4().hex[:8]}",
-            "ts": time.time(),
-        }
-        self._broadcast_remote_event(payload)
         transport = getattr(self, "_remote_nats_transport", None)
         store = getattr(self, "chat_store", None)
         if (
@@ -9445,6 +9642,22 @@ class ChatFrame(wx.Frame):
                     resolved_chat_id, role="assistant", turn_index=turn_index
                 ) if turn_index is not None else store.resolve_canonical_message_by_content(
                     resolved_chat_id, role="assistant", content=str(text or "")))
+                chat_summary = (
+                    self._current_chat_state
+                    if str((self._current_chat_state or {}).get("id") or "").strip()
+                    == resolved_chat_id
+                    else self._chat_summary_by_id(resolved_chat_id)
+                )
+                store.commit_message_notification_fact(
+                    pair_id=transport.subjects.pair_id,
+                    domain="events",
+                    chat_id=resolved_chat_id,
+                    message_id=message_id,
+                    notification_kind="assistant_final",
+                    text=str(text or ""),
+                    chat_title=str((chat_summary or {}).get("title") or "").strip(),
+                    origin_client="mc",
+                )
                 store.commit_message_execution_projection(
                     pair_id=transport.subjects.pair_id,
                     domain="events",
@@ -9455,6 +9668,7 @@ class ChatFrame(wx.Frame):
                 loop = getattr(transport, "_loop", None)
                 if loop is not None and loop.is_running():
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
+                return
             except ValueError as exc:
                 if str(exc) != "EVENT_ID_CONFLICT":
                     try:
@@ -9463,6 +9677,16 @@ class ChatFrame(wx.Frame):
                         )
                     except Exception:
                         pass
+                return
+        self._publish_remote_nats_event(
+            {
+                "type": "final_answer",
+                "chat_id": resolved_chat_id,
+                "text": str(text or ""),
+                "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+                "ts": time.time(),
+            }
+        )
 
     def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
         self._invalidate_remote_history_list_cache()
@@ -15425,6 +15649,7 @@ class ChatFrame(wx.Frame):
         return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
+        question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         submit_owner = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
         store = getattr(self, "chat_store", None)
         if (
@@ -15499,6 +15724,7 @@ class ChatFrame(wx.Frame):
                 "answer_md": REQUESTING_TEXT,
                 "model": resolved_model,
                 "created_at": now,
+                "question_origin": question_origin,
                 "local_command": command_name,
                 "local_command_args": command_args,
                 "codex_service_tier": codex_service_tier,
@@ -15548,6 +15774,7 @@ class ChatFrame(wx.Frame):
                 "answer_md": REQUESTING_TEXT,
                 "model": resolved_model,
                 "created_at": now,
+                "question_origin": question_origin,
                 "local_command": command_name,
                 "local_command_args": command_args,
             }
@@ -15592,6 +15819,7 @@ class ChatFrame(wx.Frame):
                 "answer_md": "",
                 "model": resolved_model,
                 "created_at": now,
+                "question_origin": question_origin,
                 "attachments": outgoing_attachments,
                 "suppress_empty_answer_row": True,
             }
@@ -15624,7 +15852,7 @@ class ChatFrame(wx.Frame):
                 "model": resolved_model,
                 "created_at": now,
                 "origin": "local" if source == "local" else source,
-                "question_origin": "local" if source == "local" else source,
+                "question_origin": question_origin,
                 "attachments": outgoing_attachments,
                 "openclaw_session_id": openclaw_session_id,
             }
@@ -15663,6 +15891,7 @@ class ChatFrame(wx.Frame):
             "answer_md": REQUESTING_TEXT,
             "model": resolved_model,
             "created_at": now,
+            "question_origin": question_origin,
             "attachments": outgoing_attachments,
         }
         if is_codex_model(resolved_model):
@@ -16846,6 +17075,13 @@ class ChatFrame(wx.Frame):
             return
         event.Skip()
 
+    def _on_execution_selection_changed(self, event):
+        lease = getattr(self, "_execution_focus_lease", None)
+        if self._execution_focus_lease_matches_owner(lease):
+            lease["row_id"] = self.execution_list_model.selected_id()
+            lease["row_index"] = self.execution_list.GetSelection()
+        event.Skip()
+
     def _on_execution_char(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
@@ -17389,6 +17625,19 @@ class ChatFrame(wx.Frame):
                 self.answer_list.SetFocus()
         return True
 
+    def _enter_history_view(self, chat_id: str, *, focus_answer_list: bool = True) -> bool:
+        return self._show_history_chat(chat_id, focus_answer_list=focus_answer_list)
+
+    def _enter_active_view(self, *, focus_answer_list: bool = False, keep_history_id=None) -> None:
+        self.view_mode = "active"
+        self.view_history_id = None
+        self._render_answer_list()
+        if keep_history_id:
+            self._select_history_row_if_present(str(keep_history_id))
+        if focus_answer_list:
+            if not self._focus_latest_answer_immediately():
+                self.answer_list.SetFocus()
+
     def _focus_latest_answer_immediately(self) -> bool:
         if not hasattr(self, "answer_list"):
             return False
@@ -17465,6 +17714,7 @@ class ChatFrame(wx.Frame):
         return all_ids[target_idx]
 
     def _navigate_history_chats(self, direction: int) -> bool:
+        self._release_execution_focus_lease()
         chat_id = self._adjacent_history_chat_id(direction)
         if not chat_id:
             return False
@@ -17775,6 +18025,10 @@ class ChatFrame(wx.Frame):
             return False
         direction = -1 if key == wx.WXK_LEFT else 1
         self._navigate_history_chats(direction)
+        # Preserve the native control's key-event contract after the explicit
+        # chat switch. Screen readers rely on the originating list receiving
+        # the completed key event even though no second navigation is needed.
+        event.Skip()
         return True
 
     def _handle_primary_tab_navigation(self, event) -> bool:
@@ -17818,6 +18072,10 @@ class ChatFrame(wx.Frame):
             return True
         if focus is detail_target or focus in detail_controls:
             self.input_edit.SetFocus()
+            if focus is getattr(self, "answer_list", None):
+                skip = getattr(event, "Skip", None)
+                if callable(skip):
+                    skip()
             return True
         return False
 
@@ -19322,9 +19580,16 @@ class ChatFrame(wx.Frame):
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
         self._closing = True
+        self._release_execution_focus_lease()
         self._invalidate_execution_scan()
         self._flush_chat_state_save()
-        self._flush_execution_step_persists_sync()
+        if not self._flush_execution_step_persists_sync():
+            try:
+                event.Veto()
+            except Exception:
+                pass
+            self._defer_close_for_persistence_worker()
+            return
         self._voice_input.cancel()
         self._realtime_call.shutdown()
         if self._answer_redirect_timer:
@@ -19363,6 +19628,16 @@ class ChatFrame(wx.Frame):
                 service.stop()
         except Exception:
             pass
+        # Producer shutdown can enqueue a final execution update. Drain once
+        # more before wx destroys the frame and the interpreter releases the
+        # backing SQLite store.
+        if not self._flush_execution_step_persists_sync():
+            try:
+                event.Veto()
+            except Exception:
+                pass
+            self._defer_close_for_persistence_worker()
+            return
         self._save_state(capture_notes_editor=True)
         self._global_ctrl_hook.stop()
         self._unregister_global_hotkey()

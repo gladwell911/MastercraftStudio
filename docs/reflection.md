@@ -1,5 +1,15 @@
 # 纠错反思
 
+## 2026-09-12 Story 4.1/4.2
+
+| 修正内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 真机包已由用户手动卸载后，后续仍运行了会隐式显示 `Uninstalling old version...` 的 `flutter install --debug`，可能再次清除 debug 包数据。 | 判断逻辑有问题 | 用户要求保留真机数据后，把 `flutter install` 和物理设备上的 `flutter test -d` 一并列入禁令；只允许先启 MIUI helper 再用 `adb install -r -t`，失败不得 fallback。 |
+| 首轮 E2E harness 把看似真实的 NATS endpoint/token 作为默认值，独立审查后才改为环境强制输入。 | 判断逻辑有问题 | 创建 connected harness 时先做 secret scan；endpoint、token、pair id 必须显式环境注入，缺失时 fail closed，pair 必须隔离且非 default。 |
+| 首轮真机证据跨两次运行拼接：一次完成点击，最终 durable 迁移运行被 secure keyguard 阻止点击。 | 判断逻辑有问题 | release 证据优先设计为单次最终树贯穿 canonical fact、NATS、OS 通知、真实点击和 hydration；分次证据必须分别陈述，不能合并成一次全绿。 |
+
+本次 Story 3.1/3.2 阶段无新的用户纠错；既有历史纠错继续保留。
+
 ## 2026-09-11 Story 2.4 执行时间线
 
 | 修改内容 | 错误归因 | 下次指令建议 |

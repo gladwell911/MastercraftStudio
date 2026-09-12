@@ -183,7 +183,11 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
         assert flutter_bin, "flutter executable was not found on PATH"
         adb_bin = shutil.which("adb.exe") or shutil.which("adb")
         reversed_websocket = False
-        if endpoint_host == "127.0.0.1" and not device_id.startswith("emulator-"):
+        if (
+            endpoint_host == "127.0.0.1"
+            and not device_id.startswith("emulator-")
+            and device_id not in {"windows", "chrome", "edge"}
+        ):
             assert adb_bin, "adb executable was not found on PATH"
             subprocess.run(
                 [
@@ -202,6 +206,7 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
             flutter_bin,
             "test",
             "integration_test/nats_clear_context_e2e_test.dart",
+            "--no-pub",
             "--plain-name",
             "mobile menu clears desktop chat context over NATS",
             "-d",
@@ -223,7 +228,9 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
 
         archived = frame._find_archived_chat(chat_id)
         assert archived is not None
-        assert archived["turns"] == []
+        assert len(archived["turns"]) == 1
+        assert archived["turns"][0]["question"] == question
+        assert archived["turns"][0]["clear_operation_id"]
         assert archived["execution_steps"] == []
         assert frame.active_chat_id == active_chat_id
         assert frame.current_chat_id == active_chat_id

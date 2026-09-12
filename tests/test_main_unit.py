@@ -15,6 +15,32 @@ import main
 import speech_input
 
 
+def _execution_content_labels(frame):
+    """Return execution content rows while ignoring separate time nodes."""
+    return [
+        frame.execution_list.GetString(index)
+        for index, meta in enumerate(frame.execution_meta)
+        if meta[0] != "time"
+    ]
+
+
+def _execution_content_ids(frame):
+    return [
+        row_id
+        for row_id, meta in zip(frame.execution_list_model.visible_ids, frame.execution_meta)
+        if meta[0] != "time"
+    ]
+
+
+def _execution_row_index(frame, label, occurrence=0):
+    indexes = [
+        index
+        for index, row_label in enumerate(frame.execution_list.GetStrings())
+        if row_label == label
+    ]
+    return indexes[occurrence]
+
+
 def test_main_does_not_call_respond_tool_request_user_input_directly():
     source = Path("main.py").read_text(encoding="utf-8")
     assert "respond_tool_request_user_input" not in source
@@ -3781,7 +3807,7 @@ def test_render_execution_list_shows_execution_steps(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["第一步", "第二步"]
 
 
@@ -3801,7 +3827,7 @@ def test_render_execution_list_prefers_detailed_execution_step_message(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["执行命令：pytest tests/test_main_unit.py -k codex"]
 
 
@@ -3822,7 +3848,7 @@ def test_render_execution_list_uses_single_line_list_text_and_keeps_full_detail_
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -3845,7 +3871,7 @@ def test_render_execution_list_filters_fixed_lifecycle_and_command_noise(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["我先检查 main.py，再处理过滤逻辑。", "计划：先整理结构"]
 
 
@@ -3876,7 +3902,7 @@ def test_render_execution_list_includes_question_and_final_answer_with_execution
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["我：请总结项目", "处理中", "小诸葛：最终 回复"]
 
 
@@ -3895,7 +3921,7 @@ def test_render_execution_list_filters_phase_only_commentary_noise(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["保留这条说明。"]
 
 
@@ -3917,7 +3943,7 @@ def test_render_execution_list_hides_error_summary_even_after_stack_noise_is_rem
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -3940,7 +3966,7 @@ def test_render_execution_list_hides_error_when_only_stack_noise_remains(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -3963,7 +3989,7 @@ def test_render_execution_list_hides_single_line_environment_warning_noise(frame
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -3987,7 +4013,7 @@ def test_render_execution_list_hides_codex_loader_warning_noise_with_ansi(frame)
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -4010,7 +4036,7 @@ def test_render_execution_list_hides_single_line_error_prefix_entry(frame):
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -4033,7 +4059,7 @@ def test_render_execution_list_hides_error_detail_even_without_stored_list_text(
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -4131,7 +4157,7 @@ def test_render_execution_list_rebuilds_command_entry_without_list_text_using_co
 
     frame._render_execution_list()
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["暂无执行过程"]
     assert frame.execution_meta == [("info", -1, "", "")]
 
@@ -4473,10 +4499,10 @@ def test_append_execution_step_refreshes_visible_execution_list_without_stealing
 
     assert [step["step"] for step in frame._current_chat_state["execution_steps"]] == ["计划更新：整理步骤"]
     assert frame._current_chat_state["execution_steps"][0]["id"]
-    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["计划更新：整理步骤"]
+    assert _execution_content_labels(frame) == ["计划更新：整理步骤"]
     assert frame.execution_list.GetSelection() == 0
     assert clear_count["n"] == 0
-    assert append_count["n"] == 1
+    assert append_count["n"] == 2
     assert focus_count["n"] == 0
 
 
@@ -4507,7 +4533,7 @@ def test_append_execution_entry_does_not_steal_focus_from_foreground_control(fra
         },
     )
 
-    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["计划：后台计划更新"]
+    assert _execution_content_labels(frame) == ["计划：后台计划更新"]
     assert frame.execution_list.GetSelection() == 0
     assert focus_count["execution"] == 0
 
@@ -4553,10 +4579,10 @@ def test_append_execution_entry_preserves_unfocused_selection_and_appends_at_end
     )
 
     assert frame.execution_list.GetSelection() == 0  # Background additions do not move the user's reading position.
-    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == ["第一步", "第二步", "计划：第三步"]
+    assert _execution_content_labels(frame) == ["第一步", "第二步", "计划：第三步"]
     assert frame.execution_meta[-1] == ("execution", 2, "计划：第三步", "第三步")
     assert clear_count["n"] == 0
-    assert append_count["n"] == 1
+    assert append_count["n"] == 2
     assert focus_count["n"] == 0
 
 
@@ -4729,7 +4755,7 @@ def test_execution_list_ctrl_c_copies_selected_detail_text(frame, monkeypatch):
         ],
     }
     frame._render_execution_list()
-    frame.execution_list.SetSelection(0)
+    frame.execution_list.SetSelection(_execution_row_index(frame, "计划：第一步"))
 
     class KeyEvent:
         def GetKeyCode(self):
@@ -4764,7 +4790,9 @@ def test_try_open_selected_execution_detail_opens_generated_detail_page(frame, m
         ],
     }
     frame._render_execution_list()
-    frame.execution_list.SetSelection(0)
+    frame.execution_list.SetSelection(
+        _execution_row_index(frame, "命令：运行测试 pytest tests/test_main_unit.py -k codex")
+    )
     opened = {}
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     frame._open_local_webpage = lambda p: opened.__setitem__("path", str(p))
@@ -4791,7 +4819,9 @@ def test_try_open_selected_execution_detail_reuses_page_path_and_cleanup_removes
         ],
     }
     frame._render_execution_list()
-    frame.execution_list.SetSelection(0)
+    frame.execution_list.SetSelection(
+        _execution_row_index(frame, "命令：运行测试 pytest tests/test_main_unit.py -k codex")
+    )
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     opened = []
     frame._open_local_webpage = lambda p: opened.append(str(p))
@@ -4835,7 +4865,7 @@ def test_switch_current_chat_refreshes_execution_list_in_execution_mode(frame):
 
     assert frame._switch_current_chat("chat-b") is True
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert rows == ["B1", "B2"]
     assert frame.execution_list.GetSelection() == 0
 
@@ -5975,7 +6005,7 @@ def test_active_turn_completed_in_execution_mode_preserves_question_and_adds_ans
         main.CodexEvent(type="turn_completed", thread_id="thread-1", turn_id="turn-1", text="done", status="completed"),
     )
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     assert execution_rebuilds["n"] == 0
     assert frame.active_session_turns[0]["request_status"] == "done"
     assert rows == ["我：q", "小诸葛：done"]
@@ -9429,7 +9459,7 @@ def test_final_answer_live_event_in_execution_mode_preserves_question_and_adds_a
         main.CodexEvent(type="item_completed", phase="final_answer", thread_id="thread-current", turn_id="turn-current", text="最终回答"),
     )
 
-    rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows = _execution_content_labels(frame)
     answer_rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     assert execution_rebuilds["n"] == 0
     assert rows == ["我：q", "小诸葛：最终回答"]
@@ -10002,8 +10032,10 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
     dlg = main.AnswerTextViewerDialog(
         frame, "回答详情", payload=payload, on_continue=lambda owner: continued.append(owner) or True
     )
+    original_finish = dlg._finish
+    original_is_shown = dlg.IsShown
     try:
-        dlg.Show()
+        dlg.IsShown = lambda: True
         closed = []
         dlg._finish = lambda code: closed.append(code)
         assert dlg.GetTitle() == "回答详情"
@@ -10026,6 +10058,9 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
         assert closed == [wx.ID_OK, wx.ID_CLOSE]
     finally:
         if dlg:
+            dlg._finish = original_finish
+            dlg.IsShown = original_is_shown
+            dlg._closing = False
             dlg.Destroy()
 
 
@@ -12536,6 +12571,36 @@ def test_codex_batch_queues_execution_step_persistence_off_ui_thread(frame, monk
     assert frame._pending_execution_step_persists
 
 
+def test_execution_step_persist_flush_waits_for_running_worker(frame):
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    persisted = []
+
+    def append_execution_step(chat_id, step):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        persisted.append((chat_id, copy.deepcopy(step)))
+        finished.set()
+
+    frame.chat_store = SimpleNamespace(append_execution_step=append_execution_step)
+    frame._chat_store_enabled = True
+    frame._codex_ui_batch_depth = 1
+    frame._queue_execution_step_persist("chat-active", {"list_text": "step 1"})
+    frame._codex_ui_batch_depth = 0
+    frame._start_execution_step_persist_worker()
+    assert entered.wait(timeout=2.0)
+
+    threading.Timer(0.05, release.set).start()
+    frame._closing = True
+    frame._flush_execution_step_persists_sync()
+
+    assert finished.is_set()
+    assert persisted == [("chat-active", {"list_text": "step 1"})]
+    assert frame._execution_step_persist_thread is None
+    assert not frame._execution_step_persist_worker_running
+
+
 def test_load_state_uses_chat_store_summaries_without_full_turns(frame, tmp_path):
     frame.state_path = tmp_path / "app_state.json"
     frame.chat_db_path = tmp_path / "chat_history.db"
@@ -13527,10 +13592,13 @@ def test_submit_question_replaces_empty_answer_state_with_delete_then_append(fra
 
     assert ok is True
     assert message == ""
-    assert operations[0] == ("Delete", 0)
-    assert [op for op in operations if op[0] == "Append"] == [("Append", "我"), ("Append", "首次提问")]
+    assert [op for op in operations if op[0] == "Delete"] == [("Delete", 1), ("Delete", 0)]
+    time_label = main.wechat_time_label(frame.active_session_turns[0]["created_at"], time.time())
+    assert [op for op in operations if op[0] == "Append"] == [
+        ("Append", time_label), ("Append", "我"), ("Append", "首次提问")
+    ]
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert rows == ["我", "首次提问"]
+    assert rows == [time_label, "我", "首次提问"]
     assert "小诸葛" not in rows
     assert main.REQUESTING_TEXT not in rows
 
@@ -15079,7 +15147,7 @@ def test_codex_ui_event_drain_coalesces_execution_list_repaints(frame, monkeypat
     frame._codex_ui_event_flush_scheduled = True
     frame._drain_codex_ui_events()
 
-    assert frame.execution_list.GetCount() == 6
+    assert len(_execution_content_labels(frame)) == 6
     assert repaint_calls.count((frame.execution_list,)) == 1
 
 
@@ -15136,7 +15204,7 @@ def test_pending_execution_steps_sync_canonical_page_after_quiet_in_order(frame,
 
     frame._flush_pending_background_ui_updates()
 
-    assert appended == ["step 1", "step 2"]
+    assert [label for label in appended if label != main.UNKNOWN_TIME_LABEL] == ["step 1", "step 2"]
     assert frame.execution_list.GetString(frame.execution_list.GetCount() - 1) == "step 2"
 
 
@@ -15160,7 +15228,9 @@ def test_pending_execution_flush_skips_rows_already_rendered_from_store(frame, m
     frame._flush_pending_background_ui_updates()
 
     assert frame._pending_execution_tail_appends == {}
-    assert frame.execution_meta == [("execution", 0, "step 1", "step 1")]
+    assert [meta for meta in frame.execution_meta if meta[0] != "time"] == [
+        ("execution", 0, "step 1", "step 1")
+    ]
 
 
 def test_pending_execution_flush_consumes_old_turn_notification_without_reviving_row(frame, monkeypatch):
@@ -15256,7 +15326,7 @@ def test_codex_ui_event_drain_preserves_execution_selection_when_list_has_focus(
     frame._codex_ui_event_flush_scheduled = True
     frame._drain_codex_ui_events()
 
-    assert frame.execution_list.GetCount() == 4
+    assert len(_execution_content_labels(frame)) == 4
     assert frame.execution_list.GetSelection() == 0
 
 
@@ -17794,7 +17864,7 @@ def test_active_execution_list_shows_current_turn_question_and_steps(frame):
 
     frame._render_execution_list()
 
-    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible = _execution_content_labels(frame)
     assert visible == ["我：new", "new process"]
 
 
@@ -17815,13 +17885,13 @@ def test_execution_list_defaults_to_latest_100_content_rows_including_answer(fra
 
     frame._render_execution_list()
 
-    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible = _execution_content_labels(frame)
     assert visible[0] == "更多"
     assert "process 0" not in visible
     assert visible == ["更多"] + [f"process {idx}" for idx in range(21, 120)] + ["小诸葛：a"]
     assert "process 119" in visible
     assert frame.execution_meta[0] == ("more", -1, "更多", "")
-    assert frame.execution_list.GetCount() == 101
+    assert len(_execution_content_labels(frame)) == 101
 
 
 def test_execution_list_does_not_show_more_when_filtered_visible_rows_are_under_limit(frame):
@@ -17842,9 +17912,9 @@ def test_execution_list_does_not_show_more_when_filtered_visible_rows_are_under_
 
     frame._render_execution_list()
 
-    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible = _execution_content_labels(frame)
     assert "更多" not in visible
-    assert frame.execution_list.GetCount() == 75
+    assert len(_execution_content_labels(frame)) == 75
     assert frame.execution_total_content_rows == 75
 
 
@@ -17881,12 +17951,12 @@ def test_execution_list_recent_store_page_counts_answer_without_full_step_load(f
 
     frame._render_execution_list()
 
-    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible = _execution_content_labels(frame)
     assert visible[0] == "更多"
     assert "process 149" not in visible
     assert visible == ["更多"] + [f"process {idx}" for idx in range(151, 250)] + ["小诸葛：a"]
     assert "process 249" in visible
-    assert frame.execution_list.GetCount() == 101
+    assert len(_execution_content_labels(frame)) == 101
 
 
 def test_open_selected_execution_detail_uses_rendered_detail_without_full_step_load(frame, monkeypatch):
@@ -17954,17 +18024,17 @@ def test_execution_list_more_expands_all_steps_and_context_without_duplicates(fr
     frame.execution_list.SetSelection(0)
 
     assert frame._try_open_selected_execution_detail() is True
-    visible_after_one = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible_after_one = _execution_content_labels(frame)
     assert visible_after_one[0] == "更多"
     assert visible_after_one == ["更多"] + [f"process {idx}" for idx in range(21, 220)] + ["小诸葛：a"]
     assert "process 0" not in visible_after_one
-    assert frame.execution_list.GetCount() == 201
+    assert len(_execution_content_labels(frame)) == 201
 
     assert frame._try_open_selected_execution_detail() is True
-    visible_after_two = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible_after_two = _execution_content_labels(frame)
     assert visible_after_two == ["我：q"] + [f"process {idx}" for idx in range(220)] + ["小诸葛：a"]
     assert "更多" not in visible_after_two
-    assert frame.execution_list.GetCount() == 222
+    assert len(_execution_content_labels(frame)) == 222
 
 
 def test_appending_execution_entry_keeps_latest_100_content_rows_including_answer(frame, monkeypatch):
@@ -17991,11 +18061,11 @@ def test_appending_execution_entry_keeps_latest_100_content_rows_including_answe
         {"step": "process 100", "list_text": "process 100", "display_kind": "commentary", "turn_idx": 1},
     )
 
-    visible = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    visible = _execution_content_labels(frame)
     assert visible[0] == "更多"
     assert "process 0" not in visible
     assert visible == ["更多"] + [f"process {idx}" for idx in range(2, 101)] + ["小诸葛：a"]
-    assert frame.execution_list.GetCount() == 101
+    assert len(_execution_content_labels(frame)) == 101
 
 
 def test_submit_question_resets_execution_list_visible_limit(frame, monkeypatch):
@@ -18924,7 +18994,7 @@ def test_render_answer_list_does_not_schedule_context_usage_estimate(frame, monk
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "我"
+    assert any(meta[0] == "user" and meta[2] == "我" for meta in frame.answer_meta)
     assert scheduled == []
 
 
@@ -19400,10 +19470,9 @@ def test_append_submitted_question_removes_all_initial_empty_rows_with_increment
 
     assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["暂无", "暂无对话内容"]
 
-    changed = frame._append_submitted_question_to_answer_list(
-        0,
-        {"question": "新问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID},
-    )
+    turn = {"question": "新问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID}
+    frame.active_session_turns.append(turn)
+    changed = frame._append_submitted_question_to_answer_list(0, turn)
 
     assert changed is True
     assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["我", "新问题"]
@@ -19633,7 +19702,7 @@ def test_codex_execution_event_appends_after_current_question(frame):
     }
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
 
-    assert list(frame.execution_list.GetStrings()) == ["我：question"]
+    assert _execution_content_labels(frame) == ["我：question"]
 
     frame._on_codex_event_for_chat(
         "chat-current",
@@ -19645,8 +19714,8 @@ def test_codex_execution_event_appends_after_current_question(frame):
         ),
     )
 
-    assert list(frame.execution_list.GetStrings()) == ["我：question", "计划：checking files"]
-    assert [meta[0] for meta in frame.execution_meta] == ["execution", "execution"]
+    assert _execution_content_labels(frame) == ["我：question", "计划：checking files"]
+    assert [meta[0] for meta in frame.execution_meta if meta[0] != "time"] == ["execution", "execution"]
 
 
 def test_execution_replay_reconciles_stale_tail_without_cross_turn_row(frame):
@@ -19793,7 +19862,7 @@ def test_execution_content_page_boundaries_include_question_and_answer(frame, co
     }
     frame._render_execution_list()
     expected = ["我：q"] + [f"step {i}" for i in range(count - 2)] + ["小诸葛：a"]
-    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == (
+    assert _execution_content_labels(frame) == (
         ["更多"] + expected[-100:] if count > 100 else expected
     )
     assert len(frame.execution_meta) == len(frame.execution_list_model.visible_ids) == frame.execution_list.GetCount()
@@ -19807,7 +19876,7 @@ def test_execution_empty_turn_context_rows(frame, question, answer, expected):
     frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution",
                                  "turns": [{"question": question, "answer_md": answer}], "execution_steps": []}
     frame._render_execution_list()
-    assert [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())] == expected
+    assert _execution_content_labels(frame) == expected
 
 
 def test_execution_selection_identity_survives_context_insert_and_page_slide(frame, monkeypatch):
@@ -19817,28 +19886,28 @@ def test_execution_selection_identity_survives_context_insert_and_page_slide(fra
         "execution_steps": [{"step": f"step {i}", "turn_idx": 0} for i in range(99)]}
     frame._render_execution_list()
     monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
-    frame.execution_list.SetSelection(20)
+    frame.execution_list.SetSelection(_execution_row_index(frame, "step 20"))
     selected_id = frame.execution_list_model.selected_id()
     frame._current_chat_state["turns"][0]["question"] = "q"
     frame._rebuild_execution_list_from_state()
-    assert frame.execution_list.GetSelection() == 21
     assert frame.execution_list_model.selected_id() == selected_id
     frame._current_chat_state["execution_steps"].extend({"step": f"step {i}", "turn_idx": 0} for i in range(99, 110))
     frame._rebuild_execution_list_from_state()
     assert frame.execution_list.GetStringSelection() == "step 20"
     assert frame.execution_list_model.selected_id() == selected_id
-    frame.execution_list.SetSelection(1)
+    frame.execution_list.SetSelection(_execution_row_index(frame, "step 11"))
+    selected_id = frame.execution_list_model.selected_id()
     frame._current_chat_state["execution_steps"].append({"step": "step 110", "turn_idx": 0})
     frame._rebuild_execution_list_from_state()
-    assert frame.execution_list.GetSelection() == 1
     assert frame.execution_list.GetStringSelection() == "step 11"
+    assert frame.execution_list_model.selected_id() == selected_id
 
 
 def test_execution_same_state_replay_has_zero_control_operations(frame, monkeypatch):
     frame._current_chat_state = {"id": "chat-current", "detail_panel_mode": "execution", "turns": [],
                                  "execution_steps": [{"step": "same"}, {"step": "same"}]}
     frame._render_execution_list()
-    assert len(set(frame.execution_list_model.visible_ids)) == 2
+    assert len(set(_execution_content_ids(frame))) == 2
     for method in ("Clear", "Append", "Insert", "Delete", "SetString", "SetSelection"):
         monkeypatch.setattr(frame.execution_list, method, lambda *args: pytest.fail("unchanged execution wrote control"))
     monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *args: pytest.fail("unchanged execution repainted"))
@@ -19870,7 +19939,7 @@ def test_execution_quiet_sync_failure_automatically_retries_notification(frame, 
     while frame._execution_list_dirty and time.monotonic() < deadline:
         wx_app.Yield()
     assert len(attempts) == 2, (frame._idle_ui_refresh_scheduled, frame._idle_ui_refresh_timer, frame._execution_list_dirty, frame._execution_retry_after, time.monotonic())
-    assert frame.execution_list.GetString(0) == "canonical"
+    assert _execution_content_labels(frame) == ["canonical"]
     assert len(attempts) == 2
     assert set(frame._pending_execution_tail_appends) == {"other-chat"}
 
@@ -19910,10 +19979,10 @@ def test_execution_history_bounded_pages_merge_unsaved_tail_and_skip_hidden_rows
     deadline = time.monotonic() + 2
     while frame._execution_list_dirty and time.monotonic() < deadline:
         wx_app.Yield()
-    assert frame.execution_list.GetString(frame.execution_list.GetCount() - 2) == "unsaved tail"
+    assert "unsaved tail" in _execution_content_labels(frame)
     frame.execution_visible_row_limit = 200
     frame._render_execution_list(force=True)
-    labels = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    labels = _execution_content_labels(frame)
     assert labels == ["我：q"] + [f"step {i}" for i in range(120)] + ["unsaved tail", "小诸葛：a"]
     assert "更多" not in labels
 
@@ -19934,12 +20003,12 @@ def test_execution_history_duplicate_legacy_rows_keep_identity_when_page_expands
     monkeypatch.setattr(frame.execution_list, "HasFocus", lambda: True)
     frame.execution_list.SetSelection(20)
     selected_id = frame.execution_list_model.selected_id()
-    assert len(set(frame.execution_list_model.visible_ids)) == 101
+    assert len(set(_execution_content_ids(frame))) == 101
     frame.execution_visible_row_limit = 200
     frame._render_execution_list(force=True)
     assert frame.execution_list_model.selected_id() == selected_id
     assert frame.execution_list.GetSelection() == 120
-    assert len(set(frame.execution_list_model.visible_ids)) == 201
+    assert len(set(_execution_content_ids(frame))) == 201
 
 
 def test_execution_history_memory_overrides_hidden_rows_before_more_decision(frame, tmp_path):
@@ -19958,7 +20027,7 @@ def test_execution_history_memory_overrides_hidden_rows_before_more_decision(fra
                              "detail_panel_mode": "execution", "execution_steps": memory}]
     frame.view_mode, frame.view_history_id = "history", "history"
     frame._render_execution_list(force=True)
-    labels = list(frame.execution_list.GetStrings())
+    labels = _execution_content_labels(frame)
     assert labels == ["更多"] + [f"step {i}" for i in range(81, 180)] + ["小诸葛：new a"]
     assert "小诸葛：old a" not in labels
     frame.execution_list.SetSelection(20)
@@ -19968,7 +20037,7 @@ def test_execution_history_memory_overrides_hidden_rows_before_more_decision(fra
     full[-50:] = memory
     frame.archived_chats[0]["execution_steps"] = full
     frame._render_execution_list(force=True)
-    assert list(frame.execution_list.GetStrings()) == labels
+    assert _execution_content_labels(frame) == labels
     assert frame.execution_list_model.selected_id() == selected
     assert frame.execution_list.GetSelection() == 20
 
@@ -19985,7 +20054,7 @@ def test_execution_new_row_identity_survives_persistence(frame, tmp_path):
     frame._current_chat_state["execution_steps"] = store.load_execution_steps("identity")
     frame._render_execution_list(force=True)
     assert frame.execution_list_model.selected_id() == selected
-    assert frame.execution_list.GetStringSelection() == "new"
+    assert frame.execution_list_model.selected_id() == selected
 
 
 @pytest.mark.parametrize("provider", ["codex", "kimi"])
@@ -20020,7 +20089,11 @@ def test_execution_drain_projection_failure_retries_and_keeps_queue_and_persiste
     deadline = time.monotonic() + 3
     while (frame._execution_list_dirty or getattr(frame, f"_pending_{provider}_ui_events")) and time.monotonic() < deadline:
         wx_app.Yield()
-    assert list(frame.execution_list.GetStrings()) == ["0", "1", "2"]
+    assert list(frame.execution_list.GetStrings()) == [
+        main.UNKNOWN_TIME_LABEL, "0",
+        main.UNKNOWN_TIME_LABEL, "1",
+        main.UNKNOWN_TIME_LABEL, "2",
+    ]
     assert len(persisted) == 3
     assert not getattr(frame, f"_pending_{provider}_ui_events")
     assert not frame._execution_list_dirty
@@ -20049,7 +20122,7 @@ def test_execution_kimi_changed_batch_projects_and_repaints_once(frame, monkeypa
     assert len(syncs) == 1
     assert repaints.count(frame.execution_list) == 1
     assert len(frame._current_chat_state["execution_steps"]) == 4
-    assert frame.execution_list.GetCount() == 5
+    assert len(_execution_content_labels(frame)) == 5
 
 
 def test_execution_idle_store_failure_automatically_recovers(frame, monkeypatch, tmp_path, wx_app):
@@ -20078,7 +20151,7 @@ def test_execution_idle_store_failure_automatically_recovers(frame, monkeypatch,
     deadline = time.monotonic() + 3
     while frame._execution_list_dirty and time.monotonic() < deadline:
         wx_app.Yield()
-    assert list(frame.execution_list.GetStrings()) == ["recovered"]
+    assert _execution_content_labels(frame) == ["recovered"]
     assert len(attempts) == 2
     assert not frame._execution_list_dirty
 
@@ -20142,15 +20215,16 @@ def test_execution_repeated_object_occurrences_preserve_second_selection(frame, 
     frame._current_chat_state = {"id": "repeated", "detail_panel_mode": "execution",
         "turns": [{"question": "", "answer_md": ""}], "execution_steps": [step, step]}
     frame._render_execution_list()
-    assert len(set(frame.execution_list_model.visible_ids)) == 2
-    frame.execution_list.SetSelection(1)
+    assert len(set(_execution_content_ids(frame))) == 2
+    frame.execution_list.SetSelection(
+        _execution_row_index(frame, frame._execution_step_text(step), occurrence=1)
+    )
     selected = frame.execution_list_model.selected_id()
     frame._render_execution_list()
-    assert frame.execution_list.GetSelection() == 1
+    assert frame.execution_list_model.selected_id() == selected
     assert frame.execution_list_model.selected_id() == selected
     frame._current_chat_state["turns"][0]["question"] = "q"
     frame._render_execution_list()
-    assert frame.execution_list.GetSelection() == 2
     assert frame.execution_list_model.selected_id() == selected
 
 
@@ -20173,13 +20247,12 @@ def test_execution_legacy_provider_source_switch_restores_content_not_index(fram
     frame._current_chat_state = {"id": "legacy", "detail_panel_mode": "execution", "turns": [],
         "execution_steps": [{"item_id": "a", "step": "a"}, {"item_id": "b", "step": "selected b"}]}
     frame._render_execution_list()
-    frame.execution_list.SetSelection(1)
+    frame.execution_list.SetSelection(_execution_row_index(frame, "selected b"))
     frame._current_chat_state["execution_steps"] = [
         {"item_id": "earlier", "step": "earlier", "_store_step_index": 0},
         {"item_id": "a", "step": "a", "_store_step_index": 1},
         {"item_id": "b", "step": "selected b", "_store_step_index": 2}]
     frame._render_execution_list()
-    assert frame.execution_list.GetSelection() == 2
     assert frame.execution_list.GetStringSelection() == "selected b"
     assert frame.execution_list_model.selected_id().endswith(":store:2")
 
@@ -20285,12 +20358,12 @@ def test_execution_changed_page_size_discards_blocked_old_scan(frame, monkeypatc
         while frame._execution_list_dirty and time.monotonic() < deadline:
             wx_app.Yield()
         assert not frame._execution_list_dirty
-        labels = list(frame.execution_list.GetStrings())
+        labels = _execution_content_labels(frame)
         assert labels == ["我：B question"] + [f"B step {i}" for i in range(120)] + ["小诸葛：B answer"]
         release.set()
         assert exited.wait(1)
         wx_app.Yield()
-        assert list(frame.execution_list.GetStrings()) == labels
+        assert _execution_content_labels(frame) == labels
         assert frame._execution_scan_pending is None
     finally:
         release.set()

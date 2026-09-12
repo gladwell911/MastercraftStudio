@@ -102,7 +102,10 @@ def validate_v2_durable(payload: dict, *, verify_hash: bool = True) -> dict:
     _required_text(payload, "event_id")
     _required_text(payload, "kind")
     _required_text(payload, "chat_id")
-    _required_text(payload, "domain")
+    domain = _required_text(payload, "domain")
+    if _required_text(payload, "sequence_domain") != domain:
+        raise ValueError("SEQUENCE_DOMAIN_MISMATCH")
+    _required_text(payload, "origin_client")
     _int64(payload, "revision")
     _int64(payload, "sync_sequence", minimum=1)
     if "execution_sequence" in payload:

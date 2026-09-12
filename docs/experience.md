@@ -1,5 +1,21 @@
 # 可复用经验
 
+## Canonical 通知事实与 connected E2E
+
+- 经验：通知正文必须由同一事务内的 canonical chat/message 行派生并提交，native 消费端再重算 canonical hash；调用方不能直接提供展示标题或正文。
+- 为什么重要：clear、replacement、重放和恶意/损坏 payload 都可能让“非空字段检查”产生伪通知或过期通知。
+- 下次怎么用：共享 fixture 同时覆盖合法 hash、篡改 owner/title/text/origin、缺 message id 和并发 clear；connected E2E 从生产 `ChatStore` 事实进入 outbox，不从测试端直接伪造正向 durable event。
+
+- 经验：connected E2E 的 endpoint、token、pair id 必须环境注入并 fail closed，每轮使用唯一非 default pair。
+- 为什么重要：代码默认凭据会泄密；固定 pair 会命中 JetStream 历史而产生假通过。
+- 下次怎么用：运行前检查 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN`、`NATS_E2E_PAIR_ID`，日志只记录非敏感身份与结果。
+
+## 稳定身份驱动的无障碍焦点
+
+- 焦点恢复应保存 owner、视图和稳定内容身份，而不是控件实例或行号；刷新后优先匹配原身份，删除时再选择同视图的确定相邻项。
+- 焦点租约只能由显式用户导航建立，并在模态框、应用失活、离开视图或关闭时释放，防止延迟 UI 回调抢焦点。
+- 时间分组必须基于权威执行顺序和明确边界；本阶段跨端 fixture 验证了 `>=300s`，避免 Python 与 Dart 的边界漂移。
+
 ## 权威执行时间线与分页恢复
 
 - 经验：远程执行投影与 durable fact、revision 和每聊天执行序号必须在同一事务中提交；canonical 问题/最终回答只保存稳定消息引用，不复制正文。

@@ -370,7 +370,8 @@ class ChatStore:
         ).fetchone()["n"])
         event_id = event_base if occurrence == 0 else f"{event_base}-{occurrence + 1}"
         envelope = {"protocol_version": 2, "event_id": event_id, "kind": "clear_context", "chat_id": chat_id,
-                    "domain": domain, "revision": revision, "sync_sequence": sync,
+                    "domain": domain, "sequence_domain": domain, "origin_client": "mc",
+                    "revision": revision, "sync_sequence": sync,
                     "body": {"operation_id": operation_id, "state": state}}
         canonical = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -518,6 +519,12 @@ class ChatStore:
             raise ValueError("INVALID_FEED_SCOPE")
         if any(key in envelope for key in ("epoch", "delivery_attempt", "delivered_at")):
             raise ValueError("FORBIDDEN_DURABLE_METADATA")
+        supplied_sequence_domain = str(envelope.get("sequence_domain") or normalized_domain).strip()
+        if supplied_sequence_domain != normalized_domain:
+            raise ValueError("SEQUENCE_DOMAIN_MISMATCH")
+        origin_client = str(envelope.get("origin_client") or "mc").strip().lower()
+        if not origin_client or "\x00" in origin_client:
+            raise ValueError("INVALID_ORIGIN_CLIENT")
         event_id = str(envelope.get("event_id") or f"event-{uuid.uuid4().hex}").strip()
         kind = str(envelope.get("kind") or envelope.get("type") or "").strip()
         if not event_id or not kind or "\x00" in event_id + kind or not isinstance(envelope.get("body"), dict):
@@ -566,7 +573,10 @@ class ChatStore:
                 if int(state["execution_sequence"]) >= MAX_INT64: raise OverflowError("EXECUTION_SEQUENCE_OVERFLOW")
                 execution_seq = int(state["execution_sequence"]) + 1
             normalized = {**envelope, "protocol_version": 2, "event_id": event_id, "kind": kind,
-                          "chat_id": owner, "domain": str(domain), "revision": revision, "sync_sequence": sync}
+                          "chat_id": owner, "domain": normalized_domain,
+                          "sequence_domain": supplied_sequence_domain,
+                          "origin_client": origin_client,
+                          "revision": revision, "sync_sequence": sync}
             normalized.pop("canonical_hash", None)
             if execution_seq is not None: normalized["execution_sequence"] = execution_seq
             canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -579,6 +589,140 @@ class ChatStore:
             conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (event_id,digest,kind,str(pair_id),str(domain),owner,normalized.get("turn_id"),revision,sync,execution_seq,canonical))
             conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)", (str(pair_id),str(domain),sync,event_id,str(domain),payload))
+            return normalized
+
+    def paired_feed_high_water(self, *, pair_id: str, domain: str = "events") -> dict[str, Any]:
+        """Return one authoritative paired-feed watermark for a v2 startup handshake."""
+        normalized_pair = str(pair_id or "").strip()
+        normalized_domain = str(domain or "").strip()
+        if not normalized_pair or not normalized_domain:
+            raise ValueError("INVALID_FEED_SCOPE")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'",
+                (normalized_pair,),
+            ).fetchone()
+        return {
+            "sequence_domain": normalized_domain,
+            "high_sync_sequence": int(row["sync_sequence"]) if row else 0,
+        }
+
+    def commit_message_notification_fact(
+        self,
+        *,
+        pair_id: str,
+        domain: str,
+        chat_id: str,
+        message_id: str,
+        notification_kind: str,
+        text: str,
+        chat_title: str,
+        origin_client: str = "mc",
+    ) -> dict[str, Any]:
+        """Commit one pair-scoped notification fact backed by a canonical message."""
+        if not self.v2_writes_enabled:
+            raise RuntimeError("V2_READ_ONLY_RECOVERY")
+        owner = self.normalize_chat_id(chat_id)
+        normalized_pair = str(pair_id or "").strip()
+        normalized_domain = str(domain or "").strip()
+        normalized_message = str(message_id or "").strip()
+        normalized_kind = str(notification_kind or "").strip()
+        expected_role = {"user_message": "user", "assistant_final": "assistant"}.get(
+            normalized_kind
+        )
+        if (not normalized_pair or not normalized_domain or not normalized_message
+                or expected_role is None or "\x00" in normalized_pair + normalized_domain):
+            raise ValueError("INVALID_NOTIFICATION_FACT")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index,t.payload_json,c.title "
+                "FROM canonical_messages cm "
+                "JOIN turns t ON t.chat_id=cm.chat_id AND t.turn_index=cm.legacy_turn_index "
+                "JOIN chats c ON c.id=cm.chat_id WHERE cm.message_id=?",
+                (normalized_message,),
+            ).fetchone()
+            if row is None or str(row["chat_id"]) != owner or str(row["role"]) != expected_role:
+                raise ValueError("STALE_CANONICAL_NOTIFICATION")
+            turn = self._json_dict(row["payload_json"])
+            canonical_text = str(turn.get("question" if expected_role == "user" else "answer_md") or "")
+            canonical_title = str(row["title"] or "").strip()
+            if not canonical_text.strip() or not canonical_title:
+                raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
+            normalized_origin = str(origin_client or "mc").strip().lower()
+            if not normalized_origin or "\x00" in normalized_origin:
+                raise ValueError("INVALID_ORIGIN_CLIENT")
+            event_id = f"notification:{normalized_pair}:{normalized_message}:{normalized_kind}"
+            envelope = {
+                "protocol_version": 2,
+                "event_id": event_id,
+                "kind": normalized_kind,
+                "chat_id": owner,
+                "turn_id": str(row["turn_id"]),
+                "domain": normalized_domain,
+                "sequence_domain": normalized_domain,
+                "origin_client": normalized_origin,
+                "body": {
+                    "message_id": normalized_message,
+                    "text": canonical_text,
+                    "chat_title": canonical_title,
+                },
+            }
+            existing = conn.execute(
+                "SELECT envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            if existing:
+                original = json.loads(existing["envelope_json"])
+                comparable = {key: value for key, value in envelope.items()
+                              if key not in {"canonical_hash", "sync_sequence", "revision"}}
+                if (existing["pair_id"] != normalized_pair
+                        or existing["domain"] != normalized_domain
+                        or any(original.get(key) != value for key, value in comparable.items())):
+                    self._quarantine_conn(conn, "EVENT_ID_CONFLICT", envelope, event_id)
+                    conn.commit()
+                    raise ValueError("EVENT_ID_CONFLICT")
+                return original
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
+            state = conn.execute(
+                "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
+            ).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)",
+                (normalized_pair, "__pair__"),
+            )
+            feed = conn.execute(
+                "SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'",
+                (normalized_pair,),
+            ).fetchone()
+            if int(feed["sync_sequence"]) >= MAX_INT64:
+                raise OverflowError("SYNC_SEQUENCE_OVERFLOW")
+            sync_sequence = int(feed["sync_sequence"]) + 1
+            normalized = {
+                **envelope,
+                "revision": int(state["revision"]),
+                "sync_sequence": sync_sequence,
+            }
+            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            normalized["canonical_hash"] = digest
+            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                "UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'",
+                (sync_sequence, normalized_pair),
+            )
+            conn.execute(
+                "INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, digest, normalized_kind, normalized_pair, normalized_domain,
+                 owner, str(row["turn_id"]), int(state["revision"]), sync_sequence,
+                 None, canonical),
+            )
+            conn.execute(
+                "INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)",
+                (normalized_pair, normalized_domain, sync_sequence, event_id,
+                 normalized_domain, canonical.encode("utf-8")),
+            )
             return normalized
 
     def _quarantine_conn(self, conn: sqlite3.Connection, reason: str, payload: Any, event_id: str = "") -> None:

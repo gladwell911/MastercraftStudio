@@ -1,0 +1,30 @@
+{
+  "handshake": {
+    "protocol_version": 2,
+    "pair_id": "pair-a",
+    "sequence_domain": "events",
+    "high_sync_sequence": 10,
+    "epoch": "connection-1"
+  },
+  "events": [
+    {"name":"pre-handshake backlog","notify":false,"reason":"startup_watermark","payload":{"protocol_version":2,"event_id":"event-10","kind":"assistant_final","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":10,"revision":1,"origin_client":"mc","canonical_hash":"a8bf900726b33c7857c7a64ff194316716eb2d261b7f8d043d91d9e17b1620fa","body":{"message_id":"message-10","chat_title":"Owner title","text":"Old answer"}}},
+    {"name":"eligible user message","notify":true,"payload":{"protocol_version":2,"event_id":"event-11","kind":"user_message","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":11,"revision":1,"origin_client":"mc","canonical_hash":"af1c080c89f39611de7ab6cb1e4a29453daa13135d7a3d4ec23e112cce5aa1b0","body":{"message_id":"message-11","chat_title":"Owner title","text":"New question"}}},
+    {"name":"eligible assistant final","notify":true,"payload":{"protocol_version":2,"event_id":"event-12","kind":"assistant_final","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":12,"revision":1,"origin_client":"mc","canonical_hash":"921cb9c46382b45a323ad16edd68d1c5e0a3b34e3da4470c761344814eefdd7a","body":{"message_id":"message-12","chat_title":"Owner title","text":"New answer"}}},
+    {"name":"wrong domain","notify":false,"reason":"sequence_domain","payload":{"protocol_version":2,"event_id":"event-13","kind":"assistant_final","chat_id":"chat-1","domain":"files","sequence_domain":"files","sync_sequence":13,"revision":1,"origin_client":"mc","canonical_hash":"14cfd6c12ac79ce96a80742c5b2ccdd4cbf9e7cef9892c7845f6620dd53719df","body":{"message_id":"message-13","chat_title":"Owner title","text":"File fact"}}},
+    {"name":"remote echo","notify":false,"reason":"origin_client","payload":{"protocol_version":2,"event_id":"event-14","kind":"user_message","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":14,"revision":1,"origin_client":"rc","canonical_hash":"b8a75196c4cb59959bc5e329cb860ac50a4baed473b397392961709ba26df183","body":{"message_id":"message-14","chat_title":"Owner title","text":"Echo"}}},
+    {"name":"projection kind","notify":false,"reason":"kind","payload":{"protocol_version":2,"event_id":"event-15","kind":"execution_entry","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":15,"revision":1,"origin_client":"mc","canonical_hash":"ed6596cd34e5801b1a53a7920b39779d8f21becf1aecc3932ee44f24295c2384","body":{"kind":"reasoning","title":"Reasoning","chat_title":"Owner title","text":"Reasoning"}}},
+    {"name":"missing owner title","notify":false,"reason":"chat_title","payload":{"protocol_version":2,"event_id":"event-16","kind":"assistant_final","chat_id":"chat-1","domain":"events","sequence_domain":"events","sync_sequence":16,"revision":1,"origin_client":"mc","canonical_hash":"a421695903bab7078dfac857ca4fa341a7defab17819dd21b789a7f92bf0ed95","body":{"message_id":"message-16","chat_title":"","text":"Answer"}}}
+  ],
+  "delivery": {
+    "dedupe_identity": ["pair_id", "event_id"],
+    "transition_order": ["gate", "pending", "gate", "post", "gate", "posted", "ack"],
+    "post_failure_outcome": "retry",
+    "repair_pair_id": "pair-b"
+  },
+  "tap": {
+    "required_action": "tap",
+    "requires_history_hydration": true,
+    "deleted_or_missing_target": "safe_chat_list_fallback",
+    "notification_receipt_navigates": false
+  }
+}

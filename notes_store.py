@@ -16,6 +16,7 @@ LAST_CURSOR_STATE_KEY = "last_cursor"
 COMPAT_OUTBOX_STATE_KEY = "compat_outbox"
 PLACEMENT_MIGRATION_STATE_KEY = "entry_placement_v2"
 PLACEMENT_MIGRATION_STATE_VALUE = "complete"
+MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 NOTEBOOK_COLUMNS = {
     "id",
@@ -63,6 +64,21 @@ class NotesPlacementConflict(RuntimeError):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _semantic_modified_by(device_identity: str) -> str:
+    normalized = str(device_identity or "").strip().lower()
+    if "mobile" in normalized or "phone" in normalized or "android" in normalized:
+        return "mobile"
+    return "desktop"
+
+
+def _semantic_source_label(device_identity: str) -> str:
+    return "手机端" if _semantic_modified_by(device_identity) == "mobile" else "电脑端"
+
+
+def _semantic_conflict_suffix_label(device_identity: str) -> str:
+    return "手机" if _semantic_modified_by(device_identity) == "mobile" else "电脑"
 
 
 class NotesStore:
@@ -168,6 +184,18 @@ class NotesStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS applied_remote_ops (
+                op_id TEXT PRIMARY KEY,
+                result_json TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS remote_op_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         if "pinned" not in self._table_columns(conn, "entries"):
@@ -213,6 +241,8 @@ class NotesStore:
             DROP TABLE IF EXISTS sync_outbox;
             DROP TABLE IF EXISTS notes_change_log;
             DROP TABLE IF EXISTS note_entries;
+            DROP TABLE IF EXISTS applied_remote_ops;
+            DROP TABLE IF EXISTS remote_op_quarantine;
             DROP TABLE IF EXISTS entries;
             DROP TABLE IF EXISTS notebooks;
             DROP TABLE IF EXISTS sync_state;
@@ -725,10 +755,14 @@ class NotesStore:
         return self._project_entry(updated_doc, source=updated_doc.source)
 
     def import_entries(self, notebook_id: str, lines: Iterable[str], source: str) -> list[NoteEntry]:
-        if self.get_notebook(notebook_id) is None:
-            raise KeyError(notebook_id)
         created: list[NoteEntry] = []
         with self._connect() as conn:
+            notebook_row = conn.execute(
+                "SELECT id FROM notebooks WHERE id = ? AND deleted = 0",
+                (notebook_id,),
+            ).fetchone()
+            if notebook_row is None:
+                raise KeyError(notebook_id)
             next_sort_order = self._next_entry_sort_order(conn, notebook_id)
             for line in lines:
                 text = str(line or "").strip()
@@ -1071,4 +1105,537 @@ class NotesStore:
         return {"cursor": self.current_cursor(), "applied": [], "conflicts": [], "acked": []}
 
     def apply_remote_op(self, op: dict) -> dict:
-        return {"applied": False, "conflicts": [], "cursor": self.current_cursor()}
+        if not isinstance(op, dict):
+            return self._quarantine_remote_op("INVALID_REMOTE_OP", op)
+        payload = op.get("payload", {})
+        if not isinstance(payload, dict):
+            return self._quarantine_remote_op("INVALID_REMOTE_PAYLOAD", op)
+        entity_type = op.get("entity_type")
+        action = op.get("action")
+        entity_id = op.get("entity_id")
+        op_id = op.get("op_id", "")
+        if any(not isinstance(value, str) for value in (entity_type, action, entity_id, op_id)):
+            return self._quarantine_remote_op("INVALID_REMOTE_IDENTITY", op)
+        entity_type, action, entity_id, op_id = (
+            entity_type.strip(), action.strip(), entity_id.strip(), op_id.strip()
+        )
+        if entity_type not in {"entry", "notebook"} or action not in {"create", "update", "rename", "delete"} or not entity_id:
+            return self._quarantine_remote_op("INVALID_REMOTE_IDENTITY", op)
+        base_value = op.get("base_version")
+        if action in {"update", "rename", "delete"} and (
+            isinstance(base_value, bool)
+            or not isinstance(base_value, int)
+            or base_value < 1
+            or base_value > MAX_SQLITE_INTEGER
+        ):
+            return self._quarantine_remote_op("INVALID_BASE_VERSION", op)
+        base_version = base_value if isinstance(base_value, int) and not isinstance(base_value, bool) else 0
+        for key in ("version", "sort_order", "region_order"):
+            if key not in payload:
+                continue
+            value = payload[key]
+            minimum = 1 if key == "version" else 0
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+                or value > MAX_SQLITE_INTEGER
+            ):
+                return self._quarantine_remote_op(f"INVALID_{key.upper()}", op)
+        for key in ("pinned", "is_conflict_copy", "deleted"):
+            if key in payload and not isinstance(payload[key], bool):
+                return self._quarantine_remote_op(f"INVALID_{key.upper()}", op)
+        source_value = op.get("source_device", op.get("device_id", "remote"))
+        if not isinstance(source_value, str):
+            return self._quarantine_remote_op("INVALID_SOURCE_DEVICE", op)
+        source_device = source_value.strip() or "remote"
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if op_id:
+                replay = conn.execute(
+                    "SELECT result_json FROM applied_remote_ops WHERE op_id=?", (op_id,)
+                ).fetchone()
+                if replay is not None:
+                    return json.loads(str(replay["result_json"]))
+            if entity_type == "entry":
+                result = self._apply_remote_entry_op_conn(
+                    conn, entity_id, action, payload, base_version, source_device
+                )
+            else:
+                result = self._apply_remote_notebook_op_conn(
+                    conn, entity_id, action, payload, base_version, source_device
+                )
+            if op_id:
+                conn.execute(
+                    "INSERT INTO applied_remote_ops(op_id,result_json,applied_at) VALUES(?,?,?)",
+                    (op_id, json.dumps(result, ensure_ascii=False, sort_keys=True), _utc_now()),
+                )
+            return result
+
+    def _cursor_conn(self, conn: sqlite3.Connection) -> str:
+        row = conn.execute(
+            "SELECT value FROM sync_state WHERE key=?", (LAST_CURSOR_STATE_KEY,)
+        ).fetchone()
+        return str(row["value"]) if row is not None else "0"
+
+    def _remote_result_conn(self, conn: sqlite3.Connection, *, applied: bool,
+                            conflicts: list[dict] | None = None, **values) -> dict:
+        result = {"applied": bool(applied), "conflicts": list(conflicts or []),
+                  "cursor": self._cursor_conn(conn)}
+        result.update(values)
+        return result
+
+    def _quarantine_remote_op(self, reason: str, op) -> dict:
+        encoded = json.dumps(op, ensure_ascii=False, sort_keys=True, default=repr)
+        op_id = str(op.get("op_id") or "").strip() if isinstance(op, dict) else ""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO remote_op_quarantine(op_id,reason,payload_json,created_at) VALUES(?,?,?,?)",
+                (op_id, reason, encoded, _utc_now()),
+            )
+            return self._remote_result_conn(conn, applied=False, quarantined=True, reason=reason)
+
+    def _apply_remote_entry_op_conn(self, conn: sqlite3.Connection, entry_id: str,
+                                    action: str, payload: dict, base_version: int,
+                                    source_device: str) -> dict:
+        row = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+        current_doc = EntryDoc.from_row(dict(row)) if row is not None else None
+        if action == "create":
+            if current_doc is not None:
+                return self._remote_result_conn(conn, applied=False)
+            notebook_id = str(payload.get("notebook_id") or "").strip()
+            parent = conn.execute(
+                "SELECT 1 FROM notebooks WHERE id=? AND deleted=0", (notebook_id,)
+            ).fetchone()
+            if parent is None:
+                return self._remote_result_conn(conn, applied=False)
+            now = _utc_now()
+            placement = str(payload.get("placement") or ("top" if payload.get("pinned", False) else "normal"))
+            if placement not in {"top", "normal", "bottom"}:
+                return self._remote_result_conn(conn, applied=False)
+            supplied_order = payload.get("region_order", payload.get("sort_order"))
+            region_order = self._next_entry_sort_order(conn, notebook_id) if supplied_order is None else supplied_order
+            doc = EntryDoc(
+                id=entry_id, notebook_id=notebook_id, content=str(payload.get("content") or ""),
+                created_at=str(payload.get("created_at") or now),
+                updated_at=str(payload.get("updated_at") or payload.get("created_at") or now),
+                sort_order=payload.get("sort_order", region_order), pinned=placement == "top",
+                placement=placement, region_order=region_order,
+                normal_predecessor_id=str(payload["normal_predecessor_id"]) if payload.get("normal_predecessor_id") else None,
+                normal_successor_id=str(payload["normal_successor_id"]) if payload.get("normal_successor_id") else None,
+                version=payload.get("version", 1), device_id=source_device,
+                last_modified_by=_semantic_modified_by(source_device),
+                is_conflict_copy=payload.get("is_conflict_copy", False),
+                origin_entry_id=str(payload["origin_entry_id"]) if payload.get("origin_entry_id") else None,
+                source=str(payload.get("source") or "manual"), rev=str(payload.get("rev") or ""),
+                deleted=payload.get("deleted", False) or bool(payload.get("deleted_at")), dirty=False,
+            )
+            self._insert_entry_doc(conn, doc)
+            self._next_cursor(conn)
+            return self._remote_result_conn(
+                conn, applied=True, entry=self._project_entry(doc, source=doc.source).to_dict()
+            )
+        if current_doc is None:
+            return self._remote_result_conn(conn, applied=False)
+        current = self._project_entry(current_doc, source=current_doc.source)
+        if current_doc.version != base_version:
+            live_parent = conn.execute(
+                "SELECT 1 FROM notebooks WHERE id=? AND deleted=0",
+                (current.notebook_id,),
+            ).fetchone()
+            if live_parent is None:
+                return self._remote_result_conn(conn, applied=False)
+            conflict = self._create_entry_conflict_copy_conn(conn, current, payload, source_device)
+            self._next_cursor(conn)
+            return self._remote_result_conn(conn, applied=True, conflicts=[conflict.to_dict()])
+        if action == "delete":
+            updated = conn.execute(
+                "UPDATE entries SET deleted=1,updated_at=?,version=version+1,device_id=?,last_modified_by=?,dirty=0 "
+                "WHERE id=? AND version=?",
+                (str(payload.get("updated_at") or _utc_now()), source_device,
+                 _semantic_modified_by(source_device), entry_id, base_version),
+            )
+            if updated.rowcount != 1:
+                return self._remote_result_conn(conn, applied=False)
+            self._next_cursor(conn)
+            return self._remote_result_conn(conn, applied=True)
+        target_notebook_id = str(payload.get("notebook_id") or current.notebook_id).strip()
+        parent = conn.execute(
+            "SELECT 1 FROM notebooks WHERE id=? AND deleted=0", (target_notebook_id,)
+        ).fetchone()
+        if parent is None:
+            return self._remote_result_conn(conn, applied=False)
+        placement = str(payload.get("placement") or current.placement)
+        if "pinned" in payload and "placement" not in payload:
+            placement = "top" if payload["pinned"] else "normal"
+        if placement not in {"top", "normal", "bottom"}:
+            return self._remote_result_conn(conn, applied=False)
+        region_order = payload.get("region_order", payload.get("sort_order", current.region_order))
+        updated = conn.execute(
+            "UPDATE entries SET notebook_id=?,content=?,updated_at=?,sort_order=?,pinned=?,placement=?,"
+            "region_order=?,normal_predecessor_id=?,normal_successor_id=?,version=version+1,device_id=?,"
+            "last_modified_by=?,is_conflict_copy=0,origin_entry_id=?,source=?,dirty=0 WHERE id=? AND version=?",
+            (target_notebook_id, str(payload.get("content") if "content" in payload else current.content),
+             str(payload.get("updated_at") or _utc_now()), payload.get("sort_order", region_order),
+             int(placement == "top"), placement, region_order,
+             payload.get("normal_predecessor_id", current.normal_predecessor_id),
+             payload.get("normal_successor_id", current.normal_successor_id), source_device,
+             _semantic_modified_by(source_device), payload.get("origin_entry_id", current.origin_entry_id),
+             str(payload.get("source") or current.source or "manual"), entry_id, base_version),
+        )
+        if updated.rowcount != 1:
+            return self._remote_result_conn(conn, applied=False)
+        self._next_cursor(conn)
+        updated_row = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+        doc = EntryDoc.from_row(dict(updated_row))
+        return self._remote_result_conn(
+            conn, applied=True, entry=self._project_entry(doc, source=doc.source).to_dict()
+        )
+
+    def _create_entry_conflict_copy_conn(self, conn: sqlite3.Connection, entry: NoteEntry,
+                                         payload: dict, source_device: str) -> NoteEntry:
+        now = str(payload.get("updated_at") or _utc_now())
+        region_order = self._next_entry_sort_order(conn, entry.notebook_id)
+        doc = EntryDoc(
+            id=uuid.uuid4().hex, notebook_id=entry.notebook_id,
+            content=f"【冲突副本：来自{_semantic_source_label(source_device)}】\n{str(payload.get('content') if 'content' in payload else entry.content)}",
+            created_at=now, updated_at=now, sort_order=region_order, pinned=False,
+            placement="normal", region_order=region_order, version=1, device_id=source_device,
+            last_modified_by=_semantic_modified_by(source_device), is_conflict_copy=True,
+            origin_entry_id=entry.id, source=str(payload.get("source") or entry.source or "manual"),
+            dirty=False,
+        )
+        self._insert_entry_doc(conn, doc)
+        return self._project_entry(doc, source=doc.source)
+
+    def _apply_remote_notebook_op_conn(self, conn: sqlite3.Connection, notebook_id: str,
+                                       action: str, payload: dict, base_version: int,
+                                       source_device: str) -> dict:
+        row = conn.execute("SELECT * FROM notebooks WHERE id=?", (notebook_id,)).fetchone()
+        current_doc = NotebookDoc.from_row(dict(row)) if row is not None else None
+        if action == "create":
+            if current_doc is not None:
+                return self._remote_result_conn(conn, applied=False)
+            now = _utc_now()
+            doc = NotebookDoc(
+                id=notebook_id, title=str(payload.get("title") or "未命名笔记"),
+                created_at=str(payload.get("created_at") or now),
+                updated_at=str(payload.get("updated_at") or payload.get("created_at") or now),
+                version=payload.get("version", 1), device_id=source_device,
+                last_modified_by=_semantic_modified_by(source_device),
+                is_conflict_copy=payload.get("is_conflict_copy", False),
+                origin_notebook_id=str(payload["origin_notebook_id"]) if payload.get("origin_notebook_id") else None,
+                rev=str(payload.get("rev") or ""),
+                deleted=payload.get("deleted", False) or bool(payload.get("deleted_at")), dirty=False,
+            )
+            self._insert_notebook_doc(conn, doc)
+            self._next_cursor(conn)
+            return self._remote_result_conn(
+                conn, applied=True, notebook=self._project_notebook(doc).to_dict()
+            )
+        if current_doc is None:
+            return self._remote_result_conn(conn, applied=False)
+        current = self._project_notebook(current_doc)
+        if current_doc.version != base_version:
+            conflict = self._create_notebook_conflict_copy_conn(conn, current, payload, source_device)
+            self._next_cursor(conn)
+            return self._remote_result_conn(conn, applied=True, conflicts=[conflict.to_dict()])
+        now = str(payload.get("updated_at") or _utc_now())
+        if action == "delete":
+            updated = conn.execute(
+                "UPDATE notebooks SET deleted=1,updated_at=?,version=version+1,device_id=?,last_modified_by=?,dirty=0 "
+                "WHERE id=? AND version=?",
+                (now, source_device, _semantic_modified_by(source_device), notebook_id, base_version),
+            )
+            if updated.rowcount != 1:
+                return self._remote_result_conn(conn, applied=False)
+            conn.execute(
+                "UPDATE entries SET deleted=1,updated_at=?,version=version+1,device_id=?,last_modified_by=?,dirty=0 "
+                "WHERE notebook_id=?",
+                (now, source_device, _semantic_modified_by(source_device), notebook_id),
+            )
+            self._next_cursor(conn)
+            return self._remote_result_conn(conn, applied=True)
+        updated = conn.execute(
+            "UPDATE notebooks SET title=?,updated_at=?,version=version+1,device_id=?,last_modified_by=?,"
+            "is_conflict_copy=0,origin_notebook_id=?,dirty=0 WHERE id=? AND version=?",
+            (str(payload.get("title") if "title" in payload else current.title), now, source_device,
+             _semantic_modified_by(source_device), payload.get("origin_notebook_id", current.origin_notebook_id),
+             notebook_id, base_version),
+        )
+        if updated.rowcount != 1:
+            return self._remote_result_conn(conn, applied=False)
+        self._next_cursor(conn)
+        updated_row = conn.execute("SELECT * FROM notebooks WHERE id=?", (notebook_id,)).fetchone()
+        doc = NotebookDoc.from_row(dict(updated_row))
+        return self._remote_result_conn(
+            conn, applied=True, notebook=self._project_notebook(doc).to_dict()
+        )
+
+    def _create_notebook_conflict_copy_conn(self, conn: sqlite3.Connection,
+                                            notebook: Notebook, payload: dict,
+                                            source_device: str) -> Notebook:
+        now = str(payload.get("updated_at") or _utc_now())
+        doc = NotebookDoc(
+            id=uuid.uuid4().hex,
+            title=f"{str(payload.get('title') or notebook.title)}（冲突副本-{_semantic_conflict_suffix_label(source_device)}）",
+            created_at=now, updated_at=now, version=1, device_id=source_device,
+            last_modified_by=_semantic_modified_by(source_device), is_conflict_copy=True,
+            origin_notebook_id=notebook.id, dirty=False,
+        )
+        self._insert_notebook_doc(conn, doc)
+        return self._project_notebook(doc)
+
+    def _remote_result(self, *, applied: bool, conflicts: list[dict] | None = None, **values) -> dict:
+        result = {
+            "applied": bool(applied),
+            "conflicts": list(conflicts or []),
+            "cursor": self.current_cursor(),
+        }
+        result.update(values)
+        return result
+
+    def _apply_remote_entry_op(
+        self,
+        entry_id: str,
+        action: str,
+        payload: dict,
+        base_version: int,
+        source_device: str,
+    ) -> dict:
+        current = self.get_entry(entry_id, include_deleted=True)
+        if action == "create" and current is None:
+            notebook_id = str(payload.get("notebook_id") or "").strip()
+            if not notebook_id or self.get_notebook(notebook_id) is None:
+                return self._remote_result(applied=False)
+            now = _utc_now()
+            created_at = str(payload.get("created_at") or now)
+            updated_at = str(payload.get("updated_at") or created_at)
+            pinned = bool(payload.get("pinned", False))
+            placement = str(payload.get("placement") or ("top" if pinned else "normal"))
+            if placement not in {"top", "normal", "bottom"}:
+                placement = "top" if pinned else "normal"
+            with self._connect() as conn:
+                supplied_order = payload.get("region_order", payload.get("sort_order"))
+                if supplied_order is None:
+                    region_order = self._next_entry_sort_order(conn, notebook_id)
+                else:
+                    try:
+                        region_order = int(supplied_order)
+                    except (TypeError, ValueError):
+                        region_order = self._next_entry_sort_order(conn, notebook_id)
+                doc = EntryDoc(
+                    id=entry_id,
+                    notebook_id=notebook_id,
+                    content=str(payload.get("content") or ""),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    sort_order=int(payload.get("sort_order") if payload.get("sort_order") is not None else region_order),
+                    pinned=placement == "top",
+                    placement=placement,
+                    region_order=region_order,
+                    normal_predecessor_id=str(payload["normal_predecessor_id"]) if payload.get("normal_predecessor_id") else None,
+                    normal_successor_id=str(payload["normal_successor_id"]) if payload.get("normal_successor_id") else None,
+                    version=int(payload.get("version") or 1),
+                    device_id=source_device,
+                    last_modified_by=_semantic_modified_by(source_device),
+                    is_conflict_copy=bool(payload.get("is_conflict_copy", False)),
+                    origin_entry_id=str(payload["origin_entry_id"]) if payload.get("origin_entry_id") else None,
+                    source=str(payload.get("source") or "manual"),
+                    rev=str(payload.get("rev") or ""),
+                    deleted=bool(payload.get("deleted") or payload.get("deleted_at")),
+                    dirty=False,
+                )
+                self._insert_entry_doc(conn, doc)
+                self._next_cursor(conn)
+            created = self._project_entry(doc, source=doc.source)
+            return self._remote_result(applied=True, entry=created.to_dict())
+        if current is None:
+            return self._remote_result(applied=False)
+        if action in {"update", "rename", "delete"} and base_version and current.version != base_version:
+            conflict = self._create_entry_conflict_copy(current, payload, source_device)
+            return self._remote_result(applied=True, conflicts=[conflict.to_dict()])
+        if action == "delete":
+            now = str(payload.get("updated_at") or _utc_now())
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE entries SET deleted = 1, updated_at = ?, version = version + 1, "
+                    "device_id = ?, last_modified_by = ?, dirty = 0 WHERE id = ?",
+                    (now, source_device, _semantic_modified_by(source_device), entry_id),
+                )
+                self._next_cursor(conn)
+            return self._remote_result(applied=True)
+        if action in {"update", "rename"}:
+            updated = self._write_entry_remote_update(current, payload, source_device)
+            return self._remote_result(applied=True, entry=updated.to_dict())
+        return self._remote_result(applied=False)
+
+    def _write_entry_remote_update(self, entry: NoteEntry, payload: dict, source_device: str) -> NoteEntry:
+        placement = str(payload.get("placement") or entry.placement)
+        if placement not in {"top", "normal", "bottom"}:
+            placement = entry.placement
+        if "pinned" in payload and "placement" not in payload:
+            placement = "top" if bool(payload.get("pinned")) else "normal"
+        try:
+            region_order = int(payload.get("region_order", payload.get("sort_order", entry.region_order)))
+        except (TypeError, ValueError):
+            region_order = entry.region_order
+        updated_at = str(payload.get("updated_at") or _utc_now())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE entries
+                SET notebook_id = ?, content = ?, updated_at = ?, sort_order = ?, pinned = ?,
+                    placement = ?, region_order = ?, normal_predecessor_id = ?, normal_successor_id = ?,
+                    version = version + 1, device_id = ?, last_modified_by = ?,
+                    is_conflict_copy = 0, origin_entry_id = ?, source = ?, dirty = 0
+                WHERE id = ?
+                """,
+                (
+                    str(payload.get("notebook_id") or entry.notebook_id),
+                    str(payload.get("content") if "content" in payload else entry.content),
+                    updated_at,
+                    int(payload.get("sort_order", region_order)),
+                    int(placement == "top"),
+                    placement,
+                    region_order,
+                    payload.get("normal_predecessor_id", entry.normal_predecessor_id),
+                    payload.get("normal_successor_id", entry.normal_successor_id),
+                    source_device,
+                    _semantic_modified_by(source_device),
+                    payload.get("origin_entry_id", entry.origin_entry_id),
+                    str(payload.get("source") or entry.source or "manual"),
+                    entry.id,
+                ),
+            )
+            self._next_cursor(conn)
+            row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry.id,)).fetchone()
+            assert row is not None
+            doc = EntryDoc.from_row(dict(row))
+        return self._project_entry(doc, source=doc.source)
+
+    def _create_entry_conflict_copy(self, entry: NoteEntry, payload: dict, source_device: str) -> NoteEntry:
+        now = str(payload.get("updated_at") or _utc_now())
+        with self._connect() as conn:
+            region_order = self._next_entry_sort_order(conn, entry.notebook_id)
+            doc = EntryDoc(
+                id=uuid.uuid4().hex,
+                notebook_id=entry.notebook_id,
+                content=f"【冲突副本：来自{_semantic_source_label(source_device)}】\n{str(payload.get('content') if 'content' in payload else entry.content)}",
+                created_at=now,
+                updated_at=now,
+                sort_order=region_order,
+                pinned=False,
+                placement="normal",
+                region_order=region_order,
+                version=1,
+                device_id=source_device,
+                last_modified_by=_semantic_modified_by(source_device),
+                is_conflict_copy=True,
+                origin_entry_id=entry.id,
+                source=str(payload.get("source") or entry.source or "manual"),
+                dirty=False,
+            )
+            self._insert_entry_doc(conn, doc)
+            self._next_cursor(conn)
+        return self._project_entry(doc, source=doc.source)
+
+    def _apply_remote_notebook_op(
+        self,
+        notebook_id: str,
+        action: str,
+        payload: dict,
+        base_version: int,
+        source_device: str,
+    ) -> dict:
+        current = self.get_notebook(notebook_id, include_deleted=True)
+        if action == "create" and current is None:
+            now = _utc_now()
+            created_at = str(payload.get("created_at") or now)
+            doc = NotebookDoc(
+                id=notebook_id,
+                title=str(payload.get("title") or "未命名笔记"),
+                created_at=created_at,
+                updated_at=str(payload.get("updated_at") or created_at),
+                version=int(payload.get("version") or 1),
+                device_id=source_device,
+                last_modified_by=_semantic_modified_by(source_device),
+                is_conflict_copy=bool(payload.get("is_conflict_copy", False)),
+                origin_notebook_id=str(payload["origin_notebook_id"]) if payload.get("origin_notebook_id") else None,
+                rev=str(payload.get("rev") or ""),
+                deleted=bool(payload.get("deleted") or payload.get("deleted_at")),
+                dirty=False,
+            )
+            with self._connect() as conn:
+                self._insert_notebook_doc(conn, doc)
+                self._next_cursor(conn)
+            created = self._project_notebook(doc)
+            return self._remote_result(applied=True, notebook=created.to_dict())
+        if current is None:
+            return self._remote_result(applied=False)
+        if action in {"update", "rename", "delete"} and base_version and current.version != base_version:
+            conflict = self._create_notebook_conflict_copy(current, payload, source_device)
+            return self._remote_result(applied=True, conflicts=[conflict.to_dict()])
+        if action == "delete":
+            now = str(payload.get("updated_at") or _utc_now())
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notebooks SET deleted = 1, updated_at = ?, version = version + 1, "
+                    "device_id = ?, last_modified_by = ?, dirty = 0 WHERE id = ?",
+                    (now, source_device, _semantic_modified_by(source_device), notebook_id),
+                )
+                conn.execute(
+                    "UPDATE entries SET deleted = 1, updated_at = ?, version = version + 1, "
+                    "device_id = ?, last_modified_by = ?, dirty = 0 WHERE notebook_id = ?",
+                    (now, source_device, _semantic_modified_by(source_device), notebook_id),
+                )
+                self._next_cursor(conn)
+            return self._remote_result(applied=True)
+        if action in {"update", "rename"}:
+            updated = self._write_notebook_remote_update(current, payload, source_device)
+            return self._remote_result(applied=True, notebook=updated.to_dict())
+        return self._remote_result(applied=False)
+
+    def _write_notebook_remote_update(self, notebook: Notebook, payload: dict, source_device: str) -> Notebook:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE notebooks
+                SET title = ?, updated_at = ?, version = version + 1, device_id = ?,
+                    last_modified_by = ?, is_conflict_copy = 0, origin_notebook_id = ?, dirty = 0
+                WHERE id = ?
+                """,
+                (
+                    str(payload.get("title") if "title" in payload else notebook.title),
+                    str(payload.get("updated_at") or _utc_now()),
+                    source_device,
+                    _semantic_modified_by(source_device),
+                    payload.get("origin_notebook_id", notebook.origin_notebook_id),
+                    notebook.id,
+                ),
+            )
+            self._next_cursor(conn)
+            row = conn.execute("SELECT * FROM notebooks WHERE id = ?", (notebook.id,)).fetchone()
+            assert row is not None
+            doc = NotebookDoc.from_row(dict(row))
+        return self._project_notebook(doc)
+
+    def _create_notebook_conflict_copy(self, notebook: Notebook, payload: dict, source_device: str) -> Notebook:
+        now = str(payload.get("updated_at") or _utc_now())
+        doc = NotebookDoc(
+            id=uuid.uuid4().hex,
+            title=f"{str(payload.get('title') or notebook.title)}（冲突副本-{_semantic_conflict_suffix_label(source_device)}）",
+            created_at=now,
+            updated_at=now,
+            version=1,
+            device_id=source_device,
+            last_modified_by=_semantic_modified_by(source_device),
+            is_conflict_copy=True,
+            origin_notebook_id=notebook.id,
+            dirty=False,
+        )
+        with self._connect() as conn:
+            self._insert_notebook_doc(conn, doc)
+            self._next_cursor(conn)
+        return self._project_notebook(doc)

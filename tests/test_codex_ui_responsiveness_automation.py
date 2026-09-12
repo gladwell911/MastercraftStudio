@@ -77,6 +77,14 @@ def _activate_frame(frame, wx_app):
     wx_app.Yield()
 
 
+def _destroy_dialog_after_native_callback(dlg, wx_app):
+    """Release a dialog only after any synchronous Win32 input callback unwinds."""
+    if dlg is None:
+        return
+    dlg.Hide()
+    main.wx.CallAfter(dlg.Destroy)
+
+
 def test_real_ui_story_1_3_question_enter_and_native_modifiers(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     calls = []
@@ -301,7 +309,11 @@ def test_real_ui_execution_hidden_history_scan_releases_navigation_before_read_f
             getattr(frame, "_execution_scan_result", None) is not None,
             frame._idle_ui_refresh_scheduled, frame._detail_panel_mode(), len(reads))
         assert frame.input_edit.HasFocus()
-        assert list(frame.execution_list.GetStrings()) == ["更多"] + [f"step {i}" for i in range(21, 120)] + ["小诸葛：a"]
+        assert list(frame.execution_list.GetStrings()) == (
+            ["更多", "1970年1月1日 08:00"]
+            + [f"step {i}" for i in range(21, 120)]
+            + ["时间未知", "小诸葛：a"]
+        )
         assert len(reads) == 5
         assert all(kwargs["limit"] == 100 for _, kwargs in reads)
         assert all(kwargs.get("include_total") is False for _, kwargs in reads[1:])
@@ -523,19 +535,26 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_canonic
     dlg = main.AnswerTextViewerDialog(frame, "回答详情", opened_viewer[0][1])
     try:
         dlg.text_ctrl.SetValue("当前编辑框内容")
-        tab = main.wx.KeyEvent(main.wx.wxEVT_CHAR_HOOK)
-        tab.SetKeyCode(main.wx.WXK_TAB)
-        dlg.ProcessEvent(tab)
-        wx_app.Yield()
+        skipped = []
+
+        class _TabEvent:
+            def GetKeyCode(self): return main.wx.WXK_TAB
+            def ControlDown(self): return False
+            def AltDown(self): return False
+            def ShiftDown(self): return False
+            def Skip(self): skipped.append(True)
+
+        dlg._on_char_hook(_TabEvent())
 
         assert copied == []
+        assert skipped == [True]
         assert dlg.copy_button.GetLabel() == "复制"
         dlg._on_copy_clicked()
         assert copied == ["1. 第一项\n2. 第二项"]
         assert dlg.text_ctrl.GetWindowStyleFlag() & main.wx.TE_DONTWRAP
     finally:
         if dlg:
-            dlg.Destroy()
+            _destroy_dialog_after_native_callback(dlg, wx_app)
 
 
 def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
@@ -547,9 +566,9 @@ def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
     dlg = main.AnswerTextViewerDialog(
         frame, "回答详情", payload=payload, on_continue=lambda owner: dispatched.append(owner) or True
     )
+    original_is_shown = dlg.IsShown
     try:
-        dlg.Show()
-        wx_app.Yield()
+        dlg.IsShown = lambda: True
         dlg._finish = lambda _code: None
         dlg._on_continue_clicked()
         dlg._on_continue_clicked()
@@ -558,7 +577,8 @@ def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
         assert dlg.text_ctrl.GetValue() == "\ncanonical"
         assert not dlg.continue_button.IsEnabled()
     finally:
-        dlg.Destroy()
+        dlg.IsShown = original_is_shown
+        _destroy_dialog_after_native_callback(dlg, wx_app)
 
 
 def test_real_ui_answer_viewer_alt_c_respects_ime_modal_and_disabled_boundaries(frame, wx_app, monkeypatch):
@@ -576,9 +596,10 @@ def test_real_ui_answer_viewer_alt_c_respects_ime_modal_and_disabled_boundaries(
             return False
 
     try:
-        dlg.Show()
-        dlg.text_ctrl.SetFocusFromKbd()
-        wx_app.Yield()
+        monkeypatch.setattr(dlg, "IsShown", lambda: True)
+        monkeypatch.setattr(dlg.text_ctrl, "HasFocus", lambda: True)
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.text_ctrl)
+        monkeypatch.setattr(main.wx, "GetActiveWindow", lambda: dlg)
         monkeypatch.setattr(frame, "_has_native_ime_composition", lambda _window: True)
         assert dlg._request_continue(from_shortcut=True, event=_AltC()) is False
 
@@ -588,14 +609,14 @@ def test_real_ui_answer_viewer_alt_c_respects_ime_modal_and_disabled_boundaries(
             monkeypatch.setattr(main.wx, "GetActiveWindow", lambda: other)
             assert dlg._request_continue(from_shortcut=True, event=_AltC()) is False
         finally:
-            other.Destroy()
+            _destroy_dialog_after_native_callback(other, wx_app)
 
         dlg.continue_button.Disable()
         assert dlg._request_continue() is False
         assert dispatched == []
         assert dlg.text_ctrl.HasFocus()
     finally:
-        dlg.Destroy()
+        _destroy_dialog_after_native_callback(dlg, wx_app)
 
 
 def test_real_ui_answer_viewer_alt_c_key_path_rejects_repeat_then_dispatches(frame, wx_app, monkeypatch):
@@ -617,9 +638,8 @@ def test_real_ui_answer_viewer_alt_c_key_path_rejects_repeat_then_dispatches(fra
         def Skip(self): self.skipped += 1
 
     try:
-        dlg.Show()
-        dlg.text_ctrl.SetFocusFromKbd()
-        wx_app.Yield()
+        monkeypatch.setattr(dlg, "IsShown", lambda: True)
+        monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: dlg.text_ctrl)
         monkeypatch.setattr(main.wx, "GetActiveWindow", lambda: dlg)
         monkeypatch.setattr(frame, "_has_native_ime_composition", lambda _window: False)
         repeated = AltC(True)
@@ -633,7 +653,7 @@ def test_real_ui_answer_viewer_alt_c_key_path_rejects_repeat_then_dispatches(fra
         assert dispatched == [payload]
         assert first.skipped == 0
     finally:
-        dlg.Destroy()
+        _destroy_dialog_after_native_callback(dlg, wx_app)
 
 
 def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame, wx_app, monkeypatch):
@@ -812,8 +832,9 @@ def test_real_ui_f1_focuses_execution_latest_enter_opens_text_and_shift_enter_op
     )
 
     _send_listbox_key(frame.execution_list, main.wx.WXK_UP)
+    _send_listbox_key(frame.execution_list, main.wx.WXK_UP)
     wx_app.Yield()
-    assert frame.execution_list.GetSelection() == 0
+    assert frame.execution_list.GetStringSelection() == "first step"
 
     _send_window_key(frame.execution_list, main.wx.WXK_RETURN)
     wx_app.Yield()

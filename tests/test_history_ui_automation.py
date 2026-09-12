@@ -1133,7 +1133,7 @@ def test_ui_automation_f1_execution_view_shows_detailed_codex_progress(frame, mo
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     rows = list(frame.execution_list.GetStrings())
 
-    assert rows == ["我：please fix tests"]
+    assert rows == [main.UNKNOWN_TIME_LABEL, "我：please fix tests"]
 
 def test_ui_automation_history_execution_list_excludes_active_chat_turn_context(frame, wx_app, monkeypatch):
     frame.Show()

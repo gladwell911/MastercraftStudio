@@ -49,7 +49,7 @@ def test_should_show_time_first_message_always_shows():
 
 
 def test_should_show_time_gap_boundary():
-    assert main.should_show_time(1000.0, 1300.0) is False  # 恰好 300 秒不显示
+    assert main.should_show_time(1000.0, 1300.0) is True  # 恰好 300 秒显示
     assert main.should_show_time(1000.0, 1300.1) is True  # 超过 300 秒才显示
     assert main.should_show_time(1000.0, 1299.9) is False
 
@@ -160,7 +160,7 @@ def test_answer_list_time_rows_keep_tail_notice(frame):
     assert frame.answer_list.GetString(frame.answer_list.GetCount() - 1) == "以开启新会话"
 
 
-def test_answer_list_turn_without_created_at_gets_no_time_row(frame):
+def test_answer_list_turn_without_created_at_gets_unknown_time_row(frame):
     now = time.time()
     frame.active_session_turns = [
         {"question": "q0", "answer_md": "a0", "model": "openai/gpt-5.2"},
@@ -172,15 +172,17 @@ def test_answer_list_turn_without_created_at_gets_no_time_row(frame):
 
     kinds = [meta[0] for meta in frame.answer_meta]
     assert kinds == [
-        "user", "question", "ai", "answer",
+        "time", "user", "question", "ai", "answer",
         "time", "user", "question", "ai", "answer",
     ]
+    assert frame.answer_list.GetString(0) == main.UNKNOWN_TIME_LABEL
 
 
 def test_incremental_appends_insert_time_row_once(frame):
     now = time.time()
     turn0 = _make_turn("q0", "", now - 1000)
     frame.active_session_turns = [turn0]
+    frame._current_chat_state["turns"] = frame.active_session_turns
     frame.view_mode = "active"
 
     assert frame._append_submitted_question_to_answer_list(0, turn0) is True

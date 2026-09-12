@@ -1,0 +1,24 @@
+{
+  "time_groups": [
+    {"previous": 1000.0, "current": 1299.999, "show": false},
+    {"previous": 1000.0, "current": 1300.0, "show": true},
+    {"previous": 1000.0, "current": 1300.001, "show": true},
+    {"previous": null, "current": null, "show": true, "label": "\u65f6\u95f4\u672a\u77e5"},
+    {"previous": 1000.0, "current": "malformed", "show": true, "label": "\u65f6\u95f4\u672a\u77e5"}
+  ],
+  "execution_timestamps": [
+    {"name": "explicit null created_at falls back to ts", "created_at": null, "ts": 42.5, "known": true, "value": 42.5},
+    {"name": "malformed created_at falls back to ts", "created_at": "bad", "ts": 43.5, "known": true, "value": 43.5},
+    {"name": "all malformed is unknown", "created_at": "bad", "ts": "also bad", "known": false},
+    {"name": "numeric strings are malformed", "created_at": "44.5", "ts": "45.5", "known": false},
+    {"name": "booleans are malformed", "created_at": true, "ts": false, "known": false},
+    {"name": "legitimate epoch zero is known", "created_at": 0, "ts": 99, "known": true, "value": 0}
+  ],
+  "compact_markdown": [
+    {"input": "1. first\n2. second", "output": "first\nsecond"},
+    {"input": "Version 1.2 and 42 remain", "output": "Version 1.2 and 42 remain"},
+    {"input": "```text\n1. code\n```\n1. prose", "output": "```text\n1. code\n```\nprose"},
+    {"input": "    1. indented code\n\n3) item", "output": "    1. indented code\n\nitem"},
+    {"input": "````text\n1. outer code\n```\n2. still code\n````\n3. prose", "output": "````text\n1. outer code\n```\n2. still code\n````\nprose"}
+  ]
+}

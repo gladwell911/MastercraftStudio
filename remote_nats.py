@@ -200,14 +200,31 @@ class RemoteNatsTransport:
         try:
             if str(payload.get("type") or "").lower() == "hello":
                 offered = payload.get("protocol_versions", body_payload.get("protocol_versions", []))
-                negotiated_version = 2 if device_id and session_id and isinstance(offered, list) and 2 in offered else 1
+                can_negotiate_v2 = (
+                    device_id
+                    and session_id
+                    and isinstance(offered, list)
+                    and 2 in offered
+                    and self.durable_store is not None
+                    and getattr(self.durable_store, "v2_writes_enabled", False)
+                )
+                negotiated_version = 2 if can_negotiate_v2 else 1
                 negotiated_epoch = uuid.uuid4().hex if negotiated_version == 2 else ""
                 self._sessions[session_key] = (negotiated_version, negotiated_epoch)
                 self.protocol_version = max((state[0] for state in self._sessions.values()), default=1)
+                watermark = (
+                    self.durable_store.paired_feed_high_water(
+                        pair_id=self.subjects.pair_id,
+                        domain="events",
+                    )
+                    if negotiated_version == 2
+                    else {}
+                )
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
                     "capabilities": ["canonical-owner", "durable-outbox", "replay"],
                     "epoch": negotiated_epoch,
+                    **watermark,
                 }, chat_id=chat_id)
                 await self.publish_event(event)
                 return
