@@ -4,7 +4,7 @@
 
 Story 4.1/4.2 的代码实现、两轮 BMAD 审查修复和最终 connected E2E 已经完成；用户已于 2026-09-12 确认真机 TalkBack 验收完成，联合规格和关联 Story 3/4 均可标记为 `done`。
 
-当前分支为 `feature/epic-2-cross-client-sessions`。根目录 `D:\code\sj\_bmad-output` 不是 Git 仓库，联合规格与证据台账不会随 MC 提交；权威文件是：
+当前主分支为 `main`，所有本地功能/修复分支均已包含在其中。根目录 `D:\code\sj\_bmad-output` 不是 Git 仓库，联合规格与证据台账不会随 MC 提交；权威文件是：
 
 - `D:\code\sj\_bmad-output\implementation-artifacts\spec-4-1-and-4-2-android-notifications-and-cross-client-verification.md`
 - `D:\code\sj\_bmad-output\implementation-artifacts\story-4-2-verification-evidence.md`
