@@ -13,9 +13,11 @@ class FakeListBox:
         return len(self.items)
 
     def GetString(self, idx):
+        assert 0 <= idx < len(self.items), "GetString(): index out of range"
         return self.items[idx]
 
     def SetString(self, idx, label):
+        assert 0 <= idx < len(self.items), "SetString(): index out of range"
         self.calls.append(("SetString", idx, label))
         self.items[idx] = label
 
@@ -24,10 +26,12 @@ class FakeListBox:
         self.items.append(label)
 
     def Insert(self, label, idx):
+        assert 0 <= idx <= len(self.items), "InsertItems(): position out of range"
         self.calls.append(("Insert", idx, label))
         self.items.insert(idx, label)
 
     def Delete(self, idx):
+        assert 0 <= idx < len(self.items), "Delete(): index out of range"
         self.calls.append(("Delete", idx))
         del self.items[idx]
 
@@ -40,6 +44,7 @@ class FakeListBox:
         return self.selection
 
     def SetSelection(self, idx):
+        assert 0 <= idx < len(self.items), "SetSelection(): index out of range"
         self.calls.append(("SetSelection", idx))
         self.selection = idx
 
@@ -143,6 +148,28 @@ def test_replace_visible_page_noops_when_ids_and_labels_match():
     changed = model.replace_visible_page([("a", "Alpha"), ("b", "Beta")], selected_id="a")
 
     assert changed is False
+    assert control.calls == []
+
+
+def test_replace_visible_page_deduplicates_normalized_ids_with_first_item_winning():
+    control = FakeListBox()
+    model = IncrementalListBoxModel(control)
+
+    changed = model.replace_visible_page(
+        [(" a ", "First A"), ("", "Empty"), ("a", "Later A"), ("b", "Beta"), (" b ", "Later B")],
+        selected_id="b",
+    )
+
+    assert changed is True
+    assert model.visible_ids == ["a", "b"]
+    assert model.labels_by_id == {"a": "First A", "b": "Beta"}
+    assert control.items == ["First A", "Beta"]
+    assert control.selection == 1
+    control.calls.clear()
+
+    assert model.replace_visible_page(
+        [("a", "First A"), (" a ", "Ignored"), ("b", "Beta")], selected_id="b"
+    ) is False
     assert control.calls == []
 
 

@@ -4037,14 +4037,17 @@ class ChatFrame(wx.Frame):
         labels = []
         ids = []
         current_id = self._current_history_id()
-        target = keep_id if keep_id is not None else self.view_history_id
+        seen_ids = set()
+        target = str(keep_id if keep_id is not None else self.view_history_id or "").strip()
         if current_id:
             labels.append(self._current_history_title())
             ids.append(current_id)
+            seen_ids.add(current_id)
         for c in self.archived_chats:
-            chat_id = str(c.get("id") or "")
-            if current_id and chat_id == current_id:
+            chat_id = str(c.get("id") or "").strip()
+            if not chat_id or chat_id in seen_ids:
                 continue
+            seen_ids.add(chat_id)
             title = str(c.get("title") or "新聊天")
             if self._is_default_chat_title(title):
                 title = EMPTY_CURRENT_CHAT_TITLE
@@ -4193,7 +4196,10 @@ class ChatFrame(wx.Frame):
     def _append_turn_attachment_rows(self, turn_idx: int, attachments: list[dict], *, incoming: bool = False) -> None:
         for label, meta in self._turn_attachment_rows(turn_idx, attachments, incoming=incoming):
             if hasattr(self, "answer_list_model"):
-                self.answer_list_model.append(self._answer_row_id(meta), label)
+                row_id = self._answer_row_id(meta)
+                if row_id in self.answer_list_model.labels_by_id:
+                    continue
+                self.answer_list_model.append(row_id, label)
             else:
                 self.answer_list.Append(label)
             self.answer_meta.append(meta)
@@ -4893,6 +4899,20 @@ class ChatFrame(wx.Frame):
             return self._replace_listbox_items_if_changed(self.answer_list, rows, selected_idx)
         row_ids = [self._answer_row_id(meta) for meta in metas]
         selected_id = row_ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(row_ids) else ""
+        unique_rows = []
+        unique_metas = []
+        unique_ids = []
+        seen_ids = set()
+        for row_id, row, meta in zip(row_ids, rows, metas):
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            unique_ids.append(row_id)
+            unique_rows.append(row)
+            unique_metas.append(meta)
+        rows[:] = unique_rows
+        metas[:] = unique_metas
+        row_ids = unique_ids
         return self.answer_list_model.replace_visible_page(list(zip(row_ids, rows)), selected_id=selected_id)
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
@@ -5031,7 +5051,10 @@ class ChatFrame(wx.Frame):
             selected_idx = None
         changed = self._replace_answer_list_rows(rows, metas, selected_idx)
         self.answer_meta = metas
-        self._active_answer_row_index = active_idx
+        self._active_answer_row_index = next(
+            (idx for idx, meta in enumerate(metas) if meta == active_meta),
+            -1,
+        ) if active_meta is not None else active_idx
         if changed:
             self._request_listbox_repaint(self.answer_list)
         if mode == "execution" and refresh_execution:
@@ -16771,7 +16794,14 @@ class ChatFrame(wx.Frame):
         if not title:
             title = self._next_default_chat_title()
         created = self.active_session_started_at or time.time()
-        archived_id = str(self.active_chat_id or self.current_chat_id or uuid.uuid4())
+        archived_id = next(
+            (
+                normalized
+                for candidate in (self.active_chat_id, self.current_chat_id)
+                if (normalized := str(candidate or "").strip())
+            ),
+            str(uuid.uuid4()),
+        )
         archived = {
             "id": archived_id,
             "title": title,
@@ -16821,7 +16851,28 @@ class ChatFrame(wx.Frame):
         archived["turns"] = turns_snapshot
         if "context_usage" in self._current_chat_state:
             archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
-        self.archived_chats.append(archived)
+        existing_matches = [
+            (idx, existing)
+            for idx, existing in enumerate(self.archived_chats)
+            if isinstance(existing, dict) and str(existing.get("id") or "").strip() == archived_id
+        ]
+        if not existing_matches:
+            self.archived_chats.append(archived)
+        else:
+            existing_index, existing = existing_matches[0]
+            preserved = dict(existing)
+            preserved.update(archived)
+            archived = preserved
+            archived["pinned"] = bool(existing.get("pinned"))
+            self.archived_chats = [
+                archived if idx == existing_index else existing_chat
+                for idx, existing_chat in enumerate(self.archived_chats)
+                if idx == existing_index
+                or not (
+                    isinstance(existing_chat, dict)
+                    and str(existing_chat.get("id") or "").strip() == archived_id
+                )
+            ]
         if not use_chat_store:
             self._mark_chat_turns_dirty(archived_id, 0)
         self._sort_archived_chats()
@@ -17428,10 +17479,14 @@ class ChatFrame(wx.Frame):
             "model_value": self.model_combo.GetValue(),
             "answer_strings": list(self.answer_list.GetStrings()),
             "answer_meta": copy.deepcopy(self.answer_meta),
+            "answer_visible_ids": list(self.answer_list_model.visible_ids),
+            "answer_labels_by_id": dict(self.answer_list_model.labels_by_id),
             "answer_selection": self.answer_list.GetSelection(),
             "history_selection": self.history_list.GetSelection(),
             "history_strings": list(self.history_list.GetStrings()),
             "history_ids": list(self.history_ids),
+            "history_visible_ids": list(self.history_list_model.visible_ids),
+            "history_labels_by_id": dict(self.history_list_model.labels_by_id),
             "focus": focus,
             "provider_state": {name: copy.deepcopy(getattr(self, name, None)) for name in provider_fields},
         }
@@ -17456,11 +17511,15 @@ class ChatFrame(wx.Frame):
         self.model_combo.SetValue(snapshot["model_value"])
         self.answer_meta = snapshot["answer_meta"]
         self.answer_list.Set(snapshot["answer_strings"])
+        self.answer_list_model.visible_ids = list(snapshot["answer_visible_ids"])
+        self.answer_list_model.labels_by_id = dict(snapshot["answer_labels_by_id"])
         answer_selection = snapshot["answer_selection"]
         if answer_selection != wx.NOT_FOUND and answer_selection < self.answer_list.GetCount():
             self.answer_list.SetSelection(answer_selection)
         self.history_ids = snapshot["history_ids"]
         self.history_list.Set(snapshot["history_strings"])
+        self.history_list_model.visible_ids = list(snapshot["history_visible_ids"])
+        self.history_list_model.labels_by_id = dict(snapshot["history_labels_by_id"])
         history_selection = snapshot["history_selection"]
         if history_selection != wx.NOT_FOUND and history_selection < self.history_list.GetCount():
             self.history_list.SetSelection(history_selection)
@@ -17694,15 +17753,25 @@ class ChatFrame(wx.Frame):
         return self._activate_selected_history()
 
     def _find_archived_chat(self, chat_id):
+        normalized = str(chat_id or "").strip()
+        if not normalized:
+            return None
         for c in self.archived_chats:
-            if c.get("id") == chat_id:
+            if isinstance(c, dict) and str(c.get("id") or "").strip() == normalized:
                 return c
         return None
 
     def _get_all_chat_ids_in_order(self):
         """Get all chat IDs in order: current chat first, then archived chats sorted by updated_at descending."""
         all_ids = []
-        current_id = self.current_chat_id or self.active_chat_id
+        current_id = next(
+            (
+                normalized
+                for candidate in (self.current_chat_id, self.active_chat_id)
+                if (normalized := str(candidate or "").strip())
+            ),
+            "",
+        )
         if current_id:
             all_ids.append(current_id)
         # Sort archived chats by updated_at descending, with pinned chats first
@@ -17711,8 +17780,8 @@ class ChatFrame(wx.Frame):
             key=lambda c: (-c.get("pinned", False), -c.get("updated_at", 0))
         )
         for c in sorted_archived:
-            cid = c.get("id")
-            if cid and cid != current_id:
+            cid = str(c.get("id") or "").strip()
+            if cid and cid != current_id and cid not in all_ids:
                 all_ids.append(cid)
         return all_ids
 
@@ -17743,7 +17812,8 @@ class ChatFrame(wx.Frame):
 
     def _switch_current_chat(self, chat_id: str) -> bool:
         """Switch to a different chat."""
-        if chat_id == self.current_chat_id:
+        chat_id = str(chat_id or "").strip()
+        if chat_id == str(self.current_chat_id or "").strip():
             return True
         self._flush_relevant_execution_deltas_for_switch()
         chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id), include_execution_steps=False)
@@ -17817,7 +17887,10 @@ class ChatFrame(wx.Frame):
             self.model_combo.SetValue(model_display_name(self.selected_model))
             self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         # Remove from archived chats since it's now active
-        self.archived_chats = [c for c in self.archived_chats if c.get("id") != chat_id]
+        self.archived_chats = [
+            c for c in self.archived_chats
+            if str((c or {}).get("id") or "").strip() != chat_id
+        ]
         self._reset_answer_visible_row_limit()
         self._reset_execution_visible_row_limit()
         self._render_answer_list()
@@ -19518,12 +19591,19 @@ class ChatFrame(wx.Frame):
         target_chat = self._history_chat_for_id(cid)
         if target_chat:
             self._cleanup_chat_detail_pages(target_chat)
-        self.archived_chats = [c for c in self.archived_chats if c.get("id") != cid]
-        self._delete_chat_from_store(cid)
-        if self.view_history_id == cid:
+        normalized_cid = str(cid or "").strip()
+        self.archived_chats = [
+            c for c in self.archived_chats
+            if str((c or {}).get("id") or "").strip() != normalized_cid
+        ]
+        self._delete_chat_from_store(str((target_chat or {}).get("id") or cid))
+        if str(self.view_history_id or "").strip() == normalized_cid:
             self.view_mode = "active"
             self.view_history_id = None
-        if cid == self.current_chat_id or cid == self.active_chat_id:
+        if normalized_cid in {
+            str(self.current_chat_id or "").strip(),
+            str(self.active_chat_id or "").strip(),
+        }:
             self.current_chat_id = ""
             self.active_chat_id = ""
             self.active_session_turns = []
@@ -19572,7 +19652,9 @@ class ChatFrame(wx.Frame):
         removed_ids = [str(c.get("id") or "").strip() for c in self.archived_chats if not c.get("pinned")]
         self.archived_chats = [c for c in self.archived_chats if c.get("pinned")]
         self._delete_chats_from_store(removed_ids)
-        if self.view_mode == "history" and self.view_history_id not in {str(c.get("id")) for c in self.archived_chats}:
+        if self.view_mode == "history" and str(self.view_history_id or "").strip() not in {
+            str(c.get("id") or "").strip() for c in self.archived_chats
+        }:
             self.view_mode = "active"
             self.view_history_id = None
         self._save_state()

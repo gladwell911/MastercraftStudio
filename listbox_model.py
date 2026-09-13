@@ -37,11 +37,14 @@ class IncrementalListBoxModel:
         return True
 
     def replace_visible_page(self, rows: list[tuple[str, str]], selected_id: str | None = None) -> bool:
-        normalized_rows = [
-            (self._normalize_id(item_id), self._normalize_label(label))
-            for item_id, label in rows
-            if self._normalize_id(item_id)
-        ]
+        normalized_rows = []
+        seen_ids = set()
+        for item_id, label in rows:
+            normalized_id = self._normalize_id(item_id)
+            if not normalized_id or normalized_id in seen_ids:
+                continue
+            seen_ids.add(normalized_id)
+            normalized_rows.append((normalized_id, self._normalize_label(label)))
         ids = [item_id for item_id, _label in normalized_rows]
         labels = {item_id: label for item_id, label in normalized_rows}
         current_labels = [self.labels_by_id.get(item_id, "") for item_id in self.visible_ids]

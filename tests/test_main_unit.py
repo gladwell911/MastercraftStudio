@@ -13204,6 +13204,42 @@ def test_archive_active_session_uses_updated_at_for_recency_sort(frame):
     assert [chat["id"] for chat in frame.archived_chats] == ["chat-recent", "chat-old"]
 
 
+def test_archive_active_session_upserts_normalized_id_and_preserves_pinned(frame):
+    frame.archived_chats = [
+        {
+            "id": "chat-current",
+            "title": "stale summary",
+            "pinned": True,
+            "turns": [{"question": "stale", "answer_md": "stale"}],
+            "created_at": 1.0,
+            "updated_at": 1.0,
+        },
+        {"id": " chat-current ", "title": "duplicate", "pinned": False, "duplicate_only": True},
+    ]
+    current_turns = [{"question": "current", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}]
+    frame.active_chat_id = "   "
+    frame.current_chat_id = " chat-current "
+    frame.active_session_turns = current_turns
+    frame.active_session_started_at = 2.0
+    frame._current_chat_state.update(
+        {"id": " chat-current ", "title": "current title", "turns": current_turns, "updated_at": 3.0}
+    )
+
+    archived = frame._archive_active_session(
+        quick_title=True,
+        schedule_async_rename=False,
+        save_after_archive=False,
+        refresh_lifecycle_after_archive=False,
+    )
+
+    assert archived["id"] == "chat-current"
+    assert archived["pinned"] is True
+    assert archived["title"] == "current title"
+    assert archived["turns"] == current_turns
+    assert "duplicate_only" not in archived
+    assert [str(chat.get("id") or "").strip() for chat in frame.archived_chats] == ["chat-current"]
+
+
 def test_load_chat_as_current_coerces_string_title_manual_false(frame):
     frame._load_chat_as_current(
         {
@@ -13357,6 +13393,195 @@ def test_refresh_history_normalizes_legacy_placeholder_title(frame):
     frame._refresh_history()
 
     assert list(frame.history_list.GetStrings()) == ["心聊天"]
+
+
+def test_refresh_history_deduplicates_normalized_ids_with_current_first(frame):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": []}
+    frame.archived_chats = [
+        {"id": " chat-current ", "title": "stale current", "updated_at": 9.0},
+        {"id": " chat-old ", "title": "first old", "updated_at": 8.0},
+        {"id": "chat-old", "title": "later old", "updated_at": 7.0},
+        {"id": "", "title": "empty", "updated_at": 6.0},
+    ]
+
+    frame._refresh_history(" chat-old ")
+
+    assert frame.history_ids == ["chat-current", "chat-old"]
+    assert list(frame.history_list.GetStrings()) == ["current", "first old"]
+    assert frame.history_list.GetSelection() == 1
+
+
+def test_padded_legacy_history_row_supports_activate_pin_rename_and_delete(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": []}
+    frame.archived_chats = [
+        {"id": " chat-activate ", "title": "activate", "turns": [], "updated_at": 4.0},
+        {"id": " chat-pin ", "title": "pin", "turns": [], "updated_at": 3.0},
+        {"id": " chat-rename ", "title": "rename", "turns": [], "updated_at": 2.0},
+        {"id": " chat-delete ", "title": "delete", "turns": [], "updated_at": 1.0},
+    ]
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_confirm", lambda *args, **kwargs: True)
+    frame._refresh_history(" chat-activate ")
+
+    assert frame._activate_selected_history() is True
+    assert frame.view_history_id == "chat-activate"
+
+    frame.history_list.SetSelection(frame.history_ids.index("chat-pin"))
+    frame._history_pin(None)
+    assert frame._find_archived_chat("chat-pin")["pinned"] is True
+
+    class _Dialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ShowModal(self):
+            return main.wx.ID_OK
+
+        def get_value(self):
+            return "renamed"
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(main, "RenameDialog", _Dialog)
+    frame.history_list.SetSelection(frame.history_ids.index("chat-rename"))
+    frame._history_rename(None)
+    assert frame._find_archived_chat("chat-rename")["title"] == "renamed"
+
+    frame.history_list.SetSelection(frame.history_ids.index("chat-delete"))
+    frame._history_delete(None)
+    assert frame._find_archived_chat("chat-delete") is None
+
+
+def test_load_state_keeps_current_summary_but_projects_one_history_row(frame, monkeypatch):
+    frame.state_path.write_text(
+        json.dumps(
+            {
+                "selected_model_id": main.DEFAULT_CODEX_MODEL,
+                "active_chat_id": "chat-current",
+                "active_chat": {"id": "chat-current", "title": "current", "turns": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        frame.chat_store,
+        "list_chat_summaries",
+        lambda: [
+            {"id": " chat-current ", "title": "summary current", "updated_at": 2.0},
+            {"id": "chat-old", "title": "old", "updated_at": 1.0},
+        ],
+    )
+    monkeypatch.setattr(frame.chat_store, "load_turns", lambda chat_id: [])
+
+    frame._load_state()
+    frame._refresh_history("chat-current")
+
+    assert len(frame.archived_chats) == 2
+    assert frame.history_ids == ["chat-current", "chat-old"]
+    assert frame.history_list.GetCount() == 2
+
+
+def test_restored_current_new_chat_first_send_has_unique_history_and_one_worker(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    starts = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: starts.append(args))
+
+    class _NoOpThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+    restored_turns = [{"question": "restored q", "answer_md": "restored a", "model": main.DEFAULT_CODEX_MODEL}]
+    frame.active_chat_id = "chat-restored"
+    frame.current_chat_id = "chat-restored"
+    frame.active_session_turns = restored_turns
+    frame._current_chat_state = {
+        "id": "chat-restored", "title": "restored", "turns": restored_turns, "updated_at": 2.0
+    }
+    frame.archived_chats = [
+        {"id": " chat-restored ", "title": "stale restored", "pinned": True, "updated_at": 1.0}
+    ]
+
+    frame._on_new_chat_clicked(None)
+    new_chat_id = frame.active_chat_id
+    ok, message = frame._submit_question("first question", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert (ok, message) == (True, "")
+    assert len(starts) == 1
+    assert len(frame.active_session_turns) == 1
+    assert frame.active_session_turns[0]["question"] == "first question"
+    assert frame.input_edit.HasFocus()
+    frame._refresh_history(new_chat_id)
+    assert len(frame.history_ids) == len(set(frame.history_ids))
+    assert frame.history_ids.count("chat-restored") == 1
+
+
+def test_failed_submit_restores_native_rows_models_selection_and_allows_retry(frame, monkeypatch):
+    frame.active_session_turns = [{"question": "old", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame._render_answer_list()
+    frame.archived_chats = [{"id": "chat-old", "title": "old", "turns": [], "updated_at": 1.0}]
+    frame._refresh_history(frame.active_chat_id)
+    frame.answer_list.SetSelection(frame.answer_list.GetCount() - 1)
+    frame.history_list.SetSelection(frame.history_ids.index("chat-old"))
+    frame.input_edit.ChangeValue("retry me")
+    frame.input_edit.SetFocus()
+    expected_answer_strings = list(frame.answer_list.GetStrings())
+    original_answer_ids = list(frame.answer_list_model.visible_ids)
+    expected_answer_labels = dict(frame.answer_list_model.labels_by_id)
+    expected_answer_selection = frame.answer_list.GetSelection()
+    expected_history_strings = list(frame.history_list.GetStrings())
+    original_history_ids = list(frame.history_list_model.visible_ids)
+    expected_history_labels = dict(frame.history_list_model.labels_by_id)
+    expected_history_selection = frame.history_list.GetSelection()
+    calls = []
+
+    def flaky_submit(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            frame.answer_list.Set(["partial answer"])
+            frame.answer_list_model.visible_ids = ["partial"]
+            frame.answer_list_model.labels_by_id = {"partial": "partial answer"}
+            frame.history_list.Set(["partial history"])
+            frame.history_list_model.visible_ids = ["partial"]
+            frame.history_list_model.labels_by_id = {"partial": "partial history"}
+            return False, "failed"
+        return True, ""
+
+    monkeypatch.setattr(frame, "_submit_question", flaky_submit)
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *args, **kwargs: main.wx.ID_OK)
+
+    assert frame._request_question_submit(require_focus=False) is False
+    assert list(frame.answer_list.GetStrings()) == expected_answer_strings
+    assert frame.answer_list_model.visible_ids == original_answer_ids
+    assert frame.answer_list_model.labels_by_id == expected_answer_labels
+    assert frame.answer_list.GetSelection() == expected_answer_selection
+    assert list(frame.history_list.GetStrings()) == expected_history_strings
+    assert frame.history_list_model.visible_ids == original_history_ids
+    assert frame.history_list_model.labels_by_id == expected_history_labels
+    assert frame.history_list.GetSelection() == expected_history_selection
+    assert frame.history_ids == original_history_ids
+    assert frame.input_edit.GetValue() == "retry me"
+    frame.archived_chats[0]["title"] = "old updated"
+    assert frame._upsert_history_row("chat-old", allow_reorder=False) is True
+    assert frame.history_ids == frame.history_list_model.visible_ids
+    assert len(frame.history_ids) == len(set(frame.history_ids)) == frame.history_list.GetCount()
+    assert list(frame.history_list.GetStrings()) == [
+        frame.history_list_model.labels_by_id[item_id] for item_id in frame.history_ids
+    ]
+    assert frame._request_question_submit(require_focus=False) is True
+    assert len(calls) == 2
 
 
 def test_generate_first_question_title_retries_three_times_then_keeps_default(frame, monkeypatch):

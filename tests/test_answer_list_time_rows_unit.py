@@ -202,3 +202,53 @@ def test_incremental_appends_insert_time_row_once(frame):
     assert frame._append_submitted_question_to_answer_list(1, turn1) is True
     kinds = [meta[0] for meta in frame.answer_meta]
     assert kinds == ["time", "user", "question", "ai", "answer", "user", "question"]
+
+
+def test_answer_list_shared_model_rejects_duplicate_and_empty_id_rows(frame):
+    changed = frame.answer_list_model.replace_visible_page(
+        [(" answer:1 ", "first"), ("", "empty"), ("answer:1", "later"), ("answer:2", "second")],
+        selected_id="answer:2",
+    )
+
+    assert changed is True
+    assert frame.answer_list_model.visible_ids == ["answer:1", "answer:2"]
+    assert list(frame.answer_list.GetStrings()) == ["first", "second"]
+    assert frame.answer_list.GetSelection() == 1
+
+    assert frame.answer_list_model.replace_visible_page(
+        [("answer:1", "first"), (" answer:1 ", "ignored"), ("answer:2", "second")],
+        selected_id="answer:2",
+    ) is False
+
+
+def test_duplicate_attachment_identity_keeps_rows_metadata_and_model_aligned(frame, tmp_path):
+    attachment_path = tmp_path / "same.txt"
+    attachment = {
+        "name": "same.txt",
+        "path": str(attachment_path),
+        "open_path": str(attachment_path),
+        "status": "success",
+    }
+    frame.active_session_turns = [
+        {
+            "question": "attachments",
+            "answer_md": "answer",
+            "model": "openai/gpt-5.2",
+            "created_at": time.time(),
+            "attachments": [dict(attachment), {**attachment, "name": "later.txt"}],
+        }
+    ]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+
+    frame._render_answer_list()
+
+    attachment_metas = [meta for meta in frame.answer_meta if meta[0] == "attachment"]
+    assert len(attachment_metas) == 1
+    assert "same.txt" in attachment_metas[0][2]
+    assert "later.txt" not in attachment_metas[0][2]
+    assert frame.answer_list.GetCount() == len(frame.answer_meta)
+    assert frame.answer_list.GetCount() == len(frame.answer_list_model.visible_ids)
+    assert len(frame.answer_list_model.visible_ids) == len(set(frame.answer_list_model.visible_ids))
+    assert list(frame.answer_list.GetStrings()) == [
+        frame.answer_list_model.labels_by_id[item_id] for item_id in frame.answer_list_model.visible_ids
+    ]

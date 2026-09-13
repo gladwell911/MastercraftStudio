@@ -64,6 +64,69 @@ def test_history_navigation_stays_stable_when_background_chat_title_updates(fram
     assert frame.history_list.GetString(1)
 
 
+def test_restored_chat_new_chat_first_send_keeps_unique_real_wx_rows_and_input_focus(
+    frame, wx_app, monkeypatch
+):
+    frame.Show()
+    frame.active_chat_id = "chat-restored"
+    frame.current_chat_id = "chat-restored"
+    restored_turns = [{"question": "old q", "answer_md": "old a", "model": main.DEFAULT_CODEX_MODEL}]
+    frame.active_session_turns = restored_turns
+    frame._current_chat_state = {
+        "id": "chat-restored", "title": "restored", "turns": restored_turns, "updated_at": 2.0
+    }
+    frame.archived_chats = [
+        {"id": " chat-restored ", "title": "stale restored", "pinned": True, "updated_at": 1.0}
+    ]
+    starts = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: starts.append(args))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+
+    class _NoOpThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    frame._on_new_chat_clicked(None)
+    new_chat_id = frame.active_chat_id
+    ok, message = frame._submit_question("first question", source="local", model=main.DEFAULT_CODEX_MODEL)
+    wx_app.Yield()
+
+    assert (ok, message) == (True, "")
+    assert len(starts) == 1
+    assert len(frame.active_session_turns) == 1
+    assert frame.input_edit.HasFocus()
+    frame._refresh_history(new_chat_id)
+    assert frame.history_list.GetCount() == len(frame.history_ids)
+    assert len(frame.history_ids) == len(set(frame.history_ids))
+    assert frame.history_ids.count("chat-restored") == 1
+
+    ok, message = frame._submit_question("later question", source="local", model=main.DEFAULT_CODEX_MODEL)
+    assert (ok, message) == (True, "")
+    assert len(frame.active_session_turns) == 2
+    assert len(starts) == 2
+    assert frame.input_edit.HasFocus()
+
+    frame._on_new_chat_clicked(None)
+    final_chat_id = frame.active_chat_id
+    ok, message = frame._submit_question("another first question", source="local", model=main.DEFAULT_CODEX_MODEL)
+    wx_app.Yield()
+
+    assert (ok, message) == (True, "")
+    assert len(frame.active_session_turns) == 1
+    assert len(starts) == 3
+    assert frame.input_edit.HasFocus()
+    frame._refresh_history(final_chat_id)
+    assert frame.history_list.GetCount() == len(frame.history_ids)
+    assert len(frame.history_ids) == len(set(frame.history_ids))
+
+
 def test_ui_automation_space_from_history_moves_focus_to_input_without_activating_history(frame, wx_app, monkeypatch):
     frame.Show()
     frame.Raise()
