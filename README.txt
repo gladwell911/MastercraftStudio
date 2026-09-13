@@ -48,6 +48,8 @@ Kimi 的回答列表只在主代理最终正文获得权威完成确认后更新
 python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_model_dispatch.py -q
 ```
 
+手机端跨端回归由 `D:\code\sj\rc\scripts\run_cross_client_regression.ps1` 统一执行。日常修改使用 `-Mode Local`，它启动本仓库的隔离 strict-V2 夹具并验证手机 UI 的桌面聊天列表、`codex/main` 与 `kimi/main` 往返；发布前使用 `-Mode Live` 检查真实 Cloudflare/NATS 和已登录的桌面 provider。完整前置条件与命令见 RC 的 `docs/current/testing.md`。
+
 ## 执行过程与键盘浏览
 
 - F1 在回答与执行过程之间切换；进入执行过程时定位最新项。若历史页尚在加载，会显示“正在加载执行过程”；加载期间切到其他控件，完成后不会抢回焦点。

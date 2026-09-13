@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 隔离 strict-V2 跨端夹具
+
+- 经验：本地跨端回归也必须从隔离 `ChatStore` 的 canonical message 提交 durable fact，再调用生产 outbox drain；不能直接发布 fake/legacy `final_answer` 证明 V2。
+- 为什么重要：这样才能同时覆盖 hello 协商、历史/模型命令、canonical 引用和手机端真实投影，避免“能收到假消息”被误报为协议可用。
+- 下次怎么用：每轮生成唯一聊天、prompt 和回答 marker，使用 `10.0.2.2` 连接模拟器；固定端口均占用时选择临时 loopback 端口，不要停止正常桌面服务。
+
 ## Canonical 通知事实与 connected E2E
 
 - 经验：通知正文必须由同一事务内的 canonical chat/message 行派生并提交，native 消费端再重算 canonical hash；调用方不能直接提供展示标题或正文。
