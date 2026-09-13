@@ -13268,6 +13268,36 @@ def test_submit_question_sets_auto_title_from_first_question(frame, monkeypatch)
     assert frame._current_chat_state["title_source"] == "auto"
 
 
+def test_submit_question_continues_when_chat_title_rules_are_missing(frame, monkeypatch, tmp_path):
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_save_state", lambda: None)
+    monkeypatch.setattr(main, "_CHAT_TITLE_RULES_CACHE", None)
+    monkeypatch.setattr(main, "shared_chat_title_rules_path", lambda: tmp_path / "missing.json")
+    frame.active_session_turns = []
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "title": "新聊天",
+        "title_manual": False,
+        "turns": frame.active_session_turns,
+    }
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            pass
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+
+    ok, message = frame._submit_question("缺少标题规则也要发送", source="local", model=main.DEFAULT_CODEX_MODEL)
+
+    assert ok is True
+    assert message == ""
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+
+
 def test_submit_question_renames_placeholder_history_chat_immediately(frame, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
@@ -14174,8 +14204,48 @@ def test_load_chat_title_rules_reads_shared_json(tmp_path):
     assert rules["leading_phrases"] == ["绝对前缀"]
 
 
+@pytest.mark.parametrize("content", [None, b"\xff", b"not-json", b"[]", b'{"leading_phrases": null}'])
+def test_load_chat_title_rules_failure_falls_back_to_empty_rules(tmp_path, content):
+    path = tmp_path / "chat_title_rules.json"
+    if content is not None:
+        path.write_bytes(content)
+
+    rules = main.load_chat_title_rules(path=path, refresh=True)
+
+    assert rules == {
+        "leading_phrases": [],
+        "action_prefixes": [],
+        "what_is_prefixes": [],
+        "question_suffixes": [],
+        "trailing_punctuation": [],
+    }
+
+
+def test_load_chat_title_rules_retries_after_default_file_read_failure(monkeypatch, tmp_path):
+    path = tmp_path / "chat_title_rules.json"
+    monkeypatch.setattr(main, "_CHAT_TITLE_RULES_CACHE", None)
+    monkeypatch.setattr(main, "shared_chat_title_rules_path", lambda: path)
+
+    assert main.load_chat_title_rules()["leading_phrases"] == []
+    path.write_text('{"leading_phrases": ["后来可用"]}', encoding="utf-8")
+
+    assert main.load_chat_title_rules()["leading_phrases"] == ["后来可用"]
+
+
 def test_shared_chat_title_rules_path_points_to_repo_assets():
-    assert main.shared_chat_title_rules_path() == Path(r"c:\code\rc\assets\chat_title_rules.json")
+    expected = Path(main.__file__).resolve().parents[1] / "rc" / "assets" / "chat_title_rules.json"
+    assert main.shared_chat_title_rules_path() == expected
+
+
+def test_shared_chat_title_rules_path_frozen_uses_bundled_asset(monkeypatch, tmp_path):
+    bundled_root = tmp_path / "_internal"
+    bundled_rules = bundled_root / "assets" / "chat_title_rules.json"
+    bundled_rules.parent.mkdir(parents=True)
+    bundled_rules.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(main.sys, "_MEIPASS", str(bundled_root), raising=False)
+
+    assert main.shared_chat_title_rules_path() == bundled_rules
 
 
 def test_load_state_restores_notes_ui_state(frame, tmp_path):

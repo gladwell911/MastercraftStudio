@@ -368,6 +368,9 @@ _CHAT_TITLE_RULES_CACHE: dict | None = None
 
 
 def shared_chat_title_rules_path() -> Path:
+    if getattr(sys, "frozen", False):
+        bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        return bundle_root / "assets" / "chat_title_rules.json"
     current = Path(__file__).resolve()
     seen: set[Path] = set()
     for base in [current.parent, *current.parents, Path.cwd().resolve(), *Path.cwd().resolve().parents]:
@@ -378,7 +381,7 @@ def shared_chat_title_rules_path() -> Path:
         candidate = base / "rc" / "assets" / "chat_title_rules.json"
         if candidate.exists():
             return candidate
-    return current.parents[2] / "rc" / "assets" / "chat_title_rules.json"
+    return current.parent / "assets" / "chat_title_rules.json"
 
 
 def load_chat_title_rules(path: Path | None = None, *, refresh: bool = False) -> dict:
@@ -386,15 +389,33 @@ def load_chat_title_rules(path: Path | None = None, *, refresh: bool = False) ->
     target = Path(path) if path is not None else shared_chat_title_rules_path()
     if _CHAT_TITLE_RULES_CACHE is not None and not refresh and path is None:
         return _CHAT_TITLE_RULES_CACHE
-    data = json.loads(target.read_text(encoding="utf-8"))
-    rules = {
-        "leading_phrases": [str(item) for item in data.get("leading_phrases", []) if str(item).strip()],
-        "action_prefixes": [str(item) for item in data.get("action_prefixes", []) if str(item).strip()],
-        "what_is_prefixes": [str(item) for item in data.get("what_is_prefixes", []) if str(item).strip()],
-        "question_suffixes": [str(item) for item in data.get("question_suffixes", []) if str(item).strip()],
-        "trailing_punctuation": [str(item) for item in data.get("trailing_punctuation", []) if str(item).strip()],
+    rule_fields = (
+        "leading_phrases",
+        "action_prefixes",
+        "what_is_prefixes",
+        "question_suffixes",
+        "trailing_punctuation",
+    )
+    valid_document = False
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        valid_document = isinstance(data, dict) and all(
+            field not in data or isinstance(data[field], list)
+            for field in rule_fields
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    values = {
+        field: data.get(field) if isinstance(data.get(field), list) else []
+        for field in rule_fields
     }
-    if path is None:
+    rules = {
+        field: [str(item) for item in values[field] if str(item).strip()]
+        for field in rule_fields
+    }
+    if path is None and valid_document:
         _CHAT_TITLE_RULES_CACHE = rules
     return rules
 

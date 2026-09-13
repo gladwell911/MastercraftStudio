@@ -7,6 +7,9 @@ from PyInstaller.utils.hooks import collect_submodules
 nats_server = Path("tools/nats-server/nats-server.exe")
 nats_datas = [(str(nats_server), "nats-server")] if nats_server.exists() else []
 nats_hiddenimports = collect_submodules("nats")
+chat_title_rules = Path("assets/chat_title_rules.json")
+if not chat_title_rules.is_file():
+    raise FileNotFoundError(f"Required chat title rules not found: {chat_title_rules.resolve()}")
 
 
 a = Analysis(
@@ -19,6 +22,7 @@ a = Analysis(
     datas=[
         ('sound', 'sound'),
         ('ZDSRAPI.ini', '.'),
+        ('assets/chat_title_rules.json', 'assets'),
     ] + nats_datas,
     hiddenimports=[
         'aiohttp',

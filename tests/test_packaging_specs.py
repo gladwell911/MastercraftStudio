@@ -31,6 +31,14 @@ def test_default_pyinstaller_spec_does_not_bundle_runtime_history():
     assert "('dist/history', 'history')" not in spec_text
 
 
+def test_default_pyinstaller_spec_bundles_chat_title_rules():
+    root = Path(__file__).resolve().parents[1]
+    for spec_name in ("ZhugeQA_A11y.spec", "zgwd.spec"):
+        spec_text = (root / spec_name).read_text(encoding="utf-8")
+
+        assert "('assets/chat_title_rules.json', 'assets')" in spec_text
+
+
 def test_default_pyinstaller_spec_builds_separate_console_worker_executable():
     root = Path(__file__).resolve().parents[1]
     spec_text = (root / "zgwd.spec").read_text(encoding="utf-8")
