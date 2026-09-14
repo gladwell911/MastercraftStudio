@@ -1,5 +1,11 @@
 # 纠错反思
 
+## 2026-09-14 远程最终回答发布竞态
+
+| 修改内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 早期 provider callback 曾把“正在请求...”占位值发布为 canonical `assistant_final`；只过滤占位后又造成真实 final 未发布。 | 判断逻辑有问题 | 最终通知必须绑定到 turn 持久化完成时点，仅从 `request_status=done` 的持久化 `answer_md` 生成，并验证 pending→done 与 exactly-once。 |
+
 ## 2026-09-13 跨端回归夹具
 
 本轮无实质性用户纠错；实现中的 PowerShell 兼容性、token 脱敏和 UI marker 假阳性问题均在提交前的 diff 审查与实际试跑中发现并修正。

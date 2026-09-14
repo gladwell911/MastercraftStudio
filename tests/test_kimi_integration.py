@@ -308,8 +308,8 @@ def test_thinking_status_interleaving_creates_one_chinese_execution_step(frame, 
 
     steps = frame._current_chat_state.get("execution_steps") or []
     summaries = [step.get("list_text") for step in steps if step.get("kimi_summary")]
-    assert summaries == ["正在分析问题", "正在处理任务", "正在整理回答"]
-    assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["正在分析问题", "progress", "正在整理回答"]
+    assert summaries == ["正在分析问题", "progress", "答案"]
+    assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["正在分析问题", "progress", "答案"]
     assert not frame._execution_delta_buffer
     assert frame._kimi_turn_answer_parts[(_active_chat_id(frame), session_id, TEST_TURN_ID)] == ["答案"]
 
@@ -340,8 +340,91 @@ def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, m
         )
 
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == ["正在搜索内容", "正在读取文件", "正在执行测试", "正在调用子任务"]
+    assert [step["list_text"] for step in steps] == [
+        "正在执行搜索：Search source tree",
+        "正在执行读取文件：Read README.md",
+        "正在执行测试：Run tests",
+        "正在执行子任务：Delegate review",
+    ]
     assert [step["detail_text"] for step in steps] == ["开始执行：Search source tree", "开始执行：Read README.md", "开始执行：Run tests\n命令：pytest -q", "开始执行：Delegate review"]
+
+
+def test_kimi_tool_completion_updates_started_item_with_result_and_failure(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "运行命令")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(
+        type="item_started", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-command", title="Run checks", command="pytest -q",
+        display_kind="command", status="running",
+        data={"source_kind": "tool.call.started", "tool": {"name": "Shell"}},
+    ))
+    fake.push_event(KimiEvent(
+        type="item_completed", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-command", exit_code=2, text="two tests failed",
+        display_kind="command", status="failed",
+        data={"source_kind": "tool.result", "tool": {}},
+    ))
+
+    matching = [
+        step for step in frame._current_chat_state["execution_steps"]
+        if step.get("item_id") == "tool-command"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["list_text"] == "执行失败：Run checks"
+    assert "退出码：2" in matching[0]["detail_text"]
+    assert "two tests failed" in matching[0]["detail_text"]
+    frame._flush_execution_step_persists_sync()
+    stored = [step for step in frame.chat_store.load_execution_steps(_active_chat_id(frame)) if step.get("item_id") == "tool-command"]
+    assert len(stored) == 1
+    assert stored[0]["event_type"] == "item_completed"
+    assert stored[0]["status"] == "failed"
+    assert stored[0]["event_id"] != "tool-command"
+    assert "two tests failed" in stored[0]["detail_text"]
+
+
+def test_kimi_summary_normalizes_nested_exit_codes(frame):
+    success = frame._build_execution_entry(main.CodexEvent(
+        type="item_completed", item_id="tool-success", display_kind="command", status="completed",
+        data={"source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "0"}},
+    ))
+    failure = frame._build_execution_entry(main.CodexEvent(
+        type="item_completed", item_id="tool-failure", display_kind="command", status="completed",
+        data={"source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "3"}},
+    ))
+
+    assert success["exit_code"] == 0
+    assert "执行失败" not in success["list_text"]
+    assert failure["exit_code"] == 3
+    assert "执行失败" in failure["list_text"]
+
+
+def test_kimi_completion_does_not_overwrite_reused_item_id_from_another_turn(frame):
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [{"question": "one"}, {"question": "two"}],
+        "execution_steps": [{
+            "event_type": "item_started", "source_kind": "tool.call.started",
+            "thread_id": "session-a", "turn_id": "1", "turn_idx": 0,
+            "item_id": "reused", "_execution_uid": "started-uid", "list_text": "turn one",
+        }],
+    }
+    completion = {
+        "event_type": "item_completed", "source_kind": "tool.result",
+        "thread_id": "session-a", "turn_id": "2", "turn_idx": 1,
+        "item_id": "reused", "event_id": "reused", "list_text": "turn two complete", "detail_text": "done",
+    }
+
+    assert frame._append_execution_entry_to_chat("chat-current", completion, save_state=False)
+
+    steps = frame._current_chat_state["execution_steps"]
+    assert [step["turn_id"] for step in steps] == ["1", "2"]
+    assert steps[0]["_execution_uid"] == "started-uid"
+    assert steps[1]["_execution_uid"] != "started-uid"
+    assert steps[1]["event_id"] != "reused"
 
 
 def test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_steps(frame, monkeypatch):
@@ -365,7 +448,7 @@ def test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_st
             break
 
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == ["正在分析问题", "正在搜索内容"]
+    assert [step["list_text"] for step in steps] == ["正在分析问题", "已完成：Searching *.md"]
     assert "Searching *.md" in steps[-1]["detail_text"]
 
 
@@ -392,8 +475,8 @@ def test_mapped_assistant_delta_whitespace_is_preserved_in_answer_and_execution_
 
     assert frame.active_session_turns[-1]["answer_md"] == " leading trailing "
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == ["正在整理回答"]
-    assert [step["detail_text"] for step in steps] == ["正在整理回答"]
+    assert [step["list_text"] for step in steps] == ["leading", "trailing"]
+    assert [step["detail_text"] for step in steps] == [" leading", " trailing"]
 
 
 def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):

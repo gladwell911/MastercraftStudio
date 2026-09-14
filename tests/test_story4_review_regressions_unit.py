@@ -49,7 +49,7 @@ def test_push_remote_final_answer_commits_production_assistant_notification_fact
     store.initialize()
     store.upsert_chat({"id": "chat-final", "title": "Canonical final owner"})
     store.replace_turns(
-        "chat-final", [{"question": "Question", "answer_md": "Canonical final"}]
+            "chat-final", [{"question": "Question", "answer_md": "Canonical final", "request_status": "done"}]
     )
     frame = SimpleNamespace(
         chat_store=store,
@@ -63,6 +63,40 @@ def test_push_remote_final_answer_commits_production_assistant_notification_fact
     )
 
     assert "assistant_final" in _outbox_kinds(store)
+
+
+def test_persisted_assistant_final_waits_for_done_and_uses_canonical_answer(tmp_path):
+    store = ChatStore(tmp_path / "final-after-persist.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-race", "title": "Canonical race owner"})
+    frame = SimpleNamespace(
+        _chat_turn_dirty_from={"chat-race": 0},
+        _remote_nats_transport=_V2Transport(),
+        _current_chat_state={"id": "chat-race", "title": "untrusted UI title"},
+        archived_chats=[],
+    )
+    turns = [{
+        "question": "Question",
+        "answer_md": main.REQUESTING_TEXT,
+        "request_status": "pending",
+    }]
+
+    # An early provider callback may persist the placeholder first.  It must
+    # not consume the canonical assistant-final notification id.
+    main.ChatFrame._persist_dirty_chat_turns(frame, store, "chat-race", turns)
+    assert "assistant_final" not in _outbox_kinds(store)
+
+    turns[0].update(answer_md="Real final marker", request_status="done")
+    frame._chat_turn_dirty_from["chat-race"] = 0
+    main.ChatFrame._persist_dirty_chat_turns(frame, store, "chat-race", turns)
+
+    facts = [
+        json.loads(bytes(row["payload"]).decode("utf-8"))
+        for row in store.pending_outbox(pair_id="pair-production", domain="events")
+        if json.loads(bytes(row["payload"]).decode("utf-8"))["kind"] == "assistant_final"
+    ]
+    assert len(facts) == 1
+    assert facts[0]["body"]["text"] == "Real final marker"
 
 
 def test_slow_persistence_worker_defers_close_without_draining_under_live_sqlite_work():
@@ -91,6 +125,7 @@ def test_slow_persistence_worker_defers_close_without_draining_under_live_sqlite
         _execution_step_persist_thread=worker,
         _pending_execution_step_persists=[("chat-1", {"text": "pending"})],
         _execution_step_persist_scheduled=True,
+        _persist_execution_step=main.ChatFrame._persist_execution_step,
         chat_store=store,
     )
 

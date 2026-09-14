@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 最终通知以持久化 done turn 为唯一事实来源
+
+- 经验：provider callback、UI 占位文本和数据库持久化的到达顺序不稳定；在 callback 中直接发布 final 会产生占位终态或漏发真实终态。
+- 为什么重要：canonical message ID 一旦被错误 final 占用，后续真实答案会因幂等冲突消失；简单 return 又会导致没有 final。
+- 下次怎么用：先持久化 canonical turn，再从 `request_status=done` 的 `answer_md` 幂等提交 `assistant_final`；测试必须覆盖 pending 不发布、done 发布一次和重复保存。
+
 ## 隔离 strict-V2 跨端夹具
 
 - 经验：本地跨端回归也必须从隔离 `ChatStore` 的 canonical message 提交 durable fact，再调用生产 outbox drain；不能直接发布 fake/legacy `final_answer` 证明 V2。

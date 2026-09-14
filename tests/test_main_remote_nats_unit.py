@@ -76,6 +76,20 @@ def test_can_bind_loopback_tcp_port_returns_false_when_port_accepts_connections(
     assert frame._can_bind_loopback_tcp_port(4222) is False
 
 
+def test_existing_nats_websocket_probe_authenticates_with_configured_token(frame, monkeypatch):
+    seen = []
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda port: port == 18080)
+    monkeypatch.setattr(
+        frame,
+        "_verify_remote_public_ws",
+        lambda url: seen.append(url) or (True, ""),
+    )
+
+    assert frame._probe_remote_nats_websocket_port(18080, "secret value") is True
+    assert seen == ["ws://127.0.0.1:18080/nats?token=secret%20value"]
+    assert frame._probe_remote_nats_websocket_port(18080, "") is False
+
+
 def test_remote_nats_defaults_to_fixed_domain_when_host_is_unset(frame, monkeypatch):
     monkeypatch.setenv("REMOTE_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
@@ -189,10 +203,14 @@ def test_remote_nats_server_reuses_existing_nats_when_port_is_already_in_use(fra
 
     monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
     monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
+    def probe_existing(token):
+        started["probe_token"] = token
+        return 18080
+
     monkeypatch.setattr(
         frame,
         "_probe_existing_remote_nats_websocket_port",
-        lambda: 18080,
+        probe_existing,
         raising=False,
     )
 
@@ -203,6 +221,7 @@ def test_remote_nats_server_reuses_existing_nats_when_port_is_already_in_use(fra
     assert frame._remote_nats_transport is not None
     assert frame.remote_nats_runtime_status["enabled"] is True
     assert frame.remote_nats_runtime_status["last_error"] == ""
+    assert started["probe_token"] == "secret"
 
 
 def test_remote_nats_server_reuses_existing_nats_and_detects_live_websocket_port(frame, monkeypatch):
@@ -233,7 +252,7 @@ def test_remote_nats_server_reuses_existing_nats_and_detects_live_websocket_port
     monkeypatch.setattr(
         frame,
         "_probe_existing_remote_nats_websocket_port",
-        lambda: 18081,
+        lambda token: 18081,
         raising=False,
     )
     monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: started.setdefault("bridge", True))
@@ -269,7 +288,7 @@ def test_remote_nats_server_reuse_fails_when_existing_websocket_port_cannot_be_d
     monkeypatch.setattr(
         frame,
         "_probe_existing_remote_nats_websocket_port",
-        lambda: None,
+        lambda token: None,
         raising=False,
     )
 
@@ -354,7 +373,7 @@ def test_remote_nats_server_starts_fresh_runtime_on_fallback_tcp_port_when_reuse
 
     monkeypatch.setattr(main, "NatsServerProcess", _FakeNatsProcess)
     monkeypatch.setattr(main, "RemoteNatsTransport", _FakeNatsTransport)
-    monkeypatch.setattr(frame, "_probe_existing_remote_nats_websocket_port", lambda: 18080, raising=False)
+    monkeypatch.setattr(frame, "_probe_existing_remote_nats_websocket_port", lambda token: 18080, raising=False)
     monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: started.setdefault("bridge", True))
     monkeypatch.setattr(
         frame,

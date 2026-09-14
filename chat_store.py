@@ -1261,6 +1261,56 @@ class ChatStore:
                     ),
                 )
 
+    def replace_execution_lifecycle_step(self, chat_id: str, step: dict[str, Any]) -> bool:
+        normalized = str(chat_id or "").strip()
+        item_id = str((step or {}).get("item_id") or "").strip()
+        if not normalized or not item_id or str((step or {}).get("event_type") or "") != "item_completed":
+            return False
+        turn_value = self._optional_int(step.get("turn_idx"))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT step_index, payload_json FROM execution_steps WHERE chat_id = ? ORDER BY step_index",
+                (normalized,),
+            ).fetchall()
+            matches = []
+            for row in rows:
+                previous = self._json_dict(row["payload_json"])
+                if (
+                    str(previous.get("event_type") or "") in {"item_started", "agent_message_delta"}
+                    and str(previous.get("source_kind") or "").startswith(("tool.", "shell.", "subagent."))
+                    and str(previous.get("item_id") or "").strip() == item_id
+                    and self._optional_int(previous.get("turn_idx")) == turn_value
+                    and str(previous.get("thread_id") or "") == str(step.get("thread_id") or "")
+                    and str(previous.get("turn_id") or "") == str(step.get("turn_id") or "")
+                ):
+                    matches.append(int(row["step_index"]))
+            if not matches:
+                return False
+            first_index = matches[0]
+            conn.executemany(
+                "DELETE FROM execution_steps WHERE chat_id = ? AND step_index = ?",
+                [(normalized, index) for index in matches[1:]],
+            )
+            conn.execute(
+                """
+                UPDATE execution_steps
+                SET turn_idx=?, event_type=?, display_kind=?, list_text=?, detail_text=?, payload_json=?
+                WHERE chat_id=? AND step_index=?
+                """,
+                (
+                    turn_value,
+                    str(step.get("event_type") or ""),
+                    str(step.get("display_kind") or ""),
+                    str(step.get("list_text") or step.get("step") or ""),
+                    str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
+                    json.dumps(step, ensure_ascii=False),
+                    normalized,
+                    first_index,
+                ),
+            )
+        return True
+
     def replace_execution_steps(self, chat_id: str, steps: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:

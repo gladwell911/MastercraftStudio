@@ -244,7 +244,10 @@ def _can_bind_loopback_tcp_port(port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            sock.bind(("127.0.0.1", int(port)))
+            # The harness NATS listener binds all IPv4 interfaces. A
+            # loopback-only probe can select a port Windows then refuses for
+            # the actual wildcard listener.
+            sock.bind(("0.0.0.0", int(port)))
             return True
     except Exception:
         return False
@@ -264,7 +267,7 @@ def _choose_available_port(preferred_port: int, fallbacks: tuple[int, ...]) -> i
 def _allocate_ephemeral_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("0.0.0.0", 0))
         return int(sock.getsockname()[1])
 
 

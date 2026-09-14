@@ -1661,7 +1661,10 @@ class ChatFrame(wx.Frame):
         self._execution_list_deferred_repaint = False
         self._execution_list_deferred_select_latest = False
         self._pending_execution_step_persists = []
-        self._execution_step_persist_lock = threading.Lock()
+        # Tests and embedders may run the worker synchronously; re-entrancy
+        # keeps that execution mode from deadlocking while preserving the
+        # production thread hand-off.
+        self._execution_step_persist_lock = threading.RLock()
         self._execution_step_persist_scheduled = False
         self._execution_step_persist_worker_running = False
         self._execution_step_persist_thread = None
@@ -3274,6 +3277,12 @@ class ChatFrame(wx.Frame):
                             pair_id=transport.subjects.pair_id, domain="events",
                             chat_id=normalized, message_id=message_id,
                             projection_kind=kind)
+                        if role == "assistant" and str(turn.get("request_status") or "").strip() == "done":
+                            store.commit_message_notification_fact(
+                                pair_id=transport.subjects.pair_id, domain="events",
+                                chat_id=normalized, message_id=message_id,
+                                notification_kind="assistant_final", text=content,
+                                chat_title=chat_title, origin_client="mc")
                         if role == "user" and str(turn.get("question_origin") or "").strip() == "mc":
                             store.commit_message_notification_fact(
                                 pair_id=transport.subjects.pair_id,
@@ -6263,6 +6272,22 @@ class ChatFrame(wx.Frame):
         return str(data.get("source_kind") or "").startswith(("thinking.", "assistant.", "tool.", "shell.", "subagent."))
 
     @staticmethod
+    def _execution_exit_code(event: CodexEvent) -> int | None:
+        data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        value = getattr(event, "exit_code", None)
+        if value in (None, ""):
+            value = data.get("exitCode")
+        if value in (None, ""):
+            value = tool.get("exitCode")
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value) if value not in (None, "") else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
     def _kimi_execution_summary(event: CodexEvent) -> str:
         """Return the stable Chinese F1 label for a Kimi protocol event."""
         data = event.data if isinstance(getattr(event, "data", None), dict) else {}
@@ -6273,25 +6298,42 @@ class ChatFrame(wx.Frame):
         if display_kind == "thinking":
             return "正在分析问题"
         if display_kind == "assistant":
-            return "正在整理回答"
-        if event_type == "subagent_result" or display_kind == "agent":
-            return "正在调用子任务"
+            return str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "").strip() or "正在整理回答"
         tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        title = str(
+            getattr(event, "title", "")
+            or tool.get("description")
+            or tool.get("title")
+            or tool.get("name")
+            or ""
+        ).strip()
+        command = str(getattr(event, "command", "") or tool.get("command") or "").strip()
+        status = str(getattr(event, "status", "") or tool.get("status") or "").strip().lower()
+        exit_code = ChatFrame._execution_exit_code(event)
+        failed = status in {"failed", "error", "interrupted", "cancelled", "canceled"} or exit_code not in (None, "", 0)
+        phase = "执行失败" if failed else ("已完成" if event_type in {"item_completed", "subagent_result"} else "正在执行")
+        target = title or command
+        if event_type == "subagent_result" or display_kind == "agent":
+            return f"{phase}子任务：{target}" if target else f"{phase}子任务"
         tool_name = " ".join(
             str(tool.get(key) or "") for key in ("name", "title", "description", "kind", "toolKind")
         ).lower()
         if display_kind == "search" or any(name in tool_name for name in ("search", "grep", "glob", "find")):
-            return "正在搜索内容"
+            return f"{phase}搜索：{target}" if target else f"{phase}搜索"
         if display_kind in {"file", "diff"} or any(name in tool_name for name in ("read", "cat", "write", "edit", "patch")):
-            return "正在修改文件" if display_kind == "diff" or any(name in tool_name for name in ("write", "edit", "patch")) else "正在读取文件"
-        command = str(getattr(event, "command", "") or tool.get("command") or "").lower()
-        if "test" in command or "pytest" in command:
-            return "正在执行测试"
+            action = "修改文件" if display_kind == "diff" or any(name in tool_name for name in ("write", "edit", "patch")) else "读取文件"
+            return f"{phase}{action}：{target}" if target else f"{phase}{action}"
+        command_lower = command.lower()
+        if "test" in command_lower or "pytest" in command_lower:
+            return f"{phase}测试：{target}" if target else f"{phase}测试"
         if display_kind in {"command", "tool"} or any(name in tool_name for name in ("shell", "bash", "command", "powershell")):
-            return "正在执行命令"
+            label = f"{phase}命令：{target}" if target else f"{phase}命令"
+            return f"{label}（退出码：{exit_code}）" if event_type == "item_completed" and exit_code not in (None, "") else label
         if display_kind == "skill":
-            return "正在调用工具"
-        return "正在处理任务"
+            return f"{phase}工具：{target}" if target else f"{phase}工具"
+        if display_kind == "commentary":
+            return str(getattr(event, "text", "") or "").strip()
+        return f"{phase}任务：{target}" if target else f"{phase}任务"
 
     def _build_execution_entry(self, event: CodexEvent) -> dict | None:
         if not isinstance(event, CodexEvent):
@@ -6302,8 +6344,6 @@ class ChatFrame(wx.Frame):
         if not detail_text and not kimi_summary:
             return None
         event_type = str(getattr(event, "type", "") or "").strip()
-        if self._kimi_protocol_event(event) and display_kind == "tool" and event_type == "item_completed":
-            return None
         if display_kind == "error":
             detail_text = self._sanitize_execution_error_text(detail_text)
             if not detail_text:
@@ -6311,17 +6351,11 @@ class ChatFrame(wx.Frame):
         item = event.data if isinstance(event.data, dict) else {}
         title = str(getattr(event, "title", "") or item.get("title") or item.get("name") or item.get("label") or "").strip()
         command = str(getattr(event, "command", "") or item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
-        exit_code = getattr(event, "exit_code", None)
-        if exit_code in (None, ""):
-            exit_code = item.get("exitCode")
-        try:
-            exit_code = int(exit_code) if exit_code not in (None, "") else None
-        except (TypeError, ValueError):
-            exit_code = None
+        exit_code = self._execution_exit_code(event)
         subtype = str(getattr(event, "subtype", "") or item.get("type") or "").strip()
         phase = str(getattr(event, "phase", "") or "").strip()
         command_fallback = subtype or str(getattr(event, "status", "") or "").strip() or event_type
-        if kimi_summary and display_kind in {"thinking", "assistant"}:
+        if kimi_summary and display_kind == "thinking":
             detail_text = kimi_summary
         if kimi_summary:
             list_text = kimi_summary
@@ -6591,6 +6625,71 @@ class ChatFrame(wx.Frame):
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
+        if (
+            str(entry.get("event_type") or "") == "item_completed"
+            and str(entry.get("source_kind") or "").startswith(("tool.", "shell.", "subagent."))
+            and str(entry.get("item_id") or "").strip()
+        ):
+            entry = dict(entry)
+            completion_uid = uuid.uuid4().hex
+            entry["_execution_uid"] = completion_uid
+            entry["event_id"] = f"execution-{completion_uid}"
+        if str(entry.get("event_type") or "") == "item_completed" and str(entry.get("item_id") or "").strip():
+            compatible_indexes = []
+            for index, previous in enumerate(steps):
+                if not isinstance(previous, dict):
+                    continue
+                previous_type = str(previous.get("event_type") or "")
+                previous_source = str(previous.get("source_kind") or "")
+                if (
+                    previous_type in {"item_started", "agent_message_delta"}
+                    and previous_source.startswith(("tool.", "shell.", "subagent."))
+                    and str(previous.get("item_id") or "").strip() == str(entry.get("item_id") or "").strip()
+                    and self._safe_int(previous.get("turn_idx"), -1) == self._safe_int(entry.get("turn_idx"), -1)
+                    and str(previous.get("thread_id") or "") == str(entry.get("thread_id") or "")
+                    and str(previous.get("turn_id") or "") == str(entry.get("turn_id") or "")
+                ):
+                    compatible_indexes.append(index)
+            if compatible_indexes:
+                index = compatible_indexes[0]
+                previous = steps[index]
+                entry = dict(entry)
+                previous_timestamp = _execution_timestamp(previous)
+                if previous_timestamp is not None:
+                    entry["created_at"] = previous_timestamp
+                previous_title = str(previous.get("title") or "").strip()
+                previous_command = str(previous.get("command") or "").strip()
+                if not str(entry.get("title") or "").strip() and previous_title:
+                    entry["title"] = previous_title
+                if not str(entry.get("command") or "").strip() and previous_command:
+                    entry["command"] = previous_command
+                if entry.get("kimi_summary") and (previous_title or previous_command):
+                    failed = str(entry.get("status") or "").lower() in {
+                        "failed", "error", "interrupted", "cancelled", "canceled"
+                    } or entry.get("exit_code") not in (None, "", 0)
+                    target = previous_title or previous_command
+                    entry["list_text"] = f"{'执行失败' if failed else '已完成'}：{target}"
+                    entry["kimi_summary"] = entry["list_text"]
+                    details = [entry["list_text"]]
+                    if previous_command:
+                        details.append(f"命令：{previous_command}")
+                    if entry.get("exit_code") not in (None, ""):
+                        details.append(f"退出码：{entry['exit_code']}")
+                    result_text = str(entry.get("text") or "").strip()
+                    if result_text:
+                        details.append(result_text)
+                    entry["detail_text"] = "\n".join(details)
+                for remove_index in reversed(compatible_indexes):
+                    del steps[remove_index]
+                steps.insert(index, copy.deepcopy(entry))
+                resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
+                if resolved_chat_id:
+                    self._persist_execution_step_or_queue(resolved_chat_id, steps[index])
+                    self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[index]))
+                self._request_execution_list_sync(target_chat)
+                if save_state:
+                    self._defer_chat_state_save()
+                return True
         if steps and self._execution_entries_should_dedupe(steps[-1], entry):
             return False
         if not any(entry.get(key) for key in ("id", "event_id", "item_id")):
@@ -6625,9 +6724,17 @@ class ChatFrame(wx.Frame):
         if not chat_id or not isinstance(step, dict):
             return
         if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) <= 0:
-            self.chat_store.append_execution_step(chat_id, step)
+            self._persist_execution_step(self.chat_store, chat_id, step)
             return
         self._queue_execution_step_persist(chat_id, step)
+
+    @staticmethod
+    def _persist_execution_step(store, chat_id: str, step: dict) -> None:
+        replace_lifecycle = getattr(store, "replace_execution_lifecycle_step", None)
+        if str(step.get("event_type") or "") == "item_completed" and callable(replace_lifecycle):
+            if replace_lifecycle(chat_id, step):
+                return
+        store.append_execution_step(chat_id, step)
 
     def _queue_execution_step_persist(self, chat_id: str, step: dict) -> None:
         with self._execution_step_persist_lock:
@@ -6675,7 +6782,7 @@ class ChatFrame(wx.Frame):
                     continue
                 for chat_id, step in batch:
                     try:
-                        store.append_execution_step(chat_id, step)
+                        self._persist_execution_step(store, chat_id, step)
                     except Exception:
                         continue
         finally:
@@ -6711,7 +6818,7 @@ class ChatFrame(wx.Frame):
             return True
         for chat_id, step in batch:
             try:
-                store.append_execution_step(chat_id, step)
+                self._persist_execution_step(store, chat_id, step)
             except Exception:
                 continue
         return True
@@ -6879,6 +6986,28 @@ class ChatFrame(wx.Frame):
     def _execution_step_text(self, step) -> str:
         return self._execution_meta_tuple(-1, step)[2]
 
+    @staticmethod
+    def _collapse_kimi_execution_lifecycle(steps: list) -> list:
+        collapsed = []
+        positions = {}
+        for step in steps or []:
+            if not isinstance(step, dict) or not str(step.get("source_kind") or "").startswith(("tool.", "shell.", "subagent.")):
+                collapsed.append(step)
+                continue
+            item_id = str(step.get("item_id") or "").strip()
+            key = (
+                str(step.get("thread_id") or ""),
+                str(step.get("turn_id") or ""),
+                item_id,
+            )
+            if item_id and key in positions:
+                collapsed[positions[key]] = step
+                continue
+            if item_id:
+                positions.setdefault(key, len(collapsed))
+            collapsed.append(step)
+        return collapsed
+
     def _execution_turn_context_steps(self, steps: list) -> list:
         if getattr(self, "view_mode", "") == "history" and str(getattr(self, "view_history_id", "") or "").strip():
             viewed_chat = self._hydrate_chat_from_store(self._find_archived_chat(self.view_history_id), include_execution_steps=False)
@@ -6914,28 +7043,42 @@ class ChatFrame(wx.Frame):
         if answer_md and answer_md != REQUESTING_TEXT:
             model = str(turn.get("model") or self.selected_model or "")
             answer_text = remove_emojis(md_to_plain_preserving_paragraphs(self._answer_markdown_for_output(answer_md, model))).strip()
+        def projected_timestamp(raw_kind: str) -> float | None:
+            for step in steps or []:
+                if not isinstance(step, dict) or self._safe_int(step.get("turn_idx"), -1) != first_idx:
+                    continue
+                kind = str(step.get("raw_kind") or step.get("kind") or step.get("display_kind") or "").strip()
+                if kind == raw_kind:
+                    timestamp = _execution_timestamp(step)
+                    if timestamp is not None:
+                        return timestamp
+            return _finite_timestamp(turn.get("created_at"))
         prefix_steps = []
         if question:
-            prefix_steps.append(
-                {
+            question_step = {
                     "display_kind": "turn_context",
                     "list_text": f"我：{question}",
                     "detail_text": question,
                     "turn_idx": first_idx,
                     "synthetic": "question",
                 }
-            )
+            question_timestamp = projected_timestamp("question")
+            if question_timestamp is not None:
+                question_step["created_at"] = question_timestamp
+            prefix_steps.append(question_step)
         suffix_steps = []
         if answer_text:
-            suffix_steps.append(
-                {
+            answer_step = {
                     "display_kind": "turn_context",
                     "list_text": f"小诸葛：{answer_text}",
                     "detail_text": answer_text,
                     "turn_idx": first_idx,
                     "synthetic": "answer",
                 }
-            )
+            answer_timestamp = projected_timestamp("final")
+            if answer_timestamp is not None:
+                answer_step["created_at"] = answer_timestamp
+            suffix_steps.append(answer_step)
         return prefix_steps + list(steps or []) + suffix_steps
 
     @staticmethod
@@ -7041,6 +7184,7 @@ class ChatFrame(wx.Frame):
 
     def _execution_page_projection(self) -> tuple[list, list]:
         total_steps, steps = self._current_execution_steps_for_render()
+        steps = self._collapse_kimi_execution_lifecycle(steps)
         positions_by_object = {}
         for index, step in enumerate(steps):
             positions_by_object.setdefault(id(step), []).append(index)
@@ -9670,10 +9814,28 @@ class ChatFrame(wx.Frame):
 
     def _push_remote_final_answer(self, chat_id: str, text: str, *, turn_index: int | None = None) -> None:
         resolved_chat_id = str(chat_id or "").strip()
-        if not resolved_chat_id:
+        final_text = str(text or "").strip()
+        # A Codex/Kimi delta can observe the persisted request placeholder before
+        # the provider's terminal answer is written.  Publishing that value as
+        # assistant_final consumes the canonical message id and prevents the
+        # later real final from reaching mobile clients.
+        if not resolved_chat_id or not final_text or final_text == REQUESTING_TEXT:
             return
         transport = getattr(self, "_remote_nats_transport", None)
         store = getattr(self, "chat_store", None)
+        # V2 notifications are an immutable projection of durable turn state,
+        # never of an early provider callback.  This also leaves the canonical
+        # message id available until the actual final is persisted.
+        if store is not None and turn_index is not None:
+            turns = store.load_turns(resolved_chat_id)
+            if turn_index < 0 or turn_index >= len(turns):
+                return
+            persisted = turns[turn_index]
+            if str(persisted.get("request_status") or "").strip() != "done":
+                return
+            final_text = str(persisted.get("answer_md") or "").strip()
+            if not final_text or final_text == REQUESTING_TEXT:
+                return
         if (
             resolved_chat_id
             and transport is not None
@@ -9685,7 +9847,7 @@ class ChatFrame(wx.Frame):
                 message_id = (store.resolve_canonical_message_by_turn(
                     resolved_chat_id, role="assistant", turn_index=turn_index
                 ) if turn_index is not None else store.resolve_canonical_message_by_content(
-                    resolved_chat_id, role="assistant", content=str(text or "")))
+                    resolved_chat_id, role="assistant", content=final_text))
                 chat_summary = (
                     self._current_chat_state
                     if str((self._current_chat_state or {}).get("id") or "").strip()
@@ -9698,7 +9860,7 @@ class ChatFrame(wx.Frame):
                     chat_id=resolved_chat_id,
                     message_id=message_id,
                     notification_kind="assistant_final",
-                    text=str(text or ""),
+                    text=final_text,
                     chat_title=str((chat_summary or {}).get("title") or "").strip(),
                     origin_client="mc",
                 )
@@ -9726,7 +9888,7 @@ class ChatFrame(wx.Frame):
             {
                 "type": "final_answer",
                 "chat_id": resolved_chat_id,
-                "text": str(text or ""),
+                "text": final_text,
                 "event_id": f"evt-{uuid.uuid4().hex[:8]}",
                 "ts": time.time(),
             }
@@ -9816,6 +9978,7 @@ class ChatFrame(wx.Frame):
             question,
             answer_md,
             model,
+            turn.get("created_at"),
             str(turn.get("request_status") or ""),
             str(turn.get("request_error") or ""),
         )
@@ -9832,12 +9995,14 @@ class ChatFrame(wx.Frame):
             "question": question,
             "answer": answer,
             "model": model,
-            "created_at": float(turn.get("created_at") or 0.0),
             "assistant_only": (not question.strip()) and bool(answer_md.strip()),
             "pending": str(turn.get("request_status") or "").strip() == "pending" or answer_md == REQUESTING_TEXT,
             "request_status": str(turn.get("request_status") or ""),
             "request_error": str(turn.get("request_error") or ""),
         }
+        created_at = _finite_timestamp(turn.get("created_at"))
+        if created_at is not None:
+            payload["created_at"] = created_at
         cache[cache_key] = (signature, dict(payload))
         return payload
 
@@ -13935,7 +14100,7 @@ class ChatFrame(wx.Frame):
                     if port_unavailable:
                         continue
                     reused_existing_runtime = True
-                    websocket_port = self._probe_existing_remote_nats_websocket_port()
+                    websocket_port = self._probe_existing_remote_nats_websocket_port(token)
                     if websocket_port is None:
                         raise RuntimeError("Could not determine websocket port for existing NATS runtime")
                     self._remote_nats_websocket_port = websocket_port
@@ -14042,7 +14207,7 @@ class ChatFrame(wx.Frame):
         except Exception:
             return False
 
-    def _probe_existing_remote_nats_websocket_port(self) -> int | None:
+    def _probe_existing_remote_nats_websocket_port(self, token: str) -> int | None:
         candidates = []
         runtime_url = str((getattr(self, "remote_nats_runtime_status", {}) or {}).get("websocket_url") or "").strip()
         if runtime_url:
@@ -14068,14 +14233,16 @@ class ChatFrame(wx.Frame):
             if port in seen or port <= 0:
                 continue
             seen.add(port)
-            if self._probe_remote_nats_websocket_port(port):
+            if self._probe_remote_nats_websocket_port(port, token):
                 return port
         return None
 
-    def _probe_remote_nats_websocket_port(self, port: int) -> bool:
+    def _probe_remote_nats_websocket_port(self, port: int, token: str) -> bool:
         if port <= 0 or not self._remote_local_listener_ready(port):
             return False
-        url = f"ws://127.0.0.1:{int(port)}/nats"
+        if not str(token or ""):
+            return False
+        url = f"ws://127.0.0.1:{int(port)}/nats?token={quote(str(token))}"
         ok, _detail = self._verify_remote_public_ws(url)
         return ok
 

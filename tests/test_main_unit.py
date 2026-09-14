@@ -8857,7 +8857,7 @@ def test_kimi_execution_delta_buffer_separates_agent_and_source_streams(frame):
 
     assert len(frame._execution_delta_buffer) == 3
     assert frame._flush_execution_delta("chat-1", "turn-1") is True
-    assert [step["list_text"] for step in frame._current_chat_state["execution_steps"]] == ["正在分析问题", "正在分析问题", "正在处理任务"]
+    assert [step["list_text"] for step in frame._current_chat_state["execution_steps"]] == ["正在分析问题", "正在分析问题", "tool-a"]
 
 
 def test_non_kimi_item_title_keeps_existing_execution_summary_behavior(frame):
@@ -9064,7 +9064,7 @@ def test_background_agent_message_delta_buffers_and_flushes_for_target_chat(fram
         ),
     )
 
-    assert ("chat-background", "turn-background", "msg-1") in frame._execution_delta_buffer
+    assert any(key[:3] == ("chat-background", "turn-background", "msg-1") for key in frame._execution_delta_buffer)
     assert frame.archived_chats[0]["execution_steps"] == []
 
     flushed = frame._flush_execution_delta("chat-background", "turn-background", "msg-1")
@@ -16085,6 +16085,13 @@ def test_remote_turn_payload_preserves_canonical_answer_for_all_models(frame, mo
     assert other_payload["answer"] == other_turn["answer_md"]
 
 
+@pytest.mark.parametrize("created_at", [None, "bad", float("nan"), True])
+def test_remote_turn_payload_omits_non_authoritative_timestamp(frame, created_at):
+    payload = frame._remote_turn_payload({"question": "q", "answer_md": "a", "created_at": created_at})
+
+    assert "created_at" not in payload
+
+
 def test_codex_answer_filter_preserves_plain_english_sentences(frame):
     frame.codex_answer_english_filter_enabled = True
 
@@ -19313,12 +19320,12 @@ def test_context_usage_estimate_applies_state_without_refreshing_visible_header(
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: saves.append(True))
 
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == main.UNKNOWN_TIME_LABEL
 
     frame._apply_context_usage_estimate(("chat-current", 0), usage)
 
     assert frame._current_chat_state["context_usage"] == usage
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == main.UNKNOWN_TIME_LABEL
     assert refreshes == []
 
 
@@ -19770,9 +19777,9 @@ def test_append_submitted_question_removes_all_initial_empty_rows_with_increment
     changed = frame._append_submitted_question_to_answer_list(0, turn)
 
     assert changed is True
-    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["我", "新问题"]
-    assert frame.answer_meta == [("user", 0, "我", ""), ("question", 0, "新问题", "")]
-    assert frame.answer_list_model.visible_ids == ["answer:0:user", "answer:0:question"]
+    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == [main.UNKNOWN_TIME_LABEL, "我", "新问题"]
+    assert frame.answer_meta == [("time", 0, main.UNKNOWN_TIME_LABEL, ""), ("user", 0, "我", ""), ("question", 0, "新问题", "")]
+    assert frame.answer_list_model.visible_ids == ["time:0", "answer:0:user", "answer:0:question"]
 
 
 def test_execution_shift_tab_uses_primary_navigation_instead_of_forcing_input_focus(frame, monkeypatch):
@@ -20172,6 +20179,59 @@ def test_execution_empty_turn_context_rows(frame, question, answer, expected):
                                  "turns": [{"question": question, "answer_md": answer}], "execution_steps": []}
     frame._render_execution_list()
     assert _execution_content_labels(frame) == expected
+
+
+def test_execution_turn_context_rows_inherit_recorded_turn_timestamp(frame):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [{"question": "q", "answer_md": "a", "created_at": 1234.5}],
+    }
+
+    projected = frame._execution_turn_context_steps([])
+
+    assert [row["created_at"] for row in projected] == [1234.5, 1234.5]
+
+
+def test_execution_turn_context_prefers_existing_projection_times_and_keeps_invalid_unknown(frame):
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-current",
+        "turns": [{"question": "q", "answer_md": "a", "created_at": "invalid"}],
+    }
+    steps = [
+        {"display_kind": "question", "turn_idx": 0, "created_at": 42.0},
+        {"display_kind": "final", "turn_idx": 0, "ts": 43.0},
+    ]
+
+    projected = frame._execution_turn_context_steps(steps)
+
+    assert projected[0]["created_at"] == 42.0
+    assert projected[-1]["created_at"] == 43.0
+    frame._current_chat_state["turns"][0]["created_at"] = float("nan")
+    unknown = frame._execution_turn_context_steps([])
+    assert all("created_at" not in row for row in unknown)
+
+
+def test_restored_kimi_lifecycle_projects_completion_once(frame):
+    started = {
+        "event_type": "item_started", "source_kind": "tool.call.started",
+        "thread_id": "session-a", "turn_id": "1", "item_id": "tool-a",
+        "list_text": "正在执行读取文件：README.md",
+    }
+    completed = {
+        "event_type": "item_completed", "source_kind": "tool.result",
+        "thread_id": "session-a", "turn_id": "1", "item_id": "tool-a",
+        "list_text": "已完成：README.md",
+    }
+
+    progress = dict(started, event_type="agent_message_delta", source_kind="tool.progress", list_text="halfway")
+    unrelated_turn = dict(started, turn_id="2", list_text="other turn")
+
+    assert frame._collapse_kimi_execution_lifecycle([started, progress, unrelated_turn, completed]) == [
+        completed,
+        unrelated_turn,
+    ]
 
 
 def test_execution_selection_identity_survives_context_insert_and_page_slide(frame, monkeypatch):

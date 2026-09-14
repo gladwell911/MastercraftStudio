@@ -137,11 +137,35 @@ def validate_execution_body(body: dict) -> dict:
     return dict(body)
 
 
+_V2_GLOBAL_COMMAND_TYPES = frozenset({
+    "common_commands_create",
+    "common_commands_delete",
+    "common_commands_list",
+    "common_commands_move_down",
+    "common_commands_move_up",
+    "common_commands_pin",
+    "common_commands_unpin",
+    "common_commands_update",
+    "history_list",
+    "model_list",
+    "new_chat",
+    "notes_bulk_docs",
+    "notes_changes",
+})
+
+
 def validate_v2_ephemeral(payload: dict, *, expected_epoch: str | None = None) -> dict:
     if not isinstance(payload, dict) or payload.get("protocol_version") != PROTOCOL_V2:
         raise ValueError("INVALID_PROTOCOL_VERSION")
     _required_text(payload, "request_id")
-    _required_text(payload, "chat_id")
+    # V2 ownership remains mandatory for chat-scoped commands.  These
+    # commands operate on the account-wide collection, however, so clients
+    # correctly send an empty owner before a chat exists or when refreshing
+    # the chat list.  Rejecting them makes an otherwise authenticated mobile
+    # client disconnect immediately after the hello handshake.
+    command_type = str(payload.get("type") or "").strip().lower()
+    if command_type not in _V2_GLOBAL_COMMAND_TYPES:
+        _required_text(payload, "chat_id")
     epoch = _required_text(payload, "epoch")
     if expected_epoch is not None and epoch != expected_epoch:
         raise ValueError("STALE_EPOCH")

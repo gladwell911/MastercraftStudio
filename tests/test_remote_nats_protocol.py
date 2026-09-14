@@ -108,6 +108,34 @@ def test_shared_v2_contract_matrix_matches_python_validator():
         else:
             with pytest.raises(ValueError, match=row["error"]):
                 validate_v2_ephemeral(row["payload"], expected_epoch="epoch-1")
+
+
+@pytest.mark.parametrize("command_type", ["history_list", "model_list", "new_chat", "notes_changes"])
+def test_v2_global_commands_allow_an_empty_chat_owner(command_type):
+    payload = {
+        "protocol_version": 2,
+        "request_id": f"{command_type}-1",
+        "type": command_type,
+        "chat_id": "",
+        "epoch": "epoch-1",
+        "body": {},
+    }
+
+    assert validate_v2_ephemeral(payload, expected_epoch="epoch-1")["type"] == command_type
+
+
+def test_v2_chat_scoped_command_still_requires_an_owner():
+    payload = {
+        "protocol_version": 2,
+        "request_id": "message-1",
+        "type": "message",
+        "chat_id": "",
+        "epoch": "epoch-1",
+        "body": {},
+    }
+
+    with pytest.raises(ValueError, match="INVALID_CHAT_ID"):
+        validate_v2_ephemeral(payload, expected_epoch="epoch-1")
 def test_execution_routes_delegate_to_authority_and_structure_errors():
     from remote_nats import RemoteNatsTransport
 

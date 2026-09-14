@@ -181,6 +181,31 @@ def test_chat_store_appends_and_loads_execution_steps(tmp_path):
     ]
 
 
+def test_chat_store_replaces_kimi_lifecycle_with_one_completed_result(tmp_path):
+    store = ChatStore(tmp_path / "chat_history.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-1", "title": "First"})
+    identity = {"turn_idx": 0, "thread_id": "session-1", "turn_id": "turn-1", "item_id": "tool-1"}
+    store.append_execution_step("chat-1", {
+        **identity, "event_type": "item_started", "source_kind": "tool.call.started",
+        "list_text": "running", "_execution_uid": "started",
+    })
+    completed = {
+        **identity, "event_type": "item_completed", "source_kind": "tool.result",
+        "list_text": "completed", "detail_text": "result output", "status": "completed",
+        "event_id": "session-1:turn-1:tool-1:completed", "_execution_uid": "completed",
+    }
+
+    assert store.replace_execution_lifecycle_step("chat-1", completed) is True
+
+    reloaded = store.load_execution_steps("chat-1")
+    assert len(reloaded) == 1
+    assert reloaded[0]["event_type"] == "item_completed"
+    assert reloaded[0]["status"] == "completed"
+    assert reloaded[0]["detail_text"] == "result output"
+    assert reloaded[0]["event_id"] == "session-1:turn-1:tool-1:completed"
+
+
 def test_chat_store_can_load_chat_without_execution_steps(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()

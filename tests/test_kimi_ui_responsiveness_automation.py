@@ -199,6 +199,7 @@ def test_quiet_window_batches_events(frame, wx_app, monkeypatch):
     # 安静窗口内 + 导航控件持有焦点：小批量，可见列表不变，条目进入尾部延迟队列
     frame._navigation_quiet_until = time.monotonic() + main.NAVIGATION_QUIET_SECONDS
     rows_before = frame.execution_list.GetCount()
+    content_rows_before = sum(1 for meta in frame.execution_meta if meta[0] != "time")
     before = processed["n"]
     frame._drain_kimi_ui_events()
     assert processed["n"] - before == interactive_batch
@@ -226,11 +227,11 @@ def test_quiet_window_batches_events(frame, wx_app, monkeypatch):
     assert not (frame._pending_execution_tail_appends.get("chat-kimi") or [])
 
     rows = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
-    assert len(rows) == rows_before + 40
-    assert len(rows[rows_before:]) == 40
+    content_rows = [row for row, meta in zip(rows, frame.execution_meta) if meta[0] != "time"]
+    assert len(content_rows) - content_rows_before == 40
     assert all(any(f"计划步骤 {idx}" in row for row in rows) for idx in range(40))
     # 最后一次 drain 的事件按序落在尾部
-    tail = rows[-last_drain:]
+    tail = content_rows[-last_drain:]
     for offset, row in enumerate(tail):
         assert f"计划步骤 {40 - last_drain + offset}" in row
 
@@ -328,7 +329,10 @@ def test_execution_entries_append_at_tail_outside_quiet_window(frame, wx_app, mo
     wx_app.Yield()
     assert not frame._navigation_quiet_active()
 
-    rows_before = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows_before = [
+        row for row, meta in zip(frame.execution_list.GetStrings(), frame.execution_meta)
+        if meta[0] != "time"
+    ]
     assert len(rows_before) == 3
     assert "kimi 问题" in rows_before[0]
     assert "既有步骤一" in rows_before[1]
@@ -341,7 +345,10 @@ def test_execution_entries_append_at_tail_outside_quiet_window(frame, wx_app, mo
         )
     assert _yield_until(wx_app, lambda: not frame._pending_kimi_ui_events, timeout=2.0)
 
-    rows_after = [frame.execution_list.GetString(i) for i in range(frame.execution_list.GetCount())]
+    rows_after = [
+        row for row, meta in zip(frame.execution_list.GetStrings(), frame.execution_meta)
+        if meta[0] != "time"
+    ]
     assert len(rows_after) == 6
     assert "新步骤一" in rows_after[3]
     assert "新步骤二" in rows_after[4]
