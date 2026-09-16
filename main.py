@@ -12819,12 +12819,16 @@ class ChatFrame(wx.Frame):
             if target_chat is self._current_chat_state:
                 self.active_kimi_request_queue = queue
         finalized: list[int] = []
+        accepted: list[int] = []
         for idx in covered:
             if not isinstance(idx, int) or idx < 0 or idx >= len(target_turns):
                 continue
             turn = target_turns[idx]
             if not isinstance(turn, dict):
                 continue
+            if not self._accept_clear_operation_result(turn, chat_id):
+                continue
+            accepted.append(idx)
             if status == "completed":
                 has_final_text = bool(final_text and final_text != REQUESTING_TEXT)
                 if not has_final_text:
@@ -12834,14 +12838,16 @@ class ChatFrame(wx.Frame):
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
                 turn["request_recovered_after_restart"] = False
+                self._complete_clear_operation_turn(turn, failed=False)
             else:
                 # The protocol error is authoritative; never disguise it with a
                 # partial assistant stream.
                 error_text = str(getattr(event, "text", "") or "").strip() or ("已中断" if status == "interrupted" else "Kimi Code turn 失败")
                 turn["answer_md"] = error_text
                 self._mark_turn_request_failed(turn, error_text)
+                self._complete_clear_operation_turn(turn, failed=True)
             finalized.append(idx)
-        if not finalized:
+        if not accepted:
             return []
         self._pop_kimi_answer_parts(chat_id, event_session_id, owner_prompt_id)
         with self._kimi_owner_lock:
@@ -12994,13 +13000,20 @@ class ChatFrame(wx.Frame):
                     None,
                 )
         error_text = str(message or "").strip() or "Kimi Code 请求失败"
+        accepted: list[int] = []
         for idx in covered:
             if not (0 <= idx < len(target_turns)) or not isinstance(target_turns[idx], dict):
                 continue
             failed_turn = target_turns[idx]
+            if not self._accept_clear_operation_result(failed_turn, chat_id):
+                continue
+            accepted.append(idx)
             self._mark_turn_request_failed(failed_turn, error_text)
             failed_turn["answer_md"] = error_text
+            self._complete_clear_operation_turn(failed_turn, failed=True)
             self._mark_chat_turns_dirty(None if is_current_target else chat_id, idx)
+        if not accepted:
+            return
         if isinstance(owner, dict):
             queue = target_chat.get("kimi_request_queue")
             with self._kimi_owner_lock:
@@ -13024,7 +13037,7 @@ class ChatFrame(wx.Frame):
             if isinstance(queue, list):
                 doomed = {
                     str(target_turns[idx].get("kimi_prompt_id") or "").strip()
-                    for idx in covered
+                    for idx in accepted
                     if 0 <= idx < len(target_turns) and isinstance(target_turns[idx], dict)
                 }
                 queue[:] = [
@@ -13310,6 +13323,9 @@ class ChatFrame(wx.Frame):
                             and str(target_turns[idx].get("request_status") or "").strip() == "done"
                             and bool(str(target_turns[idx].get("answer_md") or "").strip())
                         ]
+                        if finalized:
+                            self._mark_chat_turns_dirty(chat_id, min(finalized))
+                            self._refresh_visible_history_chat(chat_id)
                         if successful:
                             self._play_finish_sound()
                             for finalized_idx in finalized:
@@ -13325,8 +13341,6 @@ class ChatFrame(wx.Frame):
                                         finalized_idx,
                                         str(finalized_turn.get("model") or DEFAULT_KIMI_MODEL),
                                     )
-                            self._mark_chat_turns_dirty(chat_id, min(finalized))
-                            self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
             return
         if event_type == "agent_message_delta":
@@ -15675,6 +15689,11 @@ class ChatFrame(wx.Frame):
         normalized = str(choice or "").strip().lower()
         if normalized == "cancel":
             store.transition_clear_operation(operation_id, "completed_clear_only")
+            self._pending_clear_recoveries = [
+                item for item in (getattr(self, "_pending_clear_recoveries", []) or [])
+                if isinstance(item, dict)
+                and str(item.get("operation_id") or "") != str(operation_id)
+            ]
             return True
         if normalized not in {"retry", "text-only", "text_only"}:
             return False
@@ -15683,13 +15702,63 @@ class ChatFrame(wx.Frame):
             operation, operation.get("snapshot") or {}, text_only=normalized != "retry"
         )
 
+    def _reconcile_clear_operation_for_owner(self, chat_id: str, *, surface_recovery: bool = False) -> dict | None:
+        owner = str(chat_id or "").strip()
+        store = getattr(self, "chat_store", None)
+        if not owner or store is None or not hasattr(store, "active_clear_operation"):
+            return None
+        operation = store.active_clear_operation(owner)
+        if not operation:
+            return None
+        operation_id = str(operation.get("operation_id") or "").strip()
+        if hasattr(store, "reconcile_completed_clear_operation"):
+            revision = operation.get("revision")
+            reconciled = store.reconcile_completed_clear_operation(
+                operation_id, chat_id=owner, revision=revision
+            )
+            if reconciled is not None:
+                self._pending_clear_recoveries = [
+                    item for item in (getattr(self, "_pending_clear_recoveries", []) or [])
+                    if isinstance(item, dict)
+                    and str(item.get("operation_id") or "") != operation_id
+                ]
+                return None
+        pending_ids = {
+            str(item.get("operation_id") or "")
+            for item in (getattr(self, "_pending_clear_recoveries", []) or [])
+            if isinstance(item, dict)
+        }
+        if operation_id in pending_ids and operation.get("state") in {"requested", "clear_acknowledged"}:
+            self._pending_clear_recoveries = [
+                item for item in (getattr(self, "_pending_clear_recoveries", []) or [])
+                if isinstance(item, dict)
+                and str(item.get("operation_id") or "") != operation_id
+            ]
+            self._dispatch_clear_operation_resend(operation, operation.get("snapshot") or {})
+            return store.active_clear_operation(owner)
+        if surface_recovery and operation.get("state") == "resend_blocked":
+            self._pending_clear_recoveries = [
+                item for item in (getattr(self, "_pending_clear_recoveries", []) or [])
+                if isinstance(item, dict)
+                and str(item.get("operation_id") or "") != operation_id
+            ]
+            self._offer_clear_operation_recovery(operation_id)
+            return store.active_clear_operation(owner)
+        return operation
+
     def _accept_clear_operation_result(self, turn: dict, chat_id: str) -> bool:
         operation_id = str((turn or {}).get("clear_operation_id") or "").strip()
         if not operation_id:
             return True
         store = getattr(self, "chat_store", None)
         operation = store.get_clear_operation(operation_id) if store is not None else None
-        if operation and operation.get("state") != "superseded" and operation.get("revision") == turn.get("clear_revision"):
+        owner = str(chat_id or "").strip()
+        if (
+            operation
+            and operation.get("state") == "resend_dispatched"
+            and str(operation.get("chat_id") or "").strip() == owner
+            and operation.get("revision") == turn.get("clear_revision")
+        ):
             return True
         if store is not None:
             store.quarantine("SUPERSEDED_CLEAR_RESULT", {"operation_id": operation_id, "chat_id": str(chat_id or "")})
@@ -15861,14 +15930,6 @@ class ChatFrame(wx.Frame):
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
-        submit_owner = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
-        store = getattr(self, "chat_store", None)
-        if (
-            submit_owner and not str(getattr(self, "_clear_resend_operation_id", "") or "")
-            and getattr(self, "_chat_store_enabled", False) and store is not None
-            and hasattr(store, "active_clear_operation") and store.active_clear_operation(submit_owner) is not None
-        ):
-            return False, "Clear/resend recovery is still pending for this chat."
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
@@ -15880,32 +15941,37 @@ class ChatFrame(wx.Frame):
         self._answer_list_tail_notice = ""
         self._answer_list_tail_notice_chat_id = ""
 
-        # 检查目标聊天是否有活跃的 Claude Code 客户端在等待输入
-        submit_chat_id = str(chat_id or self.active_chat_id or self.current_chat_id or "").strip()
-        if self._send_active_claudecode_input(submit_chat_id, q):
-            # 将消息发送到 Claude Code 的 stdin 队列
-            # 清空输入框
+        resolved_model = normalize_model_id(model or self._resolve_current_model() or "")
+        selected_history_id = ""
+        if (not chat_id) and self.view_mode == "history":
+            selected_history_id = str(self.view_history_id or "").strip()
+        submit_owner = str(
+            chat_id or selected_history_id or self.active_chat_id or self.current_chat_id or ""
+        ).strip()
+        if not submit_owner:
+            self._ensure_active_chat_id()
+            submit_owner = str(self.active_chat_id or self.current_chat_id or "").strip()
+        store = getattr(self, "chat_store", None)
+        if (
+            submit_owner and not str(getattr(self, "_clear_resend_operation_id", "") or "")
+            and getattr(self, "_chat_store_enabled", False) and store is not None
+            and self._reconcile_clear_operation_for_owner(submit_owner, surface_recovery=True) is not None
+        ):
+            return False, "Clear/resend recovery is still pending for this chat."
+        if self._send_active_claudecode_input(submit_owner, q):
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
             return True, ""
-
-        resolved_model = normalize_model_id(model or self._resolve_current_model() or "")
-        if (not chat_id) and self.view_mode == "history":
-            selected_history_id = str(self.view_history_id or "").strip()
-            if selected_history_id and selected_history_id not in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}:
-                if not self._switch_current_chat(selected_history_id):
+        active_owner = str(self.active_chat_id or self.current_chat_id or "").strip()
+        if submit_owner and submit_owner != active_owner:
+            if self._find_archived_chat(submit_owner):
+                if not self._switch_current_chat(submit_owner):
                     return False, "载入历史聊天失败"
-        if chat_id:
-            if chat_id != self.active_chat_id:
-                if self._find_archived_chat(chat_id):
-                    self._switch_current_chat(chat_id)
-                else:
-                    self.active_chat_id = chat_id
-                    self.current_chat_id = chat_id
+            elif chat_id:
+                self.active_chat_id = submit_owner
+                self.current_chat_id = submit_owner
         if not self.active_session_started_at:
             self.active_session_started_at = time.time()
-        if not self.active_chat_id:
-            self._ensure_active_chat_id()
         self.selected_model = resolved_model
         self.model_combo.SetValue(model_display_name(resolved_model))
         self._current_chat_state["id"] = self.active_chat_id or self.current_chat_id or ""

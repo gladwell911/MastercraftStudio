@@ -404,6 +404,81 @@ class ChatStore:
             ).fetchone()
         return self._decode_clear_operation(row) if row else None
 
+    def reconcile_completed_clear_operation(
+        self, operation_id: str, *, chat_id: str, revision: int
+    ) -> dict[str, Any] | None:
+        """Complete a legacy resend only from one matching persisted done turn."""
+        owner = self.normalize_chat_id(chat_id)
+        expected_revision = self._clear_revision_value(revision)
+        if expected_revision is None:
+            return None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)
+            ).fetchone()
+            if (
+                row is None
+                or str(row["chat_id"]) != owner
+                or int(row["revision"]) != expected_revision
+                or str(row["state"]) == "superseded"
+            ):
+                return None
+            current = str(row["state"])
+            if current == "completed_with_resend":
+                return self._decode_clear_operation(row)
+            if current not in {"resend_dispatched", "resend_blocked"}:
+                return None
+            if current == "resend_blocked" and str(row["failure_code"]) != "DELIVERY_OUTCOME_UNCERTAIN":
+                return None
+            chat_state = conn.execute(
+                "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
+            ).fetchone()
+            if chat_state is None or int(chat_state["revision"]) != expected_revision:
+                return None
+            matches = []
+            for turn_row in conn.execute(
+                "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
+            ):
+                payload = self._json_dict(turn_row["payload_json"])
+                if (
+                    str(payload.get("clear_operation_id") or "").strip() == str(operation_id)
+                    and self._clear_revision_value(payload.get("clear_revision")) == expected_revision
+                    and str(payload.get("request_status") or "").strip() == "done"
+                ):
+                    matches.append(payload)
+            if len(matches) != 1:
+                return None
+            now = time.time()
+            changed = conn.execute(
+                "UPDATE clear_operations SET state='completed_with_resend',failure_code='',updated_at=? "
+                "WHERE operation_id=? AND chat_id=? AND revision=? AND "
+                "(state='resend_dispatched' OR (state='resend_blocked' AND failure_code='DELIVERY_OUTCOME_UNCERTAIN'))",
+                (now, str(operation_id), owner, expected_revision),
+            ).rowcount
+            if not changed:
+                return None
+            self._insert_clear_fact_conn(
+                conn, row["pair_id"], row["domain"], str(operation_id), owner,
+                expected_revision, "completed_with_resend",
+            )
+            completed = conn.execute(
+                "SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)
+            ).fetchone()
+            return self._decode_clear_operation(completed)
+
+    @staticmethod
+    def _clear_revision_value(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit():
+                return int(text)
+        return None
+
     def recoverable_clear_operations(self) -> list[dict[str, Any]]:
         """Return unfinished operations; indeterminate dispatched work is explicitly blocked."""
         with self._connect() as conn:
@@ -414,6 +489,14 @@ class ChatStore:
         recovered = []
         for operation_id in ids:
             operation = self.get_clear_operation(operation_id)
+            if operation and operation["state"] in {"resend_dispatched", "resend_blocked"}:
+                reconciled = self.reconcile_completed_clear_operation(
+                    operation_id,
+                    chat_id=str(operation["chat_id"]),
+                    revision=int(operation["revision"]),
+                )
+                if reconciled is not None:
+                    continue
             if operation and operation["state"] == "resend_dispatched":
                 operation = self.transition_clear_operation(
                     operation_id, "resend_blocked", failure_code="DELIVERY_OUTCOME_UNCERTAIN"

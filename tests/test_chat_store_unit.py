@@ -468,6 +468,109 @@ def test_clear_operation_dispatch_claim_and_recovery_transitions(tmp_path):
     assert all("hello" not in row["payload"].decode("utf-8") for row in store.pending_outbox())
 
 
+def test_clear_operation_reconciliation_requires_one_matching_persisted_done_turn(tmp_path):
+    store = ChatStore(tmp_path / "reconcile.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    operation_id = operation["operation_id"]
+    revision = operation["revision"]
+    store.claim_clear_resend_dispatch(operation_id)
+    store.replace_turns("owner", [{
+        "question": "first",
+        "request_status": "done",
+        "clear_operation_id": operation_id,
+        "clear_revision": str(revision),
+    }])
+
+    assert store.reconcile_completed_clear_operation(
+        operation_id, chat_id="owner", revision="not-a-revision"
+    ) is None
+    assert store.reconcile_completed_clear_operation(
+        operation_id, chat_id="owner", revision=1.5
+    ) is None
+    assert store.reconcile_completed_clear_operation(
+        operation_id, chat_id="other", revision=revision
+    ) is None
+    assert store.reconcile_completed_clear_operation(
+        operation_id, chat_id="owner", revision=revision + 1
+    ) is None
+    completed = store.reconcile_completed_clear_operation(
+        operation_id, chat_id="owner", revision=revision
+    )
+    assert completed["state"] == "completed_with_resend"
+    assert store.reconcile_completed_clear_operation(
+        operation_id, chat_id="owner", revision=revision
+    )["state"] == "completed_with_resend"
+    lifecycle = [json.loads(row["payload"])["body"]["state"] for row in store.pending_outbox()]
+    assert lifecycle.count("completed_with_resend") == 1
+    assert all("first" not in row["payload"].decode("utf-8") for row in store.pending_outbox())
+
+
+def test_clear_operation_reconciliation_only_repairs_uncertain_blocked_delivery(tmp_path):
+    store = ChatStore(tmp_path / "reconcile-blocked.db")
+    store.initialize()
+    for owner, failure_code in (("uncertain", "DELIVERY_OUTCOME_UNCERTAIN"), ("failed", "PROVIDER_FAILURE")):
+        store.upsert_chat({"id": owner})
+        store.replace_turns(owner, [{"question": owner}])
+        operation = store.begin_clear_operation(owner, idempotency_key=owner)
+        store.claim_clear_resend_dispatch(operation["operation_id"])
+        store.transition_clear_operation(
+            operation["operation_id"], "resend_blocked", failure_code=failure_code
+        )
+        store.replace_turns(owner, [{
+            "request_status": "done",
+            "clear_operation_id": operation["operation_id"],
+            "clear_revision": operation["revision"],
+        }])
+        reconciled = store.reconcile_completed_clear_operation(
+            operation["operation_id"], chat_id=owner, revision=operation["revision"]
+        )
+        if owner == "uncertain":
+            assert reconciled["state"] == "completed_with_resend"
+        else:
+            assert reconciled is None
+            assert store.get_clear_operation(operation["operation_id"])["state"] == "resend_blocked"
+
+
+def test_clear_operation_reconciliation_refuses_ambiguous_completed_turns(tmp_path):
+    store = ChatStore(tmp_path / "reconcile-ambiguous.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    store.claim_clear_resend_dispatch(operation["operation_id"])
+    evidence = {
+        "request_status": "done",
+        "clear_operation_id": operation["operation_id"],
+        "clear_revision": operation["revision"],
+    }
+    store.replace_turns("owner", [dict(evidence), dict(evidence)])
+
+    assert store.reconcile_completed_clear_operation(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    ) is None
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "resend_dispatched"
+
+
+def test_recoverable_clear_operations_reconciles_and_omits_persisted_done_turn(tmp_path):
+    store = ChatStore(tmp_path / "recoverable-reconcile.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.replace_turns("owner", [{
+        "request_status": "done",
+        "clear_operation_id": operation["operation_id"],
+        "clear_revision": str(operation["revision"]),
+    }])
+
+    assert store.recoverable_clear_operations() == []
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "completed_with_resend"
+
+
 def test_clear_operation_no_message_and_revision_overflow_are_safe(tmp_path):
     store = ChatStore(tmp_path / "empty.db")
     store.initialize()
