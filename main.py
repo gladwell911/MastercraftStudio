@@ -1781,21 +1781,16 @@ class ChatFrame(wx.Frame):
         self._start_file_service_if_configured()
         self._start_claudecode_remote_nats_runtime_if_configured()
         self._refresh_openclaw_sync_lifecycle(force_replay=not bool(self.active_openclaw_session_file))
-        if self.active_session_turns:
-            last_model = ""
-            for turn in reversed(self.active_session_turns):
-                last_model = str(turn.get("model") or "").strip()
-                if last_model:
-                    break
-            resolved_last_model = model_id_from_display_name(last_model)
-            if is_visible_model_id(last_model):
-                self.selected_model = last_model
-            elif is_visible_model_id(resolved_last_model):
-                self.selected_model = resolved_last_model
-            elif not is_visible_model_id(self.selected_model):
-                self.selected_model = STARTUP_DEFAULT_MODEL_ID
-        else:
-            self.selected_model = STARTUP_DEFAULT_MODEL_ID
+        # The restored owner is authoritative, including for an empty chat.
+        # Legacy rows may use their own newest valid turn once, then the
+        # deterministic startup default; never borrow the ambient selector.
+        restored_model = self._model_for_chat_selection(self._current_chat_state)
+        self.selected_model = restored_model or STARTUP_DEFAULT_MODEL_ID
+        if isinstance(self._current_chat_state, dict) and self.active_chat_id:
+            needs_model_backfill = self._current_chat_state.get("model") != self.selected_model
+            self._current_chat_state["model"] = self.selected_model
+            if needs_model_backfill:
+                self._defer_chat_state_save()
         self.model_combo.SetValue(model_display_name(self.selected_model))
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         self._refresh_history()
@@ -3152,7 +3147,7 @@ class ChatFrame(wx.Frame):
             "title_source": str(state.get("title_source") or ("manual" if title_manual else "default")),
             "title_updated_at": float(state.get("title_updated_at") or state.get("updated_at") or now),
             "title_revision": int(state.get("title_revision") or 1),
-            "model": str(state.get("model") or self.selected_model or DEFAULT_MODEL_ID),
+            "model": self._model_for_chat_selection(state) or STARTUP_DEFAULT_MODEL_ID,
             "created_at": float(state.get("created_at") or self.active_session_started_at or now),
             "updated_at": float(state.get("updated_at") or now),
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
@@ -3386,6 +3381,12 @@ class ChatFrame(wx.Frame):
                 merged.update(current)
                 merged["id"] = self.active_chat_id
                 merged["turns"] = self.active_session_turns
+                # Store metadata is the durable owner record.  A stale global
+                # state snapshot must not replace its committed model.
+                owner_model_source = {"model": summary.get("model"), "turns": self.active_session_turns}
+                merged["model"] = self._model_for_chat_selection(owner_model_source) or STARTUP_DEFAULT_MODEL_ID
+                if summary.get("model") != merged["model"]:
+                    changed = True
                 self._current_chat_state = merged
             elif isinstance(active_turns, list) and active_turns:
                 self.active_session_turns = active_turns
@@ -5487,36 +5488,19 @@ class ChatFrame(wx.Frame):
         # the active chat or produce a misleading remote state event.
         if not is_visible_model_id(model):
             return
-        if self.view_mode == "history":
-            current_chat = self._find_archived_chat(self.view_history_id)
-            if not isinstance(current_chat, dict):
-                return
-        else:
-            current_chat = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else None
-        current_model = str((current_chat or {}).get("model") or "").strip()
-        if self.selected_model == model and current_model == model:
+        if self.selected_model == model:
             try:
                 self._sync_codex_speed_combo_enabled_for_model(model)
             except Exception:
                 pass
             return
         self.selected_model = model
-        if current_chat is None:
-            self._current_chat_state = {}
-            current_chat = self._current_chat_state
-        current_chat["model"] = model
-        self._invalidate_remote_state_cache()
-        self._invalidate_remote_history_list_cache()
         try:
             self._sync_codex_speed_combo_enabled_for_model(model)
         except Exception:
             pass
-        # Persist asynchronously so a combobox event does not disturb keyboard
-        # focus, then publish the already-compatible authoritative snapshot.
-        self._defer_chat_state_save()
-        chat_id = str(current_chat.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-        if chat_id:
-            self._push_remote_state(chat_id)
+        # This is only a candidate.  Allocation or an accepted submission is
+        # the owner-consuming action that commits it to a chat.
 
     @staticmethod
     def _codex_service_tier_for_chat(chat: dict | None) -> str:
@@ -10459,6 +10443,11 @@ class ChatFrame(wx.Frame):
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
         requested_chat_id = str(payload.get("chat_id") or "").strip()
+        previous_owner_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        previous_selected_model = str(self.selected_model or STARTUP_DEFAULT_MODEL_ID)
+        previous_combo_value = self.model_combo.GetValue() if threading.current_thread() is threading.main_thread() else ""
+        previous_input_value = self.input_edit.GetValue() if threading.current_thread() is threading.main_thread() else ""
+        previous_focus = wx.Window.FindFocus() if threading.current_thread() is threading.main_thread() else None
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
         archived_target = None
@@ -10483,7 +10472,7 @@ class ChatFrame(wx.Frame):
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
                 if archived_target is not None:
-                    self._switch_current_chat(requested_chat_id)
+                    pass
                 else:
                     self._start_remote_new_chat({"chat_id": requested_chat_id, "model": model})
             chat_id = requested_chat_id
@@ -10494,10 +10483,7 @@ class ChatFrame(wx.Frame):
             if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
-        if threading.current_thread() is threading.main_thread():
-            self.model_combo.SetValue(model_display_name(model))
-        self.selected_model = model
-        if threading.current_thread() is threading.main_thread():
+        if archived_target is None and threading.current_thread() is threading.main_thread():
             self.input_edit.SetValue(text)
         title_revision_before = 0
         if isinstance(target_chat, dict):
@@ -10505,10 +10491,43 @@ class ChatFrame(wx.Frame):
                 title_revision_before = int(target_chat.get("title_revision") or 0)
             except Exception:
                 title_revision_before = 0
-        ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id)
+        if archived_target is not None:
+            ok, message = self._submit_archived_remote_question(archived_target, text, model)
+        else:
+            ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id)
+        restore_previous_owner = False
+        if restore_previous_owner and previous_owner_id in {
+            str((chat or {}).get("id") or "").strip() for chat in self.archived_chats if isinstance(chat, dict)
+        }:
+            self._switch_current_chat(previous_owner_id)
+        if not ok:
+            if is_new_chat:
+                if previous_owner_id in {
+                    str((chat or {}).get("id") or "").strip() for chat in self.archived_chats if isinstance(chat, dict)
+                }:
+                    self._switch_current_chat(previous_owner_id)
+                self.archived_chats = [
+                    chat for chat in self.archived_chats
+                    if str((chat or {}).get("id") or "").strip() != requested_chat_id
+                ]
+                store = getattr(self, "chat_store", None)
+                if requested_chat_id and store is not None:
+                    store.delete_chat(requested_chat_id)
+            self.selected_model = previous_selected_model
+            if threading.current_thread() is threading.main_thread():
+                self.model_combo.SetValue(previous_combo_value or model_display_name(previous_selected_model))
+                self.input_edit.SetValue(previous_input_value)
+                if previous_focus is not None:
+                    previous_focus.SetFocus()
         if ok:
-            self._push_remote_state(chat_id)
             target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
+            if isinstance(target_chat, dict):
+                target_chat["model"] = model
+            if chat_id in {self.active_chat_id, self.current_chat_id}:
+                self.selected_model = model
+                if threading.current_thread() is threading.main_thread():
+                    self.model_combo.SetValue(model_display_name(model))
+            self._push_remote_state(chat_id)
             title_revision_after = title_revision_before
             if isinstance(target_chat, dict):
                 try:
@@ -10517,6 +10536,8 @@ class ChatFrame(wx.Frame):
                     title_revision_after = title_revision_before
             if title_revision_after == title_revision_before:
                 self._push_remote_history_changed(chat_id)
+        if restore_previous_owner and previous_focus is not None and threading.current_thread() is threading.main_thread():
+            previous_focus.SetFocus()
         return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
 
     def _resolve_remote_message_model(
@@ -10533,8 +10554,6 @@ class ChatFrame(wx.Frame):
         requested_raw = str((payload or {}).get("model") or "").strip()
         requested_model = normalize_model_id(requested_raw, default="") if requested_raw else ""
         chat_model = self._model_for_chat_selection(target_chat)
-        if is_new_chat and requested_model:
-            return requested_model, ""
         if change_mode == "explicit":
             if not requested_raw:
                 return "", "missing_explicit_model"
@@ -10542,11 +10561,13 @@ class ChatFrame(wx.Frame):
                 return requested_model, ""
             if requested_raw:
                 return "", "invalid_explicit_model"
-        if chat_model:
-            return chat_model, ""
-        if requested_model:
-            return requested_model, ""
-        return normalize_model_id(current_model or DEFAULT_MODEL_ID), ""
+        if is_new_chat:
+            if requested_model:
+                return requested_model, ""
+            return normalize_model_id(current_model or STARTUP_DEFAULT_MODEL_ID), ""
+        if isinstance(target_chat, dict):
+            return chat_model or STARTUP_DEFAULT_MODEL_ID, ""
+        return normalize_model_id(current_model or STARTUP_DEFAULT_MODEL_ID), ""
 
     def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat = self._start_remote_new_chat(payload)
@@ -13797,9 +13818,8 @@ class ChatFrame(wx.Frame):
         self._current_chat_state["turns"] = self.active_session_turns
         self.active_session_started_at = float(chat.get("created_at") or time.time())
         self.active_turn_idx = len(self.active_session_turns) - 1
-        self.selected_model = model_id_from_display_name(str(chat.get("model") or self.selected_model or STARTUP_DEFAULT_MODEL_ID))
-        if not is_visible_model_id(self.selected_model):
-            self.selected_model = STARTUP_DEFAULT_MODEL_ID
+        self.selected_model = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
+        self._current_chat_state["model"] = self.selected_model
         self.model_combo.SetValue(model_display_name(self.selected_model))
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         self.active_codex_thread_id = ""
@@ -15944,6 +15964,64 @@ class ChatFrame(wx.Frame):
     def _on_send_clicked(self, _):
         return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
+    def _submit_archived_remote_question(self, chat: dict, question: str, model: str) -> tuple[bool, str]:
+        """Accept a remote turn for an off-screen owner without projecting it."""
+        owner_id = str((chat or {}).get("id") or "").strip()
+        resolved_model = normalize_model_id(model or "", default="")
+        text = str(question or "").strip()
+        if not owner_id or not resolved_model or not text:
+            return False, "invalid archived chat submission"
+        store = getattr(self, "chat_store", None)
+        if getattr(self, "_chat_store_enabled", False) and store is not None:
+            if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
+                return False, "Clear/resend recovery is still pending for this chat."
+            loaded = store.load_chat(owner_id, include_execution_steps=False)
+            if isinstance(loaded, dict):
+                # Preserve the object held by archived_chats while replacing
+                # summary-only metadata with this owner's complete durable state.
+                chat.clear()
+                chat.update(loaded)
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        chat["turns"] = turns
+        previous_model = self._model_for_chat_selection(chat) or STARTUP_DEFAULT_MODEL_ID
+        turn_idx = len(turns)
+        turn = {
+            "question": text,
+            "answer_md": REQUESTING_TEXT,
+            "model": resolved_model,
+            "created_at": time.time(),
+            "question_origin": "rc",
+        }
+        turns.append(turn)
+        chat["model"] = resolved_model
+        chat["updated_at"] = turn["created_at"]
+        self._mark_turn_request_pending(turn, resolved_model, text)
+        try:
+            if is_codex_model(resolved_model):
+                started = self._start_codex_worker_for_turn(owner_id, turn_idx, text, resolved_model)
+            elif is_kimi_model(resolved_model):
+                started = self._start_kimi_worker_for_turn(owner_id, turn_idx, text, resolved_model)
+            elif is_claudecode_model(resolved_model):
+                started = self._start_claudecode_worker_for_turn(
+                    owner_id, turn_idx, text, str(chat.get("claudecode_session_id") or ""), resolved_model
+                )
+            else:
+                worker = threading.Thread(
+                    target=self._worker,
+                    args=(openrouter_api_key_for_app(), turn_idx, text, resolved_model, False, owner_id),
+                    daemon=True,
+                )
+                started = worker.start()
+            if started is False:
+                raise RuntimeError("Provider rejected submission")
+        except Exception as exc:
+            del turns[turn_idx:]
+            chat["model"] = previous_model
+            return False, str(exc)
+        self._mark_chat_turns_dirty(owner_id, turn_idx)
+        self._defer_chat_state_save()
+        return True, ""
+
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
@@ -15975,10 +16053,24 @@ class ChatFrame(wx.Frame):
             and self._reconcile_clear_operation_for_owner(submit_owner, surface_recovery=True) is not None
         ):
             return False, "Clear/resend recovery is still pending for this chat."
-        if self._send_active_claudecode_input(submit_owner, q):
-            self.input_edit.SetValue("")
-            self.input_edit.SetFocus()
-            return True, ""
+        current_state_owner = str((self._current_chat_state or {}).get("id") or "").strip()
+        if is_claudecode_model(resolved_model) and current_state_owner == submit_owner:
+            previous_committed_model = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
+            try:
+                continued = self._send_active_claudecode_input(submit_owner, q)
+            except Exception as exc:
+                self.selected_model = previous_committed_model
+                self.model_combo.SetValue(model_display_name(previous_committed_model))
+                return False, str(exc)
+            if continued:
+                self.selected_model = resolved_model
+                self._current_chat_state["model"] = resolved_model
+                if threading.current_thread() is threading.main_thread():
+                    self.model_combo.SetValue(model_display_name(resolved_model))
+                self._defer_chat_state_save()
+                self.input_edit.SetValue("")
+                self.input_edit.SetFocus()
+                return True, ""
         active_owner = str(self.active_chat_id or self.current_chat_id or "").strip()
         if submit_owner and submit_owner != active_owner:
             if self._find_archived_chat(submit_owner):
@@ -15987,6 +16079,25 @@ class ChatFrame(wx.Frame):
             elif chat_id:
                 self.active_chat_id = submit_owner
                 self.current_chat_id = submit_owner
+        # Fence later persistence, title and provider work to the owner that
+        # was resolved above, including submissions originating in history.
+        chat_id = submit_owner
+        previous_committed_model = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
+
+        def rollback_rejected_start(turn_idx: int, exc: Exception) -> tuple[bool, str]:
+            if len(self.active_session_turns) > turn_idx:
+                del self.active_session_turns[turn_idx:]
+            self.active_turn_idx = len(self.active_session_turns) - 1
+            self._current_chat_state["model"] = previous_committed_model
+            self.selected_model = previous_committed_model
+            self.model_combo.SetValue(model_display_name(previous_committed_model))
+            self.is_running = False
+            self._active_request_count = 0
+            self._pending_input_attachments = requested_attachments
+            self.input_edit.SetValue(raw_question)
+            self._defer_chat_state_save()
+            self._render_answer_list()
+            return False, str(exc)
         if not self.active_session_started_at:
             self.active_session_started_at = time.time()
         self.selected_model = resolved_model
@@ -16049,13 +16160,18 @@ class ChatFrame(wx.Frame):
                 else:
                     self._render_answer_list()
             if source == "local":
-                self._start_codex_local_command_worker_for_turn(
-                    chat_id or self.active_chat_id or self.current_chat_id or "",
-                    turn_idx,
-                    command_name,
-                    command_args,
-                    resolved_model,
-                )
+                try:
+                    started = self._start_codex_local_command_worker_for_turn(
+                        chat_id or self.active_chat_id or self.current_chat_id or "",
+                        turn_idx,
+                        command_name,
+                        command_args,
+                        resolved_model,
+                    )
+                    if started is False:
+                        raise RuntimeError("Provider rejected submission")
+                except Exception as exc:
+                    return rollback_rejected_start(turn_idx, exc)
             return True, ""
         kimi_local_command = self._parse_kimi_local_command(q) if is_kimi_model(resolved_model) and not outgoing_attachments else None
         if kimi_local_command:
@@ -16098,13 +16214,18 @@ class ChatFrame(wx.Frame):
                 else:
                     self._render_answer_list()
             if source == "local":
-                self._start_kimi_local_command_worker_for_turn(
-                    chat_id or self.active_chat_id or self.current_chat_id or "",
-                    turn_idx,
-                    command_name,
-                    command_args,
-                    resolved_model,
-                )
+                try:
+                    started = self._start_kimi_local_command_worker_for_turn(
+                        chat_id or self.active_chat_id or self.current_chat_id or "",
+                        turn_idx,
+                        command_name,
+                        command_args,
+                        resolved_model,
+                    )
+                    if started is False:
+                        raise RuntimeError("Provider rejected submission")
+                except Exception as exc:
+                    return rollback_rejected_start(turn_idx, exc)
             return True, ""
         if (not success_attachments) and (not q):
             now = time.time()
@@ -16225,21 +16346,26 @@ class ChatFrame(wx.Frame):
         # The transport that submitted the turn must not choose its provider.
         # Remote NATS requests carry the same resolved model IDs as desktop
         # submissions, so CLI-backed models need their dedicated workers too.
-        if is_codex_model(resolved_model):
-            self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
-        elif is_kimi_model(resolved_model):
-            self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
-        elif is_claudecode_model(resolved_model):
-            self._start_claudecode_worker_for_turn(
-                chat_id or self.active_chat_id or self.current_chat_id or "",
-                turn_idx,
-                worker_question,
-                self.active_claudecode_session_id,
-                resolved_model,
-            )
-        else:
-            t = threading.Thread(target=self._worker, args=(openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
-            t.start()
+        try:
+            if is_codex_model(resolved_model):
+                started = self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
+            elif is_kimi_model(resolved_model):
+                started = self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
+            elif is_claudecode_model(resolved_model):
+                started = self._start_claudecode_worker_for_turn(
+                    chat_id or self.active_chat_id or self.current_chat_id or "",
+                    turn_idx,
+                    worker_question,
+                    self.active_claudecode_session_id,
+                    resolved_model,
+                )
+            else:
+                t = threading.Thread(target=self._worker, args=(openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
+                started = t.start()
+            if started is False:
+                raise RuntimeError("Provider rejected submission")
+        except Exception as exc:
+            return rollback_rejected_start(turn_idx, exc)
         if automatic_clear_resend and (is_codex_model(resolved_model) or is_kimi_model(resolved_model)):
             self._play_clear_resend_accepted_sound(
                 str(self._clear_resend_operation_id),
@@ -17026,7 +17152,8 @@ class ChatFrame(wx.Frame):
     ):
         if flush_before_archive:
             self._flush_chat_state_save()
-        if not self.active_session_turns:
+        owner_id = str(self.active_chat_id or self.current_chat_id or (self._current_chat_state or {}).get("id") or "").strip()
+        if not self.active_session_turns and not owner_id:
             return None
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None)
         turn_count = len(self.active_session_turns)
@@ -17035,15 +17162,7 @@ class ChatFrame(wx.Frame):
             turns_snapshot = list(self.active_session_turns)
         else:
             turns_snapshot = copy.deepcopy(self.active_session_turns)
-        model_snapshot = str(self._current_chat_state.get("model") or "").strip()
-        if not is_visible_model_id(model_snapshot):
-            for turn in reversed(self.active_session_turns):
-                turn_model = str((turn or {}).get("model") or "").strip()
-                if is_visible_model_id(turn_model):
-                    model_snapshot = turn_model
-                    break
-        if not is_visible_model_id(model_snapshot):
-            model_snapshot = self._resolve_current_model()
+        model_snapshot = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
         api_key = openrouter_api_key_for_app() if (not quick_title) else ""
         title_manual = self._current_chat_state.get("title_manual")
         if isinstance(title_manual, str):
@@ -17896,21 +18015,22 @@ class ChatFrame(wx.Frame):
         self._show_history_menu()
 
     def _model_for_chat_selection(self, chat: dict | None) -> str:
-        model = str((chat or {}).get("model") or "").strip()
-        if is_visible_model_id(model):
+        model = normalize_model_id(str((chat or {}).get("model") or "").strip(), default="")
+        if model:
             return model
         turns = (chat or {}).get("turns")
         if isinstance(turns, list):
             for turn in reversed(turns):
-                turn_model = str((turn or {}).get("model") or "").strip()
-                if is_visible_model_id(turn_model):
+                turn_model = normalize_model_id(str((turn or {}).get("model") or "").strip(), default="")
+                if turn_model:
                     return turn_model
         return ""
 
     def _apply_selected_chat_model_to_combo(self, chat: dict | None) -> None:
-        model = self._model_for_chat_selection(chat)
-        if not model:
-            return
+        model = self._model_for_chat_selection(chat) or STARTUP_DEFAULT_MODEL_ID
+        if isinstance(chat, dict) and chat.get("model") != model:
+            chat["model"] = model
+            self._defer_chat_state_save()
         display = model_display_name(model)
         self.selected_model = model
         if threading.current_thread() is threading.main_thread() and self.model_combo.GetValue() != display:
@@ -18079,8 +18199,8 @@ class ChatFrame(wx.Frame):
         chat = self._hydrate_chat_from_store(self._find_archived_chat(chat_id), include_execution_steps=False)
         if not chat:
             return False
-        # Archive current session if it has turns
-        if self.active_session_turns:
+        # Empty chats are durable owners too.
+        if str(self.active_chat_id or self.current_chat_id or "").strip():
             self._archive_active_session(quick_title=True, schedule_async_rename=True)
         # Load the selected chat
         turns = chat.get("turns") or []
@@ -18131,16 +18251,7 @@ class ChatFrame(wx.Frame):
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1
-        resolved_model = str(chat.get("model") or "").strip()
-        if not is_visible_model_id(resolved_model):
-            resolved_model = ""
-        for t in reversed(self.active_session_turns):
-            m = str(t.get("model") or "").strip()
-            if not resolved_model and is_visible_model_id(m):
-                resolved_model = m
-                break
-        if not resolved_model:
-            resolved_model = self.selected_model if is_visible_model_id(self.selected_model) else DEFAULT_MODEL_ID
+        resolved_model = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
         self.selected_model = resolved_model
         self._current_chat_state["model"] = resolved_model
         if threading.current_thread() is threading.main_thread():

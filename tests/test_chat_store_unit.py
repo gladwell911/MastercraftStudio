@@ -83,6 +83,24 @@ def test_chat_store_initializes_schema_and_lists_summaries(tmp_path):
     ]
 
 
+def test_chat_models_round_trip_for_empty_and_populated_owners_after_restart(tmp_path):
+    path = tmp_path / "chat-models.db"
+    store = ChatStore(path)
+    store.initialize()
+    store.upsert_chat({"id": "chat-a", "title": "A", "model": "codex/main", "created_at": 1.0, "updated_at": 1.0})
+    store.replace_turns("chat-a", [{"question": "q", "answer_md": "a", "model": "codex/main"}])
+    store.upsert_chat({"id": "chat-b", "title": "B", "model": "kimi/main", "created_at": 2.0, "updated_at": 2.0})
+    restarted = ChatStore(path)
+    restarted.initialize()
+
+    summaries = {row["id"]: row for row in restarted.list_chat_summaries()}
+    assert summaries["chat-a"]["model"] == "codex/main"
+    assert summaries["chat-b"]["model"] == "kimi/main"
+    assert summaries["chat-b"]["turn_count"] == 0
+    assert restarted.load_chat("chat-a")["model"] == "codex/main"
+    assert restarted.load_chat("chat-b")["model"] == "kimi/main"
+
+
 def test_chat_store_replaces_and_loads_turns(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()

@@ -18575,7 +18575,7 @@ def test_model_changed_noops_without_state_save_when_selection_is_unchanged(fram
     assert pushes == []
 
 
-def test_model_changed_commits_supported_models_persists_and_pushes_exact_state(frame, monkeypatch):
+def test_model_changed_updates_only_candidate_without_committing_or_publishing(frame, monkeypatch):
     frame.selected_model = "codex/main"
     frame.active_chat_id = "chat-model-selection"
     frame.current_chat_id = "chat-model-selection"
@@ -18595,18 +18595,15 @@ def test_model_changed_commits_supported_models_persists_and_pushes_exact_state(
         frame._on_model_changed(None)
 
         assert frame.selected_model == model
-        assert frame._current_chat_state["model"] == model
-        assert published[-1]["type"] == "state"
-        assert published[-1]["chat_id"] == "chat-model-selection"
-        assert published[-1]["body"]["model"] == model
+        assert frame._current_chat_state["model"] == "codex/main"
 
-    assert deferred == [True, True, True]
-    assert len(published) == 3
+    assert deferred == []
+    assert published == []
 
     frame._on_model_changed(None)
 
-    assert deferred == [True, True, True]
-    assert len(published) == 3
+    assert deferred == []
+    assert published == []
 
 
 def test_model_changed_ignores_unsupported_model_without_persisting_or_pushing(frame, monkeypatch):
@@ -18628,7 +18625,7 @@ def test_model_changed_ignores_unsupported_model_without_persisting_or_pushing(f
     assert published == []
 
 
-def test_model_changed_in_history_updates_only_the_visible_archived_chat(frame, monkeypatch):
+def test_model_changed_in_history_is_candidate_only(frame, monkeypatch):
     active = {"id": "chat-active", "model": "codex/main", "turns": []}
     archived = {"id": "chat-history", "model": "codex/main", "turns": []}
     frame._current_chat_state = active
@@ -18647,9 +18644,251 @@ def test_model_changed_in_history_updates_only_the_visible_archived_chat(frame, 
     frame._on_model_changed(None)
 
     assert active["model"] == "codex/main"
-    assert archived["model"] == "openai/gpt-5.2"
-    assert saved == [True]
-    assert pushed == ["chat-history"]
+    assert archived["model"] == "codex/main"
+    assert frame.selected_model == "openai/gpt-5.2"
+    assert saved == []
+    assert pushed == []
+
+
+def test_new_chat_assigns_candidate_without_mutating_previous_chat(frame, monkeypatch):
+    frame.active_chat_id = "chat-a"
+    frame.current_chat_id = "chat-a"
+    frame.active_session_turns[:] = [{"question": "A", "answer_md": "done", "model": "codex/main"}]
+    frame._current_chat_state = {
+        "id": "chat-a",
+        "title": "A",
+        "model": "codex/main",
+        "turns": frame.active_session_turns,
+    }
+    frame.selected_model = "codex/main"
+    frame.model_combo.SetValue(main.model_display_name("kimi/main"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+
+    frame._on_model_changed(None)
+    frame._on_new_chat_clicked(None)
+
+    archived_a = frame._find_archived_chat("chat-a")
+    assert archived_a is not None
+    assert archived_a["model"] == "codex/main"
+    assert frame._current_chat_state["model"] == "kimi/main"
+    assert frame.selected_model == "kimi/main"
+
+
+def test_empty_chat_model_restores_from_restarted_store(frame, monkeypatch, tmp_path):
+    path = tmp_path / "empty-model-restart.db"
+    first = main.ChatStore(path)
+    first.initialize()
+    first.upsert_chat({"id": "chat-empty", "title": "Empty", "model": "kimi/main", "created_at": 1.0, "updated_at": 1.0})
+    restarted = main.ChatStore(path)
+    restarted.initialize()
+    loaded = restarted.load_chat("chat-empty")
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+
+    frame._load_chat_as_current(loaded)
+
+    assert frame.active_session_turns == []
+    assert frame._current_chat_state["model"] == "kimi/main"
+    assert frame.selected_model == "kimi/main"
+    assert frame.model_combo.GetValue() == main.model_display_name("kimi/main")
+
+
+def test_existing_chat_candidate_commits_only_after_nonempty_submit(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "model": "codex/main", "turns": frame.active_session_turns}
+    frame.selected_model = "kimi/main"
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    rejected, _ = frame._submit_question("", model="kimi/main")
+    assert rejected is False
+    assert frame._current_chat_state["model"] == "codex/main"
+
+    accepted, message = frame._submit_question("hello", model="kimi/main")
+    assert (accepted, message) == (True, "")
+    assert frame._current_chat_state["model"] == "kimi/main"
+    assert frame.active_session_turns[-1]["model"] == "kimi/main"
+
+
+def test_invalid_legacy_chat_model_uses_only_own_turn_then_startup_default(frame):
+    own_turn = {"model": "invalid/provider", "turns": [{"model": "kimi/main"}]}
+    no_valid_turn = {"model": "invalid/provider", "turns": [{"model": "also-invalid"}]}
+    frame.selected_model = "openai/gpt-5.2"
+
+    assert frame._model_for_chat_selection(own_turn) == "kimi/main"
+    assert (frame._model_for_chat_selection(no_valid_turn) or main.STARTUP_DEFAULT_MODEL_ID) == main.STARTUP_DEFAULT_MODEL_ID
+
+
+def test_load_state_store_model_beats_stale_app_candidate(frame, tmp_path):
+    frame.state_path = tmp_path / "app_state.json"
+    frame.chat_store = main.ChatStore(tmp_path / "owner-model.db")
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-a", "title": "A", "model": "kimi/main", "created_at": 1.0, "updated_at": 2.0})
+    frame.state_path.write_text(json.dumps({
+        "selected_model_id": "openai/gpt-5.2",
+        "active_chat_id": "chat-a",
+        "active_chat": {"id": "chat-a", "model": "openai/gpt-5.2"},
+    }), encoding="utf-8")
+
+    frame._load_state()
+
+    assert frame._current_chat_state["model"] == "kimi/main"
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi"])
+def test_provider_start_rejection_restores_committed_model(frame, monkeypatch, provider):
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "model": "openai/gpt-5.2", "turns": frame.active_session_turns}
+    candidate = main.DEFAULT_CODEX_MODEL if provider == "codex" else "kimi/main"
+    monkeypatch.setattr(frame, f"_start_{provider}_worker_for_turn", lambda *args, **kwargs: False)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    ok, _ = frame._submit_question("hello", model=candidate)
+
+    assert ok is False
+    assert frame._current_chat_state["model"] == "openai/gpt-5.2"
+    assert frame.selected_model == "openai/gpt-5.2"
+    assert frame.active_session_turns == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "candidate", "command"),
+    [("codex", main.DEFAULT_CODEX_MODEL, "/status"), ("kimi", "kimi/main", "/status")],
+)
+def test_local_command_start_exception_restores_committed_model(frame, monkeypatch, provider, candidate, command):
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "model": "openai/gpt-5.2", "turns": frame.active_session_turns}
+    monkeypatch.setattr(
+        frame, f"_start_{provider}_local_command_worker_for_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rejected")),
+    )
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+
+    ok, message = frame._submit_question(command, model=candidate)
+
+    assert ok is False
+    assert "rejected" in message
+    assert frame._current_chat_state["model"] == "openai/gpt-5.2"
+    assert frame.selected_model == "openai/gpt-5.2"
+    assert frame.active_session_turns == []
+    assert frame.input_edit.GetValue() == command
+
+
+def test_active_claude_continuation_rejects_wrong_owner_without_commit(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "model": "codex/main", "turns": []}
+    monkeypatch.setattr(frame, "_send_active_claudecode_input", lambda *_args: pytest.fail("wrong owner must not receive input"))
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda chat_id: None)
+    monkeypatch.setattr(frame, "_start_claudecode_worker_for_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    ok, _ = frame._submit_question("hello", model="claudecode/default", chat_id="chat-b")
+
+    assert ok is True
+    assert frame.active_chat_id == "chat-b"
+
+
+def test_remote_archived_owner_submission_restores_visible_owner_and_focus(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-visible"
+    frame._current_chat_state = {"id": "chat-visible", "title": "Visible", "model": "codex/main", "turns": []}
+    target = {"id": "chat-target", "title": "Target", "model": "kimi/main", "turns": []}
+    frame.archived_chats = [target]
+    frame.input_edit.SetValue("unsent foreground draft")
+    frame.input_edit.SetSelection(2, 9)
+    frame.input_edit.SetFocus()
+    draft_before = frame.input_edit.GetValue()
+    selection_before = frame.input_edit.GetSelection()
+    insertion_before = frame.input_edit.GetInsertionPoint()
+    dispatches = []
+    pushes = []
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn", lambda *args: dispatches.append(args))
+    monkeypatch.setattr(frame, "_switch_current_chat", lambda *_args: pytest.fail("background remote work must not switch foreground"))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *_args, **_kwargs: pytest.fail("background remote work must not render"))
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: pytest.fail("background remote work must not refresh history"))
+    monkeypatch.setattr(frame, "_save_state", lambda *_args, **_kwargs: pytest.fail("background remote work must defer owner persistence"))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda chat_id: pushes.append(("state", chat_id)))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id: pushes.append(("history", chat_id)))
+    history_selection = frame.history_list.GetSelection()
+    status, body = frame._remote_api_message_ui({"chat_id": "chat-target", "text": "hello"})
+
+    assert (status, body["accepted"]) == (200, True)
+    assert frame.active_chat_id == "chat-visible"
+    assert frame._current_chat_state["model"] == "codex/main"
+    assert frame.input_edit.HasFocus()
+    assert frame.input_edit.GetValue() == draft_before
+    assert frame.input_edit.GetSelection() == selection_before
+    assert frame.input_edit.GetInsertionPoint() == insertion_before
+    assert frame._find_archived_chat("chat-target")["model"] == "kimi/main"
+    assert frame.history_list.GetSelection() == history_selection
+    assert dispatches == [("chat-target", 0, "hello", "kimi/main")]
+    assert pushes == [("state", "chat-target"), ("history", "chat-target")]
+
+
+def test_offscreen_remote_submit_loads_full_store_turns_before_append(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({
+        "id": "chat-target", "title": "Target", "model": "kimi/main", "created_at": 1.0, "updated_at": 1.0,
+    })
+    old_turn = {"question": "old", "answer_md": "answer", "model": "kimi/main", "created_at": 1.0}
+    frame.chat_store.replace_turns("chat-target", [old_turn])
+    summary = next(row for row in frame.chat_store.list_chat_summaries() if row["id"] == "chat-target")
+    assert "turns" not in summary
+    frame.archived_chats = [summary]
+    dispatches = []
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn", lambda *args: dispatches.append(args))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    ok, message = frame._submit_archived_remote_question(summary, "new", "kimi/main")
+    frame._persist_chat_history_to_store()
+
+    assert (ok, message) == (True, "")
+    assert dispatches == [("chat-target", 1, "new", "kimi/main")]
+    persisted = frame.chat_store.load_turns("chat-target")
+    assert [turn["question"] for turn in persisted] == ["old", "new"]
+
+
+def test_offscreen_remote_submit_respects_pending_clear_fence_without_mutation(frame, monkeypatch):
+    target = {"id": "chat-target", "model": "kimi/main", "turns": []}
+    frame.archived_chats = [target]
+    frame._chat_store_enabled = True
+    checked = []
+    monkeypatch.setattr(
+        frame,
+        "_reconcile_clear_operation_for_owner",
+        lambda owner, **kwargs: checked.append((owner, kwargs)) or {"state": "resend_blocked"},
+    )
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn", lambda *_args: pytest.fail("fenced owner must not dispatch"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: pytest.fail("fenced owner must not persist"))
+
+    ok, message = frame._submit_archived_remote_question(target, "new", "kimi/main")
+
+    assert ok is False
+    assert "recovery" in message
+    assert checked == [("chat-target", {"surface_recovery": False})]
+    assert target["turns"] == []
+
+
+def test_rejected_remote_new_chat_removes_orphan_and_restores_visible_owner(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-visible"
+    frame._current_chat_state = {"id": "chat-visible", "title": "Visible", "model": "codex/main", "turns": []}
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: (False, "rejected"))
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: pytest.fail("rejection must not publish"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+
+    status, body = frame._remote_api_message_ui({"chat_id": "remote-new", "text": "hello", "model": "kimi/main"})
+
+    assert (status, body["accepted"]) == (400, False)
+    assert frame.active_chat_id == "chat-visible"
+    assert frame._find_archived_chat("remote-new") is None
+    assert frame._current_chat_state["model"] == "codex/main"
 
 
 def test_new_chat_preserves_current_codex_speed_combo_selection(frame, monkeypatch):

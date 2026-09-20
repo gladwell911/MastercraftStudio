@@ -447,3 +447,66 @@ def test_frame_close_with_active_kimi_turn_does_not_hang(frame, monkeypatch):
     assert elapsed < 5.0
     assert fake.closed == 1
     assert event.skipped is True
+
+
+def test_kimi_candidate_new_chat_reopen_codex_and_dispatch_by_owner(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame.active_chat_id = frame.current_chat_id = "chat-codex-a"
+    frame.active_session_turns = [
+        {"question": "codex question", "answer_md": "codex answer", "model": main.DEFAULT_CODEX_MODEL, "created_at": 1.0}
+    ]
+    frame._current_chat_state = {
+        "id": "chat-codex-a",
+        "title": "Codex A",
+        "model": main.DEFAULT_CODEX_MODEL,
+        "turns": frame.active_session_turns,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    frame.selected_model = main.DEFAULT_CODEX_MODEL
+    frame.model_combo.SetValue(main.model_display_name(main.DEFAULT_CODEX_MODEL))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    dispatches = []
+    monkeypatch.setattr(
+        frame, "_start_codex_worker_for_turn",
+        lambda chat_id, turn_idx, question, model: dispatches.append(("codex", chat_id, turn_idx, question, model)),
+    )
+    monkeypatch.setattr(
+        frame, "_start_kimi_worker_for_turn",
+        lambda chat_id, turn_idx, question, model: dispatches.append(("kimi", chat_id, turn_idx, question, model)),
+    )
+
+    frame.model_combo.SetValue(main.model_display_name("kimi/main"))
+    frame._on_model_changed(None)
+    assert frame._current_chat_state["model"] == main.DEFAULT_CODEX_MODEL
+    frame._on_new_chat_clicked(None)
+    kimi_b = frame.active_chat_id
+    wx_app.Yield()
+
+    assert kimi_b != "chat-codex-a"
+    assert frame._current_chat_state["model"] == "kimi/main"
+    assert frame.model_combo.GetValue() == main.model_display_name("kimi/main")
+    assert frame.input_edit.HasFocus()
+
+    assert frame._switch_current_chat("chat-codex-a") is True
+    wx_app.Yield()
+    assert frame.selected_model == main.DEFAULT_CODEX_MODEL
+    assert frame.model_combo.GetValue() == main.model_display_name(main.DEFAULT_CODEX_MODEL)
+    assert frame.input_edit.HasFocus()
+    assert frame._submit_question("codex follow-up", model=frame.selected_model) == (True, "")
+
+    assert frame._switch_current_chat(kimi_b) is True
+    wx_app.Yield()
+    assert frame.selected_model == "kimi/main"
+    assert frame.model_combo.GetValue() == main.model_display_name("kimi/main")
+    assert frame.input_edit.HasFocus()
+    assert frame._submit_question("kimi follow-up", model=frame.selected_model) == (True, "")
+
+    assert dispatches == [
+        ("codex", "chat-codex-a", 1, "codex follow-up", main.DEFAULT_CODEX_MODEL),
+        ("kimi", kimi_b, 0, "kimi follow-up", "kimi/main"),
+    ]

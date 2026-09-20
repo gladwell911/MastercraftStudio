@@ -697,7 +697,7 @@ def test_real_ui_codex_speed_combo_arrow_key_is_responsive_and_keeps_focus(frame
     assert renders == []
 
 
-def test_real_ui_history_model_selection_updates_only_visible_chat_and_keeps_focus(frame, wx_app, monkeypatch):
+def test_real_ui_history_model_selection_is_candidate_only_and_keeps_focus(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     active = {"id": "chat-active", "model": "codex/main", "turns": []}
     history = {"id": "chat-history", "model": "codex/main", "turns": []}
@@ -721,9 +721,10 @@ def test_real_ui_history_model_selection_updates_only_visible_chat_and_keeps_foc
 
     assert frame.model_combo.HasFocus()
     assert active["model"] == "codex/main"
-    assert history["model"] == "openai/gpt-5.2"
-    assert deferred == [True]
-    assert pushed == ["chat-history"]
+    assert history["model"] == "codex/main"
+    assert frame.selected_model == "openai/gpt-5.2"
+    assert deferred == []
+    assert pushed == []
 
 
 def test_real_ui_completion_focuses_latest_answer_without_refreshing_old_selection(frame, wx_app, monkeypatch):
