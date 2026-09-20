@@ -11,14 +11,18 @@
   ],
   "payload_cases": [
     {"name": "edited_text", "payload": {"question": "current edit", "model": "codex/gpt-5"}, "eligible": true},
+    {"name": "text_fallback", "payload": {"question": "   ", "text": "fallback text"}, "eligible": true},
     {"name": "local_command", "payload": {"question": "/status", "local_command": "status"}, "eligible": false},
+    {"name": "assistant_text", "payload": {"role": "assistant", "text": "not a user turn"}, "eligible": false},
+    {"name": "unmarked_local_command", "payload": {"role": "user", "text": "/status"}, "eligible": false},
+    {"name": "non_string_text", "payload": {"role": "user", "text": 42}, "eligible": false},
     {"name": "deleted", "payload": {"question": "deleted", "deleted": true}, "eligible": false},
-    {"name": "attachment_only", "payload": {"question": "", "attachments": [{"name": "input.png", "path": "durable/input.png"}]}, "eligible": true},
-    {"name": "voice", "payload": {"question": "", "voice_metadata": {"format": "wav"}}, "eligible": true},
+    {"name": "attachment_only", "payload": {"question": "", "attachments": [{"name": "input.png", "path": "durable/input.png"}]}, "eligible": false},
+    {"name": "voice", "payload": {"question": "", "voice_metadata": {"format": "wav"}}, "eligible": false},
+    {"name": "import_only", "payload": {"question": "", "import_metadata": {"source": "archive"}}, "eligible": false},
     {"name": "empty", "payload": {"question": ""}, "eligible": false}
   ],
   "lifecycle_cases": [
-    {"name": "missing_attachment", "outcome": "resend_blocked"},
     {"name": "provider_reject", "outcome": "resend_blocked"},
     {"name": "provider_timeout", "outcome": "resend_blocked"},
     {"name": "concurrent_supersession", "outcome": "superseded"},

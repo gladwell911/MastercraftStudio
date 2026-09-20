@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import json
+import sqlite3
 from pathlib import Path
 import pytest
 
@@ -434,6 +435,9 @@ def test_clear_operation_is_atomic_idempotent_and_private(tmp_path):
     store.upsert_chat({"id": "chat", "codex_thread_id": "private-thread"})
     store.replace_turns("chat", [
         {"question": "/status", "local_command": "status"},
+        {"question": "", "attachments": [{"path": "secret/earlier.txt"}]},
+        {"question": "", "voice_metadata": {"format": "wav"}},
+        {"question": "", "import_metadata": {"source": "archive"}},
         {"question": "current edited text", "model": "codex/gpt-5", "attachments": [{"path": "secret/file.txt"}]},
     ])
     store.append_execution_step("chat", {"turn_idx": 1, "list_text": "private execution"})
@@ -444,7 +448,7 @@ def test_clear_operation_is_atomic_idempotent_and_private(tmp_path):
     assert duplicate["operation_id"] == operation["operation_id"]
     assert operation["state"] == "clear_acknowledged"
     assert operation["snapshot"]["question"] == "current edited text"
-    assert operation["snapshot"]["attachments"] == [{"path": "secret/file.txt"}]
+    assert "attachments" not in operation["snapshot"]
     assert store.load_turns("chat") == []
     assert store.load_execution_steps("chat") == []
     outbox = store.pending_outbox(pair_id="pair")
@@ -459,13 +463,138 @@ def test_clear_operation_dispatch_claim_and_recovery_transitions(tmp_path):
     store.upsert_chat({"id": "chat"})
     store.replace_turns("chat", [{"question": "hello"}])
     operation = store.begin_clear_operation("chat", idempotency_key="request")
-    assert store.claim_clear_resend_dispatch(operation["operation_id"])["state"] == "resend_dispatched"
-    assert store.claim_clear_resend_dispatch(operation["operation_id"]) is None
+    assert store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="chat", revision=operation["revision"])["state"] == "resend_dispatched"
+    assert store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="chat", revision=operation["revision"]) is None
     assert store.transition_clear_operation(operation["operation_id"], "resend_blocked", failure_code="TIMEOUT")["state"] == "resend_blocked"
     assert store.transition_clear_operation(operation["operation_id"], "completed_clear_only")["terminal"] is True
     lifecycle = [json.loads(row["payload"])["body"]["state"] for row in store.pending_outbox()]
     assert lifecycle == ["requested", "clear_acknowledged", "resend_dispatched", "resend_blocked", "completed_clear_only"]
     assert all("hello" not in row["payload"].decode("utf-8") for row in store.pending_outbox())
+
+
+def test_clear_resend_sound_consumption_is_owner_revision_scoped_and_restart_safe(tmp_path):
+    store = ChatStore(tmp_path / "sound.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="sound")
+
+    # Permission cannot be consumed before synchronous worker acceptance.
+    assert store.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    ) is None
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
+    assert store.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="wrong", revision=operation["revision"]
+    ) is None
+    assert store.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"] + 1
+    ) is None
+
+    def consume():
+        return store.consume_clear_resend_sound(
+            operation["operation_id"], chat_id="owner", revision=operation["revision"]
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _index: consume(), range(16)))
+    grants = [result for result in results if result is not None]
+    assert len(grants) == 1
+    assert grants[0]["sound_consumed_at"] is not None
+
+    restarted = ChatStore(store.db_path)
+    restarted.initialize()
+    assert restarted.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    ) is None
+
+
+def test_legacy_clear_operation_row_decodes_but_has_no_replayable_sound_permission(tmp_path):
+    store = ChatStore(tmp_path / "legacy-sound.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first", "attachments": [{"path": "old"}]}])
+    operation = store.begin_clear_operation("owner", idempotency_key="legacy")
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE clear_operations SET sound_permission=0,snapshot_json=? WHERE operation_id=?",
+            (json.dumps({"question": "first", "attachments": [{"path": "old"}]}), operation["operation_id"]),
+        )
+
+    decoded = store.get_clear_operation(operation["operation_id"])
+    assert decoded["snapshot"]["question"] == "first"
+    assert decoded["snapshot"]["attachments"] == [{"path": "old"}]
+    assert store.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    ) is None
+
+
+def test_initialize_alters_actual_pre_sound_schema_and_preserves_legacy_row(tmp_path):
+    path = tmp_path / "pre-sound.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE clear_operations (operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, "
+            "revision INTEGER NOT NULL, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, "
+            "snapshot_json TEXT, source_turn_id TEXT, source_message_id TEXT, "
+            "dispatch_claimed_at REAL, failure_code TEXT NOT NULL DEFAULT '', "
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+            "UNIQUE(chat_id,idempotency_key), UNIQUE(chat_id,revision))"
+        )
+        conn.execute(
+            "INSERT INTO clear_operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("legacy-op", "legacy-owner", 2, "legacy-key", "resend_dispatched",
+             json.dumps({"question": "legacy", "attachments": [{"path": "old"}]}),
+             None, None, 1.0, "", 1.0, 1.0),
+        )
+
+    store = ChatStore(path)
+    store.initialize()
+    legacy = store.get_clear_operation("legacy-op")
+    assert legacy["snapshot"]["question"] == "legacy"
+    assert legacy["sound_permission"] == 0
+    assert legacy["sound_consumed_at"] is None
+    assert store.consume_clear_resend_sound("legacy-op", chat_id="legacy-owner", revision=2) is None
+
+    store.upsert_chat({"id": "new-owner"})
+    store.replace_turns("new-owner", [{"question": "new"}])
+    created = store.begin_clear_operation("new-owner", idempotency_key="new")
+    assert created["sound_permission"] == 1
+
+
+@pytest.mark.parametrize("terminal", ["resend_blocked", "completed_with_resend", "superseded"])
+def test_terminal_clear_operation_denies_first_sound_consumption(tmp_path, terminal):
+    store = ChatStore(tmp_path / f"terminal-{terminal}.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="first")
+    store.claim_clear_resend_dispatch(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    )
+    if terminal == "superseded":
+        store.replace_turns("owner", [{"question": "newer"}])
+        store.begin_clear_operation("owner", idempotency_key="newer")
+    else:
+        store.transition_clear_operation(operation["operation_id"], terminal)
+    assert store.consume_clear_resend_sound(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"]
+    ) is None
+
+
+def test_dispatch_claim_requires_matching_owner_and_revision(tmp_path):
+    store = ChatStore(tmp_path / "claim-identity.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first"}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    assert store.claim_clear_resend_dispatch(
+        operation["operation_id"], chat_id="wrong", revision=operation["revision"]
+    ) is None
+    assert store.claim_clear_resend_dispatch(
+        operation["operation_id"], chat_id="owner", revision=operation["revision"] + 1
+    ) is None
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "clear_acknowledged"
 
 
 def test_clear_operation_reconciliation_requires_one_matching_persisted_done_turn(tmp_path):
@@ -476,7 +605,7 @@ def test_clear_operation_reconciliation_requires_one_matching_persisted_done_tur
     operation = store.begin_clear_operation("owner", idempotency_key="request")
     operation_id = operation["operation_id"]
     revision = operation["revision"]
-    store.claim_clear_resend_dispatch(operation_id)
+    store.claim_clear_resend_dispatch(operation_id, chat_id="owner", revision=revision)
     store.replace_turns("owner", [{
         "question": "first",
         "request_status": "done",
@@ -515,7 +644,7 @@ def test_clear_operation_reconciliation_only_repairs_uncertain_blocked_delivery(
         store.upsert_chat({"id": owner})
         store.replace_turns(owner, [{"question": owner}])
         operation = store.begin_clear_operation(owner, idempotency_key=owner)
-        store.claim_clear_resend_dispatch(operation["operation_id"])
+        store.claim_clear_resend_dispatch(operation["operation_id"], chat_id=owner, revision=operation["revision"])
         store.transition_clear_operation(
             operation["operation_id"], "resend_blocked", failure_code=failure_code
         )
@@ -540,7 +669,7 @@ def test_clear_operation_reconciliation_refuses_ambiguous_completed_turns(tmp_pa
     store.upsert_chat({"id": "owner"})
     store.replace_turns("owner", [{"question": "first"}])
     operation = store.begin_clear_operation("owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
     evidence = {
         "request_status": "done",
         "clear_operation_id": operation["operation_id"],
@@ -560,7 +689,7 @@ def test_recoverable_clear_operations_reconciles_and_omits_persisted_done_turn(t
     store.upsert_chat({"id": "owner"})
     store.replace_turns("owner", [{"question": "first"}])
     operation = store.begin_clear_operation("owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
     store.replace_turns("owner", [{
         "request_status": "done",
         "clear_operation_id": operation["operation_id"],
@@ -575,7 +704,12 @@ def test_clear_operation_no_message_and_revision_overflow_are_safe(tmp_path):
     store = ChatStore(tmp_path / "empty.db")
     store.initialize()
     store.upsert_chat({"id": "chat"})
-    store.replace_turns("chat", [{"question": "/help", "local_command": True}])
+    store.replace_turns("chat", [
+        {"question": "/help", "local_command": True},
+        {"attachments": [{"path": "only.txt"}]},
+        {"voice_metadata": {"format": "wav"}},
+        {"import_metadata": {"source": "archive"}},
+    ])
     operation = store.begin_clear_operation("chat", idempotency_key="empty")
     assert operation["state"] == "completed_no_message"
     with store._connect() as conn:
@@ -598,13 +732,13 @@ def test_clear_operation_contract_fixture_every_row_is_executable(tmp_path):
     store.upsert_chat({"id": "chat"})
     store.replace_turns("chat", [{"question": "private current payload"}])
     first = store.begin_clear_operation("chat", idempotency_key="stable", pair_id="pair")
-    assert store.claim_clear_resend_dispatch(first["operation_id"])
+    assert store.claim_clear_resend_dispatch(first["operation_id"], chat_id="chat", revision=first["revision"])
     assert store.transition_clear_operation(first["operation_id"], "resend_blocked", failure_code="TIMEOUT")["state"] == "resend_blocked"
     restarted = ChatStore(store.db_path)
     restarted.initialize()
     replay = restarted.begin_clear_operation("chat", idempotency_key="stable", pair_id="pair")
     assert replay["operation_id"] == first["operation_id"] and replay["idempotent_replay"]
-    assert restarted.claim_clear_resend_dispatch(first["operation_id"]) is None
+    assert restarted.claim_clear_resend_dispatch(first["operation_id"], chat_id="chat", revision=first["revision"]) is None
     restarted.upsert_chat({"id": "chat", "updated_at": 1})
     restarted.replace_turns("chat", [{"question": "new clear"}])
     newer = restarted.begin_clear_operation("chat", idempotency_key="newer", pair_id="pair")
@@ -618,7 +752,7 @@ def test_clear_operation_contract_fixture_every_row_is_executable(tmp_path):
         "privacy": "private_payload_excluded" if b"private current payload" not in payloads else "leaked",
         "restart_reconnect": "same_operation_no_redispatch" if replay["operation_id"] == first["operation_id"] else "duplicate",
     }
-    for name, code in (("missing_attachment", "ATTACHMENT_UNAVAILABLE"), ("provider_reject", "PROVIDER_REJECTED")):
+    for name, code in (("provider_reject", "PROVIDER_REJECTED"),):
         chat_id = f"chat-{name}"
         restarted.upsert_chat({"id": chat_id})
         restarted.replace_turns(chat_id, [{"question": name}])

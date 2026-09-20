@@ -132,6 +132,8 @@ class ChatStore:
                     source_turn_id TEXT,
                     source_message_id TEXT,
                     dispatch_claimed_at REAL,
+                    sound_permission INTEGER NOT NULL DEFAULT 0 CHECK(sound_permission IN (0,1)),
+                    sound_consumed_at REAL,
                     failure_code TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
@@ -147,6 +149,10 @@ class ChatStore:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN pair_id TEXT NOT NULL DEFAULT 'default'")
             if "domain" not in columns:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN domain TEXT NOT NULL DEFAULT 'events'")
+            if "sound_permission" not in columns:
+                conn.execute("ALTER TABLE clear_operations ADD COLUMN sound_permission INTEGER NOT NULL DEFAULT 0")
+            if "sound_consumed_at" not in columns:
+                conn.execute("ALTER TABLE clear_operations ADD COLUMN sound_consumed_at REAL")
             self._advance_v2_migration(conn)
             try:
                 conn.execute(
@@ -237,20 +243,15 @@ class ChatStore:
         role = str(payload.get("role") or "user").strip().lower()
         if role not in {"", "user", "human"}:
             return False
-        if str(payload.get("question") or payload.get("text") or "").strip():
-            return True
-        if isinstance(payload.get("attachments"), list) and payload["attachments"]:
-            return True
-        return any(payload.get(key) not in (None, "", False, [], {}) for key in (
-            "voice", "voice_metadata", "audio", "audio_path", "import_metadata", "import_source"
-        ))
+        texts = [payload[key].strip() for key in ("question", "text")
+                 if isinstance(payload.get(key), str) and payload[key].strip()]
+        return bool(texts) and not any(text.startswith("/") for text in texts)
 
     @staticmethod
     def _canonical_clear_snapshot(payload: dict[str, Any], turn_id: str | None,
                                   message_id: str | None) -> dict[str, Any]:
         allowed = {
-            "question", "text", "model", "attachments", "voice", "voice_metadata", "audio", "audio_path",
-            "import_metadata", "import_source", "origin", "question_origin", "provider", "provider_kind",
+            "question", "text", "model", "origin", "question_origin", "provider", "provider_kind",
             "provider_message_id", "created_at", "codex_service_tier",
         }
         snapshot = {key: payload[key] for key in allowed if key in payload}
@@ -340,11 +341,11 @@ class ChatStore:
             conn.execute("DELETE FROM execution_steps WHERE chat_id=?", (owner,))
             try:
                 conn.execute(
-                    "INSERT INTO clear_operations(operation_id,chat_id,revision,idempotency_key,pair_id,domain,state,snapshot_json,source_turn_id,source_message_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO clear_operations(operation_id,chat_id,revision,idempotency_key,pair_id,domain,state,snapshot_json,source_turn_id,source_message_id,sound_permission,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (op_id, owner, revision, key, pair, event_domain, "requested",
                      json.dumps(snapshot, ensure_ascii=False, sort_keys=True) if snapshot is not None else None,
-                     source_turn_id, source_message_id, now, now),
+                     source_turn_id, source_message_id, 1 if snapshot is not None else 0, now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("OPERATION_ID_CONFLICT") from exc
@@ -505,23 +506,67 @@ class ChatStore:
                 recovered.append(operation)
         return recovered
 
-    def claim_clear_resend_dispatch(self, operation_id: str) -> dict[str, Any] | None:
+    def claim_clear_resend_dispatch(self, operation_id: str, *, chat_id: str,
+                                    revision: int) -> dict[str, Any] | None:
         """Persist the at-most-once boundary before any provider call."""
+        owner = self.normalize_chat_id(chat_id)
+        expected_revision = self._clear_revision_value(revision)
+        if expected_revision is None:
+            return None
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone()
-            if not row or row["state"] not in {"requested", "clear_acknowledged"}:
+            if (
+                not row
+                or str(row["chat_id"]) != owner
+                or int(row["revision"]) != expected_revision
+                or row["state"] not in {"requested", "clear_acknowledged"}
+            ):
                 return None
             now = time.time()
             changed = conn.execute(
                 "UPDATE clear_operations SET state='resend_dispatched',dispatch_claimed_at=?,updated_at=? "
-                "WHERE operation_id=? AND state IN ('requested','clear_acknowledged')", (now, now, str(operation_id))
+                "WHERE operation_id=? AND chat_id=? AND revision=? "
+                "AND state IN ('requested','clear_acknowledged')",
+                (now, now, str(operation_id), owner, expected_revision)
             ).rowcount
             if not changed:
                 return None
             self._insert_clear_fact_conn(conn, row["pair_id"], row["domain"], str(operation_id),
                                          row["chat_id"], int(row["revision"]), "resend_dispatched")
             return self._decode_clear_operation(conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone())
+
+    def consume_clear_resend_sound(self, operation_id: str, *, chat_id: str,
+                                   revision: int) -> dict[str, Any] | None:
+        """Atomically grant the one send sound for a verified accepted resend.
+
+        Rows created before this capability have ``sound_permission=0`` and
+        deliberately remain silent: their acceptance identity cannot be
+        reconstructed safely after upgrade.
+        """
+        owner = self.normalize_chat_id(chat_id)
+        expected_revision = self._clear_revision_value(revision)
+        if expected_revision is None:
+            return None
+        op_id = str(operation_id or "").strip()
+        if not op_id:
+            return None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            changed = conn.execute(
+                "UPDATE clear_operations SET sound_consumed_at=?,updated_at=? "
+                "WHERE operation_id=? AND chat_id=? AND revision=? "
+                "AND state='resend_dispatched' AND sound_permission=1 "
+                "AND sound_consumed_at IS NULL",
+                (now, now, op_id, owner, expected_revision),
+            ).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM clear_operations WHERE operation_id=?", (op_id,)
+            ).fetchone()
+            return self._decode_clear_operation(row)
 
     def transition_clear_operation(self, operation_id: str, state: str, *, failure_code: str = "") -> dict[str, Any]:
         target = str(state or "").strip()

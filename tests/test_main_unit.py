@@ -20787,11 +20787,17 @@ def test_offscreen_clear_resend_dispatches_once_without_active_chat_or_focus_cha
     claims = []
     transitions = []
     frame.chat_store = SimpleNamespace(
-        claim_clear_resend_dispatch=lambda op: claims.append(op) or ({"operation_id": op} if len(claims) == 1 else None),
+        get_clear_operation=lambda _op: {**operation, "snapshot": payload},
+        claim_clear_resend_dispatch=lambda op, **_identity: claims.append(op) or ({"operation_id": op} if len(claims) == 1 else None),
+        consume_clear_resend_sound=lambda op, *, chat_id, revision: (
+            {"operation_id": op} if (chat_id, revision) == ("chat-archived", 2) else None
+        ),
         transition_clear_operation=lambda op, state, **kw: transitions.append((op, state, kw)),
     )
     starts = []
+    sounds = []
     monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: starts.append(args))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: sounds.append("send"))
     monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
     operation = {"operation_id": "op-1", "chat_id": "chat-archived", "revision": 2}
@@ -20804,6 +20810,226 @@ def test_offscreen_clear_resend_dispatches_once_without_active_chat_or_focus_cha
     assert frame.active_chat_id == frame.current_chat_id == "chat-active"
     assert frame.active_session_turns == [{"question": "active stays"}]
     assert transitions == []
+    assert sounds == ["send"]
+
+
+@pytest.mark.parametrize("model,starter_name", [
+    (main.DEFAULT_CODEX_MODEL, "_start_codex_worker_for_turn"),
+    (main.DEFAULT_KIMI_MODEL, "_start_kimi_worker_for_turn"),
+])
+def test_active_clear_resend_sound_follows_worker_acceptance(frame, monkeypatch, model, starter_name):
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns, "model": model}
+    events = []
+    state = {"value": "clear_acknowledged"}
+
+    def claim(_op, **_identity):
+        state["value"] = "resend_dispatched"
+        return {"operation_id": "op", "state": state["value"]}
+
+    frame.chat_store = SimpleNamespace(
+        get_clear_operation=lambda _op: {**operation, "snapshot": {"question": "first", "model": model}},
+        claim_clear_resend_dispatch=claim,
+        consume_clear_resend_sound=lambda _op, *, chat_id, revision: (
+            {"operation_id": "op"} if (chat_id, revision) == ("owner", 7) else None
+        ),
+        transition_clear_operation=lambda _op, new_state, **_kw: state.__setitem__("value", new_state),
+    )
+    monkeypatch.setattr(frame, starter_name, lambda *_args: events.append("accepted"))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: events.append("sound"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    operation = {"operation_id": "op", "chat_id": "owner", "revision": 7}
+    assert frame._dispatch_clear_operation_resend(operation, {"question": "first", "model": model}) is True
+    assert events == ["accepted", "sound"]
+
+
+def test_active_clear_resend_rejected_start_is_silent(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns}
+    transitions = []
+    frame.chat_store = SimpleNamespace(
+        claim_clear_resend_dispatch=lambda _op, **_identity: {"operation_id": "op"},
+        get_clear_operation=lambda _op: {
+            "operation_id": "op", "chat_id": "owner", "revision": 7,
+            "state": "clear_acknowledged",
+            "snapshot": {"question": "first", "model": main.DEFAULT_CODEX_MODEL},
+        },
+        transition_clear_operation=lambda op, state, **kw: transitions.append((op, state, kw)),
+    )
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: (_ for _ in ()).throw(RuntimeError("reject")))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("rejected starts must be silent"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    operation = {"operation_id": "op", "chat_id": "owner", "revision": 7}
+    assert frame._dispatch_clear_operation_resend(
+        operation, {"question": "first", "model": main.DEFAULT_CODEX_MODEL}
+    ) is False
+    assert transitions[-1][1:] == ("resend_blocked", {"failure_code": "PROVIDER_REJECTED"})
+
+
+def test_clear_with_no_eligible_text_does_not_dispatch_or_sound(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = [
+        {"question": "", "attachments": [{"path": "only.png"}]},
+        {"voice_metadata": {"format": "wav"}},
+        {"import_metadata": {"source": "archive"}},
+    ]
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_begin_durable_clear_operation", lambda *_args, **_kwargs: {
+        "operation_id": "op", "chat_id": "owner", "revision": 3,
+        "state": "completed_no_message", "snapshot": None,
+    })
+    monkeypatch.setattr(frame, "_dispatch_clear_operation_resend", lambda *_args, **_kwargs: pytest.fail("must not dispatch"))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("must stay silent"))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args: None)
+
+    assert frame._clear_context_and_start_new_chat(auto_resend_first=True) is True
+    assert frame.active_session_turns == []
+
+
+def test_non_durable_clear_resend_text_fallback_fails_closed_and_is_silent(frame, monkeypatch):
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("must not submit"))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("must stay silent"))
+
+    assert frame._dispatch_clear_operation_resend(
+        None, {"question": " ", "text": "legacy fallback text"}
+    ) is False
+
+
+def test_clear_resend_malformed_identity_store_and_payload_mismatch_fail_closed(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "fail-closed.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first", "model": main.DEFAULT_CODEX_MODEL}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    frame.chat_store = store
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_submit_question", lambda *_args, **_kwargs: pytest.fail("must not submit"))
+    snapshot = operation["snapshot"]
+
+    assert frame._dispatch_clear_operation_resend(None, snapshot) is False
+    assert frame._dispatch_clear_operation_resend({**operation, "operation_id": ""}, snapshot) is False
+    assert frame._dispatch_clear_operation_resend({**operation, "chat_id": ""}, snapshot) is False
+    assert frame._dispatch_clear_operation_resend({**operation, "revision": None}, snapshot) is False
+    assert frame._dispatch_clear_operation_resend({**operation, "chat_id": "wrong"}, snapshot) is False
+    assert frame._dispatch_clear_operation_resend({**operation, "revision": operation["revision"] + 1}, snapshot) is False
+    assert frame._dispatch_clear_operation_resend(operation, {**snapshot, "question": "tampered"}) is False
+    frame.chat_store = None
+    assert frame._dispatch_clear_operation_resend(operation, snapshot) is False
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "clear_acknowledged"
+
+
+@pytest.mark.parametrize("model,starter_name", [
+    (main.DEFAULT_CODEX_MODEL, "_start_codex_worker_for_turn"),
+    (main.DEFAULT_KIMI_MODEL, "_start_kimi_worker_for_turn"),
+])
+def test_alt_a_real_store_claims_accepts_and_sounds_once(frame, tmp_path, monkeypatch, model, starter_name):
+    store = main.ChatStore(tmp_path / f"alt-a-{model.replace('/', '-')}.db")
+    store.initialize()
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = [{"question": "first", "model": model}]
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns, "model": model}
+    events = []
+    monkeypatch.setattr(frame, starter_name, lambda *_args: events.append("accepted"))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: events.append("sound"))
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_mark_openclaw_lifecycle_dirty", lambda: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args: None)
+
+    assert frame._clear_context_and_start_new_chat(auto_resend_first=True, request_id="alt-a") is True
+    operation = store.active_clear_operation("owner")
+    assert operation["state"] == "resend_dispatched"
+    assert events == ["accepted", "sound"]
+    assert frame._clear_context_and_start_new_chat(auto_resend_first=True, request_id="alt-a") is True
+    assert events == ["accepted", "sound"]
+
+
+def test_remote_offscreen_kimi_real_store_claims_accepts_and_sounds_once(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "remote-kimi.db")
+    store.initialize()
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "active"
+    frame.active_session_turns = [{"question": "active"}]
+    frame._current_chat_state = {"id": "active", "turns": frame.active_session_turns}
+    archived = {"id": "remote", "model": main.DEFAULT_KIMI_MODEL,
+                "turns": [{"question": "first", "model": main.DEFAULT_KIMI_MODEL}]}
+    frame.archived_chats = [archived]
+    events = []
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn", lambda *_args: events.append("accepted"))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: events.append("sound"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args: None)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_args: None)
+
+    status, body = frame._remote_api_clear_context_ui({"chat_id": "remote", "request_id": "remote-kimi"})
+    assert status == 200 and body["accepted"] is True
+    assert events == ["accepted", "sound"]
+    assert store.active_clear_operation("remote")["state"] == "resend_dispatched"
+    status, body = frame._remote_api_clear_context_ui({"chat_id": "remote", "request_id": "remote-kimi"})
+    assert status == 200 and body["accepted"] is True
+    assert events == ["accepted", "sound"]
+    assert frame.active_chat_id == frame.current_chat_id == "active"
+
+
+def test_accepted_worker_sound_store_exception_remains_dispatched_and_silent(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "sound-error.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first", "model": main.DEFAULT_CODEX_MODEL}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    frame.chat_store = store
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns}
+    accepted = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: accepted.append(True))
+    monkeypatch.setattr(store, "consume_clear_resend_sound", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk")))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("must stay silent"))
+
+    assert frame._dispatch_clear_operation_resend(operation, operation["snapshot"]) is True
+    assert accepted == [True]
+    assert len(frame.active_session_turns) == 1
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "resend_dispatched"
+
+
+def test_starter_rejection_removes_pending_projection(frame, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "starter-reject.db")
+    store.initialize()
+    store.upsert_chat({"id": "owner"})
+    store.replace_turns("owner", [{"question": "first", "model": main.DEFAULT_CODEX_MODEL}])
+    operation = store.begin_clear_operation("owner", idempotency_key="request")
+    frame.chat_store = store
+    frame.active_chat_id = frame.current_chat_id = "owner"
+    frame.active_session_turns = []
+    frame._current_chat_state = {"id": "owner", "turns": frame.active_session_turns}
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: (_ for _ in ()).throw(RuntimeError("reject")))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("must stay silent"))
+
+    assert frame._dispatch_clear_operation_resend(operation, operation["snapshot"]) is False
+    assert frame.active_session_turns == []
+    assert store.get_clear_operation(operation["operation_id"])["state"] == "resend_blocked"
+
+
+@pytest.mark.parametrize("state", ["superseded", "resend_blocked", "completed_with_resend"])
+def test_non_dispatchable_clear_operation_never_plays_acceptance_sound(frame, monkeypatch, state):
+    frame.chat_store = SimpleNamespace(
+        consume_clear_resend_sound=lambda _op, *, chat_id, revision: None
+    )
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("stale or terminal operation must stay silent"))
+
+    assert frame._play_clear_resend_accepted_sound("op", "owner", 3) is False
 
 
 def test_remote_offscreen_clear_uses_operation_snapshot_and_preserves_active_owner(frame, monkeypatch):
@@ -20858,14 +21084,11 @@ def test_remote_offscreen_clear_real_store_stable_request_dispatches_exactly_onc
     assert len(rows) == 1
 
 
-def test_clear_recovery_choices_and_post_claim_failure_use_real_operations(frame, tmp_path, monkeypatch):
+def test_clear_recovery_is_cancel_only_and_text_snapshot_ignores_attachments(frame, tmp_path, monkeypatch):
     store = main.ChatStore(tmp_path / "ui-recovery.db")
     store.initialize()
     frame.chat_store = store
     frame._chat_store_enabled = True
-    calls = []
-    monkeypatch.setattr(frame, "_dispatch_clear_operation_resend",
-                        lambda op, payload, text_only=False: calls.append((op["operation_id"], text_only)) or True)
     operations = {}
     for choice in ("retry", "text-only", "cancel"):
         owner = f"choice-{choice}"
@@ -20874,21 +21097,16 @@ def test_clear_recovery_choices_and_post_claim_failure_use_real_operations(frame
         op = store.begin_clear_operation(owner, idempotency_key=choice)
         store.transition_clear_operation(op["operation_id"], "resend_blocked", failure_code="TIMEOUT")
         operations[choice] = op
-        assert frame.recover_clear_operation(op["operation_id"], choice)
-    assert calls == [(operations["retry"]["operation_id"], False),
-                     (operations["text-only"]["operation_id"], True)]
+        assert frame.recover_clear_operation(op["operation_id"], choice) is (choice == "cancel")
+    assert store.get_clear_operation(operations["retry"]["operation_id"])["state"] == "resend_blocked"
+    assert store.get_clear_operation(operations["text-only"]["operation_id"])["state"] == "resend_blocked"
     assert store.get_clear_operation(operations["cancel"]["operation_id"])["state"] == "completed_clear_only"
 
     missing = tmp_path / "missing.txt"
     store.upsert_chat({"id": "missing"})
     store.replace_turns("missing", [{"question": "with file", "attachments": [{"path": str(missing)}]}])
     op = store.begin_clear_operation("missing", idempotency_key="missing")
-    # Exercise the production dispatcher, not the recovery spy.
-    monkeypatch.undo()
-    frame.chat_store = store
-    frame._chat_store_enabled = True
-    assert frame._dispatch_clear_operation_resend(op, op["snapshot"]) is False
-    assert store.get_clear_operation(op["operation_id"])["state"] == "resend_blocked"
+    assert "attachments" not in op["snapshot"]
 
 
 def test_kimi_authoritative_completion_closes_matching_clear_operation(frame, tmp_path):
@@ -20897,7 +21115,7 @@ def test_kimi_authoritative_completion_closes_matching_clear_operation(frame, tm
     store.upsert_chat({"id": "kimi-owner"})
     store.replace_turns("kimi-owner", [{"question": "first"}])
     operation = store.begin_clear_operation("kimi-owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="kimi-owner", revision=operation["revision"])
     turn = {
         "question": "first",
         "answer_md": main.REQUESTING_TEXT,
@@ -20932,7 +21150,7 @@ def test_kimi_authoritative_offscreen_failure_blocks_only_owner_operation(frame,
     store.upsert_chat({"id": "kimi-owner"})
     store.replace_turns("kimi-owner", [{"question": "first"}])
     operation = store.begin_clear_operation("kimi-owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="kimi-owner", revision=operation["revision"])
     failed_turn = {
         "question": "first", "model": main.DEFAULT_KIMI_MODEL, "request_status": "pending",
         "kimi_turn_id": "turn-1", "clear_operation_id": operation["operation_id"],
@@ -20960,7 +21178,7 @@ def test_restart_completed_turn_reconciles_without_redispatch(frame, tmp_path, m
     store.upsert_chat({"id": "owner"})
     store.replace_turns("owner", [{"question": "first"}])
     operation = store.begin_clear_operation("owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
     store.replace_turns("owner", [{
         "request_status": "done", "clear_operation_id": operation["operation_id"],
         "clear_revision": operation["revision"],
@@ -20982,7 +21200,7 @@ def test_uncertain_restart_surfaces_recovery_choice_without_automatic_resend(fra
     store.upsert_chat({"id": "owner"})
     store.replace_turns("owner", [{"question": "first"}])
     operation = store.begin_clear_operation("owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="owner", revision=operation["revision"])
     pending = store.recoverable_clear_operations()
     frame.chat_store = store
     frame._pending_clear_recoveries = pending
@@ -21069,7 +21287,7 @@ def test_kimi_completion_cross_owner_misroute_preserves_turn_buffers_and_owner(f
     store.upsert_chat({"id": "real-owner"})
     store.replace_turns("real-owner", [{"question": "first"}])
     operation = store.begin_clear_operation("real-owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="real-owner", revision=operation["revision"])
     turn = {
         "question": "first", "answer_md": main.REQUESTING_TEXT,
         "model": main.DEFAULT_KIMI_MODEL, "request_status": "pending",
@@ -21116,7 +21334,7 @@ def test_kimi_error_cross_owner_misroute_preserves_turn_and_owner(frame, tmp_pat
     store.upsert_chat({"id": "real-owner"})
     store.replace_turns("real-owner", [{"question": "first"}])
     operation = store.begin_clear_operation("real-owner", idempotency_key="request")
-    store.claim_clear_resend_dispatch(operation["operation_id"])
+    store.claim_clear_resend_dispatch(operation["operation_id"], chat_id="real-owner", revision=operation["revision"])
     turn = {
         "question": "first", "answer_md": main.REQUESTING_TEXT,
         "model": main.DEFAULT_KIMI_MODEL, "request_status": "pending",
