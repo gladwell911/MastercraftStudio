@@ -10334,7 +10334,7 @@ def test_answer_text_viewer_dialog_esc_closes_and_continue_callback_runs(frame):
         dlg._finish = lambda code: closed.append(code)
         assert dlg.GetTitle() == "回答详情"
         assert dlg.text_ctrl.GetValue() == "\n第一段\n\n第二段"
-        assert not dlg.text_ctrl.IsEditable()
+        assert dlg.text_ctrl.IsEditable()
         assert dlg.close_button.GetLabel() == "关闭"
         assert dlg.continue_button.GetLabel() == "继续"
         dlg._on_continue_clicked()
@@ -10363,7 +10363,7 @@ def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
     dlg = main.AnswerTextViewerDialog(frame, "回答详情", "原始内容")
     try:
-        dlg.text_ctrl.SetValue("编辑后的当前内容")
+        dlg.text_ctrl.SetValue("\n编辑后的当前内容")
         skipped = []
 
         class E:
@@ -10388,8 +10388,9 @@ def test_answer_text_viewer_dialog_copy_button_copies_current_text_and_tab_moves
         assert skipped == [True]
         assert dlg.copy_button.GetLabel() == "复制"
         dlg._on_copy_clicked()
-        assert copied == ["原始内容"]
+        assert copied == ["编辑后的当前内容"]
         assert dlg.text_ctrl.GetWindowStyleFlag() & wx.TE_DONTWRAP
+        assert dlg.canonical_text == "原始内容"
     finally:
         if dlg:
             dlg.Destroy()
@@ -10403,6 +10404,208 @@ def test_answer_text_viewer_normalizes_only_display_leading_newlines(frame, cano
         assert dlg.text_ctrl.GetValue() == "\n" + canonical.lstrip("\r\n")
     finally:
         dlg.Destroy()
+
+
+@pytest.mark.parametrize(
+    "scratch,selection,expected",
+    [
+        ("\nedited whole", (0, 0), "edited whole"),
+        ("edited without prefix", (0, 0), "edited without prefix"),
+        ("\nalpha beta", (7, 11), "beta"),
+        ("\n\nkept", (0, 0), "\nkept"),
+    ],
+)
+def test_answer_text_viewer_copy_uses_scratch_selection_or_normalized_whole_text(
+    frame, monkeypatch, scratch, selection, expected
+):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        dlg.text_ctrl.SetValue(scratch)
+        dlg.text_ctrl.SetSelection(*selection)
+        dlg._on_copy_clicked()
+
+        assert copied == [expected]
+        assert dlg.canonical_text == "canonical"
+    finally:
+        dlg.Destroy()
+
+
+def test_answer_text_viewer_failed_copy_keeps_scratch_selection_and_canonical(frame, monkeypatch):
+    statuses = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda _text: False)
+    monkeypatch.setattr(frame, "SetStatusText", lambda text: statuses.append(text))
+    payload = main.AnswerViewerPayload("chat", 0, "turn", "session", main.DEFAULT_MODEL_ID, "canonical")
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", payload=payload)
+    try:
+        dlg.text_ctrl.SetValue("\nscratch value")
+        dlg.text_ctrl.SetSelection(1, 8)
+        dlg._on_copy_clicked()
+
+        assert dlg.text_ctrl.GetValue() == "\nscratch value"
+        assert dlg.text_ctrl.GetSelection() == (1, 8)
+        assert dlg.canonical_text == "canonical"
+        assert dlg.payload == payload
+        assert statuses == []
+    finally:
+        dlg.Destroy()
+
+
+def test_answer_text_viewer_clipboard_exception_keeps_scratch_selection_and_canonical(frame, monkeypatch):
+    def fail(_text):
+        raise RuntimeError("clipboard unavailable")
+
+    monkeypatch.setattr(frame, "_set_clipboard_text", fail)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        dlg.text_ctrl.SetValue("\nscratch")
+        dlg.text_ctrl.SetSelection(1, 4)
+
+        assert dlg._copy_scratch_to_clipboard() is False
+        assert dlg.text_ctrl.GetValue() == "\nscratch"
+        assert dlg.text_ctrl.GetSelection() == (1, 4)
+        assert dlg.canonical_text == "canonical"
+    finally:
+        dlg.Destroy()
+
+
+def test_answer_text_viewer_tracks_synthetic_newline_through_edits_by_identity(frame, monkeypatch):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        dlg.text_ctrl.SetInsertionPoint(0)
+        dlg.text_ctrl.WriteText("before")
+        assert dlg._display_marker_offset == len("before")
+        dlg._on_copy_clicked()
+        assert copied.pop() == "beforecanonical"
+
+        marker = dlg._display_marker_offset
+        dlg.text_ctrl.Remove(marker, marker + 1)
+        assert dlg._display_marker_offset is None
+        dlg.text_ctrl.SetInsertionPoint(marker)
+        dlg.text_ctrl.WriteText("\n")
+        dlg._on_copy_clicked()
+        assert copied.pop() == "before\ncanonical"
+    finally:
+        dlg.Destroy()
+
+
+def test_answer_text_viewer_selection_copy_removes_synthetic_only_when_selected(frame, monkeypatch):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "alpha\nbeta")
+    try:
+        dlg.text_ctrl.SetSelection(0, 7)
+        dlg._on_copy_clicked()
+        dlg.text_ctrl.SetSelection(7, dlg.text_ctrl.GetLastPosition())
+        dlg._on_copy_clicked()
+        assert copied == ["alpha\n", "beta"]
+    finally:
+        dlg.Destroy()
+
+
+@pytest.mark.parametrize("replacement", ["replace", "set_value"])
+def test_answer_text_viewer_same_text_replacement_surrenders_synthetic_marker(
+    frame, monkeypatch, replacement
+):
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        if replacement == "replace":
+            dlg.text_ctrl.Replace(0, 1, "\n")
+        else:
+            dlg.text_ctrl.SetValue(dlg.text_ctrl.GetValue())
+            # Some wx builds suppress EVT_TEXT for an identical SetValue;
+            # exercise the conservative handler contract explicitly.
+            if dlg._display_marker_offset is not None:
+                event = type("TextEvent", (), {"Skip": lambda self: None})()
+                dlg._on_scratch_text_changed(event)
+        dlg._on_copy_clicked()
+
+        assert dlg._display_marker_offset is None
+        assert copied == ["\ncanonical"]
+    finally:
+        dlg.Destroy()
+
+
+@pytest.mark.parametrize("close_path", ["button", "escape", "window"])
+def test_answer_text_viewer_close_paths_discard_scratch_and_reopen_canonical(frame, close_path):
+    canonical = "\ncanonical answer"
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", canonical)
+    try:
+        dlg.text_ctrl.SetValue("\nscratch mutation")
+        dlg._finish = lambda _code: None
+        if close_path == "button":
+            dlg._on_close()
+        elif close_path == "escape":
+            event = type("Escape", (), {"GetKeyCode": lambda self: wx.WXK_ESCAPE})()
+            dlg._on_char_hook(event)
+        else:
+            dlg.Destroy()
+            dlg = None
+    finally:
+        if dlg is not None:
+            dlg.Destroy()
+
+    reopened = main.AnswerTextViewerDialog(frame, "回答详情", canonical)
+    try:
+        assert reopened.text_ctrl.GetValue() == "\ncanonical answer"
+        assert reopened.canonical_text == canonical
+    finally:
+        reopened.Destroy()
+
+
+@pytest.mark.parametrize("close_path", ["button", "escape", "title"])
+def test_open_selected_answer_viewer_modal_lifecycle_discards_scratch_without_side_effects(
+    frame, monkeypatch, close_path
+):
+    canonical = "canonical answer"
+    turn = {
+        "question": "q",
+        "answer_md": canonical,
+        "model": main.DEFAULT_CODEX_MODEL,
+        "codex_thread_id": "thread",
+        "codex_turn_id": "turn",
+    }
+    frame.active_chat_id = frame.current_chat_id = "chat"
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "chat", "model": main.DEFAULT_CODEX_MODEL, "turns": frame.active_session_turns}
+    frame.answer_meta = [("answer", 0, canonical, canonical)]
+    frame.answer_list.Set([canonical])
+    frame.answer_list.SetSelection(0)
+    snapshots = []
+    real_viewer = main.AnswerTextViewerDialog
+
+    def viewer_factory(*args, **kwargs):
+        dlg = real_viewer(*args, **kwargs)
+        snapshots.append((dlg.canonical_text, dlg.payload))
+
+        def show_modal():
+            dlg.text_ctrl.SetValue("\nscratch mutation")
+            dlg._finish = lambda _code: None
+            if close_path == "button":
+                dlg._on_close()
+            elif close_path == "escape":
+                event = type("Escape", (), {"GetKeyCode": lambda self: wx.WXK_ESCAPE})()
+                dlg._on_char_hook(event)
+            return wx.ID_CLOSE
+
+        dlg.ShowModal = show_modal
+        return dlg
+
+    monkeypatch.setattr(main, "AnswerTextViewerDialog", viewer_factory)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: pytest.fail("scratch must not save"))
+    monkeypatch.setattr(frame, "_continue_from_answer_text_viewer", lambda _payload: pytest.fail("scratch must not continue"))
+    monkeypatch.setattr(frame, "_try_open_selected_answer_detail", lambda: pytest.fail("scratch must not open detail"))
+
+    assert frame._open_selected_answer_text_viewer() is True
+    assert frame._open_selected_answer_text_viewer() is True
+    assert turn["answer_md"] == canonical
+    assert [item[0] for item in snapshots] == [canonical, canonical]
+    assert all(item[1].answer_md == canonical for item in snapshots)
 
 
 def test_answer_text_viewer_payload_captures_historical_codex_turn_owner(frame):

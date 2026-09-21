@@ -37,6 +37,13 @@ def _send_window_key(window, key_code, *, shift=False, ctrl=False, alt=False):
     virtual_key = virtual_keys.get(key_code, int(key_code))
     down_lparam = 1 | (scan << 16)
     up_lparam = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    if key_code in (
+        main.wx.WXK_LEFT, main.wx.WXK_RIGHT, main.wx.WXK_UP, main.wx.WXK_DOWN,
+        main.wx.WXK_HOME, main.wx.WXK_END, main.wx.WXK_PAGEUP, main.wx.WXK_PAGEDOWN,
+        main.wx.WXK_DELETE,
+    ):
+        down_lparam |= 1 << 24
+        up_lparam |= 1 << 24
     hwnd = int(window.GetHandle())
     original_keys = (ctypes.c_ubyte * 256)()
     if not user32.GetKeyboardState(original_keys):
@@ -67,6 +74,12 @@ def _send_window_key(window, key_code, *, shift=False, ctrl=False, alt=False):
     finally:
         if not user32.SetKeyboardState(original_keys):
             raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _send_text_char(window, character):
+    ctypes.WinDLL("user32", use_last_error=True).SendMessageW(
+        int(window.GetHandle()), 0x0102, ord(character), 1
+    )
 
 
 def _activate_frame(frame, wx_app):
@@ -494,7 +507,7 @@ def test_real_ui_answer_enter_opens_text_viewer_and_shift_enter_opens_web_detail
     assert opened_web == [True]
 
 
-def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_canonical_text(frame, wx_app, monkeypatch):
+def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_scratch_text(frame, wx_app, monkeypatch):
     _activate_frame(frame, wx_app)
     frame.active_chat_id = "chat-answer-viewer-tab-copy"
     frame.current_chat_id = "chat-answer-viewer-tab-copy"
@@ -534,7 +547,7 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_canonic
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
     dlg = main.AnswerTextViewerDialog(frame, "回答详情", opened_viewer[0][1])
     try:
-        dlg.text_ctrl.SetValue("当前编辑框内容")
+        dlg.text_ctrl.SetValue("\n当前编辑框内容")
         skipped = []
 
         class _TabEvent:
@@ -550,11 +563,131 @@ def test_real_ui_answer_viewer_keeps_single_lines_and_copy_button_copies_canonic
         assert skipped == [True]
         assert dlg.copy_button.GetLabel() == "复制"
         dlg._on_copy_clicked()
-        assert copied == ["1. 第一项\n2. 第二项"]
+        assert copied == ["当前编辑框内容"]
+        assert dlg.text_ctrl.IsEditable()
         assert dlg.text_ctrl.GetWindowStyleFlag() & main.wx.TE_DONTWRAP
     finally:
         if dlg:
             _destroy_dialog_after_native_callback(dlg, wx_app)
+
+
+def test_real_ui_answer_viewer_native_edit_copy_marker_and_tab_navigation(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        dlg.Show()
+        dlg.Raise()
+        ctypes.WinDLL("user32", use_last_error=True).SetForegroundWindow(int(dlg.GetHandle()))
+        dlg.text_ctrl.SetFocus()
+        dlg.text_ctrl.SetInsertionPoint(0)
+        wx_app.Yield()
+
+        _send_text_char(dlg.text_ctrl, "X")
+        wx_app.Yield()
+        assert dlg.text_ctrl.GetValue() == "X\ncanonical"
+        assert dlg._display_marker_offset == 1
+
+        _send_window_key(dlg.text_ctrl, ord("A"), ctrl=True)
+        assert dlg._display_marker_offset == 1
+        for key_code in (main.wx.WXK_LEFT, main.wx.WXK_HOME, main.wx.WXK_F2):
+            navigation = main.wx.KeyEvent(main.wx.wxEVT_KEY_DOWN)
+            navigation.SetKeyCode(key_code)
+            dlg.text_ctrl.ProcessEvent(navigation)
+            assert dlg._display_marker_offset == 1
+        wx_app.Yield()
+        assert dlg._display_marker_offset == 1
+        dlg._on_copy_clicked()
+        assert copied.pop() == "Xcanonical"
+
+        _send_window_key(dlg.text_ctrl, ord("A"), ctrl=True)
+        _send_window_key(dlg.text_ctrl, ord("C"), ctrl=True)
+        wx_app.Yield()
+        assert copied.pop() == "Xcanonical"
+
+        dlg.text_ctrl.SetInsertionPoint(2)
+        _send_window_key(dlg.text_ctrl, main.wx.WXK_BACK)
+        wx_app.Yield()
+        assert dlg._display_marker_offset is None
+        dlg.text_ctrl.WriteText("\n")
+        wx_app.Yield()
+        _send_window_key(dlg.text_ctrl, ord("A"), ctrl=True)
+        _send_window_key(dlg.text_ctrl, ord("C"), ctrl=True)
+        wx_app.Yield()
+        assert copied.pop() == "X\ncanonical"
+
+        dlg.text_ctrl.SetFocus()
+        dlg.text_ctrl.Navigate(main.wx.NavigationKeyEvent.IsForward)
+        wx_app.Yield()
+        assert dlg.copy_button.HasFocus()
+        dlg.copy_button.Navigate(main.wx.NavigationKeyEvent.IsBackward)
+        wx_app.Yield()
+        assert dlg.text_ctrl.HasFocus()
+
+        dlg.text_ctrl.SetSelection(2, dlg.text_ctrl.GetLastPosition())
+        dlg.copy_button.SetFocus()
+        _send_window_key(dlg.copy_button, main.wx.WXK_SPACE)
+        wx_app.Yield()
+        assert copied.pop() == "canonical"
+    finally:
+        _destroy_dialog_after_native_callback(dlg, wx_app)
+
+
+def test_real_ui_answer_viewer_noop_background_drain_preserves_modal_scratch_owner_and_focus(
+    frame, wx_app, monkeypatch
+):
+    _activate_frame(frame, wx_app)
+    payload = main.AnswerViewerPayload(
+        "chat-owner", 0, "turn-owner", "thread-owner", main.DEFAULT_CODEX_MODEL, "canonical"
+    )
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", payload=payload, on_continue=lambda _payload: True)
+
+    class EmptyClient:
+        def drain_pending_messages(self):
+            return []
+
+    repaint_calls = []
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: repaint_calls.append((args, kwargs)))
+    try:
+        dlg.Show()
+        dlg.Raise()
+        dlg.text_ctrl.SetValue("\nscratch")
+        dlg.text_ctrl.SetSelection(2, 5)
+        dlg.text_ctrl.SetFocus()
+        wx_app.Yield()
+        before = (dlg.text_ctrl.GetValue(), dlg.text_ctrl.GetSelection(), dlg.payload, main.wx.Window.FindFocus())
+
+        frame._drain_codex_worker_client_messages("chat-owner", EmptyClient())
+        wx_app.Yield()
+
+        assert (dlg.text_ctrl.GetValue(), dlg.text_ctrl.GetSelection(), dlg.payload, main.wx.Window.FindFocus()) == before
+        assert repaint_calls == []
+    finally:
+        _destroy_dialog_after_native_callback(dlg, wx_app)
+
+
+def test_real_ui_answer_viewer_same_newline_replacement_is_not_treated_as_synthetic(
+    frame, wx_app, monkeypatch
+):
+    _activate_frame(frame, wx_app)
+    copied = []
+    monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
+    dlg = main.AnswerTextViewerDialog(frame, "回答详情", "canonical")
+    try:
+        dlg.Show()
+        dlg.Raise()
+        dlg.text_ctrl.SetFocus()
+        dlg.text_ctrl.SetSelection(0, 1)
+        dlg.text_ctrl.Replace(0, 1, "\n")
+        wx_app.Yield()
+
+        dlg.text_ctrl.SetSelection(0, 0)
+        dlg._on_copy_clicked()
+        assert dlg._display_marker_offset is None
+        assert copied == ["\ncanonical"]
+    finally:
+        _destroy_dialog_after_native_callback(dlg, wx_app)
 
 
 def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
@@ -570,11 +703,13 @@ def test_real_ui_answer_viewer_continue_button_is_once_latched(frame, wx_app):
     try:
         dlg.IsShown = lambda: True
         dlg._finish = lambda _code: None
+        dlg.text_ctrl.SetValue("\nscratch must not be continued")
         dlg._on_continue_clicked()
         dlg._on_continue_clicked()
 
         assert dispatched == [payload]
-        assert dlg.text_ctrl.GetValue() == "\ncanonical"
+        assert dispatched[0].answer_md == "\r\ncanonical"
+        assert dlg.text_ctrl.GetValue() == "\nscratch must not be continued"
         assert not dlg.continue_button.IsEnabled()
     finally:
         dlg.IsShown = original_is_shown

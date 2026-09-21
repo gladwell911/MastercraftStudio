@@ -991,11 +991,15 @@ class AnswerTextViewerDialog(wx.Dialog):
         self._continue_callback = on_continue
         self._continue_requested = False
         self._closing = False
-        display_text = "\n" + self.canonical_text.lstrip("\r\n")
+        self._display_prefix = "\n"
+        display_text = self._display_prefix + self.canonical_text.lstrip("\r\n")
+        self._display_marker_offset: int | None = 0
+        self._scratch_previous_text = display_text
+        self._scratch_non_edit_key_pending = False
         self.text_ctrl = wx.TextCtrl(
             panel,
             value=display_text,
-            style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL | wx.TE_READONLY,
+            style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL,
         )
         self.text_ctrl.SetName("文本内容")
         root.Add(self.text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
@@ -1015,6 +1019,8 @@ class AnswerTextViewerDialog(wx.Dialog):
         self.close_button.MoveAfterInTabOrder(self.copy_button)
         self.continue_button.MoveAfterInTabOrder(self.close_button)
         self.copy_button.Bind(wx.EVT_BUTTON, self._on_copy_clicked)
+        self.text_ctrl.Bind(wx.EVT_TEXT, self._on_scratch_text_changed)
+        self.text_ctrl.Bind(wx.EVT_KEY_DOWN, self._on_scratch_key_down)
         self.close_button.Bind(wx.EVT_BUTTON, self._on_close)
         self.continue_button.Bind(wx.EVT_BUTTON, self._on_continue_clicked)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
@@ -1031,12 +1037,117 @@ class AnswerTextViewerDialog(wx.Dialog):
         self._closing = True
         self._finish(wx.ID_CLOSE)
 
-    def _on_copy_clicked(self, _event=None):
+    def _on_scratch_text_changed(self, event=None):
+        old_text = self._scratch_previous_text
+        new_text = self.text_ctrl.GetValue()
+        marker = self._display_marker_offset
+        if marker is not None and old_text == new_text:
+            # EVT_TEXT can represent an equal-byte replacement. Without an
+            # authoritative edit delta, the newline can no longer be proven
+            # to be the viewer-owned character.
+            if not self._scratch_non_edit_key_pending:
+                marker = None
+        elif marker is not None:
+            prefix = 0
+            common_limit = min(len(old_text), len(new_text))
+            while prefix < common_limit and old_text[prefix] == new_text[prefix]:
+                prefix += 1
+            suffix = 0
+            old_remaining = len(old_text) - prefix
+            new_remaining = len(new_text) - prefix
+            while (
+                suffix < old_remaining
+                and suffix < new_remaining
+                and old_text[len(old_text) - suffix - 1] == new_text[len(new_text) - suffix - 1]
+            ):
+                suffix += 1
+            old_end = len(old_text) - suffix
+            inserted_length = len(new_text) - prefix - suffix
+            if prefix <= marker < old_end:
+                marker = None
+            elif old_end <= marker:
+                marker += inserted_length - (old_end - prefix)
+        self._display_marker_offset = marker
+        self._scratch_previous_text = new_text
+        self._scratch_non_edit_key_pending = False
+        if event is not None:
+            event.Skip()
+
+    def _scratch_copy_text(self) -> str:
+        start, end = self.text_ctrl.GetSelection()
+        has_selection = start != end
+        if not has_selection:
+            start, end = 0, self.text_ctrl.GetLastPosition()
+        copied_text = self.text_ctrl.GetRange(start, end)
+        marker = self._display_marker_offset
+        if marker is not None and start <= marker < end:
+            relative_marker = marker - start
+            copied_text = copied_text[:relative_marker] + copied_text[relative_marker + 1:]
+        return copied_text
+
+    def _copy_scratch_to_clipboard(self) -> bool:
+        copied_text = self._scratch_copy_text()
         setter = getattr(self.GetParent(), "_set_clipboard_text", None)
-        if callable(setter) and setter(self.canonical_text):
+        try:
+            accepted = bool(callable(setter) and setter(copied_text))
+        except Exception:
+            accepted = False
+        if accepted:
             status = getattr(self.GetParent(), "SetStatusText", None)
             if callable(status):
                 status("已复制")
+        return accepted
+
+    def _on_copy_clicked(self, _event=None):
+        self._copy_scratch_to_clipboard()
+
+    def _on_scratch_key_down(self, event):
+        key_code = event.GetKeyCode()
+        ctrl_down = event.ControlDown()
+        alt_down = event.AltDown()
+        if ctrl_down and not alt_down and key_code in (ord("C"), ord("c")):
+            self._copy_scratch_to_clipboard()
+            return
+        marker = self._display_marker_offset
+        if marker is not None:
+            start, end = self.text_ctrl.GetSelection()
+            replaces_selection = start <= marker < end
+            unicode_key = getattr(event, "GetUnicodeKey", lambda: wx.WXK_NONE)()
+            non_text_keys = {
+                wx.WXK_LEFT, wx.WXK_RIGHT, wx.WXK_UP, wx.WXK_DOWN,
+                wx.WXK_HOME, wx.WXK_END, wx.WXK_PAGEUP, wx.WXK_PAGEDOWN,
+                wx.WXK_NUMPAD_LEFT, wx.WXK_NUMPAD_RIGHT,
+                wx.WXK_NUMPAD_UP, wx.WXK_NUMPAD_DOWN,
+                wx.WXK_NUMPAD_HOME, wx.WXK_NUMPAD_END,
+                wx.WXK_NUMPAD_PAGEUP, wx.WXK_NUMPAD_PAGEDOWN,
+                wx.WXK_TAB, wx.WXK_ESCAPE,
+            }
+            is_function_key = wx.WXK_F1 <= key_code <= wx.WXK_F24
+            produces_text = (
+                not ctrl_down
+                and not alt_down
+                and key_code not in non_text_keys
+                and not is_function_key
+                and unicode_key != wx.WXK_NONE
+                and unicode_key >= 32
+            )
+            explicit_mutation = (
+                (ctrl_down and not alt_down and key_code in (ord("V"), ord("v"), ord("X"), ord("x")))
+                or key_code in (wx.WXK_BACK, wx.WXK_DELETE)
+            )
+            edit_hits_marker = replaces_selection and (
+                explicit_mutation
+                or produces_text
+            )
+            if start == end:
+                edit_hits_marker = edit_hits_marker or key_code == wx.WXK_DELETE and start == marker
+                edit_hits_marker = edit_hits_marker or key_code == wx.WXK_BACK and start == marker + 1
+            if edit_hits_marker:
+                self._display_marker_offset = None
+            elif not produces_text and not explicit_mutation:
+                self._scratch_non_edit_key_pending = True
+                wx.CallAfter(setattr, self, "_scratch_non_edit_key_pending", False)
+        event.Skip()
 
     def _on_continue_clicked(self, _event=None):
         self._request_continue()
