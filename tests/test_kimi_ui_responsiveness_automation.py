@@ -384,9 +384,9 @@ def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(fram
 
     source = {"adapter": "kimi_server", "source_kind": "thinking.delta", "offset": 0}
     for event in (
-        main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text="The", raw_text="The", display_kind="thinking", data=source),
+            main.CodexEvent(type="agent_message_delta", provider="kimi", event_id="thinking-1", fragment_id="f0", offset=0, thread_id="session-1", turn_id="turn-1", text="The", raw_text="The", display_kind="thinking", data=source),
         main.CodexEvent(type="thread_status_changed", thread_id="session-1", turn_id="turn-1", status="streaming"),
-        main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text=" user", raw_text=" user", display_kind="thinking", data={**source, "offset": 3}),
+            main.CodexEvent(type="agent_message_delta", provider="kimi", event_id="thinking-1", fragment_id="f3", offset=3, thread_id="session-1", turn_id="turn-1", text=" user", raw_text=" user", display_kind="thinking", data={**source, "offset": 3}),
         main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text="答案", raw_text="答案", display_kind="assistant", data={"source_kind": "assistant.delta", "offset": 0}),
     ):
         frame._dispatch_kimi_event_to_ui("chat-kimi", event)

@@ -157,6 +157,14 @@ class KimiEvent:
     params: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
+    provider: str = "kimi"
+    event_id: str = ""
+    fragment_id: str = ""
+    offset: int | None = None
+    session_id: str = ""
+    stream_id: str = ""
+    tool_call_id: str = ""
+    revision: int | None = None
 
 
 def event_to_payload(event: KimiEvent) -> dict[str, Any]:
@@ -287,6 +295,13 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     base: dict[str, Any] = {
         "thread_id": session_id,
         "data": event_data,
+        "provider": "kimi",
+        "session_id": session_id,
+        "event_id": _str(body.get("eventId") or body.get("messageId") or body.get("toolCallId") or body.get("callId") or body.get("stepId") or body.get("id")),
+        "fragment_id": _str(body.get("fragmentId") or body.get("deltaId") or message.get("id")),
+        "offset": body.get("offset") if isinstance(body.get("offset"), int) else None,
+        "stream_id": _str(body.get("messageId") or body.get("toolCallId") or body.get("callId") or body.get("stepId")),
+        "tool_call_id": _str(body.get("toolCallId") or body.get("callId")),
     }
 
     if body_type == "assistant.delta":

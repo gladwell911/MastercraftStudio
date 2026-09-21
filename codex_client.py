@@ -290,6 +290,14 @@ class CodexEvent:
     params: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
+    provider: str = "codex"
+    event_id: str = ""
+    fragment_id: str = ""
+    offset: int | None = None
+    session_id: str = ""
+    stream_id: str = ""
+    tool_call_id: str = ""
+    revision: int | None = None
 
 
 def _first_non_empty(*values) -> str:
@@ -391,6 +399,10 @@ def _event_from_item(method: str, params: dict) -> CodexEvent:
         phase=str(item.get("phase") or ""),
         status=item_type,
         data=item,
+        event_id=str(item.get("id") or ""),
+        session_id=str(params.get("threadId") or ""),
+        stream_id=str(item.get("id") or ""),
+        tool_call_id=str(item.get("toolCallId") or item.get("callId") or ""),
     )
 
 
@@ -962,6 +974,11 @@ class CodexAppServerClient:
                     subtype="agentMessageDelta",
                     display_kind="commentary",
                     data=params,
+                    event_id=str(params.get("eventId") or params.get("itemId") or ""),
+                    fragment_id=str(params.get("fragmentId") or params.get("deltaId") or params.get("eventId") or ""),
+                    offset=params.get("offset") if isinstance(params.get("offset"), int) else None,
+                    session_id=str(params.get("threadId") or ""),
+                    stream_id=str(params.get("itemId") or ""),
                 )
             )
             return

@@ -287,8 +287,10 @@ def test_codex_execution_step_replaces_empty_placeholder(frame):
         },
     )
 
-    assert list(frame.execution_list.GetStrings()) == ["计划：正在检查项目文件"]
-    assert [meta[0] for meta in frame.execution_meta] == ["execution"]
+    # Time separators are independent reachable rows; the placeholder must be
+    # replaced by the execution content, not necessarily be the only row.
+    assert list(frame.execution_list.GetStrings())[-1] == "计划：正在检查项目文件"
+    assert [meta[0] for meta in frame.execution_meta if meta[0] != "time"] == ["execution"]
 
 
 

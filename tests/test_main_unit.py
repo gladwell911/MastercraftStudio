@@ -8842,7 +8842,7 @@ def test_agent_message_delta_buffers_without_immediate_execution_step(frame, mon
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="stream"),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", fragment_id="f1", text="stream"),
     )
 
     assert frame._current_chat_state["execution_steps"] == []
@@ -8867,11 +8867,11 @@ def test_execution_delta_buffer_flushes_into_single_commentary_item(frame, monke
 
     frame._buffer_execution_delta(
         "chat-1",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="先检查 main.py。"),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", fragment_id="f1", text="先检查 main.py。"),
     )
     frame._buffer_execution_delta(
         "chat-1",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="再处理 codex_client.py。"),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", fragment_id="f2", text="再处理 codex_client.py。"),
     )
 
     flushed = frame._flush_execution_delta("chat-1", "turn-1", "msg-1")
@@ -8885,17 +8885,19 @@ def test_execution_delta_buffer_flushes_into_single_commentary_item(frame, monke
 
 
 def test_execution_delta_flush_preserves_fragment_edge_whitespace(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
     frame._current_chat_state = {"id": "chat-1", "turns": [], "execution_steps": []}
+    frame._chat_store_enabled = False
     captured = []
     monkeypatch.setattr(frame, "_build_execution_entry", lambda event: captured.append(event) or None)
 
     frame._buffer_execution_delta(
         "chat-1",
-        main.CodexEvent(type="agent_message_delta", turn_id="turn-1", text=" leading"),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="edge-message-1", fragment_id="edge-f1", text=" leading"),
     )
     frame._buffer_execution_delta(
         "chat-1",
-        main.CodexEvent(type="agent_message_delta", turn_id="turn-1", text=" trailing "),
+        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="edge-message-1", fragment_id="edge-f2", text=" trailing "),
     )
 
     assert frame._flush_execution_delta("chat-1", "turn-1") is False
@@ -8917,7 +8919,10 @@ def test_kimi_execution_delta_buffer_separates_agent_and_source_streams(frame):
             "chat-1",
             main.CodexEvent(
                 type="agent_message_delta",
-                turn_id="turn-1",
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                    item_id=f"{agent}:{source}",
+                    fragment_id=f"fragment:{agent}:{source}",
                 text=text,
                 display_kind=kind,
                     data={"adapter": "kimi_server", "agent_id": agent, "source_kind": source},
@@ -9204,7 +9209,7 @@ def test_switch_to_execution_mode_flushes_pending_delta_before_rebuild(frame, mo
     }
     frame._buffer_execution_delta(
         "chat-1",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", text="待落地过程"),
+            main.CodexEvent(type="agent_message_delta", thread_id="thread-1", turn_id="turn-1", item_id="msg-1", fragment_id="f1", text="待落地过程"),
     )
     rebuilt = {"count": 0}
     monkeypatch.setattr(frame, "_rebuild_execution_list_from_state", lambda: rebuilt.__setitem__("count", rebuilt["count"] + 1))
@@ -9242,7 +9247,7 @@ def test_history_view_execution_mode_flushes_pending_delta_for_viewed_archived_c
     ]
     frame._buffer_execution_delta(
         "chat-history",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-history", turn_id="turn-history", item_id="msg-1", text="历史缓冲"),
+            main.CodexEvent(type="agent_message_delta", thread_id="thread-history", turn_id="turn-history", item_id="msg-1", fragment_id="f1", text="历史缓冲"),
     )
     rebuilt = {"count": 0}
     monkeypatch.setattr(frame, "_rebuild_execution_list_from_state", lambda: rebuilt.__setitem__("count", rebuilt["count"] + 1))
@@ -9279,7 +9284,7 @@ def test_show_history_chat_flushes_pending_execution_delta_before_switch(frame, 
     ]
     frame._buffer_execution_delta(
         "chat-current",
-        main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", text="切换前先落地"),
+            main.CodexEvent(type="agent_message_delta", thread_id="thread-current", turn_id="turn-current", item_id="msg-1", fragment_id="f1", text="切换前先落地"),
     )
     monkeypatch.setattr(frame, "_save_state", lambda: None)
 
@@ -21934,3 +21939,76 @@ def test_clear_reconciliation_declines_malformed_operation_revision_without_cras
     frame._pending_clear_recoveries = []
 
     assert frame._reconcile_clear_operation_for_owner("owner") == operation
+@pytest.mark.parametrize("provider", ["codex", "kimi"])
+def test_lifecycle_envelope_ids_share_stable_tool_identity(frame, provider):
+    frame.active_chat_id = frame.current_chat_id = "lifecycle-chat"
+    frame._current_chat_state = {"id": "lifecycle-chat", "revision": 3, "turns": [], "execution_steps": []}
+    common = {"provider": provider, "thread_id": f"{provider}-session", "session_id": f"{provider}-session",
+              "turn_id": "turn-0", "item_id": "tool-7", "tool_call_id": "tool-7",
+              "agent_id": "main", "revision": 3, "display_kind": "command"}
+    assert frame._append_execution_entry_to_chat("lifecycle-chat", {
+        **common, "provider_event_id": "envelope-start", "event_type": "item_started",
+        "list_text": "running", "detail_text": "start",
+    })
+    assert frame._append_execution_entry_to_chat("lifecycle-chat", {
+        **common, "provider_event_id": "envelope-complete", "event_type": "item_completed",
+        "list_text": "done", "detail_text": "complete",
+    })
+    rows = frame._current_chat_state["execution_steps"]
+    assert len(rows) == 1
+    assert rows[0]["list_text"] == "done"
+    assert rows[0]["detail_text"] == "startcomplete"
+
+
+def test_non_store_assembler_same_start_containment_and_conflict(frame):
+    frame.active_chat_id = frame.current_chat_id = "fallback"
+    frame._current_chat_state = {"id": "fallback", "revision": 1, "turns": [], "execution_steps": []}
+    frame._chat_store_enabled = False
+    def send(fragment_id, text):
+        frame._buffer_execution_delta("fallback", main.CodexEvent(
+            type="agent_message_delta", thread_id="thread", turn_id="turn", item_id="stream",
+            fragment_id=fragment_id, offset=0, text=text))
+    send("long", "abcdef")
+    send("short", "abc")
+    state = next(iter(frame._execution_delta_buffer.values()))
+    assert state["parts"] == ["abcdef"]
+    send("longer", "abcdefgh")
+    assert state["parts"] == ["abcdefgh"]
+    send("bad", "abX")
+    assert state["parts"] == ["abcdefgh"]
+    assert state["conflicts"][-1]["fragment_id"] == "bad"
+
+
+def test_non_store_assembler_leading_gap_waits_for_origin(frame):
+    frame.active_chat_id = frame.current_chat_id = "fallback-gap"
+    frame._current_chat_state = {"id":"fallback-gap","revision":1,"turns":[],"execution_steps":[]}
+    frame._chat_store_enabled = False
+    def send(fragment_id, offset, text):
+        frame._buffer_execution_delta("fallback-gap", main.CodexEvent(
+            type="agent_message_delta", thread_id="thread", turn_id="turn", item_id="stream",
+            fragment_id=fragment_id, offset=offset, text=text))
+    send("late", 3, "def")
+    state = next(iter(frame._execution_delta_buffer.values()))
+    assert state["pending_gap"] and state["parts"] == []
+    assert frame._flush_execution_delta("fallback-gap", "turn") is False
+    assert frame._execution_delta_buffer
+    send("first", 0, "abc")
+    assert not state["pending_gap"] and state["parts"] == ["abcdef"]
+
+
+def test_non_store_private_latch_redacts_and_avoids_overlap_conflict(frame):
+    frame.active_chat_id = frame.current_chat_id = "fallback-private"
+    frame._current_chat_state = {"id":"fallback-private","revision":1,"turns":[],"execution_steps":[]}
+    frame._chat_store_enabled = False
+    base = dict(type="agent_message_delta", provider="kimi", thread_id="session", turn_id="turn",
+                item_id="thinking", display_kind="thinking")
+    frame._buffer_execution_delta("fallback-private", main.CodexEvent(**base, fragment_id="public", offset=0,
+        text="PUBLIC", data={"adapter":"kimi_server","source_kind":"thinking.delta"}))
+    frame._buffer_execution_delta("fallback-private", main.CodexEvent(**base, fragment_id="private", offset=6,
+        text="SECRET", data={"adapter":"kimi_server","source_kind":"thinking.delta","non_disclosable":True}))
+    state = next(iter(frame._execution_delta_buffer.values()))
+    assert state["private_reasoning"] and "PUBLIC" not in "".join(state["parts"])
+    before_conflicts = len(state["conflicts"])
+    frame._buffer_execution_delta("fallback-private", main.CodexEvent(**base, fragment_id="later", offset=3,
+        text="LIC-CHANGED", data={"adapter":"kimi_server","source_kind":"thinking.delta"}))
+    assert state["private_reasoning"] and len(state["conflicts"]) == before_conflicts

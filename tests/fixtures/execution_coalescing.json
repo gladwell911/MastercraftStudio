@@ -1,0 +1,11 @@
+{
+  "scope": {"chat_id":"chat-a","revision":2,"thread_id":"session-a","turn_id":"turn-0","provider":"provider","agent_id":"main","native_id":"event-a"},
+  "cases": [
+    {"name":"ordered","fragments":[{"id":"f0","offset":0,"text":"abc"},{"id":"f3","offset":3,"text":"def"}],"assembled":"abcdef"},
+    {"name":"overlap-replay","fragments":[{"id":"f0","offset":0,"text":"abcd"},{"id":"f2","offset":2,"text":"cdef"}],"assembled":"abcdef"},
+    {"name":"gap","fragments":[{"id":"f0","offset":0,"text":"ab"},{"id":"f4","offset":4,"text":"ef"}],"assembled":"ab","pending_gap":true},
+    {"name":"conflict","fragments":[{"id":"f0","offset":0,"text":"abc"},{"id":"f0","offset":0,"text":"axc"}],"conflict":"FRAGMENT_ID_CONFLICT"},
+    {"name":"equal-label-independent","native_ids":["event-a","event-b"],"label":"正在分析问题"},
+    {"name":"reused-native-id-independent","owners":[["chat-a",2,"session-a","turn-0","codex"],["chat-b",2,"session-a","turn-0","codex"],["chat-a",3,"session-a","turn-0","codex"],["chat-a",2,"session-b","turn-0","kimi"]]}
+  ]
+}

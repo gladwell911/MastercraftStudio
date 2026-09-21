@@ -897,3 +897,262 @@ def test_repeated_turn_save_preserves_canonical_ids_and_projection_is_idempotent
     assert again["event_id"] == first["event_id"]
     with store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) n FROM durable_facts WHERE event_id=?", (first["event_id"],)).fetchone()["n"] == 1
+def test_execution_logical_identity_upsert_preserves_first_metadata(tmp_path):
+    store = ChatStore(tmp_path / "logical.db")
+    store.initialize()
+    scope = {"chat_id": "chat", "revision": 1, "thread_id": "session", "turn_id": "turn",
+             "provider": "codex", "agent_id": "", "native_id": "item"}
+    logical_key = store.execution_logical_key(scope)
+    first = {
+        "logical_key": logical_key, "logical_scope": scope, "logical_scope_hash": logical_key,
+        "canonical_item_id": f"execution-{logical_key}", "provider": "codex", "thread_id": "session",
+        "agent_id": "", "event_id": "canonical-event",
+        "_execution_uid": "stable-row", "created_at": 10.0, "revision": 1,
+        "execution_sequence": 7, "item_id": "item", "turn_id": "turn",
+        "list_text": "started", "detail_text": "a",
+    }
+    store.append_execution_step("chat", first)
+    update = dict(first, event_id="replacement", _execution_uid="replacement", created_at=20.0,
+                  execution_sequence=9, list_text="completed", detail_text="ab")
+    assert store.update_execution_step_by_identity("chat", update)
+    rows = store.load_execution_steps("chat")
+    assert len(rows) == 1
+    assert rows[0]["list_text"] == "completed"
+    assert rows[0]["event_id"] == "canonical-event"
+    assert rows[0]["_execution_uid"] == "stable-row"
+    assert rows[0]["created_at"] == 10.0
+    assert rows[0]["execution_sequence"] == 7
+
+
+def test_durable_execution_assembler_replay_overlap_gap_and_restart(tmp_path):
+    path = tmp_path / "assembler.db"
+    store = ChatStore(path)
+    store.initialize()
+    scope = {"chat_id": "c", "revision": 2, "thread_id": "s", "turn_id": "t",
+             "provider": "kimi", "agent_id": "main", "native_id": "m"}
+    key = store.execution_logical_key(scope)
+    assert store.apply_execution_fragment("c", key, scope, fragment_id="f1", offset=0, text="abc")["assembled"] == "abc"
+    replay = store.apply_execution_fragment("c", key, scope, fragment_id="f1", offset=0, text="abc")
+    assert replay["replay"] and not replay["accepted"]
+    overlap = store.apply_execution_fragment("c", key, scope, fragment_id="f2", offset=2, text="cde")
+    assert overlap["assembled"] == "abcde"
+    gap = store.apply_execution_fragment("c", key, scope, fragment_id="f3", offset=7, text="hi")
+    assert gap["pending_gap"] and gap["assembled"] == "abcde"
+    restarted = ChatStore(path)
+    fill = restarted.apply_execution_fragment("c", key, scope, fragment_id="f4", offset=5, text="fg")
+    assert not fill["pending_gap"] and fill["assembled"] == "abcdefghi"
+
+
+def test_durable_execution_assembler_persists_conflicts_without_mutation(tmp_path):
+    store = ChatStore(tmp_path / "conflict.db")
+    store.initialize()
+    scope = {"chat_id": "c", "revision": 1, "thread_id": "s", "turn_id": "t",
+             "provider": "codex", "agent_id": "", "native_id": "m"}
+    key = store.execution_logical_key(scope)
+    store.apply_execution_fragment("c", key, scope, fragment_id="f", offset=0, text="abc")
+    conflict = store.apply_execution_fragment("c", key, scope, fragment_id="f", offset=0, text="axc")
+    assert conflict["conflict"] and conflict["assembled"] == "abc"
+    records = store.load_execution_fragment_conflicts("c", key)
+    assert records[-1]["reason"] == "FRAGMENT_ID_CONFLICT"
+
+
+def test_assembler_transaction_materializes_projection_and_same_start_ranges(tmp_path):
+    path = tmp_path / "atomic-assembler.db"
+    store = ChatStore(path)
+    store.initialize()
+    scope = {"chat_id": "c", "revision": 4, "thread_id": "s", "turn_id": "0",
+             "provider": "kimi", "agent_id": "main", "native_id": "tool-1"}
+    key = store.execution_logical_key(scope)
+    safe_seed = {"event_type": "agent_message_delta", "display_kind": "commentary",
+                 "list_text": "正在处理", "detail_text": ""}
+    store.apply_execution_fragment("c", key, scope, fragment_id="long", offset=0, text="abcdef",
+                                   projection_seed=safe_seed)
+    # Simulate a crash before the UI projection code runs: the same SQLite
+    # transaction already left a stable, reloadable canonical item.
+    reloaded = ChatStore(path).load_execution_steps("c")
+    assert len(reloaded) == 1 and reloaded[0]["list_text"] == "正在处理"
+    assert reloaded[0]["detail_text"] == ""
+    stable = (reloaded[0]["event_id"], reloaded[0]["created_at"], reloaded[0]["_execution_uid"])
+    shorter = store.apply_execution_fragment("c", key, scope, fragment_id="short", offset=0, text="abc")
+    assert shorter["assembled"] == "abcdef"
+    longer = store.apply_execution_fragment("c", key, scope, fragment_id="longer", offset=0, text="abcdefgh")
+    assert longer["assembled"] == "abcdefgh"
+    after = store.load_execution_steps("c")[0]
+    assert (after["event_id"], after["created_at"], after["_execution_uid"]) == stable
+    conflict = store.apply_execution_fragment("c", key, scope, fragment_id="bad", offset=0, text="abX")
+    assert conflict["conflict"] and conflict["assembled"] == "abcdefgh"
+
+
+def test_projection_rejects_logical_key_and_scope_tampering(tmp_path):
+    store = ChatStore(tmp_path / "tamper.db")
+    store.initialize()
+    scope = {"chat_id": "c", "revision": 1, "thread_id": "s", "turn_id": "t",
+             "provider": "codex", "agent_id": "", "native_id": "tool"}
+    key = store.execution_logical_key(scope)
+    result = store.apply_execution_fragment("c", key, scope, fragment_id="f", offset=0, text="x")
+    projection = result["projection"]
+    with pytest.raises(ValueError, match="LOGICAL_KEY_MISMATCH"):
+        store.upsert_execution_step("c", dict(projection, logical_scope={**scope, "provider": "kimi"}))
+    with pytest.raises(ValueError, match="SCOPE_CONFLICT"):
+        store.upsert_execution_step("c", dict(projection, provider="kimi"))
+
+
+def test_crash_projection_seed_never_leaks_private_or_raw_command_into_list(tmp_path):
+    store = ChatStore(tmp_path / "safe-crash.db")
+    store.initialize()
+    private_scope = {"chat_id": "c", "revision": 1, "thread_id": "s", "turn_id": "t",
+                     "provider": "kimi", "agent_id": "main", "native_id": "thinking"}
+    private_key = store.execution_logical_key(private_scope)
+    store.apply_execution_fragment("c", private_key, private_scope, fragment_id="p", offset=0,
+        text="secret reasoning /private/path", projection_seed={"event_type":"agent_message_delta",
+        "display_kind":"thinking", "list_text":"正在分析问题", "detail_text":"", "source_detail":{},
+        "private_reasoning":True})
+    command_scope = {**private_scope, "native_id": "tool", "provider": "codex"}
+    command_key = store.execution_logical_key(command_scope)
+    store.apply_execution_fragment("c", command_key, command_scope, fragment_id="c", offset=0,
+        text="Running: cat C:\\secret\\token.txt", projection_seed={"event_type":"agent_message_delta",
+        "display_kind":"command", "list_text":"正在执行命令", "detail_text":""})
+    rows = ChatStore(store.db_path).load_execution_steps("c")
+    assert [row["list_text"] for row in rows] == ["正在分析问题", "正在执行命令"]
+    assert rows[0]["detail_text"] == "" and rows[0]["source_detail"] == {}
+    assert all("secret" not in row["list_text"] and "Running:" not in row["list_text"] for row in rows)
+
+
+def test_hidden_crash_projection_is_promoted_safely_by_exact_replay(tmp_path):
+    path = tmp_path / "hidden-replay.db"
+    store = ChatStore(path)
+    store.initialize()
+    scope = {"chat_id": "c", "revision": 1, "thread_id": "s", "turn_id": "t",
+             "provider": "kimi", "agent_id": "main", "native_id": "thinking"}
+    key = store.execution_logical_key(scope)
+    store.apply_execution_fragment("c", key, scope, fragment_id="f", offset=0, text="PRIVATE RAW")
+    assert ChatStore(path).load_execution_steps("c") == []
+    replay = ChatStore(path).apply_execution_fragment("c", key, scope, fragment_id="f", offset=0,
+        text="PRIVATE RAW", projection_seed={"event_type":"agent_message_delta", "display_kind":"thinking",
+        "list_text":"正在分析问题", "detail_text":"", "private_reasoning":True, "source_detail":{}})
+    assert replay["replay"] and replay["projection"]["projection_ready"]
+    rows = ChatStore(path).load_execution_steps("c")
+    assert len(rows) == 1 and rows[0]["list_text"] == "正在分析问题"
+    assert rows[0]["detail_text"] == "" and "PRIVATE RAW" not in json.dumps(rows[0], ensure_ascii=False)
+
+
+def test_leading_offset_gap_persists_until_origin_is_filled_after_restart(tmp_path):
+    path = tmp_path / "leading-gap.db"
+    store = ChatStore(path)
+    store.initialize()
+    scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+             "provider":"codex","agent_id":"","native_id":"stream"}
+    key = store.execution_logical_key(scope)
+    late = store.apply_execution_fragment("c", key, scope, fragment_id="late", offset=3, text="def",
+        projection_seed={"event_type":"agent_message_delta","display_kind":"commentary",
+                         "list_text":"working","detail_text":""})
+    assert late["pending_gap"] and late["assembled"] == ""
+    assert ChatStore(path).load_execution_steps("c")[0]["incomplete"] is True
+    filled = ChatStore(path).apply_execution_fragment("c", key, scope, fragment_id="first", offset=0, text="abc",
+        projection_seed={"event_type":"agent_message_delta","display_kind":"commentary",
+                         "list_text":"working","detail_text":"abcdef"})
+    assert not filled["pending_gap"] and filled["assembled"] == "abcdef"
+
+
+def test_recent_execution_sql_excludes_hidden_rows_from_total_and_window(tmp_path):
+    store = ChatStore(tmp_path / "hidden-page.db")
+    store.initialize()
+    store.append_execution_step("c", {"list_text":"ready-1","detail_text":"ready-1"})
+    def hidden(native_id):
+        scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+                 "provider":"kimi","agent_id":"main","native_id":native_id}
+        store.apply_execution_fragment("c", store.execution_logical_key(scope), scope,
+                                       fragment_id="f", offset=0, text="hidden")
+    hidden("hidden-middle")
+    store.append_execution_step("c", {"list_text":"ready-2","detail_text":"ready-2"})
+    hidden("hidden-latest")
+    total, latest = store.load_recent_execution_steps("c", limit=1)
+    assert total == 2 and [row["list_text"] for row in latest] == ["ready-2"]
+    total, older = store.load_recent_execution_steps("c", limit=10,
+                                                      before_step_index=latest[0]["_store_step_index"])
+    assert total == 1 and [row["list_text"] for row in older] == ["ready-1"]
+
+
+def test_private_latch_redacts_prior_public_state_and_survives_restart(tmp_path):
+    path = tmp_path / "privacy-transition.db"
+    store = ChatStore(path); store.initialize()
+    scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+             "provider":"kimi","agent_id":"main","native_id":"thinking"}
+    key = store.execution_logical_key(scope)
+    public_seed = {"event_type":"agent_message_delta","display_kind":"thinking",
+                   "list_text":"正在分析问题","detail_text":"PUBLIC RAW","source_detail":{"raw":"PUBLIC RAW"}}
+    private_seed = {"event_type":"agent_message_delta","display_kind":"thinking",
+                    "list_text":"正在分析问题","detail_text":"","private_reasoning":True,"source_detail":{}}
+    store.apply_execution_fragment("c", key, scope, fragment_id="public", offset=0, text="PUBLIC", projection_seed=public_seed)
+    store.apply_execution_fragment("c", key, scope, fragment_id="private", offset=6, text="SECRET", projection_seed=private_seed)
+    with store._connect() as conn:
+        raw_state = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
+    assert "PUBLIC" not in raw_state and "SECRET" not in raw_state
+    row = ChatStore(path).load_execution_steps("c")[0]
+    assert row["private_reasoning"] and row["detail_text"] == "" and row["source_detail"] == {}
+    resumed = ChatStore(path).apply_execution_fragment("c", key, scope, fragment_id="later", offset=3,
+        text="LIC-CHANGED", projection_seed=public_seed)
+    assert resumed["accepted"] and resumed["private_reasoning"] and not resumed.get("conflict")
+    with store._connect() as conn:
+        raw_state = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
+    assert "CHANGED" not in raw_state
+
+
+def test_private_first_restart_then_public_overlap_never_downgrades(tmp_path):
+    path = tmp_path / "privacy-first.db"
+    store = ChatStore(path); store.initialize()
+    scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+             "provider":"kimi","agent_id":"main","native_id":"thinking"}
+    key = store.execution_logical_key(scope)
+    private_seed = {"event_type":"agent_message_delta","display_kind":"thinking",
+                    "list_text":"正在分析问题","detail_text":"","private_reasoning":True,"source_detail":{}}
+    store.apply_execution_fragment("c", key, scope, fragment_id="private", offset=0, text="SECRET", projection_seed=private_seed)
+    public_seed = {"event_type":"agent_message_delta","display_kind":"thinking",
+                   "list_text":"正在分析问题","detail_text":"PUBLIC","source_detail":{"raw":"PUBLIC"}}
+    resumed = ChatStore(path).apply_execution_fragment("c", key, scope, fragment_id="public", offset=3,
+        text="RET-PUBLIC", projection_seed=public_seed)
+    assert resumed["private_reasoning"] and not resumed.get("conflict")
+    row = ChatStore(path).load_execution_steps("c")[0]
+    assert row["private_reasoning"] and row["detail_text"] == "" and row["source_detail"] == {}
+
+
+def test_exact_replay_can_escalate_privacy_before_restart_and_continuation(tmp_path):
+    path = tmp_path / "exact-private.db"
+    store = ChatStore(path); store.initialize()
+    scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+             "provider":"kimi","agent_id":"main","native_id":"thinking"}
+    key = store.execution_logical_key(scope)
+    public = {"event_type":"agent_message_delta","display_kind":"thinking","list_text":"正在分析问题",
+              "detail_text":"PUBLIC","source_detail":{"raw":"PUBLIC"}}
+    private = {"event_type":"agent_message_delta","display_kind":"thinking","list_text":"正在分析问题",
+               "detail_text":"","private_reasoning":True,"source_detail":{}}
+    store.apply_execution_fragment("c", key, scope, fragment_id="same", offset=0, text="PUBLIC", projection_seed=public)
+    replay = store.apply_execution_fragment("c", key, scope, fragment_id="same", offset=0, text="PUBLIC", projection_seed=private)
+    assert replay["replay"] and replay["private_reasoning"]
+    with store._connect() as conn:
+        state_json = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
+    assert "PUBLIC" not in state_json and json.loads(state_json)["private_reasoning"] is True
+    row = ChatStore(path).load_execution_steps("c")[0]
+    assert row["private_reasoning"] and row["detail_text"] == "" and row["source_detail"] == {}
+    continuation = ChatStore(path).apply_execution_fragment("c", key, scope, fragment_id="next", offset=3,
+        text="LIC-CONTINUE", projection_seed=public)
+    assert continuation["private_reasoning"] and not continuation.get("conflict")
+    with store._connect() as conn:
+        state_json = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
+    assert "CONTINUE" not in state_json
+
+
+def test_hidden_exact_private_replay_persists_private_assembler_state(tmp_path):
+    path = tmp_path / "hidden-exact-private.db"
+    store = ChatStore(path); store.initialize()
+    scope = {"chat_id":"c","revision":1,"thread_id":"s","turn_id":"t",
+             "provider":"kimi","agent_id":"main","native_id":"thinking"}
+    key = store.execution_logical_key(scope)
+    store.apply_execution_fragment("c", key, scope, fragment_id="same", offset=0, text="SECRET")
+    private = {"event_type":"agent_message_delta","display_kind":"thinking","list_text":"正在分析问题",
+               "detail_text":"","private_reasoning":True,"source_detail":{}}
+    replay = store.apply_execution_fragment("c", key, scope, fragment_id="same", offset=0, text="SECRET", projection_seed=private)
+    assert replay["replay"] and replay["private_reasoning"] and replay["projection"]["projection_ready"]
+    with store._connect() as conn:
+        state_json = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
+    assert "SECRET" not in state_json and json.loads(state_json)["private_reasoning"] is True

@@ -298,11 +298,11 @@ def test_thinking_status_interleaving_creates_one_chinese_execution_step(frame, 
     source_data = {"source_kind": "thinking.delta", "agent_id": "main", "offset": 0}
 
     fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
-    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="The", raw_text="The", display_kind="thinking", data=source_data))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, event_id="thinking-1", fragment_id="f0", offset=0, text="The", raw_text="The", display_kind="thinking", data=source_data))
     fake.push_event(KimiEvent(type="thread_status_changed", thread_id=session_id, turn_id=TEST_TURN_ID, status="streaming"))
-    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
-    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
-    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="The", raw_text="The", display_kind="thinking", data=source_data))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, event_id="thinking-1", fragment_id="f3", offset=3, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, event_id="thinking-1", fragment_id="f3", offset=3, text=" user", raw_text=" user", display_kind="thinking", data={**source_data, "offset": 3}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, event_id="thinking-1", fragment_id="f0", offset=0, text="The", raw_text="The", display_kind="thinking", data=source_data))
     fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="progress", raw_text="progress", display_kind="commentary", data={"source_kind": "tool.progress", "agent_id": "main"}))
     fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="答案", raw_text="答案", display_kind="assistant", data={"source_kind": "assistant.delta", "offset": 0}))
 
@@ -345,7 +345,9 @@ def test_thinking_privacy_is_monotonic_across_buffered_fragments_and_restart(fra
     fragments = ["EARLY SECRET ", "LATE SECRET"]
     offset = 0
     for index, fragment in enumerate(fragments):
-        payload = {"type": "thinking.delta", "turnId": TEST_TURN_ID, "agentId": "main", "delta": fragment}
+        payload = {"type": "thinking.delta", "turnId": TEST_TURN_ID, "agentId": "main",
+                   "messageId": "private-thinking", "fragmentId": f"private-{index}",
+                   "offset": offset, "delta": fragment}
         if index == private_fragment:
             payload["nonDisclosable"] = True
         mapped = map_session_event({"type": "thinking.delta", "session_id": session_id, "offset": offset, "payload": payload})

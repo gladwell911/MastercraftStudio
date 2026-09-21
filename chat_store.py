@@ -63,8 +63,28 @@ class ChatStore:
                     list_text TEXT NOT NULL DEFAULT '',
                     detail_text TEXT NOT NULL DEFAULT '',
                     payload_json TEXT NOT NULL,
+                    logical_key TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (chat_id, step_index)
                 );
+                CREATE TABLE IF NOT EXISTS execution_assemblers (
+                    chat_id TEXT NOT NULL,
+                    logical_key TEXT NOT NULL,
+                    scope_json TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(chat_id, logical_key)
+                );
+                CREATE TABLE IF NOT EXISTS execution_fragment_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL,
+                    logical_key TEXT NOT NULL,
+                    fragment_id TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE INDEX IF NOT EXISTS idx_execution_fragment_conflicts
+                    ON execution_fragment_conflicts(chat_id, logical_key, id);
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -144,6 +164,10 @@ class ChatStore:
                     ON clear_operations(chat_id, state, revision DESC);
                 """
             )
+            execution_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_steps)")}
+            if "logical_key" not in execution_columns:
+                conn.execute("ALTER TABLE execution_steps ADD COLUMN logical_key TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_logical_key ON execution_steps(chat_id, logical_key) WHERE logical_key <> ''")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(clear_operations)")}
             if "pair_id" not in columns:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN pair_id TEXT NOT NULL DEFAULT 'default'")
@@ -1344,6 +1368,9 @@ class ChatStore:
         normalized = str(chat_id or "").strip()
         if not normalized or not isinstance(step, dict):
             return
+        if str(step.get("logical_key") or "").strip():
+            self.upsert_execution_step(normalized, step)
+            return
         turn_value = self._optional_int(step.get("turn_idx"))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1355,8 +1382,8 @@ class ChatStore:
             conn.execute(
                 """
                 INSERT INTO execution_steps(
-                    chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json, logical_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized,
@@ -1367,6 +1394,7 @@ class ChatStore:
                     str(step.get("list_text") or step.get("step") or ""),
                     str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
                     json.dumps(step, ensure_ascii=False),
+                    str(step.get("logical_key") or ""),
                 ),
             )
             if turn_value is not None and self.max_execution_steps_per_turn > 0:
@@ -1441,29 +1469,46 @@ class ChatStore:
 
     def update_execution_step_by_identity(self, chat_id: str, step: dict[str, Any]) -> bool:
         normalized = str(chat_id or "").strip()
+        logical_key = str((step or {}).get("logical_key") or "").strip()
         item_id = str((step or {}).get("item_id") or "").strip()
-        if not normalized or not item_id:
+        if not normalized or (not logical_key and not item_id):
             return False
         turn_value = self._optional_int(step.get("turn_idx"))
         with self._connect() as conn:
+            if logical_key:
+                row = conn.execute(
+                    "SELECT step_index, payload_json FROM execution_steps WHERE chat_id=? AND logical_key=?",
+                    (normalized, logical_key),
+                ).fetchone()
+                if row is None:
+                    return False
+                previous = self._json_dict(row["payload_json"])
+                merged = dict(step)
+                for key in ("event_id", "_execution_uid", "created_at", "ts", "execution_sequence", "revision"):
+                    if previous.get(key) not in (None, ""):
+                        merged[key] = previous[key]
+                conn.execute(
+                    """UPDATE execution_steps SET turn_idx=?, event_type=?, display_kind=?, list_text=?,
+                       detail_text=?, payload_json=? WHERE chat_id=? AND logical_key=?""",
+                    (self._optional_int(merged.get("turn_idx")), str(merged.get("event_type") or ""),
+                     str(merged.get("display_kind") or ""), str(merged.get("list_text") or merged.get("step") or ""),
+                     str(merged.get("detail_text") or merged.get("message") or merged.get("step") or ""),
+                     json.dumps(merged, ensure_ascii=False), normalized, logical_key),
+                )
+                return True
             rows = conn.execute(
-                "SELECT step_index, payload_json FROM execution_steps WHERE chat_id = ? ORDER BY step_index DESC",
+                "SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? ORDER BY step_index DESC",
                 (normalized,),
             ).fetchall()
             for row in rows:
                 previous = self._json_dict(row["payload_json"])
-                if (
-                    str(previous.get("item_id") or "").strip() == item_id
-                    and self._optional_int(previous.get("turn_idx")) == turn_value
-                    and str(previous.get("thread_id") or "") == str(step.get("thread_id") or "")
-                    and str(previous.get("turn_id") or "") == str(step.get("turn_id") or "")
-                ):
+                if (str(previous.get("item_id") or "").strip() == item_id
+                        and self._optional_int(previous.get("turn_idx")) == turn_value
+                        and str(previous.get("thread_id") or "") == str(step.get("thread_id") or "")
+                        and str(previous.get("turn_id") or "") == str(step.get("turn_id") or "")):
                     conn.execute(
-                        """
-                        UPDATE execution_steps
-                        SET turn_idx=?, event_type=?, display_kind=?, list_text=?, detail_text=?, payload_json=?
-                        WHERE chat_id=? AND step_index=?
-                        """,
+                        """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                           WHERE chat_id=? AND step_index=?""",
                         (turn_value, str(step.get("event_type") or ""), str(step.get("display_kind") or ""),
                          str(step.get("list_text") or step.get("step") or ""),
                          str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
@@ -1471,6 +1516,248 @@ class ChatStore:
                     )
                     return True
         return False
+
+    def upsert_execution_step(self, chat_id: str, step: dict[str, Any]) -> dict[str, Any]:
+        """Atomically insert/update one fully-scoped execution projection."""
+        normalized = str(chat_id or "").strip()
+        logical_key = str((step or {}).get("logical_key") or "").strip()
+        if not normalized or not logical_key:
+            raise ValueError("MISSING_EXECUTION_LOGICAL_KEY")
+        incoming = dict(step)
+        scope = incoming.get("logical_scope") if isinstance(incoming.get("logical_scope"), dict) else None
+        if scope is None or self.execution_logical_key(scope) != logical_key or str(scope.get("chat_id") or "").strip() != normalized:
+            raise ValueError("EXECUTION_LOGICAL_KEY_MISMATCH")
+        expected = {
+            "provider": scope.get("provider"), "thread_id": scope.get("thread_id"),
+            "turn_id": scope.get("turn_id"), "revision": scope.get("revision"), "agent_id": scope.get("agent_id"),
+        }
+        for field, value in expected.items():
+            if str(incoming.get(field) if incoming.get(field) is not None else "") != str(value if value is not None else ""):
+                raise ValueError("EXECUTION_SCOPE_CONFLICT")
+        immutable = ("logical_key", "canonical_item_id", "provider", "thread_id", "turn_id", "revision", "agent_id")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            assembler = conn.execute("SELECT scope_json FROM execution_assemblers WHERE chat_id=? AND logical_key=?",
+                                     (normalized, logical_key)).fetchone()
+            if assembler is not None and self._json_dict(assembler["scope_json"]) != scope:
+                self._record_execution_conflict(conn, normalized, logical_key, str(incoming.get("fragment_id") or ""), "PROJECTION_ASSEMBLER_SCOPE_CONFLICT", incoming)
+                raise ValueError("EXECUTION_SCOPE_CONFLICT")
+            row = conn.execute(
+                "SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? AND logical_key=?",
+                (normalized, logical_key),
+            ).fetchone()
+            if row is not None:
+                previous = self._json_dict(row["payload_json"])
+                for key in immutable:
+                    if str(previous.get(key) if previous.get(key) is not None else "") != str(incoming.get(key) if incoming.get(key) is not None else ""):
+                        self._record_execution_conflict(conn, normalized, logical_key, str(incoming.get("fragment_id") or ""), "IMMUTABLE_SCOPE_CONFLICT", incoming)
+                        raise ValueError("EXECUTION_SCOPE_CONFLICT")
+                for key in ("event_id", "canonical_item_id", "_execution_uid", "created_at", "ts", "execution_sequence", "revision"):
+                    if previous.get(key) not in (None, ""):
+                        incoming[key] = previous[key]
+                step_index = int(row["step_index"])
+                conn.execute(
+                    """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                       WHERE chat_id=? AND logical_key=?""",
+                    (self._optional_int(incoming.get("turn_idx")), str(incoming.get("event_type") or ""),
+                     str(incoming.get("display_kind") or ""), str(incoming.get("list_text") or incoming.get("step") or ""),
+                     str(incoming.get("detail_text") or incoming.get("message") or incoming.get("step") or ""),
+                     json.dumps(incoming, ensure_ascii=False), normalized, logical_key),
+                )
+            else:
+                next_row = conn.execute("SELECT COALESCE(MAX(step_index),-1)+1 n FROM execution_steps WHERE chat_id=?", (normalized,)).fetchone()
+                step_index = int(next_row["n"] or 0)
+                conn.execute(
+                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,logical_key)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (normalized, step_index, self._optional_int(incoming.get("turn_idx")), str(incoming.get("event_type") or ""),
+                     str(incoming.get("display_kind") or ""), str(incoming.get("list_text") or incoming.get("step") or ""),
+                     str(incoming.get("detail_text") or incoming.get("message") or incoming.get("step") or ""),
+                     json.dumps(incoming, ensure_ascii=False), logical_key),
+                )
+        return incoming
+
+    @staticmethod
+    def _record_execution_conflict(conn, chat_id: str, logical_key: str, fragment_id: str, reason: str, payload: dict) -> None:
+        conn.execute(
+            "INSERT INTO execution_fragment_conflicts(chat_id,logical_key,fragment_id,reason,payload_json) VALUES(?,?,?,?,?)",
+            (chat_id, logical_key, fragment_id, reason, json.dumps(payload, ensure_ascii=False)),
+        )
+
+    @staticmethod
+    def execution_logical_key(scope: dict[str, Any]) -> str:
+        canonical = [
+            str(scope.get("chat_id") or "").strip(),
+            int(scope.get("revision", 0)),
+            str(scope.get("thread_id") or scope.get("session_id") or "").strip(),
+            str(scope.get("turn_id") if scope.get("turn_id") is not None else "").strip(),
+            str(scope.get("provider") or "").strip(),
+            str(scope.get("agent_id") or "").strip(),
+            str(scope.get("native_id") or "").strip(),
+        ]
+        return hashlib.sha256(json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def apply_execution_fragment(self, chat_id: str, logical_key: str, scope: dict[str, Any], *,
+                                 fragment_id: str, offset: int | None, text: str,
+                                 projection_seed: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Durably accept a fragment and return contiguous assembled content."""
+        normalized = str(chat_id or "").strip()
+        logical_key = str(logical_key or "").strip()
+        fragment_id = str(fragment_id or "").strip()
+        if not normalized or not logical_key or (offset is None and not fragment_id):
+            raise ValueError("AMBIGUOUS_EXECUTION_FRAGMENT")
+        if self.execution_logical_key(scope) != logical_key or str(scope.get("chat_id") or "").strip() != normalized:
+            raise ValueError("EXECUTION_LOGICAL_KEY_MISMATCH")
+        signature = hashlib.sha256((str(offset) + "\0" + text).encode("utf-8")).hexdigest()
+        incoming_private = bool(isinstance(projection_seed, dict) and projection_seed.get("private_reasoning"))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT scope_json,state_json FROM execution_assemblers WHERE chat_id=? AND logical_key=?",
+                               (normalized, logical_key)).fetchone()
+            state = self._json_dict(row["state_json"]) if row else {"fragments": {}, "segments": {}, "ordered": [], "pending_gap": False}
+            if row and self._json_dict(row["scope_json"]) != scope:
+                self._record_execution_conflict(conn, normalized, logical_key, fragment_id, "ASSEMBLER_SCOPE_CONFLICT", {"scope": scope})
+                return {"accepted": False, "conflict": True, **state}
+            private_fragment = bool(state.get("private_reasoning")) or incoming_private
+            if private_fragment and not bool(state.get("private_reasoning")):
+                state["segments"] = {key: "\0" * len(value) for key, value in state.get("segments", {}).items()}
+                state["ordered"] = [dict(part, text="\0" * len(str(part.get("text") or ""))) for part in state.get("ordered", [])]
+                state["assembled"] = "\0" * len(str(state.get("assembled") or ""))
+            state["private_reasoning"] = private_fragment
+            stored_text = ("\0" * len(text)) if private_fragment else text
+            if private_fragment:
+                safe_seed = dict(projection_seed) if isinstance(projection_seed, dict) else {}
+                safe_seed.update({"private_reasoning": True, "detail_text": "", "raw_text": "", "text": "",
+                                  "source_detail": {}, "source_detail_history": [], "diagnostic_history": []})
+                projection_seed = safe_seed
+            prior = state["fragments"].get(fragment_id) if fragment_id else None
+            if prior:
+                if prior != signature:
+                    self._record_execution_conflict(conn, normalized, logical_key, fragment_id, "FRAGMENT_ID_CONFLICT",
+                                                    {"offset": offset, "text": "<redacted>" if private_fragment else text})
+                    return {"accepted": False, "conflict": True, **state}
+                projection = conn.execute(
+                    "SELECT payload_json FROM execution_steps WHERE chat_id=? AND logical_key=?",
+                    (normalized, logical_key),
+                ).fetchone()
+                payload = self._json_dict(projection["payload_json"]) if projection else {}
+                if projection is not None and isinstance(projection_seed, dict) and projection_seed:
+                    for field in ("event_type", "display_kind", "list_text", "detail_text", "private_reasoning",
+                                  "source_kind", "source_detail", "source_detail_history", "diagnostic_history",
+                                  "raw_text", "text", "operation_kind", "kimi_summary"):
+                        if field in projection_seed:
+                            payload[field] = projection_seed[field]
+                    payload["projection_ready"] = True
+                    conn.execute(
+                        """UPDATE execution_steps SET event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                           WHERE chat_id=? AND logical_key=?""",
+                        (str(payload.get("event_type") or ""), str(payload.get("display_kind") or ""),
+                         str(payload.get("list_text") or ""), str(payload.get("detail_text") or ""),
+                        json.dumps(payload, ensure_ascii=False), normalized, logical_key),
+                    )
+                conn.execute(
+                    """INSERT INTO execution_assemblers(chat_id,logical_key,scope_json,state_json,updated_at) VALUES(?,?,?,?,?)
+                       ON CONFLICT(chat_id,logical_key) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                    (normalized, logical_key, json.dumps(scope, ensure_ascii=False, sort_keys=True),
+                     json.dumps(state, ensure_ascii=False), time.time()),
+                )
+                return {"accepted": False, "replay": True, "projection": payload, **state}
+            if offset is not None:
+                for raw_offset, accepted in state["segments"].items():
+                    accepted_offset = int(raw_offset)
+                    overlap_start = max(offset, accepted_offset)
+                    overlap_end = min(offset + len(text), accepted_offset + len(accepted))
+                    if (not private_fragment and overlap_start < overlap_end
+                            and text[overlap_start-offset:overlap_end-offset] != accepted[overlap_start-accepted_offset:overlap_end-accepted_offset]):
+                        self._record_execution_conflict(conn, normalized, logical_key, fragment_id, "OFFSET_BYTES_CONFLICT", {"offset": offset, "text": text})
+                        return {"accepted": False, "conflict": True, **state}
+                same_start = state["segments"].get(str(offset))
+                if same_start is None or len(stored_text) > len(same_start):
+                    state["segments"][str(offset)] = stored_text
+            else:
+                state["ordered"].append({"id": fragment_id, "text": stored_text})
+            if fragment_id:
+                state["fragments"][fragment_id] = signature
+            if state["segments"]:
+                ordered = sorted((int(k), v) for k, v in state["segments"].items())
+                origin = int(scope.get("origin_offset", 0) or 0)
+                cursor = origin
+                assembled = ""
+                pending = False
+                for segment_offset, segment in ordered:
+                    if segment_offset > cursor:
+                        pending = True
+                        continue
+                    if segment_offset + len(segment) <= cursor:
+                        continue
+                    overlap = max(0, cursor-segment_offset)
+                    if overlap < len(segment):
+                        assembled += segment[overlap:]
+                        cursor = segment_offset + len(segment)
+                state["assembled"] = assembled
+                state["origin_offset"] = origin
+                state["pending_gap"] = pending
+            else:
+                state["assembled"] = "".join(part["text"] for part in state["ordered"])
+            conn.execute(
+                """INSERT INTO execution_assemblers(chat_id,logical_key,scope_json,state_json,updated_at) VALUES(?,?,?,?,?)
+                   ON CONFLICT(chat_id,logical_key) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                (normalized, logical_key, json.dumps(scope, ensure_ascii=False, sort_keys=True), json.dumps(state, ensure_ascii=False), time.time()),
+            )
+            projection = conn.execute(
+                "SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? AND logical_key=?",
+                (normalized, logical_key),
+            ).fetchone()
+            now = time.time()
+            if projection is None:
+                next_row = conn.execute("SELECT COALESCE(MAX(step_index),-1)+1 n FROM execution_steps WHERE chat_id=?", (normalized,)).fetchone()
+                step_index = int(next_row["n"] or 0)
+                stable_id = f"execution-{logical_key}"
+                seed = dict(projection_seed) if isinstance(projection_seed, dict) else {}
+                ready = bool(seed)
+                payload = {
+                    **seed,
+                    "logical_key": logical_key, "logical_scope": scope,
+                    "logical_scope_hash": logical_key, "canonical_item_id": stable_id,
+                    "event_id": stable_id, "_execution_uid": logical_key,
+                    "created_at": now, "revision": int(scope.get("revision", 0)),
+                    "provider": str(scope.get("provider") or ""), "thread_id": str(scope.get("thread_id") or ""),
+                    "session_id": str(scope.get("thread_id") or ""), "turn_id": str(scope.get("turn_id") or ""),
+                    "agent_id": str(scope.get("agent_id") or ""), "provider_event_id": str(scope.get("native_id") or ""),
+                    "item_id": str(scope.get("native_id") or ""),
+                    "event_type": str(seed.get("event_type") or "agent_message_delta"),
+                    "display_kind": str(seed.get("display_kind") or "commentary"),
+                    "list_text": str(seed.get("list_text") or "") if ready else "",
+                    "detail_text": str(seed.get("detail_text") or "") if ready else "",
+                    "projection_ready": ready, "incomplete": bool(state.get("pending_gap")),
+                }
+                conn.execute(
+                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,logical_key)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (normalized, step_index, None, payload["event_type"], payload["display_kind"], payload["list_text"],
+                     payload["detail_text"], json.dumps(payload, ensure_ascii=False), logical_key),
+                )
+            else:
+                payload = self._json_dict(projection["payload_json"])
+                if isinstance(projection_seed, dict) and projection_seed:
+                    for field in ("event_type", "display_kind", "list_text", "detail_text", "private_reasoning",
+                                  "source_kind", "source_detail", "source_detail_history", "diagnostic_history",
+                                  "raw_text", "text", "operation_kind", "kimi_summary"):
+                        if field in projection_seed:
+                            payload[field] = projection_seed[field]
+                    payload["projection_ready"] = True
+                payload["incomplete"] = bool(state.get("pending_gap"))
+                conn.execute(
+                    "UPDATE execution_steps SET detail_text=?,payload_json=? WHERE chat_id=? AND logical_key=?",
+                    (payload["detail_text"], json.dumps(payload, ensure_ascii=False), normalized, logical_key),
+                )
+        return {"accepted": True, "projection": payload, **state}
+
+    def load_execution_fragment_conflicts(self, chat_id: str, logical_key: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM execution_fragment_conflicts WHERE chat_id=? AND logical_key=? ORDER BY id",
+                                (str(chat_id or "").strip(), str(logical_key or "").strip())).fetchall()
+        return [dict(row) for row in rows]
 
     def replace_execution_steps(self, chat_id: str, steps: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
@@ -1501,6 +1788,8 @@ class ChatStore:
         out: list[dict[str, Any]] = []
         for row in rows:
             payload = self._json_dict(row["payload_json"])
+            if payload.get("projection_ready") is False:
+                continue
             payload["_store_step_index"] = int(row["step_index"])
             payload.setdefault("turn_idx", row["turn_idx"])
             payload.setdefault("event_type", str(row["event_type"] or ""))
@@ -1523,7 +1812,7 @@ class ChatStore:
         if not normalized:
             return 0, []
         params: list[Any] = [normalized]
-        where = "chat_id = ?"
+        where = "chat_id = ? AND COALESCE(json_extract(payload_json, '$.projection_ready'), 1) != 0"
         if turn_idx is not None:
             where += " AND turn_idx = ?"
             params.append(int(turn_idx))
@@ -1549,6 +1838,8 @@ class ChatStore:
         out: list[dict[str, Any]] = []
         for row in reversed(rows):
             payload = self._json_dict(row["payload_json"])
+            if payload.get("projection_ready") is False:
+                continue
             payload["_store_step_index"] = int(row["step_index"])
             payload.setdefault("turn_idx", row["turn_idx"])
             payload.setdefault("event_type", str(row["event_type"] or ""))

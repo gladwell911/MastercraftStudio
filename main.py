@@ -3,6 +3,7 @@ import copy
 import asyncio
 import base64
 import functools
+import hashlib
 import json
 import math
 import os
@@ -5750,13 +5751,6 @@ class ChatFrame(wx.Frame):
             indices = [i for i in matches.get(self._execution_merge_identity(item), []) if i not in used]
             if not indices and isinstance(item, dict) and "_store_step_index" not in item and not item.get("_execution_uid"):
                 indices = [i for i in legacy_matches.get(self._execution_legacy_key(item), []) if i not in used]
-                if not indices:
-                    provider_id = item.get("id") or item.get("event_id") or item.get("item_id")
-                    candidates = [i for i, row in enumerate(persisted) if i not in used and isinstance(row, dict)
-                                  and provider_id and provider_id == (row.get("id") or row.get("event_id") or row.get("item_id"))
-                                  and row.get("turn_idx") == item.get("turn_idx")]
-                    if len(candidates) == 1:
-                        indices = candidates
             if indices:
                 index = indices.pop(0)
                 used.add(index)
@@ -5878,6 +5872,8 @@ class ChatFrame(wx.Frame):
     def _execution_merge_identity(self, item) -> tuple:
         if not isinstance(item, dict):
             return ("value", self._normalize_execution_text_for_compare(str(item or "")))
+        if item.get("logical_key"):
+            return ("logical", item["logical_key"])
         if item.get("_execution_uid"):
             return ("uid", item["_execution_uid"])
         if "_store_step_index" in item:
@@ -6498,7 +6494,15 @@ class ChatFrame(wx.Frame):
             "source_kind": str(item.get("source_kind") or "").strip(),
             "source_detail": safe_source_detail,
             "operation_kind": str(item.get("operation_kind") or display_kind or "").strip(),
+            "private_reasoning": bool(private_reasoning),
             "created_at": time.time(),
+            "provider": str(getattr(event, "provider", "") or item.get("adapter") or "codex").strip(),
+            "provider_event_id": str(getattr(event, "event_id", "") or item.get("event_id") or item.get("eventId") or "").strip(),
+            "fragment_id": str(getattr(event, "fragment_id", "") or item.get("fragment_id") or item.get("fragmentId") or "").strip(),
+            "fragment_offset": getattr(event, "offset", None) if getattr(event, "offset", None) is not None else item.get("offset"),
+            "session_id": str(getattr(event, "session_id", "") or self._event_thread_id(event)).strip(),
+            "stream_id": str(getattr(event, "stream_id", "") or "").strip(),
+            "tool_call_id": str(getattr(event, "tool_call_id", "") or "").strip(),
         }
         if kimi_summary:
             entry["kimi_summary"] = kimi_summary
@@ -6516,6 +6520,8 @@ class ChatFrame(wx.Frame):
     def _execution_row_id(self, step_idx: int, step) -> str:
         chat_id = self._visible_execution_chat_id()
         if isinstance(step, dict):
+            if step.get("logical_key"):
+                return f"execution:{chat_id}:logical:{step['logical_key']}"
             if step.get("synthetic"):
                 return f"execution:{chat_id}:turn:{step.get('turn_idx')}:{step['synthetic']}"
             if step.get("_execution_uid"):
@@ -6672,6 +6678,14 @@ class ChatFrame(wx.Frame):
     def _execution_entries_should_dedupe(self, previous_step, next_step) -> bool:
         if not isinstance(previous_step, dict) or not isinstance(next_step, dict):
             return False
+        previous_key = str(previous_step.get("logical_key") or "")
+        next_key = str(next_step.get("logical_key") or "")
+        if previous_key or next_key:
+            return bool(previous_key and previous_key == next_key)
+        # Identity-less entries are deliberately never coalesced.  They may
+        # remain as separate legacy facts, but prose similarity is not proof
+        # that they represent one provider event.
+        return False
         previous_kind = str(previous_step.get("display_kind") or "").strip()
         next_kind = str(next_step.get("display_kind") or "").strip()
         if (
@@ -6699,9 +6713,13 @@ class ChatFrame(wx.Frame):
         title = str(entry.get("list_text") or entry.get("step") or entry.get("text") or "").strip()
         detail = str(entry.get("detail_text") or entry.get("detail") or title).strip()
         kind = str(entry.get("display_kind") or entry.get("event_type") or "info").strip() or "info"
-        event_id = str(
-            entry.get("event_id") or entry.get("id") or entry.get("_execution_uid") or ""
-        ).strip()
+        canonical_item_id = str(entry.get("canonical_item_id") or entry.get("event_id")
+                                or entry.get("id") or entry.get("_execution_uid") or "").strip()
+        mutation_body = json.dumps(
+            [canonical_item_id, str(entry.get("status") or ""), title, detail],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        event_id = "execution-mutation-" + hashlib.sha256(mutation_body.encode("utf-8")).hexdigest()
         if not event_id:
             raise ValueError("MISSING_EXECUTION_EVENT_ID")
         ts = _execution_timestamp(entry)
@@ -6709,6 +6727,7 @@ class ChatFrame(wx.Frame):
             "type": "execution_entry",
             "chat_id": str(chat_id or ""),
             "event_id": event_id,
+            "canonical_item_id": canonical_item_id,
             "kind": kind,
             "title": title,
             "detail": detail,
@@ -6729,11 +6748,77 @@ class ChatFrame(wx.Frame):
             if active_idx >= 0:
                 entry = dict(entry)
                 entry["turn_idx"] = active_idx
+        current_revision = self._safe_int(target_chat.get("revision", 1), 1)
+        supplied_revision = entry.get("revision")
+        revision = self._safe_int(supplied_revision, current_revision)
+        if supplied_revision is not None and revision != current_revision:
+            return False
+        provider = str(entry.get("provider") or ("kimi" if str(entry.get("source_kind") or "") else "codex")).strip()
+        turn_identity = entry.get("turn_id")
+        if turn_identity in (None, ""):
+            turn_identity = entry.get("turn_idx")
+        canonical_turn = "" if turn_identity is None else str(turn_identity).strip()
+        native_id = str(entry.get("tool_call_id") or entry.get("item_id") or entry.get("stream_id")
+                        or entry.get("provider_event_id") or "").strip()
+        agent_id = str(entry.get("agent_id") or "").strip()
+        if canonical_turn and native_id:
+            thread_scope = str(entry.get("session_id") or entry.get("thread_id") or "").strip()
+            if not thread_scope:
+                return False
+            scope = json.dumps([str(chat_id or "").strip(), revision, thread_scope, canonical_turn, provider, agent_id, native_id], ensure_ascii=False, separators=(",", ":"))
+            logical_key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+            logical_scope = {"chat_id": str(chat_id or "").strip(), "revision": revision,
+                             "thread_id": thread_scope, "turn_id": canonical_turn, "provider": provider,
+                             "agent_id": agent_id, "native_id": native_id}
+            entry = dict(entry, logical_key=logical_key, logical_scope=logical_scope,
+                         logical_scope_hash=logical_key, revision=revision, provider=provider,
+                         canonical_item_id=f"execution-{logical_key}")
+            stable_id = f"execution-{logical_key}"
+            entry.setdefault("event_id", stable_id)
+            entry.setdefault("_execution_uid", logical_key)
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
-        if str(entry.get("event_type") or "") == "item_completed" and str(entry.get("item_id") or "").strip():
+        logical_key = str(entry.get("logical_key") or "")
+        if logical_key:
+            for index, previous in enumerate(steps):
+                if not isinstance(previous, dict) or str(previous.get("logical_key") or "") != logical_key:
+                    continue
+                updated = dict(entry)
+                for key in ("event_id", "_execution_uid", "created_at", "ts", "execution_sequence", "revision"):
+                    if previous.get(key) not in (None, ""):
+                        updated[key] = previous[key]
+                previous_detail = str(previous.get("detail_text") or "")
+                incoming_detail = str(updated.get("detail_text") or "")
+                if previous_detail and incoming_detail and not incoming_detail.startswith(previous_detail):
+                    updated["detail_text"] = previous_detail + incoming_detail
+                for history_key in ("source_detail_history", "diagnostic_history"):
+                    combined = list(previous.get(history_key) or [])
+                    for value in list(updated.get(history_key) or []):
+                        if value not in combined:
+                            combined.append(value)
+                    if combined:
+                        updated[history_key] = combined
+                if previous.get("private_reasoning"):
+                    updated["private_reasoning"] = True
+                for keep_key in ("operation_kind", "source_detail"):
+                    if not updated.get(keep_key) and previous.get(keep_key):
+                        updated[keep_key] = copy.deepcopy(previous[keep_key])
+                if updated == previous:
+                    return False
+                steps[index] = copy.deepcopy(updated)
+                resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
+                if resolved_chat_id:
+                    if not self._persist_execution_step_or_queue(resolved_chat_id, steps[index]):
+                        steps[index] = previous
+                        return False
+                    self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[index]))
+                self._request_execution_list_sync(target_chat)
+                if save_state:
+                    self._defer_chat_state_save()
+                return True
+        if not logical_key and str(entry.get("event_type") or "") == "item_completed" and str(entry.get("item_id") or "").strip():
             compatible_indexes = []
             for index, previous in enumerate(steps):
                 if not isinstance(previous, dict):
@@ -6813,6 +6898,8 @@ class ChatFrame(wx.Frame):
                     self._defer_chat_state_save()
                 return True
         if (
+            not logical_key
+            and
             str(entry.get("event_type") or "") == "item_completed"
             and str(entry.get("source_kind") or "").startswith(("tool.", "shell.", "subagent."))
             and str(entry.get("item_id") or "").strip()
@@ -6830,11 +6917,14 @@ class ChatFrame(wx.Frame):
             # moment. Preserve explicit null/malformed remote timestamps as
             # unknown instead of silently replacing those protocol values.
             entry = dict(entry, ts=time.time())
-        entry = dict(entry, _execution_uid=uuid.uuid4().hex)
+        if not entry.get("_execution_uid"):
+            entry = dict(entry, _execution_uid=uuid.uuid4().hex)
         steps.append(copy.deepcopy(entry))
         resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
         if resolved_chat_id:
-            self._persist_execution_step_or_queue(resolved_chat_id, steps[-1])
+            if not self._persist_execution_step_or_queue(resolved_chat_id, steps[-1]):
+                steps.pop()
+                return False
         self._prune_cached_execution_steps_for_turn(target_chat, steps[-1])
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
@@ -6849,24 +6939,37 @@ class ChatFrame(wx.Frame):
             self._defer_chat_state_save()
         return True
 
-    def _persist_execution_step_or_queue(self, chat_id: str, step: dict) -> None:
+    def _persist_execution_step_or_queue(self, chat_id: str, step: dict) -> bool:
         if not getattr(self, "_chat_store_enabled", False) or getattr(self, "chat_store", None) is None:
-            return
+            return True
         if not chat_id or not isinstance(step, dict):
-            return
+            return False
+        if str(step.get("logical_key") or "").strip():
+            try:
+                self._persist_execution_step(self.chat_store, chat_id, step)
+                return True
+            except Exception:
+                return False
         if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) <= 0:
             self._persist_execution_step(self.chat_store, chat_id, step)
-            return
+            return True
         self._queue_execution_step_persist(chat_id, step)
+        return True
 
     @staticmethod
     def _persist_execution_step(store, chat_id: str, step: dict) -> None:
+        if str(step.get("logical_key") or "").strip():
+            upsert = getattr(store, "upsert_execution_step", None)
+            if not callable(upsert):
+                raise RuntimeError("EXECUTION_UPSERT_UNAVAILABLE")
+            upsert(chat_id, step)
+            return
         replace_lifecycle = getattr(store, "replace_execution_lifecycle_step", None)
         if str(step.get("event_type") or "") == "item_completed" and callable(replace_lifecycle):
             if replace_lifecycle(chat_id, step):
                 return
         update_identity = getattr(store, "update_execution_step_by_identity", None)
-        if str(step.get("item_id") or "").strip() and callable(update_identity) and update_identity(chat_id, step):
+        if (str(step.get("logical_key") or "").strip() or str(step.get("item_id") or "").strip()) and callable(update_identity) and update_identity(chat_id, step):
             return
         store.append_execution_step(chat_id, step)
 
@@ -7003,28 +7106,110 @@ class ChatFrame(wx.Frame):
         if not isinstance(event, CodexEvent):
             return
         display_kind = str(getattr(event, "display_kind", "") or "").strip()
+        if display_kind == "assistant":
+            return
         event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
         agent_id = str(event_data.get("agent_id") or event_data.get("agentId") or "").strip()
         source_kind = str(event_data.get("source_kind") or "").strip().split(".", 1)[0]
-        key = (str(chat_id or ""), self._event_turn_id(event), str(getattr(event, "item_id", "") or "").strip(), display_kind, agent_id, source_kind)
-        offset = event_data.get("offset")
+        native_id = str(getattr(event, "tool_call_id", "") or getattr(event, "item_id", "")
+                        or getattr(event, "stream_id", "") or getattr(event, "event_id", "")
+                        or event_data.get("event_id") or event_data.get("eventId") or "").strip()
+        if not native_id:
+            return
+        target_chat = self._chat_state_for_execution_steps(chat_id)
+        if not isinstance(target_chat, dict):
+            return
+        revision = self._safe_int(getattr(event, "revision", None), self._safe_int(target_chat.get("revision", 1), 1))
+        if getattr(event, "revision", None) is not None and revision != self._safe_int(target_chat.get("revision", 1), 1):
+            return
+        thread_scope = str(getattr(event, "session_id", "") or self._event_thread_id(event)).strip()
+        turn_scope = self._event_turn_id(event)
+        provider = str(getattr(event, "provider", "") or event_data.get("adapter") or "codex").replace("_server", "").strip()
+        if not thread_scope or not turn_scope:
+            return
+        scope_values = [str(chat_id or "").strip(), revision, thread_scope, turn_scope, provider, agent_id, native_id]
+        logical_key = hashlib.sha256(json.dumps(scope_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        key = (str(chat_id or ""), turn_scope, native_id, display_kind, agent_id, source_kind)
+        offset = getattr(event, "offset", None) if getattr(event, "offset", None) is not None else event_data.get("offset")
         state = self._execution_delta_buffer.setdefault(
             key,
-            {"parts": [], "event": event, "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False},
+            {"parts": [], "segments": {}, "conflicts": [], "fragment_ids": set(), "fragment_signatures": {}, "event": event,
+             "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False},
         )
         if display_kind == "thinking" and self._kimi_private_reasoning(event_data):
             state["private_reasoning"] = True
+        effective_private = bool(state.get("private_reasoning"))
+        if effective_private and not state.get("segments_redacted"):
+            state["segments"] = {key: "\0" * len(value) for key, value in state.get("segments", {}).items()}
+            state["parts"] = ["\0" * len(str(value or "")) for value in state.get("parts", [])]
+            state["segments_redacted"] = True
         fragment = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
-        start_offset = state.get("start_offset")
-        if isinstance(offset, int) and isinstance(start_offset, int):
-            existing_text = "".join(str(part or "") for part in state["parts"])
-            relative_offset = offset - start_offset
-            if 0 <= relative_offset < len(existing_text):
-                overlap = min(len(existing_text) - relative_offset, len(fragment))
-                if existing_text[relative_offset:relative_offset + overlap] == fragment[:overlap]:
-                    fragment = fragment[overlap:]
-        if fragment:
-            state["parts"].append(fragment)
+        stored_fragment = "\0" * len(fragment) if effective_private else fragment
+        fragment_id = str(getattr(event, "fragment_id", "") or event_data.get("fragment_id") or event_data.get("fragmentId") or "").strip()
+        store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
+        if store is not None and hasattr(store, "apply_execution_fragment"):
+            scope = {"chat_id": str(chat_id or "").strip(), "revision": revision, "thread_id": thread_scope,
+                     "turn_id": turn_scope, "provider": provider, "agent_id": agent_id, "native_id": native_id}
+            try:
+                projection_seed = self._build_execution_entry(event)
+                if bool(state.get("private_reasoning")) and isinstance(projection_seed, dict):
+                    projection_seed = dict(projection_seed, detail_text="", raw_text="", text="",
+                                           source_detail={}, private_reasoning=True)
+                result = store.apply_execution_fragment(str(chat_id or "").strip(), logical_key, scope,
+                                                        fragment_id=fragment_id, offset=offset, text=fragment,
+                                                        projection_seed=projection_seed)
+            except ValueError:
+                return
+            if not result.get("accepted") and not result.get("replay"):
+                return
+            state["parts"] = [str(result.get("assembled") or "")]
+            state["pending_gap"] = bool(result.get("pending_gap"))
+            state["logical_key"] = logical_key
+            state["event"] = event
+            state["last_event_at"] = time.time()
+            return
+        signature = hashlib.sha256((str(offset) + "\0" + fragment).encode("utf-8")).hexdigest()
+        if fragment_id and fragment_id in state["fragment_ids"]:
+            if state["fragment_signatures"].get(fragment_id) != signature:
+                state["conflicts"].append({"offset": offset, "fragment_id": fragment_id,
+                                           "reason": "FRAGMENT_ID_CONFLICT"})
+            return
+        if isinstance(offset, int):
+            segments = state["segments"]
+            for accepted_offset, accepted in segments.items():
+                overlap_start = max(offset, accepted_offset)
+                overlap_end = min(offset + len(fragment), accepted_offset + len(accepted))
+                if overlap_start < overlap_end:
+                    incoming = stored_fragment[overlap_start - offset:overlap_end - offset]
+                    existing = accepted[overlap_start - accepted_offset:overlap_end - accepted_offset]
+                    if not effective_private and incoming != existing:
+                        state["conflicts"].append({"offset": offset, "fragment_id": fragment_id})
+                        return
+            same_start = segments.get(offset)
+            if same_start is None or len(stored_fragment) > len(same_start):
+                segments[offset] = stored_fragment
+            origin = self._safe_int(event_data.get("origin_offset", 0), 0)
+            cursor = origin
+            assembled = ""
+            pending_gap = False
+            for segment_offset, segment in sorted(segments.items()):
+                if segment_offset > cursor:
+                    pending_gap = True
+                    continue
+                if segment_offset + len(segment) <= cursor:
+                    continue
+                overlap = max(0, cursor - segment_offset)
+                if overlap < len(segment):
+                    assembled += segment[overlap:]
+                    cursor = segment_offset + len(segment)
+            state["origin_offset"] = origin
+            state["pending_gap"] = pending_gap
+            state["parts"] = [assembled] if assembled else []
+        elif stored_fragment:
+            state["parts"].append(stored_fragment)
+        if fragment_id:
+            state["fragment_ids"].add(fragment_id)
+            state["fragment_signatures"][fragment_id] = signature
         state["event"] = event
         state["last_event_at"] = time.time()
 
@@ -7087,9 +7272,12 @@ class ChatFrame(wx.Frame):
                 continue
             if normalized_display_kind is not None and buf_display_kind != normalized_display_kind:
                 continue
-            state = self._execution_delta_buffer.pop(key, None)
+            state = self._execution_delta_buffer.get(key)
             if not isinstance(state, dict):
                 continue
+            if bool(state.get("pending_gap")):
+                continue
+            self._execution_delta_buffer.pop(key, None)
             text = "".join(str(part or "") for part in (state.get("parts") or []))
             base_event = state.get("event")
             if not text.strip() or not isinstance(base_event, CodexEvent):
@@ -7104,7 +7292,7 @@ class ChatFrame(wx.Frame):
                 type="agent_message_delta",
                 thread_id=self._event_thread_id(base_event),
                 turn_id=self._event_turn_id(base_event),
-                item_id=str(getattr(base_event, "item_id", "") or "").strip(),
+                item_id=str(getattr(base_event, "item_id", "") or buf_item_id or "").strip(),
                 text=text,
                 raw_text=text,
                 phase=str(getattr(base_event, "phase", "") or "").strip(),
@@ -7112,6 +7300,14 @@ class ChatFrame(wx.Frame):
                 subtype=str(getattr(base_event, "subtype", "") or "").strip() or "agentMessageDelta",
                 display_kind=buf_display_kind or "commentary",
                 data=base_data,
+                provider=str(getattr(base_event, "provider", "") or "codex"),
+                event_id=str(getattr(base_event, "event_id", "") or buf_item_id),
+                fragment_id=str(getattr(base_event, "fragment_id", "") or ""),
+                offset=getattr(base_event, "offset", None),
+                session_id=str(getattr(base_event, "session_id", "") or self._event_thread_id(base_event)),
+                stream_id=str(getattr(base_event, "stream_id", "") or buf_item_id),
+                tool_call_id=str(getattr(base_event, "tool_call_id", "") or ""),
+                revision=getattr(base_event, "revision", None),
             )
             entry = self._build_execution_entry(merged_event)
             if entry and self._append_execution_entry_to_chat(chat_id, entry, save_state=False):
