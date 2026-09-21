@@ -104,7 +104,8 @@ from speech_input import MODE_DIRECT, MODE_OPTIMIZE, VoiceInputController
 from zdsr_tts import ZDSRTTSClient
 
 REQUESTING_TEXT = "正在请求..."
-EMPTY_CURRENT_CHAT_TITLE = "心聊天"
+LEGACY_EMPTY_CURRENT_CHAT_TITLE = "心聊天"
+EMPTY_CURRENT_CHAT_TITLE = "新聊天"
 APP_STATE_FILE = "app_state.json"
 APP_WINDOW_TITLE = "神匠工坊"
 MAX_RECOVERY_ATTEMPTS = 3
@@ -3855,6 +3856,12 @@ class ChatFrame(wx.Frame):
     @staticmethod
     def _is_default_chat_title(title: str) -> bool:
         text = str(title or "").strip()
+        if text in {EMPTY_CURRENT_CHAT_TITLE, LEGACY_EMPTY_CURRENT_CHAT_TITLE}:
+            return True
+        if re.fullmatch(rf"{re.escape(EMPTY_CURRENT_CHAT_TITLE)}\d+", text):
+            return True
+        if re.fullmatch(rf"{re.escape(LEGACY_EMPTY_CURRENT_CHAT_TITLE)}\d+", text):
+            return True
         return (
             text == "新聊天"
             or text == EMPTY_CURRENT_CHAT_TITLE
@@ -3872,6 +3879,17 @@ class ChatFrame(wx.Frame):
         current_title = str((self._current_chat_state or {}).get("title") or "").strip()
         if current_title and current_id != excluded:
             existing_titles.add(current_title)
+        store = getattr(self, "chat_store", None)
+        list_summaries = getattr(store, "list_chat_summaries", None)
+        if bool(getattr(self, "_chat_store_enabled", False)) and not callable(list_summaries):
+            raise RuntimeError("Live chat titles cannot be enumerated authoritatively")
+        if bool(getattr(self, "_chat_store_enabled", False)):
+            for chat in list_summaries():
+                if not isinstance(chat, dict) or str(chat.get("id") or "").strip() == excluded:
+                    continue
+                durable_title = str(chat.get("title") or "").strip()
+                if durable_title:
+                    existing_titles.add(durable_title)
         return {title for title in existing_titles if title}
 
     def _unique_chat_title(self, title: str, *, exclude_chat_id: str = "") -> str:
@@ -3946,7 +3964,9 @@ class ChatFrame(wx.Frame):
                 return compact or title
         return ""
 
-    def _apply_generated_first_question_title(self, chat_id: str, question: str, title: str) -> None:
+    def _apply_generated_first_question_title(
+        self, chat_id: str, question: str, title: str, expected_title_revision: int
+    ) -> None:
         resolved_chat_id = str(chat_id or "").strip()
         if not resolved_chat_id or not title:
             return
@@ -3956,17 +3976,65 @@ class ChatFrame(wx.Frame):
             chat = self._find_archived_chat(resolved_chat_id)
         if not isinstance(chat, dict):
             return
+        try:
+            expected_revision = int(expected_title_revision)
+            current_revision = int(chat.get("title_revision"))
+        except (TypeError, ValueError):
+            return
+        if current_revision != expected_revision:
+            return
         if bool(chat.get("title_manual")) or str(chat.get("title_source") or "").strip() == "manual":
             return
         current_title = str(chat.get("title") or "").strip()
         current_source = str(chat.get("title_source") or "").strip()
-        if (not self._is_default_chat_title(current_title)) and current_source != "auto":
+        if not self._is_default_chat_title(current_title) or current_source not in {"", "default"}:
             return
         if not self._compact_first_question_title(question, 120):
             return
+        title_fields = (
+            "title", "title_manual", "title_source", "title_updated_at", "title_revision",
+            "first_question_auto_title_scheduled",
+        )
+        missing = object()
+        before_title = {key: chat.get(key, missing) for key in title_fields}
         self._bump_chat_title_revision(chat, "auto", title=self._unique_chat_title(title, exclude_chat_id=resolved_chat_id))
-        self._defer_chat_state_save()
-        self._refresh_history(resolved_chat_id)
+        store = getattr(self, "chat_store", None)
+        persisted = self._slim_active_chat_state() if chat is self._current_chat_state else chat
+
+        def rollback_generated_title() -> None:
+            for key, value in before_title.items():
+                if value is missing:
+                    chat.pop(key, None)
+                else:
+                    chat[key] = value
+            chat["first_question_auto_title_scheduled"] = False
+
+        try:
+            if (
+                not bool(getattr(self, "_chat_store_enabled", False))
+                or not callable(getattr(store, "upsert_chat", None))
+                or not callable(getattr(store, "load_chat", None))
+            ):
+                raise RuntimeError("Generated title cannot be durably committed")
+            store.upsert_chat(persisted)
+            committed = store.load_chat(resolved_chat_id, include_execution_steps=False)
+            if (
+                not isinstance(committed, dict)
+                or str(committed.get("id") or "").strip() != resolved_chat_id
+                or str(committed.get("title") or "").strip() != str(chat.get("title") or "").strip()
+                or str(committed.get("title_source") or "").strip() != "auto"
+                or int(committed.get("title_revision") or 0) != int(chat.get("title_revision") or 0)
+            ):
+                raise RuntimeError("Generated title durable commit could not be confirmed")
+        except Exception:
+            rollback_generated_title()
+            try:
+                if callable(getattr(store, "upsert_chat", None)):
+                    store.upsert_chat(self._slim_active_chat_state() if chat is self._current_chat_state else chat)
+            except Exception:
+                pass
+            return
+        self._upsert_history_row(resolved_chat_id)
         self._push_remote_history_changed(resolved_chat_id)
 
     def _schedule_first_question_auto_title(self, chat_id: str, question: str) -> None:
@@ -3984,34 +4052,36 @@ class ChatFrame(wx.Frame):
             return
         if not self._is_default_chat_title(str(chat.get("title") or "")):
             return
+        expected_title_revision = int(chat.get("title_revision") or 0)
         command_title = self._cd_command_title(normalized_question)
         if command_title:
             self._apply_generated_first_question_title(
                 resolved_chat_id,
                 normalized_question,
                 command_title,
+                expected_title_revision,
             )
             return
-        immediate_title = self._compact_first_question_title(normalized_question, 12)
-        if immediate_title:
-            self._apply_generated_first_question_title(
-                resolved_chat_id,
-                normalized_question,
-                immediate_title,
-            )
         if chat.get("first_question_auto_title_scheduled"):
             return
         chat["first_question_auto_title_scheduled"] = True
 
+        def _reset_schedule() -> None:
+            target = self._current_chat_state if resolved_chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(resolved_chat_id)
+            if isinstance(target, dict) and int(target.get("title_revision") or 0) == expected_title_revision:
+                target["first_question_auto_title_scheduled"] = False
+
         def _worker() -> None:
             title = self._generate_first_question_title(normalized_question)
             if not title:
+                wx_call_after_if_alive(_reset_schedule)
                 return
             wx_call_after_if_alive(
                 self._apply_generated_first_question_title,
                 resolved_chat_id,
                 normalized_question,
                 title,
+                expected_title_revision,
             )
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -16020,6 +16090,8 @@ class ChatFrame(wx.Frame):
             return False, str(exc)
         self._mark_chat_turns_dirty(owner_id, turn_idx)
         self._defer_chat_state_save()
+        if turn_idx == 0:
+            self._schedule_first_question_auto_title(owner_id, text)
         return True, ""
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
@@ -16068,6 +16140,8 @@ class ChatFrame(wx.Frame):
                 if threading.current_thread() is threading.main_thread():
                     self.model_combo.SetValue(model_display_name(resolved_model))
                 self._defer_chat_state_save()
+                if not any(str((item or {}).get("question") or "").strip() for item in self.active_session_turns):
+                    self._schedule_first_question_auto_title(submit_owner, q)
                 self.input_edit.SetValue("")
                 self.input_edit.SetFocus()
                 return True, ""
@@ -16140,8 +16214,6 @@ class ChatFrame(wx.Frame):
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
-            if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             self._mark_turn_request_pending(turn, resolved_model, command_name)
             self.is_running = True
             self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
@@ -16172,6 +16244,8 @@ class ChatFrame(wx.Frame):
                         raise RuntimeError("Provider rejected submission")
                 except Exception as exc:
                     return rollback_rejected_start(turn_idx, exc)
+            if turn_idx == 0:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             return True, ""
         kimi_local_command = self._parse_kimi_local_command(q) if is_kimi_model(resolved_model) and not outgoing_attachments else None
         if kimi_local_command:
@@ -16194,8 +16268,6 @@ class ChatFrame(wx.Frame):
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
-            if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             self._mark_turn_request_pending(turn, resolved_model, command_name)
             self.is_running = True
             self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
@@ -16226,6 +16298,8 @@ class ChatFrame(wx.Frame):
                         raise RuntimeError("Provider rejected submission")
                 except Exception as exc:
                     return rollback_rejected_start(turn_idx, exc)
+            if turn_idx == 0:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             return True, ""
         if (not success_attachments) and (not q):
             now = time.time()
@@ -16277,8 +16351,6 @@ class ChatFrame(wx.Frame):
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
             self._current_chat_state["updated_at"] = now
-            if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             self._mark_turn_request_pending(turn, resolved_model, worker_question)
             self.is_running = True
             self.input_edit.SetValue("")
@@ -16297,6 +16369,8 @@ class ChatFrame(wx.Frame):
                 args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id, openclaw_session_id),
                 daemon=True,
             ).start()
+            if self.active_turn_idx == 0:
+                self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             return True, ""
 
         turn_idx = len(self.active_session_turns)
@@ -16320,8 +16394,6 @@ class ChatFrame(wx.Frame):
         self._reset_answer_visible_row_limit()
         self._reset_current_turn_execution_view()
         self._current_chat_state["updated_at"] = now
-        if len([item for item in self.active_session_turns if str((item or {}).get("question") or "").strip()]) == 1:
-            self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
         self._mark_turn_request_pending(turn, resolved_model, worker_question)
         if is_claudecode_model(resolved_model):
             self.active_claudecode_session_id = str(self.active_claudecode_session_id or "").strip()
@@ -16366,6 +16438,8 @@ class ChatFrame(wx.Frame):
                 raise RuntimeError("Provider rejected submission")
         except Exception as exc:
             return rollback_rejected_start(turn_idx, exc)
+        if turn_idx == 0:
+            self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
         if automatic_clear_resend and (is_codex_model(resolved_model) or is_kimi_model(resolved_model)):
             self._play_clear_resend_accepted_sound(
                 str(self._clear_resend_operation_id),
@@ -17304,9 +17378,68 @@ class ChatFrame(wx.Frame):
         self.SetStatusText(f"已载入项目：{folder_name}")
 
     def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False):
-        previous_codex_service_tier = self._current_codex_service_tier()
         manual_title = str(title or "").strip()
         manual = bool(title_manual and manual_title)
+        store = getattr(self, "chat_store", None)
+        required_store_methods = ("list_chat_summaries", "upsert_chat", "load_chat", "delete_chat")
+        if not bool(getattr(self, "_chat_store_enabled", False)) or store is None or any(
+            not callable(getattr(store, name, None)) for name in required_store_methods
+        ):
+            return False
+        restore_keys = [
+            key for key in self.__dict__
+            if key.startswith("active_") or key in {
+                "current_chat_id", "selected_model", "view_mode", "view_history_id",
+                "_pending_context_usage_by_turn",
+                "_active_claudecode_client", "_chat_state_flush_dirty", "_history_list_dirty",
+                "_pending_history_keep_id", "_openclaw_lifecycle_dirty",
+            }
+            if key != "active_session_turns"
+        ]
+        original_turns = self.active_session_turns
+        original_current_state = self._current_chat_state
+        original_current_contents = dict(original_current_state)
+        original_archived = self.archived_chats
+        original_archived_entries = list(original_archived)
+        original_archived_contents = [dict(item) if isinstance(item, dict) else item for item in original_archived_entries]
+        snapshot = {}
+        for key in restore_keys:
+            value = getattr(self, key)
+            snapshot[key] = value if isinstance(value, (dict, list, set, tuple)) else copy.deepcopy(value)
+        input_value = self.input_edit.GetValue()
+        focused_control = wx.Window.FindFocus()
+        model_value = self.model_combo.GetValue()
+        try:
+            allocated_title = self._unique_chat_title(manual_title) if manual else self._next_default_chat_title()
+        except Exception:
+            return False
+
+        def rollback_new_chat(new_chat_id: str = "") -> bool:
+            if new_chat_id:
+                try:
+                    store.delete_chat(new_chat_id)
+                except Exception:
+                    pass
+            for key, value in snapshot.items():
+                setattr(self, key, value)
+            original_current_state.clear()
+            original_current_state.update(original_current_contents)
+            for item, contents in zip(original_archived_entries, original_archived_contents):
+                if isinstance(item, dict) and isinstance(contents, dict):
+                    item.clear()
+                    item.update(contents)
+            original_archived[:] = original_archived_entries
+            self.active_session_turns = original_turns
+            self._current_chat_state = original_current_state
+            self._current_chat_state["turns"] = original_turns
+            self.archived_chats = original_archived
+            self.input_edit.ChangeValue(input_value)
+            self.model_combo.SetValue(model_value)
+            if focused_control is not None:
+                focused_control.SetFocus()
+            return False
+
+        previous_codex_service_tier = self._current_codex_service_tier()
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
@@ -17325,7 +17458,7 @@ class ChatFrame(wx.Frame):
         now = time.time()
         self._current_chat_state = {
             "id": "",
-            "title": self._unique_chat_title(manual_title) if manual else self._next_default_chat_title(),
+            "title": allocated_title,
             "title_manual": manual,
             "title_source": "manual" if manual else "default",
             "title_updated_at": now,
@@ -17351,13 +17484,34 @@ class ChatFrame(wx.Frame):
         self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         if is_openclaw_model(self.selected_model):
             self._openclaw_session_id_for_active_chat()
-        self._mark_history_list_dirty(archived["id"] if archived else None)
+        try:
+            store.upsert_chat(self._slim_active_chat_state())
+            committed = store.load_chat(self.active_chat_id, include_execution_steps=False)
+            if (
+                not isinstance(committed, dict)
+                or str(committed.get("id") or "").strip() != self.active_chat_id
+                or str(committed.get("title") or "").strip() != str(self._current_chat_state.get("title") or "").strip()
+                or not str(committed.get("model") or "").strip()
+                or str(committed.get("model") or "").strip() != model
+                or str(committed.get("title_source") or "").strip() != str(self._current_chat_state.get("title_source") or "").strip()
+                or bool(committed.get("title_manual")) != bool(self._current_chat_state.get("title_manual"))
+                or int(committed.get("title_revision") or 0) != int(self._current_chat_state.get("title_revision") or 0)
+                or float(committed.get("title_updated_at") or 0) != float(self._current_chat_state.get("title_updated_at") or 0)
+                or float(committed.get("created_at") or 0) != float(self._current_chat_state.get("created_at") or 0)
+                or list(committed.get("turns") or [])
+            ):
+                return rollback_new_chat(self.active_chat_id)
+        except Exception:
+            return rollback_new_chat(self.active_chat_id)
+        self._upsert_history_row(self.active_chat_id)
+        self._select_history_row_if_present(self.active_chat_id)
         self._render_answer_list()
         self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
         self._defer_chat_state_save()
         self._mark_openclaw_lifecycle_dirty()
         self._push_remote_history_changed(self.active_chat_id)
+        return True
 
     def _on_answer_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -20044,10 +20198,19 @@ class ChatFrame(wx.Frame):
         if d.ShowModal() == wx.ID_OK:
             name = d.get_value()
             if name:
-                c["title"] = name
-                c["title_manual"] = True
-                self._save_state()
-                self._refresh_history(c.get("id"))
+                before = copy.deepcopy(c)
+                self._bump_chat_title_revision(c, "manual", title=name)
+                store = getattr(self, "chat_store", None)
+                try:
+                    if not bool(getattr(self, "_chat_store_enabled", False)) or not callable(getattr(store, "upsert_chat", None)):
+                        raise RuntimeError("Manual title cannot be durably committed")
+                    store.upsert_chat(self._slim_active_chat_state() if c is self._current_chat_state else c)
+                except Exception:
+                    c.clear()
+                    c.update(before)
+                    d.Destroy()
+                    return
+                self._upsert_history_row(c.get("id"))
                 self._push_remote_history_changed(c.get("id"))
         d.Destroy()
 

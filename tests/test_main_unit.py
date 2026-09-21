@@ -3575,7 +3575,7 @@ def test_new_chat_allowed_while_waiting_for_reply(frame, monkeypatch):
     assert seen["status"] == "已开始新聊天"
 
 
-def test_new_chat_schedules_history_refresh_with_placeholder_title(frame, monkeypatch):
+def test_new_chat_projects_selected_placeholder_row_immediately(frame, monkeypatch):
     frame.active_chat_id = ""
     frame.current_chat_id = ""
     frame.active_session_turns = []
@@ -3584,11 +3584,10 @@ def test_new_chat_schedules_history_refresh_with_placeholder_title(frame, monkey
 
     frame._on_new_chat_clicked(None)
 
-    assert list(frame.history_list.GetStrings()) == []
-    assert frame._history_list_dirty is True
-    monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: False)
-    frame._flush_idle_ui_refreshes()
-    assert list(frame.history_list.GetStrings()) == ["心聊天"]
+    assert list(frame.history_list.GetStrings()) == [main.EMPTY_CURRENT_CHAT_TITLE]
+    assert frame.history_ids == [frame.active_chat_id]
+    assert frame.history_list.GetSelection() == 0
+    assert frame.input_edit.HasFocus()
 
 
 def test_new_chat_initializes_detail_panel_defaults(frame):
@@ -3604,7 +3603,77 @@ def test_new_chat_initializes_detail_panel_defaults(frame):
     assert frame._current_chat_state["execution_steps"] == []
 
 
-def test_new_chat_defers_heavy_history_refresh_and_state_save(frame, monkeypatch):
+def test_new_chat_returns_with_confirmed_durable_zero_turn_owner(frame, tmp_path):
+    frame.chat_store = main.ChatStore(tmp_path / "immediate-new-chat.db")
+    frame.chat_store.initialize()
+    frame._chat_store_enabled = True
+    frame.active_chat_id = ""
+    frame.current_chat_id = ""
+    frame.active_session_turns = []
+    frame.archived_chats = []
+    frame._current_chat_state = {}
+    frame.selected_model = "kimi/main"
+    frame.model_combo.SetValue(main.model_display_name("kimi/main"))
+
+    frame._on_new_chat_clicked(None)
+
+    loaded = frame.chat_store.load_chat(frame.active_chat_id)
+    assert loaded is not None
+    assert loaded["title"] == main.EMPTY_CURRENT_CHAT_TITLE
+    assert loaded["model"] == "kimi/main"
+    assert loaded["title_revision"] == 1
+    assert loaded["turns"] == []
+    assert frame.history_ids[frame.history_list.GetSelection()] == frame.active_chat_id
+    assert frame.input_edit.HasFocus()
+
+
+def test_new_chat_commit_precedes_projection_and_failure_restores_owner(frame, monkeypatch):
+    old_id = frame.active_chat_id
+    old_state = copy.deepcopy(frame._current_chat_state)
+    events = []
+    real_upsert = frame.chat_store.upsert_chat
+    real_load = frame.chat_store.load_chat
+    monkeypatch.setattr(frame.chat_store, "upsert_chat", lambda chat: (events.append("commit"), real_upsert(chat))[1])
+    monkeypatch.setattr(frame, "_upsert_history_row", lambda *_args, **_kwargs: events.append("project") or True)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: events.append("publish"))
+
+    assert frame._on_new_chat_clicked(None) is True
+    assert events.index("commit") < events.index("project") < events.index("publish")
+
+    created_id = frame.active_chat_id
+    turns_ref = frame.active_session_turns
+    live_turn = {"question": "pending", "answer_md": main.REQUESTING_TEXT, "model": "kimi/main"}
+    turns_ref.append(live_turn)
+    state_ref = frame._current_chat_state
+    state_ref["turns"] = turns_ref
+    execution_ref = []
+    state_ref["execution_steps"] = execution_ref
+    pending_ref = [{"prompt": "pending"}]
+    frame.active_codex_request_queue = pending_ref
+    archived_ref = frame.archived_chats
+    archived_entry_refs = list(frame.archived_chats)
+    archived_turn_refs = [entry.get("turns") for entry in archived_entry_refs]
+    monkeypatch.setattr(frame.chat_store, "load_chat", lambda *_args, **_kwargs: None)
+    assert frame._on_new_chat_clicked(None) is False
+    assert frame.active_chat_id == created_id
+    assert frame.active_session_turns is turns_ref
+    assert frame._current_chat_state is state_ref
+    assert frame._current_chat_state["turns"] is frame.active_session_turns
+    assert frame._current_chat_state["execution_steps"] is execution_ref
+    assert frame.active_codex_request_queue is pending_ref
+    assert frame.archived_chats is archived_ref
+    assert all(actual is expected for actual, expected in zip(frame.archived_chats, archived_entry_refs))
+    assert all(entry.get("turns") is expected for entry, expected in zip(frame.archived_chats, archived_turn_refs))
+    live_turn["answer_md"] = "callback completed"
+    assert frame.active_session_turns[0] is live_turn
+    assert frame._current_chat_state["turns"][0]["answer_md"] == "callback completed"
+    frame.chat_store.replace_turns(created_id, frame.active_session_turns)
+    assert real_load(created_id)["turns"][0]["answer_md"] == "callback completed"
+    state_ref["callback_result"] = "completed"
+    assert frame._current_chat_state["callback_result"] == "completed"
+
+
+def test_new_chat_uses_incremental_history_projection_and_deferred_full_save(frame, monkeypatch):
     frame.active_chat_id = "chat-old"
     frame.current_chat_id = "chat-old"
     frame.active_session_turns = [
@@ -3631,8 +3700,8 @@ def test_new_chat_defers_heavy_history_refresh_and_state_save(frame, monkeypatch
     assert frame.active_chat_id and frame.active_chat_id != "chat-old"
     assert frame.active_session_turns == []
     assert [chat.get("id") for chat in frame.archived_chats] == ["chat-old"]
-    assert frame._history_list_dirty is True
-    assert frame._pending_history_keep_id == "chat-old"
+    assert frame._history_list_dirty is False
+    assert frame.history_ids[frame.history_list.GetSelection()] == frame.active_chat_id
     assert frame._openclaw_lifecycle_dirty is True
     assert any(delay == main.IDLE_UI_REFRESH_DELAY_MS and fn == frame._flush_idle_ui_refreshes for delay, fn, _args in delayed)
     assert frame._chat_state_flush_dirty is True
@@ -13278,7 +13347,7 @@ def test_load_chat_as_current_avoids_deepcopying_turns_when_chat_store_enabled(f
     assert frame._current_chat_state["turns"] is frame.active_session_turns
 
 
-def test_submit_question_sets_auto_title_from_first_question(frame, monkeypatch):
+def test_submit_question_schedules_revision_fenced_title_generation(frame, monkeypatch):
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
     monkeypatch.setattr(frame, "_save_state", lambda: None)
@@ -13300,8 +13369,30 @@ def test_submit_question_sets_auto_title_from_first_question(frame, monkeypatch)
 
     assert ok is True
     assert message == ""
-    assert frame._current_chat_state["title"] == "自动化测试"
-    assert frame._current_chat_state["title_source"] == "auto"
+    assert frame._is_default_chat_title(frame._current_chat_state["title"])
+    assert frame._current_chat_state.get("first_question_auto_title_scheduled") is True
+
+
+def test_provider_rejection_does_not_schedule_title_and_accepted_retry_does(frame, monkeypatch):
+    frame.active_session_turns = []
+    frame._current_chat_state.update(
+        {"id": frame.active_chat_id, "title": "新聊天", "title_source": "default", "title_revision": 1,
+         "turns": frame.active_session_turns}
+    )
+    scheduled = []
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args: scheduled.append(args))
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: False)
+
+    ok, _ = frame._submit_question("retry title", model=main.DEFAULT_CODEX_MODEL)
+    assert ok is False
+    assert scheduled == []
+    assert frame._current_chat_state["title"] == "新聊天"
+
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: True)
+    assert frame._submit_question("retry title", model=main.DEFAULT_CODEX_MODEL) == (True, "")
+    assert len(scheduled) == 1
 
 
 def test_submit_question_continues_when_chat_title_rules_are_missing(frame, monkeypatch, tmp_path):
@@ -13334,7 +13425,7 @@ def test_submit_question_continues_when_chat_title_rules_are_missing(frame, monk
     assert frame.active_session_turns[0]["request_status"] == "pending"
 
 
-def test_submit_question_renames_placeholder_history_chat_immediately(frame, monkeypatch):
+def test_submit_question_keeps_placeholder_until_generated_title_arrives(frame, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
     monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
@@ -13356,24 +13447,24 @@ def test_submit_question_renames_placeholder_history_chat_immediately(frame, mon
     monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
 
     frame._on_new_chat_clicked(None)
-    assert list(frame.history_list.GetStrings()) == ["心聊天"]
+    assert list(frame.history_list.GetStrings()) == [main.EMPTY_CURRENT_CHAT_TITLE]
 
     ok, message = frame._submit_question("帮我整理安卓自动化测试方案", source="local", model="openai/gpt-5.2")
 
     assert ok is True
     assert message == ""
     items = list(frame.history_list.GetStrings())
-    assert items == ["自动化测试"]
+    assert items == [main.EMPTY_CURRENT_CHAT_TITLE]
 
 
 def test_next_default_chat_title_uses_xinliaotian_sequence(frame):
     frame.archived_chats = [
-        {"id": "chat-a", "title": "心聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0},
-        {"id": "chat-b", "title": "心聊天1", "turns": [], "created_at": 2.0, "updated_at": 2.0},
+        {"id": "chat-a", "title": "新聊天", "turns": [], "created_at": 1.0, "updated_at": 1.0},
+        {"id": "chat-b", "title": "新聊天1", "turns": [], "created_at": 2.0, "updated_at": 2.0},
     ]
     frame._current_chat_state["title"] = "别的标题"
 
-    assert frame._next_default_chat_title() == "心聊天2"
+    assert frame._next_default_chat_title() == "新聊天2"
 
 
 def test_next_default_chat_title_treats_legacy_placeholder_as_default(frame):
@@ -13382,7 +13473,7 @@ def test_next_default_chat_title_treats_legacy_placeholder_as_default(frame):
         {"id": "chat-b", "title": "心聊天1", "turns": [], "created_at": 2.0, "updated_at": 2.0},
     ]
 
-    assert frame._next_default_chat_title() == "心聊天2"
+    assert frame._next_default_chat_title() == "新聊天1"
 
 
 def test_refresh_history_normalizes_legacy_placeholder_title(frame):
@@ -13392,7 +13483,7 @@ def test_refresh_history_normalizes_legacy_placeholder_title(frame):
 
     frame._refresh_history()
 
-    assert list(frame.history_list.GetStrings()) == ["心聊天"]
+    assert list(frame.history_list.GetStrings()) == [main.EMPTY_CURRENT_CHAT_TITLE]
 
 
 def test_refresh_history_deduplicates_normalized_ids_with_current_first(frame):
@@ -13596,7 +13687,7 @@ def test_generate_first_question_title_retries_three_times_then_keeps_default(fr
 
     title = frame._generate_first_question_title("帮我整理安卓自动化测试方案")
 
-    assert title == "自动化测试"
+    assert title == ""
     assert seen["calls"] == 3
 
 
@@ -13621,13 +13712,144 @@ def test_apply_generated_first_question_title_accepts_legacy_default_title(frame
     monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: deferred.append(True))
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda chat_id="": pushed.append(chat_id))
 
-    frame._apply_generated_first_question_title("chat-current", "帮我整理安卓自动化测试方案", "自动化测试")
+    frame._apply_generated_first_question_title("chat-current", "帮我整理安卓自动化测试方案", "自动化测试", 1)
 
     assert frame._current_chat_state["title"] == "自动化测试"
     assert frame._current_chat_state["title_source"] == "auto"
     assert saved == []
-    assert deferred == [True]
+    assert deferred == []
     assert pushed == ["chat-current"]
+
+
+def test_generated_first_question_title_rejects_stale_revision_without_ui_mutation(frame, monkeypatch):
+    frame.active_chat_id = "chat-current"
+    frame.current_chat_id = "chat-current"
+    frame._current_chat_state.update(
+        {
+            "id": "chat-current",
+            "title": "manual title",
+            "title_manual": True,
+            "title_source": "manual",
+            "title_revision": 2,
+        }
+    )
+    monkeypatch.setattr(frame, "_upsert_history_row", lambda *_args, **_kwargs: pytest.fail("stale callback repainted"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: pytest.fail("stale callback published"))
+
+    frame._apply_generated_first_question_title(
+        "chat-current", "first question", "generated title", expected_title_revision=1
+    )
+
+    assert frame._current_chat_state["title"] == "manual title"
+    assert frame._current_chat_state["title_revision"] == 2
+
+
+def test_generated_title_updates_offscreen_owner_without_moving_visible_selection(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state.update({"id": "chat-a", "title": "A", "title_revision": 1})
+    owner_b = {
+        "id": "chat-b", "title": "新聊天", "title_manual": False, "title_source": "default",
+        "title_revision": 1, "title_updated_at": 1.0, "created_at": 1.0, "updated_at": 1.0,
+        "model": "codex/main", "turns": [],
+    }
+    frame.archived_chats = [owner_b]
+    frame.chat_store.upsert_chat(owner_b)
+    frame._refresh_history("chat-a")
+    selected_before = frame.history_ids[frame.history_list.GetSelection()]
+    frame.input_edit.SetFocus()
+
+    frame._apply_generated_first_question_title("chat-b", "first question", "B title", 1)
+
+    assert owner_b["title"] == "B title"
+    assert owner_b["title_revision"] == 2
+    assert frame.chat_store.load_chat("chat-b")["title_revision"] == 2
+    assert frame.history_ids[frame.history_list.GetSelection()] == selected_before
+    assert frame.input_edit.HasFocus()
+
+
+def test_generated_title_for_deleted_owner_is_noop(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame.archived_chats = []
+    monkeypatch.setattr(frame, "_upsert_history_row", lambda *_args, **_kwargs: pytest.fail("deleted owner projected"))
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: pytest.fail("deleted owner published"))
+
+    frame._apply_generated_first_question_title("deleted-chat", "first question", "generated", 1)
+
+    assert frame._find_archived_chat("deleted-chat") is None
+
+
+def test_generated_title_transient_persist_failure_resets_schedule_and_retry_succeeds(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-retry"
+    frame._current_chat_state.update(
+        {"id": "chat-retry", "title": "新聊天", "title_manual": False, "title_source": "default",
+         "title_revision": 1, "title_updated_at": 1.0, "created_at": 1.0, "updated_at": 1.0,
+         "model": "codex/main", "turns": [], "first_question_auto_title_scheduled": True}
+    )
+    frame.chat_store.upsert_chat(frame._slim_active_chat_state())
+    real_upsert = frame.chat_store.upsert_chat
+    published = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args: published.append(args))
+
+    def fail_auto(chat):
+        if str(chat.get("title_source") or "") == "auto":
+            raise OSError("transient")
+        return real_upsert(chat)
+
+    monkeypatch.setattr(frame.chat_store, "upsert_chat", fail_auto)
+    frame._apply_generated_first_question_title("chat-retry", "question", "generated", 1)
+    assert frame._current_chat_state["title"] == "新聊天"
+    assert frame._current_chat_state["first_question_auto_title_scheduled"] is False
+    assert published == []
+
+    monkeypatch.setattr(frame.chat_store, "upsert_chat", real_upsert)
+    frame._apply_generated_first_question_title("chat-retry", "question", "generated", 1)
+    assert frame._current_chat_state["title_revision"] == 2
+    assert frame.chat_store.load_chat("chat-retry")["title"] == "generated"
+    assert len(published) == 1
+
+
+def test_generated_title_mismatched_reload_is_silent_and_retryable(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-mismatch"
+    frame._current_chat_state.update(
+        {"id": "chat-mismatch", "title": "新聊天", "title_manual": False, "title_source": "default",
+         "title_revision": 1, "title_updated_at": 1.0, "created_at": 1.0, "updated_at": 1.0,
+         "model": "codex/main", "turns": [], "first_question_auto_title_scheduled": True}
+    )
+    frame.chat_store.upsert_chat(frame._slim_active_chat_state())
+    real_load = frame.chat_store.load_chat
+    published = []
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args: published.append(args))
+    monkeypatch.setattr(frame.chat_store, "load_chat", lambda *_args, **_kwargs: {"id": "chat-mismatch", "title": "wrong", "title_source": "auto", "title_revision": 2})
+
+    frame._apply_generated_first_question_title("chat-mismatch", "question", "generated", 1)
+    assert frame._current_chat_state["title"] == "新聊天"
+    assert frame._current_chat_state["first_question_auto_title_scheduled"] is False
+    assert published == []
+
+    monkeypatch.setattr(frame.chat_store, "load_chat", real_load)
+    frame._apply_generated_first_question_title("chat-mismatch", "question", "generated", 1)
+    assert frame._current_chat_state["title_revision"] == 2
+    assert len(published) == 1
+
+
+def test_default_title_allocation_uses_durable_inventory_and_reuses_smallest_gap(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.archived_chats = []
+    frame._current_chat_state = {"id": "current", "title": "other"}
+    monkeypatch.setattr(
+        frame.chat_store,
+        "list_chat_summaries",
+        lambda: [
+            {"id": "a", "title": "新聊天"},
+            {"id": "c", "title": "新聊天2"},
+            {"id": "similar", "title": "新聊天x"},
+        ],
+    )
+
+    assert frame._next_default_chat_title() == "新聊天1"
 
 
 def test_schedule_first_question_auto_title_respects_manual_lock(frame, monkeypatch):
@@ -15297,8 +15519,11 @@ def test_generated_title_does_not_change_history_recency_order(frame, monkeypatc
         {
             "id": "old-chat",
             "title": "新聊天",
-            "title_source": "default",
-            "title_manual": False,
+                "title_source": "default",
+                "title_manual": False,
+                "title_revision": 1,
+                "title_updated_at": 1.0,
+                "model": "openclaw/main",
             "created_at": 1.0,
             "updated_at": 1.0,
             "turns": [{"question": "old question", "answer_md": "old answer", "model": "openclaw/main", "created_at": 1.0}],
@@ -15322,7 +15547,7 @@ def test_generated_title_does_not_change_history_recency_order(frame, monkeypatc
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_args, **_kwargs: None)
 
-    frame._apply_generated_first_question_title("old-chat", "old question", "old renamed")
+    frame._apply_generated_first_question_title("old-chat", "old question", "old renamed", 1)
     frame._sort_archived_chats()
 
     assert [chat["id"] for chat in frame.archived_chats] == ["new-chat-1", "new-chat-2", "old-chat"]

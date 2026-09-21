@@ -101,6 +101,47 @@ def test_chat_models_round_trip_for_empty_and_populated_owners_after_restart(tmp
     assert restarted.load_chat("chat-b")["model"] == "kimi/main"
 
 
+def test_empty_chat_title_metadata_survives_restart_and_delete_or_rename_releases_name(tmp_path):
+    path = tmp_path / "empty-title-restart.db"
+    store = ChatStore(path)
+    store.initialize()
+    store.upsert_chat(
+        {
+            "id": "chat-base",
+            "title": "新聊天",
+            "model": "codex/main",
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "title_source": "default",
+            "title_revision": 1,
+        }
+    )
+    store.upsert_chat(
+        {
+            "id": "chat-one",
+            "title": "新聊天1",
+            "model": "kimi/main",
+            "created_at": 2.0,
+            "updated_at": 2.0,
+            "title_source": "default",
+            "title_revision": 1,
+        }
+    )
+
+    restarted = ChatStore(path)
+    restarted.initialize()
+    loaded = restarted.load_chat("chat-one")
+    assert (loaded["id"], loaded["title"], loaded["model"], loaded["title_revision"], loaded["turns"]) == (
+        "chat-one", "新聊天1", "kimi/main", 1, []
+    )
+
+    loaded.update({"title": "manual", "title_manual": True, "title_source": "manual", "title_revision": 2})
+    restarted.upsert_chat(loaded)
+    assert {row["title"] for row in restarted.list_chat_summaries()} == {"新聊天", "manual"}
+    restarted.delete_chat("chat-base")
+    assert [row["title"] for row in restarted.list_chat_summaries()] == ["manual"]
+
+
 def test_chat_store_replaces_and_loads_turns(tmp_path):
     store = ChatStore(tmp_path / "chat_history.db")
     store.initialize()

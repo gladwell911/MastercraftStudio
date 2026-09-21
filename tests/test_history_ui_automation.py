@@ -95,6 +95,9 @@ def test_restored_chat_new_chat_first_send_keeps_unique_real_wx_rows_and_input_f
 
     frame._on_new_chat_clicked(None)
     new_chat_id = frame.active_chat_id
+    assert new_chat_id in frame.history_ids
+    assert frame.history_ids[frame.history_list.GetSelection()] == new_chat_id
+    assert frame.input_edit.HasFocus()
     ok, message = frame._submit_question("first question", source="local", model=main.DEFAULT_CODEX_MODEL)
     wx_app.Yield()
 
@@ -115,6 +118,10 @@ def test_restored_chat_new_chat_first_send_keeps_unique_real_wx_rows_and_input_f
 
     frame._on_new_chat_clicked(None)
     final_chat_id = frame.active_chat_id
+    assert final_chat_id != new_chat_id
+    assert {new_chat_id, final_chat_id}.issubset(set(frame.history_ids))
+    assert frame.history_ids[frame.history_list.GetSelection()] == final_chat_id
+    assert frame.input_edit.HasFocus()
     ok, message = frame._submit_question("another first question", source="local", model=main.DEFAULT_CODEX_MODEL)
     wx_app.Yield()
 
@@ -125,6 +132,38 @@ def test_restored_chat_new_chat_first_send_keeps_unique_real_wx_rows_and_input_f
     frame._refresh_history(final_chat_id)
     assert frame.history_list.GetCount() == len(frame.history_ids)
     assert len(frame.history_ids) == len(set(frame.history_ids))
+
+
+def test_native_first_accepted_send_renames_only_its_immediate_empty_row(frame, wx_app, monkeypatch):
+    frame.Show()
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args, **kwargs: True)
+    monkeypatch.setattr(frame, "_generate_first_question_title", lambda _question: "generated title")
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
+
+    class _ImmediateThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+        def start(self):
+            self.target(*self.args, **self.kwargs)
+
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main, "wx_call_after_if_alive", lambda fn, *args: fn(*args))
+
+    assert frame._on_new_chat_clicked(None) is True
+    owner = frame.active_chat_id
+    assert frame.history_ids[frame.history_list.GetSelection()] == owner
+    assert frame.input_edit.HasFocus()
+
+    assert frame._submit_question("first accepted question", model=main.DEFAULT_CODEX_MODEL) == (True, "")
+    wx_app.Yield()
+
+    assert frame._current_chat_state["title"] == "generated title"
+    assert frame._current_chat_state["title_revision"] == 2
+    assert frame.chat_store.load_chat(owner)["title"] == "generated title"
+    assert frame.history_ids[frame.history_list.GetSelection()] == owner
+    assert frame.input_edit.HasFocus()
 
 
 def test_ui_automation_space_from_history_moves_focus_to_input_without_activating_history(frame, wx_app, monkeypatch):
