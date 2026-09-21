@@ -50,6 +50,7 @@ DEFAULT_HEALTH_TIMEOUT = 45.0
 DEFAULT_REST_TIMEOUT = 60.0
 DEFAULT_SHUTDOWN_TIMEOUT = 10.0
 DEFAULT_QUEUE_LIMIT = 2000
+MAX_DIAGNOSTIC_TEXT = 2000
 DEFAULT_RECOVERY_ATTEMPTS = 6
 DEFAULT_RECOVERY_BACKOFF = 0.1
 DEFAULT_WS_CONNECT_TIMEOUT = 10.0
@@ -160,8 +161,13 @@ class KimiEvent:
 
 def event_to_payload(event: KimiEvent) -> dict[str, Any]:
     if is_dataclass(event):
-        return asdict(event)
-    return dict(getattr(event, "__dict__", {}) or {})
+        payload = asdict(event)
+    else:
+        payload = dict(getattr(event, "__dict__", {}) or {})
+    data = dict(payload.get("data") or {})
+    data["adapter"] = "kimi_server"
+    payload["data"] = data
+    return payload
 
 
 def event_from_payload(payload: dict[str, Any]) -> KimiEvent:
@@ -201,6 +207,22 @@ def _text_fragment(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _bounded_fragment(value: Any) -> str:
+    return _text_fragment(value)[:MAX_DIAGNOSTIC_TEXT]
+
+
+def _bounded_payload(value: Any, depth: int = 0) -> Any:
+    if depth >= 5:
+        return "<truncated>"
+    if isinstance(value, dict):
+        return {str(key): _bounded_payload(item, depth + 1) for key, item in list(value.items())[:100]}
+    if isinstance(value, list):
+        return [_bounded_payload(item, depth + 1) for item in value[:50]]
+    if isinstance(value, str):
+        return _bounded_fragment(value)
+    return value
+
+
 def _payload_of(message: dict[str, Any]) -> dict[str, Any]:
     payload = message.get("payload")
     return payload if isinstance(payload, dict) else {}
@@ -237,12 +259,25 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     agent_id = _str(body.get("agentId"))
     agent_scope = _agent_scope(body_type, agent_id)
     event_data: dict[str, Any] = {
+        "adapter": "kimi_server",
         "seq": seq,
         "offset": message.get("offset"),
         "agent_id": agent_id,
         "agent_scope": agent_scope,
         "source_kind": body_type,
     }
+    for source_key, target_key in (
+        ("disclosable", "disclosable"),
+        ("isDisclosable", "disclosable"),
+        ("private", "private"),
+        ("isPrivate", "private"),
+        ("non_disclosable", "non_disclosable"),
+        ("nonDisclosable", "non_disclosable"),
+        ("visibility", "visibility"),
+        ("reasoningVisibility", "reasoning_visibility"),
+    ):
+        if source_key in body:
+            event_data[target_key] = body[source_key]
     prompt_id = _str(body.get("promptId"))
     if prompt_id:
         event_data["prompt_id"] = prompt_id
@@ -255,6 +290,8 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     }
 
     if body_type == "assistant.delta":
+        # Assistant deltas are the canonical final-answer stream. Never apply
+        # execution-diagnostic bounds or redaction at the protocol boundary.
         delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
@@ -266,7 +303,7 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
             **base,
         )
     if body_type == "thinking.delta":
-        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
+        delta = _bounded_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
             text=delta,
@@ -320,14 +357,15 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         )
     if body_type in ("turn.step.started", "turn.step.completed", "turn.step.retrying"):
         started = body_type != "turn.step.completed"
+        retrying = body_type == "turn.step.retrying"
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         return KimiEvent(
             type="item_started" if started else "item_completed",
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("stepId") or body.get("step")),
             title="step %s" % _str(body.get("step")),
-            display_kind="step",
-            status=_str(body.get("status")) or ("running" if started else "completed"),
+            display_kind="waiting" if retrying else "step",
+            status=_str(body.get("status")) or ("retrying" if retrying else "running" if started else "completed"),
             usage=dict(usage),
             **base,
         )
@@ -345,25 +383,35 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     if body_type in ("tool.call.started", "shell.started"):
         display = body.get("display") if isinstance(body.get("display"), dict) else {}
         kind = _str(display.get("kind") or body.get("kind") or body.get("toolKind"))
+        operation = _str(display.get("operation")).lower()
+        if operation in {"search", "grep", "glob", "find"}:
+            kind = "search"
+        elif operation in {"read", "open"}:
+            kind = "file_io"
+        elif operation in {"write", "edit", "patch", "delete", "create"}:
+            kind = "diff"
+        elif operation in {"test", "tests", "pytest", "verify"}:
+            kind = "test"
         args = body.get("args") if isinstance(body.get("args"), dict) else {}
         return KimiEvent(
             type="item_started",
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("toolCallId") or body.get("callId") or body.get("id")),
             title=_str(body.get("description") or body.get("title") or body.get("name") or kind),
-            command=_str(body.get("command") or args.get("command")),
+            command=_bounded_fragment(body.get("command") or args.get("command")),
             display_kind=_TOOL_KIND_DISPLAY.get(kind, "command" if body_type == "shell.started" else kind or "tool"),
             status="running",
-            data={**base["data"], "tool": body},
+            data={**base["data"], "operation_kind": _TOOL_KIND_DISPLAY.get(kind, kind or "tool"), "tool": _bounded_payload(body)},
             thread_id=session_id,
         )
     if body_type in ("tool.progress", "shell.output"):
-        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("output") if body.get("output") is not None else body.get("text"))
+        delta = _bounded_fragment(body.get("delta") if body.get("delta") is not None else body.get("output") if body.get("output") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("toolCallId") or body.get("callId") or body.get("id")),
             text=delta,
+            raw_text=delta,
             display_kind="commentary",
             **base,
         )
@@ -373,17 +421,29 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     if body_type in ("tool.result", "shell.completed"):
         display = body.get("display") if isinstance(body.get("display"), dict) else {}
         kind = _str(display.get("kind") or body.get("kind") or body.get("toolKind"))
+        operation = _str(display.get("operation")).lower()
+        if operation in {"search", "grep", "glob", "find"}:
+            kind = "search"
+        elif operation in {"read", "open"}:
+            kind = "file_io"
+        elif operation in {"write", "edit", "patch", "delete", "create"}:
+            kind = "diff"
+        elif operation in {"test", "tests", "pytest", "verify"}:
+            kind = "test"
+        result_text = _bounded_fragment(body.get("summary") if body.get("summary") is not None else body.get("output"))
+        tool_body = _bounded_payload(body)
         return KimiEvent(
             type="item_completed",
             turn_id=_str(body.get("turnId")),
             item_id=_str(body.get("toolCallId") or body.get("callId") or body.get("id")),
             title=_str(body.get("description") or body.get("title") or body.get("name")),
-            command=_str(body.get("command")),
+            command=_bounded_fragment(body.get("command")),
             exit_code=body.get("exitCode") if isinstance(body.get("exitCode"), int) else None,
             status=_str(body.get("status")) or "completed",
-            text=_str(body.get("summary") or body.get("output"))[:2000],
+            text=result_text,
+            raw_text=result_text,
             display_kind="command" if body_type == "shell.completed" else _TOOL_KIND_DISPLAY.get(kind, kind or "tool"),
-            data={**base["data"], "tool": body},
+            data={**base["data"], "operation_kind": _TOOL_KIND_DISPLAY.get(kind, kind or "tool"), "tool": tool_body},
             thread_id=session_id,
         )
     if body_type.startswith("subagent."):
@@ -494,6 +554,19 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
             text=_str(body.get("message") or body.get("code")),
             **base,
         )
+    lifecycle_state = body_type.rsplit(".", 1)[-1]
+    if lifecycle_state in {"started", "completed", "failed", "interrupted", "retrying", "waiting"}:
+        completed = lifecycle_state in {"completed", "failed", "interrupted"}
+        return KimiEvent(
+            type="item_completed" if completed else "item_started",
+            turn_id=_str(body.get("turnId")),
+            item_id=_str(body.get("itemId") or body.get("id") or body.get("callId")),
+            display_kind="waiting" if lifecycle_state in {"retrying", "waiting"} else "unknown_action",
+            status=lifecycle_state,
+            text=_text_fragment(body.get("message") or body.get("summary")),
+            data={**base["data"], "structured_unknown": True, "protocol": body},
+            thread_id=session_id,
+        )
     if body_type in (
         "event.session.work_changed",
         "session.meta.updated",
@@ -518,7 +591,7 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         type="notification",
         display_kind="unmapped",
         subtype=body_type,
-        data={**base["data"], "unmapped": True, "raw": body},
+        data={**base["data"], "unmapped": True, "raw": _bounded_payload(body)},
         thread_id=session_id,
     )
 

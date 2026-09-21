@@ -2,7 +2,7 @@ import ctypes
 import time
 
 import main
-from kimi_server_client import KimiEvent
+from kimi_server_client import KimiEvent, event_to_payload
 from test_kimi_integration import FakeKimiServerClient, _setup_kimi_frame
 
 
@@ -382,7 +382,7 @@ def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(fram
     assert frame.input_edit.HasFocus()
     assert frame.execution_list.GetSelection() == 1
 
-    source = {"source_kind": "thinking.delta", "offset": 0}
+    source = {"adapter": "kimi_server", "source_kind": "thinking.delta", "offset": 0}
     for event in (
         main.CodexEvent(type="agent_message_delta", thread_id="session-1", turn_id="turn-1", text="The", raw_text="The", display_kind="thinking", data=source),
         main.CodexEvent(type="thread_status_changed", thread_id="session-1", turn_id="turn-1", status="streaming"),
@@ -420,7 +420,36 @@ def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(fram
             raise AssertionError("Ctrl+C should be handled")
 
     frame._on_execution_key_down(_CopyEvent())
-    assert copied == ["正在分析问题"]
+    assert copied == ["The user"]
+
+
+def test_background_structured_kimi_batch_persists_owner_without_foreground_repaint(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution",
+        execution_steps=[{"event_type": "plan_updated", "display_kind": "plan", "list_text": "前台", "detail_text": "前台", "turn_idx": 0}])
+    frame.archived_chats = [{
+        "id": "chat-bg", "title": "bg", "turns": [{"question": "bg", "answer_md": main.REQUESTING_TEXT,
+        "model": "kimi/main", "request_status": "pending", "kimi_session_id": "session-bg", "kimi_turn_id": "turn-bg"}],
+        "kimi_session_id": "session-bg", "execution_steps": [],
+    }]
+    frame._kimi_active_turns["chat-bg"] = {"turn_idx": 0, "turn_id": "turn-bg", "session_id": "session-bg", "model": "kimi/main"}
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.execution_list.SetSelection(1)
+    frame.input_edit.SetFocusFromKbd()
+    wx_app.Yield()
+    repaint = []
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *_args: repaint.append(True))
+    event = KimiEvent(type="item_started", thread_id="session-bg", turn_id="turn-bg", item_id="bg-tool",
+        title="C:/private/file.txt", display_kind="file",
+        data={"source_kind": "tool.call.started", "operation_kind": "file"})
+    frame._dispatch_kimi_event_to_ui("chat-bg", main.CodexEvent(**event_to_payload(event)))
+    _drain_all_kimi_events(frame)
+    bg_steps = frame.archived_chats[0]["execution_steps"]
+    assert [step["list_text"] for step in bg_steps] == ["正在执行读取文件"]
+    assert "C:/private/file.txt" in bg_steps[0]["detail_text"]
+    assert repaint == []
+    assert frame.execution_list.GetSelection() == 1
+    assert frame.input_edit.HasFocus()
 
 
 # D5 — 活跃 turn 中关闭 frame：close 在超时内完成且 client.close() 恰好调用一次

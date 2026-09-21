@@ -6323,7 +6323,45 @@ class ChatFrame(wx.Frame):
     @staticmethod
     def _kimi_protocol_event(event: CodexEvent) -> bool:
         data = event.data if isinstance(getattr(event, "data", None), dict) else {}
-        return str(data.get("source_kind") or "").startswith(("thinking.", "assistant.", "tool.", "shell.", "subagent."))
+        return str(data.get("adapter") or data.get("provider") or "").strip().lower() in {
+            "kimi", "kimi_server", "kimi-server"
+        }
+
+    @staticmethod
+    def _kimi_private_reasoning(data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
+        visibility = str(data.get("visibility") or data.get("reasoning_visibility") or "").strip().lower()
+        return (
+            data.get("disclosable") is False
+            or data.get("private") is True
+            or data.get("non_disclosable") is True
+            or visibility in {"private", "hidden", "non_disclosable", "non-disclosable"}
+        )
+
+    @staticmethod
+    def _bounded_kimi_diagnostic(text: str, limit: int = 2000) -> str:
+        value = ChatFrame._strip_ansi_control_sequences(str(text or ""))[: max(0, int(limit))]
+        value = re.sub(r"(?i)(api[_-]?key|access[_-]?token|password|secret)(\s*[:=]\s*)\S+", r"\1\2<redacted>", value)
+        value = re.sub(r"(?i)(--token\s+|[?&]token=|token\s*[:=]\s*)\S+", r"\1<redacted>", value)
+        return value
+
+    @staticmethod
+    def _safe_kimi_source_detail(value, depth: int = 0):
+        if depth >= 5:
+            return "<truncated>"
+        if isinstance(value, dict):
+            return {
+                str(key): ChatFrame._safe_kimi_source_detail(item, depth + 1)
+                for key, item in list(value.items())[:100]
+            }
+        if isinstance(value, list):
+            return [ChatFrame._safe_kimi_source_detail(item, depth + 1) for item in value[:50]]
+        if isinstance(value, str):
+            return ChatFrame._bounded_kimi_diagnostic(value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return ChatFrame._bounded_kimi_diagnostic(str(value))
 
     @staticmethod
     def _execution_exit_code(event: CodexEvent) -> int | None:
@@ -6349,45 +6387,55 @@ class ChatFrame(wx.Frame):
             return ""
         event_type = str(getattr(event, "type", "") or "").strip()
         display_kind = str(getattr(event, "display_kind", "") or "").strip()
+        source_kind = str(data.get("source_kind") or "").strip().lower()
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        status = str(getattr(event, "status", "") or tool.get("status") or "").strip().lower()
+        exit_code = ChatFrame._execution_exit_code(event)
+        failed = status in {"failed", "error", "interrupted", "cancelled", "canceled"} or exit_code not in (None, 0)
+        completed = event_type in {"item_completed", "subagent_result"} or status in {"completed", "done", "success"}
+        if display_kind in {"session", "unmapped", "compaction", "goal"}:
+            return ""
+        if source_kind in {"tool.progress", "shell.output"}:
+            return ""
         if display_kind == "thinking":
             return "正在分析问题"
         if display_kind == "assistant":
-            return str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "").strip() or "正在整理回答"
-        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
-        title = str(
-            getattr(event, "title", "")
-            or tool.get("description")
-            or tool.get("title")
-            or tool.get("name")
-            or ""
-        ).strip()
-        command = str(getattr(event, "command", "") or tool.get("command") or "").strip()
-        status = str(getattr(event, "status", "") or tool.get("status") or "").strip().lower()
-        exit_code = ChatFrame._execution_exit_code(event)
-        failed = status in {"failed", "error", "interrupted", "cancelled", "canceled"} or exit_code not in (None, "", 0)
+            return ""
+        if display_kind == "warning":
+            return "执行警告"
+        if status in {"retrying", "waiting", "awaiting", "awaiting_input", "awaiting_approval"}:
+            return "正在等待"
+        if status in {"failed", "error", "interrupted", "cancelled", "canceled"}:
+            return "执行失败"
+        if display_kind == "status":
+            return "正在整理回答" if source_kind == "prompt.completed" else ""
+        if display_kind == "step":
+            return ""
         phase = "执行失败" if failed else ("已完成" if event_type in {"item_completed", "subagent_result"} else "正在执行")
-        target = title or command
         if event_type == "subagent_result" or display_kind == "agent":
-            return f"{phase}子任务：{target}" if target else f"{phase}子任务"
+            return f"{phase}子任务"
         tool_name = " ".join(
-            str(tool.get(key) or "") for key in ("name", "title", "description", "kind", "toolKind")
+            str(tool.get(key) or "") for key in ("name", "kind", "toolKind")
         ).lower()
         if display_kind == "search" or any(name in tool_name for name in ("search", "grep", "glob", "find")):
-            return f"{phase}搜索：{target}" if target else f"{phase}搜索"
+            return f"{phase}搜索"
         if display_kind in {"file", "diff"} or any(name in tool_name for name in ("read", "cat", "write", "edit", "patch")):
             action = "修改文件" if display_kind == "diff" or any(name in tool_name for name in ("write", "edit", "patch")) else "读取文件"
-            return f"{phase}{action}：{target}" if target else f"{phase}{action}"
-        command_lower = command.lower()
-        if "test" in command_lower or "pytest" in command_lower:
-            return f"{phase}测试：{target}" if target else f"{phase}测试"
+            return f"{phase}{action}"
+        operation_kind = str(data.get("operation_kind") or "").strip().lower()
+        if display_kind == "test" or operation_kind == "test":
+            return f"{phase}测试"
         if display_kind in {"command", "tool"} or any(name in tool_name for name in ("shell", "bash", "command", "powershell")):
-            label = f"{phase}命令：{target}" if target else f"{phase}命令"
-            return f"{label}（退出码：{exit_code}）" if event_type == "item_completed" and exit_code not in (None, "") else label
+            return f"{phase}命令"
         if display_kind == "skill":
-            return f"{phase}工具：{target}" if target else f"{phase}工具"
-        if display_kind == "commentary":
-            return str(getattr(event, "text", "") or "").strip()
-        return f"{phase}任务：{target}" if target else f"{phase}任务"
+            return f"{phase}工具"
+        if display_kind in {"waiting", "user_input"}:
+            return "等待用户输入"
+        if display_kind == "error" or event_type == "error":
+            return "执行失败"
+        if event_type in {"item_started", "item_completed", "subagent_result"}:
+            return "执行失败" if failed else ("已完成任务" if completed else "正在处理任务")
+        return ""
 
     def _build_execution_entry(self, event: CodexEvent) -> dict | None:
         if not isinstance(event, CodexEvent):
@@ -6395,6 +6443,15 @@ class ChatFrame(wx.Frame):
         detail_text = self._execution_detail_text_from_event(event)
         display_kind = self._execution_display_kind(event)
         kimi_summary = self._kimi_execution_summary(event)
+        item = event.data if isinstance(event.data, dict) else {}
+        private_reasoning = display_kind == "thinking" and self._kimi_private_reasoning(item)
+        if private_reasoning:
+            detail_text = ""
+        elif self._kimi_protocol_event(event):
+            original_raw = str(getattr(event, "raw_text", "") or "")
+            detail_text = self._bounded_kimi_diagnostic(original_raw if original_raw else detail_text)
+        if self._kimi_protocol_event(event) and not kimi_summary:
+            return None
         if not detail_text and not kimi_summary:
             return None
         event_type = str(getattr(event, "type", "") or "").strip()
@@ -6402,15 +6459,12 @@ class ChatFrame(wx.Frame):
             detail_text = self._sanitize_execution_error_text(detail_text)
             if not detail_text:
                 return None
-        item = event.data if isinstance(event.data, dict) else {}
         title = str(getattr(event, "title", "") or item.get("title") or item.get("name") or item.get("label") or "").strip()
         command = str(getattr(event, "command", "") or item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
         exit_code = self._execution_exit_code(event)
         subtype = str(getattr(event, "subtype", "") or item.get("type") or "").strip()
         phase = str(getattr(event, "phase", "") or "").strip()
         command_fallback = subtype or str(getattr(event, "status", "") or "").strip() or event_type
-        if kimi_summary and display_kind == "thinking":
-            detail_text = kimi_summary
         if kimi_summary:
             list_text = kimi_summary
         elif event_type == "diff_updated":
@@ -6421,14 +6475,17 @@ class ChatFrame(wx.Frame):
             list_text = self._execution_command_list_text(event_type, title, command, exit_code, command_fallback)
         else:
             list_text = self._execution_list_text_from_detail(detail_text, display_kind)
+        safe_raw_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "raw_text", "") or ""))
+        safe_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "text", "") or ""))
+        safe_source_detail = {} if private_reasoning else self._safe_kimi_source_detail(item)
         entry = {
             "event_type": event_type,
             "display_kind": display_kind,
             "subtype": subtype,
             "list_text": list_text,
             "detail_text": detail_text,
-            "raw_text": str(getattr(event, "raw_text", "") or ""),
-            "text": str(getattr(event, "text", "") or ""),
+            "raw_text": safe_raw_text,
+            "text": safe_text,
             "title": title,
             "command": command,
             "exit_code": exit_code,
@@ -6439,6 +6496,8 @@ class ChatFrame(wx.Frame):
             "item_id": str(getattr(event, "item_id", "") or "").strip(),
             "agent_id": str(item.get("agent_id") or item.get("agentId") or "").strip(),
             "source_kind": str(item.get("source_kind") or "").strip(),
+            "source_detail": safe_source_detail,
+            "operation_kind": str(item.get("operation_kind") or display_kind or "").strip(),
             "created_at": time.time(),
         }
         if kimi_summary:
@@ -6591,7 +6650,7 @@ class ChatFrame(wx.Frame):
             or step.get("content")
             or step.get("description")
             or ""
-        ).strip()
+        )
 
     @staticmethod
     def _normalize_execution_text_for_compare(text: str) -> str:
@@ -6622,13 +6681,8 @@ class ChatFrame(wx.Frame):
             and previous_kind == next_kind
             and previous_step.get("agent_id") == next_step.get("agent_id")
             and previous_step.get("source_kind") == next_step.get("source_kind")
-            and (
-                previous_kind in {"thinking", "assistant"}
-                or (
-                    str(previous_step.get("item_id") or "").strip()
-                    and previous_step.get("item_id") == next_step.get("item_id")
-                )
-            )
+            and str(previous_step.get("item_id") or "").strip()
+            and previous_step.get("item_id") == next_step.get("item_id")
         ):
             return True
         if previous_kind != "commentary" or next_kind != "commentary":
@@ -6679,15 +6733,6 @@ class ChatFrame(wx.Frame):
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
-        if (
-            str(entry.get("event_type") or "") == "item_completed"
-            and str(entry.get("source_kind") or "").startswith(("tool.", "shell.", "subagent."))
-            and str(entry.get("item_id") or "").strip()
-        ):
-            entry = dict(entry)
-            completion_uid = uuid.uuid4().hex
-            entry["_execution_uid"] = completion_uid
-            entry["event_id"] = f"execution-{completion_uid}"
         if str(entry.get("event_type") or "") == "item_completed" and str(entry.get("item_id") or "").strip():
             compatible_indexes = []
             for index, previous in enumerate(steps):
@@ -6708,6 +6753,9 @@ class ChatFrame(wx.Frame):
                 index = compatible_indexes[0]
                 previous = steps[index]
                 entry = dict(entry)
+                for identity_key in ("id", "event_id", "_execution_uid"):
+                    if previous.get(identity_key):
+                        entry[identity_key] = previous[identity_key]
                 previous_timestamp = _execution_timestamp(previous)
                 if previous_timestamp is not None:
                     entry["created_at"] = previous_timestamp
@@ -6717,22 +6765,42 @@ class ChatFrame(wx.Frame):
                     entry["title"] = previous_title
                 if not str(entry.get("command") or "").strip() and previous_command:
                     entry["command"] = previous_command
-                if entry.get("kimi_summary") and (previous_title or previous_command):
-                    failed = str(entry.get("status") or "").lower() in {
-                        "failed", "error", "interrupted", "cancelled", "canceled"
-                    } or entry.get("exit_code") not in (None, "", 0)
-                    target = previous_title or previous_command
-                    entry["list_text"] = f"{'执行失败' if failed else '已完成'}：{target}"
-                    entry["kimi_summary"] = entry["list_text"]
-                    details = [entry["list_text"]]
-                    if previous_command:
-                        details.append(f"命令：{previous_command}")
+                previous_source_detail = previous.get("source_detail")
+                if isinstance(previous_source_detail, dict) and previous_source_detail:
+                    entry["source_detail_history"] = [copy.deepcopy(previous_source_detail)]
+                if previous.get("diagnostic_history"):
+                    entry["diagnostic_history"] = copy.deepcopy(previous["diagnostic_history"])
+                operation_kind = str(previous.get("operation_kind") or previous.get("display_kind") or "").strip()
+                if operation_kind:
+                    entry["operation_kind"] = operation_kind
+                if entry.get("kimi_summary"):
+                    # Preserve the finite structured summary and merge permitted
+                    # diagnostics only into detail. Completion must not rebuild
+                    # a row from a title, path, command, output, or exit code.
+                    details = []
+                    previous_detail = str(previous.get("detail_text") or "")
+                    current_detail = str(entry.get("detail_text") or "")
+                    if previous_detail:
+                        details.append(previous_detail)
+                    if current_detail and current_detail not in details:
+                        details.append(current_detail)
                     if entry.get("exit_code") not in (None, ""):
-                        details.append(f"退出码：{entry['exit_code']}")
-                    result_text = str(entry.get("text") or "").strip()
-                    if result_text:
-                        details.append(result_text)
-                    entry["detail_text"] = "\n".join(details)
+                        exit_detail = f"退出码：{entry['exit_code']}"
+                        if exit_detail not in details:
+                            details.append(exit_detail)
+                    entry["detail_text"] = self._bounded_kimi_diagnostic("\n".join(details))
+                    failure_prefix = "执行失败" if str(entry.get("status") or "").lower() in {
+                        "failed", "error", "interrupted", "cancelled", "canceled"
+                    } or entry.get("exit_code") not in (None, "", 0) else "已完成"
+                    action_by_kind = {
+                        "search": "搜索", "file": "读取文件", "diff": "修改文件",
+                        "test": "测试", "command": "命令", "agent": "子任务",
+                        "skill": "工具", "task": "任务", "tool": "命令",
+                    }
+                    action = action_by_kind.get(operation_kind, "任务")
+                    entry["list_text"] = f"{failure_prefix}{action}"
+                    entry["kimi_summary"] = entry["list_text"]
+                    entry["display_kind"] = str(previous.get("display_kind") or entry.get("display_kind") or "")
                 for remove_index in reversed(compatible_indexes):
                     del steps[remove_index]
                 steps.insert(index, copy.deepcopy(entry))
@@ -6744,6 +6812,15 @@ class ChatFrame(wx.Frame):
                 if save_state:
                     self._defer_chat_state_save()
                 return True
+        if (
+            str(entry.get("event_type") or "") == "item_completed"
+            and str(entry.get("source_kind") or "").startswith(("tool.", "shell.", "subagent."))
+            and str(entry.get("item_id") or "").strip()
+        ):
+            entry = dict(entry)
+            completion_uid = uuid.uuid4().hex
+            entry["_execution_uid"] = completion_uid
+            entry["event_id"] = f"execution-{completion_uid}"
         if steps and self._execution_entries_should_dedupe(steps[-1], entry):
             return False
         if not any(entry.get(key) for key in ("id", "event_id", "item_id")):
@@ -6788,6 +6865,9 @@ class ChatFrame(wx.Frame):
         if str(step.get("event_type") or "") == "item_completed" and callable(replace_lifecycle):
             if replace_lifecycle(chat_id, step):
                 return
+        update_identity = getattr(store, "update_execution_step_by_identity", None)
+        if str(step.get("item_id") or "").strip() and callable(update_identity) and update_identity(chat_id, step):
+            return
         store.append_execution_step(chat_id, step)
 
     def _queue_execution_step_persist(self, chat_id: str, step: dict) -> None:
@@ -6930,8 +7010,10 @@ class ChatFrame(wx.Frame):
         offset = event_data.get("offset")
         state = self._execution_delta_buffer.setdefault(
             key,
-            {"parts": [], "event": event, "last_event_at": 0.0, "start_offset": offset},
+            {"parts": [], "event": event, "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False},
         )
+        if display_kind == "thinking" and self._kimi_private_reasoning(event_data):
+            state["private_reasoning"] = True
         fragment = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
         start_offset = state.get("start_offset")
         if isinstance(offset, int) and isinstance(start_offset, int):
@@ -6945,6 +7027,47 @@ class ChatFrame(wx.Frame):
             state["parts"].append(fragment)
         state["event"] = event
         state["last_event_at"] = time.time()
+
+    def _append_kimi_tool_diagnostic(self, chat_id: str, event: CodexEvent) -> bool:
+        if not self._kimi_protocol_event(event):
+            return False
+        data = event.data if isinstance(event.data, dict) else {}
+        if str(data.get("source_kind") or "").strip() not in {"tool.progress", "shell.output"}:
+            return False
+        item_id = str(getattr(event, "item_id", "") or "").strip()
+        if not item_id:
+            return False
+        target_chat = self._chat_state_for_execution_steps(chat_id)
+        if not isinstance(target_chat, dict):
+            return False
+        thread_id = self._event_thread_id(event)
+        turn_id = self._event_turn_id(event)
+        diagnostic = self._bounded_kimi_diagnostic(
+            str(getattr(event, "raw_text", "") or getattr(event, "text", "") or "")
+        )
+        if not diagnostic:
+            return False
+        steps = target_chat.get("execution_steps") if isinstance(target_chat.get("execution_steps"), list) else []
+        for step in reversed(steps):
+            if not isinstance(step, dict):
+                continue
+            if (
+                str(step.get("item_id") or "") != item_id
+                or str(step.get("thread_id") or "") != thread_id
+                or str(step.get("turn_id") or "") != turn_id
+            ):
+                continue
+            existing = str(step.get("detail_text") or "")
+            separator = "\n" if existing and not existing.endswith("\n") else ""
+            step["detail_text"] = self._bounded_kimi_diagnostic(existing + separator + diagnostic)
+            history = list(step.get("diagnostic_history") or [])
+            history.append({"source_kind": str(data.get("source_kind") or ""), "text": diagnostic})
+            step["diagnostic_history"] = history[-20:]
+            resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
+            if resolved_chat_id:
+                self._persist_execution_step_or_queue(resolved_chat_id, step)
+            return True
+        return False
 
     def _flush_execution_delta(
         self, chat_id: str, turn_id: str | None = None, item_id: str | None = None, display_kind: str | None = None
@@ -6972,6 +7095,11 @@ class ChatFrame(wx.Frame):
             if not text.strip() or not isinstance(base_event, CodexEvent):
                 continue
             base_data = dict(base_event.data or {}) if isinstance(getattr(base_event, "data", None), dict) else {}
+            if bool(state.get("private_reasoning")):
+                # Privacy is monotonic for the whole buffered stream: a later
+                # sparse fragment must not erase an earlier restriction, and a
+                # later restriction protects all already buffered fragments.
+                base_data["non_disclosable"] = True
             merged_event = CodexEvent(
                 type="agent_message_delta",
                 thread_id=self._event_thread_id(base_event),
@@ -13353,8 +13481,10 @@ class ChatFrame(wx.Frame):
         context_usage = self._kimi_context_usage_payload(event) if event_type == "thread_status_changed" else None
         if not is_current_chat:
             if event_type == "agent_message_delta":
-                if delta_kind != "assistant":
+                if delta_kind == "thinking":
                     self._buffer_execution_delta(chat_id, event)
+                elif delta_kind == "commentary":
+                    self._append_kimi_tool_diagnostic(chat_id, event)
                 elif execution_entry:
                     self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
                 return
@@ -13435,8 +13565,10 @@ class ChatFrame(wx.Frame):
             self._defer_codex_state_save()
             return
         if event_type == "agent_message_delta":
-            if delta_kind != "assistant":
+            if delta_kind == "thinking":
                 self._buffer_execution_delta(chat_id, event)
+            elif delta_kind == "commentary":
+                self._append_kimi_tool_diagnostic(chat_id, event)
             elif execution_entry:
                 self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
             return

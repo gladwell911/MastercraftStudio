@@ -144,7 +144,47 @@ def test_delta_preserves_whitespace_and_stream_identity_metadata():
 
     assert event.text == " user"
     assert event.raw_text == " user"
-    assert event.data == {"seq": 9, "offset": 3, "agent_id": "main", "agent_scope": "main", "source_kind": "thinking.delta"}
+    assert event.data == {"adapter": "kimi_server", "seq": 9, "offset": 3, "agent_id": "main", "agent_scope": "main", "source_kind": "thinking.delta"}
+
+
+def test_thinking_privacy_markers_and_structured_test_operation_are_preserved():
+    private = map_session_event({
+        "type": "thinking.delta", "session_id": "s",
+        "payload": {"type": "thinking.delta", "turnId": "t", "delta": "secret", "isPrivate": True,
+                    "reasoningVisibility": "hidden"},
+    })
+    assert private.data["adapter"] == "kimi_server"
+    assert private.data["private"] is True
+    assert private.data["reasoning_visibility"] == "hidden"
+    test_event = map_session_event({
+        "type": "tool.call.started", "session_id": "s",
+        "payload": {"type": "tool.call.started", "turnId": "t", "toolCallId": "x",
+                    "display": {"kind": "command", "operation": "test"}},
+    })
+    assert test_event.display_kind == "test"
+    assert test_event.data["operation_kind"] == "test"
+
+
+def test_assistant_delta_over_diagnostic_limit_is_canonical():
+    delta = " leading " + ("答" * 3000) + " trailing "
+    event = map_session_event({
+        "type": "assistant.delta", "session_id": "s",
+        "payload": {"type": "assistant.delta", "turnId": "t", "agentId": "main", "delta": delta},
+    })
+    assert event.text == delta
+    assert event.raw_text == delta
+
+
+def test_unknown_structured_lifecycle_is_actionable_but_unknown_noise_is_not():
+    action = map_session_event({
+        "type": "database.query.started", "session_id": "s",
+        "payload": {"type": "database.query.started", "turnId": "t", "itemId": "q"},
+    })
+    assert action.type == "item_started"
+    assert action.display_kind == "unknown_action"
+    assert action.data["structured_unknown"] is True
+    noise = map_session_event({"type": "vendor.telemetry", "session_id": "s", "payload": {"type": "vendor.telemetry"}})
+    assert noise.display_kind == "unmapped"
 
 
 # ----------------------------------------------------------------------
@@ -263,7 +303,7 @@ def test_fixture_tool_call_started_maps_to_item_started():
     assert event.type == "item_started"
     assert event.title == msg["payload"]["description"]
     assert event.item_id == msg["payload"]["toolCallId"]
-    assert event.display_kind == "file"  # fixture display.kind is file_io
+    assert event.display_kind == "search"  # structured operation=glob is more specific than file_io
     assert event.status == "running"
 
 

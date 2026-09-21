@@ -8920,13 +8920,13 @@ def test_kimi_execution_delta_buffer_separates_agent_and_source_streams(frame):
                 turn_id="turn-1",
                 text=text,
                 display_kind=kind,
-                data={"agent_id": agent, "source_kind": source},
+                    data={"adapter": "kimi_server", "agent_id": agent, "source_kind": source},
             ),
         )
 
     assert len(frame._execution_delta_buffer) == 3
     assert frame._flush_execution_delta("chat-1", "turn-1") is True
-    assert [step["list_text"] for step in frame._current_chat_state["execution_steps"]] == ["正在分析问题", "正在分析问题", "tool-a"]
+    assert [step["list_text"] for step in frame._current_chat_state["execution_steps"]] == ["正在分析问题", "正在分析问题"]
 
 
 def test_non_kimi_item_title_keeps_existing_execution_summary_behavior(frame):

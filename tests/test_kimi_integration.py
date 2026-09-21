@@ -261,7 +261,7 @@ def test_turn_events_render_execution_list(frame, monkeypatch):
 
     steps = frame._current_chat_state.get("execution_steps") or []
     kinds = [str(step.get("display_kind") or "") for step in steps]
-    assert "status" in kinds  # turn_started
+    assert "status" not in kinds  # turn_started is protocol noise
     assert "command" in kinds
     commands = [str(step.get("command") or "") for step in steps]
     assert "ls" in commands
@@ -308,10 +308,105 @@ def test_thinking_status_interleaving_creates_one_chinese_execution_step(frame, 
 
     steps = frame._current_chat_state.get("execution_steps") or []
     summaries = [step.get("list_text") for step in steps if step.get("kimi_summary")]
-    assert summaries == ["正在分析问题", "progress", "答案"]
-    assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["正在分析问题", "progress", "答案"]
+    assert summaries == ["正在分析问题"]
+    assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["The user"]
+    assert all("progress" not in str(step.get("list_text") or "") for step in steps)
     assert not frame._execution_delta_buffer
     assert frame._kimi_turn_answer_parts[(_active_chat_id(frame), session_id, TEST_TURN_ID)] == ["答案"]
+
+
+def test_mapped_private_reasoning_is_withheld_through_store(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "private")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    mapped = map_session_event({
+        "type": "thinking.delta", "session_id": session_id,
+        "payload": {"type": "thinking.delta", "turnId": TEST_TURN_ID, "delta": "PRIVATE COT", "private": True},
+    })
+    frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(mapped)))
+    frame._flush_execution_delta(_active_chat_id(frame), TEST_TURN_ID)
+    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary"))
+    assert step["list_text"] == "正在分析问题"
+    assert step["detail_text"] == ""
+    assert step["source_detail"] == {}
+    assert "PRIVATE COT" not in str(step)
+    frame._flush_execution_step_persists_sync()
+    stored = frame.chat_store.load_execution_steps(_active_chat_id(frame))
+    assert "PRIVATE COT" not in str(stored)
+
+
+@pytest.mark.parametrize("private_fragment", [0, 1])
+def test_thinking_privacy_is_monotonic_across_buffered_fragments_and_restart(frame, monkeypatch, private_fragment):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "private stream")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fragments = ["EARLY SECRET ", "LATE SECRET"]
+    offset = 0
+    for index, fragment in enumerate(fragments):
+        payload = {"type": "thinking.delta", "turnId": TEST_TURN_ID, "agentId": "main", "delta": fragment}
+        if index == private_fragment:
+            payload["nonDisclosable"] = True
+        mapped = map_session_event({"type": "thinking.delta", "session_id": session_id, "offset": offset, "payload": payload})
+        frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(mapped)))
+        offset += len(fragment)
+    frame._flush_execution_delta(_active_chat_id(frame), TEST_TURN_ID)
+    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary"))
+    assert step["list_text"] == "正在分析问题"
+    assert step["detail_text"] == ""
+    assert step["source_detail"] == {}
+    assert "SECRET" not in str(step)
+    frame._flush_execution_step_persists_sync()
+    restarted = main.ChatStore(frame.chat_store.db_path)
+    restarted.initialize()
+    assert "SECRET" not in str(restarted.load_execution_steps(_active_chat_id(frame)))
+
+
+@pytest.mark.parametrize("parts", [
+    ["S" * 3001],
+    [" leading " + ("A" * 1700), ("B" * 1700) + " trailing "],
+])
+def test_long_mapped_assistant_answer_is_exact_and_creates_no_execution_row(frame, monkeypatch, parts):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "long answer")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    offset = 0
+    for part in parts:
+        mapped = map_session_event({
+            "type": "assistant.delta", "session_id": session_id, "offset": offset,
+            "payload": {"type": "assistant.delta", "turnId": TEST_TURN_ID, "agentId": "main", "delta": part},
+        })
+        frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(mapped)))
+        offset += len(part)
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id=TEST_TURN_ID, status="completed"))
+    assert frame.active_session_turns[-1]["answer_md"] == "".join(parts)
+    assert not any(step.get("display_kind") == "assistant" for step in frame._current_chat_state["execution_steps"])
+
+
+def test_tool_progress_updates_same_item_detail_without_new_row_and_reloads(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "progress")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(type="item_started", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-p", title="Run", display_kind="command",
+        data={"source_kind": "tool.call.started", "operation_kind": "command"}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-p", text=" line 1 ", raw_text=" line 1 ", display_kind="commentary",
+        data={"source_kind": "tool.progress"}))
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("item_id") == "tool-p"]
+    assert len(steps) == 1
+    assert " line 1 " in steps[0]["detail_text"]
+    assert steps[0]["diagnostic_history"][-1]["text"] == " line 1 "
+    frame._flush_execution_step_persists_sync()
+    restarted = main.ChatStore(frame.chat_store.db_path)
+    restarted.initialize()
+    stored = [step for step in restarted.load_execution_steps(_active_chat_id(frame)) if step.get("item_id") == "tool-p"]
+    assert len(stored) == 1
+    assert stored[0]["diagnostic_history"][-1]["text"] == " line 1 "
+    assert frame._execution_meta_tuple(0, stored[0])[3] == stored[0]["detail_text"]
 
 
 def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, monkeypatch):
@@ -341,12 +436,36 @@ def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, m
 
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
     assert [step["list_text"] for step in steps] == [
-        "正在执行搜索：Search source tree",
-        "正在执行读取文件：Read README.md",
-        "正在执行测试：Run tests",
-        "正在执行子任务：Delegate review",
+        "正在执行搜索",
+        "正在执行读取文件",
+        "正在执行命令",
+        "正在执行子任务",
     ]
     assert [step["detail_text"] for step in steps] == ["开始执行：Search source tree", "开始执行：Read README.md", "开始执行：Run tests\n命令：pytest -q", "开始执行：Delegate review"]
+    assert not any(
+        raw in step["list_text"]
+        for step in steps
+        for raw in ("Search source tree", "README.md", "pytest", "Delegate review")
+    )
+
+
+def test_mapped_test_retry_error_warning_and_unknown_actions_project_safe_stages(frame):
+    messages = [
+        {"type": "tool.call.started", "payload": {"type": "tool.call.started", "toolCallId": "test-1", "display": {"kind": "command", "operation": "test"}}},
+        {"type": "turn.step.retrying", "payload": {"type": "turn.step.retrying", "stepId": "retry-1"}},
+        {"type": "turn.step.interrupted", "payload": {"type": "turn.step.interrupted", "stepId": "stop-1", "message": "raw failure"}},
+        {"type": "warning", "payload": {"type": "warning", "message": "raw warning"}},
+        {"type": "database.query.started", "payload": {"type": "database.query.started", "itemId": "unknown-1"}},
+    ]
+    labels = []
+    for message in messages:
+        message["session_id"] = "session"
+        message["payload"]["turnId"] = "turn"
+        mapped = map_session_event(message)
+        entry = frame._build_execution_entry(main.CodexEvent(**event_to_payload(mapped)))
+        labels.append(entry["list_text"] if entry else None)
+    assert labels == ["正在执行测试", "正在等待", "执行失败", "执行警告", "正在处理任务"]
+    assert all("raw" not in label for label in labels if label)
 
 
 def test_kimi_tool_completion_updates_started_item_with_result_and_failure(frame, monkeypatch):
@@ -372,7 +491,9 @@ def test_kimi_tool_completion_updates_started_item_with_result_and_failure(frame
         if step.get("item_id") == "tool-command"
     ]
     assert len(matching) == 1
-    assert matching[0]["list_text"] == "执行失败：Run checks"
+    assert matching[0]["list_text"] == "执行失败命令"
+    assert "Run checks" not in matching[0]["list_text"]
+    assert "pytest" not in matching[0]["list_text"]
     assert "退出码：2" in matching[0]["detail_text"]
     assert "two tests failed" in matching[0]["detail_text"]
     frame._flush_execution_step_persists_sync()
@@ -380,18 +501,18 @@ def test_kimi_tool_completion_updates_started_item_with_result_and_failure(frame
     assert len(stored) == 1
     assert stored[0]["event_type"] == "item_completed"
     assert stored[0]["status"] == "failed"
-    assert stored[0]["event_id"] != "tool-command"
+    assert stored[0]["_execution_uid"] == matching[0]["_execution_uid"]
     assert "two tests failed" in stored[0]["detail_text"]
 
 
 def test_kimi_summary_normalizes_nested_exit_codes(frame):
     success = frame._build_execution_entry(main.CodexEvent(
         type="item_completed", item_id="tool-success", display_kind="command", status="completed",
-        data={"source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "0"}},
+        data={"adapter": "kimi_server", "source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "0"}},
     ))
     failure = frame._build_execution_entry(main.CodexEvent(
         type="item_completed", item_id="tool-failure", display_kind="command", status="completed",
-        data={"source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "3"}},
+        data={"adapter": "kimi_server", "source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "3"}},
     ))
 
     assert success["exit_code"] == 0
@@ -448,7 +569,7 @@ def test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_st
             break
 
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == ["正在分析问题", "已完成：Searching *.md"]
+    assert [step["list_text"] for step in steps] == ["正在分析问题", "已完成搜索"]
     assert "Searching *.md" in steps[-1]["detail_text"]
 
 
@@ -475,8 +596,7 @@ def test_mapped_assistant_delta_whitespace_is_preserved_in_answer_and_execution_
 
     assert frame.active_session_turns[-1]["answer_md"] == " leading trailing "
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == ["leading", "trailing"]
-    assert [step["detail_text"] for step in steps] == [" leading", " trailing"]
+    assert steps == []
 
 
 def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
@@ -2042,7 +2162,7 @@ def test_legacy_owner_migration_uses_time_to_disambiguate_repeated_question(fram
     )["turn_idx"] == 0
 
 
-def test_subagent_assistant_delta_is_kept_in_execution_progress(frame, monkeypatch):
+def test_subagent_assistant_delta_is_not_exposed_as_execution_progress(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
     _submit(frame, "main task")
     session_id = fake.created_sessions[0]["session_id"]
@@ -2052,10 +2172,7 @@ def test_subagent_assistant_delta_is_kept_in_execution_progress(frame, monkeypat
         data={"agent_id": "agent-1", "source_kind": "assistant.delta"},
     ))
 
-    assert any(
-        "subagent prose" in str(step)
-        for step in frame._current_chat_state.get("execution_steps", [])
-    )
+    assert not any("subagent prose" in str(step) for step in frame._current_chat_state.get("execution_steps", []))
     assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
 
 
