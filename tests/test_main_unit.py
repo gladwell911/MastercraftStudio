@@ -15,6 +15,206 @@ import main
 import speech_input
 
 
+@pytest.mark.parametrize(
+    "times,separator_indexes",
+    [
+        ([0, 200, 299.999, 300, 599.999, 600], [0, 3, 5]),
+        ([1000, 1299.999, 1300], [0, 2]),
+    ],
+)
+def test_execution_time_groups_use_last_displayed_anchor(frame, times, separator_indexes):
+    frame.current_chat_id = frame.active_chat_id = "grouping"
+    frame._current_chat_state = {
+        "id": "grouping", "revision": 7, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": str(index), "created_at": timestamp, "_execution_uid": f"event-{index}", "revision": 7}
+            for index, timestamp in enumerate(times)
+        ],
+    }
+    rows, metas = frame._execution_page_projection()
+    assert [meta[1] for meta in metas if meta[0] == "time"] == separator_indexes
+    assert sum(meta[0] != "time" for meta in metas) == len(times)
+    assert all("revision:7" in row_id for (row_id, _), meta in zip(rows, metas) if meta[0] == "time")
+
+
+def test_unknown_legacy_execution_separator_identity_survives_prepend(frame):
+    frame.current_chat_id = frame.active_chat_id = "legacy"
+    legacy = {"step": "unknown", "created_at": None}
+    frame._current_chat_state = {
+        "id": "legacy", "revision": 2, "turns": [], "detail_panel_mode": "execution", "execution_steps": [legacy],
+    }
+    first_rows, first_meta = frame._execution_page_projection()
+    first_time_id = next(row[0] for row, meta in zip(first_rows, first_meta) if meta[0] == "time")
+    assert "legacy-quarantine" in first_time_id
+    frame._current_chat_state["execution_steps"].insert(
+        0, {"step": "older", "created_at": None, "_execution_uid": "older", "revision": 2}
+    )
+    second_rows, second_meta = frame._execution_page_projection()
+    unknown_index = next(i for i, meta in enumerate(second_meta) if meta[0] != "time" and meta[2] == "unknown")
+    assert second_rows[unknown_index - 1][0] == first_time_id
+
+
+def test_legacy_native_identity_uses_complete_story32_scope(frame):
+    frame.current_chat_id = frame.active_chat_id = "scope"
+    frame._current_chat_state = {
+        "id": "scope", "revision": 3, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [
+            {"step": "a", "item_id": "reused", "turn_id": "turn-a", "provider": "codex", "created_at": None},
+            {"step": "b", "item_id": "reused", "turn_id": "turn-b", "provider": "codex", "created_at": None},
+            {"step": "c", "item_id": "reused", "turn_id": "turn-a", "provider": "kimi", "created_at": None},
+        ],
+    }
+    rows, metas = frame._execution_page_projection()
+    content_ids = [row[0] for row, meta in zip(rows, metas) if meta[0] != "time"]
+    time_ids = [row[0] for row, meta in zip(rows, metas) if meta[0] == "time"]
+    assert len(set(content_ids)) == 3
+    assert len(set(time_ids)) == 3
+
+
+def test_identityless_legacy_ids_survive_deepcopy_reload_and_prepend(frame):
+    duplicate = {"step": "same", "detail_text": "immutable legacy payload", "created_at": None}
+    timeline = [copy.deepcopy(duplicate), copy.deepcopy(duplicate)]
+    frame.current_chat_id = frame.active_chat_id = "copied"
+    frame._current_chat_state = {
+        "id": "copied", "revision": 4, "turns": [], "detail_panel_mode": "execution", "execution_steps": timeline,
+    }
+    first_rows, first_meta = frame._execution_page_projection()
+    first_content = [row[0] for row, meta in zip(first_rows, first_meta) if meta[0] != "time"]
+    first_times = [row[0] for row, meta in zip(first_rows, first_meta) if meta[0] == "time"]
+    assert len(set(first_content)) == len(set(first_times)) == 2
+    frame._current_chat_state["execution_steps"] = [
+        {"step": "older", "detail_text": "different immutable payload", "created_at": None},
+        *copy.deepcopy(timeline),
+    ]
+    second_rows, second_meta = frame._execution_page_projection()
+    second_content = [row[0] for row, meta in zip(second_rows, second_meta) if meta[0] != "time"][1:]
+    second_times = [row[0] for row, meta in zip(second_rows, second_meta) if meta[0] == "time"][1:]
+    assert second_content == first_content
+    assert second_times == first_times
+
+
+def test_focused_unknown_separator_survives_identity_preserving_reload(frame):
+    row = {"step": "unknown", "detail_text": "immutable", "created_at": None}
+    frame.current_chat_id = frame.active_chat_id = "focus-legacy"
+    frame._current_chat_state = {
+        "id": "focus-legacy", "revision": 5, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [row],
+    }
+    frame._render_execution_list(force=True)
+    time_index = next(i for i, meta in enumerate(frame.execution_meta) if meta[0] == "time")
+    frame.execution_list.SetSelection(time_index)
+    selected_id = frame.execution_list_model.selected_id()
+    frame._acquire_execution_focus_lease()
+    frame._current_chat_state["execution_steps"] = [copy.deepcopy(row)]
+    frame._render_execution_list(force=True)
+    assert frame.execution_list_model.selected_id() == selected_id
+    assert frame.execution_list.GetSelection() == time_index
+
+
+def test_focused_second_identical_legacy_row_blocks_ambiguous_older_prepend(frame):
+    duplicate = {"step": "same", "detail_text": "identical immutable legacy payload", "created_at": None}
+    frame.current_chat_id = frame.active_chat_id = "duplicate-prepend"
+    frame._current_chat_state = {
+        "id": "duplicate-prepend", "revision": 6, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [copy.deepcopy(duplicate), copy.deepcopy(duplicate)],
+    }
+    frame._render_execution_list(force=True)
+    content_indexes = [i for i, meta in enumerate(frame.execution_meta) if meta[0] != "time"]
+    second_content_index = content_indexes[1]
+    second_content_id = frame.execution_list_model.visible_ids[second_content_index]
+    second_time_id = frame.execution_list_model.visible_ids[second_content_index - 1]
+    frame.execution_list.SetSelection(second_content_index - 1)
+    frame._acquire_execution_focus_lease()
+    prior_ids = list(frame.execution_list_model.visible_ids)
+    prior_labels = list(frame.execution_list.GetStrings())
+    prior_meta = list(frame.execution_meta)
+
+    frame._current_chat_state["execution_steps"] = [
+        copy.deepcopy(duplicate),
+        *copy.deepcopy(frame._current_chat_state["execution_steps"]),
+    ]
+    frame._render_execution_list(force=True)
+
+    assert len(frame._current_chat_state["execution_steps"]) == 3
+    assert frame.execution_list_model.visible_ids == prior_ids
+    assert list(frame.execution_list.GetStrings()) == prior_labels
+    assert frame.execution_meta == prior_meta
+    assert frame.execution_list_model.selected_id() == second_time_id
+    assert frame.execution_list_model.visible_ids[frame.execution_list.GetSelection() + 1] == second_content_id
+
+    # A hydration/reload deep copy must reproduce the same end-relative IDs.
+    frame._current_chat_state["execution_steps"] = copy.deepcopy(frame._current_chat_state["execution_steps"])
+    frame._render_execution_list(force=True)
+    assert frame.execution_list_model.selected_id() == second_time_id
+    assert frame.execution_list_model.visible_ids[frame.execution_list.GetSelection() + 1] == second_content_id
+
+
+def test_late_identical_identityless_insertion_is_blocked(frame):
+    duplicate = {"step": "same", "detail_text": "indistinguishable", "created_at": None}
+    frame.current_chat_id = frame.active_chat_id = "late-ambiguous"
+    frame._current_chat_state = {
+        "id": "late-ambiguous", "revision": 1, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [copy.deepcopy(duplicate)],
+    }
+    frame._execution_page_projection()
+    frame._current_chat_state["execution_steps"].append(copy.deepcopy(duplicate))
+    with pytest.raises(main.ExecutionIdentityBlocked, match="ambiguous insertion"):
+        frame._execution_page_projection()
+
+
+def test_mixed_middle_identical_insertion_blocks_without_native_replacement(frame):
+    duplicate = {"step": "D", "detail_text": "same D", "created_at": None}
+    other = {"step": "X", "detail_text": "different X", "created_at": None}
+    frame.current_chat_id = frame.active_chat_id = "mixed-ambiguous"
+    frame._current_chat_state = {
+        "id": "mixed-ambiguous", "revision": 1, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [copy.deepcopy(duplicate), copy.deepcopy(other), copy.deepcopy(duplicate)],
+    }
+    frame._render_execution_list(force=True)
+    first_time = next(i for i, meta in enumerate(frame.execution_meta) if meta[0] == "time")
+    frame.execution_list.SetSelection(first_time)
+    frame._acquire_execution_focus_lease()
+    prior_ids = list(frame.execution_list_model.visible_ids)
+    prior_labels = list(frame.execution_list.GetStrings())
+    selected_id = frame.execution_list_model.selected_id()
+    frame._current_chat_state["execution_steps"] = [
+        copy.deepcopy(duplicate), copy.deepcopy(duplicate), copy.deepcopy(other), copy.deepcopy(duplicate),
+    ]
+    frame._render_execution_list(force=True)
+    assert len(frame._current_chat_state["execution_steps"]) == 4
+    assert frame.execution_list_model.visible_ids == prior_ids
+    assert list(frame.execution_list.GetStrings()) == prior_labels
+    assert frame.execution_list_model.selected_id() == selected_id
+
+
+@pytest.mark.parametrize(
+    "initial,replacement",
+    [
+        (["D", "X"], ["D", "D"]),
+        (["D", "X", "Y"], ["D", "D"]),
+    ],
+)
+def test_identityless_duplicate_count_increase_blocks_even_without_total_growth(frame, initial, replacement):
+    def row(value):
+        return {"step": value, "detail_text": f"immutable {value}", "created_at": None}
+
+    frame.current_chat_id = frame.active_chat_id = "count-ambiguity"
+    frame._current_chat_state = {
+        "id": "count-ambiguity", "revision": 1, "turns": [], "detail_panel_mode": "execution",
+        "execution_steps": [row(value) for value in initial],
+    }
+    frame._render_execution_list(force=True)
+    frame.execution_list.SetSelection(0)
+    prior_ids = list(frame.execution_list_model.visible_ids)
+    prior_labels = list(frame.execution_list.GetStrings())
+    selected_id = frame.execution_list_model.selected_id()
+    frame._current_chat_state["execution_steps"] = [row(value) for value in replacement]
+    frame._render_execution_list(force=True)
+    assert frame.execution_list_model.visible_ids == prior_ids
+    assert list(frame.execution_list.GetStrings()) == prior_labels
+    assert frame.execution_list_model.selected_id() == selected_id
+
+
 def _execution_content_labels(frame):
     """Return execution content rows while ignoring separate time nodes."""
     return [
@@ -8882,6 +9082,26 @@ def test_execution_delta_buffer_flushes_into_single_commentary_item(frame, monke
     assert frame._current_chat_state["execution_steps"][0]["event_type"] == "agent_message_delta"
     assert frame._current_chat_state["execution_steps"][0]["display_kind"] == "commentary"
     assert frame._current_chat_state["execution_steps"][0]["detail_text"] == "先检查 main.py。再处理 codex_client.py。"
+
+
+@pytest.mark.parametrize("provider_origin,expected", [(1_795_000_000.0, 1_795_000_000.0), (None, 1_800_000_000.0)])
+def test_execution_delta_delayed_flush_retains_first_origin_or_fallback(
+    frame, monkeypatch, provider_origin, expected
+):
+    frame.active_chat_id = frame.current_chat_id = "origin"
+    frame._current_chat_state = {"id": "origin", "turns": [], "execution_steps": []}
+    frame._chat_store_enabled = False
+    clock = iter([1_800_000_000.0, 1_800_000_100.0, 1_800_000_200.0])
+    monkeypatch.setattr(main.time, "time", lambda: next(clock))
+    common = dict(type="agent_message_delta", thread_id="thread", turn_id="turn", item_id="item")
+    frame._buffer_execution_delta("origin", main.CodexEvent(
+        **common, fragment_id="one", text="first", origin_timestamp=provider_origin
+    ))
+    frame._buffer_execution_delta("origin", main.CodexEvent(
+        **common, fragment_id="two", text=" second", origin_timestamp=1_795_000_999.0
+    ))
+    assert frame._flush_execution_delta("origin", "turn", "item") is True
+    assert frame._current_chat_state["execution_steps"][0]["created_at"] == expected
 
 
 def test_execution_delta_flush_preserves_fragment_edge_whitespace(frame, monkeypatch):

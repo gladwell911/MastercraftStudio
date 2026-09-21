@@ -4,9 +4,23 @@ import wx
 
 import main
 from codex_client import CodexAppServerClient, CodexEvent, resolve_codex_launch_command
+import codex_client
 
 TEST_THREAD_ID = "019d36ab-804a-73a2-a2dd-7a17e181628f"
 TEST_TURN_ID = "019d36b3-0a1c-7c61-aed9-387f6afbb9f9"
+
+
+def test_codex_origin_timestamp_normalization_matches_provider_contract():
+    seconds = 1_795_000_000.0
+    assert codex_client._provider_origin_timestamp({"timestamp": seconds}) == seconds
+    assert codex_client._provider_origin_timestamp({"created_at": str(int(seconds * 1000))}) == seconds
+    assert codex_client._provider_origin_timestamp({"createdAt": "2026-09-21T08:30:00Z"}) is not None
+    for invalid in (True, float("nan"), float("inf"), "2026-09-21T08:30:00", 12.5):
+        assert codex_client._provider_origin_timestamp({"timestamp": invalid}) is None
+    assert codex_client._provider_origin_timestamp({"time": seconds}) is None
+    assert codex_client._provider_origin_timestamp(
+        {"timestamp": seconds}, {"timestamp": seconds + 1}
+    ) == seconds
 
 
 class _ImmediateThread:

@@ -26,6 +26,31 @@ from kimi_server_client import (
 )
 
 
+@pytest.mark.parametrize("event_type", ["tool.call.started", "tool.result", "turn.step.started", "session.meta.updated"])
+def test_visible_and_lifecycle_events_retain_envelope_origin_timestamp(event_type):
+    payload = {"type": event_type, "turnId": "turn-1", "toolCallId": "tool-1", "stepId": "step-1"}
+    event = kimi_server_client.map_session_event({
+        "type": event_type, "session_id": "session-1", "timestamp": "2026-09-21T08:30:00Z", "payload": payload,
+    })
+    assert event is not None
+    assert event.origin_timestamp == pytest.approx(1_789_979_400.0)
+
+
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "2026-09-21T08:30:00", "12.5", 12.5])
+def test_kimi_origin_timestamp_rejects_ambiguous_or_implausible_values(value):
+    assert kimi_server_client._provider_origin_timestamp({"timestamp": value}) is None
+
+
+def test_kimi_origin_timestamp_normalizes_seconds_milliseconds_and_precedence():
+    seconds = 1_795_000_000.0
+    assert kimi_server_client._provider_origin_timestamp({"timestamp": seconds}) == seconds
+    assert kimi_server_client._provider_origin_timestamp({"createdAt": str(int(seconds * 1000))}) == seconds
+    assert kimi_server_client._provider_origin_timestamp(
+        {"timestamp": seconds}, {"timestamp": seconds + 1}
+    ) == seconds
+    assert kimi_server_client._provider_origin_timestamp({"time": seconds}) is None
+
+
 # ----------------------------------------------------------------------
 # fakes
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 import tempfile
+from datetime import datetime
 
 from context_usage import context_window_for_model, normalize_context_usage
 
@@ -298,6 +299,42 @@ class CodexEvent:
     stream_id: str = ""
     tool_call_id: str = ""
     revision: int | None = None
+    origin_timestamp: float | None = None
+
+
+_MIN_PROVIDER_EPOCH = 946684800.0  # 2000-01-01 UTC
+_MAX_PROVIDER_EPOCH = 4102444800.0  # 2100-01-01 UTC
+
+
+def _provider_origin_timestamp(*payloads: dict) -> float | None:
+    """Return a schema-authoritative, plausible Unix origin in seconds."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("created_at", "createdAt", "timestamp"):
+            value = payload.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                parsed = float(value)
+            elif isinstance(value, str) and value.strip():
+                try:
+                    parsed = float(value.strip())
+                except ValueError:
+                    try:
+                        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                        if moment.tzinfo is None or moment.utcoffset() is None:
+                            continue
+                        parsed = moment.timestamp()
+                    except (ValueError, OverflowError, OSError):
+                        continue
+            else:
+                continue
+            if 1_000_000_000_000.0 <= parsed <= 4_102_444_800_000.0:
+                parsed /= 1000.0
+            if parsed == parsed and abs(parsed) != float("inf") and _MIN_PROVIDER_EPOCH <= parsed <= _MAX_PROVIDER_EPOCH:
+                return parsed
+    return None
 
 
 def _first_non_empty(*values) -> str:
@@ -353,7 +390,7 @@ def _item_file_change_summary(item: dict) -> str:
     return _first_non_empty(item.get("summary"), item.get("description"), "File change")
 
 
-def _event_from_item(method: str, params: dict) -> CodexEvent:
+def _event_from_item(method: str, params: dict, raw: dict | None = None) -> CodexEvent:
     item = params.get("item") if isinstance(params.get("item"), dict) else {}
     item_type = str(item.get("type") or "").strip()
     raw_text = str(item.get("text") or "")
@@ -403,6 +440,7 @@ def _event_from_item(method: str, params: dict) -> CodexEvent:
         session_id=str(params.get("threadId") or ""),
         stream_id=str(item.get("id") or ""),
         tool_call_id=str(item.get("toolCallId") or item.get("callId") or ""),
+        origin_timestamp=_provider_origin_timestamp(item, params, raw or {}),
     )
 
 
@@ -979,11 +1017,12 @@ class CodexAppServerClient:
                     offset=params.get("offset") if isinstance(params.get("offset"), int) else None,
                     session_id=str(params.get("threadId") or ""),
                     stream_id=str(params.get("itemId") or ""),
+                    origin_timestamp=_provider_origin_timestamp(params, raw),
                 )
             )
             return
         if method in {"item/started", "item/completed"}:
-            self._emit_event(_event_from_item(method, params))
+            self._emit_event(_event_from_item(method, params, raw))
             return
         if method == "stderr":
             line = str(params.get("line") or "")
@@ -1010,6 +1049,8 @@ class CodexAppServerClient:
         self._emit_event(CodexEvent(type="notification", method=method, params=params, data=raw))
 
     def _emit_event(self, event: CodexEvent) -> None:
+        if event.origin_timestamp is None:
+            event.origin_timestamp = _provider_origin_timestamp(event.data, event.params)
         if event.type == "token_count" and event.usage:
             self.last_context_usage = event.usage
         if callable(self.on_event):

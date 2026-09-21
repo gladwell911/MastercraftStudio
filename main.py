@@ -19,7 +19,7 @@ import webbrowser
 import winsound
 import sys
 from dataclasses import dataclass
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from ctypes import wintypes
 from datetime import datetime
@@ -1515,6 +1515,10 @@ class CommonCommandsDialog(wx.Dialog):
 
 class ExecutionPagePending(Exception):
     """A bounded history page is being completed off the GUI thread."""
+
+
+class ExecutionIdentityBlocked(Exception):
+    """An ambiguous legacy insertion cannot be projected safely."""
 
 
 class ChatFrame(wx.Frame):
@@ -6474,6 +6478,7 @@ class ChatFrame(wx.Frame):
         safe_raw_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "raw_text", "") or ""))
         safe_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "text", "") or ""))
         safe_source_detail = {} if private_reasoning else self._safe_kimi_source_detail(item)
+        origin_timestamp = _finite_timestamp(getattr(event, "origin_timestamp", None))
         entry = {
             "event_type": event_type,
             "display_kind": display_kind,
@@ -6495,7 +6500,7 @@ class ChatFrame(wx.Frame):
             "source_detail": safe_source_detail,
             "operation_kind": str(item.get("operation_kind") or display_kind or "").strip(),
             "private_reasoning": bool(private_reasoning),
-            "created_at": time.time(),
+            "created_at": origin_timestamp if origin_timestamp is not None else time.time(),
             "provider": str(getattr(event, "provider", "") or item.get("adapter") or "codex").strip(),
             "provider_event_id": str(getattr(event, "event_id", "") or item.get("event_id") or item.get("eventId") or "").strip(),
             "fragment_id": str(getattr(event, "fragment_id", "") or item.get("fragment_id") or item.get("fragmentId") or "").strip(),
@@ -6517,7 +6522,7 @@ class ChatFrame(wx.Frame):
             return False
         return self._append_execution_entry_to_chat(chat_id, {"step": text}, save_state=save_state)
 
-    def _execution_row_id(self, step_idx: int, step) -> str:
+    def _execution_row_id(self, step_idx: int, step, occurrence: int = 0) -> str:
         chat_id = self._visible_execution_chat_id()
         if isinstance(step, dict):
             if step.get("logical_key"):
@@ -6528,7 +6533,72 @@ class ChatFrame(wx.Frame):
                 return f"execution:{chat_id}:uid:{step['_execution_uid']}"
             if "_store_step_index" in step:
                 return f"execution:{chat_id}:store:{step['_store_step_index']}"
-        return f"execution:{chat_id}:position:{step_idx}"
+            native_id = str(step.get("event_id") or step.get("id") or step.get("item_id") or "").strip()
+            if native_id:
+                stable = hashlib.sha256(json.dumps(
+                    ["legacy-event", *self._execution_legacy_native_scope(step), int(occurrence)],
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                return f"execution:{chat_id}:legacy-event:{stable}"
+        stable = hashlib.sha256(json.dumps(
+            ["legacy-record", chat_id, self._execution_legacy_record_fingerprint(step), int(occurrence)],
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        return f"execution:{chat_id}:legacy-quarantine:{stable}"
+
+    def _execution_legacy_native_scope(self, step: dict) -> list:
+        state = self._visible_execution_chat_state() or {}
+        chat_id = self._visible_execution_chat_id()
+        provider = str(step.get("provider") or step.get("adapter") or "legacy").replace("_server", "").strip().lower()
+        turn_value = step.get("turn_id") or step.get("turnId")
+        if turn_value is None or str(turn_value).strip() == "":
+            turn_value = step.get("turn_idx")
+        return [
+            chat_id,
+            self._safe_int(step.get("revision"), self._safe_int(state.get("revision"), 1)),
+            "" if turn_value is None else str(turn_value).strip(),
+            provider,
+            str(step.get("agent_id") or step.get("agentId") or "").strip(),
+            str(step.get("thread_id") or step.get("threadId") or step.get("session_id") or "").strip(),
+            str(step.get("session_id") or step.get("thread_id") or "").strip(),
+            str(step.get("event_id") or step.get("id") or step.get("item_id") or "").strip(),
+        ]
+
+    def _execution_legacy_record_fingerprint(self, step) -> str:
+        if not isinstance(step, dict):
+            payload = {"value_type": type(step).__name__, "value": str(step or "")}
+        else:
+            payload = {key: value for key, value in step.items() if key not in {
+                "_store_step_index", "_execution_uid", "updated_at", "status",
+            }}
+        return hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+
+    def _execution_legacy_identity_bucket(self, step) -> tuple:
+        if isinstance(step, dict):
+            if "_store_step_index" in step:
+                return ("store", self._visible_execution_chat_id(), step.get("_store_step_index"))
+            native_id = str(step.get("event_id") or step.get("id") or step.get("item_id") or "").strip()
+            if native_id and not any(step.get(key) for key in ("logical_key", "synthetic", "_execution_uid")):
+                return ("native", *self._execution_legacy_native_scope(step))
+        return ("record", self._execution_legacy_record_fingerprint(step))
+
+    def _execution_separator_anchor_id(self, step_idx: int, step, occurrence: int = 0) -> str:
+        chat_id = self._visible_execution_chat_id()
+        if isinstance(step, dict) and "_store_step_index" in step and not any(
+            step.get(key) for key in ("logical_key", "synthetic", "_execution_uid", "event_id", "id", "item_id")
+        ):
+            revision = self._safe_int(step.get("revision"), 1)
+            stable = hashlib.sha256(
+                f"legacy-store-record\0{chat_id}\0{revision}\0{step['_store_step_index']}".encode("utf-8")
+            ).hexdigest()
+            return f"execution:{chat_id}:legacy-store:{stable}"
+        if isinstance(step, dict) and "_store_step_index" in step:
+            without_position = dict(step)
+            without_position.pop("_store_step_index", None)
+            return self._execution_row_id(step_idx, without_position, occurrence)
+        return self._execution_row_id(step_idx, step, occurrence)
 
     def _visible_execution_chat_state(self) -> dict | None:
         if self._detail_panel_mode() != "execution":
@@ -7131,10 +7201,12 @@ class ChatFrame(wx.Frame):
         logical_key = hashlib.sha256(json.dumps(scope_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
         key = (str(chat_id or ""), turn_scope, native_id, display_kind, agent_id, source_kind)
         offset = getattr(event, "offset", None) if getattr(event, "offset", None) is not None else event_data.get("offset")
+        accepted_origin = _finite_timestamp(getattr(event, "origin_timestamp", None))
         state = self._execution_delta_buffer.setdefault(
             key,
             {"parts": [], "segments": {}, "conflicts": [], "fragment_ids": set(), "fragment_signatures": {}, "event": event,
-             "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False},
+             "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False,
+             "origin_timestamp": accepted_origin if accepted_origin is not None else time.time()},
         )
         if display_kind == "thinking" and self._kimi_private_reasoning(event_data):
             state["private_reasoning"] = True
@@ -7308,6 +7380,7 @@ class ChatFrame(wx.Frame):
                 stream_id=str(getattr(base_event, "stream_id", "") or buf_item_id),
                 tool_call_id=str(getattr(base_event, "tool_call_id", "") or ""),
                 revision=getattr(base_event, "revision", None),
+                origin_timestamp=_finite_timestamp(state.get("origin_timestamp")),
             )
             entry = self._build_execution_entry(merged_event)
             if entry and self._append_execution_entry_to_chat(chat_id, entry, save_state=False):
@@ -7577,6 +7650,35 @@ class ChatFrame(wx.Frame):
         self._execution_projection_legacy_keys = {}
         total_steps = max(total_steps, len(steps))
         visible_items = []
+        identity_buckets = [self._execution_legacy_identity_bucket(step) for step in steps]
+        owner_key = (
+            self._visible_execution_chat_id(),
+            self._safe_int((self._visible_execution_chat_state() or {}).get("revision"), 1),
+        )
+        prior_timelines = getattr(self, "_legacy_execution_authoritative_buckets", None)
+        if not isinstance(prior_timelines, dict):
+            prior_timelines = {}
+            self._legacy_execution_authoritative_buckets = prior_timelines
+        previous_buckets = prior_timelines.get(owner_key)
+        if isinstance(previous_buckets, list):
+            previous_counts = Counter(bucket for bucket in previous_buckets if bucket[0] == "record")
+            current_counts = Counter(bucket for bucket in identity_buckets if bucket[0] == "record")
+            if any(previous_counts[bucket] and count > previous_counts[bucket]
+                   for bucket, count in current_counts.items()):
+                raise ExecutionIdentityBlocked("ambiguous insertion of identity-less execution record")
+        prior_timelines[owner_key] = list(identity_buckets)
+        authoritative_occurrences = {}
+        identity_occurrences = [0] * len(steps)
+        # Count identical legacy records from the newest/end side. Historical
+        # paging prepends older rows, so existing duplicate identities remain
+        # unchanged. A late insertion of an indistinguishable newer record is
+        # intentionally outside this migration contract and must not be used
+        # as an identity inference.
+        for index in range(len(steps) - 1, -1, -1):
+            step = steps[index]
+            bucket = identity_buckets[index]
+            identity_occurrences[index] = authoritative_occurrences.get(bucket, 0)
+            authoritative_occurrences[bucket] = authoritative_occurrences.get(bucket, 0) + 1
         for idx, step in enumerate(steps):
             if not self._should_show_execution_step(step):
                 continue
@@ -7584,7 +7686,8 @@ class ChatFrame(wx.Frame):
             row_text = str(meta[2] or "").strip()
             if not row_text:
                 continue
-            visible_items.append((row_text, meta, step, source_positions[idx]))
+            occurrence = identity_occurrences[idx]
+            visible_items.append((row_text, meta, step, source_positions[idx], occurrence))
         self.execution_total_content_rows = len(visible_items)
         limit = max(
             EXECUTION_LIST_DEFAULT_VISIBLE_ROWS,
@@ -7601,21 +7704,26 @@ class ChatFrame(wx.Frame):
         if not visible_items:
             return [("__execution_info__", "暂无执行过程")], [("info", -1, "", "")]
         row_ids = ["__execution_more__"] if has_more else []
-        previous_timestamp = None
-        for row_text, meta, step, source_position in visible_items:
+        separator_anchor_timestamp = None
+        render_now = time.time()
+        for row_text, meta, step, source_position, occurrence in visible_items:
             timestamp = _execution_timestamp(step)
-            if should_show_time(previous_timestamp, timestamp):
-                anchor_id = self._execution_row_id(source_position, step)
-                rows.append(wechat_time_label(timestamp, time.time()))
+            if should_show_time(separator_anchor_timestamp, timestamp):
+                anchor_id = self._execution_separator_anchor_id(source_position, step, occurrence)
+                revision = self._safe_int(
+                    step.get("revision") if isinstance(step, dict) else None,
+                    self._safe_int((self._visible_execution_chat_state() or {}).get("revision"), 1),
+                )
+                rows.append(wechat_time_label(timestamp, render_now))
                 metas.append(("time", meta[1], "", ""))
-                row_ids.append(f"execution:time:{anchor_id}")
+                row_ids.append(f"execution:time:revision:{revision}:{anchor_id}")
+                separator_anchor_timestamp = timestamp
             rows.append(row_text)
             metas.append(meta)
-            row_id = self._execution_row_id(source_position, step)
+            row_id = self._execution_row_id(source_position, step, occurrence)
             row_ids.append(row_id)
             if not isinstance(step, dict) or not step.get("_execution_uid"):
                 self._execution_projection_legacy_keys[row_id] = self._execution_legacy_key(step)
-            previous_timestamp = timestamp
         return list(zip(row_ids, rows)), metas
 
     def _show_execution_loading_for_new_owner(self) -> None:
@@ -7648,6 +7756,9 @@ class ChatFrame(wx.Frame):
         except ExecutionPagePending:
             self._execution_list_dirty = True
             self._show_execution_loading_for_new_owner()
+        except ExecutionIdentityBlocked:
+            self._execution_list_dirty = False
+            return False
         except Exception:
             self._execution_list_dirty = True
             self._show_execution_loading_for_new_owner()

@@ -27,6 +27,7 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime
 from collections import deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -165,6 +166,15 @@ class KimiEvent:
     stream_id: str = ""
     tool_call_id: str = ""
     revision: int | None = None
+    origin_timestamp: float | None = None
+
+    def __post_init__(self) -> None:
+        # Constructors that override ``data`` still carry the authoritative
+        # envelope origin through the normalized base data.
+        if self.origin_timestamp is None and isinstance(self.data, dict):
+            value = self.data.get("provider_origin_timestamp")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.origin_timestamp = float(value)
 
 
 def event_to_payload(event: KimiEvent) -> dict[str, Any]:
@@ -208,6 +218,41 @@ def _str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+_MIN_PROVIDER_EPOCH = 946684800.0
+_MAX_PROVIDER_EPOCH = 4102444800.0
+
+
+def _provider_origin_timestamp(*payloads: dict[str, Any]) -> float | None:
+    """Normalize numeric or ISO provider time; malformed values stay absent."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("created_at", "createdAt", "timestamp"):
+            value = payload.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                parsed = float(value)
+            elif isinstance(value, str) and value.strip():
+                try:
+                    parsed = float(value.strip())
+                except ValueError:
+                    try:
+                        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                        if moment.tzinfo is None or moment.utcoffset() is None:
+                            continue
+                        parsed = moment.timestamp()
+                    except (ValueError, OverflowError, OSError):
+                        continue
+            else:
+                continue
+            if 1_000_000_000_000.0 <= parsed <= 4_102_444_800_000.0:
+                parsed /= 1000.0
+            if parsed == parsed and abs(parsed) != float("inf") and _MIN_PROVIDER_EPOCH <= parsed <= _MAX_PROVIDER_EPOCH:
+                return parsed
+    return None
 
 
 def _text_fragment(value: Any) -> str:
@@ -274,6 +319,9 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         "agent_scope": agent_scope,
         "source_kind": body_type,
     }
+    origin_timestamp = _provider_origin_timestamp(body, message)
+    if origin_timestamp is not None:
+        event_data["provider_origin_timestamp"] = origin_timestamp
     for source_key, target_key in (
         ("disclosable", "disclosable"),
         ("isDisclosable", "disclosable"),
@@ -302,6 +350,7 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         "offset": body.get("offset") if isinstance(body.get("offset"), int) else None,
         "stream_id": _str(body.get("messageId") or body.get("toolCallId") or body.get("callId") or body.get("stepId")),
         "tool_call_id": _str(body.get("toolCallId") or body.get("callId")),
+        "origin_timestamp": origin_timestamp,
     }
 
     if body_type == "assistant.delta":
