@@ -14,6 +14,7 @@
 - [`../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md`](../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md)：Kimi F1 执行过程中文化与流式步骤归并的验收规格
 - [`../_bmad-output/implementation-artifacts/spec-fix-execution-ui-blockers.md`](../_bmad-output/implementation-artifacts/spec-fix-execution-ui-blockers.md)：2026-09-08 执行列表增量同步、异步历史分页、等待期归属与真实 GUI 验收；末尾为最终结果，frontmatter 为剩余限制
 - [`../../_bmad-output/implementation-artifacts/spec-2-4-synchronize-the-complete-execution-timeline-to-mobile.md`](../../_bmad-output/implementation-artifacts/spec-2-4-synchronize-the-complete-execution-timeline-to-mobile.md)：Story 2.4 跨端权威执行时间线、冻结分页、缺口恢复与验收结果
+- 2026-09-21 Epics 1–4 最终规格位于工作区 `_bmad-output/implementation-artifacts/`：`spec-1-1-restart-the-current-text-context-once-with-truthful-audio.md`、`spec-2-1-preserve-each-chats-selected-model.md`、`spec-2-2-create-and-name-a-new-chat-immediately.md`、`spec-3-1-show-meaningful-kimi-execution-stages.md`、`spec-3-2-coalesce-one-logical-provider-event-into-one-item.md`、`spec-3-3-group-every-execution-timeline-by-accessible-time.md`、`spec-4-1-edit-answer-detail-temporarily-without-saving.md`。
 - [`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)：2026-09-06 全量非实时测试的历史失败基线与复现范围
 
 ## 关键当前事实
@@ -25,6 +26,8 @@
 - Kimi 的回答列表仅在主代理最终正文获得权威完成确认后更新；子代理过程、不完整流片段和失败终态只保留在执行过程或错误状态，不能提前显示为回答或播放完成音。
 - 执行列表的旧 15 项失败已在上述执行规格逐项归类并修复/更新契约；最终定向验收去重 467 项通过，不代表冻结基线的其他领域或全笔记领域已验证。
 - V2 远程执行时间线以 `durable_facts` 为权威来源；问题和最终回答引用稳定的 canonical message，分页游标绑定 pair、序列域、chat、revision、快照高水位、排他边界和有效期。
+- 桌面执行项按 owner/revision/turn/provider/native event 身份归并；时间节点以“上一次实际显示时间的过程”为累计 300 秒基准，而不是比较相邻行。
+- 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。
 
 ## 历史归档
@@ -36,7 +39,7 @@
 
 这些文档保留用于追溯历史决策，但默认不建议在新会话中优先加载。
 
-[`cross-client-codex-kimicode-audit-2026-09-06.md`](./cross-client-codex-kimicode-audit-2026-09-06.md) 是指定旧提交的跨端审查底稿，不是当前发布结论；开始后续跨端工作前须复核证据。当前跨端执行协议以 Story 2.4 规格和代码为准。
+[`cross-client-codex-kimicode-audit-2026-09-06.md`](./cross-client-codex-kimicode-audit-2026-09-06.md) 是指定旧提交的跨端审查底稿，不是当前发布结论；开始后续跨端工作前须复核证据。跨端 durable 协议仍以 Story 2.4 规格和代码为准，2026-09-21 的桌面事件归并、时间投影和临时详情编辑以对应新规格和当前代码为准。
 
 ## 不再保留的内容
 
