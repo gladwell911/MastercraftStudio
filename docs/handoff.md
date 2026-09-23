@@ -1,8 +1,8 @@
 # 当前交接
 
-## 快照（2026-09-22）
+## 快照（2026-09-23）
 
-当前分支为 `feature/epic-4-answer-detail`，最新产品代码里程碑为 `392bf03adc44244ad2d55e01534ca84e782181f7`，其后只有交接文档同步提交。本阶段 BMAD Epics 1–4 已完成，Epic 5 尚未开始。2026-09-14 的正式包、公网 Live 和哈希记录仅代表上一次发布验证，不包含本阶段新提交。
+当前分支为 `feature/epic-4-answer-detail`，最新 MC 产品代码里程碑为 `392bf03adc44244ad2d55e01534ca84e782181f7`，其后只有交接文档同步提交。MC 的 BMAD Epics 1–4 已完成；RC 已在 `feature/epic-5-mobile-accessibility` 完成 Epic 5 两项代码，提交为 `572689b` 与 `c1db1e1`。2026-09-14 的正式包、公网 Live 和哈希记录仅代表上一次发布验证，不包含这些新提交。
 
 ## 已完成
 
@@ -13,6 +13,8 @@
 - `fb82429`：Codex/Kimi 按完整 owner/revision/provider 事件身份持久归并；重放、缺口、冲突、隐私锁存和重启恢复保持同一稳定行。
 - `5d80f62`：执行列表第一条显示时间，后续相对“上一次显示时间的过程”累计达到或超过 300 秒时显示下一时间；稳定时间节点支持分页、重载和焦点恢复。
 - `392bf03`：回答详情可在当前窗口临时编辑和复制；关闭后丢弃，不改变 canonical 回答、Continue、列表复制、朗读、HTML、持久化或移动同步。
+- RC `572689b`：手机端发送状态只保留标题栏下方一个视觉与语义节点。
+- RC `c1db1e1`：按 owner-qualified 稳定身份路由真实 Android accessibility focus；回答、不可变执行项、通知/历史入口和空聊天均有定向自动化覆盖。
 
 ## 验证状态
 
@@ -20,15 +22,12 @@
 - Story 3.3：13 项主流程、1 项 Codex 时间来源、11 项 Kimi 映射、32 项原生 UI 测试通过；`py_compile` 与 `git diff --check` 通过。
 - Story 4.1：35 项 unit/list 与 8 项原生 wx 测试通过；`py_compile` 与 `git diff --check` 通过。
 - 本阶段未执行真实 provider Live、正式包重建或物理 Windows 读屏验收；不能把定向自动化结果描述为新版本公网发布结论。
+- RC Epic 5 的 8 项 CAP-21 widget 测试、native resolver/dispatcher JVM 测试和 Kotlin 编译通过；实体 Android TalkBack 仍未验收。
 
 ## 当前待办
 
-Epic 5 仍为 backlog：
-
-1. Story 5.1：手机端“消息已发送到电脑端”只保留标题栏下方实例，彻底移除页面底部重复提示。
-2. Story 5.2：收到已合并完成的新回答/执行过程时强制移动 TalkBack 焦点；从通知或聊天列表进入时定位最后一条消息，空聊天定位输入框。
-
-完成 Epic 5 后必须执行实体 Android TalkBack 验收，覆盖状态提示可触摸位置、连续流合并后的焦点、通知入口、历史入口和空聊天输入框。随后再进行真实 Codex/Kimi provider 与跨端 Live 回归。
+1. 执行实体 Android TalkBack 验收，覆盖顶部唯一状态、首次接受的不可变执行项、实时回答、通知入口、历史入口、最后一条用户/助手消息、空聊天输入框、重复文案 identity 和负例不抢焦点。
+2. 运行本地跨端回归，再进行真实 Codex/Kimi provider 与公网 Live 回归；所有发布证据必须基于包含 MC/RC 本阶段提交的新构建。
 
 ## 不要重复踩坑
 
