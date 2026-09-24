@@ -9160,7 +9160,7 @@ def test_non_kimi_item_title_keeps_existing_execution_summary_behavior(frame):
     assert frame._execution_detail_text_from_event(event) == "开始执行：步骤"
 
 
-def test_append_execution_entry_to_chat_dedupes_adjacent_identical_commentary(frame, monkeypatch):
+def test_append_execution_entry_to_chat_keeps_adjacent_identical_commentary_without_identity(frame, monkeypatch):
     frame.active_chat_id = "chat-1"
     frame.current_chat_id = "chat-1"
     frame._current_chat_state = {
@@ -9190,11 +9190,11 @@ def test_append_execution_entry_to_chat_dedupes_adjacent_identical_commentary(fr
         save_state=False,
     )
 
-    assert appended is False
-    assert len(frame._current_chat_state["execution_steps"]) == 1
+    assert appended is True
+    assert len(frame._current_chat_state["execution_steps"]) == 2
 
 
-def test_append_execution_entry_to_chat_dedupes_adjacent_expanded_commentary(frame, monkeypatch):
+def test_append_execution_entry_to_chat_keeps_adjacent_expanded_commentary_without_identity(frame, monkeypatch):
     frame.active_chat_id = "chat-1"
     frame.current_chat_id = "chat-1"
     frame._current_chat_state = {
@@ -9224,8 +9224,8 @@ def test_append_execution_entry_to_chat_dedupes_adjacent_expanded_commentary(fra
         save_state=False,
     )
 
-    assert appended is False
-    assert len(frame._current_chat_state["execution_steps"]) == 1
+    assert appended is True
+    assert len(frame._current_chat_state["execution_steps"]) == 2
 
 
 def test_append_execution_entry_broadcasts_remote_execution_entry(frame, monkeypatch):
@@ -9257,7 +9257,7 @@ def test_append_execution_entry_broadcasts_remote_execution_entry(frame, monkeyp
     assert events[0]["event_id"]
 
 
-def test_deduped_execution_entry_does_not_broadcast_remote_event(frame, monkeypatch):
+def test_identityless_commentary_entry_broadcasts_remote_event(frame, monkeypatch):
     events = []
     monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: events.append(payload))
     frame.active_chat_id = "chat-1"
@@ -9287,9 +9287,82 @@ def test_deduped_execution_entry_does_not_broadcast_remote_event(frame, monkeypa
         save_state=False,
     )
 
-    assert appended is False
-    assert events == []
+    assert appended is True
+    assert len(events) == 1
+    assert events[0]["type"] == "execution_entry"
+    assert events[0]["canonical_item_id"]
 
+
+def test_execution_entry_replay_dedupes_by_stable_provider_identity(frame, monkeypatch):
+    events = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: events.append(payload))
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL}],
+        "execution_steps": [],
+    }
+    entry = {
+        "event_type": "agent_message_delta",
+        "display_kind": "commentary",
+        "detail_text": "正在核对稳定事件身份。",
+        "list_text": "正在核对稳定事件身份。",
+        "session_id": "thread-1",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "provider": "codex",
+        "item_id": "provider-item-1",
+    }
+
+    first = frame._append_execution_entry_to_chat("chat-1", dict(entry), save_state=False)
+    replay = frame._append_execution_entry_to_chat("chat-1", dict(entry), save_state=False)
+
+    assert first is True
+    assert replay is False
+    assert len(frame._current_chat_state["execution_steps"]) == 1
+    assert len(events) == 1
+    assert events[0]["canonical_item_id"] == frame._current_chat_state["execution_steps"][0]["canonical_item_id"]
+
+def test_identical_commentary_from_distinct_provider_items_remains_distinct(frame, monkeypatch):
+    events = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda payload: events.append(payload))
+    frame.active_chat_id = "chat-1"
+    frame.current_chat_id = "chat-1"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {
+        "id": "chat-1",
+        "title": "当前聊天",
+        "turns": [{"question": "q", "answer_md": "", "model": main.DEFAULT_CODEX_MODEL}],
+        "execution_steps": [],
+    }
+    base_entry = {
+        "event_type": "agent_message_delta",
+        "display_kind": "commentary",
+        "detail_text": "我正在检查稳定事件身份。",
+        "list_text": "我正在检查稳定事件身份。",
+        "session_id": "thread-1",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "provider": "codex",
+    }
+
+    first = frame._append_execution_entry_to_chat(
+        "chat-1", dict(base_entry, item_id="provider-item-1"), save_state=False
+    )
+    second = frame._append_execution_entry_to_chat(
+        "chat-1", dict(base_entry, item_id="provider-item-2"), save_state=False
+    )
+
+    steps = frame._current_chat_state["execution_steps"]
+    assert first is True
+    assert second is True
+    assert len(steps) == 2
+    assert len(events) == 2
+    assert len({step["logical_key"] for step in steps}) == 2
+    assert len({event["canonical_item_id"] for event in events}) == 2
 
 def test_identical_non_commentary_execution_entry_still_appends(frame, monkeypatch):
     events = []

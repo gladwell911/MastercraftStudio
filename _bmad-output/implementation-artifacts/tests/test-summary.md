@@ -53,3 +53,34 @@
 - 已覆盖省略 epoch 继承、同 seq 无 offset volatile phase、坏订阅隔离、HTTP 200 应用层 5xx 的 POST 结果未知，以及恢复成功仅报告一次实际 session 集合。
 - 已覆盖子代理 assistant 正文进入 F1、非 main idle 不授权 fallback、失败终态不响铃、offset 缺口阻止发布、stream 首次出现顺序，以及 `/clear` 清理 owner/buffer/recovery 状态。
 - 已覆盖同一 client 的服务进程重启换 token、ambiguous steer 的 alias/queued 双分支、迟到失败 generation 不覆盖完成结果，以及共享 deadline 剩余预算传递。
+
+## 2026-09-23 — MC Epics 1–4 定向回归
+
+本轮复用已有自动化用例，没有新增或修改应用代码、测试代码。
+
+### 通过
+
+- wx UI：`tests/test_history_ui_automation.py` 与 `tests/test_codex_ui_responsiveness_automation.py` 的 Alt+A 清空上下文、清空通知归属、新聊天创建、所选模型恢复和临时回答详情编辑筛选：12 passed，39 deselected。
+- Kimi UI 响应：`tests/test_kimi_ui_responsiveness_automation.py`：8 passed。
+- 执行事件持久存储：`tests/test_chat_store_unit.py`：53 passed。
+- Codex/Kimi 执行事件集成筛选：10 passed，93 deselected。
+- 执行时间分组、时间戳与分页身份窄选：22 passed。
+
+### 失败与范围说明
+
+- 较宽的 time/execution/page/focus/replay 筛选：232 passed、7 failed、736 deselected。3 项旧 commentary 文本/相邻位置去重断言与当前 Epic 3.2 的稳定事件身份契约冲突；其余为 2 项 Ctrl+方向键、1 项归档标题和 1 项 NATS 固定端口断言，均不属于本轮时间分组窄选路径。
+- 两项旧相邻 commentary 去重断言单独复跑仍失败；未修改测试或产品代码。
+- 本轮未连接真实 Codex/Kimi provider，也未运行公网 Live。
+
+## 2026-09-25 — 稳定事件身份回归测试
+
+### 新增与更新的测试
+
+- tests/test_main_unit.py：新增同一 provider 身份精确重放只保留一条并只广播一次的测试。
+- tests/test_main_unit.py：新增文案相同但 provider item 身份不同仍保留两条并各自广播的测试。
+- 将 3 项旧的相邻文本去重断言改为验证无稳定身份时不按文案合并。
+
+### 验证
+
+- 5 个精确 pytest 用例通过。
+- 本轮未连接真实 Codex/Kimi provider；此处验证的是桌面事件归并、持久化入口和广播行为。

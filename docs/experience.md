@@ -87,6 +87,7 @@ PyInstaller 冻结后的 GUI 不应以 `sys.executable -m` 启动后台 worker�
 - 经验：同一 provider 事件必须先用 chat/revision/turn/provider/native identity 建立唯一 durable owner，再在一个事务中更新 assembler 与安全投影；精确重放无操作，冲突可观察但不改变既有投影。
 - 为什么重要：列表行、时间节点、分页、重启恢复和读屏焦点都依赖同一个稳定身份；文本相似、位置或接收批次无法承担这个职责。
 - 下次怎么用：新增流式事件时同时测试乱序、leading gap、重叠、冲突、重启、相同标签和跨 owner ID 复用。无法可靠区分的旧记录应保守阻止投影更新，不要猜测并转移焦点。
+- 回归测试也必须按稳定事件身份判断重放与冲突；旧测试若要求仅凭相邻文本合并，先核对契约并更新测试预期，不要据此修改生产归并逻辑。
 
 ## Owner-local 候选状态与提交边界
 
