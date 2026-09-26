@@ -1,49 +1,38 @@
 # 当前交接
 
-## 快照（2026-09-25）
+## 快照（2026-09-27）
 
-当前分支为 `feature/epic-4-answer-detail`，最新 MC 产品代码里程碑为 `392bf03adc44244ad2d55e01534ca84e782181f7`，其后只有交接文档同步提交。MC 的 BMAD Epics 1–4 已完成；RC 已在 `feature/epic-5-mobile-accessibility` 完成 Epic 5 两项代码，提交为 `572689b` 与 `c1db1e1`。2026-09-14 的正式包、公网 Live 和哈希记录仅代表上一次发布验证，不包含这些新提交。
+MC 桌面程序仓库当前在 `main` 分支，最新提交为 `fbe2325`（Kimi F1 思考叙述行 + 答案恢复加固，2026-09-26 完成，含 bmad-build-auto 两轮评审与一轮 bad_spec 回环）。本次另有未提交的端到端测试文件 `tests/test_kimi_f1_e2e.py` 与三份收尾文档更新。特性规格与评审记录见 `D:\code\sj\_bmad-output\implementation-artifacts\spec-kimi-f1-thinking-narrative-and-answer-recovery.md`（该目录不是 Git 仓库，仅文件留档）。RC 手机端的 Epic 5 两项代码（`572689b`、`c1db1e1`）与 Android TalkBack 待验收事项仍是独立工作线，状态见下"当前待办"。
 
-## 已完成
+## 已完成（2026-09-26 本轮）
 
-- `36543a9`：Alt+A 清除上下文后只重发当前会话首个有效用户文本；自动重发被接受后播放一次普通发送成功音效。
-- `e1cce1b`：聊天各自持久化并恢复所选模型；新聊天选择不污染旧聊天。
-- `25d4f61`：新聊天立即进入历史列表，使用“新聊天”及最小可用数字后缀；首条消息后再自动命名。
-- `9de2441`：Kimi 执行列表只显示有意义的中文阶段，原始过程仅进入允许的详情。
-- `fb82429`：Codex/Kimi 按完整 owner/revision/provider 事件身份持久归并；重放、缺口、冲突、隐私锁存和重启恢复保持同一稳定行。
-- `5d80f62`：执行列表第一条显示时间，后续相对“上一次显示时间的过程”累计达到或超过 300 秒时显示下一时间；稳定时间节点支持分页、重载和焦点恢复。
-- `392bf03`：回答详情可在当前窗口临时编辑和复制；关闭后丢弃，不改变 canonical 回答、Continue、列表复制、朗读、HTML、持久化或移动同步。
-- RC `572689b`：手机端发送状态只保留标题栏下方一个视觉与语义节点。
-- RC `c1db1e1`：按 owner-qualified 稳定身份路由真实 Android accessibility focus；回答、不可变执行项、通知/历史入口和空聊天均有定向自动化覆盖。
+- `fbe2325`：Kimi 的 F1"执行过程"列表不再显示工具流水账行（"正在执行命令"等，含失败/等待状态的工具事件），改为显示模型的思考叙述：每个 thinking 块一行（列表行首行节选 ≤80 字，详情窗看全文），内容来自 Kimi server 的 REST `/messages` 接口（事件流不推送 thinking）。
+- 思考行两条同步通道，均以 2 秒/会话节流并 marshal 回 UI 线程：中途由 Kimi 协议事件触发轻量后台拉取；回合结束由恢复 worker 用翻页后的完整记录兜底。
+- 修复间歇性 "Kimi Code transcript has no final answer for this prompt"：`list_messages` 支持 `before_id` 游标向前翻页（接口只返回最近 50 条），找回滚出窗口的边界提问；会话已 idle 但答案文本未落库时在恢复 deadline 内温和轮询，不再立即报错。
+- 新增 `tests/test_kimi_f1_e2e.py`：3 个端到端用例（完整回合思考行/答案、长记录翻页恢复、idle 竞态等待），只 fake 网络层，其余走真实提交→事件分发→恢复→F1 渲染路径。
+- API 契约测试：`test_list_messages_passes_before_id_as_query_param` 断言 `before_id` 真实传到 HTTP 查询参数。
 
-## 验证状态
+## 验证状态（2026-09-26/27）
 
-- Story 3.2：store 53 项、Codex/Kimi integration 12 项和 UI responsiveness 32 项通过；经过独立对抗审查收口。
-- Story 3.3：13 项主流程、1 项 Codex 时间来源、11 项 Kimi 映射、32 项原生 UI 测试通过；`py_compile` 与 `git diff --check` 通过。
-- Story 4.1：35 项 unit/list 与 8 项原生 wx 测试通过；`py_compile` 与 `git diff --check` 通过。
-- 本阶段未执行真实 provider Live、正式包重建或物理 Windows 读屏验收；不能把定向自动化结果描述为新版本公网发布结论。
-- RC Epic 5 的 8 项 CAP-21 widget 测试、native resolver/dispatcher JVM 测试和 Kotlin 编译通过；实体 Android TalkBack 仍未验收。
-
-- 本轮 BMAD Epic 1–4 定向回归：store 53 项、Kimi UI 8 项、历史/响应 UI 12 项及若干 Codex/Kimi integration 与时间分页焦点用例通过。
-- 较宽的 pytest 选择（232 passed、7 failed、736 deselected）包含 2 项聊天快捷键候选问题、1 项历史标题恢复差异、1 项 NATS 端口断言差异，以及 3 项与稳定事件身份契约冲突的旧文本去重断言；详情见下方。
-- 2026-09-25 稳定事件身份定向用例 5 项通过：同身份精确重放合并、不同 provider item 即使文案相同仍保留独立行；3 项旧文本去重断言已按当前契约更新。
+- `pytest tests/test_kimi_f1_e2e.py tests/test_kimi_integration.py tests/test_kimi_server_client_unit.py tests/test_kimi_ui_responsiveness_automation.py -q` → 176 passed，5 failed；这 5 个是既有基线失败（在未改动的 HEAD 上以同样断言失败，已用 git stash / worktree 对照两次确认）。
+- `pytest tests/test_main_unit.py tests/test_chat_store_unit.py -q --tb=no` → 31 failed，与改动前基线失败清单逐字节一致，零新增回归。
+- 尚未做：真实 Kimi server 的端到端实机验证（`before_id` 翻页已在开发时对运行中的服务端实测；事件驱动→REST→F1 的完整链路只在测试替身下跑过）。
 
 ## 当前待办
 
-1. 执行实体 Android TalkBack 验收，覆盖顶部唯一状态、首次接受的不可变执行项、实时回答、通知入口、历史入口、最后一条用户/助手消息、空聊天输入框、重复文案 identity 和负例不抢焦点。
-2. 已于 2026-09-23 在推荐模拟器视口完成本地跨端回归；后续再进行真实 Codex/Kimi provider 与公网 Live 回归。发布证据必须基于包含 MC/RC 本阶段提交的新构建。
+1. 重新打包 `d:\code\cx` 的 MC 程序做真机验证：聊一句按 F1，确认思考行随回合实时滚动、长工具回合结束后答案正常显示、不再出现 "no final answer"。
+2. spec 记录的两个既有 stale 测试（`test_kimi_tool_completion_updates_started_item_with_result_and_failure`、`test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_steps`）断言的是已废除的工具行行为，但它们本就因其他原因红着，需先排查其既有失败原因再更新预期（见 spec 的 deferred）。
+3. RC 线：实体 Android TalkBack 验收（顶部唯一状态、不可变执行项、实时回答、通知/历史入口等）仍未执行。
+4. 后续正式包/公网 Live 回归必须基于包含 `fbe2325` 的新构建。
 
-## 本轮测试发现与后续处理（2026-09-24）
+## 本轮测试发现与后续处理
 
-- 聊天切换快捷键候选问题：test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus 中事件调用了 Skip()；test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus 未记录目标聊天。若真实使用中复现，会影响从不同焦点位置用 Ctrl+左/右切换聊天。后续按这两个用例单独复测并检查焦点状态下的键盘路由。
-- 历史标题恢复差异：test_load_state_rebuilds_timestamp_like_archive_titles 期望恢复出包含初始提问的标题，实际得到“自动化测试”。目前证据指向历史列表可发现性/命名恢复差异，没有发现消息丢失；后续核对归档数据与标题回填规则。
-- NATS 端口断言差异：test_fixed_domain_nats_runtime_uses_public_runtime_and_status 期望 ws://127.0.0.1:18080/nats，实际运行时选择 ws://127.0.0.1:18082/nats。代码有端口回退行为；只有外部隧道或对端固定假设 18080 时才可能影响连接。本轮未运行公网 Live，需在目标部署配置下确认。
-- 相邻 commentary 的 3 项旧测试曾要求仅凭文本合并，已在 2026-09-25 改为验证稳定身份契约；同身份重放才归并，无稳定身份的相似文本保留独立事件。5 项相关定向测试通过。
+- 共享假 Kimi server（`tests/test_kimi_integration.py` 的 `FakeKimiServerClient`）的 `list_messages` 返回最旧在前，与真实接口（最新在前）不一致；`test_kimi_f1_e2e.py` 用反转包装匹配真实语义。若后续扩展该假客户端，建议直接把 newest-first 语义做进 `list_messages`。
+- 基线失败口径：`test_kimi_integration.py` 5 个、`test_main_unit.py` 31 个失败是改动前就存在的基线；判断回归必须用 `git stash` 前后失败清单对比，不能只看红绿。
 
 ## 不要重复踩坑
 
-- 不要按文本、相邻位置或当前选中聊天归并 provider 事件；使用完整 owner/revision/turn/provider/native identity，并让冲突保持可观察但不改变投影。
-- 不要让私有 Kimi 片段、原始命令或路径先落入可见 crash-safe projection；隐私必须跨片段、精确重放和重启单调生效。
-- 不要把时间基准更新到每一条过程；只有实际显示了时间节点的过程才成为下一基准。
-- 不要把详情编辑缓冲写回 canonical 数据；展示用前导换行必须按字符身份跟踪，不能按 `startswith` 猜测。
-- 不要把历史专项基线或 2026-09-14 发布记录当作本阶段全量通过证据。
+- 不要把中途增量功能挂在恢复 worker 上：`_reconcile_kimi_session_worker` 在 `requested_generation <= handled_generation` 时会直接退出，健康回合中途它不运行（触发点是提交、传输错误和 `prompt.completed`）。复用现有循环实现"事件驱动"前，先核实该循环在目标场景真的会执行。
+- 不要从 Kimi 事件流里找模型文本：服务端不推送 `thinking.delta`/`assistant.delta`，思考和答案都走 REST `GET /api/v1/sessions/{id}/messages`（assistant 消息的 `content` 里有 `thinking` 块）；该接口只返回最近 50 条，`limit`/`max_results` 被忽略，`before_id` 游标可链式翻页，`page_size` 参数会报错。
+- 后台线程不得直接改执行列表：思考同步等写 UI 的操作必须经 `_call_after_if_alive` marshal 到 UI 线程（项目指令原有红线，本轮评审再次实证）。
+- 下列旧条目仍有效：不要按文本/位置/选中聊天归并 provider 事件；私有 Kimi 片段不得先落可见投影；时间基准只来自实际显示的时间节点；详情编辑缓冲不写回 canonical；不要把历史基线或 2026-09-14 发布记录当作本阶段全量通过证据。

@@ -1,5 +1,17 @@
 # 可复用经验
 
+## Kimi server 的文本只走 REST，事件流没有模型内容
+
+- 经验：Kimi server 的 WebSocket 事件流只推送工具调用、步骤编号和会话管理事件，从不推送 `thinking.delta`/`assistant.delta`；模型的思考块和最终答案只能从 `GET /api/v1/sessions/{id}/messages` 拿（assistant 消息的 `content` 里 `type: "thinking"`/`"text"` 块）。该接口只返回最近 50 条，`limit`/`max_results` 参数被忽略，`page_size` 会报错，`before_id=<msg id>` 游标可链式向前翻页（每页 50 条，已对照运行中的服务端实测）。
+- 为什么重要：F1 思考行、最终答案恢复、任何"模型说了什么"的功能都必须走这个接口；指望事件流会永远拿不到文本。
+- 下次怎么用：展示思考/取答案一律走 REST `/messages`；需要窗口外旧记录时用 `before_id` 链式翻页并设页数上限；事件流只当"活动脉冲"（触发拉取）用。
+
+## 恢复 worker 的生命周期边界
+
+- 经验：`_reconcile_kimi_session_worker` 由提交、传输错误和 `prompt.completed` 触发；处理完一轮后若 `requested_generation <= handled_generation` 就直接退出，健康回合中途不运行。答案恢复靠回合结束时的 `prompt.completed` 触发，而不是持续轮询。
+- 为什么重要：把"回合进行中要做的事"（如中途同步）挂在这个 worker 上会静默退化成回合结束才执行。
+- 下次怎么用：中途增量功能挂在事件分发路径（`_on_kimi_event_for_chat`）上自带节流触发；恢复 worker 只做回合结束兜底。
+
 ## 最终通知以持久化 done turn 为唯一事实来源
 
 - 经验：provider callback、UI 占位文本和数据库持久化的到达顺序不稳定；在 callback 中直接发布 final 会产生占位终态或漏发真实终态。
