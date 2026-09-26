@@ -48,6 +48,7 @@ class FakeKimiServerClient:
         self.list_approval_calls = 0
         self.status_by_session = {}
         self.messages_by_session = {}
+        self.list_messages_calls = []
         self.session_exists_result = True
         self.pending_messages = []
         self._prompt_counter = 0
@@ -98,8 +99,14 @@ class FakeKimiServerClient:
     def get_status(self, session_id):
         return dict(self.status_by_session.get(session_id) or {"context_tokens": 128, "max_context_tokens": 2048})
 
-    def list_messages(self, session_id):
-        return list(self.messages_by_session.get(session_id) or [])
+    def list_messages(self, session_id, before_id=None, timeout=None):
+        self.list_messages_calls.append((session_id, before_id))
+        messages = [dict(m) for m in (self.messages_by_session.get(session_id) or [])]
+        if before_id:
+            ids = [str(m.get("id") or "") for m in messages]
+            if before_id in ids:
+                messages = messages[: ids.index(before_id)]
+        return messages[-50:]
 
     def list_approvals(self, session_id):
         self.list_approval_calls += 1
@@ -262,9 +269,10 @@ def test_turn_events_render_execution_list(frame, monkeypatch):
     steps = frame._current_chat_state.get("execution_steps") or []
     kinds = [str(step.get("display_kind") or "") for step in steps]
     assert "status" not in kinds  # turn_started is protocol noise
-    assert "command" in kinds
+    assert "command" not in kinds  # tool events never become F1 list rows
+    assert not any(step.get("kimi_summary") for step in steps)
     commands = [str(step.get("command") or "") for step in steps]
-    assert "ls" in commands
+    assert "ls" not in commands
 
 
 def test_delta_then_final_answer_updates_answer_list(frame, monkeypatch):
@@ -387,7 +395,7 @@ def test_long_mapped_assistant_answer_is_exact_and_creates_no_execution_row(fram
     assert not any(step.get("display_kind") == "assistant" for step in frame._current_chat_state["execution_steps"])
 
 
-def test_tool_progress_updates_same_item_detail_without_new_row_and_reloads(frame, monkeypatch):
+def test_tool_progress_creates_no_execution_row_and_nothing_persists(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
     _submit(frame, "progress")
     session_id = fake.created_sessions[0]["session_id"]
@@ -399,19 +407,15 @@ def test_tool_progress_updates_same_item_detail_without_new_row_and_reloads(fram
         item_id="tool-p", text=" line 1 ", raw_text=" line 1 ", display_kind="commentary",
         data={"source_kind": "tool.progress"}))
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("item_id") == "tool-p"]
-    assert len(steps) == 1
-    assert " line 1 " in steps[0]["detail_text"]
-    assert steps[0]["diagnostic_history"][-1]["text"] == " line 1 "
+    assert steps == []
     frame._flush_execution_step_persists_sync()
     restarted = main.ChatStore(frame.chat_store.db_path)
     restarted.initialize()
     stored = [step for step in restarted.load_execution_steps(_active_chat_id(frame)) if step.get("item_id") == "tool-p"]
-    assert len(stored) == 1
-    assert stored[0]["diagnostic_history"][-1]["text"] == " line 1 "
-    assert frame._execution_meta_tuple(0, stored[0])[3] == stored[0]["detail_text"]
+    assert stored == []
 
 
-def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, monkeypatch):
+def test_structured_kimi_tool_events_create_no_list_rows(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
     _submit(frame, "执行任务")
     session_id = fake.created_sessions[0]["session_id"]
@@ -437,16 +441,14 @@ def test_structured_kimi_events_show_chinese_summaries_and_keep_details(frame, m
         )
 
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary")]
-    assert [step["list_text"] for step in steps] == [
-        "正在执行搜索",
-        "正在执行读取文件",
-        "正在执行命令",
-        "正在执行子任务",
-    ]
-    assert [step["detail_text"] for step in steps] == ["开始执行：Search source tree", "开始执行：Read README.md", "开始执行：Run tests\n命令：pytest -q", "开始执行：Delegate review"]
+    assert steps == []
     assert not any(
-        raw in step["list_text"]
-        for step in steps
+        str(step.get("display_kind") or "") in {"search", "file", "command", "agent", "tool", "diff", "test", "skill"}
+        for step in frame._current_chat_state["execution_steps"]
+    )
+    assert not any(
+        raw in str(step.get("list_text") or "") + str(step.get("detail_text") or "")
+        for step in frame._current_chat_state["execution_steps"]
         for raw in ("Search source tree", "README.md", "pytest", "Delegate review")
     )
 
@@ -466,7 +468,7 @@ def test_mapped_test_retry_error_warning_and_unknown_actions_project_safe_stages
         mapped = map_session_event(message)
         entry = frame._build_execution_entry(main.CodexEvent(**event_to_payload(mapped)))
         labels.append(entry["list_text"] if entry else None)
-    assert labels == ["正在执行测试", "正在等待", "执行失败", "执行警告", "正在处理任务"]
+    assert labels == [None, "正在等待", "执行失败", "执行警告", "正在处理任务"]
     assert all("raw" not in label for label in labels if label)
 
 
@@ -507,7 +509,7 @@ def test_kimi_tool_completion_updates_started_item_with_result_and_failure(frame
     assert "two tests failed" in stored[0]["detail_text"]
 
 
-def test_kimi_summary_normalizes_nested_exit_codes(frame):
+def test_kimi_tool_results_no_longer_create_execution_entries(frame):
     success = frame._build_execution_entry(main.CodexEvent(
         type="item_completed", item_id="tool-success", display_kind="command", status="completed",
         data={"adapter": "kimi_server", "source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "0"}},
@@ -517,10 +519,8 @@ def test_kimi_summary_normalizes_nested_exit_codes(frame):
         data={"adapter": "kimi_server", "source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": "3"}},
     ))
 
-    assert success["exit_code"] == 0
-    assert "执行失败" not in success["list_text"]
-    assert failure["exit_code"] == 3
-    assert "执行失败" in failure["list_text"]
+    assert success is None
+    assert failure is None
 
 
 def test_kimi_completion_does_not_overwrite_reused_item_id_from_another_turn(frame):
@@ -2314,3 +2314,282 @@ def test_recovery_deadline_helper_passes_remaining_budget(frame, monkeypatch):
 
     assert result == "ok"
     assert observed == [2.5]
+
+
+def test_rest_thinking_blocks_sync_to_execution_rows_without_duplicates(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "think hard")
+    session_id = fake.created_sessions[0]["session_id"]
+    chat_id = _active_chat_id(frame)
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    long_line = "先分析一个很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长的问题" + "再长一点" * 10
+    full_text = long_line + "\n\n第二段：得出结论"
+    messages = [
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "think hard"}]},
+        {"id": "assistant-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z",
+         "content": [
+             {"type": "thinking", "text": full_text},
+             {"type": "thinking", "text": "第二条思路"},
+             {"type": "text", "text": "done"},
+         ]},
+        {"id": "assistant-2", "role": "assistant", "created_at": "2026-01-01T00:00:02Z",
+         "content": [{"type": "thinking", "text": "私密推理", "private": True}]},
+    ]
+
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages) is True
+
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("source_kind") == "rest.thinking"]
+    assert [step["detail_text"] for step in steps] == [full_text, "第二条思路"]
+    assert [step["list_text"] for step in steps] == [frame._kimi_thinking_excerpt(full_text), "第二条思路"]
+    assert all(step["list_text"] == step["kimi_summary"] for step in steps)
+    assert len(steps[0]["list_text"]) <= 80
+    assert "\n" not in steps[0]["list_text"]
+    assert steps[0]["display_kind"] == "thinking"
+    assert steps[0]["turn_idx"] == owner["turn_idx"]
+
+    # 再次同步同样的内容：记忆去重 + item_id 逻辑键都不得产生重复行
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages) is False
+    steps_again = [step for step in frame._current_chat_state["execution_steps"] if step.get("source_kind") == "rest.thinking"]
+    assert len(steps_again) == 2
+
+
+def test_kimi_tool_events_produce_no_kimi_summary_rows(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "跑工具")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(type="item_started", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-1", title="Run", display_kind="command",
+        data={"source_kind": "tool.call.started", "tool": {"name": "Shell"}}))
+    fake.push_event(KimiEvent(type="item_completed", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-1", title="Run", display_kind="command", exit_code=0,
+        data={"source_kind": "tool.result", "tool": {"name": "Shell"}}))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID,
+        text="working", raw_text="working", display_kind="commentary",
+        data={"source_kind": "tool.progress"}))
+
+    steps = frame._current_chat_state.get("execution_steps") or []
+    assert not any(step.get("kimi_summary") for step in steps)
+    assert not any(str(step.get("display_kind") or "") in {"command", "tool"} for step in steps)
+
+
+def test_recovery_pages_back_with_before_id_to_find_boundary(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._kimi_reconcile_attempts = 2
+    _submit(frame, "long history")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    rows = [
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "long history"}]},
+    ]
+    for i in range(60):
+        rows.append({
+            "id": f"filler-{i:03d}", "role": "assistant",
+            "created_at": f"2026-01-01T00:{1 + i // 60:02d}:{i % 60:02d}Z",
+            "content": [{"type": "thinking", "text": f"思考步骤 {i}"}],
+        })
+    rows.append({"id": "final-1", "role": "assistant", "created_at": "2026-01-01T00:02:00Z",
+                 "content": [{"type": "text", "text": "paged answer"}]})
+    fake.messages_by_session[session_id] = rows
+    fake.get_status = lambda _session_id: {"busy": False, "status": "completed"}
+    reconciled = []
+    monkeypatch.setattr(frame, "_on_kimi_event", reconciled.append)
+
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    frame._reconcile_kimi_owner_worker(owner)
+
+    assert len(reconciled) == 1
+    assert reconciled[0].text == "paged answer"
+    assert any(before_id for _sid, before_id in fake.list_messages_calls)
+    # The recovery channel syncs thinking rows from the PAGED rows, so blocks
+    # older than the 50-message window (visible only via before_id paging)
+    # must appear, in transcript order.
+    thinking_steps = [
+        step for step in frame._current_chat_state["execution_steps"]
+        if step.get("source_kind") == "rest.thinking"
+    ]
+    assert len(thinking_steps) == 60
+    assert thinking_steps[0]["detail_text"] == "思考步骤 0"
+    assert thinking_steps[-1]["detail_text"] == "思考步骤 59"
+
+
+def test_terminal_without_answer_keeps_monitoring_until_answer_persists(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "late answer")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    fake.get_status = lambda _session_id: {"busy": False, "status": "idle"}
+    base_rows = [
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "late answer"}]},
+    ]
+    answered_rows = base_rows + [
+        {"id": "answer-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z",
+         "content": [{"type": "text", "text": "迟到但最终到达的答案"}]},
+    ]
+    fake.messages_by_session[session_id] = base_rows
+    calls = {"n": 0}
+    original = fake.list_messages
+
+    def late_persist(session_id_arg, before_id=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            fake.messages_by_session[session_id_arg] = answered_rows
+        return original(session_id_arg, before_id=before_id, timeout=timeout)
+
+    fake.list_messages = late_persist
+    reconciled = []
+    monkeypatch.setattr(frame, "_on_kimi_event", reconciled.append)
+    errors = []
+    monkeypatch.setattr(frame, "_apply_kimi_error", lambda *args, **kwargs: errors.append(args))
+
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    outcome = frame._reconcile_kimi_owner_worker(
+        dict(owner, _recovery_deadline=time.monotonic() + 5.0)
+    )
+
+    assert outcome == "done"
+    assert len(reconciled) == 1
+    assert reconciled[0].text == "迟到但最终到达的答案"
+    assert errors == []
+
+
+def test_thinking_sync_orders_newest_first_pages_into_transcript_order(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "order check")
+    session_id = fake.created_sessions[0]["session_id"]
+    chat_id = _active_chat_id(frame)
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    # Endpoint pages are newest-first; the sync must emit transcript order.
+    messages = [
+        {"id": "assistant-2", "role": "assistant", "created_at": "2026-01-01T00:00:02Z",
+         "content": [{"type": "thinking", "text": "第二条思路"}]},
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "order check"}]},
+        {"id": "assistant-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z",
+         "content": [{"type": "thinking", "text": "第一条思路"}]},
+    ]
+
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages) is True
+
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("source_kind") == "rest.thinking"]
+    assert [step["detail_text"] for step in steps] == ["第一条思路", "第二条思路"]
+
+
+def test_thinking_fetch_worker_appends_rows_through_ui_marshal(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "mid-turn")
+    session_id = fake.created_sessions[0]["session_id"]
+    chat_id = _active_chat_id(frame)
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    fake.messages_by_session[session_id] = [
+        {"id": "assistant-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z",
+         "content": [{"type": "thinking", "text": "中途思考"}]},
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "mid-turn"}]},
+    ]
+
+    frame._kimi_thinking_fetch_worker(owner)
+
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("source_kind") == "rest.thinking"]
+    assert [step["detail_text"] for step in steps] == ["中途思考"]
+
+
+def test_maybe_trigger_kimi_thinking_sync_spawns_throttled_fetch(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "trigger check")
+    session_id = fake.created_sessions[0]["session_id"]
+    chat_id = _active_chat_id(frame)
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    frame._kimi_active_turns[chat_id] = {
+        "turn_idx": owner["turn_idx"], "turn_id": owner.get("turn_id") or "",
+        "session_id": session_id, "model": "kimi/main",
+    }
+    fake.messages_by_session[session_id] = [
+        {"id": "assistant-1", "role": "assistant", "created_at": "2026-01-01T00:00:01Z",
+         "content": [{"type": "thinking", "text": "事件触发的中途思考"}]},
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "trigger check"}]},
+    ]
+    event = KimiEvent(type="item_started", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-1", display_kind="file",
+        data={"source_kind": "tool.call.started", "tool": {"name": "Read"}})
+
+    frame._maybe_trigger_kimi_thinking_sync(chat_id, main.CodexEvent(**event_to_payload(event)))
+
+    steps = []
+    for _ in range(60):
+        steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("source_kind") == "rest.thinking"]
+        if steps:
+            break
+        time.sleep(0.05)
+    assert [step["detail_text"] for step in steps] == ["事件触发的中途思考"]
+
+
+def test_recovery_pages_back_with_before_id_under_deadline(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._kimi_reconcile_attempts = 2
+    _submit(frame, "deadline paging")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    rows = [
+        {"id": prompt_id, "role": "user", "created_at": "2026-01-01T00:00:00Z",
+         "content": [{"type": "text", "text": "deadline paging"}]},
+    ]
+    for i in range(60):
+        rows.append({
+            "id": f"filler-{i:03d}", "role": "assistant",
+            "created_at": f"2026-01-01T00:{1 + i // 60:02d}:{i % 60:02d}Z",
+            "content": [{"type": "thinking", "text": f"思考步骤 {i}"}],
+        })
+    rows.append({"id": "final-1", "role": "assistant", "created_at": "2026-01-01T00:02:00Z",
+                 "content": [{"type": "text", "text": "deadline paged answer"}]})
+    fake.messages_by_session[session_id] = rows
+    fake.get_status = lambda _session_id: {"busy": False, "status": "completed"}
+    reconciled = []
+    monkeypatch.setattr(frame, "_on_kimi_event", reconciled.append)
+
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    assert owner is not None
+    frame._reconcile_kimi_owner_worker(
+        dict(owner, _recovery_deadline=time.monotonic() + 10.0)
+    )
+
+    assert len(reconciled) == 1
+    assert reconciled[0].text == "deadline paged answer"
+    # The deadline + before_id combination must actually reach the client:
+    # without kwargs passthrough the paged fetch degrades to re-fetching the
+    # same newest window forever.
+    assert any(
+        session_id == sid and before_id
+        for sid, before_id in fake.list_messages_calls
+    )
+
+
+def test_failed_tool_events_create_no_execution_row(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "failing tool")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(type="item_started", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-fail", title="Run", display_kind="command", status="running",
+        data={"source_kind": "tool.call.started", "tool": {"name": "Shell"}}))
+    fake.push_event(KimiEvent(type="item_completed", thread_id=session_id, turn_id=TEST_TURN_ID,
+        item_id="tool-fail", title="Run", display_kind="command", status="failed", exit_code=1,
+        data={"source_kind": "tool.result", "tool": {"name": "Shell", "exitCode": 1}}))
+
+    steps = frame._current_chat_state.get("execution_steps") or []
+    assert not any(step.get("kimi_summary") for step in steps)
+    assert not any(str(step.get("display_kind") or "") in {"command", "tool"} for step in steps)

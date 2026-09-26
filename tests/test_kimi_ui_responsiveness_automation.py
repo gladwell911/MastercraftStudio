@@ -445,8 +445,7 @@ def test_background_structured_kimi_batch_persists_owner_without_foreground_repa
     frame._dispatch_kimi_event_to_ui("chat-bg", main.CodexEvent(**event_to_payload(event)))
     _drain_all_kimi_events(frame)
     bg_steps = frame.archived_chats[0]["execution_steps"]
-    assert [step["list_text"] for step in bg_steps] == ["正在执行读取文件"]
-    assert "C:/private/file.txt" in bg_steps[0]["detail_text"]
+    assert bg_steps == []  # tool events never become F1 list rows
     assert repaint == []
     assert frame.execution_list.GetSelection() == 1
     assert frame.input_edit.HasFocus()

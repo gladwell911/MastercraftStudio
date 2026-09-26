@@ -1738,6 +1738,9 @@ class ChatFrame(wx.Frame):
         self._kimi_pending_submissions: dict[str, list[dict]] = {}
         self._kimi_reconcile_attempts = 8
         self._kimi_reconcile_backoff = 0.25
+        self._kimi_thinking_sync_interval = 2.0
+        self._kimi_thinking_sync_at: dict[str, float] = {}
+        self._kimi_thinking_synced: dict[tuple[str, str], set[str]] = {}
         self._codex_clients: dict[str, CodexWorkerClient] = {}
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
@@ -6514,6 +6517,18 @@ class ChatFrame(wx.Frame):
             return ""
         if display_kind == "warning":
             return "执行警告"
+        tool_name = " ".join(
+            str(tool.get(key) or "") for key in ("name", "kind", "toolKind")
+        ).lower()
+        # Tool/action events never become F1 list rows — including failed or
+        # waiting ones (the generic 执行失败/正在等待 labels below must not
+        # resurrect them). Turn-level errors and waiting states keep their
+        # rows because those display kinds are not tool kinds. Thinking
+        # narrative rows come from the REST message sync instead.
+        if display_kind in {"command", "tool", "file", "diff", "search", "test", "skill", "agent"}:
+            return ""
+        if any(name in tool_name for name in ("search", "grep", "glob", "find", "read", "cat", "write", "edit", "patch", "shell", "bash", "command", "powershell")):
+            return ""
         if status in {"retrying", "waiting", "awaiting", "awaiting_input", "awaiting_approval"}:
             return "正在等待"
         if status in {"failed", "error", "interrupted", "cancelled", "canceled"}:
@@ -6522,24 +6537,6 @@ class ChatFrame(wx.Frame):
             return "正在整理回答" if source_kind == "prompt.completed" else ""
         if display_kind == "step":
             return ""
-        phase = "执行失败" if failed else ("已完成" if event_type in {"item_completed", "subagent_result"} else "正在执行")
-        if event_type == "subagent_result" or display_kind == "agent":
-            return f"{phase}子任务"
-        tool_name = " ".join(
-            str(tool.get(key) or "") for key in ("name", "kind", "toolKind")
-        ).lower()
-        if display_kind == "search" or any(name in tool_name for name in ("search", "grep", "glob", "find")):
-            return f"{phase}搜索"
-        if display_kind in {"file", "diff"} or any(name in tool_name for name in ("read", "cat", "write", "edit", "patch")):
-            action = "修改文件" if display_kind == "diff" or any(name in tool_name for name in ("write", "edit", "patch")) else "读取文件"
-            return f"{phase}{action}"
-        operation_kind = str(data.get("operation_kind") or "").strip().lower()
-        if display_kind == "test" or operation_kind == "test":
-            return f"{phase}测试"
-        if display_kind in {"command", "tool"} or any(name in tool_name for name in ("shell", "bash", "command", "powershell")):
-            return f"{phase}命令"
-        if display_kind == "skill":
-            return f"{phase}工具"
         if display_kind in {"waiting", "user_input"}:
             return "等待用户输入"
         if display_kind == "error" or event_type == "error":
@@ -9370,23 +9367,23 @@ class ChatFrame(wx.Frame):
         raise RuntimeError("Kimi Code client startup failed")
 
     @staticmethod
-    def _kimi_call_with_deadline(func, *args, deadline: float | None = None):
+    def _kimi_call_with_deadline(func, *args, deadline: float | None = None, **kwargs):
         """Pass the shared recovery budget to blocking client calls.
 
         Test doubles and older injected clients may not expose ``timeout``;
         retain compatibility for those while the production client enforces it.
         """
         if deadline is None:
-            return func(*args)
+            return func(*args, **kwargs)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Kimi recovery deadline exhausted")
         try:
-            return func(*args, timeout=max(0.05, remaining))
+            return func(*args, timeout=max(0.05, remaining), **kwargs)
         except TypeError as exc:
             if "timeout" not in str(exc):
                 raise
-            return func(*args)
+            return func(*args, **kwargs)
 
     def _iter_kimi_chats(self):
         seen: set[str] = set()
@@ -12444,6 +12441,197 @@ class ChatFrame(wx.Frame):
                     parts.append(text)
         return "".join(parts).strip()
 
+    @staticmethod
+    def _kimi_message_thinking(message: dict) -> list[str]:
+        """Return the thinking block texts of a transcript message.
+
+        Blocks marked private / non-disclosable are skipped, mirroring
+        ``_kimi_private_reasoning`` semantics for both block and message
+        metadata.
+        """
+        if not isinstance(message, dict):
+            return []
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        message_private = ChatFrame._kimi_private_reasoning(message)
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").strip() != "thinking":
+                continue
+            if message_private or ChatFrame._kimi_private_reasoning(block):
+                continue
+            text = str(block.get("text") or block.get("thinking") or "").strip()
+            if text:
+                texts.append(text)
+        return texts
+
+    @staticmethod
+    def _kimi_thinking_excerpt(text: str, limit: int = 80) -> str:
+        """First non-empty line of a thinking block, trimmed, ellipsis on truncation."""
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                if len(stripped) <= limit:
+                    return stripped
+                return stripped[: max(1, limit - 1)].rstrip() + "…"
+        return ""
+
+    @staticmethod
+    def _kimi_oldest_message_id(rows: list[dict]) -> str:
+        candidates = [
+            (str(row.get("created_at") or ""), idx, str(row.get("id") or "").strip())
+            for idx, row in enumerate(rows)
+            if isinstance(row, dict) and str(row.get("id") or "").strip()
+        ]
+        if not candidates:
+            return ""
+        if all(created for created, _idx, _mid in candidates):
+            _created, _idx, message_id = min(candidates, key=lambda item: (item[0], item[1]))
+            return message_id
+        # No timestamps: the endpoint returns newest-first.
+        return candidates[-1][2]
+
+    def _kimi_messages_back_to_boundary(
+        self,
+        client,
+        session_id: str,
+        prompt_id: str,
+        *,
+        messages: list[dict] | None = None,
+        max_pages: int = 10,
+        deadline: float | None = None,
+    ) -> list[dict]:
+        """Accumulate transcript pages (oldest-first) until the boundary user message is included.
+
+        The messages endpoint only returns the newest window, so an older
+        boundary prompt scrolls out; page back with the ``before_id`` cursor
+        until it is found again (or the page cap is reached).
+        """
+        prompt_id = str(prompt_id or "").strip()
+        if messages is None:
+            rows = list(self._kimi_call_with_deadline(client.list_messages, session_id, deadline=deadline))
+        else:
+            rows = [dict(row) for row in messages if isinstance(row, dict)]
+        pages = 1
+        while prompt_id and pages < max(1, int(max_pages)):
+            if any(
+                isinstance(row, dict)
+                and str(row.get("role") or "").strip() == "user"
+                and str(row.get("id") or "").strip() == prompt_id
+                for row in rows
+            ):
+                break
+            oldest_id = self._kimi_oldest_message_id(rows)
+            if not oldest_id:
+                break
+            older = list(
+                self._kimi_call_with_deadline(
+                    client.list_messages,
+                    session_id,
+                    deadline=deadline,
+                    before_id=oldest_id,
+                )
+            )
+            if not older:
+                break
+            seen_ids = {str(row.get("id") or "").strip() for row in rows if isinstance(row, dict)}
+            rows = [
+                dict(row)
+                for row in older
+                if isinstance(row, dict) and str(row.get("id") or "").strip() not in seen_ids
+            ] + rows
+            pages += 1
+        return rows
+
+    def _kimi_thinking_sync_due(self, session_id: str) -> bool:
+        """Per-session throttle so REST thinking fetches stay cheap.
+
+        Optimistically stamps the throttle before the fetch runs: a fetch that
+        fails immediately still waits a full interval before retrying, which
+        is the intended back-off behavior.
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+        now = time.monotonic()
+        with self._kimi_owner_lock:
+            last = self._kimi_thinking_sync_at.get(session_id, 0.0)
+            if now - last < float(self._kimi_thinking_sync_interval):
+                return False
+            self._kimi_thinking_sync_at[session_id] = now
+        return True
+
+    def _kimi_sync_thinking_rows(self, chat_id: str, owner: dict, messages: list[dict]) -> bool:
+        """Append one F1 execution row per new transcript thinking block.
+
+        Rows flow through ``_append_execution_entry_to_chat`` like any other
+        execution entry; the ``item_id`` carries the (message id, block index)
+        dedupe key, and the ``_kimi_thinking_synced`` set ensures each block is
+        appended at most once per process life (a refetch of the same block is
+        skipped, not re-upserted). Runs on the UI thread (via ``wx.CallAfter``),
+        sorts newest-first endpoint pages into transcript order, and never lets
+        a shape failure escape as an unhandled UI-thread exception.
+        """
+        try:
+            chat_id = str(chat_id or "").strip()
+            session_id = str((owner or {}).get("session_id") or "").strip()
+            turn_idx = (owner or {}).get("turn_idx")
+            if not chat_id or not session_id or not isinstance(turn_idx, int) or turn_idx < 0:
+                return False
+            synced_key = (chat_id, session_id)
+            with self._kimi_owner_lock:
+                synced = self._kimi_thinking_synced.setdefault(synced_key, set())
+            rows = [row for row in (messages or []) if isinstance(row, dict)]
+            if rows and all(str(row.get("created_at") or "").strip() for row in rows):
+                rows = [row for _idx, row in sorted(enumerate(rows), key=lambda pair: (str(pair[1].get("created_at")), pair[0]))]
+            changed = False
+            for message in rows:
+                message_id = str(message.get("id") or "").strip()
+                if not message_id:
+                    continue
+                for block_index, text in enumerate(self._kimi_message_thinking(message)):
+                    dedupe_key = f"{message_id}:{block_index}"
+                    if dedupe_key in synced:
+                        continue
+                    excerpt = self._kimi_thinking_excerpt(text)
+                    if not excerpt:
+                        # Nothing displayable: mark synced so we do not rescan
+                        # this block on every pass.
+                        synced.add(dedupe_key)
+                        continue
+                    entry = {
+                        "event_type": "thinking_synced",
+                        "display_kind": "thinking",
+                        "list_text": excerpt,
+                        "detail_text": text,
+                        "kimi_summary": excerpt,
+                        "thread_id": session_id,
+                        "session_id": session_id,
+                        "turn_idx": turn_idx,
+                        # Prefer the owner's Kimi turn id; an empty id falls back
+                        # to the turn index so the entry still matches the
+                        # logical scope computed by ``_append_execution_entry_to_chat``.
+                        "turn_id": str((owner or {}).get("turn_id") or turn_idx),
+                        "item_id": f"kimi-thinking:{message_id}:{block_index}",
+                        "source_kind": "rest.thinking",
+                        "status": "completed",
+                        "created_at": time.time(),
+                    }
+                    # Register the dedupe key only after a successful append so
+                    # a rejected entry can be retried on a later pass instead of
+                    # silently dropping the block forever.
+                    if self._append_execution_entry_to_chat(chat_id, entry, save_state=True):
+                        synced.add(dedupe_key)
+                        changed = True
+            return changed
+        except Exception:
+            # The sync is marshalled to the UI thread; never surface a fetch /
+            # shape failure as an unhandled wx event-loop exception.
+            return False
+
     def _kimi_rest_answer_for_prompt(self, messages: list[dict], prompt_id: str) -> str:
         """Return only the final assistant text inside one user-message boundary."""
         answer, _closed = self._kimi_rest_answer_boundary(messages, prompt_id)
@@ -12585,13 +12773,24 @@ class ChatFrame(wx.Frame):
         deadline = float(deadline_value) if isinstance(deadline_value, (int, float)) else None
         last_error = ""
         last_was_exception = False
-        for attempt in range(max(1, int(self._kimi_reconcile_attempts))):
+        max_attempts = max(1, int(self._kimi_reconcile_attempts))
+        attempt = 0
+        terminal_wait = False
+        while True:
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-                if attempt:
-                    delay = min(float(self._kimi_reconcile_backoff) * (2 ** (attempt - 1)), 2.0)
-                    if deadline is not None:
-                        delay = min(delay, max(0.0, deadline - time.monotonic()))
+                if attempt or terminal_wait:
+                    if terminal_wait:
+                        # Idle-before-persist race: the session already ended
+                        # but the assistant text has not landed yet. Poll
+                        # gently within the recovery deadline instead of
+                        # burning exponential retry attempts. (terminal_wait
+                        # is only ever set when a deadline exists.)
+                        delay = min(0.5, max(0.0, deadline - time.monotonic()))
+                    else:
+                        delay = min(float(self._kimi_reconcile_backoff) * (2 ** (attempt - 1)), 2.0)
+                        if deadline is not None:
+                            delay = min(delay, max(0.0, deadline - time.monotonic()))
                     if delay:
                         time.sleep(delay)
                 try:
@@ -12636,16 +12835,52 @@ class ChatFrame(wx.Frame):
                         if not isinstance(migrated, dict):
                             last_error = "Kimi Code could not unambiguously migrate the archived prompt"
                             last_was_exception = False
+                            attempt += 1
+                            if attempt >= max_attempts:
+                                break
                             continue
                         owner = migrated
                         prompt_id = str(owner.get("prompt_id") or "").strip()
                     boundary_prompt_id = self._kimi_reconciliation_boundary(owner)
-                    answer, boundary_closed = self._kimi_rest_answer_boundary(messages, boundary_prompt_id)
+                    rows = self._kimi_messages_back_to_boundary(
+                        client,
+                        session_id,
+                        boundary_prompt_id,
+                        messages=messages,
+                        deadline=deadline,
+                    )
+                    if self._kimi_thinking_sync_due(session_id):
+                        try:
+                            # The sync appends execution entries that repaint
+                            # the F1 list; marshal it to the UI thread like
+                            # the final-answer event below. Use the fully
+                            # paged rows so thinking blocks older than the
+                            # 50-message window are not skipped.
+                            self._call_after_if_alive(
+                                self._kimi_sync_thinking_rows,
+                                str(owner.get("chat_id") or "").strip(),
+                                owner,
+                                rows,
+                            )
+                        except Exception:
+                            # Fetch/shape failure: keep last good rows and
+                            # retry on the next monitor iteration.
+                            pass
+                    answer, boundary_closed = self._kimi_rest_answer_boundary(rows, boundary_prompt_id)
                     if busy is not False and not terminal and not boundary_closed:
                         return "monitor"
                     if not answer:
                         last_error = "Kimi Code transcript has no final answer for this prompt"
                         last_was_exception = False
+                        if deadline is not None:
+                            # Terminal (or boundary closed) without persisted
+                            # answer text: keep monitoring until the recovery
+                            # deadline before surfacing the error.
+                            terminal_wait = True
+                            continue
+                        attempt += 1
+                        if attempt >= max_attempts:
+                            break
                         continue
                     data = {
                         "prompt_id": prompt_id,
@@ -12670,6 +12905,14 @@ class ChatFrame(wx.Frame):
                 except Exception as exc:
                     last_error = str(exc)
                     last_was_exception = True
+                    if terminal_wait:
+                        # A transient failure during the gentle terminal poll
+                        # must not burn retry attempts or drop the poll mode;
+                        # the recovery deadline bounds the wait.
+                        continue
+                    attempt += 1
+                    if attempt >= max_attempts:
+                        break
         failure = original_error or (last_error if last_was_exception else (last_error or "Kimi Code 未返回任何内容。"))
         self._call_after_if_alive(
             self._apply_kimi_error,
@@ -13827,6 +14070,94 @@ class ChatFrame(wx.Frame):
             return max(1, min(CODEX_UI_INTERACTIVE_EVENT_BATCH_SIZE, CODEX_UI_EVENT_BATCH_SIZE))
         return CODEX_UI_EVENT_BATCH_SIZE
 
+    def _maybe_trigger_kimi_thinking_sync(self, chat_id: str, event: CodexEvent) -> None:
+        """Mid-turn channel: throttle-gated, event-driven REST thinking sync.
+
+        The recovery worker alone exits mid-turn in a healthy session, so
+        thinking rows would only appear at completion. Each activity-bearing
+        Kimi protocol event during a turn with a pending active owner may
+        spawn a lightweight daemon fetch; the shared 2s per-session throttle
+        keeps REST load negligible.
+        """
+        try:
+            if not self._kimi_protocol_event(event):
+                return
+            data = event.data if isinstance(event.data, dict) else {}
+            source_kind = str(data.get("source_kind") or "").strip()
+            if not (
+                source_kind.startswith(("tool.", "shell.", "subagent.", "turn.step"))
+                or source_kind in {"thinking.delta", "assistant.delta"}
+            ):
+                return
+            session_id = str(self._event_thread_id(event) or "").strip()
+            chat_id = str(chat_id or "").strip()
+            if not session_id or not chat_id:
+                return
+            with self._kimi_owner_lock:
+                active = self._kimi_active_turns.get(chat_id)
+            if not isinstance(active, dict):
+                return
+            if str(active.get("session_id") or "").strip() != session_id:
+                return
+            if not self._kimi_thinking_sync_due(session_id):
+                return
+            turn_idx = active.get("turn_idx")
+            if not isinstance(turn_idx, int) or turn_idx < 0:
+                # Without a valid turn index the sync would silently no-op.
+                return
+            owner = {
+                "chat_id": chat_id,
+                "session_id": session_id,
+                "turn_idx": turn_idx,
+                "turn_id": str(active.get("turn_id") or "").strip(),
+            }
+        except Exception:
+            return
+        threading.Thread(
+            target=self._kimi_thinking_fetch_worker,
+            args=(owner,),
+            daemon=True,
+        ).start()
+
+    def _kimi_thinking_fetch_worker(self, owner: dict) -> None:
+        """Daemon fetch for the mid-turn channel: REST off the UI thread, then
+        marshal the sync back onto it. Failures stay silent; the next throttled
+        event retries."""
+        try:
+            client = self._kimi_client
+            if client is None:
+                return
+            session_id = str((owner or {}).get("session_id") or "").strip()
+            chat_id = str((owner or {}).get("chat_id") or "").strip()
+            if not session_id or not chat_id:
+                return
+            timeout = getattr(client, "rest_timeout", None) or 5.0
+            try:
+                messages = client.list_messages(session_id, timeout=timeout)
+            except TypeError as exc:
+                if "timeout" not in str(exc):
+                    raise
+                messages = client.list_messages(session_id)
+            if not isinstance(messages, list) or not messages:
+                return
+            # The endpoint returns newest-first and the window may still hold
+            # the previous turn's tail: only sync messages newer than the last
+            # user (prompt) message so prior-turn thinking blocks are not
+            # stamped with this turn's index. With no user message in the
+            # window the whole page belongs to the current turn.
+            boundary_index = next(
+                (index for index, row in enumerate(messages)
+                 if isinstance(row, dict) and str(row.get("role") or "").strip() == "user"),
+                None,
+            )
+            if boundary_index is not None:
+                messages = messages[:boundary_index]
+            if not messages:
+                return
+            self._call_after_if_alive(self._kimi_sync_thinking_rows, chat_id, owner, messages)
+        except Exception:
+            pass
+
     def _on_kimi_event(self, event: CodexEvent) -> None:
         chat_id = self._resolve_kimi_event_chat_id(event)
         if not chat_id:
@@ -13853,6 +14184,7 @@ class ChatFrame(wx.Frame):
         authoritative = self._kimi_event_is_authoritative(event)
         if authoritative:
             self._apply_kimi_event_scope(chat_id, event)
+        self._maybe_trigger_kimi_thinking_sync(chat_id, event)
         event_turn_id = self._event_turn_id(event)
         silent_notification = (
             event_type == "notification"

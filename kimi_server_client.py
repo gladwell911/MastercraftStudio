@@ -907,8 +907,20 @@ class KimiServerClient:
                 return False
             raise
 
-    def list_messages(self, session_id: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
-        data = self._request_data("GET", f"/api/v1/sessions/{session_id}/messages", timeout=timeout)
+    def list_messages(
+        self,
+        session_id: str,
+        *,
+        timeout: float | None = None,
+        before_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"before_id": str(before_id)} if before_id else None
+        data = self._request_data(
+            "GET",
+            f"/api/v1/sessions/{session_id}/messages",
+            timeout=timeout,
+            params=params,
+        )
         items = data.get("items")
         return list(items) if isinstance(items, list) else []
 
@@ -1061,7 +1073,15 @@ class KimiServerClient:
             return {"Authorization": f"Bearer {self.token}"}
         return {}
 
-    def _request(self, method: str, path: str, *, json_body: Any = None, timeout: float | None = None):
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Any = None,
+        timeout: float | None = None,
+        params: dict[str, str] | None = None,
+    ):
         if self._http is None:
             raise KimiServerError("kimi client is not started")
         try:
@@ -1069,6 +1089,7 @@ class KimiServerClient:
                 method,
                 f"{self.base_url}{path}",
                 json=json_body,
+                params=params,
                 headers=self._auth_headers(),
                 timeout=timeout or self.rest_timeout,
             )
@@ -1098,8 +1119,9 @@ class KimiServerClient:
         *,
         json_body: Any = None,
         timeout: float | None = None,
+        params: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        resp = self._request(method, path, json_body=json_body, timeout=timeout)
+        resp = self._request(method, path, json_body=json_body, timeout=timeout, params=params)
         try:
             payload = resp.json()
         except Exception as exc:

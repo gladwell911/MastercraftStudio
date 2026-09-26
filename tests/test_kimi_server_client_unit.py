@@ -92,8 +92,8 @@ class FakeHttpSession:
             return FakeResponse(200, {"status": "ok"})
         return self._route("GET", url)
 
-    def request(self, method, url, json=None, headers=None, timeout=None):
-        self.calls.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout})
+    def request(self, method, url, json=None, headers=None, timeout=None, params=None):
+        self.calls.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout, "params": params})
         return self._route(method, url)
 
     def _route(self, method, url):
@@ -1358,3 +1358,17 @@ def test_same_client_process_restart_rediscovers_token(monkeypatch):
     assert client.process is not first_process
     assert client.token == "token-b"
     assert sockets[-1] == ["Authorization: Bearer token-b"]
+
+
+def test_list_messages_passes_before_id_as_query_param():
+    http = FakeHttpSession()
+    client, _, _, _, _ = started_client(http=http)
+    http.routes[("GET", "/api/v1/sessions/s1/messages")] = FakeResponse(
+        200, {"code": 0, "msg": "success", "data": {"items": [], "has_more": False}}
+    )
+
+    assert client.list_messages("s1", before_id="m1") == []
+    assert http.calls[-1]["params"] == {"before_id": "m1"}
+
+    assert client.list_messages("s1") == []
+    assert http.calls[-1]["params"] is None
