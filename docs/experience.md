@@ -1,5 +1,15 @@
 # 可复用经验
 
+## canonical 执行内容与远程可视快照
+
+- 经验：桌面列表由 canonical `execution_steps` 经 Kimi 折叠、轮次问答补行和可见性过滤生成；V2 durable fact 记录的是另一条事件链。跨端可视一致性应复用纯内容投影，并为远程页面单独创建不可变行快照，不应修改旧事实流的游标语义。
+- 为什么重要：Kimi item 可原位更新，旧事件游标无法表达同一可视行的变化；手机本地过滤还缺桌面使用的元数据。
+- 下次怎么用：canonical replace 单事务提交；在一个读事务中获取 revision、turns、steps，再生成稳定行 ID 与快照。用同一 fixture 比对桌面行和 v3 响应，覆盖 Kimi 更新、重复旧行、跨轮、清空、冻结翻页与过期游标。
+
+- 经验：NATS 只读接口即使按页返回 100 行，建快照时仍可能全量扫描。将源读取、投影、哈希和写快照放 worker，wx 主线程只做常量规模 owner/generation 捕获与复核；旧页在索引表按行号 `LIMIT` 读取。
+- 为什么重要：单页网络 limit 不限制前台 SQLite 和 Python 工作量，长历史会让键盘与读屏卡顿。
+- 下次怎么用：用受控慢数据库读取证明 wx `Yield` 仍可响应，同时测试源在捕获与返回之间变化时安全拒绝，不向新 owner 交付旧行。
+
 ## Kimi server 的文本只走 REST，事件流没有模型内容
 
 - 经验：Kimi server 的 WebSocket 事件流只推送工具调用、步骤编号和会话管理事件，从不推送 `thinking.delta`/`assistant.delta`；模型的思考块和最终答案只能从 `GET /api/v1/sessions/{id}/messages` 拿（assistant 消息的 `content` 里 `type: "thinking"`/`"text"` 块）。该接口只返回最近 50 条，`limit`/`max_results` 参数被忽略，`page_size` 会报错，`before_id=<msg id>` 游标可链式向前翻页（每页 50 条，已对照运行中的服务端实测）。
