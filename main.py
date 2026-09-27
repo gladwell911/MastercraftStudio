@@ -1586,10 +1586,10 @@ class ChatInformationDialog(wx.Dialog):
             return
         if new_identity != self.identity:
             self.identity = new_identity
-        self.owner._refresh_chat_information(chat)
         if is_codex_model(model):
             self.owner._request_codex_chat_information(chat, model)
         elif is_kimi_model(model):
+            self.owner._refresh_chat_information(chat)
             self.owner._request_kimi_quota(chat, model)
 
     def set_rows(self, rows: list[str]) -> None:
@@ -2674,12 +2674,10 @@ class ChatFrame(wx.Frame):
                 return
         changed = False
         if kind == "status" and int(chat.get("kimi_context_revision") or 0) == request.get("context_revision"):
-            usage = None if failed else self._kimi_context_usage_payload(CodexEvent(
-                type="thread_status_changed", usage={
-                    "context_tokens": (payload or {}).get("context_tokens", (payload or {}).get("contextTokens")),
-                    "max_context_tokens": (payload or {}).get("max_context_tokens", (payload or {}).get("maxContextTokens")),
-                },
-            ))
+            usage = None if failed else self._kimi_context_usage_from_values({
+                "context_tokens": (payload or {}).get("context_tokens", (payload or {}).get("contextTokens")),
+                "max_context_tokens": (payload or {}).get("max_context_tokens", (payload or {}).get("maxContextTokens")),
+            })
             if usage is not None:
                 changed = self._set_chat_context_usage(chat, usage)
             elif chat.get("context_usage") is not None:
@@ -14100,15 +14098,17 @@ class ChatFrame(wx.Frame):
 
     def _kimi_context_usage_payload(self, event: CodexEvent) -> dict | None:
         usage = event.usage if isinstance(getattr(event, "usage", None), dict) else {}
+        model = str(event.data.get("model") or "").strip() if isinstance(event.data, dict) else ""
+        return self._kimi_context_usage_from_values(usage, model=model)
+
+    @staticmethod
+    def _kimi_context_usage_from_values(usage: dict, *, model: str = "") -> dict | None:
         used = usage.get("context_tokens")
         window = usage.get("max_context_tokens")
         if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 0:
             return None
         if isinstance(window, bool) or not isinstance(window, (int, float)) or window <= 0:
             window = 0
-        model = ""
-        if isinstance(event.data, dict):
-            model = str(event.data.get("model") or "").strip()
         return {
             "used_tokens": int(used),
             "context_window": int(window),

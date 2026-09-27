@@ -91,6 +91,15 @@ def test_kimi_quota_explicit_auth_states():
     assert "查询失败" in main.ChatFrame._kimi_quota_labels({"kind": "error"})[0]
 
 
+def test_kimi_event_and_rest_context_share_usage_parser(frame):
+    values = {"context_tokens": 300, "max_context_tokens": 1200}
+    event = main.CodexEvent(type="thread_status_changed", usage=values)
+    direct = frame._kimi_context_usage_from_values(values)
+    via_event = frame._kimi_context_usage_payload(event)
+    assert {key: value for key, value in direct.items() if key != "updated_at"} == {
+        key: value for key, value in via_event.items() if key != "updated_at"}
+
+
 def test_kimi_quota_account_result_replaces_previous_account(frame, wx_app):
     frame.Show()
     frame.view_mode = "active"
@@ -202,6 +211,22 @@ def test_codex_chat_information_list_arrows_and_escape_restore_focus(frame, wx_a
     assert frame._chat_information_dialog is None
     assert not frame.IsIconized()
     assert main.wx.Window.FindFocus() is frame.input_edit
+
+
+def test_codex_information_timer_queries_without_unneeded_row_refresh(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = "chat-t"
+    frame._current_chat_state = {"id": "chat-t", "model": "codex/main", "codex_thread_id": "thread-t"}
+    assert frame._show_chat_information()
+    calls = []
+    monkeypatch.setattr(frame, "_refresh_chat_information", lambda *_a: calls.append("refresh"))
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_a: calls.append("request"))
+    frame._chat_information_dialog._on_refresh_timer(None)
+    assert calls == ["request"]
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
 
 
 def test_chat_information_is_unavailable_for_other_models_and_unchanged_rows_keep_focus(frame, wx_app):
