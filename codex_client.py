@@ -11,7 +11,7 @@ from typing import Callable
 import tempfile
 from datetime import datetime
 
-from context_usage import context_window_for_model, normalize_context_usage
+from context_usage import normalize_context_usage
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -1100,44 +1100,10 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
     if not isinstance(payload, dict):
         return None
     info = _first_dict(payload.get("info"), payload.get("usage"), payload)
-    total_usage = _first_dict(
-        info.get("total_token_usage"),
-        info.get("totalTokenUsage"),
-        info.get("total_usage"),
-    )
-    total = _usage_int_field(
-        total_usage,
-        ("total_tokens", "totalTokens", "total", "tokens"),
-        default=None,
-    )
-    if total is None:
-        total = _usage_int_field(
-            info,
-            ("total_tokens", "totalTokens", "totalTokenUsage", "total_token_usage"),
-            default=None,
-        )
-    if total is None or total <= 0:
-        component_usage = total_usage if total_usage else info
-        input_tokens = _usage_int_field(component_usage, ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"))
-        output_tokens = _usage_int_field(component_usage, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
-        cache_read_tokens = _usage_int_field(
-            component_usage,
-            ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_tokens", "cacheReadTokens", "cached_input_tokens", "cachedInputTokens"),
-        )
-        cache_creation_tokens = _usage_int_field(
-            component_usage,
-            (
-                "cache_creation_input_tokens",
-                "cacheCreationInputTokens",
-                "cache_creation_tokens",
-                "cacheCreationTokens",
-            ),
-        )
-        values = [input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens]
-        if any(value is None for value in values):
-            return None
-        total = sum(values)
-    if total <= 0:
+    token_usage = _first_dict(payload.get("tokenUsage"), info.get("tokenUsage"), info.get("token_usage"))
+    last_usage = _first_dict(token_usage.get("last"), info.get("last_token_usage"), info.get("lastTokenUsage"))
+    used = _usage_int_field(last_usage, ("totalTokens", "total_tokens"), default=None)
+    if used is None:
         return None
 
     explicit_model_name = str(
@@ -1149,19 +1115,15 @@ def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAUL
         or payload.get("modelId")
         or ""
     ).strip()
-    context_window = _usage_int_field(
-        info,
-        ("context_window", "contextWindow", "model_context_window", "modelContextWindow", "context_tokens", "contextTokens"),
-        default=0,
-    )
+    context_window = _usage_int_field(token_usage, ("modelContextWindow", "model_context_window"), default=None)
+    if context_window is None:
+        context_window = _usage_int_field(info, ("model_context_window", "modelContextWindow", "context_window", "contextWindow"), default=0)
     model_name = explicit_model_name or _codex_model_from_rate_limits(payload) or _codex_model_from_context_window(context_window) or str(fallback_model or "").strip()
-    if context_window <= 0:
-        context_window = context_window_for_model(model_name or fallback_model)
     return normalize_context_usage(
-        used_tokens=total,
+        used_tokens=used,
         context_window=context_window,
         source="codex",
-        exact=True,
+        exact=bool(context_window),
         fresh=True,
         model=model_name,
     ).to_dict()

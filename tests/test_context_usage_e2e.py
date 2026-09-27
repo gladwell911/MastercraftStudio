@@ -77,6 +77,7 @@ def test_e2e_codex_token_count_lifecycle_updates_top_row_and_preserves_selection
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_context_generation": 0,
             "request_status": "pending",
         }
     ]
@@ -88,11 +89,14 @@ def test_e2e_codex_token_count_lifecycle_updates_top_row_and_preserves_selection
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
     assert frame.answer_list.GetString(0) == "暂无"
     assert frame.answer_list.GetSelection() == 0
+    assert ("chat-current", 0) in frame._pending_context_usage_by_turn
+
+    frame._apply_codex_worker_thread_state("chat-current", {"thread_id": "thread-1", "turn_id": "turn-1", "turn_idx": 0, "context_generation": 0})
     assert ("chat-current", 0) in frame._pending_context_usage_by_turn
 
     frame._on_codex_event_for_chat(
@@ -139,6 +143,7 @@ def test_e2e_context_usage_persists_after_restart_and_history_switch(tmp_path, m
         restarted.view_mode = "history"
         restarted.view_history_id = "chat-archived"
         restarted._render_answer_list()
-        assert restarted.answer_list.GetString(0) == "暂无"
+        assert all(meta[0] != "context_usage" for meta in restarted.answer_meta)
+        assert restarted.answer_meta[0][0] == "time"
     finally:
         restarted.Destroy()

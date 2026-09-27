@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from collections import OrderedDict
 import traceback
 from typing import Any, Callable, TextIO
 
@@ -18,12 +19,16 @@ ClientFactory = Callable[[Callable[[CodexEvent], None], str], CodexAppServerClie
 
 
 class CodexWorkerRuntime:
+    MAX_EVENT_SCOPES = 256
+
     def __init__(self, client_factory: ClientFactory | None = None, output: TextIO | None = None) -> None:
         self.client_factory = client_factory or self._default_client_factory
         self.output = output or sys.stdout
         self._lock = threading.RLock()
         self._clients: dict[tuple[str, str], Any] = {}
         self._turn_indices: dict[tuple[str, str], Any] = {}
+        self._thread_turn_scopes: OrderedDict[tuple[str, str, str], tuple[int, int]] = OrderedDict()
+        self._turn_id_scopes: OrderedDict[tuple[str, str, str], tuple[int, int, str] | None] = OrderedDict()
         self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
         self._ambiguous_input_requests: set[tuple[str, str]] = set()
 
@@ -57,6 +62,8 @@ class CodexWorkerRuntime:
             clients = list(self._clients.values())
             self._clients.clear()
             self._turn_indices.clear()
+            self._thread_turn_scopes.clear()
+            self._turn_id_scopes.clear()
             self._input_request_clients.clear()
             self._ambiguous_input_requests.clear()
         for client in clients:
@@ -82,13 +89,26 @@ class CodexWorkerRuntime:
             "model": model,
             "event": event_to_payload(event),
         }
+        thread_id = str(getattr(event, "thread_id", "") or "").strip()
+        turn_id = str(getattr(event, "turn_id", "") or "").strip()
         key = (chat_id, model)
         request_id = getattr(event, "request_id", None)
         method = str(getattr(event, "method", "") or "")
         event_type = str(getattr(event, "type", "") or "")
         with self._lock:
-            if key in self._turn_indices:
-                payload["turn_idx"] = self._turn_indices[key]
+            scope = None
+            known_turn = self._turn_id_scopes.get((chat_id, model, turn_id)) if turn_id else None
+            if turn_id and (chat_id, model, turn_id) in self._turn_id_scopes:
+                self._turn_id_scopes.move_to_end((chat_id, model, turn_id))
+            if known_turn is not None and (not thread_id or known_turn[2] == thread_id):
+                scope = known_turn[:2]
+            elif thread_id and (not turn_id or (chat_id, model, turn_id) not in self._turn_id_scopes):
+                key = (chat_id, model, thread_id)
+                scope = self._thread_turn_scopes.get(key)
+                if scope is not None:
+                    self._thread_turn_scopes.move_to_end(key)
+            if scope is not None:
+                payload["turn_idx"], payload["context_generation"] = scope
             if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
                 request_key = (chat_id, str(request_id))
                 existing_key = self._input_request_clients.get(request_key)
@@ -104,6 +124,7 @@ class CodexWorkerRuntime:
         chat_id = str(payload.get("chat_id") or "").strip()
         model = str(payload.get("model") or "").strip() or DEFAULT_CODEX_MODEL
         turn_idx = payload.get("turn_idx")
+        context_generation = int(payload.get("context_generation") or 0)
         service_tier = payload.get("service_tier")
         service_tier_arg = service_tier if str(service_tier or "").strip() else None
         if not chat_id:
@@ -137,6 +158,10 @@ class CodexWorkerRuntime:
                     thread_id = self._start_thread(client, payload, service_tier_arg)
                     items = self._recovery_input_items(payload, items)
 
+            if thread_id and isinstance(turn_idx, int):
+                with self._lock:
+                    self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (turn_idx, context_generation))
+
             should_steer = bool(payload.get("should_steer")) and bool(str(payload.get("turn_id") or "").strip())
             if should_steer and hasattr(client, "steer_turn_items"):
                 try:
@@ -152,6 +177,17 @@ class CodexWorkerRuntime:
             else:
                 turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
+            if turn_id and isinstance(turn_idx, int):
+                with self._lock:
+                    key = (chat_id, model, turn_id)
+                    value = (turn_idx, context_generation, thread_id)
+                    if key not in self._turn_id_scopes:
+                        stored = value
+                    elif self._turn_id_scopes[key] == value:
+                        stored = value
+                    else:
+                        stored = None
+                    self._remember_scope(self._turn_id_scopes, key, stored)
             self.emit(
                 "thread_state",
                 {
@@ -160,6 +196,7 @@ class CodexWorkerRuntime:
                     "model": model,
                     "thread_id": thread_id,
                     "turn_id": turn_id,
+                    "context_generation": context_generation,
                     "active": True,
                 },
                 request_id=message.get("id"),
@@ -172,12 +209,19 @@ class CodexWorkerRuntime:
                     "model": model,
                     "thread_id": thread_id,
                     "turn_id": turn_id,
+                    "context_generation": context_generation,
                     "active": True,
                 },
                 request_id=message.get("id"),
             )
         except Exception as exc:
             self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
+
+    def _remember_scope(self, scopes: OrderedDict, key: tuple, value: tuple | None) -> None:
+        scopes.pop(key, None)
+        scopes[key] = value
+        while len(scopes) > self.MAX_EVENT_SCOPES:
+            scopes.popitem(last=False)
 
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(

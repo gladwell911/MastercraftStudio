@@ -508,10 +508,10 @@ def test_codex_protocol_token_count_event_normalizes_usage():
     )
 
     assert seen[-1].type == "token_count"
-    assert seen[-1].usage["used_tokens"] == 44176
-    assert seen[-1].usage["context_window"] == 258400
+    assert seen[-1].usage["used_tokens"] == 11891
+    assert seen[-1].usage["context_window"] == 0
     assert seen[-1].usage["source"] == "codex"
-    assert seen[-1].usage["exact"] is True
+    assert seen[-1].usage["exact"] is False
     assert seen[-1].usage["fresh"] is True
     assert seen[-1].usage["model"] == "gpt-5-codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage
@@ -537,7 +537,7 @@ def test_codex_event_msg_token_count_payload_normalizes_usage():
     )
 
     assert seen[-1].type == "token_count"
-    assert seen[-1].usage["used_tokens"] == 68292
+    assert seen[-1].usage["used_tokens"] == 23096
     assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage
@@ -554,7 +554,7 @@ def test_codex_token_count_uses_rate_limit_name_as_actual_model():
             "payload": {
                 "type": "token_count",
                 "info": {
-                    "total_token_usage": {"total_tokens": 10503},
+                    "last_token_usage": {"total_tokens": 10503},
                     "model_context_window": 258400,
                 },
                 "rate_limits": {
@@ -578,7 +578,7 @@ def test_codex_token_count_infers_actual_model_from_context_window_when_name_mis
             "payload": {
                 "type": "token_count",
                 "info": {
-                    "total_token_usage": {"total_tokens": 21673},
+                    "last_token_usage": {"total_tokens": 21673},
                     "model_context_window": 121600,
                 },
                 "rate_limits": {
@@ -604,7 +604,7 @@ def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "info": {
-                    "total_token_usage": {"total_tokens": 44176},
+                    "last_token_usage": {"total_tokens": 44176},
                     "model": "gpt-5-codex",
                 },
             },
@@ -626,23 +626,23 @@ def test_codex_thread_token_usage_updated_event_normalizes_usage():
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": "thread-1",
-                "info": {
-                    "total_token_usage": {"total_tokens": 44176},
-                    "model_context_window": 258400,
-                    "model": "gpt-5-codex",
+                "tokenUsage": {
+                    "total": {"totalTokens": 44176},
+                    "last": {"totalTokens": 11891},
+                    "modelContextWindow": 258400,
                 },
             },
         }
     )
 
     assert seen[-1].type == "token_count"
-    assert seen[-1].usage["used_tokens"] == 44176
+    assert seen[-1].usage["used_tokens"] == 11891
     assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
     assert client.last_context_usage == seen[-1].usage
 
 
-def test_codex_protocol_token_count_sums_usage_fields_when_total_missing():
+def test_codex_protocol_token_count_without_last_usage_does_not_guess_context():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)
 
@@ -661,12 +661,10 @@ def test_codex_protocol_token_count_sums_usage_fields_when_total_missing():
         }
     )
 
-    assert seen[-1].usage["used_tokens"] == 190
-    assert seen[-1].usage["context_window"] == 1000
-    assert seen[-1].usage["exact"] is True
+    assert seen[-1].usage == {}
 
 
-def test_codex_protocol_token_count_sums_nested_component_usage():
+def test_codex_protocol_token_count_with_only_cumulative_usage_is_unknown():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)
 
@@ -687,9 +685,7 @@ def test_codex_protocol_token_count_sums_nested_component_usage():
         }
     )
 
-    assert seen[-1].usage["used_tokens"] == 190
-    assert seen[-1].usage["context_window"] == 1000
-    assert seen[-1].usage["exact"] is True
+    assert seen[-1].usage == {}
 
 
 def test_codex_protocol_token_count_ignores_malformed_usage():

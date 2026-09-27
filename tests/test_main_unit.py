@@ -5911,9 +5911,10 @@ def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -5927,7 +5928,7 @@ def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
@@ -5955,10 +5956,11 @@ def test_active_pending_codex_token_count_event_does_not_refresh_context_usage_r
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "pending",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -5977,7 +5979,7 @@ def test_active_pending_codex_token_count_event_does_not_refresh_context_usage_r
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
@@ -5999,10 +6001,11 @@ def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_s
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "pending",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -6029,11 +6032,11 @@ def test_repeated_codex_token_count_event_does_not_rebuild_answer_list_or_save_s
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=dict(usage)),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=dict(usage)),
     )
 
     assert frame._pending_context_usage_by_turn[("chat-current", 0)] == usage
@@ -6056,10 +6059,11 @@ def test_codex_token_count_same_visible_label_does_not_rebuild_answer_list(frame
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "pending",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     first_usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -6081,17 +6085,17 @@ def test_codex_token_count_same_visible_label_does_not_rebuild_answer_list(frame
     monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *controls: repaints.__setitem__("count", repaints["count"] + 1))
 
     frame._render_answer_list()
-    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", turn_id="turn-1", usage=first_usage))
+    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=first_usage))
     repaints["count"] = 0
 
-    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", turn_id="turn-1", usage=second_usage))
+    frame._on_codex_event_for_chat("chat-current", main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=second_usage))
 
     assert frame.answer_list.GetString(0) == "暂无"
     assert refreshes["count"] == 0
     assert repaints["count"] == 0
 
 
-def test_active_pending_codex_token_count_event_without_turn_id_does_not_refresh_context_usage_row(frame, monkeypatch):
+def test_active_pending_codex_token_count_without_native_identity_is_ignored(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame.active_turn_idx = 1
@@ -6133,7 +6137,7 @@ def test_active_pending_codex_token_count_event_without_turn_id_does_not_refresh
         main.CodexEvent(type="token_count", usage=usage),
     )
 
-    assert frame._pending_context_usage_by_turn[("chat-current", 1)] == usage
+    assert ("chat-current", 1) not in frame._pending_context_usage_by_turn
     assert frame.answer_list.GetString(0) == "暂无"
 
 
@@ -6150,10 +6154,11 @@ def test_active_pending_codex_token_count_event_preserves_selected_context_usage
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "pending",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -6171,7 +6176,7 @@ def test_active_pending_codex_token_count_event_preserves_selected_context_usage
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame.answer_list.GetString(0) == "暂无"
@@ -6192,10 +6197,11 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "pending",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     usage = {
         "used_tokens": 44176,
         "context_window": 258400,
@@ -6214,7 +6220,7 @@ def test_active_codex_completion_preserves_selected_context_usage_row_after_pend
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame.answer_list.GetString(0) == "暂无"
@@ -6291,10 +6297,11 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "done",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     frame.view_mode = "active"
     usage = {
         "used_tokens": 44176,
@@ -6314,7 +6321,7 @@ def test_late_codex_token_count_event_updates_context_usage_row(frame, monkeypat
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame._current_chat_state["context_usage"] == usage
@@ -6334,10 +6341,11 @@ def test_late_codex_token_count_event_updates_state_without_refreshing_visible_c
             "model": "codex/main",
             "created_at": 1.0,
             "codex_turn_id": "turn-1",
+            "codex_thread_id": "thread-1",
             "request_status": "done",
         }
     ]
-    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "codex_thread_id": "thread-1"}
     frame.view_mode = "active"
     usage = {
         "used_tokens": 44176,
@@ -6357,7 +6365,7 @@ def test_late_codex_token_count_event_updates_state_without_refreshing_visible_c
 
     frame._on_codex_event_for_chat(
         "chat-current",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame._current_chat_state["context_usage"] == usage
@@ -6377,14 +6385,16 @@ def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(
         {
             "id": "chat-inactive",
             "title": "后台聊天",
+            "codex_thread_id": "thread-1",
             "turns": [
                 {
                     "question": "q",
                     "answer_md": "done",
                     "model": "codex/main",
                     "created_at": 1.0,
-                    "codex_turn_id": "turn-1",
-                    "request_status": "done",
+                        "codex_turn_id": "turn-1",
+                        "codex_thread_id": "thread-1",
+                        "request_status": "done",
                 }
             ],
         }
@@ -6402,7 +6412,7 @@ def test_late_codex_token_count_event_updates_inactive_chat_for_later_selection(
 
     frame._on_codex_event_for_chat(
         "chat-inactive",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     archived = frame._find_archived_chat("chat-inactive")
@@ -6426,14 +6436,16 @@ def test_late_codex_token_count_event_updates_visible_history_state_without_refr
         {
             "id": "chat-visible",
             "title": "正在查看",
+            "codex_thread_id": "thread-1",
             "turns": [
                 {
                     "question": "q",
                     "answer_md": "done",
                     "model": "codex/main",
                     "created_at": 1.0,
-                    "codex_turn_id": "turn-1",
-                    "request_status": "done",
+                        "codex_turn_id": "turn-1",
+                        "codex_thread_id": "thread-1",
+                        "request_status": "done",
                 }
             ],
         }
@@ -6458,7 +6470,7 @@ def test_late_codex_token_count_event_updates_visible_history_state_without_refr
 
     frame._on_codex_event_for_chat(
         "chat-visible",
-        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=usage),
+        main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", data={"turn_idx": 0, "context_generation": 0}, usage=usage),
     )
 
     assert frame._find_archived_chat("chat-visible")["context_usage"] == usage
@@ -7559,11 +7571,13 @@ def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, mo
                     "created_at": 2.0,
                     "request_status": "pending",
                     "codex_thread_id": "",
-                    "codex_turn_id": "",
+                        "codex_turn_id": "",
+                        "codex_context_generation": 0,
                 }
             ],
             "codex_thread_id": "",
             "codex_turn_id": "",
+            "codex_context_generation": 0,
             "codex_turn_active": False,
             "execution_steps": [],
         }
@@ -7579,7 +7593,8 @@ def test_codex_worker_thread_state_updates_matching_archived_chat_only(frame, mo
                 "chat_id": "chat-c",
                 "turn_idx": 0,
                 "thread_id": "thread-c-new",
-                "turn_id": "turn-c-new",
+                    "turn_id": "turn-c-new",
+                    "context_generation": 0,
                 "active": True,
             },
         },
@@ -7635,6 +7650,7 @@ def test_codex_worker_turn_started_ack_does_not_mark_request_done(frame, monkeyp
             "request_status": "pending",
             "codex_thread_id": "",
             "codex_turn_id": "",
+            "codex_context_generation": 0,
         }
     ]
     frame._current_chat_state = {
@@ -7642,6 +7658,7 @@ def test_codex_worker_turn_started_ack_does_not_mark_request_done(frame, monkeyp
         "turns": frame.active_session_turns,
         "codex_thread_id": "",
         "codex_turn_id": "",
+        "codex_context_generation": 0,
         "codex_turn_active": False,
         "execution_steps": [],
     }
@@ -7656,6 +7673,7 @@ def test_codex_worker_turn_started_ack_does_not_mark_request_done(frame, monkeyp
                 "turn_idx": 0,
                 "thread_id": "thread-c",
                 "turn_id": "turn-c",
+                "context_generation": 0,
                 "active": True,
             },
         },
@@ -17555,8 +17573,10 @@ def test_run_codex_turn_worker_sends_start_turn_to_worker(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["codex_context_generation"] = 3
     frame._current_chat_state["turns"] = [
-        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL,
+         "codex_context_generation": 3}
     ]
     frame.active_session_turns = frame._current_chat_state["turns"]
 
@@ -17565,6 +17585,7 @@ def test_run_codex_turn_worker_sends_start_turn_to_worker(frame, monkeypatch):
     assert sent
     assert sent[0]["chat_id"] == "chat-current"
     assert sent[0]["turn_idx"] == 0
+    assert sent[0]["context_generation"] == 3
     assert sent[0]["question"] == "问题"
     assert sent[0]["input_items"][0]["type"] == "text"
 

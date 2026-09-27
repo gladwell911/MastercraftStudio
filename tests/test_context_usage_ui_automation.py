@@ -57,12 +57,11 @@ def test_ui_automation_context_usage_row_is_fixed_above_answers(frame):
     frame._render_answer_list()
 
     rows = list(frame.answer_list.GetStrings())
-    assert rows[:5] == ["2k / 128k", "我", "first question", "小诸葛", "first answer"]
+    content_rows = [row for row, meta in zip(rows, frame.answer_meta) if meta[0] != "time"]
+    assert content_rows[:5] == ["2k / 128k", "我", "first question", "小诸葛", "first answer"]
     assert frame.answer_meta[0][0] == "context_usage"
     assert all(meta[0] != "current_model" for meta in frame.answer_meta)
-    assert frame.answer_meta[1][0] == "user"
-    assert frame.answer_meta[2][0] == "question"
-    assert frame.answer_meta[3][0] == "ai"
+    assert [meta[0] for meta in frame.answer_meta if meta[0] != "time"][:4] == ["context_usage", "user", "question", "ai"]
 
     frame._focus_latest_answer()
 
@@ -101,7 +100,9 @@ def test_ui_automation_answer_list_arrow_keys_can_select_context_usage_row(frame
 
     assert frame.answer_list.ProcessEvent(down)
     assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "user"
+    assert frame.answer_meta[1][0] == "time"
+    assert frame.answer_list.ProcessEvent(down)
+    assert frame.answer_meta[frame.answer_list.GetSelection()][0] == "user"
 
 
 def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame, wx_app):
@@ -133,7 +134,10 @@ def test_ui_automation_native_listbox_arrow_key_reaches_context_usage_row(frame,
     wx_app.Yield()
 
     assert frame.answer_list.GetSelection() == 1
-    assert frame.answer_meta[1][0] == "user"
+    assert frame.answer_meta[1][0] == "time"
+    _send_listbox_key(frame.answer_list, main.wx.WXK_DOWN)
+    wx_app.Yield()
+    assert frame.answer_meta[frame.answer_list.GetSelection()][0] == "user"
 
 
 def test_ui_automation_history_switch_uses_stored_context_usage_then_cli_unknown(frame):
@@ -170,11 +174,13 @@ def test_ui_automation_history_switch_uses_stored_context_usage_then_cli_unknown
     frame.view_mode = "history"
     frame.view_history_id = "chat-codex"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert all(meta[0] != "context_usage" for meta in frame.answer_meta)
+    assert frame.answer_meta[0][0] == "time"
 
     frame.view_history_id = "chat-stored"
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert all(meta[0] != "context_usage" for meta in frame.answer_meta)
+    assert frame.answer_meta[0][0] == "time"
 
 
 def test_ui_automation_context_row_selection_survives_visible_history_usage_refresh(frame, monkeypatch):
@@ -189,6 +195,7 @@ def test_ui_automation_context_row_selection_survives_visible_history_usage_refr
         {
             "id": "chat-visible",
             "title": "visible",
+            "context_usage": _usage(used=40000, window=258400, source="codex", exact=True, model="gpt-5-codex"),
             "turns": [
                 {
                     "question": "q",
@@ -207,13 +214,13 @@ def test_ui_automation_context_row_selection_survives_visible_history_usage_refr
 
     frame._render_answer_list()
     frame.answer_list.SetSelection(0)
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == "40k / 258k"
 
     frame._on_codex_event_for_chat(
         "chat-visible",
         main.CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1", usage=_usage(used=44176, window=258400, source="codex", exact=True, model="gpt-5-codex")),
     )
 
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == "40k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"

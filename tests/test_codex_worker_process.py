@@ -56,6 +56,18 @@ class RaisingTurnCodexClient(FakeCodexClient):
         raise RuntimeError("turn failed")
 
 
+class EarlyUsageCodexClient(FakeCodexClient):
+    def start_turn_items(self, thread_id, items, service_tier=None):
+        self.on_event(CodexEvent(type="token_count", thread_id=thread_id, turn_id="turn-early"))
+        return {"turn": {"id": "turn-early"}}
+
+
+class UniqueTurnCodexClient(FakeCodexClient):
+    def start_turn_items(self, thread_id, items, service_tier=None):
+        self.started_turns.append((thread_id, items, service_tier))
+        return {"turn": {"id": f"turn-{len(self.started_turns)}"}}
+
+
 class RaisingReplyCodexClient(FakeCodexClient):
     def respond_tool_request_user_input(self, request_id, answers):
         raise RuntimeError("reply failed")
@@ -147,6 +159,100 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
     assert created[0].started_threads[0]["sandbox"] == "danger-full-access"
     assert created[0].started_threads[0]["personality"] == "pragmatic"
     assert created[0].started_turns[0][2] == "fast"
+
+
+def test_worker_events_keep_thread_scope_when_new_turn_or_model_starts():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        or created[-1],
+        output=output,
+    )
+    starts = [
+        ("codex/main", "thread-old", 0, 0),
+        ("codex/main", "thread-new", 1, 1),
+        ("codex/other", "thread-new", 2, 2),
+    ]
+    for model, thread_id, turn_idx, generation in starts:
+        runtime.handle_message(make_ui_request(
+            f"req-{turn_idx}", "start_turn",
+            {"chat_id": "chat-c", "model": model, "thread_id": thread_id,
+             "turn_idx": turn_idx, "context_generation": generation,
+             "input_items": [{"type": "text", "text": "q"}]},
+        ))
+
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-old"))
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-new"))
+    created[1].on_event(CodexEvent(type="token_count", thread_id="thread-new"))
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-unknown"))
+    events = [decode_worker_line(line + "\n")["payload"] for line in output.getvalue().splitlines()
+              if decode_worker_line(line + "\n")["type"] == "event"]
+    assert [(event.get("turn_idx"), event.get("context_generation")) for event in events] == [
+        (0, 0), (1, 1), (2, 2), (None, None),
+    ]
+
+
+def test_worker_early_token_event_has_scope_before_thread_ack():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda callback, model: EarlyUsageCodexClient(callback, model), output=output)
+    runtime.handle_message(make_ui_request(
+        "req-early", "start_turn",
+        {"chat_id": "chat-c", "model": "codex/main", "turn_idx": 4,
+         "context_generation": 7, "input_items": [{"type": "text", "text": "q"}]},
+    ))
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert [item["type"] for item in messages[:3]] == ["event", "thread_state", "turn_started_ack"]
+    assert messages[0]["payload"]["turn_idx"] == 4
+    assert messages[0]["payload"]["context_generation"] == 7
+    assert messages[1]["payload"]["context_generation"] == 7
+
+
+def test_worker_old_turn_on_same_thread_keeps_its_original_scope():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda callback, model: created.append(UniqueTurnCodexClient(callback, model)) or created[-1],
+        output=output,
+    )
+    for idx, generation in [(0, 4), (1, 5)]:
+        runtime.handle_message(make_ui_request(
+            f"req-{idx}", "start_turn",
+            {"chat_id": "chat-c", "model": "codex/main", "thread_id": "thread-1",
+             "turn_idx": idx, "context_generation": generation,
+             "input_items": [{"type": "text", "text": "q"}]},
+        ))
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-1"))
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-1", turn_id="turn-2"))
+    events = [decode_worker_line(line + "\n")["payload"] for line in output.getvalue().splitlines()
+              if decode_worker_line(line + "\n")["type"] == "event"]
+    assert [(event.get("turn_idx"), event.get("context_generation")) for event in events] == [(0, 4), (1, 5)]
+
+
+def test_worker_event_scopes_are_bounded_and_evicted_events_are_unscoped():
+    output = io.StringIO()
+    created = []
+    runtime = CodexWorkerRuntime(
+        client_factory=lambda callback, model: created.append(UniqueTurnCodexClient(callback, model)) or created[-1],
+        output=output,
+    )
+    for idx in range(runtime.MAX_EVENT_SCOPES + 1):
+        runtime.handle_message(make_ui_request(
+            f"req-{idx}", "start_turn",
+            {"chat_id": "chat-c", "model": "codex/main", "thread_id": f"thread-{idx}",
+             "turn_idx": idx, "context_generation": idx,
+             "input_items": [{"type": "text", "text": "q"}]},
+        ))
+    assert len(runtime._thread_turn_scopes) == runtime.MAX_EVENT_SCOPES
+    assert len(runtime._turn_id_scopes) == runtime.MAX_EVENT_SCOPES
+    created[0].on_event(CodexEvent(type="token_count", thread_id="thread-0", turn_id="turn-1"))
+    created[0].on_event(CodexEvent(type="token_count", thread_id=f"thread-{runtime.MAX_EVENT_SCOPES}",
+                                   turn_id=f"turn-{runtime.MAX_EVENT_SCOPES + 1}"))
+    events = [decode_worker_line(line + "\n")["payload"] for line in output.getvalue().splitlines()
+              if decode_worker_line(line + "\n")["type"] == "event"]
+    assert [(event.get("turn_idx"), event.get("context_generation")) for event in events] == [
+        (None, None), (runtime.MAX_EVENT_SCOPES, runtime.MAX_EVENT_SCOPES),
+    ]
 
 
 def test_worker_runtime_reply_user_input_routes_to_matching_chat_client():

@@ -1554,6 +1554,55 @@ class CommonCommandEditDialog(wx.Dialog):
         )
 
 
+class ChatInformationDialog(wx.Dialog):
+    def __init__(self, owner: "ChatFrame", identity: tuple[str, str, str, str], focus_target):
+        super().__init__(owner, title="聊天信息", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.owner = owner
+        self.identity = identity
+        self.focus_target = focus_target
+        panel = wx.Panel(self)
+        layout = wx.BoxSizer(wx.VERTICAL)
+        self.information_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.information_list.SetName("聊天信息")
+        layout.Add(self.information_list, 1, wx.EXPAND | wx.ALL, 10)
+        panel.SetSizer(layout)
+        self.SetSize((480, 240))
+        self.information_list.Bind(wx.EVT_KEY_DOWN, self._on_list_key_down)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def set_rows(self, rows: list[str]) -> None:
+        if list(self.information_list.GetStrings()) == rows:
+            return
+        selected = self.information_list.GetSelection()
+        self.information_list.Set(rows)
+        if rows:
+            self.information_list.SetSelection(min(max(selected, 0), len(rows) - 1))
+
+    def _on_list_key_down(self, event) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def _on_char_hook(self, event) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def _on_close(self, _event) -> None:
+        self.owner._chat_information_dialog = None
+        target = self.focus_target
+        self.Destroy()
+        if target is not None:
+            try:
+                if not target.IsBeingDeleted() and target.IsShown():
+                    wx.CallAfter(target.SetFocus)
+            except Exception:
+                pass
+
+
 class CommonCommandsDialog(wx.Dialog):
     def __init__(self, owner: "ChatFrame"):
         super().__init__(owner, title="常用命令", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -1863,6 +1912,7 @@ class ChatFrame(wx.Frame):
         self._answer_redirect_timer = None
         self._pending_input_attachments = []
         self._pending_context_usage_by_turn = {}
+        self._codex_early_context_usage_owner = {}
         self._openclaw_sync_thread = None
         self._openclaw_sync_stop = threading.Event()
         self._openclaw_sync_lock = threading.Lock()
@@ -1888,6 +1938,9 @@ class ChatFrame(wx.Frame):
         self._chat_navigation_right_id = wx.NewIdRef()
         self._clear_context_id = wx.NewIdRef()
         self._common_commands_menu_id = wx.NewIdRef()
+        self._chat_information_menu_id = wx.NewIdRef()
+        self._chat_information_dialog = None
+        self._chat_information_previous_focus = None
         self._file_manager_menu_id = wx.NewIdRef()
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
@@ -1947,6 +2000,7 @@ class ChatFrame(wx.Frame):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
         app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+Z")
+        app_menu.Append(int(self._chat_information_menu_id), "查看聊天信息")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -1956,6 +2010,7 @@ class ChatFrame(wx.Frame):
         menu_bar = wx.MenuBar()
         menu_bar.Append(app_menu, "应用(&A)")
         self.SetMenuBar(menu_bar)
+        self.Bind(wx.EVT_MENU_OPEN, self._on_chat_information_menu_open)
 
         frame_panel = wx.Panel(self)
         frame_root = wx.BoxSizer(wx.VERTICAL)
@@ -2146,6 +2201,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(auto_resend_first=True), id=int(self._clear_context_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_common_commands_surface(), id=int(self._common_commands_menu_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_chat_information(), id=int(self._chat_information_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_file_manager(), id=int(self._file_manager_menu_id))
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
@@ -2224,6 +2280,78 @@ class ChatFrame(wx.Frame):
         dialog.Show()
         dialog.Raise()
         dialog.focus_default_control()
+        return True
+
+    def _visible_chat_information_owner(self) -> tuple[dict, str] | None:
+        chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
+        if not isinstance(chat, dict):
+            return None
+        model = normalize_model_id(str(chat.get("model") or self.selected_model or ""), default="")
+        if not (is_codex_model(model) or is_kimi_model(model)):
+            return None
+        return chat, model
+
+    def _chat_information_identity(self, chat: dict, model: str) -> tuple[str, str, str, str]:
+        native_id = self._codex_thread_id_for_chat(chat) if is_codex_model(model) else self._kimi_session_id_for_chat(chat)
+        account_id = str(chat.get("codex_account_id") or chat.get("kimi_account_id") or "").strip()
+        return (str(chat.get("id") or ""), model, native_id, account_id)
+
+    def _on_chat_information_menu_open(self, event) -> None:
+        self._chat_information_previous_focus = wx.Window.FindFocus()
+        item = self.GetMenuBar().FindItemById(int(self._chat_information_menu_id))
+        if item is not None:
+            item.Enable(self._visible_chat_information_owner() is not None)
+        event.Skip()
+
+    def _chat_information_rows(self, chat: dict, model: str) -> list[str]:
+        usage = context_usage_from_dict(chat.get("context_usage"))
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        if turns:
+            usage = self._pending_context_usage_for_chat(chat, len(turns) - 1) or usage
+        if is_codex_model(model) and usage is not None and usage.source == "codex":
+            if usage.context_window > 0:
+                percent = usage.used_tokens / usage.context_window * 100
+                context_row = f"当前上下文：已用 {percent:.1f}%（{usage.used_tokens:,} / {usage.context_window:,} token）"
+            else:
+                context_row = f"当前上下文：{usage.used_tokens:,} token，窗口未知"
+        else:
+            context_row = "当前上下文：暂不可用"
+        return [context_row, "会话累计 token：暂不可用"]
+
+    def _refresh_chat_information(self, chat: dict | None = None) -> None:
+        dialog = getattr(self, "_chat_information_dialog", None)
+        if dialog is None or dialog.IsBeingDeleted():
+            return
+        owner = self._visible_chat_information_owner()
+        if owner is None:
+            return
+        visible_chat, model = owner
+        if chat is not None and chat is not visible_chat:
+            return
+        if self._chat_information_identity(visible_chat, model) != dialog.identity:
+            return
+        dialog.set_rows(self._chat_information_rows(visible_chat, model))
+
+    def _show_chat_information(self) -> bool:
+        owner = self._visible_chat_information_owner()
+        if owner is None:
+            return False
+        chat, model = owner
+        dialog = self._chat_information_dialog
+        identity = self._chat_information_identity(chat, model)
+        if dialog is not None and not dialog.IsBeingDeleted() and dialog.identity != identity:
+            dialog.focus_target = None
+            dialog.Close()
+            dialog = None
+        if dialog is None or dialog.IsBeingDeleted():
+            focus_target = self._chat_information_previous_focus or wx.Window.FindFocus()
+            self._chat_information_previous_focus = None
+            dialog = ChatInformationDialog(self, identity, focus_target)
+            self._chat_information_dialog = dialog
+        dialog.set_rows(self._chat_information_rows(chat, model))
+        dialog.Show()
+        dialog.Raise()
+        dialog.information_list.SetFocus()
         return True
 
     def _selected_common_command(self):
@@ -5026,6 +5154,7 @@ class ChatFrame(wx.Frame):
         if not self._context_usage_payload_changed(previous, usage):
             return False
         self._pending_context_usage_by_turn[key] = usage
+        self._refresh_chat_information(chat)
         return True
 
     def _reset_answer_visible_row_limit(self) -> None:
@@ -6170,6 +6299,46 @@ class ChatFrame(wx.Frame):
                 return True
             return not self._codex_event_requires_known_turn(event)
         return turn_id in known_turn_ids
+
+    def _codex_token_usage_matches_native_chat(self, chat: dict, event: CodexEvent) -> bool:
+        current_thread = self._codex_thread_id_for_chat(chat)
+        event_thread = self._event_thread_id(event)
+        if current_thread and event_thread != current_thread:
+            return False
+        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        turn_idx = self._event_scoped_turn_index(turns, event)
+        if turn_idx < 0 or turn_idx != len(turns) - 1:
+            return False
+        turn = turns[turn_idx]
+        if not isinstance(turn, dict):
+            return False
+        data = event.data if isinstance(event.data, dict) else {}
+        try:
+            event_generation = int(data.get("context_generation"))
+        except (TypeError, ValueError):
+            return False
+        turn_thread = str(turn.get("codex_thread_id") or "").strip()
+        turn_id = self._event_turn_id(event)
+        known_turn_id = str(turn.get("codex_turn_id") or "").strip()
+        if turn_id and known_turn_id and turn_id != known_turn_id:
+            return False
+        if event_generation != int(turn.get("codex_start_generation", turn.get("codex_context_generation") or 0)):
+            return False
+        if current_thread:
+            return bool(event_thread and turn_thread == current_thread)
+        if event_thread:
+            retired = chat.get("codex_context_retired_threads")
+            if isinstance(retired, list) and event_thread in retired:
+                return False
+            chat_turn_id = str(chat.get("codex_turn_id") or "").strip()
+            return (turn_idx == len(turns) - 1
+                    and str(turn.get("request_status") or "").strip() == "pending"
+                    and event_generation == int(turn.get("codex_context_generation") or 0)
+                    and event_generation == int(chat.get("codex_context_generation") or 0)
+                    and bool(turn_id) and chat_turn_id in {"", turn_id}
+                    and known_turn_id in {"", turn_id}
+                    and turn_thread in {"", event_thread})
+        return False
 
     @staticmethod
     def _codex_event_requires_known_turn(event: CodexEvent) -> bool:
@@ -8870,6 +9039,11 @@ class ChatFrame(wx.Frame):
         turn["request_recovered_after_restart"] = False
 
     def _start_codex_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str) -> None:
+        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
+        turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
+        if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict):
+            turns[turn_idx]["codex_context_generation"] = int(target_chat.get("codex_context_generation") or 0)
+            turns[turn_idx]["codex_start_generation"] = turns[turn_idx]["codex_context_generation"]
         def _worker() -> None:
             self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
 
@@ -8976,6 +9150,7 @@ class ChatFrame(wx.Frame):
 
     def _handle_codex_clear_command(self, chat: dict) -> str:
         if isinstance(chat, dict):
+            self._clear_codex_context_usage_for_thread_change(chat)
             chat["codex_thread_id"] = ""
             chat["codex_turn_id"] = ""
             chat["codex_turn_active"] = False
@@ -8990,8 +9165,48 @@ class ChatFrame(wx.Frame):
             self.active_codex_pending_prompt = ""
             self.active_codex_pending_request = None
             self.active_codex_thread_flags = []
+        self._publish_codex_context_thread_change(chat)
         self._save_state()
         return "## Codex 清理\n\n已清除当前聊天关联的 Codex 线程状态。聊天记录不会被删除。"
+
+    def _clear_codex_context_usage_for_thread_change(self, chat: dict, *, preserve: tuple[int, str, str] | None = None) -> None:
+        retired_thread = self._codex_thread_id_for_chat(chat)
+        if retired_thread:
+            retired = chat.get("codex_context_retired_threads")
+            retired = list(retired) if isinstance(retired, list) else []
+            if retired_thread not in retired:
+                retired.append(retired_thread)
+            chat["codex_context_retired_threads"] = retired[-16:]
+        chat["context_usage"] = None
+        chat["codex_context_generation"] = int(chat.get("codex_context_generation") or 0) + 1
+        chat_id = str(chat.get("id") or "").strip()
+        if chat_id:
+            for key in list(self._pending_context_usage_by_turn):
+                if key[0] == chat_id:
+                    early_owner = self._codex_early_context_usage_owner.get(key)
+                    if preserve is not None and key[1] == preserve[0] and early_owner == preserve[1:]:
+                        continue
+                    self._pending_context_usage_by_turn.pop(key, None)
+                    self._codex_early_context_usage_owner.pop(key, None)
+
+    def _publish_codex_context_thread_change(self, chat: dict) -> None:
+        if getattr(self, "_chat_information_dialog", None) is None:
+            return
+        if threading.current_thread() is threading.main_thread():
+            self._rebind_chat_information_after_thread_change(chat)
+        else:
+            self._call_after_if_alive(self._rebind_chat_information_after_thread_change, chat)
+
+    def _rebind_chat_information_after_thread_change(self, chat: dict) -> None:
+        dialog = getattr(self, "_chat_information_dialog", None)
+        owner = self._visible_chat_information_owner()
+        if dialog is None or dialog.IsBeingDeleted() or owner is None or owner[0] is not chat:
+            return
+        if dialog.identity[0] != str(chat.get("id") or ""):
+            return
+        dialog.identity = self._chat_information_identity(chat, owner[1])
+        dialog.set_rows(self._chat_information_rows(chat, owner[1]))
+        self._refresh_context_usage_header_rows()
 
     def _handle_codex_stop_command(self, client, chat: dict, model: str = "") -> str:
         thread_id = self._codex_thread_id_for_chat(chat)
@@ -9088,6 +9303,7 @@ class ChatFrame(wx.Frame):
             client.start_turn(
                 chat_id=client_chat_id,
                 turn_idx=turn_idx,
+                context_generation=int(target_turns[turn_idx].get("codex_context_generation") or 0),
                 question=send_question,
                 model=model,
                 cwd=self._workspace_dir_for_codex(),
@@ -11042,6 +11258,7 @@ class ChatFrame(wx.Frame):
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
+        self._codex_early_context_usage_owner = {}
         self._clear_active_claudecode_client()
         self.current_chat_id = ""
         self.active_chat_id = ""
@@ -12053,8 +12270,20 @@ class ChatFrame(wx.Frame):
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
-        if isinstance(identity_chat, dict) and not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
-            return
+        early_codex_usage = False
+        if event_type == "token_count" and isinstance(identity_chat, dict):
+            if not self._codex_token_usage_matches_native_chat(identity_chat, event):
+                return
+            early_codex_usage = bool(event_thread_id and not self._codex_thread_id_for_chat(identity_chat))
+            if event.usage and event_thread_id and not self._codex_thread_id_for_chat(identity_chat):
+                turns = identity_chat.get("turns") if isinstance(identity_chat.get("turns"), list) else []
+                turn_idx = self._event_scoped_turn_index(turns, event)
+                if turn_idx >= 0:
+                    key = self._context_usage_pending_key_from_chat(identity_chat, turn_idx)
+                    self._codex_early_context_usage_owner[key] = (event_thread_id, event_turn_id)
+        if isinstance(identity_chat, dict) and not early_codex_usage:
+            if not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
+                return
         execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
         if not is_current_chat:
@@ -14469,6 +14698,8 @@ class ChatFrame(wx.Frame):
         data = dict(event.data or {}) if isinstance(event.data, dict) else {}
         if "turn_idx" not in data and "turn_idx" in payload:
             data["turn_idx"] = payload.get("turn_idx")
+        if "context_generation" in payload:
+            data["context_generation"] = payload.get("context_generation")
         model = str(payload.get("model") or "").strip()
         if model and "model" not in data:
             data["model"] = model
@@ -14549,12 +14780,39 @@ class ChatFrame(wx.Frame):
         target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
         if not isinstance(target_chat, dict):
             return
+        if "thread_id" in payload:
+            ack_idx = payload.get("turn_idx")
+            turns = self.active_session_turns if is_current_target else target_chat.get("turns")
+            if not isinstance(ack_idx, int) or not isinstance(turns, list) or not 0 <= ack_idx < len(turns):
+                return
+            ack_turn = turns[ack_idx]
+            if not isinstance(ack_turn, dict):
+                return
+            try:
+                ack_generation = int(payload.get("context_generation"))
+            except (TypeError, ValueError):
+                return
+            if ack_generation != int(target_chat.get("codex_context_generation") or 0):
+                return
+            if ack_generation != int(ack_turn.get("codex_context_generation") or 0):
+                return
+            ack_turn.setdefault("codex_start_generation", ack_generation)
         thread_id = str(payload.get("thread_id") or "").strip()
         turn_id = str(payload.get("turn_id") or "").strip()
         if "thread_id" in payload:
+            thread_changed = str(target_chat.get("codex_thread_id") or "").strip() != thread_id
+            if thread_changed:
+                turn_idx = payload.get("turn_idx")
+                preserve = (turn_idx, thread_id, turn_id) if isinstance(turn_idx, int) and turn_id else None
+                self._clear_codex_context_usage_for_thread_change(target_chat, preserve=preserve)
+                if preserve is not None:
+                    key = self._context_usage_pending_key_from_chat(target_chat, turn_idx)
+                    self._codex_early_context_usage_owner.pop(key, None)
             target_chat["codex_thread_id"] = thread_id
             if is_current_target:
                 self.active_codex_thread_id = thread_id
+            if thread_changed:
+                self._publish_codex_context_thread_change(target_chat)
         if "turn_id" in payload:
             target_chat["codex_turn_id"] = turn_id
             if is_current_target:
@@ -14574,6 +14832,8 @@ class ChatFrame(wx.Frame):
             if isinstance(turn, dict):
                 if "thread_id" in payload:
                     turn["codex_thread_id"] = thread_id
+                    if thread_changed:
+                        turn["codex_context_generation"] = int(target_chat.get("codex_context_generation") or 0)
                 if "turn_id" in payload:
                     turn["codex_turn_id"] = turn_id
                 if thread_id or turn_id:
@@ -16423,6 +16683,7 @@ class ChatFrame(wx.Frame):
         self.active_claudecode_session_id = ""
         self._clear_active_claudecode_client()
         self._pending_context_usage_by_turn = {}
+        self._codex_early_context_usage_owner = {}
         self._current_chat_state["id"] = self.active_chat_id
         self._current_chat_state["turns"] = self.active_session_turns
         self._current_chat_state["updated_at"] = now
@@ -16790,6 +17051,7 @@ class ChatFrame(wx.Frame):
         return "cleared"
 
     def _clear_context_chat_state(self, chat: dict, chat_id: str, updated_at: float) -> None:
+        self._clear_codex_context_usage_for_thread_change(chat)
         chat["id"] = str(chat.get("id") or chat_id or "").strip()
         chat["turns"] = []
         chat["updated_at"] = updated_at
@@ -17938,6 +18200,7 @@ class ChatFrame(wx.Frame):
                 return False
             chat["context_usage"] = usage
             self._invalidate_remote_state_cache()
+            self._refresh_chat_information(chat)
             return True
         return False
 
@@ -18281,6 +18544,7 @@ class ChatFrame(wx.Frame):
         self.view_mode = "active"
         self.view_history_id = None
         self._pending_context_usage_by_turn = {}
+        self._codex_early_context_usage_owner = {}
         self._clear_active_claudecode_client()
         archived = self._archive_active_session(
             quick_title=True,

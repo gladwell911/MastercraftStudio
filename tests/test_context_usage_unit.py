@@ -80,22 +80,19 @@ def test_missing_usage_label_is_missing():
     assert format_context_usage_label(None) == "\u6682\u65e0"
 
 
-def test_codex_usage_payload_falls_back_to_model_context_window():
+def test_codex_usage_payload_does_not_guess_model_context_window():
     usage = codex_context_usage_from_payload(
         {
-            "usage": {
-                "inputTokens": 40000,
-                "outputTokens": 4176,
-                "cacheReadInputTokens": 0,
-                "cacheCreationInputTokens": 0,
+            "info": {
+                "last_token_usage": {"total_tokens": 44176},
                 "model": "codex/main",
             }
         }
     )
 
     assert usage["used_tokens"] == 44176
-    assert usage["context_window"] == 258400
-    assert format_context_usage_label(usage) == "44k / 258k"
+    assert usage["context_window"] == 0
+    assert format_context_usage_label(usage) == "暂无"
 
 
 def test_normalize_context_usage_computes_percent_and_bounds_values():
