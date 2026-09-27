@@ -10,6 +10,14 @@
 - 为什么重要：把累计值用于上下文百分比会产生超过窗口容量的假象，Kimi 普通 session 详情的 `usage` 目前是零值占位。
 - 下次怎么用：按 `_bmad-output/specs/spec-codex-kimi-chat-information/data-contract.md` 核对每个字段的单位、来源、更新时机和缺失状态，再接到界面。
 
+- 经验：Codex worker 的 token 事件应携稳定的 thread、turn 和 context generation；账号或原生 thread 切换后拒绝旧事件。Kimi 的实时 status 优先于打开面板时较早发出的 REST `/status` 结果，历史 session 的 status 不得改写当前 session。snapshot 累计值可以独立更新。
+- 为什么重要：只按当前列表行、共享 turn 索引或请求返回顺序更新，会让旧会话用量重新出现在新会话，或使压缩后的上下文百分比倒退。
+- 下次怎么用：回归同时覆盖清空发生在旧 worker ack 之前、同 thread 连续 turn、账号切换、旧 session 迟到事件，以及“先收到新实时 status、后收到旧 REST 结果”的顺序；无可证实归属时不更新可视值。
+
+- 经验：BMad 票据标题含中文时，仅按 ASCII slug 生成计划文件名可能碰撞；已安装的票据 CLI 应为无计划条目使用 ticket ID 命名，并保留已存在计划的路径。
+- 为什么重要：Story 1.1 和 1.2 的标题都曾被压成 `codex`，使 `find 1.2` 指向 1.1 的已完成计划。
+- 下次怎么用：开始新票据时核对 `find` 返回的 `id`、`plan` 与计划 frontmatter 的 `ticket` 一致；外部 CLI 修复位于本机技能目录，不属于 MC 仓库提交。
+
 ## canonical 执行内容与远程可视快照
 
 - 经验：桌面列表由 canonical `execution_steps` 经 Kimi 折叠、轮次问答补行和可见性过滤生成；V2 durable fact 记录的是另一条事件链。跨端可视一致性应复用纯内容投影，并为远程页面单独创建不可变行快照，不应修改旧事实流的游标语义。

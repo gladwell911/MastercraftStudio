@@ -9,6 +9,7 @@
 - Any interactive CLI client reference that can consume later user input must carry its owning `chat_id`. Only matching-chat input may be forwarded to that client; add a cross-chat regression whenever this routing changes.
 - Execution-page changes must preserve the applied chat/turn owner across labels, metadata, selection and detail actions, including pending/error states. Keep bounded foreground reads, generation-checked background results, and automatic retry without interrupting provider drains. See the current execution specification linked from `docs/README.md`.
 - Run wx GUI suites serially. Tests enabling real timers must own cleanup from frame construction through teardown, stopping their timers/scans before destroying the frame; do not disable production drains or relax navigation thresholds to hide cross-test contamination.
+- Chat information separates Codex `last` context usage from thread `total` token consumption, and Kimi live status context from snapshot `session.usage` totals. Async account, status, and snapshot results must match the visible chat, native thread/session, account, and request generation. Do not let late Codex worker events or an older Kimi REST status overwrite a newer owner or live status event. Keep unchanged list text and keyboard focus stable.
 
 ## Durable project context
 
