@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from collections import Counter, deque
 from contextlib import contextmanager
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -72,6 +72,7 @@ from codex_worker_process import main as codex_worker_main
 from kimi_server_client import (
     DEFAULT_KIMI_MODEL,
     KimiServerClient,
+    KimiServerError,
     event_from_payload as kimi_event_from_payload,
     event_to_payload as kimi_event_to_payload,
     is_kimi_model,
@@ -1571,6 +1572,25 @@ class ChatInformationDialog(wx.Dialog):
         self.information_list.Bind(wx.EVT_KEY_DOWN, self._on_list_key_down)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.refresh_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_refresh_timer, self.refresh_timer)
+        self.refresh_timer.Start(60000)
+
+    def _on_refresh_timer(self, _event) -> None:
+        current = self.owner._visible_chat_information_owner()
+        if current is None:
+            return
+        chat, model = current
+        new_identity = self.owner._chat_information_identity(chat, model)
+        if new_identity[:3] != self.identity[:3]:
+            return
+        if new_identity != self.identity:
+            self.identity = new_identity
+        self.owner._refresh_chat_information(chat)
+        if is_codex_model(model):
+            self.owner._request_codex_chat_information(chat, model)
+        elif is_kimi_model(model):
+            self.owner._request_kimi_quota(chat, model)
 
     def set_rows(self, rows: list[str]) -> None:
         if list(self.information_list.GetStrings()) == rows:
@@ -1593,6 +1613,7 @@ class ChatInformationDialog(wx.Dialog):
         event.Skip()
 
     def _on_close(self, _event) -> None:
+        self.refresh_timer.Stop()
         self.owner._chat_information_dialog = None
         target = self.focus_target
         self.Destroy()
@@ -2298,7 +2319,7 @@ class ChatFrame(wx.Frame):
 
     def _chat_information_identity(self, chat: dict, model: str) -> tuple[str, str, str, str]:
         native_id = self._codex_thread_id_for_chat(chat) if is_codex_model(model) else self._kimi_session_id_for_chat(chat)
-        account_id = str(chat.get("codex_account_id") or chat.get("kimi_account_id") or "").strip()
+        account_id = str(chat.get("codex_account_id") or "").strip() if is_codex_model(model) else ""
         return (str(chat.get("id") or ""), model, native_id, account_id)
 
     def _on_chat_information_menu_open(self, event) -> None:
@@ -2332,7 +2353,61 @@ class ChatFrame(wx.Frame):
                 rows.append(str(chat.get("codex_weekly_quota_label") or "Codex 周额度：暂不可用"))
             else:
                 rows.extend(["Codex 账号：未查询", "Codex 周额度：暂不可用"])
+        else:
+            owner_matches = chat.get("kimi_quota_owner") == chat.get("kimi_verified_account_id")
+            quota = chat.get("kimi_quota_payload") if owner_matches else None
+            labels = self._kimi_quota_labels(quota, failed=bool(chat.get("kimi_quota_error"))) if owner_matches and (quota is not None or chat.get("kimi_quota_error")) else None
+            if labels is not None and chat.get("kimi_quota_updated_at"):
+                stamp = datetime.fromtimestamp(chat["kimi_quota_updated_at"]).strftime("%Y-%m-%d %H:%M")
+                labels = [f"{label}（上次更新于 {stamp}）" for label in labels]
+            rows.extend(labels if labels is not None else ["Kimi 五小时额度：暂不可用", "Kimi 七日额度：暂不可用"])
         return rows
+
+    @staticmethod
+    def _kimi_quota_labels(payload: dict | None, *, failed: bool = False) -> list[str]:
+        names = ("Kimi 五小时额度", "Kimi 七日额度")
+        if isinstance(payload, dict) and payload.get("kind") in {"not_applicable", "unauthenticated"}:
+            state = "此登录方式不适用" if payload["kind"] == "not_applicable" else "未登录"
+            return [f"{name}：{state}" for name in names]
+        if isinstance(payload, dict) and payload.get("kind") == "error":
+            error = payload.get("error")
+            code = str(error.get("code") if isinstance(error, dict) else "").lower()
+            if code == "unauthorized":
+                return [f"{name}：未登录" for name in names]
+        if failed or not isinstance(payload, dict) or payload.get("kind") == "error":
+            return [f"{name}：查询失败" for name in names]
+        if payload.get("kind") != "ok":
+            return [f"{name}：服务端未提供" for name in names]
+        quota = payload.get("quota")
+        usages = quota.get("usages") if isinstance(quota, dict) else None
+        if not isinstance(usages, dict):
+            usages = {}
+        result = []
+        for name, key in zip(names, ("limit5h", "limit7d")):
+            window = usages.get(key)
+            if not isinstance(window, dict):
+                result.append(f"{name}：服务端未提供")
+                continue
+            ratio = window.get("usedRatio")
+            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+                result.append(f"{name}：使用比例暂不可用")
+                continue
+            label = f"{name}：已用 {ratio * 100:.1f}%"
+            reset = window.get("resetAt")
+            try:
+                reset_time = datetime.fromisoformat(str(reset).replace("Z", "+00:00"))
+                if reset_time.tzinfo is None:
+                    raise ValueError("timezone missing")
+                if key == "limit5h":
+                    label += f"，本地重置 {reset_time.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                else:
+                    seconds = max(0, int((reset_time - datetime.now(timezone.utc)).total_seconds()))
+                    hours, minutes = divmod((seconds + 59) // 60, 60)
+                    label += f"，距重置 {hours} 小时 {minutes} 分钟"
+            except (TypeError, ValueError, OverflowError):
+                label += "，重置时间暂不可用"
+            result.append(label)
+        return result
 
     def _refresh_chat_information(self, chat: dict | None = None) -> None:
         dialog = getattr(self, "_chat_information_dialog", None)
@@ -2364,6 +2439,10 @@ class ChatFrame(wx.Frame):
             self._chat_information_previous_focus = None
             dialog = ChatInformationDialog(self, identity, focus_target)
             self._chat_information_dialog = dialog
+            if is_kimi_model(model):
+                if chat.get("kimi_quota_payload") is not None and not chat.get("kimi_quota_updated_at"):
+                    chat.pop("kimi_quota_payload", None)
+                    chat.pop("kimi_quota_error", None)
         dialog.set_rows(self._chat_information_rows(chat, model))
         dialog.Show()
         dialog.Raise()
@@ -2372,6 +2451,7 @@ class ChatFrame(wx.Frame):
             self._request_codex_chat_information(chat, model)
         elif is_kimi_model(model):
             self._request_kimi_chat_information(chat, model, visible_only=True)
+            self._request_kimi_quota(chat, model)
         return True
 
     def _request_codex_chat_information(self, chat: dict, model: str) -> None:
@@ -2506,6 +2586,76 @@ class ChatFrame(wx.Frame):
                                           identity[0], generation, identity, kind, payload, failed)
 
         threading.Thread(target=_read, daemon=True).start()
+
+    def _request_kimi_quota(self, chat: dict, model: str) -> None:
+        dialog = getattr(self, "_chat_information_dialog", None)
+        identity = self._chat_information_identity(chat, model)
+        if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity or not identity[0]):
+            return
+        self._kimi_quota_generation = getattr(self, "_kimi_quota_generation", 0) + 1
+        generation = self._kimi_quota_generation
+        self._kimi_quota_request = (generation, identity)
+
+        def _read() -> None:
+            try:
+                client = self._ensure_kimi_client()
+                client.start()
+                auth = client.get_auth()
+                provider = auth.get("managed_provider") if isinstance(auth, dict) else None
+                if not isinstance(provider, dict):
+                    payload = {"kind": "not_applicable"}
+                elif str(provider.get("status") or "").lower() in {"unauthenticated", "expired", "revoked"}:
+                    payload = {"kind": "unauthenticated"}
+                elif str(provider.get("status") or "").lower() != "authenticated":
+                    payload = {"kind": "error"}
+                else:
+                    user = client.get_oauth_userinfo()
+                    info = user.get("userInfo") if isinstance(user, dict) and user.get("kind") == "ok" else None
+                    user_id = str(info.get("userId") or "").strip() if isinstance(info, dict) else ""
+                    if not user_id:
+                        payload = {"kind": "error"}
+                    else:
+                        usage = client.get_oauth_usage()
+                        confirm = client.get_oauth_userinfo()
+                        confirmed_info = confirm.get("userInfo") if isinstance(confirm, dict) and confirm.get("kind") == "ok" else None
+                        confirmed_id = str(confirmed_info.get("userId") or "").strip() if isinstance(confirmed_info, dict) else ""
+                        confirmed_auth = client.get_auth()
+                        confirmed_provider = confirmed_auth.get("managed_provider") if isinstance(confirmed_auth, dict) else None
+                        auth_ok = isinstance(confirmed_provider, dict) and str(confirmed_provider.get("status") or "").lower() == "authenticated"
+                        payload = dict(usage, _account_id=user_id) if user_id == confirmed_id and auth_ok else {"kind": "error"}
+                failed = False
+            except KimiServerError as exc:
+                payload = {"kind": "error", "error": {"code": "unauthorized"}} if exc.status_code == 401 else None
+                failed = payload is None
+            except Exception:
+                payload, failed = None, True
+            self._call_after_if_alive(self._apply_kimi_quota, generation, identity, payload, failed)
+
+        threading.Thread(target=_read, daemon=True, name="kimi-chat-quota").start()
+
+    def _apply_kimi_quota(self, generation: int, identity: tuple[str, str, str, str],
+                          payload: dict | None, failed: bool) -> None:
+        dialog = getattr(self, "_chat_information_dialog", None)
+        owner = self._visible_chat_information_owner()
+        if (getattr(self, "_kimi_quota_request", None) != (generation, identity)
+                or dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
+                or owner is None or self._chat_information_identity(*owner) != identity):
+            return
+        self._kimi_quota_request = None
+        chat = owner[0]
+        account_id = str((payload or {}).get("_account_id") or "")
+        verified_changed = str(chat.get("kimi_verified_account_id") or "") != account_id
+        if account_id != str(chat.get("kimi_quota_owner") or ""):
+            chat.pop("kimi_quota_payload", None)
+            chat.pop("kimi_quota_updated_at", None)
+        chat["kimi_verified_account_id"] = account_id
+        if (verified_changed or chat.get("kimi_quota_payload") != payload or bool(chat.get("kimi_quota_error")) != failed
+                or chat.get("kimi_quota_owner") != account_id):
+            chat["kimi_quota_payload"] = payload
+            chat["kimi_quota_error"] = failed
+            chat["kimi_quota_owner"] = account_id
+            chat["kimi_quota_updated_at"] = time.time()
+            self._refresh_chat_information(chat)
 
     def _apply_kimi_chat_information_result(
         self, chat_id: str, generation: int, identity: tuple[str, str, str, str],
@@ -10195,7 +10345,12 @@ class ChatFrame(wx.Frame):
         if dialog.identity[0] != str(chat.get("id") or ""):
             return
         dialog.identity = self._chat_information_identity(chat, owner[1])
+        chat.pop("kimi_quota_payload", None)
+        chat.pop("kimi_quota_updated_at", None)
+        chat.pop("kimi_quota_owner", None)
+        chat.pop("kimi_verified_account_id", None)
         dialog.set_rows(self._chat_information_rows(chat, owner[1]))
+        self._request_kimi_quota(chat, owner[1])
 
     def _handle_kimi_stop_command(self, client, chat: dict, model: str = "") -> str:
         session_id = self._kimi_session_id_for_chat(chat)

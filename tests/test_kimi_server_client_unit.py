@@ -474,6 +474,23 @@ def test_snapshot_total_uses_only_input_and_output_tokens():
         "input_tokens": -1, "output_tokens": 20}}}) is None
 
 
+def test_oauth_usage_reads_quota_endpoint():
+    client, _, http, _, _ = started_client()
+    data = {"kind": "ok", "quota": {"usages": {"limit5h": {"usedRatio": 0.25}}}}
+    http.routes[("GET", "/api/v1/oauth/usage")] = FakeResponse(200, {"code": 0, "data": data})
+    assert client.get_oauth_usage() == data
+
+
+def test_auth_and_userinfo_read_account_endpoints():
+    client, _, http, _, _ = started_client()
+    auth = {"managed_provider": {"status": "authenticated"}}
+    info = {"kind": "ok", "userInfo": {"userId": "user-1"}}
+    http.routes[("GET", "/api/v1/auth")] = FakeResponse(200, {"code": 0, "data": auth})
+    http.routes[("GET", "/api/v1/oauth/userinfo")] = FakeResponse(200, {"code": 0, "data": info})
+    assert client.get_auth() == auth
+    assert client.get_oauth_userinfo() == info
+
+
 # ----------------------------------------------------------------------
 # A9-A10: close escalation and idempotence
 

@@ -944,6 +944,15 @@ class KimiServerClient:
     def get_snapshot(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         return self._request_data("GET", f"/api/v1/sessions/{session_id}/snapshot", timeout=timeout)
 
+    def get_oauth_usage(self, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", "/api/v1/oauth/usage", timeout=timeout)
+
+    def get_auth(self, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", "/api/v1/auth", timeout=timeout)
+
+    def get_oauth_userinfo(self, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", "/api/v1/oauth/userinfo", timeout=timeout)
+
     def session_exists(self, session_id: str, *, timeout: float | None = None) -> bool:
         try:
             self._request_data("GET", f"/api/v1/sessions/{session_id}", timeout=timeout)

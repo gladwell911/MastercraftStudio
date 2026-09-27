@@ -9,12 +9,14 @@ import pytest
 
 _REAL_CODEX_INFORMATION_REQUEST = main.ChatFrame._request_codex_chat_information
 _REAL_KIMI_INFORMATION_REQUEST = main.ChatFrame._request_kimi_chat_information
+_REAL_KIMI_QUOTA_REQUEST = main.ChatFrame._request_kimi_quota
 
 
 @pytest.fixture(autouse=True)
 def _disable_external_codex_information_reads(monkeypatch):
     monkeypatch.setattr(main.ChatFrame, "_request_codex_chat_information", lambda *_args: None)
     monkeypatch.setattr(main.ChatFrame, "_request_kimi_chat_information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", lambda *_args, **_kwargs: None)
 
 
 def _send_key(window, key):
@@ -22,6 +24,149 @@ def _send_key(window, key):
     hwnd = int(window.GetHandle())
     user32.SendMessageW(hwnd, 0x0100, key, 1)
     user32.SendMessageW(hwnd, 0x0101, key, 1 | (1 << 30) | (1 << 31))
+
+
+def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main", "kimi_session_id": "session-q",
+            "kimi_account_id": "account-q"}
+    frame._current_chat_state = chat
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetFocus()
+    identity = dialog.identity
+    frame._kimi_quota_request = (1, identity)
+    frame._apply_kimi_quota(1, identity, {
+        "kind": "ok", "quota": {"usages": {
+            "limit5h": {"usedRatio": .25, "resetAt": "2026-09-27T12:00:00Z"},
+            "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
+    rows = list(dialog.information_list.GetStrings())
+    assert "已用 25.0%" in rows[2] and "本地重置" in rows[2]
+    assert "已用 50.0%" in rows[3] and "距重置" in rows[3]
+    assert dialog.information_list.GetSelection() == 2
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    chat["kimi_session_id"] = "session-new"
+    frame._apply_kimi_quota(1, identity, None, True)
+    assert chat["kimi_quota_payload"]["kind"] == "ok"
+    dialog.Close()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    assert "上次更新于" in dialog.information_list.GetStrings()[2]
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_quota_without_session_and_timer_skips_session_reads(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    calls = []
+    monkeypatch.setattr(frame, "_request_kimi_chat_information", lambda *_a, **_k: calls.append("session"))
+    monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a, **_k: calls.append("quota"))
+    assert frame._show_chat_information()
+    assert calls == ["session", "quota"]
+    calls.clear()
+    dialog = frame._chat_information_dialog
+    dialog._on_refresh_timer(None)
+    assert calls == ["quota"]
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_quota_explicit_auth_states():
+    assert "不适用" in main.ChatFrame._kimi_quota_labels({"kind": "not_applicable"})[0]
+    assert "未登录" in main.ChatFrame._kimi_quota_labels({"kind": "unauthenticated"})[0]
+    assert "未登录" in main.ChatFrame._kimi_quota_labels({"kind": "error", "error": {"code": "unauthorized"}})[0]
+    assert "查询失败" in main.ChatFrame._kimi_quota_labels({"kind": "error", "error": {"code": "not_applicable"}})[0]
+    assert "查询失败" in main.ChatFrame._kimi_quota_labels({"kind": "error"})[0]
+
+
+def test_kimi_quota_account_result_replaces_previous_account(frame, wx_app):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    identity = frame._chat_information_dialog.identity
+    for generation, user_id, ratio in ((1, "user-1", .2), (2, "user-2", .7)):
+        frame._kimi_quota_request = (generation, identity)
+        frame._apply_kimi_quota(generation, identity, {"kind": "ok", "_account_id": user_id,
+            "quota": {"usages": {"limit5h": {"usedRatio": ratio}}}}, False)
+    assert chat["kimi_quota_owner"] == "user-2"
+    assert chat["kimi_verified_account_id"] == "user-2"
+    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "上次更新于" in frame._chat_information_dialog.information_list.GetString(2)
+    chat["kimi_verified_account_id"] = "user-3"
+    frame._refresh_chat_information(chat)
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
+    frame._kimi_quota_request = (3, identity)
+    frame._apply_kimi_quota(2, identity, {"kind": "ok", "_account_id": "user-2",
+        "quota": {"usages": {"limit5h": {"usedRatio": .9}}}}, False)
+    assert chat["kimi_verified_account_id"] == "user-3"
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
+    same_payload = chat["kimi_quota_payload"]
+    frame._kimi_quota_request = (4, identity)
+    frame._apply_kimi_quota(4, identity, same_payload, False)
+    assert chat["kimi_verified_account_id"] == "user-2"
+    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(2)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_quota_http_401_is_unlogged_and_reopen_clears_cache(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", _REAL_KIMI_QUOTA_REQUEST)
+
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Client:
+        def start(self):
+            pass
+
+        def get_auth(self):
+            return {"managed_provider": {"status": "authenticated"}}
+
+        def get_oauth_userinfo(self):
+            return {"kind": "ok", "userInfo": {"userId": "user-1"}}
+
+        def get_oauth_usage(self):
+            raise main.KimiServerError("unauthorized", status_code=401)
+
+    monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
+    frame._request_kimi_quota(chat, "kimi/main")
+    wx_app.Yield()
+    assert "未登录" in frame._chat_information_dialog.information_list.GetString(2)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", lambda *_a, **_k: None)
+    assert frame._show_chat_information()
+    assert "上次更新于" in frame._chat_information_dialog.information_list.GetString(2)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
 
 
 def test_codex_chat_information_list_arrows_and_escape_restore_focus(frame, wx_app):
@@ -465,7 +610,7 @@ def test_kimi_status_snapshot_and_session_clear_keep_focus_and_reject_old_result
         "generation": 5, "identity": identity, "context_revision": 0, "visible_only": True,
         "remaining": {"status", "snapshot"},
     }
-    chat["kimi_account_id"] = "account-2"
+    chat["kimi_session_id"] = "session-2"
     frame._apply_kimi_chat_information_result("chat-1", 5, identity, "snapshot",
                                                {"session": {"usage": {"input_tokens": 999,
                                                                       "output_tokens": 999}}}, False)
