@@ -134,6 +134,14 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(request_id, "start_turn", payload))
         return request_id
 
+    def read_chat_information(self, *, chat_id: str, model: str, identity: list[str], generation: int) -> str:
+        request_id = self._next_id()
+        self._send_message(make_ui_request(request_id, "read_chat_information", {
+            "chat_id": str(chat_id or ""), "model": str(model or ""), "identity": list(identity),
+            "generation": int(generation),
+        }))
+        return request_id
+
     def reply_user_input(self, chat_id: str, request_id: str, answers: dict[str, Any]) -> str:
         message_id = self._next_id()
         payload = {"chat_id": chat_id, "request_id": request_id, "answers": dict(answers or {})}

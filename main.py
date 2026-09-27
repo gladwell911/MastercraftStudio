@@ -1814,6 +1814,8 @@ class ChatFrame(wx.Frame):
         self._kimi_thinking_sync_at: dict[str, float] = {}
         self._kimi_thinking_synced: dict[tuple[str, str], set[str]] = {}
         self._codex_clients: dict[str, CodexWorkerClient] = {}
+        self._chat_information_request_generation = 0
+        self._chat_information_request: tuple[str | None, int, tuple[str, str, str, str]] | None = None
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
@@ -2316,7 +2318,17 @@ class ChatFrame(wx.Frame):
                 context_row = f"当前上下文：{usage.used_tokens:,} token，窗口未知"
         else:
             context_row = "当前上下文：暂不可用"
-        return [context_row, "会话累计 token：暂不可用"]
+        total = chat.get("codex_session_total_tokens") if is_codex_model(model) else None
+        total_row = f"会话累计 token：{total:,}" if isinstance(total, int) and total >= 0 else "会话累计 token：暂不可用"
+        rows = [context_row, total_row]
+        if is_codex_model(model):
+            owner_id = str(chat.get("codex_account_id") or "").strip()
+            if str(chat.get("codex_chat_information_account_owner") or "").strip() == owner_id:
+                rows.append(str(chat.get("codex_account_label") or "Codex 账号：未查询"))
+                rows.append(str(chat.get("codex_weekly_quota_label") or "Codex 周额度：暂不可用"))
+            else:
+                rows.extend(["Codex 账号：未查询", "Codex 周额度：暂不可用"])
+        return rows
 
     def _refresh_chat_information(self, chat: dict | None = None) -> None:
         dialog = getattr(self, "_chat_information_dialog", None)
@@ -2352,7 +2364,107 @@ class ChatFrame(wx.Frame):
         dialog.Show()
         dialog.Raise()
         dialog.information_list.SetFocus()
+        if is_codex_model(model):
+            self._request_codex_chat_information(chat, model)
         return True
+
+    def _request_codex_chat_information(self, chat: dict, model: str) -> None:
+        dialog = getattr(self, "_chat_information_dialog", None)
+        if dialog is None or dialog.IsBeingDeleted():
+            return
+        identity = self._chat_information_identity(chat, model)
+        if dialog.identity != identity or not identity[0]:
+            return
+        self._chat_information_request_generation += 1
+        generation = self._chat_information_request_generation
+        try:
+            client = self._get_or_create_codex_client(identity[0], model)
+        except Exception:
+            self._chat_information_request = (None, generation, identity)
+            self._fail_codex_chat_information_request(generation, identity)
+            return
+        self._chat_information_request = (None, generation, identity)
+
+        def _read() -> None:
+            try:
+                client.start()
+                client.read_chat_information(chat_id=identity[0], model=model,
+                                             identity=list(identity), generation=generation)
+            except Exception:
+                self._call_after_if_alive(self._fail_codex_chat_information_request, generation, identity)
+
+        threading.Thread(target=_read, daemon=True, name="codex-chat-information").start()
+
+    def _fail_codex_chat_information_request(self, generation: int, identity: tuple[str, str, str, str]) -> None:
+        request = self._chat_information_request
+        dialog = getattr(self, "_chat_information_dialog", None)
+        owner = self._visible_chat_information_owner()
+        if (request is None or request[1:] != (generation, identity)
+                or dialog is None or dialog.IsBeingDeleted() or owner is None
+                or dialog.identity != identity or self._chat_information_identity(*owner) != identity):
+            return
+        chat = owner[0]
+        chat["codex_account_label"] = "Codex 账号：查询失败"
+        chat["codex_weekly_quota_label"] = "Codex 周额度：查询失败"
+        chat["codex_chat_information_account_owner"] = identity[3]
+        self._chat_information_request = None
+        self._refresh_chat_information(chat)
+
+    def _apply_codex_chat_information(self, chat_id: str, message: dict, payload: dict) -> None:
+        request = self._chat_information_request
+        dialog = getattr(self, "_chat_information_dialog", None)
+        owner = self._visible_chat_information_owner()
+        if request is None or dialog is None or dialog.IsBeingDeleted() or owner is None:
+            return
+        request_id, generation, identity = request
+        chat, model = owner
+        if ((request_id is not None and str(message.get("id") or "") != request_id) or chat_id != identity[0]
+                or self._chat_information_identity(chat, model) != identity or dialog.identity != identity
+                or list(payload.get("identity") or []) != list(identity)
+                or payload.get("generation") != generation):
+            return
+        self._chat_information_request = None
+        account_resp = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+        account = account_resp.get("account") if isinstance(account_resp.get("account"), dict) else None
+        if payload.get("account_error"):
+            account_label = "Codex 账号：查询失败"
+        elif account is None:
+            account_label = "Codex 账号：未登录"
+        else:
+            account_label = f"Codex 账号：{self._format_codex_account_status(account_resp)}"
+        account_type = str((account or {}).get("type") or "").lower()
+        if account is None and not payload.get("account_error"):
+            quota_label = "Codex 周额度：未登录"
+        elif account_type in {"apikey", "api_key", "api-key"}:
+            quota_label = "Codex 周额度：API key 账号不适用"
+        elif payload.get("rate_limits_error") or payload.get("account_error"):
+            quota_label = "Codex 周额度：查询失败"
+        else:
+            quota_label = self._codex_weekly_quota_label(payload.get("rate_limits"))
+        new_account_id = str((account or {}).get("id") or (account or {}).get("email") or "").strip()
+        account_identity_changed = bool(not payload.get("account_error") and new_account_id != identity[3])
+        changed = (chat.get("codex_account_label") != account_label
+                   or chat.get("codex_weekly_quota_label") != quota_label
+                   or str(chat.get("codex_chat_information_account_owner") or "").strip() != identity[3]
+                   or account_identity_changed)
+        if changed:
+            if account_identity_changed:
+                if identity[3]:
+                    self._clear_codex_context_usage_for_thread_change(chat)
+                    chat["codex_thread_id"] = ""
+                    chat["codex_turn_id"] = ""
+                    chat["codex_turn_active"] = False
+                    if chat is self._current_chat_state:
+                        self.active_codex_thread_id = ""
+                        self.active_codex_turn_id = ""
+                        self.active_codex_turn_active = False
+                chat["codex_account_id"] = new_account_id
+                dialog.identity = self._chat_information_identity(chat, model)
+            chat["codex_account_label"] = account_label
+            chat["codex_weekly_quota_label"] = quota_label
+            chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
+            self._refresh_chat_information(chat)
+            self._defer_codex_state_save()
 
     def _selected_common_command(self):
         dialog = getattr(self, "common_commands_dialog", None)
@@ -4873,6 +4985,36 @@ class ChatFrame(wx.Frame):
         if isinstance(percent, (int, float)):
             return f"{name}：{percent:.0f}% 已用"
         return name or "未知"
+
+    @staticmethod
+    def _codex_weekly_quota_label(response) -> str:
+        if not isinstance(response, dict):
+            return "Codex 周额度：查询失败"
+        limits = response.get("rateLimits")
+        by_id = response.get("rateLimitsByLimitId")
+        if isinstance(by_id, dict) and isinstance(by_id.get("codex"), dict):
+            limits = by_id["codex"]
+        if not isinstance(limits, dict):
+            return "Codex 周额度：周窗口暂不可用"
+        limit_id = str(limits.get("limitId") or limits.get("limitName") or "codex").lower()
+        if limit_id != "codex":
+            return "Codex 周额度：周窗口暂不可用"
+        windows = [limits.get("primary"), limits.get("secondary")]
+        weekly = next((item for item in windows if isinstance(item, dict)
+                       and item.get("windowDurationMins") == 10080), None)
+        if weekly is None:
+            return "Codex 周额度：周窗口暂不可用"
+        used = weekly.get("usedPercent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
+            remaining = "剩余比例暂不可用"
+        else:
+            remaining = f"剩余 {100 - used:.1f}%"
+        reset = weekly.get("resetsAt")
+        try:
+            reset_text = datetime.fromtimestamp(float(reset)).strftime("%Y-%m-%d %H:%M:%S") if reset is not None else "重置时间暂不可用"
+        except (TypeError, ValueError, OverflowError, OSError):
+            reset_text = "重置时间暂不可用"
+        return f"Codex 周额度：{remaining}，本地重置 {reset_text}"
 
     @staticmethod
     def _codex_thread_status_from_response(thread_resp: dict) -> tuple[str, list[str]]:
@@ -9178,8 +9320,11 @@ class ChatFrame(wx.Frame):
                 retired.append(retired_thread)
             chat["codex_context_retired_threads"] = retired[-16:]
         chat["context_usage"] = None
-        chat["codex_context_generation"] = int(chat.get("codex_context_generation") or 0) + 1
         chat_id = str(chat.get("id") or "").strip()
+        preserve_total = bool(preserve and chat_id and self._codex_early_context_usage_owner.get((chat_id, preserve[0])) == preserve[1:])
+        if not preserve_total:
+            chat["codex_session_total_tokens"] = None
+        chat["codex_context_generation"] = int(chat.get("codex_context_generation") or 0) + 1
         if chat_id:
             for key in list(self._pending_context_usage_by_turn):
                 if key[0] == chat_id:
@@ -12275,7 +12420,8 @@ class ChatFrame(wx.Frame):
             if not self._codex_token_usage_matches_native_chat(identity_chat, event):
                 return
             early_codex_usage = bool(event_thread_id and not self._codex_thread_id_for_chat(identity_chat))
-            if event.usage and event_thread_id and not self._codex_thread_id_for_chat(identity_chat):
+            event_data = event.data if isinstance(event.data, dict) else {}
+            if (event.usage or isinstance(event_data.get("session_total_tokens"), int)) and event_thread_id and not self._codex_thread_id_for_chat(identity_chat):
                 turns = identity_chat.get("turns") if isinstance(identity_chat.get("turns"), list) else []
                 turn_idx = self._event_scoped_turn_index(turns, event)
                 if turn_idx >= 0:
@@ -12283,6 +12429,16 @@ class ChatFrame(wx.Frame):
                     self._codex_early_context_usage_owner[key] = (event_thread_id, event_turn_id)
         if isinstance(identity_chat, dict) and not early_codex_usage:
             if not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
+                return
+        if event_type == "token_count" and isinstance(identity_chat, dict):
+            event_data = event.data if isinstance(event.data, dict) else {}
+            total = event_data.get("session_total_tokens")
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                if identity_chat.get("codex_session_total_tokens") != total:
+                    identity_chat["codex_session_total_tokens"] = total
+                    self._refresh_chat_information(identity_chat)
+                    self._defer_codex_state_save()
+            if not event.usage:
                 return
         execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
@@ -12344,6 +12500,7 @@ class ChatFrame(wx.Frame):
                         self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                    self._request_codex_chat_information(target_chat, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._complete_clear_operation_turn(turn, failed=False)
                 self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
@@ -12421,6 +12578,7 @@ class ChatFrame(wx.Frame):
                 ):
                     self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
+                self._request_codex_chat_information(self._current_chat_state, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._complete_clear_operation_turn(turn, failed=False)
                 if self._background_ui_mutations_blocked():
                     self._mark_background_answer_list_dirty()
@@ -14652,7 +14810,7 @@ class ChatFrame(wx.Frame):
             return
         message_type = str(message.get("type") or "").strip()
         if (
-            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error"}
+            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error", "chat_information"}
             and threading.current_thread() is not threading.main_thread()
         ):
             self._call_after_if_alive(self._on_codex_worker_message, default_chat_id, message, client)
@@ -14662,6 +14820,9 @@ class ChatFrame(wx.Frame):
             return
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         chat_id = str(payload.get("chat_id") or default_chat_id or "").strip()
+        if message_type == "chat_information":
+            self._apply_codex_chat_information(chat_id, message, payload)
+            return
         if message_type == "event":
             event_payload = payload.get("event") if isinstance(payload.get("event"), dict) else payload
             try:

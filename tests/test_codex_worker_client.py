@@ -80,6 +80,36 @@ def test_worker_client_send_start_turn_writes_json_line():
     assert '"service_tier":"fast"' in written
 
 
+def test_worker_client_reads_chat_information_with_identity_and_generation():
+    proc = FakeProcess()
+    client = CodexWorkerClient(process_factory=lambda _args: proc, start_reader_threads=False)
+    client.start()
+    request_id = client.read_chat_information(
+        chat_id="chat-1", model="codex/main",
+        identity=["chat-1", "codex/main", "thread-1", "account-1"], generation=3,
+    )
+    message = json.loads(proc.stdin.getvalue())
+    assert message["id"] == request_id
+    assert message["type"] == "read_chat_information"
+    assert message["payload"]["chat_id"] == "chat-1"
+    assert message["payload"]["generation"] == 3
+
+
+def test_worker_client_concurrent_start_reuses_one_process():
+    created = []
+    client = CodexWorkerClient(
+        process_factory=lambda _args: created.append(FakeProcess()) or created[-1],
+        start_reader_threads=False,
+    )
+    threads = [threading.Thread(target=client.start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(created) == 1
+
+
 def test_worker_client_uses_console_worker_executable_when_running_from_frozen_executable(monkeypatch):
     proc = FakeProcess()
     commands = []

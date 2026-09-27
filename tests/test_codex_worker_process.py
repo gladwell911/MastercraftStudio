@@ -68,6 +68,16 @@ class UniqueTurnCodexClient(FakeCodexClient):
         return {"turn": {"id": f"turn-{len(self.started_turns)}"}}
 
 
+class InformationCodexClient(FakeCodexClient):
+    def read_account(self, refresh_token=False):
+        return {"account": {"type": "chatgpt", "id": "account-1"}}
+
+    def read_rate_limits(self):
+        return {"rateLimits": {"limitId": "codex", "secondary": {
+            "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000,
+        }}}
+
+
 class RaisingReplyCodexClient(FakeCodexClient):
     def respond_tool_request_user_input(self, request_id, answers):
         raise RuntimeError("reply failed")
@@ -253,6 +263,23 @@ def test_worker_event_scopes_are_bounded_and_evicted_events_are_unscoped():
     assert [(event.get("turn_idx"), event.get("context_generation")) for event in events] == [
         (None, None), (runtime.MAX_EVENT_SCOPES, runtime.MAX_EVENT_SCOPES),
     ]
+
+
+def test_worker_reads_chat_information_with_request_identity():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda callback, model: InformationCodexClient(callback, model), output=output)
+    runtime.handle_message(make_ui_request(
+        "req-info", "read_chat_information", {"chat_id": "chat-1", "model": "codex/main",
+                                               "identity": ["chat-1", "codex/main", "thread-1", "account-1"],
+                                               "generation": 3},
+    ))
+    message = decode_worker_line(output.getvalue())
+    assert message["type"] == "chat_information"
+    assert message["id"] == "req-info"
+    assert message["payload"]["identity"] == ["chat-1", "codex/main", "thread-1", "account-1"]
+    assert message["payload"]["generation"] == 3
+    assert message["payload"]["account"]["account"]["id"] == "account-1"
+    assert message["payload"]["rate_limits"]["rateLimits"]["secondary"]["usedPercent"] == 25
 
 
 def test_worker_runtime_reply_user_input_routes_to_matching_chat_client():

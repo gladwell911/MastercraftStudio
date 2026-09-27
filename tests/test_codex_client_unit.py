@@ -233,6 +233,15 @@ def test_codex_client_read_rate_limits_sends_request(monkeypatch):
     assert seen == {"method": "account/rateLimits/read", "params": None, "timeout": None}
 
 
+def test_codex_session_total_tokens_only_reads_authoritative_total():
+    parser = codex_client.codex_session_total_tokens_from_payload
+    assert parser({"tokenUsage": {"last": {"totalTokens": 9}, "total": {"totalTokens": 123}}}) == 123
+    assert parser({"info": {"last_token_usage": {"total_tokens": 9},
+                            "total_token_usage": {"total_tokens": 456}}}) == 456
+    assert parser({"tokenUsage": {"last": {"totalTokens": 9}}}) is None
+    assert parser({"tokenUsage": {"total": {"totalTokens": -1}}}) is None
+
+
 def test_codex_client_compact_thread_sends_request(monkeypatch):
     client = codex_client.CodexAppServerClient()
     seen = {}
@@ -515,6 +524,7 @@ def test_codex_protocol_token_count_event_normalizes_usage():
     assert seen[-1].usage["fresh"] is True
     assert seen[-1].usage["model"] == "gpt-5-codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage
+    assert seen[-1].data["session_total_tokens"] == 44176
     assert client.last_context_usage == seen[-1].usage
 
 
@@ -541,6 +551,7 @@ def test_codex_event_msg_token_count_payload_normalizes_usage():
     assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
     assert seen[-1].data["context_usage"] == seen[-1].usage
+    assert seen[-1].data["session_total_tokens"] == 68292
     assert client.last_context_usage == seen[-1].usage
 
 
@@ -614,6 +625,7 @@ def test_codex_protocol_namespaced_token_count_event_normalizes_usage():
     assert seen[-1].type == "token_count"
     assert seen[-1].usage["used_tokens"] == 44176
     assert seen[-1].usage["source"] == "codex"
+    assert "session_total_tokens" not in seen[-1].data
     assert client.last_context_usage == seen[-1].usage
 
 
@@ -639,6 +651,7 @@ def test_codex_thread_token_usage_updated_event_normalizes_usage():
     assert seen[-1].usage["used_tokens"] == 11891
     assert seen[-1].usage["context_window"] == 258400
     assert seen[-1].usage["source"] == "codex"
+    assert seen[-1].data["session_total_tokens"] == 44176
     assert client.last_context_usage == seen[-1].usage
 
 

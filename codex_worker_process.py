@@ -48,6 +48,8 @@ class CodexWorkerRuntime:
             self._handle_compact_thread(message)
         elif message_type == "cancel_turn":
             self._handle_cancel_turn(message)
+        elif message_type == "read_chat_information":
+            self._handle_read_chat_information(message)
         elif message_type == "ping":
             self.emit("pong", request_id=message.get("id"))
         elif message_type == "shutdown":
@@ -331,6 +333,31 @@ class CodexWorkerRuntime:
             client.compact_thread(thread_id)
         except Exception as exc:
             self._emit_scoped_error(message, str(exc), chat_id, None, model)
+
+    def _handle_read_chat_information(self, message: dict[str, Any]) -> None:
+        payload = dict(message.get("payload") or {})
+        chat_id = str(payload.get("chat_id") or "").strip()
+        model = str(payload.get("model") or "").strip() or DEFAULT_CODEX_MODEL
+        if not chat_id:
+            self._emit_protocol_error(message, "read_chat_information requires payload.chat_id")
+            return
+        result: dict[str, Any] = {"chat_id": chat_id, "model": model, "identity": payload.get("identity"),
+                                  "generation": payload.get("generation")}
+        try:
+            client = self._client_for(chat_id, model)
+        except Exception as exc:
+            result["account_error"] = str(exc)
+            result["rate_limits_error"] = str(exc)
+        else:
+            try:
+                result["account"] = client.read_account(refresh_token=False)
+            except Exception as exc:
+                result["account_error"] = str(exc)
+            try:
+                result["rate_limits"] = client.read_rate_limits()
+            except Exception as exc:
+                result["rate_limits_error"] = str(exc)
+        self.emit("chat_information", result, request_id=message.get("id"))
 
     def _handle_cancel_turn(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})

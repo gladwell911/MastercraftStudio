@@ -904,9 +904,12 @@ class CodexAppServerClient:
                 return
         if method in {"token_count", "codex/event/token_count", "thread/tokenUsage/updated"} or str(params.get("type") or "").strip() == "token_count":
             usage = codex_context_usage_from_payload(params)
+            session_total_tokens = codex_session_total_tokens_from_payload(params)
             data = dict(params)
             if usage:
                 data["context_usage"] = usage
+            if session_total_tokens is not None:
+                data["session_total_tokens"] = session_total_tokens
             self._emit_event(
                 CodexEvent(
                     type="token_count",
@@ -1094,6 +1097,22 @@ def _codex_model_from_context_window(context_window: int) -> str:
     except Exception:
         window = 0
     return CODEX_MODEL_BY_CONTEXT_WINDOW.get(window, "")
+
+
+def codex_session_total_tokens_from_payload(payload: dict) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    info = _first_dict(payload.get("info"), payload.get("usage"), payload)
+    token_usage = _first_dict(payload.get("tokenUsage"), info.get("tokenUsage"), info.get("token_usage"))
+    total = _first_dict(token_usage.get("total"), info.get("total_token_usage"), info.get("totalTokenUsage"))
+    raw = total.get("totalTokens", total.get("total_tokens"))
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAULT_CODEX_MODEL) -> dict | None:

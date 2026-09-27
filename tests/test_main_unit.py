@@ -5899,6 +5899,21 @@ def test_on_done_uses_pending_codex_context_usage(frame):
     assert frame._pending_context_usage_by_turn == {}
 
 
+def test_codex_weekly_quota_uses_only_codex_10080_minute_window():
+    parse = main.ChatFrame._codex_weekly_quota_label
+    assert "剩余 75.0%" in parse({"rateLimits": {"limitId": "codex", "primary": {
+        "windowDurationMins": 300, "usedPercent": 90}, "secondary": {
+        "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}})
+    assert "周窗口暂不可用" in parse({"rateLimits": {"limitId": "other", "primary": {
+        "windowDurationMins": 10080, "usedPercent": 25}}})
+    assert "周窗口暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
+        "windowDurationMins": 300, "usedPercent": 25}}})
+    assert "剩余比例暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
+        "windowDurationMins": 10080, "resetsAt": 1770000000}}})
+    assert "重置时间暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
+        "windowDurationMins": 10080, "usedPercent": 25}}})
+
+
 def test_codex_token_count_event_stores_pending_usage_until_turn_completed(frame, monkeypatch):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"

@@ -15,6 +15,8 @@ CHAT_SCOPED_TYPES = {
     "start_turn",
     "reply_user_input",
     "cancel_turn",
+    "read_chat_information",
+    "chat_information",
     "event",
     "thread_state",
     "request_user_input",

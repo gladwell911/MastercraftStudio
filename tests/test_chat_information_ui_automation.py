@@ -1,8 +1,18 @@
 import ctypes
+import threading
+import time
 from types import SimpleNamespace
 
 import main
 import pytest
+
+
+_REAL_CODEX_INFORMATION_REQUEST = main.ChatFrame._request_codex_chat_information
+
+
+@pytest.fixture(autouse=True)
+def _disable_external_codex_information_reads(monkeypatch):
+    monkeypatch.setattr(main.ChatFrame, "_request_codex_chat_information", lambda *_args: None)
 
 
 def _send_key(window, key):
@@ -31,7 +41,7 @@ def test_codex_chat_information_list_arrows_and_escape_restore_focus(frame, wx_a
     wx_app.Yield()
     assert main.wx.Window.FindFocus() is dialog.information_list
     assert dialog.information_list.GetStrings()[0] == "当前上下文：已用 4.6%（11,891 / 258,400 token）"
-    assert dialog.information_list.GetCount() == 2
+    assert dialog.information_list.GetCount() == 4
 
     _send_key(dialog.information_list, 0x28)
     wx_app.Yield()
@@ -193,6 +203,196 @@ def test_codex_thread_reset_discards_old_usage_until_new_thread_reports(frame, w
                                           "source": "codex", "exact": True, "fresh": True}),
     )
     assert "1,000" in dialog.information_list.GetString(0)
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_codex_total_and_weekly_quota_rows_ignore_stale_reply(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    turn = {"question": "q", "model": "codex/main", "request_status": "done",
+            "codex_turn_id": "turn-1", "codex_thread_id": "thread-1"}
+    chat = {"id": "chat-1", "model": "codex/main", "codex_thread_id": "thread-1",
+            "codex_turn_id": "turn-1", "codex_account_id": "account-1", "turns": [turn]}
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
+    frame.active_codex_thread_id = "thread-1"
+    frame.active_codex_turn_id = "turn-1"
+    frame.active_session_turns = chat["turns"]
+    frame._current_chat_state = chat
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(1)
+    dialog.information_list.SetFocus()
+    identity = dialog.identity
+    frame._chat_information_request = ("req-new", 2, identity)
+
+    stale = {"chat_id": "chat-1", "identity": list(identity), "generation": 1,
+             "account": {"account": {"type": "chatgpt", "id": "account-1"}},
+             "rate_limits": {"rateLimits": {"limitId": "codex", "secondary": {
+                 "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}}}
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-old", "payload": stale})
+    assert dialog.information_list.GetString(3) == "Codex 周额度：暂不可用"
+
+    fresh = dict(stale, generation=2)
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-new", "payload": fresh})
+    assert "剩余 75.0%" in dialog.information_list.GetString(3)
+    assert "本地重置" in dialog.information_list.GetString(3)
+    assert dialog.information_list.GetSelection() == 1
+    assert main.wx.Window.FindFocus() is dialog.information_list
+
+    frame._on_codex_event_for_chat("chat-1", main.CodexEvent(
+        type="token_count", thread_id="thread-1", turn_id="turn-1",
+        data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 789},
+    ))
+    assert dialog.information_list.GetString(1) == "会话累计 token：789"
+    frame._handle_codex_clear_command(chat)
+    assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
+    frame._on_codex_event_for_chat("chat-1", main.CodexEvent(
+        type="token_count", thread_id="thread-1", turn_id="turn-1",
+        data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 999},
+    ))
+    assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_codex_information_account_states_and_identity_switch(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    chat = {"id": "chat-1", "model": "codex/main", "codex_thread_id": "thread-1",
+            "codex_account_id": "account-1"}
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
+    frame.active_codex_thread_id = "thread-1"
+    frame._current_chat_state = chat
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    identity = dialog.identity
+
+    frame._chat_information_request = ("req-1", 1, identity)
+    payload = {"chat_id": "chat-1", "identity": list(identity), "generation": 1,
+               "account": {"account": {"type": "apiKey", "id": "account-1"}},
+               "rate_limits_error": "not available"}
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-1", "payload": payload})
+    assert dialog.information_list.GetString(3) == "Codex 周额度：API key 账号不适用"
+
+    frame._chat_information_request = ("req-2", 2, identity)
+    payload = dict(payload, generation=2, account={"account": None}, rate_limits_error="")
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-2", "payload": payload})
+    assert dialog.information_list.GetString(2) == "Codex 账号：未登录"
+    assert dialog.information_list.GetString(3) == "Codex 周额度：未登录"
+
+    current_rows = list(dialog.information_list.GetStrings())
+    frame._chat_information_request = ("req-3", 3, dialog.identity)
+    chat["codex_thread_id"] = "thread-2"
+    payload = dict(payload, identity=list(dialog.identity), generation=3,
+                   account={"account": {"type": "chatgpt", "id": "account-2"}})
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-3", "payload": payload})
+    assert list(dialog.information_list.GetStrings()) == current_rows
+    closed_identity = dialog.identity
+    saved_account_label = chat.get("codex_account_label")
+    dialog.Close()
+    wx_app.Yield()
+    frame._chat_information_request = ("req-late", 4, closed_identity)
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-late",
+                                              "payload": dict(payload, identity=list(closed_identity), generation=4)})
+    assert chat.get("codex_account_label") == saved_account_label
+
+
+def test_first_codex_information_read_starts_worker_off_ui_thread(frame, wx_app, monkeypatch):
+    monkeypatch.setattr(main.ChatFrame, "_request_codex_chat_information", _REAL_CODEX_INFORMATION_REQUEST)
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
+    frame.active_codex_thread_id = "thread-1"
+    frame._current_chat_state = {"id": "chat-1", "model": "codex/main", "codex_thread_id": "thread-1"}
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Client:
+        def start(self):
+            calls.append(threading.current_thread())
+            started.set()
+            assert release.wait(2)
+
+        def read_chat_information(self, **payload):
+            frame._on_codex_worker_message("chat-1", {
+                "type": "chat_information", "id": "req-1", "payload": {
+                    "chat_id": "chat-1", "identity": payload["identity"],
+                    "generation": payload["generation"],
+                    "account": {"account": {"type": "chatgpt", "id": "account-1"}},
+                    "rate_limits": {"rateLimits": {"limitId": "codex", "primary": {
+                        "windowDurationMins": 10080, "usedPercent": 20, "resetsAt": 1770000000}}},
+                },
+            })
+            return "req-1"
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda *_args: Client())
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    assert started.wait(1)
+    assert calls[0] is not threading.main_thread()
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    assert dialog.information_list.GetString(3) == "Codex 周额度：暂不可用"
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and "剩余 80.0%" not in dialog.information_list.GetString(3):
+        wx_app.Yield()
+        time.sleep(0.01)
+    assert "剩余 80.0%" in dialog.information_list.GetString(3)
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_codex_account_switch_retires_old_thread_and_rejects_its_tokens(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    turns = [{"question": "q", "model": "codex/main", "request_status": "done",
+              "codex_thread_id": "thread-1", "codex_turn_id": "turn-1"}]
+    chat = {"id": "chat-1", "model": "codex/main", "codex_thread_id": "thread-1",
+            "codex_turn_id": "turn-1", "codex_account_id": "account-A", "turns": turns,
+            "codex_session_total_tokens": 500,
+            "context_usage": {"used_tokens": 100, "context_window": 1000,
+                              "source": "codex", "exact": True, "fresh": True}}
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
+    frame.active_codex_thread_id = "thread-1"
+    frame.active_codex_turn_id = "turn-1"
+    frame.active_session_turns = turns
+    frame._current_chat_state = chat
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    identity = dialog.identity
+    frame._chat_information_request = ("req-switch", 1, identity)
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-switch",
+                                              "payload": {"chat_id": "chat-1", "identity": list(identity),
+                                                          "generation": 1,
+                                                          "account": {"account": {"type": "chatgpt", "id": "account-B"}},
+                                                          "rate_limits": {"rateLimits": {}}}})
+    assert chat["codex_thread_id"] == ""
+    assert frame.active_codex_thread_id == ""
+    assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
+    frame._on_codex_event_for_chat("chat-1", main.CodexEvent(
+        type="token_count", thread_id="thread-1", turn_id="turn-1",
+        data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 999},
+        usage={"used_tokens": 900, "context_window": 1000,
+               "source": "codex", "exact": True, "fresh": True},
+    ))
+    assert chat["codex_session_total_tokens"] is None
+    assert chat["context_usage"] is None
+    assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
     dialog.Close()
     wx_app.Yield()
 
