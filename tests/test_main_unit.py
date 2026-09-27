@@ -15509,6 +15509,67 @@ def test_remote_history_and_state_payloads_round_trip_detail_panel_fields(frame)
     assert state["execution_steps"] == [{"step": "当前步骤"}]
 
 
+def test_remote_execution_projection_page_uses_canonical_steps(frame, tmp_path):
+    store = main.ChatStore(tmp_path / "execution-v3.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat-v3", "title": "测试", "model": main.DEFAULT_MODEL_ID,
+                       "created_at": 1.0, "updated_at": 1.0,
+                       "turns": [{"question": "问题", "answer_md": "回答", "model": main.DEFAULT_MODEL_ID,
+                                  "created_at": 1.0}]})
+    store.replace_turns("chat-v3", [{"question": "问题", "answer_md": "回答",
+                                     "model": main.DEFAULT_MODEL_ID, "created_at": 1.0}])
+    store.replace_execution_steps("chat-v3", [
+        {"turn_idx": 0, "display_kind": "commentary", "list_text": "可见过程", "detail_text": "完整过程"},
+        {"turn_idx": 0, "display_kind": "command", "list_text": "隐藏命令", "detail_text": "命令详情"},
+    ])
+    frame.chat_store = store
+    frame.active_chat_id = "chat-v3"
+    frame.current_chat_id = "chat-v3"
+    frame.active_turn_idx = 0
+    frame._current_chat_state = {"id": "chat-v3", "turns": store.load_turns("chat-v3"),
+                                 "execution_steps": store.load_execution_steps("chat-v3"),
+                                 "detail_panel_mode": "execution"}
+    frame.view_mode = "active"
+    status, tail = frame._remote_api_execution_page_ui(
+        {"chat_id": "chat-v3", "body": {"limit": 10}}, secret="secret"
+    )
+    assert status == 200
+    assert [row["list_text"] for row in tail["rows"]] == ["我：问题", "可见过程", "小诸葛：回答"]
+    assert all(row["row_id"].startswith("execution:chat-v3:") for row in tail["rows"])
+    frame._current_execution_steps_for_render = lambda: (2, store.load_execution_steps("chat-v3"))
+    desktop_rows, desktop_meta = frame._execution_page_projection()
+    desktop_content = [(row_id, text) for (row_id, text), meta in zip(desktop_rows, desktop_meta)
+                       if meta[0] == "execution"]
+    assert desktop_content == [(row["row_id"], row["list_text"]) for row in tail["rows"]]
+
+
+def test_remote_execution_projection_new_turn_without_steps(frame, tmp_path):
+    store = main.ChatStore(tmp_path / "execution-new-turn.db")
+    store.initialize()
+    turns = [
+        {"question": "old", "answer_md": "done", "model": main.DEFAULT_MODEL_ID, "created_at": 1.0},
+        {"question": "new", "answer_md": "", "model": main.DEFAULT_MODEL_ID, "created_at": 2.0},
+    ]
+    store.upsert_chat({"id": "chat-new-turn", "title": "new", "model": main.DEFAULT_MODEL_ID,
+                       "created_at": 1.0, "updated_at": 2.0, "turns": turns})
+    store.replace_turns("chat-new-turn", turns)
+    store.replace_execution_steps("chat-new-turn", [
+        {"turn_idx": 0, "display_kind": "commentary", "event_id": "old-step",
+         "list_text": "old step", "detail_text": "old step"},
+    ])
+    frame.chat_store = store
+    frame.active_chat_id = frame.current_chat_id = "chat-new-turn"
+    frame.active_turn_idx = 1
+    frame._current_chat_state = {"id": "chat-new-turn", "turns": store.load_turns("chat-new-turn"),
+                                 "execution_steps": store.load_execution_steps("chat-new-turn")}
+    frame.view_mode = "active"
+    status, page = frame._remote_api_execution_page_ui(
+        {"chat_id": "chat-new-turn", "body": {"limit": 10}}, secret="secret"
+    )
+    assert status == 200, page
+    assert all("old step" not in row["list_text"] for row in page["rows"])
+
+
 def test_remote_history_list_is_lightweight_without_turns_or_execution_steps(frame, monkeypatch):
     def fail_if_called(_turn):
         raise AssertionError("history_list should not render remote turn payloads")

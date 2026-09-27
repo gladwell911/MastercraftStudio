@@ -2,11 +2,87 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import json
 import sqlite3
+import time
 from pathlib import Path
 import pytest
 
 from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
+
+
+def test_execution_replace_is_atomic_and_source_read_has_one_owner(tmp_path, monkeypatch):
+    store = ChatStore(tmp_path / "atomic-execution.db")
+    store.initialize()
+    store.replace_execution_steps("owner", [{"list_text": "old"}])
+    store.replace_execution_steps("other", [{"list_text": "other"}])
+    original = store._append_execution_step_on_conn
+    calls = 0
+
+    def fail_second(conn, chat_id, step):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("replacement interrupted")
+        return original(conn, chat_id, step)
+
+    monkeypatch.setattr(store, "_append_execution_step_on_conn", fail_second)
+    with pytest.raises(RuntimeError, match="replacement interrupted"):
+        store.replace_execution_steps("owner", [{"list_text": "new-1"}, {"list_text": "new-2"}])
+    source = store.read_execution_projection_source("owner")
+    assert [step["list_text"] for step in source["steps"]] == ["old"]
+    assert source["chat_id"] == "owner"
+    assert [step["list_text"] for step in store.read_execution_projection_source("other")["steps"]] == ["other"]
+
+
+def test_execution_projection_snapshot_freezes_pages_and_scopes_cursor(tmp_path):
+    store = ChatStore(tmp_path / "projection-page.db")
+    store.initialize()
+    store.replace_execution_steps("owner", [{"list_text": str(i)} for i in range(5)])
+    source = store.read_execution_projection_source("owner")
+    rows = [{"row_id": f"row-{i}", "list_text": str(i)} for i in range(5)]
+    snapshot = store.create_execution_projection_snapshot(
+        chat_id="owner", revision=source["revision"],
+        source_hash=source["source_hash"], rows=rows,
+    )
+    tail = store.load_execution_projection_page(
+        pair_id="pair", domain="events", chat_id="owner", secret="secret",
+        snapshot_id=snapshot, limit=2,
+    )
+    assert [row["row_id"] for row in tail["rows"]] == ["row-3", "row-4"]
+    store.replace_execution_steps("owner", [{"list_text": "mutated"}])
+    older = store.load_execution_projection_page(
+        pair_id="pair", domain="events", chat_id="owner", secret="secret",
+        snapshot_id=snapshot, limit=2, cursor=tail["cursor"],
+    )
+    assert [row["row_id"] for row in older["rows"]] == ["row-1", "row-2"]
+    with pytest.raises(ValueError, match="SCOPE_MISMATCH"):
+        store.load_execution_projection_page(
+            pair_id="other", domain="events", chat_id="owner", secret="secret",
+            snapshot_id=snapshot, cursor=tail["cursor"],
+        )
+    with pytest.raises(ValueError, match="SOURCE_CHANGED"):
+        store.create_execution_projection_snapshot(
+            chat_id="owner", revision=source["revision"],
+            source_hash=source["source_hash"], rows=rows,
+        )
+    with pytest.raises(ValueError, match="SNAPSHOT_MISSING"):
+        store.load_execution_projection_page(
+            pair_id="pair", domain="events", chat_id="other", secret="secret",
+            snapshot_id=snapshot, cursor=tail["cursor"],
+        )
+    with pytest.raises(ValueError, match="EXPIRED"):
+        store.load_execution_projection_page(
+            pair_id="pair", domain="events", chat_id="owner", secret="secret",
+            snapshot_id=snapshot, cursor=tail["cursor"], now=time.time() + 901,
+        )
+    with store._connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO v2_chat_state(chat_id,revision,execution_sequence) VALUES(?,?,?)",
+                     ("owner", source["revision"] + 1, 0))
+    with pytest.raises(ValueError, match="SCOPE_MISMATCH"):
+        store.load_execution_projection_page(
+            pair_id="pair", domain="events", chat_id="owner", secret="secret",
+            snapshot_id=snapshot, cursor=tail["cursor"],
+        )
 
 
 def test_clear_reconciliation_fixture_is_shared_byte_for_byte():

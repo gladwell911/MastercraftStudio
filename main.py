@@ -44,6 +44,16 @@ from common_commands_store import (
     DesktopCommonCommandsStore,
 )
 from chat_store import ChatStore
+from execution_projection import (
+    collapse_kimi_execution_lifecycle,
+    execution_command_list_text,
+    execution_list_text_from_detail,
+    execution_row_id,
+    execution_step_detail_text,
+    execution_turn_context_steps,
+    project_execution_rows,
+    should_show_execution_step,
+)
 from chat_client import ChatClient, DEFAULT_MODEL, DEFAULT_OPENROUTER_API_KEY
 from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
 from cli_agent_manager import get_default_cli_agent_manager
@@ -506,6 +516,19 @@ def normalize_model_id(value: str, *, default: str = DEFAULT_MODEL_ID) -> str:
 
 def is_cli_filtered_model(model_id: str) -> bool:
     return is_codex_model(model_id) or is_claudecode_model(model_id) or is_kimi_model(model_id) or is_openclaw_model(model_id)
+
+
+def execution_answer_to_plain(answer_md: str, model: str, english_filter_enabled: bool) -> str:
+    """Render answer context without accessing ChatFrame or wx state."""
+    text = str(answer_md or "")
+    if english_filter_enabled and is_cli_filtered_model(model):
+        text = re.sub(r"\[[^\]]+\]\([^)]+\)", "[文件路径]", text)
+        text = re.sub(r"`[^`]*(?:[A-Za-z]:[\\/]|/)[^`]*`", "[文件路径]", text)
+        text = re.sub(r"`[^`]*\.(?:py|md|txt|json|yaml|yml)[^`]*`", "[文件路径]", text)
+        text = re.sub(r"(?<![\w/.-])(?:[A-Za-z]:[\\/][^\s\]\)]+|/[^\s\]\)]+)", "[文件路径]", text)
+        text = re.sub(r"pytest\s+tests/[^\n]+", "pytest [文件路径]", text)
+        text = re.sub(r"\btest_[A-Za-z0-9_]+\b", "[测试项]", text)
+    return remove_emojis(md_to_plain_preserving_paragraphs(text)).strip()
 
 
 def is_visible_model_id(model_id: str) -> bool:
@@ -6399,40 +6422,11 @@ class ChatFrame(wx.Frame):
 
     @staticmethod
     def _execution_list_text_from_detail(detail: str, kind: str) -> str:
-        single_line = re.sub(r"\s+", " ", str(detail or "").strip())
-        if not single_line:
-            return ""
-        prefix_map = {
-            "command": "命令：",
-            "error": "错误：",
-            "plan": "计划：",
-        }
-        prefix = prefix_map.get(str(kind or "").strip(), "")
-        if prefix and not single_line.startswith(prefix):
-            return f"{prefix}{single_line}"
-        return single_line
+        return execution_list_text_from_detail(detail, kind)
 
     @staticmethod
     def _execution_command_list_text(event_type: str, title: str, command: str, exit_code, fallback_text: str = "") -> str:
-        parts = []
-        normalized_type = str(event_type or "").strip()
-        if normalized_type == "item_started":
-            parts.append("开始执行")
-        elif normalized_type == "item_completed":
-            parts.append("完成执行")
-        title_text = str(title or "").strip()
-        command_text = str(command or "").strip()
-        fallback = str(fallback_text or "").strip()
-        if title_text:
-            parts.append(title_text)
-        if command_text:
-            parts.append(command_text)
-        if not title_text and not command_text and fallback:
-            parts.append(fallback)
-        if normalized_type == "item_completed" and exit_code not in (None, ""):
-            parts.append(f"退出码：{exit_code}")
-        summary = " ".join(parts).strip()
-        return f"命令：{summary}" if summary else "命令：commandExecution"
+        return execution_command_list_text(event_type, title, command, exit_code, fallback_text)
 
     @staticmethod
     def _kimi_protocol_event(event: CodexEvent) -> bool:
@@ -6632,27 +6626,9 @@ class ChatFrame(wx.Frame):
 
     def _execution_row_id(self, step_idx: int, step, occurrence: int = 0) -> str:
         chat_id = self._visible_execution_chat_id()
-        if isinstance(step, dict):
-            if step.get("logical_key"):
-                return f"execution:{chat_id}:logical:{step['logical_key']}"
-            if step.get("synthetic"):
-                return f"execution:{chat_id}:turn:{step.get('turn_idx')}:{step['synthetic']}"
-            if step.get("_execution_uid"):
-                return f"execution:{chat_id}:uid:{step['_execution_uid']}"
-            if "_store_step_index" in step:
-                return f"execution:{chat_id}:store:{step['_store_step_index']}"
-            native_id = str(step.get("event_id") or step.get("id") or step.get("item_id") or "").strip()
-            if native_id:
-                stable = hashlib.sha256(json.dumps(
-                    ["legacy-event", *self._execution_legacy_native_scope(step), int(occurrence)],
-                    ensure_ascii=False, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
-                return f"execution:{chat_id}:legacy-event:{stable}"
-        stable = hashlib.sha256(json.dumps(
-            ["legacy-record", chat_id, self._execution_legacy_record_fingerprint(step), int(occurrence)],
-            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
-        ).encode("utf-8")).hexdigest()
-        return f"execution:{chat_id}:legacy-quarantine:{stable}"
+        state = self._visible_execution_chat_state() or {}
+        revision = self._safe_int(state.get("revision"), 1)
+        return execution_row_id(chat_id, revision, step, occurrence)
 
     def _execution_legacy_native_scope(self, step: dict) -> list:
         state = self._visible_execution_chat_state() or {}
@@ -6823,18 +6799,7 @@ class ChatFrame(wx.Frame):
 
     @staticmethod
     def _execution_step_detail_text(step) -> str:
-        if not isinstance(step, dict):
-            return str(step or "").strip()
-        return str(
-            step.get("detail_text")
-            or step.get("message")
-            or step.get("step")
-            or step.get("title")
-            or step.get("text")
-            or step.get("content")
-            or step.get("description")
-            or ""
-        )
+        return execution_step_detail_text(step)
 
     @staticmethod
     def _normalize_execution_text_for_compare(text: str) -> str:
@@ -7547,25 +7512,7 @@ class ChatFrame(wx.Frame):
 
     @staticmethod
     def _collapse_kimi_execution_lifecycle(steps: list) -> list:
-        collapsed = []
-        positions = {}
-        for step in steps or []:
-            if not isinstance(step, dict) or not str(step.get("source_kind") or "").startswith(("tool.", "shell.", "subagent.")):
-                collapsed.append(step)
-                continue
-            item_id = str(step.get("item_id") or "").strip()
-            key = (
-                str(step.get("thread_id") or ""),
-                str(step.get("turn_id") or ""),
-                item_id,
-            )
-            if item_id and key in positions:
-                collapsed[positions[key]] = step
-                continue
-            if item_id:
-                positions.setdefault(key, len(collapsed))
-            collapsed.append(step)
-        return collapsed
+        return collapse_kimi_execution_lifecycle(steps)
 
     def _execution_turn_context_steps(self, steps: list) -> list:
         if getattr(self, "view_mode", "") == "history" and str(getattr(self, "view_history_id", "") or "").strip():
@@ -7575,70 +7522,15 @@ class ChatFrame(wx.Frame):
         else:
             state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
             turns = state.get("turns") if isinstance(state.get("turns"), list) else []
-        if not turns:
-            return list(steps or [])
-        turn_indices: list[int] = []
-        if self.view_mode == "active":
-            active_idx = self._active_turn_index_value()
-            if 0 <= active_idx < len(turns):
-                turn_indices = [active_idx]
-        if not turn_indices:
-            seen = []
-            for step in steps or []:
-                if self.view_mode == "history" and not self._should_show_execution_step(step):
-                    continue
-                if isinstance(step, dict) and "turn_idx" in step:
-                    idx = self._safe_int(step.get("turn_idx"), -1)
-                    if 0 <= idx < len(turns) and idx not in seen:
-                        seen.append(idx)
-            turn_indices = seen or ([0] if len(turns) == 1 else [])
-        if not turn_indices:
-            return list(steps or [])
-        first_idx = max(turn_indices) if self.view_mode == "history" else turn_indices[0]
-        turn = turns[first_idx] if 0 <= first_idx < len(turns) and isinstance(turns[first_idx], dict) else {}
-        question = str(turn.get("question") or "").strip()
-        answer_md = str(turn.get("answer_md") or "").strip()
-        answer_text = ""
-        if answer_md and answer_md != REQUESTING_TEXT:
-            model = str(turn.get("model") or self.selected_model or "")
-            answer_text = remove_emojis(md_to_plain_preserving_paragraphs(self._answer_markdown_for_output(answer_md, model))).strip()
-        def projected_timestamp(raw_kind: str) -> float | None:
-            for step in steps or []:
-                if not isinstance(step, dict) or self._safe_int(step.get("turn_idx"), -1) != first_idx:
-                    continue
-                kind = str(step.get("raw_kind") or step.get("kind") or step.get("display_kind") or "").strip()
-                if kind == raw_kind:
-                    timestamp = _execution_timestamp(step)
-                    if timestamp is not None:
-                        return timestamp
-            return _finite_timestamp(turn.get("created_at"))
-        prefix_steps = []
-        if question:
-            question_step = {
-                    "display_kind": "turn_context",
-                    "list_text": f"我：{question}",
-                    "detail_text": question,
-                    "turn_idx": first_idx,
-                    "synthetic": "question",
-                }
-            question_timestamp = projected_timestamp("question")
-            if question_timestamp is not None:
-                question_step["created_at"] = question_timestamp
-            prefix_steps.append(question_step)
-        suffix_steps = []
-        if answer_text:
-            answer_step = {
-                    "display_kind": "turn_context",
-                    "list_text": f"小诸葛：{answer_text}",
-                    "detail_text": answer_text,
-                    "turn_idx": first_idx,
-                    "synthetic": "answer",
-                }
-            answer_timestamp = projected_timestamp("final")
-            if answer_timestamp is not None:
-                answer_step["created_at"] = answer_timestamp
-            suffix_steps.append(answer_step)
-        return prefix_steps + list(steps or []) + suffix_steps
+        return execution_turn_context_steps(
+            steps, turns,
+            view_mode=self.view_mode,
+            active_turn_index=self._active_turn_index_value(),
+            selected_model=self.selected_model,
+            requesting_text=REQUESTING_TEXT,
+            answer_to_plain=lambda answer_md, model: execution_answer_to_plain(
+                answer_md, model, self.codex_answer_english_filter_enabled),
+        )
 
     @staticmethod
     def _strip_ansi_control_sequences(text: str) -> str:
@@ -7694,52 +7586,7 @@ class ChatFrame(wx.Frame):
         return "\n".join(kept).strip()
 
     def _should_show_execution_step(self, step) -> bool:
-        if not isinstance(step, dict):
-            return bool(str(step or "").strip())
-        display_kind = str(step.get("display_kind") or "").strip()
-        event_type = str(step.get("event_type") or "").strip()
-        phase = str(step.get("phase") or "").strip()
-        list_text = str(step.get("list_text") or "").strip()
-        detail_text = self._execution_step_detail_text(step)
-        if str(step.get("kimi_summary") or "").strip():
-            return True
-        if display_kind == "error":
-            return False
-        hidden_status_texts = {"开始处理本轮请求", "本轮处理结束", "active", "idle"}
-        normalized_detail_text = self._normalize_execution_text_for_compare(detail_text)
-        normalized_list_text = self._normalize_execution_text_for_compare(list_text)
-        if normalized_detail_text in {
-            "开始执行：阶段：commentary",
-            "完成执行：阶段：commentary",
-            "开始执行：阶段：final_answer",
-            "完成执行：阶段：final_answer",
-        }:
-            return False
-        if normalized_list_text in {
-            "开始执行：阶段：commentary",
-            "完成执行：阶段：commentary",
-            "开始执行：阶段：final_answer",
-            "完成执行：阶段：final_answer",
-        }:
-            return False
-
-        if event_type in {"turn_started", "turn_completed"} and (detail_text in hidden_status_texts or list_text in hidden_status_texts):
-            return False
-        if event_type == "item_completed" and phase == "final_answer":
-            return False
-        if display_kind == "command":
-            return False
-        if display_kind == "status" and (detail_text in hidden_status_texts or list_text in hidden_status_texts):
-            return False
-        if list_text in {"active", "idle"} or detail_text in {"active", "idle"}:
-            return False
-        if display_kind in {"commentary", "plan", "error", "user_input", "turn_context"}:
-            return bool(list_text or detail_text)
-        if event_type in {"agent_message_delta", "plan_updated", "stderr", "server_request"}:
-            return bool(list_text or detail_text)
-        if display_kind:
-            return False
-        return bool(list_text or detail_text)
+        return should_show_execution_step(step)
 
     def _execution_page_projection(self) -> tuple[list, list]:
         total_steps, steps = self._current_execution_steps_for_render()
@@ -11662,6 +11509,114 @@ class ChatFrame(wx.Frame):
         except Exception:
             self._remote_state_cache_revision = 1
 
+    def _capture_execution_projection_context_ui(self, payload: dict) -> tuple[int, dict]:
+        owner = str(payload.get("chat_id") or "").strip()
+        active = owner in {str(getattr(self, "active_chat_id", "") or ""),
+                           str(getattr(self, "current_chat_id", "") or "")}
+        state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
+        steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
+        turns = state.get("turns") if isinstance(state.get("turns"), list) else []
+        with self._execution_step_persist_lock:
+            dirty = bool(self._pending_execution_step_persists) or bool(self._execution_step_persist_worker_running)
+        dirty = dirty or bool(getattr(self, "_codex_ui_batch_depth", 0))
+        last_step = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+        active_turn_index = self._active_turn_index_value() if active else -1
+        if active and self._safe_int(last_step.get("turn_idx"), -1) != active_turn_index:
+            last_step = {}
+        last_turn = turns[-1] if turns and isinstance(turns[-1], dict) else {}
+        return 200, {
+            "active": active,
+            "active_turn_index": active_turn_index,
+            "selected_model": str(getattr(self, "selected_model", "") or ""),
+            "english_filter": bool(self.codex_answer_english_filter_enabled),
+            "generation": int(getattr(self, "_execution_scan_generation", 0)),
+            "steps_owner": id(steps), "steps_count": len(steps),
+            "turns_owner": id(turns), "turns_count": len(turns),
+            "last_turn_question": str(last_turn.get("question") or ""),
+            "last_turn_answer": str(last_turn.get("answer_md") or ""),
+            "last_step_key": str(last_step.get("logical_key") or last_step.get("_execution_uid") or last_step.get("event_id") or ""),
+            "last_step_text": str(last_step.get("list_text") or ""),
+            "dirty": dirty,
+        }
+
+    def _verify_execution_projection_context_ui(self, payload: dict) -> tuple[int, dict]:
+        status, current = self._capture_execution_projection_context_ui(payload)
+        expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else {}
+        keys = ("active", "active_turn_index", "selected_model", "english_filter", "generation",
+                "steps_owner", "steps_count", "turns_owner", "turns_count", "last_step_key", "last_step_text",
+                "last_turn_question", "last_turn_answer")
+        valid = status == 200 and not current["dirty"] and all(current.get(key) == expected.get(key) for key in keys)
+        return (200, {"valid": True}) if valid else (409, {"error": "EXECUTION_SOURCE_PENDING"})
+
+    def _remote_api_execution_page_ui(self, payload: dict, *, secret: str) -> tuple[int, dict]:
+        """Serve frozen pages on the NATS worker; touch wx only for small owner captures."""
+        store = getattr(self, "chat_store", None)
+        if store is None:
+            return 503, {"error": "execution_authority_unavailable"}
+        owner = str(payload.get("chat_id") or "").strip()
+        body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+        if not owner:
+            return 400, {"error": "chat_id_required"}
+        pair_id = "default"
+        if not secret:
+            return 503, {"error": "cursor_secret_unavailable"}
+        domain = str(body.get("sequence_domain") or "events")
+        cursor = str(body.get("cursor") or "")
+        snapshot_id = str(body.get("snapshot_id") or "")
+        try:
+            if not cursor:
+                status, context = self._run_remote_ui_route(self._capture_execution_projection_context_ui, payload)
+                if status != 200 or context.get("dirty"):
+                    return 409, {"error": "EXECUTION_SOURCE_PENDING", "recovery": "SNAPSHOT_REQUIRED"}
+                source = store.read_execution_projection_source(owner)
+                active = bool(context["active"])
+                mode = "active" if active else "history"
+                active_index = int(context["active_turn_index"])
+                steps = source["steps"]
+                if active and any(isinstance(step, dict) and "turn_idx" in step for step in steps):
+                    steps = [step for step in steps if not isinstance(step, dict)
+                             or "turn_idx" not in step
+                             or self._safe_int(step.get("turn_idx"), -1) == active_index]
+                if active and context["steps_count"] and context["last_step_key"]:
+                    if not any(str(step.get("logical_key") or step.get("_execution_uid") or step.get("event_id") or "")
+                               == context["last_step_key"] and str(step.get("list_text") or "") == context["last_step_text"]
+                               for step in steps):
+                        raise ValueError("EXECUTION_SOURCE_PENDING")
+                if active and context["turns_count"] != len(source["turns"]):
+                    raise ValueError("EXECUTION_SOURCE_PENDING")
+                if active and source["turns"]:
+                    last_turn = source["turns"][-1]
+                    if (str(last_turn.get("question") or "") != context["last_turn_question"]
+                            or str(last_turn.get("answer_md") or "") != context["last_turn_answer"]):
+                        raise ValueError("EXECUTION_SOURCE_PENDING")
+                rows = project_execution_rows(
+                    chat_id=owner, revision=source["revision"], steps=steps,
+                    turns=source["turns"], view_mode=mode,
+                    active_turn_index=active_index,
+                    selected_model=context["selected_model"],
+                    requesting_text=REQUESTING_TEXT,
+                    answer_to_plain=lambda answer_md, model: execution_answer_to_plain(
+                        answer_md, model, context["english_filter"]),
+                )
+                snapshot_id = store.create_execution_projection_snapshot(
+                    chat_id=owner, revision=source["revision"],
+                    source_hash=source["source_hash"], rows=rows,
+                )
+                verify_status, _ = self._run_remote_ui_route(
+                    self._verify_execution_projection_context_ui,
+                    {"chat_id": owner, "expected": context},
+                )
+                if verify_status != 200:
+                    raise ValueError("EXECUTION_SOURCE_PENDING")
+            page = store.load_execution_projection_page(
+                pair_id=pair_id, domain=domain, chat_id=owner,
+                secret=secret, snapshot_id=snapshot_id,
+                limit=int(body.get("limit") or 100), cursor=cursor,
+            )
+            return 200, page
+        except (TypeError, ValueError) as exc:
+            return 409, {"error": str(exc), "recovery": "SNAPSHOT_REQUIRED"}
+
     def _remote_api_history_read_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
@@ -15114,6 +15069,7 @@ class ChatFrame(wx.Frame):
                     on_common_commands_move_down=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_down_ui, payload),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
+                    on_execution_page=lambda payload: self._remote_api_execution_page_ui(payload, secret=token),
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
                     on_file_command=lambda payload: self._run_remote_ui_route(self._remote_api_file_command_ui, payload),

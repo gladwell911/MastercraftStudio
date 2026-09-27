@@ -676,3 +676,9 @@ def test_execution_authority_routes_and_structured_errors():
     unavailable = RemoteNatsTransport(pair_id="pair", token="secret")
     assert unavailable._route_command({"type":"execution_tail","chat_id":"chat"}) == (
         503, {"error":"execution_authority_unavailable"})
+    versioned = RemoteNatsTransport(
+        pair_id="pair", token="secret",
+        on_execution_page=lambda request: (200, {"version": 3, "chat_id": request["chat_id"]}),
+    )
+    assert versioned._route_command({"type": "execution_page_v3", "chat_id": "chat"}) == (
+        200, {"version": 3, "chat_id": "chat"})

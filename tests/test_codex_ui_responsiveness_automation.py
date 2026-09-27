@@ -1612,3 +1612,35 @@ def test_real_ui_common_commands_list_stays_responsive_during_remote_refresh_bur
     assert elapsed < 0.5
     assert dialog.common_commands_list.HasFocus()
     assert dialog.selected_command().title == "Two"
+
+
+def test_versioned_execution_snapshot_read_does_not_block_wx(frame, wx_app, tmp_path, monkeypatch):
+    store = main.ChatStore(tmp_path / "slow-projection.db")
+    store.initialize()
+    store.upsert_chat({"id": "slow", "title": "slow", "created_at": 1, "updated_at": 1})
+    store.replace_execution_steps("slow", [{"display_kind": "commentary", "list_text": "step"}])
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    blocked, release = threading.Event(), threading.Event()
+    original = store.read_execution_projection_source
+
+    def slow_read(owner):
+        assert threading.current_thread() is not threading.main_thread()
+        blocked.set()
+        assert release.wait(5)
+        return original(owner)
+
+    monkeypatch.setattr(store, "read_execution_projection_source", slow_read)
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(
+        frame._remote_api_execution_page_ui({"chat_id": "slow", "body": {"limit": 10}}, secret="secret")
+    ))
+    worker.start()
+    assert _yield_until(wx_app, blocked.is_set)
+    started = time.perf_counter()
+    wx_app.Yield()
+    assert time.perf_counter() - started < 0.5
+    release.set()
+    assert _yield_until(wx_app, lambda: not worker.is_alive())
+    worker.join(timeout=1)
+    assert outcome[0][0] in {200, 409}

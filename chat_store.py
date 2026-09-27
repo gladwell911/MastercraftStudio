@@ -85,6 +85,23 @@ class ChatStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_execution_fragment_conflicts
                     ON execution_fragment_conflicts(chat_id, logical_key, id);
+                CREATE TABLE IF NOT EXISTS execution_projection_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    rows_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_execution_projection_snapshot_owner
+                    ON execution_projection_snapshots(chat_id, revision, expires_at);
+                CREATE TABLE IF NOT EXISTS execution_projection_rows (
+                    snapshot_id TEXT NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    row_json TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, row_index)
+                );
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -1001,6 +1018,118 @@ class ChatStore:
                 "oldest_cursor": next_cursor, "revision": revision,
                 "sequence_domain": sequence_domain, "snapshot_high": snapshot_high}
 
+    def create_execution_projection_snapshot(
+        self, *, chat_id: str, revision: int, source_hash: str,
+        rows: list[dict[str, Any]], ttl: int = 900,
+    ) -> str:
+        """Freeze projected rows only if their canonical source still matches."""
+        owner = self.normalize_chat_id(chat_id)
+        snapshot_id = uuid.uuid4().hex
+        now = time.time()
+        rows_json = json.dumps(rows, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            expired = [row["snapshot_id"] for row in conn.execute(
+                "SELECT snapshot_id FROM execution_projection_snapshots WHERE expires_at<?", (now,)
+            ).fetchall()]
+            if expired:
+                conn.executemany("DELETE FROM execution_projection_rows WHERE snapshot_id=?",
+                                 [(value,) for value in expired])
+                conn.executemany("DELETE FROM execution_projection_snapshots WHERE snapshot_id=?",
+                                 [(value,) for value in expired])
+            state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            current_revision = int(state["revision"]) if state else 0
+            turn_rows = conn.execute(
+                "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
+            ).fetchall()
+            step_rows = conn.execute(
+                "SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? ORDER BY step_index", (owner,)
+            ).fetchall()
+            current_hash = self._execution_projection_source_hash(current_revision, turn_rows, step_rows)
+            if current_revision != int(revision) or current_hash != source_hash:
+                raise ValueError("EXECUTION_SOURCE_CHANGED")
+            previous = conn.execute(
+                """SELECT snapshot_id,rows_json FROM execution_projection_snapshots
+                   WHERE chat_id=? AND revision=? AND source_hash=? AND expires_at>=?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (owner, current_revision, source_hash, now),
+            ).fetchone()
+            if previous is not None and str(previous["rows_json"]) == rows_json:
+                return str(previous["snapshot_id"])
+            conn.execute(
+                """INSERT INTO execution_projection_snapshots
+                   (snapshot_id,chat_id,revision,source_hash,rows_json,created_at,expires_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (snapshot_id, owner, current_revision, source_hash,
+                 rows_json, now, now + max(1, int(ttl))),
+            )
+            conn.executemany(
+                "INSERT INTO execution_projection_rows(snapshot_id,row_index,row_json) VALUES(?,?,?)",
+                [(snapshot_id, index, json.dumps(row, ensure_ascii=False))
+                 for index, row in enumerate(rows)],
+            )
+        return snapshot_id
+
+    def load_execution_projection_page(
+        self, *, pair_id: str, domain: str, chat_id: str,
+        secret: str | bytes, snapshot_id: str, limit: int = 100,
+        cursor: str = "", now: float | None = None,
+    ) -> dict[str, Any]:
+        """Page an immutable projection with an owner/revision-bound cursor."""
+        owner = self.normalize_chat_id(chat_id)
+        current_time = time.time() if now is None else float(now)
+        page_limit = min(100, max(1, int(limit)))
+        with self._connect() as conn:
+            state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            current_revision = int(state["revision"]) if state else 0
+            snapshot = conn.execute(
+                """SELECT revision,expires_at FROM execution_projection_snapshots
+                   WHERE snapshot_id=? AND chat_id=?""", (snapshot_id, owner),
+            ).fetchone()
+        if snapshot is None:
+            raise ValueError("EXECUTION_SNAPSHOT_MISSING")
+        revision = int(snapshot["revision"])
+        if revision != current_revision:
+            raise ValueError("EXECUTION_CURSOR_SCOPE_MISMATCH")
+        expires_at = float(snapshot["expires_at"])
+        if expires_at < current_time:
+            raise ValueError("EXECUTION_CURSOR_EXPIRED")
+        with self._connect() as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM execution_projection_rows WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()
+        total = int(total_row["n"] if total_row else 0)
+        before = total
+        if cursor:
+            decoded = self._decode_execution_cursor(cursor, secret)
+            required = {"v": 3, "pair": pair_id, "domain": domain, "chat": owner,
+                        "revision": revision, "snapshot": snapshot_id}
+            if any(decoded.get(key) != value for key, value in required.items()):
+                raise ValueError("EXECUTION_CURSOR_SCOPE_MISMATCH")
+            if float(decoded.get("expires_at") or 0) < current_time:
+                raise ValueError("EXECUTION_CURSOR_EXPIRED")
+            before = int(decoded.get("before", -1))
+            if before < 0 or before > total:
+                raise ValueError("INVALID_EXECUTION_CURSOR")
+        start = max(0, before - page_limit)
+        with self._connect() as conn:
+            selected = [json.loads(row["row_json"]) for row in conn.execute(
+                """SELECT row_json FROM execution_projection_rows
+                   WHERE snapshot_id=? AND row_index>=? AND row_index<?
+                   ORDER BY row_index LIMIT ?""",
+                (snapshot_id, start, before, page_limit),
+            ).fetchall()]
+        has_more = start > 0
+        next_cursor = self._execution_cursor_token({
+            "v": 3, "pair": pair_id, "domain": domain, "chat": owner,
+            "revision": revision, "snapshot": snapshot_id,
+            "before": start, "expires_at": expires_at,
+        }, secret) if has_more else ""
+        return {"version": 3, "snapshot_id": snapshot_id, "chat_id": owner,
+                "revision": revision, "rows": selected, "has_more": has_more,
+                "cursor": next_cursor, "oldest_cursor": next_cursor}
+
     def load_execution_range(self, *, pair_id: str, domain: str, chat_id: str,
                              revision: int, start_sequence: int, end_sequence: int) -> dict[str, Any]:
         owner = self.normalize_chat_id(chat_id)
@@ -1371,51 +1500,81 @@ class ChatStore:
         if str(step.get("logical_key") or "").strip():
             self.upsert_execution_step(normalized, step)
             return
-        turn_value = self._optional_int(step.get("turn_idx"))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT COALESCE(MAX(step_index), -1) + 1 AS next_idx FROM execution_steps WHERE chat_id = ?",
-                (normalized,),
+            self._append_execution_step_on_conn(conn, normalized, step)
+
+    def _append_execution_step_on_conn(self, conn, chat_id: str, step: dict[str, Any]) -> None:
+        """Append one trusted canonical step inside the caller's transaction."""
+        logical_key = str(step.get("logical_key") or "").strip()
+        if logical_key:
+            scope = step.get("logical_scope")
+            if (not isinstance(scope, dict)
+                    or self.execution_logical_key(scope) != logical_key
+                    or str(scope.get("chat_id") or "").strip() != chat_id):
+                raise ValueError("EXECUTION_LOGICAL_KEY_MISMATCH")
+            for field in ("provider", "thread_id", "turn_id", "revision", "agent_id"):
+                incoming = step.get(field)
+                expected = scope.get(field)
+                if str(incoming if incoming is not None else "") != str(expected if expected is not None else ""):
+                    raise ValueError("EXECUTION_SCOPE_CONFLICT")
+            existing = conn.execute(
+                "SELECT step_index FROM execution_steps WHERE chat_id=? AND logical_key=?",
+                (chat_id, logical_key),
             ).fetchone()
-            next_idx = int(row["next_idx"] or 0)
+            if existing is not None:
+                conn.execute(
+                    """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,
+                       list_text=?,detail_text=?,payload_json=? WHERE chat_id=? AND logical_key=?""",
+                    (self._optional_int(step.get("turn_idx")), str(step.get("event_type") or ""),
+                     str(step.get("display_kind") or ""), str(step.get("list_text") or step.get("step") or ""),
+                     str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
+                     json.dumps(step, ensure_ascii=False), chat_id, logical_key),
+                )
+                return
+        turn_value = self._optional_int(step.get("turn_idx"))
+        row = conn.execute(
+            "SELECT COALESCE(MAX(step_index), -1) + 1 AS next_idx FROM execution_steps WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        next_idx = int(row["next_idx"] or 0)
+        conn.execute(
+            """
+            INSERT INTO execution_steps(
+                chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json, logical_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                next_idx,
+                turn_value,
+                str(step.get("event_type") or ""),
+                str(step.get("display_kind") or ""),
+                str(step.get("list_text") or step.get("step") or ""),
+                str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
+                json.dumps(step, ensure_ascii=False),
+                str(step.get("logical_key") or ""),
+            ),
+        )
+        if turn_value is not None and self.max_execution_steps_per_turn > 0:
             conn.execute(
                 """
-                INSERT INTO execution_steps(
-                    chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json, logical_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                DELETE FROM execution_steps
+                WHERE chat_id = ? AND turn_idx = ? AND step_index NOT IN (
+                    SELECT step_index FROM execution_steps
+                    WHERE chat_id = ? AND turn_idx = ?
+                    ORDER BY step_index DESC
+                    LIMIT ?
+                )
                 """,
                 (
-                    normalized,
-                    next_idx,
+                    chat_id,
                     turn_value,
-                    str(step.get("event_type") or ""),
-                    str(step.get("display_kind") or ""),
-                    str(step.get("list_text") or step.get("step") or ""),
-                    str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
-                    json.dumps(step, ensure_ascii=False),
-                    str(step.get("logical_key") or ""),
+                    chat_id,
+                    turn_value,
+                    int(self.max_execution_steps_per_turn),
                 ),
             )
-            if turn_value is not None and self.max_execution_steps_per_turn > 0:
-                conn.execute(
-                    """
-                    DELETE FROM execution_steps
-                    WHERE chat_id = ? AND turn_idx = ? AND step_index NOT IN (
-                        SELECT step_index FROM execution_steps
-                        WHERE chat_id = ? AND turn_idx = ?
-                        ORDER BY step_index DESC
-                        LIMIT ?
-                    )
-                    """,
-                    (
-                        normalized,
-                        turn_value,
-                        normalized,
-                        turn_value,
-                        int(self.max_execution_steps_per_turn),
-                    ),
-                )
 
     def replace_execution_lifecycle_step(self, chat_id: str, step: dict[str, Any]) -> bool:
         normalized = str(chat_id or "").strip()
@@ -1764,10 +1923,11 @@ class ChatStore:
         if not normalized:
             return
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM execution_steps WHERE chat_id = ?", (normalized,))
-        for step in steps or []:
-            if isinstance(step, dict):
-                self.append_execution_step(normalized, step)
+            for step in steps or []:
+                if isinstance(step, dict):
+                    self._append_execution_step_on_conn(conn, normalized, step)
 
     def load_execution_steps(self, chat_id: str, turn_idx: int | None = None) -> list[dict[str, Any]]:
         params: list[Any] = [str(chat_id or "").strip()]
@@ -1798,6 +1958,53 @@ class ChatStore:
             payload.setdefault("detail_text", str(row["detail_text"] or ""))
             out.append(payload)
         return out
+
+    def read_execution_projection_source(self, chat_id: str) -> dict[str, Any]:
+        """Read one canonical owner and its turns/steps from one SQLite snapshot."""
+        owner = self.normalize_chat_id(chat_id)
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            state = conn.execute(
+                "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
+            ).fetchone()
+            turn_rows = conn.execute(
+                "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
+            ).fetchall()
+            step_rows = conn.execute(
+                """SELECT step_index,payload_json,turn_idx,event_type,display_kind,
+                          list_text,detail_text FROM execution_steps
+                   WHERE chat_id=? ORDER BY step_index""", (owner,)
+            ).fetchall()
+            source_hash = self._execution_projection_source_hash(
+                int(state["revision"]) if state else 0, turn_rows, step_rows,
+            )
+            turns = [self._json_dict(row["payload_json"]) for row in turn_rows]
+            steps = []
+            for row in step_rows:
+                step = self._json_dict(row["payload_json"])
+                if step.get("projection_ready") is False:
+                    continue
+                step["_store_step_index"] = int(row["step_index"])
+                step.setdefault("turn_idx", row["turn_idx"])
+                for field in ("event_type", "display_kind", "list_text", "detail_text"):
+                    step.setdefault(field, str(row[field] or ""))
+                steps.append(step)
+        return {
+            "chat_id": owner,
+            "revision": int(state["revision"]) if state else 0,
+            "source_hash": source_hash,
+            "turns": turns,
+            "steps": steps,
+        }
+
+    @staticmethod
+    def _execution_projection_source_hash(revision, turn_rows, step_rows) -> str:
+        source = [
+            int(revision),
+            [str(row["payload_json"]) for row in turn_rows],
+            [[int(row["step_index"]), str(row["payload_json"])] for row in step_rows],
+        ]
+        return hashlib.sha256(json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     def load_recent_execution_steps(
         self,
