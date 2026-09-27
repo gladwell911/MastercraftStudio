@@ -178,6 +178,170 @@ def test_kimi_quota_http_401_is_unlogged_and_reopen_clears_cache(frame, wx_app, 
     wx_app.Yield()
 
 
+def test_kimi_quota_dialog_timer_account_switch_rejects_late_a_without_session(frame, wx_app, monkeypatch):
+    jobs, callbacks, calls = [], [], []
+    account = ["A"]
+    frame.Show()
+    wx_app.Yield()
+
+    class QueuedThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            jobs.append(self.target)
+
+    class Client:
+        def start(self):
+            calls.append("start")
+
+        def get_auth(self):
+            calls.append("auth")
+            return {"managed_provider": {"status": "authenticated"}}
+
+        def get_oauth_userinfo(self):
+            calls.append("userinfo")
+            return {"kind": "ok", "userInfo": {"userId": account[0]}}
+
+        def get_oauth_usage(self):
+            calls.append("usage")
+            ratio = .2 if account[0] == "A" else .7
+            return {"kind": "ok", "quota": {"usages": {"limit5h": {"usedRatio": ratio}}}}
+
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", _REAL_KIMI_QUOTA_REQUEST)
+    monkeypatch.setattr(main.threading, "Thread", QueuedThread)
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda callback, *args: callbacks.append((callback, args)))
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    frame._current_chat_state = {"id": "chat-q", "model": "kimi/main"}
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetFocus()
+    assert len(jobs) == 1
+    jobs.pop(0)()
+    assert len(callbacks) == 1
+    account[0] = "B"
+    dialog._on_refresh_timer(None)
+    assert len(jobs) == 1
+    jobs.pop(0)()
+    # Apply B first, then the delayed A callback.
+    callback_b, args_b = callbacks.pop(1)
+    callback_b(*args_b)
+    callback_a, args_a = callbacks.pop(0)
+    callback_a(*args_a)
+    wx_app.Yield()
+    assert frame._current_chat_state["kimi_quota_owner"] == "B"
+    assert "70.0%" in dialog.information_list.GetString(2)
+    assert dialog.information_list.GetSelection() == 2
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    assert "status" not in calls and "snapshot" not in calls
+    assert calls.count("usage") == 2
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_quota_real_thread_delivers_to_wx_dialog(frame, wx_app, monkeypatch):
+    account = ["A"]
+    calls = []
+
+    class Client:
+        def start(self):
+            pass
+
+        def get_auth(self):
+            return {"managed_provider": {"status": "authenticated"}}
+
+        def get_oauth_userinfo(self):
+            return {"kind": "ok", "userInfo": {"userId": account[0]}}
+
+        def get_oauth_usage(self):
+            calls.append("usage")
+            return {"kind": "ok", "quota": {"usages": {"limit5h": {
+                "usedRatio": .2 if account[0] == "A" else .7}}}}
+
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", _REAL_KIMI_QUOTA_REQUEST)
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetFocus()
+
+    def pump_until_owner(expected):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            wx_app.Yield()
+            if chat.get("kimi_quota_owner") == expected:
+                return
+        pytest.fail(f"quota callback for {expected} was not delivered")
+
+    pump_until_owner("A")
+    assert "20.0%" in dialog.information_list.GetString(2)
+    account[0] = "B"
+    dialog._on_refresh_timer(None)
+    pump_until_owner("B")
+    assert "70.0%" in dialog.information_list.GetString(2)
+    assert calls == ["usage", "usage"]
+    assert dialog.information_list.GetSelection() == 2
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    dialog.Close()
+    wx_app.Yield()
+
+
+@pytest.mark.parametrize(("provider", "expected"), [
+    (None, "不适用"),
+    ({"status": "unauthenticated"}, "未登录"),
+    ({"status": "expired"}, "未登录"),
+    ({"status": "revoked"}, "未登录"),
+])
+def test_kimi_quota_dialog_auth_states_without_session(frame, wx_app, monkeypatch, provider, expected):
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Client:
+        def start(self):
+            pass
+
+        def get_auth(self):
+            return {"managed_provider": provider}
+
+        def get_oauth_userinfo(self):
+            pytest.fail("userinfo must not be read for this auth state")
+
+        def get_oauth_usage(self):
+            pytest.fail("usage must not be read for this auth state")
+
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", _REAL_KIMI_QUOTA_REQUEST)
+    monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    frame._current_chat_state = {"id": "chat-q", "model": "kimi/main"}
+    assert frame._show_chat_information()
+    wx_app.Yield()
+    assert expected in frame._chat_information_dialog.information_list.GetString(2)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
 def test_codex_chat_information_list_arrows_and_escape_restore_focus(frame, wx_app):
     frame.Show()
     frame.view_mode = "active"

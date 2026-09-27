@@ -84,3 +84,17 @@
 
 - 5 个精确 pytest 用例通过。
 - 本轮未连接真实 Codex/Kimi provider；此处验证的是桌面事件归并、持久化入口和广播行为。
+
+## 2026-09-27 — 聊天信息 Story 1.4/1.5 QA 自动化
+
+### 新增与复用的测试
+
+- `tests/test_chat_information_ui_automation.py`：使用真实 wx 聊天信息窗口和定时器入口，受控 Kimi 客户端验证无 session 的 OAuth 账号 A→B 切换、迟到 A 回包按代次丢弃、焦点与选择保持，以及定时器不重查 session status/snapshot。
+- 同一文件新增真实后台线程与 `wx.CallAfter` 投递的窗口集成测试；有界事件泵等待 A、B 两次额度更新，不使用固定 sleep。迟到回包用例采用确定性调度，以精确控制回包顺序。
+- 同一文件覆盖非 OAuth、unauthenticated、expired、revoked 与 HTTP 401 的列表状态。
+- 已有 `tests/test_kimi_server_client_unit.py` 覆盖 `/api/v1/auth`、`/api/v1/oauth/userinfo`、`/api/v1/oauth/usage` 三个只读客户端端点，本轮无需重复添加端点测试。
+
+### 验证边界
+
+- GUI 使用真实 wx 控件与真实后台线程；Kimi 服务响应由替身提供，不验证真实 Kimi 账号或网络服务。
+- `tests/test_chat_information_ui_automation.py` 与 `tests/test_kimi_server_client_unit.py`：112 passed。真实 provider 验收仍需发布环境完成。
