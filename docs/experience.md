@@ -1,5 +1,15 @@
 # 可复用经验
 
+## CLI 追加消息与 token 用量的协议口径
+
+- 经验：Codex 客户端调用 `turn/start` 时，Core 可把输入送入同线程的活跃 turn；Kimi 则先提交 prompt，再尝试 `prompts:steer`，失败会排队。判断前一任务是否受影响必须看服务端 admission 和真实 turn ID。
+- 为什么重要：接口名字和本地 UI 新增行不等于独立任务，按请求索引归属后续事件还可能与服务端活跃 turn 不一致。
+- 下次怎么用：设计运行中追加输入或停止动作时，分别验证普通消息、steer 和 interrupt，并以服务端 turn 身份追踪事件；`/stop` 才是明确的中断请求。
+
+- 经验：当前上下文占用与会话累计 token 是两个指标。Codex token 事件的 `last` 与 `total` 分别提供近次用量和累计值；Kimi 的状态字段提供上下文占用，真实累计值应从 session snapshot 读取。
+- 为什么重要：把累计值用于上下文百分比会产生超过窗口容量的假象，Kimi 普通 session 详情的 `usage` 目前是零值占位。
+- 下次怎么用：按 `_bmad-output/specs/spec-codex-kimi-chat-information/data-contract.md` 核对每个字段的单位、来源、更新时机和缺失状态，再接到界面。
+
 ## canonical 执行内容与远程可视快照
 
 - 经验：桌面列表由 canonical `execution_steps` 经 Kimi 折叠、轮次问答补行和可见性过滤生成；V2 durable fact 记录的是另一条事件链。跨端可视一致性应复用纯内容投影，并为远程页面单独创建不可变行快照，不应修改旧事实流的游标语义。

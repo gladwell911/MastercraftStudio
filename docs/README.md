@@ -7,6 +7,8 @@
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：待实施的 Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
+- [`../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml`](../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml)：聊天信息功能的五项实施任务，当前从 Story 1.1 开始
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
 - [`experience.md`](./experience.md)：已经验证、可复用的排障与运行经验
 - [`../_bmad-output/implementation-artifacts/spec-fix-concurrent-kimi-session-event-routing.md`](../_bmad-output/implementation-artifacts/spec-fix-concurrent-kimi-session-event-routing.md)：Kimi 并发 session 事件路由修复的验收规格
