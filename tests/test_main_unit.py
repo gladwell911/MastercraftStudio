@@ -5899,6 +5899,18 @@ def test_on_done_uses_pending_codex_context_usage(frame):
     assert frame._pending_context_usage_by_turn == {}
 
 
+def test_kimi_context_usage_keeps_used_tokens_when_window_missing(frame):
+    usage = frame._kimi_context_usage_payload(main.CodexEvent(
+        type="thread_status_changed", usage={"context_tokens": 300},
+    ))
+    assert usage["used_tokens"] == 300
+    assert usage["context_window"] == 0
+    assert usage["exact"] is False
+    assert frame._kimi_context_usage_payload(main.CodexEvent(
+        type="thread_status_changed", usage={"context_tokens": -1},
+    )) is None
+
+
 def test_codex_weekly_quota_uses_only_codex_10080_minute_window():
     parse = main.ChatFrame._codex_weekly_quota_label
     assert "剩余 75.0%" in parse({"rateLimits": {"limitId": "codex", "primary": {

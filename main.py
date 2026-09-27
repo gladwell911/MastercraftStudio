@@ -76,6 +76,7 @@ from kimi_server_client import (
     event_to_payload as kimi_event_to_payload,
     is_kimi_model,
     kimi_model_to_server_alias,
+    kimi_snapshot_total_tokens,
 )
 from context_usage import (
     context_usage_from_dict,
@@ -1816,6 +1817,8 @@ class ChatFrame(wx.Frame):
         self._codex_clients: dict[str, CodexWorkerClient] = {}
         self._chat_information_request_generation = 0
         self._chat_information_request: tuple[str | None, int, tuple[str, str, str, str]] | None = None
+        self._kimi_information_generation = 0
+        self._kimi_information_requests: dict[str, dict] = {}
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
@@ -2310,16 +2313,17 @@ class ChatFrame(wx.Frame):
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         if turns:
             usage = self._pending_context_usage_for_chat(chat, len(turns) - 1) or usage
-        if is_codex_model(model) and usage is not None and usage.source == "codex":
+        if (is_codex_model(model) and usage is not None and usage.source == "codex") or (is_kimi_model(model) and usage is not None and usage.source == "kimi"):
             if usage.context_window > 0:
                 percent = usage.used_tokens / usage.context_window * 100
                 context_row = f"当前上下文：已用 {percent:.1f}%（{usage.used_tokens:,} / {usage.context_window:,} token）"
             else:
                 context_row = f"当前上下文：{usage.used_tokens:,} token，窗口未知"
         else:
-            context_row = "当前上下文：暂不可用"
-        total = chat.get("codex_session_total_tokens") if is_codex_model(model) else None
-        total_row = f"会话累计 token：{total:,}" if isinstance(total, int) and total >= 0 else "会话累计 token：暂不可用"
+            context_row = "当前上下文：查询失败" if is_kimi_model(model) and chat.get("kimi_context_error") else "当前上下文：暂不可用"
+        total = chat.get("codex_session_total_tokens") if is_codex_model(model) else chat.get("kimi_session_total_tokens")
+        total_row = f"会话累计 token：{total:,}" if isinstance(total, int) and total >= 0 else (
+            "会话累计 token：查询失败" if is_kimi_model(model) and chat.get("kimi_snapshot_error") else "会话累计 token：暂不可用")
         rows = [context_row, total_row]
         if is_codex_model(model):
             owner_id = str(chat.get("codex_account_id") or "").strip()
@@ -2366,6 +2370,8 @@ class ChatFrame(wx.Frame):
         dialog.information_list.SetFocus()
         if is_codex_model(model):
             self._request_codex_chat_information(chat, model)
+        elif is_kimi_model(model):
+            self._request_kimi_chat_information(chat, model, visible_only=True)
         return True
 
     def _request_codex_chat_information(self, chat: dict, model: str) -> None:
@@ -2463,6 +2469,89 @@ class ChatFrame(wx.Frame):
             chat["codex_account_label"] = account_label
             chat["codex_weekly_quota_label"] = quota_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
+            self._refresh_chat_information(chat)
+            self._defer_codex_state_save()
+
+    def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False) -> None:
+        identity = self._chat_information_identity(chat, model)
+        if not identity[0] or not identity[2]:
+            return
+        dialog = getattr(self, "_chat_information_dialog", None)
+        if visible_only and (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity):
+            return
+        self._kimi_information_generation += 1
+        generation = self._kimi_information_generation
+        self._kimi_information_requests[identity[0]] = {
+            "generation": generation, "identity": identity,
+            "context_revision": int(chat.get("kimi_context_revision") or 0),
+            "visible_only": visible_only, "remaining": {"status", "snapshot"},
+        }
+
+        def _read() -> None:
+            try:
+                client = self._ensure_kimi_client()
+                client.start()
+            except Exception:
+                for kind in ("status", "snapshot"):
+                    self._call_after_if_alive(self._apply_kimi_chat_information_result,
+                                              identity[0], generation, identity, kind, None, True)
+                return
+            for kind, getter in (("status", client.get_status), ("snapshot", client.get_snapshot)):
+                try:
+                    payload = getter(identity[2])
+                    failed = False
+                except Exception:
+                    payload, failed = None, True
+                self._call_after_if_alive(self._apply_kimi_chat_information_result,
+                                          identity[0], generation, identity, kind, payload, failed)
+
+        threading.Thread(target=_read, daemon=True).start()
+
+    def _apply_kimi_chat_information_result(
+        self, chat_id: str, generation: int, identity: tuple[str, str, str, str],
+        kind: str, payload: dict | None, failed: bool,
+    ) -> None:
+        request = self._kimi_information_requests.get(chat_id)
+        if not isinstance(request, dict) or request.get("generation") != generation or request.get("identity") != identity:
+            return
+        chat, _is_current = self._kimi_target_chat(chat_id)
+        if not isinstance(chat, dict) or self._chat_information_identity(chat, identity[1]) != identity:
+            return
+        if request.get("visible_only"):
+            dialog = getattr(self, "_chat_information_dialog", None)
+            if dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity:
+                self._kimi_information_requests.pop(chat_id, None)
+                return
+        changed = False
+        if kind == "status" and int(chat.get("kimi_context_revision") or 0) == request.get("context_revision"):
+            usage = None if failed else self._kimi_context_usage_payload(CodexEvent(
+                type="thread_status_changed", usage={
+                    "context_tokens": (payload or {}).get("context_tokens", (payload or {}).get("contextTokens")),
+                    "max_context_tokens": (payload or {}).get("max_context_tokens", (payload or {}).get("maxContextTokens")),
+                },
+            ))
+            if usage is not None:
+                changed = self._set_chat_context_usage(chat, usage)
+            elif chat.get("context_usage") is not None:
+                chat["context_usage"] = None
+                changed = True
+            if bool(chat.get("kimi_context_error")) != bool(failed):
+                chat["kimi_context_error"] = bool(failed)
+                changed = True
+        elif kind == "snapshot":
+            total = None if failed else kimi_snapshot_total_tokens(payload)
+            if chat.get("kimi_session_total_tokens") != total:
+                chat["kimi_session_total_tokens"] = total
+                changed = True
+            if bool(chat.get("kimi_snapshot_error")) != bool(failed):
+                chat["kimi_snapshot_error"] = bool(failed)
+                changed = True
+        remaining = request.get("remaining")
+        if isinstance(remaining, set):
+            remaining.discard(kind)
+            if not remaining:
+                self._kimi_information_requests.pop(chat_id, None)
+        if changed:
             self._refresh_chat_information(chat)
             self._defer_codex_state_save()
 
@@ -10018,6 +10107,7 @@ class ChatFrame(wx.Frame):
     def _handle_kimi_clear_command(self, chat: dict) -> str:
         cleared_session = str((chat or {}).get("kimi_session_id") or "").strip()
         if isinstance(chat, dict):
+            self._clear_kimi_information_for_session_change(chat)
             chat["kimi_session_id"] = ""
             chat["kimi_turn_id"] = ""
             chat["kimi_turn_active"] = False
@@ -10035,6 +10125,8 @@ class ChatFrame(wx.Frame):
                     turn.pop("request_resume_token", None)
         if chat is self._current_chat_state:
             self._reset_active_kimi_session_state()
+        if isinstance(chat, dict):
+            self._publish_kimi_information_session_change(chat)
         chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
         if chat_id:
             with self._kimi_owner_lock:
@@ -10073,6 +10165,37 @@ class ChatFrame(wx.Frame):
                     }
         self._save_state()
         return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
+
+    def _clear_kimi_information_for_session_change(self, chat: dict) -> None:
+        usage = context_usage_from_dict(chat.get("context_usage"))
+        if usage is not None and usage.source == "kimi":
+            chat["context_usage"] = None
+        chat["kimi_session_total_tokens"] = None
+        chat["kimi_context_error"] = False
+        chat["kimi_snapshot_error"] = False
+        chat["kimi_information_generation"] = int(chat.get("kimi_information_generation") or 0) + 1
+        chat_id = str(chat.get("id") or "").strip()
+        self._kimi_information_requests.pop(chat_id, None)
+        for key in list(self._pending_context_usage_by_turn):
+            if key[0] == chat_id:
+                self._pending_context_usage_by_turn.pop(key, None)
+        if threading.current_thread() is threading.main_thread():
+            self._refresh_chat_information(chat)
+        else:
+            self._call_after_if_alive(self._refresh_chat_information, chat)
+
+    def _publish_kimi_information_session_change(self, chat: dict) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self._call_after_if_alive(self._publish_kimi_information_session_change, chat)
+            return
+        dialog = getattr(self, "_chat_information_dialog", None)
+        owner = self._visible_chat_information_owner()
+        if dialog is None or dialog.IsBeingDeleted() or owner is None or owner[0] is not chat:
+            return
+        if dialog.identity[0] != str(chat.get("id") or ""):
+            return
+        dialog.identity = self._chat_information_identity(chat, owner[1])
+        dialog.set_rows(self._chat_information_rows(chat, owner[1]))
 
     def _handle_kimi_stop_command(self, client, chat: dict, model: str = "") -> str:
         session_id = self._kimi_session_id_for_chat(chat)
@@ -10345,9 +10468,12 @@ class ChatFrame(wx.Frame):
         session_id = str(payload.get("session_id") or "").strip()
         turn_id = str(payload.get("turn_id") or "").strip()
         if "session_id" in payload:
+            if str(target_chat.get("kimi_session_id") or "").strip() != session_id:
+                self._clear_kimi_information_for_session_change(target_chat)
             target_chat["kimi_session_id"] = session_id
             if is_current_target:
                 self.active_kimi_session_id = session_id
+            self._publish_kimi_information_session_change(target_chat)
         if "turn_id" in payload:
             target_chat["kimi_turn_id"] = turn_id
             if is_current_target:
@@ -13821,8 +13947,10 @@ class ChatFrame(wx.Frame):
         usage = event.usage if isinstance(getattr(event, "usage", None), dict) else {}
         used = usage.get("context_tokens")
         window = usage.get("max_context_tokens")
-        if not isinstance(used, (int, float)) or not isinstance(window, (int, float)):
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 0:
             return None
+        if isinstance(window, bool) or not isinstance(window, (int, float)) or window <= 0:
+            window = 0
         model = ""
         if isinstance(event.data, dict):
             model = str(event.data.get("model") or "").strip()
@@ -13830,7 +13958,7 @@ class ChatFrame(wx.Frame):
             "used_tokens": int(used),
             "context_window": int(window),
             "source": "kimi",
-            "exact": True,
+            "exact": bool(window),
             "fresh": True,
             "model": model,
             "updated_at": time.time(),
@@ -13893,7 +14021,10 @@ class ChatFrame(wx.Frame):
                 self._kimi_active_turns[normalized] = metadata
         if isinstance(target_chat, dict):
             if session_id:
+                if str(target_chat.get("kimi_session_id") or "").strip() != session_id:
+                    self._clear_kimi_information_for_session_change(target_chat)
                 target_chat["kimi_session_id"] = session_id
+                self._publish_kimi_information_session_change(target_chat)
             if event_turn_id:
                 target_chat["kimi_turn_id"] = event_turn_id
             target_chat["kimi_turn_active"] = True
@@ -14571,6 +14702,10 @@ class ChatFrame(wx.Frame):
                             proof = {"owner_key": list(key), "generation": generation}
                     identity_chat["kimi_idle_verified"] = proof
         context_usage = self._kimi_context_usage_payload(event) if event_type == "thread_status_changed" else None
+        if context_usage is not None and isinstance(identity_chat, dict):
+            current_session_id = str(identity_chat.get("kimi_session_id") or "").strip()
+            if not current_session_id or self._event_thread_id(event) != current_session_id:
+                context_usage = None
         if not is_current_chat:
             if event_type == "agent_message_delta":
                 if delta_kind == "thinking":
@@ -14588,6 +14723,7 @@ class ChatFrame(wx.Frame):
             target_turns = target_chat.get("turns") if isinstance(target_chat.get("turns"), list) else []
             target_idx = self._kimi_event_turn_index(target_turns, event)
             if context_usage is not None and target_idx >= 0:
+                target_chat["kimi_context_revision"] = int(target_chat.get("kimi_context_revision") or 0) + 1
                 turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
                 completed_turn = str(turn.get("request_status") or "").strip() == "done"
                 if completed_turn:
@@ -14639,6 +14775,7 @@ class ChatFrame(wx.Frame):
                         if finalized:
                             self._mark_chat_turns_dirty(chat_id, min(finalized))
                             self._refresh_visible_history_chat(chat_id)
+                            self._request_kimi_chat_information(target_chat, str(turn.get("model") or DEFAULT_KIMI_MODEL), visible_only=True)
                         if successful:
                             self._play_finish_sound()
                             for finalized_idx in finalized:
@@ -14673,6 +14810,7 @@ class ChatFrame(wx.Frame):
             if target_idx < 0:
                 target_idx = self.active_turn_idx if 0 <= self.active_turn_idx < len(self.active_session_turns) else (len(self.active_session_turns) - 1)
             if target_idx >= 0:
+                self._current_chat_state["kimi_context_revision"] = int(self._current_chat_state.get("kimi_context_revision") or 0) + 1
                 turn = self.active_session_turns[target_idx] if target_idx < len(self.active_session_turns) and isinstance(self.active_session_turns[target_idx], dict) else {}
                 completed_turn = str(turn.get("request_status") or "").strip() == "done"
                 if completed_turn:
@@ -14724,6 +14862,7 @@ class ChatFrame(wx.Frame):
             if not finalized:
                 self._defer_chat_state_save()
                 return
+            self._request_kimi_chat_information(self._current_chat_state, str(self._current_chat_state.get("model") or DEFAULT_KIMI_MODEL), visible_only=True)
             self._request_execution_list_sync(self._current_chat_state)
             still_active = bool(self._current_chat_state.get("kimi_turn_active"))
             self.active_kimi_turn_active = still_active

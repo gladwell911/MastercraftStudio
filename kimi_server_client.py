@@ -39,6 +39,20 @@ import requests
 KIMI_MODEL_PREFIX = "kimi/"
 DEFAULT_KIMI_MODEL = "kimi/main"
 
+
+def kimi_snapshot_total_tokens(payload: dict[str, Any]) -> int | None:
+    session = payload.get("session") if isinstance(payload, dict) else None
+    usage = session.get("usage") if isinstance(session, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    values = []
+    for key in ("input_tokens", "output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        values.append(value)
+    return sum(values)
+
 # Mapping from app model id -> kimi provider model alias passed to the server.
 KIMI_SERVER_MODEL_ALIASES: dict[str, str] = {
     "kimi/main": "kimi-code/kimi-for-coding",
@@ -926,6 +940,9 @@ class KimiServerClient:
 
     def get_status(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         return self._request_data("GET", f"/api/v1/sessions/{session_id}/status", timeout=timeout)
+
+    def get_snapshot(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", f"/api/v1/sessions/{session_id}/snapshot", timeout=timeout)
 
     def session_exists(self, session_id: str, *, timeout: float | None = None) -> bool:
         try:

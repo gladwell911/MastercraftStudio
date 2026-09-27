@@ -460,6 +460,20 @@ def test_rest_calls_send_bearer_header():
         assert call["headers"].get("Authorization") == "Bearer secret-token"
 
 
+def test_snapshot_total_uses_only_input_and_output_tokens():
+    client, _, http, _, _ = started_client()
+    data = {"session": {"usage": {"input_tokens": 100, "output_tokens": 20,
+                                 "cache_read_tokens": 90, "cache_creation_tokens": 40}}}
+    http.routes[("GET", "/api/v1/sessions/session-1/snapshot")] = FakeResponse(
+        200, {"code": 0, "data": data},
+    )
+    assert client.get_snapshot("session-1") == data
+    assert kimi_server_client.kimi_snapshot_total_tokens(data) == 120
+    assert kimi_server_client.kimi_snapshot_total_tokens({"session": {"usage": {"input_tokens": 100}}}) is None
+    assert kimi_server_client.kimi_snapshot_total_tokens({"session": {"usage": {
+        "input_tokens": -1, "output_tokens": 20}}}) is None
+
+
 # ----------------------------------------------------------------------
 # A9-A10: close escalation and idempotence
 
