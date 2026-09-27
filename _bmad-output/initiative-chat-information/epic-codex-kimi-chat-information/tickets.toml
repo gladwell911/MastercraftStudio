@@ -1,0 +1,54 @@
+[[entry]]
+id = 1
+type = "story"
+title = "打通聊天信息菜单、列表和 Codex 上下文"
+description = "在应用菜单加入仅 Codex/Kimi 聊天可用的入口，建立独立键盘列表与 Esc 焦点恢复，以聊天、原生会话和账号身份作为后续数据源共用的更新契约，并用正确的 Codex 最近用量贯通第一行。"
+verify = "Codex 聊天从应用菜单打开信息列表后可读到上下文百分比及 token 数；方向键与 Esc 正常，关闭后焦点回到原控件。"
+covers = ["CAP-1", "CAP-2"]
+after = []
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "接入 Codex 累计消耗和主周限额"
+description = "解析 Codex 新旧 token 事件中的累计值，读取主 codex bucket 周窗口及重置时间，并显示账号和字段缺失状态。"
+verify = "累计 token 与当前上下文占用分别显示；主 codex 周窗显示剩余比例和本地重置时间，API key 与缺周窗有正确状态。"
+covers = ["CAP-3", "CAP-4", "CAP-7"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "接入 Kimi 上下文和会话累计消耗"
+description = "将 Kimi 实时 status 的上下文数值接入列表，并从 session snapshot 读取输入加输出的累计 token，绑定正确会话。"
+verify = "Kimi 聊天显示上下文百分比及已用／总窗口 token，累计值来自 snapshot；切换聊天和压缩上下文后数据正确。"
+covers = ["CAP-2", "CAP-3", "CAP-7"]
+after = [2]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "接入 Kimi 额度及可见窗口刷新"
+description = "读取 Kimi OAuth 五小时和七日额度，完成两种重置时间展示，并基于第 1 项的身份契约统一 Codex token/周额度及 Kimi status/snapshot/额度的可见刷新、任务完成与账号变化触发、失效回调丢弃和焦点保护。"
+verify = "两家全部信息行在事件或后台快照变化后更新；Kimi 额度形式正确，账号不可用、网络失败、会话切换和关闭窗口时不串号，无变化时不触发 UI 更新或焦点变动。"
+covers = ["CAP-5", "CAP-6", "CAP-7"]
+after = [2, 3]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Refactor sweep"
+description = "依据前四项实施记录与审查发现整理重复的用量映射、刷新和 UI 更新代码；若无重复或待处理发现则记录检查结果，不增加新功能。"
+verify = "检查用量映射与刷新路径的重复实现并记录处理结果；无变化刷新不调度 UI 工作、不改变选择或焦点，相关 GUI、Codex、Kimi 回归通过。"
+covers = ["CAP-1", "CAP-2", "CAP-3", "CAP-4", "CAP-5", "CAP-6", "CAP-7"]
+after = [1, 2, 3, 4]
+hitl = false
+risk = "low"

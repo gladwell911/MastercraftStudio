@@ -1,0 +1,5 @@
+[[epic]]
+id = 1
+slug = "epic-codex-kimi-chat-information"
+title = "桌面端查看 Codex 与 Kimi 聊天信息"
+covers = ["CAP-1", "CAP-2", "CAP-3", "CAP-4", "CAP-5", "CAP-6", "CAP-7"]
