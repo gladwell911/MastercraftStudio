@@ -14,6 +14,7 @@ Codex/Kimi 聊天信息 Story 1.1–1.5 已分别提交为 `703a4b7`、`2c1c106`
 - Kimi 上下文来自实时 status，缺窗口时显示未知；会话累计仅取 snapshot 的 `session.usage.input_tokens + output_tokens`。后台 status 用于恢复，不覆盖更新的实时事件；旧 session 事件与异步旧回包不能写入当前聊天。Codex 清空、切 thread 或切账号后同样拒绝迟到 token/ack。
 - Story 1.4 接入 Kimi OAuth 五小时和七日额度：后台读取 auth、userinfo 和 usage，按认证状态及 userId 绑定结果；五小时显示本地重置时刻，七日显示剩余时长，缓存注明上次更新时间。窗口可见时低频更新额度，旧聊天/session/账号或过期请求结果不写入当前面板。
 - Story 1.5 共用 Kimi 实时事件与 REST status 的上下文值解析器，移除 REST 路径构造临时事件；Codex 定时器不再做请求前的列表刷新。其余映射和 session rebind 路径保留原有独立语义。
+- 打包版常用命令改为读取个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\common_commands.json`，源码运行仍读 `dist\history`。本机旧文件的 5 条命令已复制到 OneDrive 目标文件且哈希一致；旧文件保留。若打包版未检测到 OneDrive 环境变量或目标文件尚未同步，启动时提示并停止，不会静默使用旧文件。此改动尚未重新打包，当前已安装的 MC 不受影响。
 
 ## 验证状态
 
@@ -26,10 +27,11 @@ Codex/Kimi 聊天信息 Story 1.1–1.5 已分别提交为 `703a4b7`、`2c1c106`
 - Story 1.4 已提交为 `68082ce`，Story 1.5 已提交为 `5791a98`。Story 1.5 独立 engineer 验证 141 项通过、1 项已知基线排除，`py_compile` 和 `git diff --check` 通过；President 审查未发现阻塞项。实现与审查记录见对应票据计划；这些定向结果不能替代完整套件。
 - 当前宽回归有 6 项已知基线排除，不能把排除后的通过结果称作完整套件通过。
 - 2026-09-28 修复 Kimi 额度刷新后，聊天信息 GUI 与客户端定向测试 116 项通过；显式启用的只读 Live 测试 2 项通过，访问已登录的 Kimi OAuth/usage 和 Codex app-server 账号/周窗。默认运行时这 2 项跳过。只读 Live 不发送模型请求，未覆盖 Kimi 历史 session 分支；Kimi integration 的 5 项旧执行摘要失败经停用新增信息查询后仍复现，完整 MC 宽套件不能视为通过。
+- 常用命令 OneDrive 路径、缺少环境变量、目标文件未同步与启动提示的 5 项定向测试通过；现有常用命令存储、GUI 与 E2E 回归 31 项通过。
 
 ## 下一步
 
-1. Story 1.1–1.5 开发已完成，进入发布验证；两项实现和数据契约见 `_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/` 与 `_bmad-output/specs/spec-codex-kimi-chat-information/data-contract.md`。
+1. 下次打包 MC 后在两台电脑验证常用命令读取同一 OneDrive 文件；另一台电脑须先确认 `OneDrive\code\data\sj\common_commands.json` 已同步。Story 1.1–1.5 开发已完成，进入发布验证；两项实现和数据契约见 `_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/` 与 `_bmad-output/specs/spec-codex-kimi-chat-information/data-contract.md`。
 2. 原有跨端发布前仍需在具备真实配置的环境运行 `D:\code\sj\rc\scripts\run_cross_client_regression.ps1 -Mode Live`，重新打包 MC，并验收 Kimi F1、长回合恢复和手机 v3 执行页。
 3. 在实体 Android 设备上验收 TalkBack、后台通知和 ARM64 安装；历史 Kimi 宽套件失败需按旧基线逐项复核。
 

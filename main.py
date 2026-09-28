@@ -374,6 +374,18 @@ def resolve_app_data_dir() -> Path:
     return Path(__file__).resolve().parent / "dist" / "history"
 
 
+def resolve_common_commands_path() -> Path:
+    if getattr(sys, "frozen", False):
+        onedrive_dir = os.getenv("OneDriveConsumer") or os.getenv("OneDrive")
+        if not onedrive_dir:
+            raise RuntimeError("未检测到个人版 OneDrive 路径，无法读取常用命令。请先登录 OneDrive 并重新启动程序。")
+        path = Path(onedrive_dir) / "OneDrive" / "code" / "data" / "sj" / "common_commands.json"
+        if not path.is_file():
+            raise RuntimeError(f"未找到 OneDrive 常用命令文件：{path}。请等待 OneDrive 同步完成后重试。")
+        return path
+    return resolve_app_data_dir() / "common_commands.json"
+
+
 def resolve_notes_data_dir() -> Path:
     return Path(r"D:\code\note")
 
@@ -1749,7 +1761,7 @@ class ChatFrame(wx.Frame):
         self.notes_device_id = f"desktop-{platform.node().strip().lower() or 'local'}"
         self.notes_store = NotesStore(self.notes_db_path, device_id=self.notes_device_id)
         self.notes_store.initialize()
-        self.common_commands_store = DesktopCommonCommandsStore(self.app_data_dir / "common_commands.json")
+        self.common_commands_store = DesktopCommonCommandsStore(resolve_common_commands_path())
         self.common_commands_store.initialize()
         self.chat_db_path = self.app_data_dir / "chat_history.db"
         self.chat_store = ChatStore(self.chat_db_path)
@@ -21900,6 +21912,11 @@ class ChatApp(wx.App):
         self._checker = wx.SingleInstanceChecker(APP_WINDOW_TITLE + "_single_instance")
         if self._checker.IsAnotherRunning():
             self._activate_existing_window()
+            return False
+        try:
+            resolve_common_commands_path()
+        except RuntimeError as exc:
+            wx.MessageBox(str(exc), "常用命令不可用", wx.OK | wx.ICON_ERROR)
             return False
         f = ChatFrame()
         f.Show()

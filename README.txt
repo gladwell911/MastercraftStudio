@@ -72,6 +72,7 @@ python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_mode
 ## 数据位置
 
 - 聊天历史和通用应用状态仍按应用数据目录解析；源码运行时通常在项目内的 `dist\history`。
+- 打包版的常用命令读取个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\common_commands.json`；两台电脑的 OneDrive 根目录可不同。若未检测到 OneDrive 环境变量或目标文件尚未同步到本机，启动时会提示并停止，不会改读旧的 `history` 文件。源码运行继续使用 `dist\history\common_commands.json`。首次使用新包前，应先选定一台电脑的现有 JSON 作为初始版本，复制到 OneDrive 目标路径并等待两端同步完成；程序不会自动合并两台电脑的旧文件。
 - 笔记数据库独立存放在 `D:\code\note\notes.db`，由 `resolve_notes_data_dir()` 创建目录并定位文件。测试中应 monkeypatch 这个函数，避免读写真实笔记库。
 
 ## 打包

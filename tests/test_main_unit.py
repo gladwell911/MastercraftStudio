@@ -263,6 +263,49 @@ def test_chat_frame_initializes_common_commands_store(tmp_path, monkeypatch):
         frame.Destroy()
 
 
+def test_common_commands_path_uses_personal_onedrive_only_when_packaged(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path / "personal"))
+    monkeypatch.setenv("OneDrive", str(tmp_path / "other"))
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    expected = tmp_path / "personal" / "OneDrive" / "code" / "data" / "sj" / "common_commands.json"
+    expected.parent.mkdir(parents=True)
+    expected.write_text('{}', encoding="utf-8")
+    assert main.resolve_common_commands_path() == expected
+    monkeypatch.delattr(main.sys, "frozen")
+    assert main.resolve_common_commands_path() == tmp_path / "common_commands.json"
+
+
+def test_packaged_common_commands_path_rejects_missing_onedrive(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("OneDriveConsumer", raising=False)
+    monkeypatch.delenv("OneDrive", raising=False)
+    with pytest.raises(RuntimeError, match="未检测到个人版 OneDrive 路径"):
+        main.resolve_common_commands_path()
+
+
+def test_packaged_common_commands_path_rejects_unsynced_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path / "personal"))
+    with pytest.raises(RuntimeError, match="未找到 OneDrive 常用命令文件"):
+        main.resolve_common_commands_path()
+
+
+def test_app_shows_missing_onedrive_error_before_creating_frame(monkeypatch):
+    class Checker:
+        def IsAnotherRunning(self):
+            return False
+
+    messages = []
+    monkeypatch.setattr(main.wx, "SingleInstanceChecker", lambda _name: Checker())
+    monkeypatch.setattr(main, "resolve_common_commands_path", lambda: (_ for _ in ()).throw(RuntimeError("OneDrive 缺失")))
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *args: messages.append(args))
+    monkeypatch.setattr(main, "ChatFrame", lambda: pytest.fail("frame must not start"))
+    assert main.ChatApp.OnInit(type("FakeApp", (), {})()) is False
+    assert messages[0][0] == "OneDrive 缺失"
+
+
 REQUEST_METADATA_FIELDS = {
     "request_status",
     "request_model",

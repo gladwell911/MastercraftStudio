@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 打包版常用命令与 OneDrive
+
+- 经验：打包版按 `OneDriveConsumer`（其次 `OneDrive`）定位个人版 OneDrive 根目录，再使用固定相对路径；源码运行保持隔离的 `dist\history`。启动前核对目标 JSON 已同步到本机。
+- 为什么重要：两台电脑的 OneDrive 绝对路径不同；路径缺失时静默回退旧文件会造成表面正常、实际分叉的数据。常用命令每次修改会重写整份 JSON，OneDrive 不负责合并两个未同步的版本。
+- 下次怎么用：先选定一份初始 JSON 并等待两端同步，再运行新包；换电脑编辑前确认 OneDrive 同步完成，回归覆盖冻结版路径和缺文件提示。
+
 ## 聊天信息只读 Live 验收
 
 - 经验：Kimi OAuth/usage 和 Codex app-server 账号/周额度可用显式 opt-in 的只读测试验证；测试应经过窗口实际调用的 worker，并断言额度行是有效数据而非错误占位。
