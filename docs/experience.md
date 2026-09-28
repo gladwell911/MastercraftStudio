@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 聊天信息只读 Live 验收
+
+- 经验：Kimi OAuth/usage 和 Codex app-server 账号/周额度可用显式 opt-in 的只读测试验证；测试应经过窗口实际调用的 worker，并断言额度行是有效数据而非错误占位。
+- 为什么重要：只检查窗口能打开，或容许 `kind=error`，会把凭据失效和绕过生产路径误报为端到端通过。
+- 下次怎么用：保留默认跳过和显式环境开关，分别报告测试数量、真实账号读取范围及未覆盖的历史 session、模型请求和跨端公网链路。
+
 ## CLI 追加消息与 token 用量的协议口径
 
 - 经验：Codex 客户端调用 `turn/start` 时，Core 可把输入送入同线程的活跃 turn；Kimi 则先提交 prompt，再尝试 `prompts:steer`，失败会排队。判断前一任务是否受影响必须看服务端 admission 和真实 turn ID。
