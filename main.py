@@ -2643,6 +2643,7 @@ class ChatFrame(wx.Frame):
             return
         self._kimi_quota_request = None
         chat = owner[0]
+        old_rows = self._chat_information_rows(chat, owner[1])
         account_id = str((payload or {}).get("_account_id") or "")
         verified_changed = str(chat.get("kimi_verified_account_id") or "") != account_id
         if account_id != str(chat.get("kimi_quota_owner") or ""):
@@ -2654,7 +2655,9 @@ class ChatFrame(wx.Frame):
             chat["kimi_quota_payload"] = payload
             chat["kimi_quota_error"] = failed
             chat["kimi_quota_owner"] = account_id
+        if not failed and isinstance(payload, dict) and payload.get("kind") == "ok":
             chat["kimi_quota_updated_at"] = time.time()
+        if self._chat_information_rows(chat, owner[1]) != old_rows:
             self._refresh_chat_information(chat)
 
     def _apply_kimi_chat_information_result(
@@ -14931,6 +14934,7 @@ class ChatFrame(wx.Frame):
                             self._mark_chat_turns_dirty(chat_id, min(finalized))
                             self._refresh_visible_history_chat(chat_id)
                             self._request_kimi_chat_information(target_chat, str(turn.get("model") or DEFAULT_KIMI_MODEL), visible_only=True)
+                            self._request_kimi_quota(target_chat, str(turn.get("model") or DEFAULT_KIMI_MODEL))
                         if successful:
                             self._play_finish_sound()
                             for finalized_idx in finalized:
@@ -15018,6 +15022,7 @@ class ChatFrame(wx.Frame):
                 self._defer_chat_state_save()
                 return
             self._request_kimi_chat_information(self._current_chat_state, str(self._current_chat_state.get("model") or DEFAULT_KIMI_MODEL), visible_only=True)
+            self._request_kimi_quota(self._current_chat_state, str(self._current_chat_state.get("model") or DEFAULT_KIMI_MODEL))
             self._request_execution_list_sync(self._current_chat_state)
             still_active = bool(self._current_chat_state.get("kimi_turn_active"))
             self.active_kimi_turn_active = still_active

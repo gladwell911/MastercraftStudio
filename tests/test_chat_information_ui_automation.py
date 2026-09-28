@@ -173,7 +173,7 @@ def test_kimi_quota_http_401_is_unlogged_and_reopen_clears_cache(frame, wx_app, 
     wx_app.Yield()
     monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", lambda *_a, **_k: None)
     assert frame._show_chat_information()
-    assert "上次更新于" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
     frame._chat_information_dialog.Close()
     wx_app.Yield()
 
@@ -297,6 +297,137 @@ def test_kimi_quota_real_thread_delivers_to_wx_dialog(frame, wx_app, monkeypatch
     assert dialog.information_list.GetSelection() == 2
     assert main.wx.Window.FindFocus() is dialog.information_list
     dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_seven_day_countdown_timer_changes_only_visible_text(frame, wx_app, monkeypatch):
+    from datetime import datetime, timezone
+
+    clock = [datetime(2029, 12, 31, 22, 0, tzinfo=timezone.utc)]
+
+    class ClockDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(main, "datetime", ClockDateTime)
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(3)
+    dialog.information_list.SetFocus()
+    identity = dialog.identity
+    frame._kimi_quota_request = (1, identity)
+    frame._apply_kimi_quota(1, identity, {"kind": "ok", "_account_id": "A", "quota": {"usages": {
+        "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
+    first = dialog.information_list.GetString(3)
+    calls = []
+    monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a: calls.append("quota"))
+    clock[0] = datetime(2029, 12, 31, 22, 1, tzinfo=timezone.utc)
+    dialog._on_refresh_timer(None)
+    second = dialog.information_list.GetString(3)
+    assert first != second and "1 小时 59 分钟" in second
+    assert calls == ["quota"]
+    assert dialog.information_list.GetSelection() == 3
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_identical_quota_reply_updates_query_time_without_same_minute_repaint(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = "chat-q"
+    chat = {"id": "chat-q", "model": "kimi/main"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    identity = dialog.identity
+    payload = {"kind": "ok", "_account_id": "A", "quota": {"usages": {
+        "limit5h": {"usedRatio": .2}}}}
+    now = [1_700_000_000.0]
+    with monkeypatch.context() as patch:
+        patch.setattr(main.time, "time", lambda: now[0])
+        frame._kimi_quota_request = (1, identity)
+        frame._apply_kimi_quota(1, identity, payload, False)
+        first_rows = list(dialog.information_list.GetStrings())
+        now[0] += 20
+        frame._kimi_quota_request = (2, identity)
+        frame._apply_kimi_quota(2, identity, payload, False)
+        assert chat["kimi_quota_updated_at"] == now[0]
+        assert list(dialog.information_list.GetStrings()) == first_rows
+        now[0] += 60
+        frame._kimi_quota_request = (3, identity)
+        frame._apply_kimi_quota(3, identity, payload, False)
+        assert "上次更新于" in dialog.information_list.GetString(2)
+        assert list(dialog.information_list.GetStrings()) != first_rows
+        now[0] += 60
+        frame._kimi_quota_request = (4, identity)
+        frame._apply_kimi_quota(4, identity, {"kind": "error"}, False)
+        assert "kimi_quota_updated_at" not in chat
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_turn_completion_requests_visible_quota(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = frame.current_chat_id = "chat-q"
+    turn = {"question": "q", "model": "kimi/main", "request_status": "pending",
+            "kimi_turn_id": "turn-q"}
+    chat = {"id": "chat-q", "model": "kimi/main", "kimi_session_id": "session-q",
+            "turns": [turn], "kimi_turn_active": True}
+    frame._current_chat_state = chat
+    frame.active_session_turns = chat["turns"]
+    assert frame._show_chat_information()
+    calls = []
+    monkeypatch.setattr(frame, "_finalize_kimi_turn_state", lambda *_a: [0])
+    monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a: calls.append("quota"))
+    monkeypatch.setattr(frame, "_request_execution_list_sync", lambda *_a: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *_a: None)
+    monkeypatch.setattr(frame, "_update_active_answer_row", lambda *_a: None)
+    monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *_a, **_k: None)
+    monkeypatch.setattr(frame, "_append_completed_answer_to_answer_list", lambda *_a: False)
+    monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda **_k: None)
+    monkeypatch.setattr(frame, "_build_execution_entry", lambda *_a: None)
+    frame._on_kimi_event_for_chat("chat-q", main.CodexEvent(
+        type="turn_completed", thread_id="session-q", turn_id="turn-q", status="completed"))
+    assert calls == ["quota"]
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
+def test_kimi_archived_turn_completion_requests_visible_quota(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "history"
+    frame.view_history_id = "chat-old"
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    turn = {"question": "q", "model": "kimi/main", "request_status": "pending",
+            "kimi_turn_id": "turn-old"}
+    archived = {"id": "chat-old", "model": "kimi/main", "kimi_session_id": "session-old", "turns": [turn]}
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda chat_id: archived if chat_id == "chat-old" else None)
+    monkeypatch.setattr(frame, "_kimi_event_is_compatible_with_chat", lambda *_a: True)
+    monkeypatch.setattr(frame, "_kimi_event_turn_index", lambda *_a: 0)
+    assert frame._show_chat_information()
+    calls = []
+    monkeypatch.setattr(frame, "_finalize_kimi_turn_state", lambda *_a: [0])
+    monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a: calls.append("quota"))
+    monkeypatch.setattr(frame, "_mark_chat_turns_dirty", lambda *_a, **_k: None)
+    monkeypatch.setattr(frame, "_refresh_visible_history_chat", lambda *_a: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_build_execution_entry", lambda *_a: None)
+    frame._on_kimi_event_for_chat("chat-old", main.CodexEvent(
+        type="turn_completed", thread_id="session-old", turn_id="turn-old", status="completed"))
+    assert calls == ["quota"]
+    frame._chat_information_dialog.Close()
     wx_app.Yield()
 
 
