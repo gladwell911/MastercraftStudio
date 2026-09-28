@@ -98,3 +98,10 @@
 
 - GUI 使用真实 wx 控件与真实后台线程；Kimi 服务响应由替身提供，不验证真实 Kimi 账号或网络服务。
 - `tests/test_chat_information_ui_automation.py` 与 `tests/test_kimi_server_client_unit.py`：112 passed。真实 provider 验收仍需发布环境完成。
+
+## 2026-09-28 — 聊天信息只读 Live 验证
+
+- 新增 `tests/test_chat_information_live_readonly.py`，仅在 `CHAT_INFORMATION_LIVE_TEST=1` 时运行。真实 Kimi 客户端只读 `/api/v1/auth`、OAuth userinfo/usage；authenticated 时要求有效 userId、`kind=ok` 额度及至少一个有效窗口比例，并与真实 wx 行比对。非 OAuth/未登录状态逐项比对行文案。只有显式设置 `KIMI_LIVE_SESSION_ID` 才读取该既有 session 的 status/snapshot，并核对 context/total 行；不枚举或创建 session。Codex 测试走真实 `ChatFrame → worker → app-server → UI` 回包路径，核对账号行和周额度类别/百分比。两项测试均检查焦点，不输出凭据或原始账号 payload。
+- 本机 opt-in 实测：**2 passed**。Kimi managed OAuth 状态为 **authenticated**，真实额度行与有效比例匹配；Codex 周额度行显示 **剩余百分比**。未设置 `KIMI_LIVE_SESSION_ID`，因此 session status/snapshot 分支未运行。
+- 未设置 opt-in 标志的相关串行 GUI/client 回归：**116 passed、2 skipped**。本轮未运行会发送真实 prompt 的 `tests/test_kimi_live_smoke.py`，也未发送 prompt、创建或删除 session。
+- 覆盖边界：验证本机真实只读账号/额度接口及 GUI 投影；未验证付费推理、任务执行、session 可用性或其他设备的登录状态。
