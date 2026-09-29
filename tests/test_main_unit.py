@@ -19829,6 +19829,169 @@ def test_offscreen_remote_submit_loads_full_store_turns_before_append(frame, mon
     assert [turn["question"] for turn in persisted] == ["old", "new"]
 
 
+def test_archived_mobile_result_step_hydration_preserves_unflushed_ack(frame):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    old_turn = {"question": "old", "answer_md": "old answer", "model": main.DEFAULT_CODEX_MODEL,
+                "codex_thread_id": "old-thread", "codex_turn_id": "old-turn"}
+    frame.chat_store.upsert_chat({"id": "chat-b", "title": "B", "model": main.DEFAULT_CODEX_MODEL,
+                                  "codex_thread_id": "old-thread", "codex_turn_id": "old-turn"})
+    frame.chat_store.replace_turns("chat-b", [old_turn])
+    frame.chat_store.replace_execution_steps("chat-b", [
+        {"turn_idx": 0, "event_type": "plan_updated", "display_kind": "commentary",
+         "list_text": "saved step", "detail_text": "saved step"}
+    ])
+    chat = frame.chat_store.load_chat("chat-b", include_execution_steps=False)
+    pending = {"question": "phone", "answer_md": main.REQUESTING_TEXT,
+               "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
+               "codex_context_generation": 0}
+    chat["turns"].append(pending)
+    frame.archived_chats = [chat]
+    turns = chat["turns"]
+    frame._apply_codex_worker_thread_state("chat-b", {
+        "chat_id": "chat-b", "turn_idx": 1, "thread_id": "new-thread",
+        "turn_id": "new-turn", "context_generation": 0, "active": True,
+    })
+    assert frame.chat_store.load_chat("chat-b", include_execution_steps=False)["codex_thread_id"] == "old-thread"
+
+    hydrated = frame._chat_state_for_execution_steps("chat-b")
+
+    assert hydrated is chat
+    assert frame.archived_chats[0] is chat
+    assert chat["turns"] is turns
+    assert chat["turns"][1] is pending
+    assert chat["codex_thread_id"] == pending["codex_thread_id"] == "new-thread"
+    assert chat["codex_turn_id"] == pending["codex_turn_id"] == "new-turn"
+    assert chat["turns"][0] == old_turn
+    assert chat["execution_steps"][0]["list_text"] == "saved step"
+
+
+def test_archived_mobile_result_interleaved_completion_survives_store_reopen(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [{"question": "A", "answer_md": "A answer"}]
+    frame._current_chat_state = {"id": "chat-a", "turns": frame.active_session_turns}
+    old = {"question": "old", "answer_md": "old answer", "model": main.DEFAULT_CODEX_MODEL}
+    for owner in ("chat-b", "chat-c"):
+        frame.chat_store.upsert_chat({"id": owner, "title": owner, "model": main.DEFAULT_CODEX_MODEL,
+                                      "codex_thread_id": f"old-{owner}"})
+        frame.chat_store.replace_turns(owner, [old])
+    frame.archived_chats = [frame.chat_store.load_chat(owner, include_execution_steps=False)
+                            for owner in ("chat-b", "chat-c")]
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: True)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_refresh_visible_history_chat", lambda *_args: None)
+
+    for owner in ("chat-b", "chat-c"):
+        chat = frame._find_archived_chat(owner)
+        assert frame._submit_archived_remote_question(chat, f"phone {owner}", main.DEFAULT_CODEX_MODEL) == (True, "")
+        frame._apply_codex_worker_thread_state(owner, {
+            "chat_id": owner, "turn_idx": 1, "thread_id": f"new-{owner}",
+            "turn_id": f"turn-{owner}", "context_generation": 0, "active": True,
+        })
+    for thread_id, turn_id in (("new-chat-c", "turn-chat-c"), ("new-chat-b", "stale-turn")):
+        frame._on_codex_event_for_chat("chat-b", main.CodexEvent(
+            type="item_completed", phase="final_answer", thread_id=thread_id,
+            turn_id=turn_id, data={"turn_idx": 1}, text="wrong owner answer"))
+        assert frame._find_archived_chat("chat-b")["turns"][1]["answer_md"] == main.REQUESTING_TEXT
+    for owner in ("chat-c", "chat-b"):
+        chat = frame._find_archived_chat(owner)
+        event = lambda kind, **kwargs: main.CodexEvent(
+            type=kind, thread_id=f"new-{owner}", turn_id=f"turn-{owner}",
+            data={"turn_idx": 1}, **kwargs)
+        frame._on_codex_event_for_chat(owner, event("plan_updated", text=f"step {owner}"))
+        assert frame._find_archived_chat(owner) is chat
+        frame._on_codex_event_for_chat(owner, event("item_completed", phase="final_answer", text=f"answer {owner}"))
+        frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+    frame._persist_chat_history_to_store()
+
+    reopened = main.ChatStore(frame.chat_store.db_path)
+    for owner in ("chat-b", "chat-c"):
+        loaded = reopened.load_chat(owner)
+        assert [turn["question"] for turn in loaded["turns"]] == ["old", f"phone {owner}"]
+        assert loaded["turns"][0]["answer_md"] == "old answer"
+        assert loaded["turns"][1]["answer_md"] == f"answer {owner}"
+        assert loaded["turns"][1]["request_status"] == "done"
+        assert loaded["turns"][1]["codex_thread_id"] == f"new-{owner}"
+    assert frame.active_session_turns == [{"question": "A", "answer_md": "A answer"}]
+
+
+def test_archived_mobile_result_summary_hydration_merges_without_replacing_live_fields(frame):
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-b", "title": "stored title", "model": main.DEFAULT_CODEX_MODEL,
+                                  "codex_thread_id": "stored-thread"})
+    frame.chat_store.replace_turns("chat-b", [{"question": "old", "answer_md": "old answer"}])
+    summary = frame.chat_store.list_chat_summaries()[0]
+    summary["title"] = "live title"
+    summary["codex_thread_id"] = "live-thread"
+    frame.archived_chats = [summary]
+
+    hydrated = frame._hydrate_chat_from_store(summary, include_execution_steps=False)
+
+    assert hydrated is summary is frame.archived_chats[0]
+    assert summary["title"] == "live title"
+    assert summary["codex_thread_id"] == "live-thread"
+    assert summary["model"] == main.DEFAULT_CODEX_MODEL
+    assert summary["turns"][0]["answer_md"] == "old answer"
+    assert frame._hydrate_chat_from_store(summary, include_execution_steps=False) is summary
+
+
+def test_archived_mobile_result_empty_loaded_turns_do_not_resurrect_store_turns(frame):
+    frame._chat_store_enabled = True
+    frame.chat_store.upsert_chat({"id": "chat-b", "title": "B", "model": main.DEFAULT_CODEX_MODEL})
+    frame.chat_store.replace_turns("chat-b", [{"question": "old", "answer_md": "old answer"}])
+    frame.chat_store.replace_execution_steps("chat-b", [{
+        "turn_idx": 0, "event_type": "plan_updated", "display_kind": "commentary",
+        "list_text": "saved step", "detail_text": "saved step",
+    }])
+    empty_turns = []
+    chat = {"id": "chat-b", "title": "live B", "turns": empty_turns}
+    frame.archived_chats = [chat]
+
+    hydrated = frame._hydrate_chat_from_store(chat)
+
+    assert hydrated is chat is frame.archived_chats[0]
+    assert chat["turns"] is empty_turns
+    assert chat["turns"] == []
+    assert chat["title"] == "live B"
+    assert chat["execution_steps"][0]["list_text"] == "saved step"
+
+
+@pytest.mark.parametrize("unavailable", ["missing_store", "closed_store"])
+def test_archived_mobile_result_unavailable_store_preserves_live_chat(frame, monkeypatch, unavailable):
+    frame._chat_store_enabled = True
+    turn = {"question": "phone", "answer_md": main.REQUESTING_TEXT,
+            "codex_thread_id": "new-thread", "request_status": "pending"}
+    turns = [turn]
+    chat = {"id": "chat-b", "turns": turns, "codex_thread_id": "new-thread"}
+    frame.archived_chats = [chat]
+    if unavailable == "missing_store":
+        frame.chat_store = None
+    else:
+        monkeypatch.setattr(frame.chat_store, "load_execution_steps",
+                            lambda *_args: (_ for _ in ()).throw(sqlite3.ProgrammingError("closed")))
+
+    hydrated = frame._hydrate_chat_from_store(chat)
+
+    assert hydrated is chat is frame.archived_chats[0]
+    assert chat["turns"] is turns and turns[0] is turn
+    assert chat["codex_thread_id"] == "new-thread"
+    assert "execution_steps" not in chat
+
+
+def test_archived_mobile_result_missing_summary_chat_stays_unchanged(frame):
+    frame._chat_store_enabled = True
+    summary = {"id": "missing-chat", "title": "live title", "codex_thread_id": "live-thread"}
+    frame.archived_chats = [summary]
+
+    hydrated = frame._hydrate_chat_from_store(summary)
+
+    assert hydrated is summary is frame.archived_chats[0]
+    assert summary == {"id": "missing-chat", "title": "live title", "codex_thread_id": "live-thread"}
+
+
 def test_offscreen_remote_submit_respects_pending_clear_fence_without_mutation(frame, monkeypatch):
     target = {"id": "chat-target", "model": "kimi/main", "turns": []}
     frame.archived_chats = [target]

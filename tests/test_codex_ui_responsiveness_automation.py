@@ -1118,6 +1118,68 @@ def test_real_ui_execution_updates_do_not_steal_input_focus_during_event_burst(f
     assert frame.input_edit.GetValue().endswith("x")
 
 
+def test_real_ui_archived_mobile_result_keeps_foreground_and_browses_completed_owner(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame.active_session_turns = [{"question": "A", "answer_md": "A answer"}]
+    frame._current_chat_state = {"id": "chat-a", "title": "A", "turns": frame.active_session_turns}
+    for owner in ("chat-b", "chat-c"):
+        frame.chat_store.upsert_chat({"id": owner, "title": owner, "model": main.DEFAULT_CODEX_MODEL})
+        frame.chat_store.replace_turns(owner, [{
+            "question": f"phone {owner}", "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
+            "codex_context_generation": 0,
+        }])
+    frame.archived_chats = [frame.chat_store.load_chat(owner, include_execution_steps=False)
+                            for owner in ("chat-b", "chat-c")]
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    frame._refresh_history("chat-a")
+    frame._render_answer_list(refresh_execution=False)
+    frame.answer_list.SetSelection(0)
+    frame.input_edit.SetValue("unsent A draft")
+    frame.input_edit.SetSelection(2, 7)
+    frame.input_edit.SetFocus()
+    wx_app.Yield()
+    selected_history = frame.history_ids[frame.history_list.GetSelection()]
+    draft_selection = frame.input_edit.GetSelection()
+
+    for owner in ("chat-b", "chat-c"):
+        frame._apply_codex_worker_thread_state(owner, {
+            "chat_id": owner, "turn_idx": 0, "thread_id": f"thread-{owner}",
+            "turn_id": f"turn-{owner}", "context_generation": 0, "active": True,
+        })
+    for owner in ("chat-c", "chat-b"):
+        def event(kind, **kwargs):
+            return main.CodexEvent(type=kind, thread_id=f"thread-{owner}",
+                                   turn_id=f"turn-{owner}", data={"turn_idx": 0}, **kwargs)
+        frame._on_codex_event_for_chat(owner, event("plan_updated", text=f"step {owner}"))
+        frame._on_codex_event_for_chat(owner, event("item_completed", phase="final_answer",
+                                                     text=f"answer {owner}"))
+        frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+    wx_app.Yield()
+    assert frame.active_chat_id == "chat-a"
+    assert frame.input_edit.HasFocus()
+    assert frame.input_edit.GetValue() == "unsent A draft"
+    assert frame.input_edit.GetSelection() == draft_selection
+    assert frame.history_ids[frame.history_list.GetSelection()] == selected_history
+    assert frame.answer_list.GetSelection() == 0
+
+    assert frame._show_history_chat("chat-b", focus_answer_list=False)
+    wx_app.Yield()
+    assert frame.active_chat_id == "chat-a"
+    assert frame.input_edit.GetValue() == "unsent A draft"
+    assert frame._find_archived_chat("chat-b")["turns"][0]["answer_md"] == "answer chat-b"
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    _send_listbox_key(frame.history_list, main.wx.WXK_HOME)
+    _send_listbox_key(frame.history_list, main.wx.WXK_END)
+    wx_app.Yield()
+    assert frame.history_list.HasFocus()
+    assert frame.history_ids[frame.history_list.GetSelection()] == frame.history_ids[-1]
+
+
 def test_real_ui_worker_events_do_not_mutate_lists_during_navigation_quiet(frame, wx_app, monkeypatch):
     frame.Show()
     frame.active_chat_id = "chat-current"

@@ -3986,7 +3986,8 @@ class ChatFrame(wx.Frame):
             return None
         if not getattr(self, "_chat_store_enabled", False):
             return chat
-        if isinstance(chat.get("turns"), list) and (
+        turns = chat.get("turns")
+        if isinstance(turns, list) and (
             not include_execution_steps or isinstance(chat.get("execution_steps"), list)
         ):
             return chat
@@ -3994,14 +3995,23 @@ class ChatFrame(wx.Frame):
         store = getattr(self, "chat_store", None)
         if not chat_id or store is None:
             return chat
-        loaded = store.load_chat(chat_id, include_execution_steps=include_execution_steps)
+        try:
+            if isinstance(turns, list):
+                if include_execution_steps and not isinstance(chat.get("execution_steps"), list):
+                    chat["execution_steps"] = store.load_execution_steps(chat_id)
+                return chat
+            loaded = store.load_chat(chat_id, include_execution_steps=include_execution_steps)
+        except (sqlite3.Error, OSError):
+            return chat
         if not isinstance(loaded, dict):
             return chat
-        for idx, existing in enumerate(self.archived_chats):
-            if isinstance(existing, dict) and str(existing.get("id") or "").strip() == chat_id:
-                self.archived_chats[idx] = loaded
-                break
-        return loaded
+        # Summary entries may already have live edits. Fill absent durable fields
+        # without invalidating references held by event handlers or the history UI.
+        for key, value in loaded.items():
+            chat.setdefault(key, value)
+        if not isinstance(turns, list):
+            chat["turns"] = loaded.get("turns", [])
+        return chat
 
     def _load_state(self):
         if not self.state_path.exists():
