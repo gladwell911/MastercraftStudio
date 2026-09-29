@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import main
@@ -24,6 +25,59 @@ def test_v2_broadcast_commits_owner_fact_to_outbox_instead_of_direct_publish(fra
     assert committed[0]["pair_id"] == "pair"
     assert committed[0]["envelope"]["chat_id"] == "off-screen"
     assert committed[0]["envelope"]["body"]["text"] == "ok"
+
+
+def test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "chat-a"
+    frame._current_chat_state = {"id": "chat-a", "title": "A", "turns": []}
+    frame._remote_nats_transport = SimpleNamespace(
+        protocol_version=2, subjects=SimpleNamespace(pair_id="pair-mobile"), _loop=None)
+    for owner in ("chat-b", "chat-c"):
+        frame.chat_store.upsert_chat({"id": owner, "title": owner, "model": main.DEFAULT_CODEX_MODEL})
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: True)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_refresh_visible_history_chat", lambda *_args: None)
+
+    for owner in ("chat-b", "chat-c"):
+        status, body = frame._remote_api_message_ui({
+            "chat_id": owner, "text": f"phone {owner}", "model": main.DEFAULT_CODEX_MODEL})
+        assert (status, body["accepted"]) == (200, True)
+    frame._persist_chat_history_to_store()
+
+    def outbox():
+        return [json.loads(bytes(row["payload"]).decode("utf-8"))
+                for row in frame.chat_store.pending_outbox(pair_id="pair-mobile", domain="events")]
+
+    assert not any(item["kind"] == "assistant_final" for item in outbox())
+    for owner in ("chat-c", "chat-b"):
+        frame._apply_codex_worker_thread_state(owner, {
+            "chat_id": owner, "turn_idx": 0, "thread_id": f"thread-{owner}",
+            "turn_id": f"turn-{owner}", "context_generation": 0, "active": True,
+        })
+        def event(kind, **kwargs):
+            return main.CodexEvent(type=kind, thread_id=f"thread-{owner}",
+                                   turn_id=f"turn-{owner}", data={"turn_idx": 0}, **kwargs)
+        frame._on_codex_event_for_chat(owner, event("plan_updated", text=f"step {owner}"))
+        frame._on_codex_event_for_chat(owner, event("item_completed", phase="final_answer",
+                                                     text=f"final {owner}"))
+        frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+        frame._persist_chat_history_to_store()
+        frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+        frame._persist_chat_history_to_store()
+
+    items = outbox()
+    for owner in ("chat-b", "chat-c"):
+        owner_items = [item for item in items if item.get("chat_id") == owner]
+        assert any(item["kind"] == "state" for item in owner_items)
+        assert any(item["kind"] == "history_changed" for item in owner_items)
+        finals = [item for item in owner_items if item["kind"] == "assistant_final"]
+        assert len(finals) == 1
+        assert finals[0]["body"]["text"] == f"final {owner}"
+        assert all(item["body"].get("text") != main.REQUESTING_TEXT for item in finals)
 
 
 def test_v2_broadcast_quarantines_missing_owner_without_selected_chat_fallback(frame, monkeypatch):

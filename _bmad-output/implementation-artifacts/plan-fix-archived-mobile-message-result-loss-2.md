@@ -3,13 +3,13 @@ title: 'Preserve archived mobile message results during execution-step hydration
 type: 'bugfix'
 ticket: ''
 created: '2026-09-29'
-status: 'in-review'
+status: 'built'
 baseline_revision: '79ddee5456af8acc1902096c91b8efe1d6717b17'
 route: 'full'
 route_source: 'auto'
-review: 'thorough'
-review_source: 'auto'
-lenses_ran: ['blind-hunter', 'edge-case-hunter']
+review: 'quick'
+review_source: 'pinned'
+lenses_ran: ['quick']
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -59,8 +59,8 @@ deferred: []
 - [x] `tests/test_main_unit.py` -- add failing ChatStore-backed race test before code change, then cover summary hydration, reorderings, B/C interleave, stale guards, final persistence and reopen -- prove the observed failure and repair.
 - [x] `main.py` -- hydrate steps alone for populated chats and merge summary data in place -- prevent live identity rollback.
 - [x] `tests/test_codex_ui_responsiveness_automation.py` -- exercise B/C event lifecycle while foreground A has draft, focus and list selection; cover browsing B and keyboard navigation -- preserve accessibility.
-- [ ] `tests/test_main_remote_nats_unit.py` -- add targeted final/state/history ownership assertion only if existing transport coverage leaves a gap -- verify remote projection.
-- [ ] `package_mc.ps1` -- inspect output behavior, then create an isolated candidate package if tests and review pass -- avoid installed package/data.
+- [x] `tests/test_main_remote_nats_unit.py` -- add targeted final/state/history ownership assertion only if existing transport coverage leaves a gap -- verify remote projection.
+- [x] `package_mc.ps1` -- inspect output behavior, then create an isolated candidate package if tests and review pass -- avoid installed package/data.
 
 **Acceptance Criteria:**
 - Given A active and B/C archived, when each receives a unique phone request and Codex completion in interleaved order, then B/C each retain their own new identity and final answer after SQLite reopen while A and old turns remain unchanged.
@@ -80,6 +80,12 @@ deferred: []
 
 ## Review Triage Log
 
+### 2026-09-29 — Quick review pass
+- verdicts: 2 findings — high 0, medium 1, low 1, false 0, maybe-false 0
+- findings:
+  - `[medium]` `[patch]` B/C completion had no direct remote final/state/history ownership test — `main.py` persists V2 final facts and publishes state/history for the owner, but the existing tests covered only an active chat. Added `tests/test_main_remote_nats_unit.py` lifecycle test for two archived owners, placeholder suppression, and duplicate completion; it passes.
+  - `[low]` `[patch]` The earlier isolated candidate predated the empty-turns correction — rebuilt under a fresh output path after the final code change and confirmed both executables exist with no bundled history.
+
 ## Verification
 
 **Commands:**
@@ -90,6 +96,8 @@ deferred: []
 
 ## Auto Run Result
 
+### Previous interrupted run
+
 Status: blocked
 Blocking condition: no subagents. The thorough review requires four independent reviewers to launch together, but the shared thread had only two free concurrent agent slots. The third launch returned `agent thread limit reached`; the two started reviewers were interrupted without collecting findings. The required review, candidate rebuild after the empty-turns fix, and finalization remain unfinished.
 
@@ -97,3 +105,12 @@ Blocking condition: no subagents. The thorough review requires four independent 
 - The original race test failed on old code before the fix. After the fix, verification passed: `archived_mobile_result` 7 tests; related store/remote 3; routing/protocol 95; serial wx 53. The wx run emitted a Windows COM exception trace mid-run but returned exit code 0 with all 53 tests passing.
 - Matrix audit: background B/C completion and wrong-owner rejection, lazy steps with unavailable store, summary load with missing chat, and foreground navigation each have passing covering tests in those commands.
 - The candidate at `D:\code\cx\mc-archived-message-fix-candidate-20260929\dist\mc` predates the final empty-turns and test corrections, so it must be rebuilt before delivery. Physical phone verification and old production pending-record recovery were not performed.
+
+### Resumed quick review
+
+- Implemented in-place execution-step hydration for archived chats, preserving live chat/turn identity, including an intentionally empty turns list. Summary-only chats gain missing durable fields without replacing the referenced object.
+- Changed files: `main.py` fixes hydration; `tests/test_main_unit.py` covers ChatStore race, B/C completion/reopen, summary and unavailable-store boundaries; `tests/test_codex_ui_responsiveness_automation.py` covers draft/focus/selection/navigation; `tests/test_main_remote_nats_unit.py` covers owner-scoped V2 notifications; `tests/test_history_ui_automation.py` corrects the valid Unix timestamp expectation; this plan records implementation and review.
+- Quick review found two issues. One medium and one low patch were applied; no findings were deferred or rejected. Patched entry counts: high 0, medium 1, low 1. Follow-up review recommended: false.
+- Verification after review patches: `archived_mobile_result` 7 passed; related remote/store cases 3 passed; routing/protocol suite 96 passed; serial wx suite 53 passed. The wx run emitted a Windows COM exception trace but completed with exit code 0 and all tests passing.
+- New isolated candidate: `D:\code\sj\candidate_archived_mobile_result_20260929_v2\mc`. `mc.exe` SHA-256 `20C4684F032FCBE36E0D761396CD28359B25D5B75DF83217F6142963C882391C`; `mc_worker.exe` SHA-256 `FA74C80D84C2DB4318BC62C9647B3C4317E865E8E077F76810292F8F1252D0E4`. No `_internal\history` directory was bundled. The installed package and production data were not modified.
+- Residual acceptance work: physical phone sends to active A and archived B/C against this candidate were not performed; prior production pending records were not recovered. Do not infer these outcomes from mocked provider or local transport tests.
