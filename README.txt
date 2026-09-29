@@ -1,105 +1,19 @@
-神匠工坊（`mc`）是一个基于 `wxPython` 的 Windows 桌面客户端，当前主要用于统一接入 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，并管理本地聊天历史、上下文使用量和远程运行时。
+神匠工坊（mc）是面向读屏用户的 wxPython Windows 桌面客户端，整合 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，以及聊天历史、远程控制和笔记。
 
 ## 快速开始
 
-环境要求：
-- Windows 10 / 11
-- Python 3.11
+需要 Windows 10/11 与 Python 3.11。
 
-安装依赖：
+    python -m pip install -r requirements.txt
+    python main.py
 
-```powershell
-python -m pip install -r requirements.txt
-```
+开发依赖：python -m pip install -r requirements-dev.txt。详细运行与配置说明见[归档的原入口](docs/archive/entry-context-2026-09-29/README.txt)。
 
-开发测试依赖：
+## 当前状态与入口
 
-```powershell
-python -m pip install -r requirements-dev.txt
-```
+聊天信息 Story 1.1–1.5 已提交；跨端 v3 执行投影、Kimi/Codex 聊天信息与 OneDrive 数据路径已有实现。当前安装的旧 MC 仍写本地笔记库，2026-09-29 的云端文件只是快照；新包切换前须按 docs/handoff.md 补齐数据并验证。宽回归有已知基线失败，不能把定向通过称作全量通过。
 
-启动程序：
-
-```powershell
-python main.py
-```
-
-## 常用配置
-
-Story 4 connected E2E 内置测试服务器、测试令牌和专用配对码，可直接运行。需要切换测试环境时，可用 `NATS_E2E_ENDPOINT`、`NATS_E2E_TOKEN` 和 `NATS_E2E_PAIR_ID` 覆盖默认值。
-
-如需使用 OpenRouter，配置 `OPENROUTER_API_KEY`：
-
-```powershell
-setx OPENROUTER_API_KEY "你的Key"
-```
-
-如果项目目录下存在 `.venv` 或 `.venv311`，打包和测试流程优先使用对应虚拟环境。
-
-如需使用 Kimi Code 聊天（模型下拉的 "Kimi Code"），安装并登录 Kimi Code CLI（`kimi`）。程序会自动拉起本地 `kimi web` server；可用 `KIMI_BIN` 环境变量指定 kimi 可执行文件路径。客户端会自动回应服务器心跳，空闲后无需手动重启聊天。真实链路冒烟测试默认跳过，设置 `KIMI_LIVE_TEST=1` 后运行 `pytest tests/test_kimi_live_smoke.py`。Kimi 执行期间按 F1 查看执行过程时，列表显示“正在分析问题”“正在搜索内容”“正在读取/修改文件”“正在执行测试”等中文主要步骤；英文流式思考和工具原文仅保留为内部详情，不直接作为列表标题。
-
-多个 Kimi Code 聊天可并发运行。Kimi 的 `turn_id` 仅在各自 session 内唯一，客户端以 session 和 turn 的组合隔离事件；不要把不同聊天中同号 turn 的事件视为同一轮回答。
-
-Kimi 的回答列表只在主代理最终正文获得权威完成确认后更新；执行过程、子代理消息、不完整流片段和失败终态不会提前显示为回答，也不会播放“回答完毕”音效。
-
-手机端选择 `kimi/*` 后，远端消息同样走电脑端的 Kimi 专用 worker，不读取 `OPENROUTER_API_KEY`。如果 Kimi 消息返回 OpenRouter 401，应优先检查模型分派是否回退，而不是补配 OpenRouter Key。可运行以下无外部凭据回归：
-
-```powershell
-python -m pytest tests/test_mobile_kimi_cross_chat_e2e.py tests/test_remote_model_dispatch.py -q
-```
-
-手机端跨端回归由 `D:\code\sj\rc\scripts\run_cross_client_regression.ps1` 统一执行。日常修改使用 `-Mode Local`，它启动本仓库的隔离 strict-V2 夹具并验证手机 UI 的桌面聊天列表、`codex/main` 与 `kimi/main` 往返；发布前使用 `-Mode Live` 检查真实 Cloudflare/NATS 和已登录的桌面 provider。完整前置条件与命令见 RC 的 `docs/current/testing.md`。
-
-## 执行过程与键盘浏览
-
-当前聊天使用 Codex 或 Kimi 时，可从顶部“应用(&A)”菜单打开“查看聊天信息”。信息窗口是独立列表，方向键逐行浏览，Esc 关闭后焦点返回打开前的控件。Codex 显示最近一次调用的上下文占用、当前原生 thread 的累计 token，以及主 `codex` 周额度剩余比例和本地重置时间；Kimi 显示当前 session 的上下文占用、snapshot 中输入和输出 token 的累计值，以及 OAuth 账号的五小时和七日额度。缺失字段和不可用账号会逐项标明，不以零值代替；额度缓存注明上次更新时间。
-
-- F1 在回答与执行过程之间切换；进入执行过程时定位最新项。若历史页尚在加载，会显示“正在加载执行过程”；加载期间切到其他控件，完成后不会抢回焦点。
-- F1 进入执行过程后按稳定行身份保持焦点；刷新、重建或目标删除时只回退到同视图的确定相邻项。模态框、应用失活、离开执行过程或关闭窗口会释放该焦点租约。
-- 回答和执行过程把时间与正文作为独立可访问项；执行列表第一条显示时间，后续过程相对上一次已显示时间的过程累计达到或超过 300 秒时显示下一时间并更新基准，非法或缺失时间显示“时间未知”。紧凑摘要会隐藏有序列表序号，但详情、复制和朗读仍使用原始 Markdown。
-- 初始显示最新 100 个内容行（包含问题/最终回答上下文），“更多”不计入这 100 行，可向上展开。后台更新保留仍在页内的所选内容；选中项离页后回退到有效邻近行，不自动追尾。
-- 执行列表支持 Tab / Shift+Tab 单步导航、Enter / Shift+Enter 打开详情、Ctrl+C 复制完整正文。跨聊天加载时不会继续打开或复制上一聊天正文。
-- Alt+A 清除当前聊天上下文后，只自动重发该聊天首个有效用户文本；重发被接受后播放一次普通发送成功音效。附件、语音和导入内容不会随该动作重发。
-- 每个聊天独立保存模型选择。新建聊天会立即出现在历史列表，名称使用“新聊天”及最小可用数字后缀，发送首条消息后再按现有规则重命名。
-- 回答详情文本可临时编辑和复制，但它只是当前窗口的工作副本；关闭后编辑丢弃，不会改变回答列表、朗读、Continue、持久化或手机端内容。
-- 导航后的 3 秒静默窗口会延迟后台可见更新；用户主动切换视图仍即时处理。长历史继续扫描在后台进行，但初始最多两次有限页 SQLite 查询仍同步，单次慢读尚可能阻塞。
-- 当前验证与未覆盖范围见 `docs/handoff.md`；真实读屏的 loading→内容播报顺序尚未人工验收。
-
-远程 V2 会话仍将 durable 执行事实同步到手机端。初次打开加载最新 100 个事实行，继续向上浏览使用与 owner、revision 和冻结快照绑定的不透明游标；历史页与实时事件按全局事件 ID 去重、按权威执行序号排序。检测到缺口时客户端先做有界回补，必要时应用权威快照，且不会在恢复失败时清空仍然有效的行。
-
-手机执行页现优先请求 `execution_page_v3`：桌面与远程使用同一套 canonical 步骤的 Kimi 折叠、轮次上下文、可见性过滤和稳定行身份。服务端把可见行写入不可变 SQLite 快照，并用绑定聊天、修订版和有效期的游标分页；数据库读取与投影在 NATS worker 执行，wx 主线程只核对少量 owner 状态。旧 V2 durable feed 保留给旧客户端，不能把它与 v3 可视行混为同一权威列表。
-
-## 数据位置
-
-- 聊天历史和通用应用状态仍按应用数据目录解析；源码运行时通常在项目内的 `dist\history`。
-- 打包版的常用命令读取个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\common_commands.json`；两台电脑的 OneDrive 根目录可不同。若未检测到 OneDrive 环境变量或目标文件尚未同步到本机，启动时会提示并停止，不会改读旧的 `history` 文件。源码运行继续使用 `dist\history\common_commands.json`。首次使用新包前，应先选定一台电脑的现有 JSON 作为初始版本，复制到 OneDrive 目标路径并等待两端同步完成；程序不会自动合并两台电脑的旧文件。
-- 笔记数据库独立存放在 `D:\code\note\notes.db`，由 `resolve_notes_data_dir()` 创建目录并定位文件。测试中应 monkeypatch 这个函数，避免读写真实笔记库。
-
-## 打包
-
-标准打包入口：
-
-```powershell
-.\package_mc.ps1
-```
-
-默认使用 `zgwd.spec`，产物输出到当前发布目录 `D:\code\cx\mc\`。`-DistPath` 接收产物的父目录，脚本会在其下生成 `mc\`；如需输出到其他位置，可显式指定该参数。当项目 `.venv` 不可用时，用 `-PythonExe` 显式指定 Python 3.11 解释器。注意：`package_mc.ps1` 设计为在非管理员 PowerShell 会话中运行。
-
-打包目录同时包含 GUI 程序 `mc.exe` 和后台协议程序 `mc_worker.exe`；两者必须保持同目录。`mc_worker.exe` 专供 `mc.exe` 处理 Codex 的 UTF-8 JSONL 通信，请勿单独作为桌面程序启动。
-
-## 代码入口
-
-- `main.py`：主界面与大部分应用逻辑
-- `codex_client.py`：Codex 客户端封装
-- `claudecode_client.py`：Claude Code 客户端封装
-- `openclaw_client.py`：OpenClaw 客户端封装
-- `kimi_server_client.py`：Kimi Code 本地 server（`kimi web`）客户端封装，支撑 `kimi/` 模型族聊天
-- `nats_runtime.py`、`remote_nats.py`：NATS 相关运行时与远程协作逻辑
-- `tests/`：当前 pytest 测试
-- `docs/README.md`：当前有效文档索引
-
-## 当前维护约定
-
-- 把 `README.txt` 视为项目主入口文档。
-- `docs/` 第一层只放当前仍有效的说明文档。
-- `docs/archive/` 与仍保留在 `docs/superpowers/` 的带日期设计/计划用于历史追溯，不是当前实施清单；当前行为和验收以 `docs/README.md` 指向的规格及交接为准。
+- 当前交接：docs/handoff.md
+- 项目文档：docs/README.md
+- 工程指令：AGENTS.md
+- 原入口：docs/archive/entry-context-2026-09-29/README.txt

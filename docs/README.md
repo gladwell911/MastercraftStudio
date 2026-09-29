@@ -21,7 +21,7 @@
 
 ## 关键当前事实
 
-- 笔记数据库不再跟随通用应用数据目录；当前固定使用 `D:\code\note\notes.db`。
+- 源码运行的笔记数据库使用 `D:\code\note\notes.db`；打包版将使用个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\notes.db`。当前安装的旧包仍读本地库；切换门禁见 [`handoff.md`](./handoff.md)。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
 - Kimi 的 F1 执行过程列表以协议事件生成中文主要步骤；不要把原始英文 `thinking.delta`、状态通知或工具流片段直接作为列表行。

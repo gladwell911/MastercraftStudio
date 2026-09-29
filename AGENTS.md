@@ -1,16 +1,11 @@
-# Project Instructions
+# 项目指令
 
-- This is a wxPython desktop app used with screen readers. Any UI-facing change must preserve keyboard focus stability and avoid unnecessary foreground refreshes while background work is running.
-- For UI changes, run targeted accessibility/performance regression tests before completion. At minimum, include the relevant `tests/test_*ui_automation.py` test and any model-specific workflow tests touched by the change.
-- Do not schedule UI-thread work, repaint list controls, change list selection/focus, or write app state from background polling when there is no visible state change. This is required to keep Tab and arrow-key navigation responsive with screen readers.
-- Chat history and general app state still resolve under the app data/history directory, but notes storage is intentionally separate: `resolve_notes_data_dir()` returns `D:\code\note`, and `ChatFrame` uses `D:\code\note\notes.db`. Tests should monkeypatch `resolve_notes_data_dir()` instead of writing to the real notes directory.
-- The `kimi/` model family chats through a spawned local `kimi web` server; `kimi_server_client.py` owns the process, REST calls, and the WebSocket event stream. Like the codex path, inbound events must be coalesced in the background and handed to the UI in batches (`drain_pending_messages`), never one callback per delta.
-- Provider dispatch must follow the normalized model id, not the transport source: remote `kimi/*`, `codex/*`, and `claudecode/*` messages use their dedicated workers and must not fall through to OpenRouter.
-- Any interactive CLI client reference that can consume later user input must carry its owning `chat_id`. Only matching-chat input may be forwarded to that client; add a cross-chat regression whenever this routing changes.
-- Execution-page changes must preserve the applied chat/turn owner across labels, metadata, selection and detail actions, including pending/error states. Keep bounded foreground reads, generation-checked background results, and automatic retry without interrupting provider drains. See the current execution specification linked from `docs/README.md`.
-- Run wx GUI suites serially. Tests enabling real timers must own cleanup from frame construction through teardown, stopping their timers/scans before destroying the frame; do not disable production drains or relax navigation thresholds to hide cross-test contamination.
-- Chat information separates Codex `last` context usage from thread `total` token consumption, and Kimi live status context from snapshot `session.usage` totals. Async account, status, and snapshot results must match the visible chat, native thread/session, account, and request generation. Do not let late Codex worker events or an older Kimi REST status overwrite a newer owner or live status event. Keep unchanged list text and keyboard focus stable.
+每次开始新的 Codex 项目会话，先读取 docs/handoff.md、docs/experience.md 和 docs/reflection.md；再按任务读取 docs/README.md。历史快照与冻结基线只证明对应版本。
 
-## Durable project context
+- 本项目是面向读屏用户的 wxPython 桌面应用。没有可见状态变化时，不在后台轮询中触发 UI 重绘、选中变化或状态写入；保持键盘焦点稳定。
+- UI 变更至少运行相关 tests/test_*ui_automation.py 和受影响模型流程测试。wx GUI 套件串行运行；真实定时器从 frame 构造到销毁全程清理。
+- CLI 后续输入、异步状态及结果必须按 chat、turn、session、account 和 request generation 归属；按规范化 model id 分派 provider。执行页保持 owner、revision 与有界前台读取，重工作放后台。
+- 源码笔记路径为 D:\code\note\notes.db；打包版需要现存且经完整性校验的个人 OneDrive\code\data\sj\notes.db，缺失时在初始化前停止。测试须 monkeypatch resolve_notes_data_dir()。
+- 切包门禁：2026-09-29 的 OneDrive 数据库只是一次快照，已安装旧 MC 仍写本地源库。新包启用前补齐之后的改动并安全替换或合并；跨机只运行一台 MC，换机前退出并等同步。当前步骤见 docs/handoff.md。
 
-Start with `README.txt` and `docs/README.md`; `docs/handoff.md` is the current snapshot. Dated plans and frozen regression baselines are historical evidence, not proof of current failures or full-suite success. Keep project facts here and in project docs, not in global agent configuration.
+原指令细节见 [归档](docs/archive/entry-context-2026-09-29/AGENTS.md)。

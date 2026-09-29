@@ -5,6 +5,7 @@ import subprocess
 import time
 import threading
 import ctypes
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -304,6 +305,101 @@ def test_app_shows_missing_onedrive_error_before_creating_frame(monkeypatch):
     monkeypatch.setattr(main, "ChatFrame", lambda: pytest.fail("frame must not start"))
     assert main.ChatApp.OnInit(type("FakeApp", (), {})()) is False
     assert messages[0][0] == "OneDrive 缺失"
+
+
+def test_packaged_notes_resolve_personal_onedrive_and_source_stays_local(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path / "personal"))
+    monkeypatch.setenv("OneDrive", str(tmp_path / "other"))
+    target = tmp_path / "personal" / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+    target.parent.mkdir(parents=True)
+    main.NotesStore(target, device_id="test").initialize()
+    assert main.resolve_notes_data_dir() == target.parent
+    monkeypatch.delattr(main.sys, "frozen")
+    assert main.resolve_notes_data_dir() == Path(r"D:\code\note")
+
+
+def test_packaged_notes_falls_back_to_onedrive_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("OneDriveConsumer", raising=False)
+    monkeypatch.setenv("OneDrive", str(tmp_path))
+    target = tmp_path / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+    target.parent.mkdir(parents=True)
+    main.NotesStore(target, device_id="test").initialize()
+    assert main.resolve_notes_data_dir() == target.parent
+
+
+def test_packaged_notes_accepts_legacy_notes_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path))
+    target = tmp_path / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+    target.parent.mkdir(parents=True)
+    with sqlite3.connect(target) as conn:
+        conn.executescript("""
+            CREATE TABLE notebooks (
+                id TEXT, title TEXT, created_at TEXT, updated_at TEXT, version INTEGER,
+                device_id TEXT, last_modified_by TEXT, is_conflict_copy INTEGER,
+                origin_notebook_id TEXT, deleted_at TEXT
+            );
+            CREATE TABLE note_entries (
+                id TEXT, notebook_id TEXT, content TEXT, created_at TEXT, updated_at TEXT,
+                sort_order INTEGER, pinned INTEGER, version INTEGER, device_id TEXT,
+                last_modified_by TEXT, is_conflict_copy INTEGER, origin_entry_id TEXT,
+                source TEXT, deleted_at TEXT
+            );
+        """)
+    assert main.resolve_notes_data_dir() == target.parent
+    main.NotesStore(target, device_id="test").initialize()
+    assert main.resolve_notes_data_dir() == target.parent
+
+
+def test_packaged_notes_rejects_unrelated_sqlite_without_modifying_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path))
+    target = tmp_path / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+    target.parent.mkdir(parents=True)
+    with sqlite3.connect(target) as conn:
+        conn.execute("CREATE TABLE unrelated (id TEXT)")
+    before = target.read_bytes()
+    with pytest.raises(RuntimeError, match="完整性检查"):
+        main.resolve_notes_data_dir()
+    assert target.read_bytes() == before
+    assert not (target.parent / "notes.db-wal").exists()
+
+
+@pytest.mark.parametrize("condition", ["missing_env", "missing_file", "corrupt", "empty_sqlite"])
+def test_packaged_notes_fail_closed_before_store_initialize(tmp_path, monkeypatch, condition):
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("OneDriveConsumer", raising=False)
+    monkeypatch.delenv("OneDrive", raising=False)
+    if condition != "missing_env":
+        monkeypatch.setenv("OneDriveConsumer", str(tmp_path))
+        target = tmp_path / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+        target.parent.mkdir(parents=True)
+        if condition == "corrupt":
+            target.write_bytes(b"not a database")
+        elif condition == "empty_sqlite":
+            with sqlite3.connect(target):
+                pass
+    with pytest.raises(RuntimeError):
+        main.resolve_notes_data_dir()
+    if condition == "missing_file":
+        assert not target.exists()
+
+
+def test_app_shows_notes_error_before_constructing_frame(monkeypatch):
+    class Checker:
+        def IsAnotherRunning(self):
+            return False
+
+    messages = []
+    monkeypatch.setattr(main.wx, "SingleInstanceChecker", lambda _name: Checker())
+    monkeypatch.setattr(main, "resolve_common_commands_path", lambda: Path("existing.json"))
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: (_ for _ in ()).throw(RuntimeError("笔记数据库未同步")))
+    monkeypatch.setattr(main.wx, "MessageBox", lambda *args: messages.append(args))
+    monkeypatch.setattr(main, "ChatFrame", lambda: pytest.fail("NotesStore.initialize must not run"))
+    assert main.ChatApp.OnInit(type("FakeApp", (), {})()) is False
+    assert messages[0][0] == "笔记数据库未同步"
 
 
 REQUEST_METADATA_FIELDS = {

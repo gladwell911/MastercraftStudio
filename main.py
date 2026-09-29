@@ -12,6 +12,7 @@ import re
 import socket
 import subprocess
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -89,7 +90,14 @@ from listbox_model import IncrementalListBoxModel
 from notes_import import import_note_entries_from_clipboard, import_note_entries_from_file
 from notes_backup import export_notes_backup, restore_notes_backup
 from notes_projection import DesktopNotesProjection
-from notes_store import NotesPlacementConflict, NotesStore
+from notes_store import (
+    ENTRY_COLUMNS,
+    MAY_DOCUMENT_CACHE_ENTRY_COLUMNS,
+    NOTEBOOK_COLUMNS,
+    PRE_PLACEMENT_ENTRY_COLUMNS,
+    NotesPlacementConflict,
+    NotesStore,
+)
 from notes_sync import NotesSyncService
 from notes_ui import DesktopNotesController
 from openclaw_client import (
@@ -387,6 +395,37 @@ def resolve_common_commands_path() -> Path:
 
 
 def resolve_notes_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        onedrive_dir = os.getenv("OneDriveConsumer") or os.getenv("OneDrive")
+        if not onedrive_dir:
+            raise RuntimeError("未检测到个人版 OneDrive 路径，无法读取笔记。请先登录 OneDrive 并重新启动程序。")
+        path = Path(onedrive_dir) / "OneDrive" / "code" / "data" / "sj" / "notes.db"
+        if not path.is_file():
+            raise RuntimeError(f"未找到 OneDrive 笔记数据库：{path}。请等待 OneDrive 同步完成后重试。")
+        try:
+            with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as conn:
+                valid = conn.execute("PRAGMA quick_check").fetchone()
+                def columns(table: str) -> set[str]:
+                    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                current = (NOTEBOOK_COLUMNS <= columns("notebooks")
+                           and any(required <= columns("entries") for required in (
+                               ENTRY_COLUMNS, PRE_PLACEMENT_ENTRY_COLUMNS, MAY_DOCUMENT_CACHE_ENTRY_COLUMNS)))
+                legacy_notebook_columns = {
+                    "id", "title", "created_at", "updated_at", "version", "device_id",
+                    "last_modified_by", "is_conflict_copy", "origin_notebook_id", "deleted_at",
+                }
+                legacy_entry_columns = {
+                    "id", "notebook_id", "content", "created_at", "updated_at", "sort_order",
+                    "pinned", "version", "device_id", "last_modified_by", "is_conflict_copy",
+                    "origin_entry_id", "source", "deleted_at",
+                }
+                legacy = (legacy_notebook_columns <= columns("notebooks")
+                          and legacy_entry_columns <= columns("note_entries"))
+                if valid is None or valid[0] != "ok" or not (current or legacy):
+                    raise sqlite3.DatabaseError("invalid notes database")
+        except sqlite3.Error as exc:
+            raise RuntimeError("OneDrive 笔记数据库无法通过完整性检查，请等待同步完成或恢复有效备份后重试。") from exc
+        return path.parent
     return Path(r"D:\code\note")
 
 
@@ -21915,8 +21954,9 @@ class ChatApp(wx.App):
             return False
         try:
             resolve_common_commands_path()
+            resolve_notes_data_dir()
         except RuntimeError as exc:
-            wx.MessageBox(str(exc), "常用命令不可用", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox(str(exc), "启动数据不可用", wx.OK | wx.ICON_ERROR)
             return False
         f = ChatFrame()
         f.Show()
