@@ -1165,6 +1165,12 @@ def test_real_ui_archived_mobile_result_keeps_foreground_and_browses_completed_o
     assert frame.input_edit.GetSelection() == draft_selection
     assert frame.history_ids[frame.history_list.GetSelection()] == selected_history
     assert frame.answer_list.GetSelection() == 0
+    frame._last_primary_interaction_at = 0.0
+    frame._flush_idle_ui_refreshes()
+    assert frame.history_ids[0] == "chat-b"
+    assert frame.history_list_model.selected_id() == selected_history
+    monkeypatch.setattr(frame, "_refresh_history", lambda *_args: pytest.fail("unchanged idle polling must not redraw history"))
+    frame._flush_idle_ui_refreshes()
 
     assert frame._show_history_chat("chat-b", focus_answer_list=False)
     wx_app.Yield()

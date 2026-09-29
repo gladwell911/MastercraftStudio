@@ -30,7 +30,7 @@ def test_v2_broadcast_commits_owner_fact_to_outbox_instead_of_direct_publish(fra
 def test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals(frame, monkeypatch):
     frame._chat_store_enabled = True
     frame.active_chat_id = frame.current_chat_id = "chat-a"
-    frame._current_chat_state = {"id": "chat-a", "title": "A", "turns": []}
+    frame._current_chat_state = {"id": "chat-a", "title": "A", "updated_at": 1.0, "turns": []}
     frame._remote_nats_transport = SimpleNamespace(
         protocol_version=2, subjects=SimpleNamespace(pair_id="pair-mobile"), _loop=None)
     for owner in ("chat-b", "chat-c"):
@@ -41,11 +41,18 @@ def test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_fi
     monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
     monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
     monkeypatch.setattr(frame, "_refresh_visible_history_chat", lambda *_args: None)
+    sounds = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: sounds.append("send"))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: sounds.append("reply"))
 
     for owner in ("chat-b", "chat-c"):
         status, body = frame._remote_api_message_ui({
             "chat_id": owner, "text": f"phone {owner}", "model": main.DEFAULT_CODEX_MODEL})
         assert (status, body["accepted"]) == (200, True)
+    frame._flush_idle_ui_refreshes()
+    assert sounds == ["send", "send"]
+    assert frame.history_ids[:3] == ["chat-c", "chat-b", "chat-a"]
+    assert frame.active_chat_id == "chat-a"
     frame._persist_chat_history_to_store()
 
     def outbox():
@@ -70,6 +77,7 @@ def test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_fi
         frame._persist_chat_history_to_store()
 
     items = outbox()
+    assert sounds == ["send", "send", "reply", "reply"]
     for owner in ("chat-b", "chat-c"):
         owner_items = [item for item in items if item.get("chat_id") == owner]
         assert any(item["kind"] == "state" for item in owner_items)
@@ -633,13 +641,14 @@ def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeyp
     ]
     frame._current_chat_state["turns"] = frame.active_session_turns
     pushed = []
+    sounds = []
     monkeypatch.setattr(frame.new_chat_button, "Enable", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(frame, "_set_input_hint_idle", lambda: None)
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(frame, "_refresh_history", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(frame, "_refresh_answer_list_preserving_selection", lambda: None)
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: sounds.append("reply"))
     monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(frame, "_is_ui_alive", lambda: False)
     monkeypatch.setattr(frame, "SetStatusText", lambda _text: None)
@@ -662,6 +671,7 @@ def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeyp
 
     assert frame.active_session_turns[0]["answer_md"] == "desktop received: hello from emulator"
     assert frame.active_session_turns[0]["request_status"] == "done"
+    assert sounds == ["reply"]
     assert pushed == [
         ("state", "chat-e2e"),
         ("final_answer", "chat-e2e", "desktop received: hello from emulator"),

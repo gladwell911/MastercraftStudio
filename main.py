@@ -4796,26 +4796,20 @@ class ChatFrame(wx.Frame):
         return title or EMPTY_CURRENT_CHAT_TITLE
 
     def _refresh_history(self, keep_id=None):
-        self._sort_archived_chats()
         labels = []
         ids = []
         current_id = self._current_history_id()
         seen_ids = set()
-        target = str(keep_id if keep_id is not None else self.view_history_id or "").strip()
-        if current_id:
-            labels.append(self._current_history_title())
-            ids.append(current_id)
-            seen_ids.add(current_id)
-        for c in self.archived_chats:
-            chat_id = str(c.get("id") or "").strip()
+        selected_id = self.history_list_model.selected_id() if hasattr(self, "history_list_model") else ""
+        target = str(keep_id if keep_id is not None else selected_id or self.view_history_id or "").strip()
+        for chat_id in self._get_all_chat_ids_in_order():
             if not chat_id or chat_id in seen_ids:
                 continue
             seen_ids.add(chat_id)
-            title = str(c.get("title") or "新聊天")
-            if self._is_default_chat_title(title):
-                title = EMPTY_CURRENT_CHAT_TITLE
-            disp = f"[置顶] {title}" if c.get("pinned") else title
-            labels.append(disp)
+            row = self._history_row_for_chat_id(chat_id)
+            if row is None:
+                continue
+            labels.append(row[1])
             ids.append(chat_id)
         selected_idx = None
         if target in ids:
@@ -4850,14 +4844,15 @@ class ChatFrame(wx.Frame):
         chat_id = str(chat_id or "").strip()
         current_id = self._current_history_id()
         if current_id and chat_id == current_id:
-            return (0, 0, 0, chat_id)
-        chat = self._find_archived_chat(chat_id)
+            chat = self._current_chat_state
+        else:
+            chat = self._find_archived_chat(chat_id)
         if not isinstance(chat, dict):
             return (9, 0, 0, chat_id)
         pinned_rank = 0 if chat.get("pinned") else 1
         updated = float(chat.get("updated_at") or chat.get("created_at") or 0.0)
         created = float(chat.get("created_at") or 0.0)
-        return (1, pinned_rank, -updated, -created, chat_id)
+        return (pinned_rank, -updated, -created, chat_id)
 
     def _history_row_for_chat_id(self, chat_id: str) -> tuple[str, str] | None:
         chat_id = str(chat_id or "").strip()
@@ -4897,11 +4892,11 @@ class ChatFrame(wx.Frame):
             changed = self.history_list_model.insert(item_id, label, index)
         else:
             changed = self.history_list_model.update_label(item_id, label)
-            if allow_reorder and not self._primary_navigation_control_has_focus():
+            if allow_reorder and not (self._navigation_quiet_active() or self._primary_navigation_control_is_recently_active()):
                 changed = self.history_list_model.move(item_id, self._desired_history_index(item_id)) or changed
             elif allow_reorder:
                 self._pending_history_reorder = True
-                changed = True
+                self._schedule_idle_ui_refresh()
         self.history_ids = list(self.history_list_model.visible_ids)
         if selected_id:
             self.history_list_model.set_selection_by_id(selected_id)
@@ -5910,7 +5905,7 @@ class ChatFrame(wx.Frame):
             return False
         last = float(getattr(self, "_last_primary_interaction_at", 0.0) or 0.0)
         if last <= 0:
-            return True
+            return False
         elapsed_ms = max(0.0, (time.monotonic() - last) * 1000.0)
         return elapsed_ms < IDLE_UI_REFRESH_DELAY_MS
 
@@ -5939,7 +5934,7 @@ class ChatFrame(wx.Frame):
         self._idle_ui_refresh_timer = None
         if not self._is_ui_alive():
             return
-        has_history_work = bool(getattr(self, "_history_list_dirty", False))
+        has_history_work = bool(getattr(self, "_history_list_dirty", False) or getattr(self, "_pending_history_reorder", False))
         has_execution_work = bool(getattr(self, "_execution_list_dirty", False))
         has_openclaw_work = bool(getattr(self, "_openclaw_lifecycle_dirty", False))
         if not has_history_work and not has_execution_work and not has_openclaw_work:
@@ -5951,9 +5946,10 @@ class ChatFrame(wx.Frame):
         if self._primary_navigation_control_is_recently_active():
             self._schedule_idle_ui_refresh()
             return
-        if bool(getattr(self, "_history_list_dirty", False)):
+        if has_history_work:
             keep_id = getattr(self, "_pending_history_keep_id", None)
             self._history_list_dirty = False
+            self._pending_history_reorder = False
             self._pending_history_keep_id = None
             with self._measure_ui_operation("idle_history_list_refresh"):
                 self._refresh_history(keep_id)
@@ -8084,7 +8080,6 @@ class ChatFrame(wx.Frame):
             target_id = str(chat_id or "").strip()
             if target_id:
                 self._background_history_dirty_ids.add(target_id)
-            self._mark_history_list_dirty(target_id)
             self._mark_background_answer_list_dirty()
             return
         self._refresh_history(chat_id)
@@ -12789,10 +12784,33 @@ class ChatFrame(wx.Frame):
             if event_type == "agent_message_delta":
                 self._buffer_execution_delta(chat_id, event)
                 return
-            self._flush_execution_delta(chat_id, event_turn_id or None)
             target_chat = self._find_archived_chat(chat_id)
             target_turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
             target_idx = self._event_turn_index(target_turns, event)
+            if event_type == "turn_completed" and target_idx >= 0 and str(target_turns[target_idx].get("request_status") or "").strip() == "done":
+                return
+            guarded_result = (
+                event_type in {"subagent_result", "turn_completed"}
+                or (event_type == "item_completed" and str(event.phase or "") == "final_answer")
+            )
+            if guarded_result and target_idx >= 0 and isinstance(target_turns[target_idx], dict):
+                turn = target_turns[target_idx]
+                event_data = event.data if isinstance(event.data, dict) else {}
+                if "context_generation" in event_data:
+                    try:
+                        event_generation = int(event_data["context_generation"])
+                    except (TypeError, ValueError):
+                        return
+                    if (
+                        event_generation != int(turn.get("codex_start_generation", turn.get("codex_context_generation") or 0))
+                        or event_generation != int(target_chat.get("codex_context_generation") or 0)
+                    ):
+                        return
+                if not self._accept_clear_operation_result(turn, chat_id):
+                    if event_type == "turn_completed":
+                        self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
+                    return
+            self._flush_execution_delta(chat_id, event_turn_id or None)
             if event_type == "token_count" and event.usage and target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx] if target_idx < len(target_turns) and isinstance(target_turns[target_idx], dict) else {}
                 completed_turn = str(turn.get("request_status") or "").strip() == "done"
@@ -12816,6 +12834,7 @@ class ChatFrame(wx.Frame):
                 target_chat["request_kind"] = "user_input"
                 target_chat["codex_turn_active"] = True
                 target_chat["updated_at"] = time.time()
+                self._mark_history_list_dirty()
                 if target_idx >= 0:
                     self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
@@ -12823,16 +12842,16 @@ class ChatFrame(wx.Frame):
                 return
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
+                history_recency_changed = False
                 if event_type == "item_completed" and str(event.phase or "") == "final_answer":
-                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
-                    target_chat["updated_at"] = time.time()
+                    if self._apply_codex_final_answer_to_turn(turn, str(event.text or "")):
+                        target_chat["updated_at"] = time.time()
+                        history_recency_changed = True
                 elif event_type == "subagent_result":
                     if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
                         target_chat["updated_at"] = time.time()
+                        history_recency_changed = True
                 elif event_type == "turn_completed":
-                    if not self._accept_clear_operation_result(turn, chat_id):
-                        self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
-                        return
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
                     self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
@@ -12842,10 +12861,14 @@ class ChatFrame(wx.Frame):
                     ):
                         self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                     target_chat["updated_at"] = time.time()
+                    history_recency_changed = True
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._request_codex_chat_information(target_chat, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._complete_clear_operation_turn(turn, failed=False)
+                    self._play_finish_sound()
                 self._mark_chat_turns_dirty(chat_id, target_idx)
+                if history_recency_changed:
+                    self._mark_history_list_dirty()
                 self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
             return
@@ -14248,6 +14271,8 @@ class ChatFrame(wx.Frame):
                 target_chat["kimi_turn_id"] = event_turn_id
             target_chat["kimi_turn_active"] = True
             target_chat["updated_at"] = time.time()
+            if not is_current_target:
+                self._mark_history_list_dirty()
         if is_current_target:
             if session_id:
                 self.active_kimi_session_id = session_id
@@ -14460,6 +14485,8 @@ class ChatFrame(wx.Frame):
         remaining_active = self._kimi_active_turns.get(str(chat_id or "").strip())
         target_chat["kimi_turn_active"] = bool(pending or isinstance(remaining_active, dict))
         target_chat["updated_at"] = time.time()
+        if target_chat is not self._current_chat_state:
+            self._mark_history_list_dirty()
         if bool(event_data.get("stream_complete")) and event_session_id:
             with self._kimi_owner_lock:
                 if not self._kimi_pending_owners({event_session_id}):
@@ -14964,6 +14991,7 @@ class ChatFrame(wx.Frame):
             if event_type == "server_request" and str(event.method or "") == "approval":
                 target_chat["kimi_turn_active"] = True
                 target_chat["updated_at"] = time.time()
+                self._mark_history_list_dirty()
                 if target_idx >= 0:
                     self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
@@ -17683,6 +17711,7 @@ class ChatFrame(wx.Frame):
             "created_at": time.time(),
             "question_origin": "rc",
         }
+        previous_updated_at = chat.get("updated_at")
         turns.append(turn)
         chat["model"] = resolved_model
         chat["updated_at"] = turn["created_at"]
@@ -17708,7 +17737,13 @@ class ChatFrame(wx.Frame):
         except Exception as exc:
             del turns[turn_idx:]
             chat["model"] = previous_model
+            if previous_updated_at is None:
+                chat.pop("updated_at", None)
+            else:
+                chat["updated_at"] = previous_updated_at
             return False, str(exc)
+        self._play_send_sound()
+        self._mark_history_list_dirty()
         self._mark_chat_turns_dirty(owner_id, turn_idx)
         self._defer_chat_state_save()
         if turn_idx == 0:
@@ -18696,7 +18731,7 @@ class ChatFrame(wx.Frame):
             if resolved_chat_id:
                 self._upsert_history_row(
                     resolved_chat_id,
-                    allow_reorder=not self._primary_navigation_control_has_focus(),
+                    allow_reorder=True,
                 )
             else:
                 self._refresh_history(None)
@@ -19919,28 +19954,12 @@ class ChatFrame(wx.Frame):
         return None
 
     def _get_all_chat_ids_in_order(self):
-        """Get all chat IDs in order: current chat first, then archived chats sorted by updated_at descending."""
-        all_ids = []
-        current_id = next(
-            (
-                normalized
-                for candidate in (self.current_chat_id, self.active_chat_id)
-                if (normalized := str(candidate or "").strip())
-            ),
-            "",
-        )
-        if current_id:
-            all_ids.append(current_id)
-        # Sort archived chats by updated_at descending, with pinned chats first
-        sorted_archived = sorted(
-            self.archived_chats,
-            key=lambda c: (-c.get("pinned", False), -c.get("updated_at", 0))
-        )
-        for c in sorted_archived:
-            cid = str(c.get("id") or "").strip()
-            if cid and cid != current_id and cid not in all_ids:
-                all_ids.append(cid)
-        return all_ids
+        """Return the same pinned and recency order shown by the history list."""
+        current_id = self._current_history_id()
+        ids = {current_id} if current_id else set()
+        ids.update(str(chat.get("id") or "").strip() for chat in self.archived_chats if isinstance(chat, dict))
+        ids.discard("")
+        return sorted(ids, key=self._history_chat_sort_key)
 
     def _adjacent_history_chat_id(self, direction: int):
         """Get the adjacent chat ID in the specified direction (1 for next, -1 for previous)."""

@@ -603,6 +603,8 @@ def test_mapped_assistant_delta_whitespace_is_preserved_in_answer_and_execution_
 
 def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
+    sounds = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: sounds.append("reply"))
     current_turn = {
         "question": "current",
         "answer_md": main.REQUESTING_TEXT,
@@ -672,10 +674,13 @@ def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
     for event in events:
         frame._on_kimi_event(event)
 
+    frame._on_kimi_event(events[-1])
+
     assert current_turn["answer_md"] == "current answer"
     assert current_turn["request_status"] == "done"
     assert background_turn["answer_md"] == "background answer"
     assert background_turn["request_status"] == "done"
+    assert sounds == ["reply", "reply"]
     assert frame._resolve_kimi_event_chat_id(CodexEvent(type="turn_completed", turn_id="0")) == ""
 
 

@@ -615,7 +615,7 @@ def test_background_history_chat_event_defers_visible_refresh_during_quiet(frame
     assert frame._background_answer_list_dirty is True
     assert "chat-history" in frame._background_history_dirty_ids
     assert frame._history_list_dirty is True
-    assert frame._pending_history_keep_id == "chat-history"
+    assert frame._pending_history_keep_id is None
 
 
 def test_idle_history_flush_waits_for_navigation_quiet_window(frame, monkeypatch):
@@ -2965,6 +2965,8 @@ def test_answer_list_down_at_last_row_does_not_reset_selection(frame, monkeypatc
 
 def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
     frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
@@ -2972,7 +2974,7 @@ def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
     frame._refresh_history()
     seen = {}
     frame.answer_list.SetFocus()
-    frame._switch_current_chat = lambda chat_id: seen.setdefault("chat_id", chat_id) or True
+    frame._show_history_chat = lambda chat_id, **_kwargs: seen.setdefault("chat_id", chat_id) or True
 
     class E:
         def GetKeyCode(self):
@@ -2989,11 +2991,13 @@ def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
 
     frame._on_char_hook(E())
 
-    assert seen["chat_id"] == "chat-a"
+    assert seen["chat_id"] == "chat-c"
 
 
 def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
     frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
@@ -3001,7 +3005,7 @@ def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
     frame._refresh_history()
     seen = {}
     frame.input_edit.SetFocus()
-    frame._switch_current_chat = lambda chat_id: seen.setdefault("chat_id", chat_id) or True
+    frame._show_history_chat = lambda chat_id, **_kwargs: seen.setdefault("chat_id", chat_id) or True
 
     class E:
         def GetKeyCode(self):
@@ -3018,7 +3022,7 @@ def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
 
     frame._on_char_hook(E())
 
-    assert seen["chat_id"] == "chat-c"
+    assert seen["chat_id"] == "chat-a"
 
 
 def test_ctrl_history_navigation_keeps_focus_on_origin_control(frame):
@@ -3027,6 +3031,7 @@ def test_ctrl_history_navigation_keeps_focus_on_origin_control(frame):
     frame._current_chat_state["id"] = "chat-b"
     frame._current_chat_state["title"] = "聊天B"
     frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答"}]
+    frame._current_chat_state["updated_at"] = 2.0
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
@@ -3056,7 +3061,7 @@ def test_ctrl_history_navigation_keeps_focus_on_origin_control(frame):
     assert event.skipped == 1
     assert frame.input_edit.HasFocus()
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-c"
+    assert frame.view_history_id == "chat-a"
     assert frame.current_chat_id == "chat-b"
 
 
@@ -3108,10 +3113,11 @@ def test_refresh_history_keeps_switched_chat_in_sorted_position(frame):
         {"id": "chat-g", "title": "聊天G", "turns": [{"question": "G", "answer_md": "G"}], "created_at": 9.0, "updated_at": 9.0},
     ]
 
+    frame._refresh_history("chat-current")
     assert frame._show_history_chat("chat-b", focus_answer_list=False) is True
 
-    assert frame.history_ids == ["chat-current", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a"]
-    assert list(frame.history_list.GetStrings()) == ["当前聊天", "[置顶] 置顶F", "[置顶] 置顶C", "聊天G", "聊天B", "聊天A"]
+    assert frame.history_ids == ["chat-f", "chat-c", "chat-g", "chat-current", "chat-b", "chat-a"]
+    assert list(frame.history_list.GetStrings()) == ["[置顶] 置顶F", "[置顶] 置顶C", "聊天G", "当前聊天", "聊天B", "聊天A"]
     assert frame.history_list.GetSelection() == frame.history_ids.index("chat-b")
 
 
@@ -3146,6 +3152,7 @@ def test_ctrl_history_navigation_keeps_history_order_unchanged(frame):
     frame._current_chat_state["id"] = "chat-current"
     frame._current_chat_state["title"] = "当前聊天"
     frame._current_chat_state["turns"] = [{"question": "当前问题", "answer_md": "当前回答"}]
+    frame._current_chat_state["updated_at"] = 6.0
     frame.archived_chats = [
         {"id": "chat-b", "title": "聊天B", "turns": [], "created_at": 4.0, "updated_at": 4.0},
         {"id": "chat-f", "title": "置顶F", "turns": [], "created_at": 5.0, "updated_at": 5.0, "pinned": True},
@@ -3179,10 +3186,10 @@ def test_ctrl_history_navigation_keeps_history_order_unchanged(frame):
 
     assert event.skipped == 1
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-f"
+    assert frame.view_history_id == "chat-b"
     assert frame.history_ids == before_ids
     assert list(frame.history_list.GetStrings()) == before_rows
-    assert frame.history_list.GetSelection() == frame.history_ids.index("chat-f")
+    assert frame.history_list.GetSelection() == frame.history_ids.index("chat-b")
 
 
 def test_adjacent_history_chat_id_uses_selected_history_when_no_current_chat(frame):
@@ -3216,7 +3223,7 @@ def test_adjacent_history_chat_id_stops_at_boundaries_without_wrap(frame):
     ]
     frame._refresh_history()
 
-    assert frame._adjacent_history_chat_id(-1) is None
+    assert frame._adjacent_history_chat_id(-1) == "chat-c"
     assert frame._show_history_chat("chat-a", focus_answer_list=False) is True
     assert frame._adjacent_history_chat_id(1) is None
 
@@ -3364,13 +3371,15 @@ def test_char_hook_ctrl_history_navigation_noops_without_archived_chats(frame):
 
 def test_input_key_down_ctrl_left_switches_to_previous_chat(frame):
     frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
     ]
     frame._refresh_history()
     seen = {"skipped": 0}
-    frame._switch_current_chat = lambda chat_id: seen.setdefault("chat_id", chat_id) or True
+    frame._show_history_chat = lambda chat_id, **_kwargs: seen.setdefault("chat_id", chat_id) or True
 
     class E:
         def GetKeyCode(self):
@@ -3387,19 +3396,21 @@ def test_input_key_down_ctrl_left_switches_to_previous_chat(frame):
 
     frame._on_input_key_down(E())
 
-    assert seen["chat_id"] == "chat-a"
+    assert seen["chat_id"] == "chat-c"
     assert seen["skipped"] == 1
 
 
 def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
     frame.active_chat_id = "chat-b"
+    frame.current_chat_id = "chat-b"
+    frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
     ]
     frame._refresh_history()
     seen = {"skipped": 0}
-    frame._switch_current_chat = lambda chat_id: seen.setdefault("chat_id", chat_id) or True
+    frame._show_history_chat = lambda chat_id, **_kwargs: seen.setdefault("chat_id", chat_id) or True
 
     class E:
         def GetKeyCode(self):
@@ -3416,7 +3427,7 @@ def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
 
     frame._on_input_key_down(E())
 
-    assert seen["chat_id"] == "chat-c"
+    assert seen["chat_id"] == "chat-a"
     assert seen["skipped"] == 1
 
 
@@ -3425,6 +3436,7 @@ def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
     frame.current_chat_id = "chat-b"
     frame._current_chat_state["id"] = "chat-b"
     frame._current_chat_state["title"] = "聊天B"
+    frame._current_chat_state["updated_at"] = 2.0
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
@@ -3448,7 +3460,7 @@ def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
     frame._on_generic_key_down(E())
 
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-c"
+    assert frame.view_history_id == "chat-a"
     assert seen["skipped"] >= 1
 
 
@@ -3457,6 +3469,7 @@ def test_answer_key_down_ctrl_right_navigates_history_view(frame):
     frame.current_chat_id = "chat-b"
     frame._current_chat_state["id"] = "chat-b"
     frame._current_chat_state["title"] = "聊天B"
+    frame._current_chat_state["updated_at"] = 2.0
     frame._current_chat_state["turns"] = [{"question": "问题B", "answer_md": "回答B"}]
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
@@ -3486,7 +3499,7 @@ def test_answer_key_down_ctrl_right_navigates_history_view(frame):
     frame._on_answer_key_down(event)
 
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-c"
+    assert frame.view_history_id == "chat-a"
     assert event.skipped >= 1
 
 
@@ -3496,6 +3509,7 @@ def test_accelerator_ctrl_right_navigates_history_view_from_button_focus(frame):
     frame.current_chat_id = "chat-b"
     frame._current_chat_state["id"] = "chat-b"
     frame._current_chat_state["title"] = "聊天B"
+    frame._current_chat_state["updated_at"] = 2.0
     frame.archived_chats = [
         {"id": "chat-a", "title": "聊天A", "turns": [], "created_at": 1.0, "updated_at": 1.0},
         {"id": "chat-c", "title": "聊天C", "turns": [], "created_at": 3.0, "updated_at": 3.0},
@@ -3506,7 +3520,7 @@ def test_accelerator_ctrl_right_navigates_history_view_from_button_focus(frame):
     event = wx.CommandEvent(wx.wxEVT_MENU, int(frame._chat_navigation_right_id))
     assert frame.ProcessEvent(event)
     assert frame.view_mode == "history"
-    assert frame.view_history_id == "chat-c"
+    assert frame.view_history_id == "chat-a"
 
 
 def test_render_answer_list_requests_listbox_repaint(frame, monkeypatch):
@@ -8296,6 +8310,8 @@ def test_background_codex_feedback_events_batch_state_flush(frame, monkeypatch):
     assert scheduled["count"] == 1
     assert scheduled["delay"] == main.CODEX_BACKGROUND_FLUSH_DELAY_MS
     assert saves["count"] == 0
+    assert frame._find_archived_chat("chat-background")["updated_at"] == 1.0
+    assert frame._history_list_dirty is False
 
     scheduled["callback"]()
 
@@ -11943,7 +11959,7 @@ def test_history_title_change_updates_single_row_without_full_refresh(frame, mon
         {"id": "chat-old", "title": "old archived", "turns": [], "created_at": 1.0, "updated_at": 1.0}
     ]
     frame._refresh_history("chat-active")
-    frame.history_list.SetSelection(0)
+    frame.history_list.SetSelection(frame.history_ids.index("chat-active"))
 
     monkeypatch.setattr(frame.history_list, "Clear", lambda: pytest.fail("history title update must not clear the list"))
     frame._current_chat_state["title"] = "new title"
@@ -11951,9 +11967,9 @@ def test_history_title_change_updates_single_row_without_full_refresh(frame, mon
     changed = frame._upsert_history_row("chat-active", allow_reorder=False)
 
     assert changed is True
-    assert frame.history_list.GetString(0) == "new title"
-    assert frame.history_ids == ["chat-active", "chat-old"]
-    assert frame.history_list.GetSelection() == 0
+    assert frame.history_list.GetString(frame.history_ids.index("chat-active")) == "new title"
+    assert frame.history_ids == ["chat-old", "chat-active"]
+    assert frame.history_list_model.selected_id() == "chat-active"
 
 
 def test_background_history_update_defers_reorder_while_primary_control_has_focus(frame, monkeypatch):
@@ -11965,15 +11981,21 @@ def test_background_history_update_defers_reorder_while_primary_control_has_focu
     ]
     frame._refresh_history("chat-active")
     monkeypatch.setattr(frame, "_primary_navigation_control_has_focus", lambda: True)
+    frame._mark_primary_interaction()
     frame.history_list.SetSelection(0)
 
     frame.archived_chats[0]["updated_at"] = 99.0
     changed = frame._upsert_history_row("chat-old", allow_reorder=True)
 
-    assert changed is True
+    assert changed is False
     assert frame.history_ids == ["chat-active", "chat-old"]
     assert frame._pending_history_reorder is True
     assert frame.history_list.GetSelection() == 0
+    frame._last_primary_interaction_at = 0.0
+    frame._flush_idle_ui_refreshes()
+    assert frame.history_ids == ["chat-old", "chat-active"]
+    assert frame.history_list_model.selected_id() == "chat-active"
+    assert frame._pending_history_reorder is False
 
 
 def test_execution_list_render_populates_incremental_model(frame):
@@ -14171,7 +14193,7 @@ def test_refresh_history_normalizes_legacy_placeholder_title(frame):
     assert list(frame.history_list.GetStrings()) == [main.EMPTY_CURRENT_CHAT_TITLE]
 
 
-def test_refresh_history_deduplicates_normalized_ids_with_current_first(frame):
+def test_refresh_history_deduplicates_normalized_ids_in_recency_order(frame):
     frame.active_chat_id = "chat-current"
     frame.current_chat_id = "chat-current"
     frame._current_chat_state = {"id": "chat-current", "title": "current", "turns": []}
@@ -14184,9 +14206,9 @@ def test_refresh_history_deduplicates_normalized_ids_with_current_first(frame):
 
     frame._refresh_history(" chat-old ")
 
-    assert frame.history_ids == ["chat-current", "chat-old"]
-    assert list(frame.history_list.GetStrings()) == ["current", "first old"]
-    assert frame.history_list.GetSelection() == 1
+    assert frame.history_ids == ["chat-old", "chat-current"]
+    assert list(frame.history_list.GetStrings()) == ["first old", "current"]
+    assert frame.history_list.GetSelection() == 0
 
 
 def test_padded_legacy_history_row_supports_activate_pin_rename_and_delete(frame, monkeypatch):
@@ -19806,6 +19828,73 @@ def test_remote_archived_owner_submission_restores_visible_owner_and_focus(frame
     assert pushes == [("state", "chat-target"), ("history", "chat-target")]
 
 
+def test_remote_sound_history_acceptance_and_pinned_recency(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "a"
+    frame._current_chat_state = {"id": "a", "title": "A", "updated_at": 10.0, "turns": []}
+    pinned = {"id": "p", "title": "P", "pinned": True, "updated_at": 1.0, "turns": []}
+    target = {"id": "b", "title": "B", "model": main.DEFAULT_CODEX_MODEL, "updated_at": 2.0, "turns": []}
+    frame.archived_chats = [target, pinned]
+    frame._refresh_history("a")
+    sounds = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: sounds.append("send"))
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: True)
+
+    assert frame._submit_archived_remote_question(target, "", main.DEFAULT_CODEX_MODEL)[0] is False
+    assert sounds == []
+    assert frame._submit_archived_remote_question(target, "phone question", main.DEFAULT_CODEX_MODEL) == (True, "")
+    frame._flush_idle_ui_refreshes()
+
+    assert sounds == ["send"]
+    assert frame.history_ids == ["p", "b", "a"]
+    assert frame._get_all_chat_ids_in_order() == frame.history_ids
+    assert frame.history_list_model.selected_id() == "a"
+    assert frame.active_chat_id == "a"
+
+
+def test_remote_sound_history_rejected_start_restores_recency(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "a"
+    frame._current_chat_state = {"id": "a", "updated_at": 10.0, "turns": []}
+    target = {"id": "b", "model": main.DEFAULT_CODEX_MODEL, "updated_at": 2.0, "turns": []}
+    frame.archived_chats = [target]
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("rejected send must stay silent"))
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_args: False)
+
+    assert frame._submit_archived_remote_question(target, "question", main.DEFAULT_CODEX_MODEL)[0] is False
+    assert target["updated_at"] == 2.0
+    assert target["turns"] == []
+    assert frame._get_all_chat_ids_in_order() == ["a", "b"]
+
+
+def test_remote_sound_history_old_and_cleared_results_stay_silent(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "a"
+    frame._current_chat_state = {"id": "a", "updated_at": 10.0, "turns": []}
+    old = {"question": "old", "answer_md": "old answer", "request_status": "done",
+           "codex_thread_id": "old-thread", "codex_turn_id": "old-turn",
+           "codex_context_generation": 0}
+    cleared = {"question": "cleared", "answer_md": main.REQUESTING_TEXT,
+               "request_status": "pending", "codex_thread_id": "new-thread",
+               "codex_turn_id": "new-turn", "codex_context_generation": 1,
+               "clear_operation_id": "cancelled-operation", "clear_revision": 3}
+    chat = {"id": "b", "updated_at": 2.0, "turns": [old, cleared],
+            "codex_thread_id": "new-thread", "codex_turn_id": "new-turn",
+            "codex_context_generation": 1}
+    frame.archived_chats = [chat]
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: pytest.fail("stale result played a reply sound"))
+
+    frame._on_codex_event_for_chat("b", main.CodexEvent(
+        type="turn_completed", thread_id="old-thread", turn_id="old-turn",
+        data={"turn_idx": 0, "context_generation": 0}, status="completed", text="stale"))
+    frame._on_codex_event_for_chat("b", main.CodexEvent(
+        type="turn_completed", thread_id="new-thread", turn_id="new-turn",
+        data={"turn_idx": 1, "context_generation": 1}, status="completed", text="late"))
+
+    assert chat["updated_at"] == 2.0
+    assert old["answer_md"] == "old answer"
+    assert cleared["answer_md"] == main.REQUESTING_TEXT
+    assert cleared["request_status"] == "pending"
+    assert frame._get_all_chat_ids_in_order() == ["a", "b"]
+
+
 def test_offscreen_remote_submit_loads_full_store_turns_before_append(frame, monkeypatch):
     frame._chat_store_enabled = True
     frame.chat_store.upsert_chat({
@@ -19883,6 +19972,9 @@ def test_archived_mobile_result_interleaved_completion_survives_store_reopen(fra
     monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
     monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
     monkeypatch.setattr(frame, "_refresh_visible_history_chat", lambda *_args: None)
+    sounds = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: sounds.append("send"))
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: sounds.append("reply"))
 
     for owner in ("chat-b", "chat-c"):
         chat = frame._find_archived_chat(owner)
@@ -19891,6 +19983,8 @@ def test_archived_mobile_result_interleaved_completion_survives_store_reopen(fra
             "chat_id": owner, "turn_idx": 1, "thread_id": f"new-{owner}",
             "turn_id": f"turn-{owner}", "context_generation": 0, "active": True,
         })
+    frame._flush_idle_ui_refreshes()
+    assert frame._history_list_dirty is False
     for thread_id, turn_id in (("new-chat-c", "turn-chat-c"), ("new-chat-b", "stale-turn")):
         frame._on_codex_event_for_chat("chat-b", main.CodexEvent(
             type="item_completed", phase="final_answer", thread_id=thread_id,
@@ -19905,6 +19999,8 @@ def test_archived_mobile_result_interleaved_completion_survives_store_reopen(fra
         assert frame._find_archived_chat(owner) is chat
         frame._on_codex_event_for_chat(owner, event("item_completed", phase="final_answer", text=f"answer {owner}"))
         frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+        frame._on_codex_event_for_chat(owner, event("turn_completed", status="completed"))
+        assert frame._history_list_dirty is True
     frame._persist_chat_history_to_store()
 
     reopened = main.ChatStore(frame.chat_store.db_path)
@@ -19916,6 +20012,60 @@ def test_archived_mobile_result_interleaved_completion_survives_store_reopen(fra
         assert loaded["turns"][1]["request_status"] == "done"
         assert loaded["turns"][1]["codex_thread_id"] == f"new-{owner}"
     assert frame.active_session_turns == [{"question": "A", "answer_md": "A answer"}]
+    assert sounds == ["send", "send", "reply", "reply"]
+
+
+@pytest.mark.parametrize("kind, phase", [("item_completed", "final_answer"), ("subagent_result", "")])
+def test_remote_sound_history_cancelled_clear_rejects_archived_content_before_recency(frame, monkeypatch, kind, phase):
+    frame.active_chat_id = frame.current_chat_id = "a"
+    frame._current_chat_state = {"id": "a", "turns": []}
+    turn = {
+        "question": "old", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL,
+        "request_status": "pending", "codex_turn_id": "turn-b",
+        "clear_operation_id": "cancelled-clear", "clear_revision": 1,
+    }
+    chat = {"id": "b", "turns": [turn], "updated_at": 1.0, "codex_thread_id": "thread-b"}
+    frame.archived_chats = [chat]
+    quarantined = []
+    frame.chat_store = SimpleNamespace(
+        get_clear_operation=lambda _op: {"state": "cancelled", "chat_id": "b", "revision": 1},
+        quarantine=lambda *args: quarantined.append(args),
+    )
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: pytest.fail("stale content must stay silent"))
+    frame._on_codex_event_for_chat("b", main.CodexEvent(
+        type=kind, phase=phase, thread_id="thread-b", turn_id="turn-b",
+        data={"turn_idx": 0}, text="stale answer",
+    ))
+
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+    assert chat["updated_at"] == 1.0
+    assert frame._history_list_dirty is False
+    assert quarantined and quarantined[0][0] == "SUPERSEDED_CLEAR_RESULT"
+
+
+def test_remote_sound_history_old_generation_completion_cannot_finish_archived_turn(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "a"
+    frame._current_chat_state = {"id": "a", "turns": []}
+    turn = {
+        "question": "new", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL,
+        "request_status": "pending", "codex_turn_id": "turn-b",
+        "codex_context_generation": 2, "codex_start_generation": 2,
+    }
+    chat = {
+        "id": "b", "turns": [turn], "updated_at": 1.0,
+        "codex_thread_id": "thread-b", "codex_context_generation": 2,
+    }
+    frame.archived_chats = [chat]
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: pytest.fail("old generation must stay silent"))
+    frame._on_codex_event_for_chat("b", main.CodexEvent(
+        type="turn_completed", status="completed", thread_id="thread-b", turn_id="turn-b",
+        data={"turn_idx": 0, "context_generation": 1}, text="stale answer",
+    ))
+
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+    assert chat["updated_at"] == 1.0
+    assert frame._history_list_dirty is False
 
 
 def test_archived_mobile_result_summary_hydration_merges_without_replacing_live_fields(frame):
