@@ -18,3 +18,11 @@
 3. 在真实配置中完成跨端 Live 和模型链路验收；复核已知宽回归基线，并完成手机实体设备 TalkBack、震动、后台通知和 ARM64 验收。RC 最终 widget 156/156、模拟器历史分页定向 1/1 通过，不代表上述真实环境验收。
 
 详情见 [文档索引](README.md) 和 [归档快照](archive/entry-context-2026-09-29/handoff.md)。
+
+## Epic 2 — 2026-09-30
+
+手机通知标题与发送者过滤已开发并通过可执行的模拟器端到端 QA：新通知使用 canonical 聊天标题，改名后旧事实原样重放，新回答使用新名称；桌面本人消息同步但不提醒。Android 锁屏/publicVersion显示真实标题并隐藏正文，完整 pair/event 独立分组保留每条锁屏标题。
+
+当前验证：MC 合同11/11；RC 合同/相关widget26、Android unit47、native8及分组定向通过；Local受控Codex/Kimi真实UI退出0；最终私有NATS标准driver退出0，覆盖两聊天、改名、重复/逆序/重连、用户同步零通知和实际通知点击正确owner/current title。Android15 emulator-5554真实安全锁屏显示独立真实聊天标题及“新消息”，无private body；手机测试仅模拟器。一次dog四lens合并审查完成，两个低风险fixture守卫问题修复并复测。
+
+生产 Live 因缺真实 Endpoint/Token/DesktopChatTitle 未验证；上述私有服务和模拟器证据不代表生产 Live或实体设备。最终实施与QA记录位于工作区 `_bmad-output/implementation-artifacts/plan-epic2-mobile-notifications.md`、`qa-epic2-mobile-notifications.md`。未发布或重新打包生产应用。

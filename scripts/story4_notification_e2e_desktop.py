@@ -25,6 +25,39 @@ from chat_store import ChatStore
 from remote_nats import RemoteNatsTransport
 
 
+def update_fixture_chat_title(store: ChatStore, chat_id: str, title: str) -> None:
+    chat = store.load_chat(chat_id)
+    now = time.time()
+    if chat is None:
+        store.upsert_chat({"id": chat_id, "title": title, "created_at": now,
+                           "updated_at": now, "title_revision": 1,
+                           "title_updated_at": now, "title_source": "default"})
+        return
+    if chat.get("title") == title:
+        return
+    chat.update(title=title, title_manual=True, title_source="manual",
+                title_updated_at=max(now, float(chat.get("title_updated_at") or 0) + 0.000001),
+                title_revision=int(chat.get("title_revision") or 0) + 1,
+                updated_at=max(now, float(chat.get("updated_at") or 0)))
+    store.upsert_chat(chat)
+
+
+def prepare_fixture_title(store: ChatStore, payload: dict, fact: dict | None) -> str | None:
+    chat_id = str(payload.get("chat_id") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    if fact is None:
+        kind = str(payload.get("kind") or "assistant_final")
+        if kind not in {"user_message", "assistant_final"}:
+            return None
+        update_fixture_chat_title(store, chat_id, title)
+        return kind
+    if chat_id != fact.get("chat_id"):
+        return None
+    if payload.get("replay") is True and payload.get("rename") is True:
+        update_fixture_chat_title(store, chat_id, title)
+    return str(fact["kind"])
+
+
 async def run() -> None:
     endpoint = os.environ.get(
         "NATS_E2E_ENDPOINT", "wss://rc.tingyou.cc/nats"
@@ -56,11 +89,31 @@ async def run() -> None:
     )
 
     connection = await nats.connect(endpoint, token=token)
+
+    def history_chat(chat: dict) -> dict:
+        return {**chat, "chat_id": chat["id"], "running": False,
+                "request_kind": "", "current": False, "active": False,
+                "turns": [{**turn, "answer": turn.get("answer_md", "")}
+                          for turn in chat.get("turns", [])]}
+
+    def history_list() -> tuple[int, dict]:
+        return 200, {"accepted": True, "chats": [history_chat(chat)
+                                                for chat in store.list_chat_summaries()]}
+
+    def history_read(payload: dict) -> tuple[int, dict]:
+        chat = store.load_chat(str(payload.get("chat_id") or ""))
+        if chat is None:
+            return 404, {"accepted": False, "error": "chat_not_found"}
+        return 200, {"accepted": True, "chat": history_chat(chat),
+                     "has_more": False, "oldest_cursor": ""}
+
     transport = RemoteNatsTransport(
         pair_id=pair_id,
         token=token,
         jetstream=connection.jetstream(),
         durable_store=store,
+        on_history_list=history_list,
+        on_history_read=history_read,
     )
     await transport.initialize_streams()
     published = await transport.drain_outbox()
@@ -83,18 +136,25 @@ async def run() -> None:
             if not fixture_id or not chat_id or not title or not text:
                 return
             fact = fixture_facts.get(fixture_id)
+            kind = prepare_fixture_title(store, payload, fact)
+            if kind is None:
+                return
             if fact is None:
-                store.upsert_chat({"id": chat_id, "title": title})
-                store.replace_turns(chat_id, [{"question": "", "answer_md": text}])
+                turns = store.load_turns(chat_id)
+                turn_index = len(turns)
+                store.replace_turns_from(chat_id, [{
+                    "question": text if kind == "user_message" else "",
+                    "answer_md": text if kind == "assistant_final" else "",
+                }], start_index=turn_index)
                 message_id = store.resolve_canonical_message_by_turn(
-                    chat_id, role="assistant", turn_index=0
+                    chat_id, role="user" if kind == "user_message" else "assistant", turn_index=turn_index
                 )
                 fact = store.commit_message_notification_fact(
                     pair_id=pair_id,
                     domain="events",
                     chat_id=chat_id,
                     message_id=message_id,
-                    notification_kind="assistant_final",
+                    notification_kind=kind,
                     # Deliberately non-authoritative inputs: production store
                     # derivation must source both fields from canonical rows.
                     text="ignored fixture transport text",
@@ -103,6 +163,12 @@ async def run() -> None:
                 fixture_facts[fixture_id] = fact
                 await transport.drain_outbox()
             elif payload.get("replay") is True:
+                replay = store.commit_message_notification_fact(
+                    pair_id=pair_id, domain="events", chat_id=chat_id,
+                    message_id=fact["body"]["message_id"], notification_kind=fact["kind"],
+                    text=text, chat_title=title,
+                )
+                assert replay == fact, "committed notification envelope changed on replay"
                 await connection.publish(
                     transport.subjects.events,
                     json.dumps(fact, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),

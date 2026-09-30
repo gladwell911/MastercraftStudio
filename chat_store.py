@@ -815,13 +815,38 @@ class ChatStore:
                 raise ValueError("STALE_CANONICAL_NOTIFICATION")
             turn = self._json_dict(row["payload_json"])
             canonical_text = str(turn.get("question" if expected_role == "user" else "answer_md") or "")
-            canonical_title = str(row["title"] or "").strip()
-            if not canonical_text.strip() or not canonical_title:
-                raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
             normalized_origin = str(origin_client or "mc").strip().lower()
             if not normalized_origin or "\x00" in normalized_origin:
                 raise ValueError("INVALID_ORIGIN_CLIENT")
             event_id = f"notification:{normalized_pair}:{normalized_message}:{normalized_kind}"
+            existing = conn.execute(
+                "SELECT envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            if existing:
+                original = json.loads(existing["envelope_json"])
+                # A rename changes current presentation, never a committed fact.
+                # Still validate every immutable owner and canonical message field.
+                immutable = {
+                    "protocol_version": 2, "event_id": event_id,
+                    "kind": normalized_kind, "chat_id": owner,
+                    "turn_id": str(row["turn_id"]), "domain": normalized_domain,
+                    "sequence_domain": normalized_domain,
+                    "origin_client": normalized_origin,
+                }
+                original_body = original.get("body", {})
+                if (existing["pair_id"] != normalized_pair
+                        or existing["domain"] != normalized_domain
+                        or any(original.get(key) != value for key, value in immutable.items())
+                        or original_body.get("message_id") != normalized_message
+                        or original_body.get("text") != canonical_text):
+                    self._quarantine_conn(conn, "EVENT_ID_CONFLICT", immutable, event_id)
+                    conn.commit()
+                    raise ValueError("EVENT_ID_CONFLICT")
+                return original
+            canonical_title = str(row["title"] or "").strip()
+            if not canonical_text.strip() or not canonical_title:
+                raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
             envelope = {
                 "protocol_version": 2,
                 "event_id": event_id,
@@ -837,21 +862,6 @@ class ChatStore:
                     "chat_title": canonical_title,
                 },
             }
-            existing = conn.execute(
-                "SELECT envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?",
-                (event_id,),
-            ).fetchone()
-            if existing:
-                original = json.loads(existing["envelope_json"])
-                comparable = {key: value for key, value in envelope.items()
-                              if key not in {"canonical_hash", "sync_sequence", "revision"}}
-                if (existing["pair_id"] != normalized_pair
-                        or existing["domain"] != normalized_domain
-                        or any(original.get(key) != value for key, value in comparable.items())):
-                    self._quarantine_conn(conn, "EVENT_ID_CONFLICT", envelope, event_id)
-                    conn.commit()
-                    raise ValueError("EVENT_ID_CONFLICT")
-                return original
             conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
             state = conn.execute(
                 "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
