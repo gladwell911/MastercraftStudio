@@ -966,3 +966,26 @@ def test_worker_process_source_does_not_import_wx():
     source = pathlib.Path("codex_worker_process.py").read_text(encoding="utf-8")
     assert "import wx" not in source
     assert "from wx" not in source
+
+
+def test_context_only_information_does_not_query_account_or_quota():
+    calls = []
+    class Client:
+        def read_native_usage(self, thread):
+            assert thread == "native"
+            return {"session_total_tokens": 900}
+        def read_account(self, **kwargs):
+            calls.append("account")
+            return {}
+        def read_rate_limits(self):
+            calls.append("quota")
+            return {}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda on_event, codex_model: Client(), output=output)
+    runtime.handle_message(make_ui_request("read", "read_chat_information", {
+        "chat_id": "chat", "model": "codex/main", "identity": ["chat", "codex/main", "native", "account"],
+        "generation": 1, "context_only": True}))
+    result = decode_worker_line(output.getvalue().strip() + "\n")["payload"]
+    assert result["native_usage"]["session_total_tokens"] == 900
+    assert "account" not in result and "rate_limits" not in result
+    assert calls == []

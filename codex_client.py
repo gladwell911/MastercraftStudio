@@ -591,6 +591,58 @@ class CodexAppServerClient:
     def read_account(self, refresh_token: bool = False) -> dict:
         return self.request("account/read", {"refreshToken": bool(refresh_token)})
 
+    def read_native_usage(self, thread_id: str) -> dict:
+        """Read only this thread's authoritative, complete rollout token record."""
+        response = self.read_thread(thread_id, include_turns=False)
+        thread = response.get("thread") or {}
+        if thread.get("id") != thread_id:
+            raise ValueError("native thread identity mismatch")
+        path = thread.get("path") or thread.get("rolloutPath")
+        if not path:
+            return {}
+        with open(path, "rb") as stream:
+            header = stream.readline(65536)
+            meta = json.loads(header)
+            if (not isinstance(meta, dict) or meta.get("type") != "session_meta"
+                    or not isinstance(meta.get("payload"), dict) or meta["payload"].get("id") != thread_id):
+                raise ValueError("rollout session identity mismatch")
+            stream.seek(0, os.SEEK_END)
+            position = stream.tell()
+            scanned, budget = 0, 8 * 1048576
+            partial, discard_trailing = b"", True
+            while position and scanned < budget:
+                amount = min(65536, position, budget - scanned)
+                position -= amount
+                scanned += amount
+                stream.seek(position)
+                block = stream.read(amount) + partial
+                if discard_trailing:
+                    if b"\n" not in block:
+                        partial = block
+                        continue
+                    block = block.rsplit(b"\n", 1)[0]
+                    discard_trailing = False
+                lines = block.split(b"\n")
+                partial = lines[0] if position else b""
+                for line in reversed(lines[1:] if position else lines):
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    payload = record.get("payload")
+                    if record.get("type") != "event_msg" or not isinstance(payload, dict) or payload.get("type") != "token_count":
+                        continue
+                    usage = codex_context_usage_from_payload(payload, self.codex_model)
+                    total = codex_session_total_tokens_from_payload(payload)
+                    if usage is not None or total is not None:
+                        return {"context_usage": usage, "session_total_tokens": total,
+                                "observed_at": record.get("timestamp")}
+            if position:
+                raise ValueError("native usage scan limit reached (8 MiB)")
+        return {}
+
     def read_rate_limits(self) -> dict:
         return self.request("account/rateLimits/read")
 

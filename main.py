@@ -1626,6 +1626,21 @@ class ChatInformationDialog(wx.Dialog):
         self.refresh_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_refresh_timer, self.refresh_timer)
         self.refresh_timer.Start(60000)
+        self.context_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_context_timer, self.context_timer)
+        self.context_timer.Start(10000)
+
+    def _on_context_timer(self, _event) -> None:
+        if self.owner._chat_information_dialog is not self:
+            return
+        current = self.owner._visible_chat_information_owner()
+        if current is None or self.owner._chat_information_identity(*current) != self.identity:
+            return
+        chat, model = current
+        if is_codex_model(model):
+            self.owner._request_codex_chat_information(chat, model, context_only=True)
+        elif is_kimi_model(model):
+            self.owner._request_kimi_chat_information(chat, model, visible_only=True, context_only=True)
 
     def _on_refresh_timer(self, _event) -> None:
         current = self.owner._visible_chat_information_owner()
@@ -1641,6 +1656,8 @@ class ChatInformationDialog(wx.Dialog):
             self.owner._request_codex_chat_information(chat, model)
         elif is_kimi_model(model):
             self.owner._refresh_chat_information(chat)
+            if self.identity[2]:
+                self.owner._request_kimi_chat_information(chat, model, visible_only=True)
             self.owner._request_kimi_quota(chat, model)
 
     def set_rows(self, rows: list[str]) -> None:
@@ -1665,6 +1682,12 @@ class ChatInformationDialog(wx.Dialog):
 
     def _on_close(self, _event) -> None:
         self.refresh_timer.Stop()
+        self.context_timer.Stop()
+        self.owner._chat_information_request = None
+        self.owner._kimi_quota_request = None
+        request = self.owner._kimi_information_requests.get(self.identity[0])
+        if isinstance(request, dict) and request.get("visible_only"):
+            self.owner._kimi_information_requests.pop(self.identity[0], None)
         self.owner._chat_information_dialog = None
         target = self.focus_target
         self.Destroy()
@@ -2077,7 +2100,7 @@ class ChatFrame(wx.Frame):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
         app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+Z")
-        app_menu.Append(int(self._chat_information_menu_id), "查看聊天信息")
+        app_menu.Append(int(self._chat_information_menu_id), "查看聊天信息\tAlt+Y")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -2381,6 +2404,7 @@ class ChatFrame(wx.Frame):
         event.Skip()
 
     def _chat_information_rows(self, chat: dict, model: str) -> list[str]:
+        self._validate_information_cache_owner(chat, "codex" if is_codex_model(model) else "kimi")
         usage = context_usage_from_dict(chat.get("context_usage"))
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
         if turns:
@@ -2397,6 +2421,17 @@ class ChatFrame(wx.Frame):
         total_row = f"会话累计 token：{total:,}" if isinstance(total, int) and total >= 0 else (
             "会话累计 token：查询失败" if is_kimi_model(model) and chat.get("kimi_snapshot_error") else "会话累计 token：暂不可用")
         rows = [context_row, total_row]
+        provider = "codex" if is_codex_model(model) else "kimi"
+        for index, stamp in ((0, usage.updated_at if usage else None),
+                             (1, chat.get(f"{provider}_total_observed_at"))):
+            error = chat.get(f"{provider}_context_error" if index == 0 else f"{provider}_snapshot_error")
+            if stamp and (index == 0 and usage is not None or index == 1 and isinstance(total, int)):
+                when = datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S")
+                rows[index] += f"（缓存，上次观测于 {when}{'，查询失败' if error else ''}）"
+            elif error:
+                rows[index] = ("当前上下文" if index == 0 else "会话累计 token") + "：查询失败"
+        if isinstance(total, int) and f"{provider}_total_observed_at" in chat and not chat.get(f"{provider}_total_observed_at"):
+            rows[1] += "（缓存，观测时间未知）"
         if is_codex_model(model):
             owner_id = str(chat.get("codex_account_id") or "").strip()
             if str(chat.get("codex_chat_information_account_owner") or "").strip() == owner_id:
@@ -2413,6 +2448,24 @@ class ChatFrame(wx.Frame):
                 labels = [f"{label}（上次更新于 {stamp}）" for label in labels]
             rows.extend(labels if labels is not None else ["Kimi 五小时额度：暂不可用", "Kimi 七日额度：暂不可用"])
         return rows
+
+    def _information_cache_owner(self, chat: dict, provider: str) -> tuple:
+        native = self._codex_thread_id_for_chat(chat) if provider == "codex" else self._kimi_session_id_for_chat(chat)
+        account = str(chat.get(f"{provider}_account_id") or "")
+        if provider == "kimi":
+            account += ":" + str(chat.get("kimi_verified_account_id") or "")
+        generation = chat.get("codex_context_generation" if provider == "codex" else "kimi_information_generation") or 0
+        return (str(chat.get("id") or ""), native, account, int(generation))
+
+    def _validate_information_cache_owner(self, chat: dict, provider: str) -> None:
+        owner = chat.get(f"{provider}_usage_cache_owner")
+        if owner is None or tuple(owner) == self._information_cache_owner(chat, provider):
+            return
+        chat.pop(f"{provider}_usage_cache_owner", None)
+        if provider == "codex":
+            self._clear_codex_context_usage_for_thread_change(chat)
+        else:
+            self._clear_kimi_information_for_session_change(chat)
 
     @staticmethod
     def _kimi_quota_labels(payload: dict | None, *, failed: bool = False) -> list[str]:
@@ -2505,13 +2558,22 @@ class ChatFrame(wx.Frame):
             self._request_kimi_quota(chat, model)
         return True
 
-    def _request_codex_chat_information(self, chat: dict, model: str) -> None:
+    def _request_codex_chat_information(self, chat: dict, model: str, *, context_only: bool = False) -> None:
+        self._validate_information_cache_owner(chat, "codex")
         dialog = getattr(self, "_chat_information_dialog", None)
         if dialog is None or dialog.IsBeingDeleted():
             return
         identity = self._chat_information_identity(chat, model)
         if dialog.identity != identity or not identity[0]:
             return
+        if (self._chat_information_request is not None
+                and self._chat_information_request[2] == identity
+                and time.monotonic() - getattr(self, "_codex_information_started", 0) < 30):
+            return
+        self._codex_information_started = time.monotonic()
+        self._codex_information_context_only = context_only
+        self._codex_information_revision = int(chat.get("codex_usage_revision") or 0)
+        self._codex_information_context_generation = int(chat.get("codex_context_generation") or 0)
         self._chat_information_request_generation += 1
         generation = self._chat_information_request_generation
         try:
@@ -2526,7 +2588,8 @@ class ChatFrame(wx.Frame):
             try:
                 client.start()
                 client.read_chat_information(chat_id=identity[0], model=model,
-                                             identity=list(identity), generation=generation)
+                                             identity=list(identity), generation=generation,
+                                             context_only=context_only)
             except Exception:
                 self._call_after_if_alive(self._fail_codex_chat_information_request, generation, identity)
 
@@ -2541,9 +2604,12 @@ class ChatFrame(wx.Frame):
                 or dialog.identity != identity or self._chat_information_identity(*owner) != identity):
             return
         chat = owner[0]
-        chat["codex_account_label"] = "Codex 账号：查询失败"
-        chat["codex_weekly_quota_label"] = "Codex 周额度：查询失败"
-        chat["codex_chat_information_account_owner"] = identity[3]
+        chat["codex_context_error"] = True
+        chat["codex_snapshot_error"] = True
+        if not getattr(self, "_codex_information_context_only", False):
+            chat["codex_account_label"] = "Codex 账号：查询失败"
+            chat["codex_weekly_quota_label"] = "Codex 周额度：查询失败"
+            chat["codex_chat_information_account_owner"] = identity[3]
         self._chat_information_request = None
         self._refresh_chat_information(chat)
 
@@ -2561,6 +2627,28 @@ class ChatFrame(wx.Frame):
                 or payload.get("generation") != generation):
             return
         self._chat_information_request = None
+        native = payload.get("native_usage") or {}
+        if (int(chat.get("codex_usage_revision") or 0) == getattr(self, "_codex_information_revision", 0)
+                and int(chat.get("codex_context_generation") or 0) == getattr(self, "_codex_information_context_generation", 0)):
+            usage = native.get("context_usage")
+            try:
+                observed_at = datetime.fromisoformat(str(native.get("observed_at")).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                observed_at = None
+            if isinstance(usage, dict):
+                if observed_at is not None:
+                    usage["updated_at"] = observed_at
+                self._set_chat_context_usage(chat, usage)
+            total = native.get("session_total_tokens")
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                chat["codex_session_total_tokens"] = total
+                chat["codex_total_observed_at"] = observed_at
+                chat["codex_usage_cache_owner"] = self._information_cache_owner(chat, "codex")
+            chat["codex_context_error"] = bool(payload.get("usage_error"))
+            chat["codex_snapshot_error"] = bool(payload.get("usage_error"))
+        if payload.get("context_only"):
+            self._refresh_chat_information(chat)
+            return
         account_resp = payload.get("account") if isinstance(payload.get("account"), dict) else {}
         account = account_resp.get("account") if isinstance(account_resp.get("account"), dict) else None
         if payload.get("account_error"):
@@ -2596,26 +2684,38 @@ class ChatFrame(wx.Frame):
                         self.active_codex_turn_id = ""
                         self.active_codex_turn_active = False
                 chat["codex_account_id"] = new_account_id
+                if not identity[3] and chat.get("codex_usage_cache_owner"):
+                    chat["codex_usage_cache_owner"] = self._information_cache_owner(chat, "codex")
                 dialog.identity = self._chat_information_identity(chat, model)
             chat["codex_account_label"] = account_label
             chat["codex_weekly_quota_label"] = quota_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
             self._refresh_chat_information(chat)
             self._defer_codex_state_save()
+        self._refresh_chat_information(chat)
 
-    def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False) -> None:
+    def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False,
+                                       context_only: bool = False) -> None:
+        self._validate_information_cache_owner(chat, "kimi")
         identity = self._chat_information_identity(chat, model)
         if not identity[0] or not identity[2]:
             return
         dialog = getattr(self, "_chat_information_dialog", None)
         if visible_only and (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity):
             return
+        pending = self._kimi_information_requests.get(identity[0])
+        if (isinstance(pending, dict) and pending.get("identity") == identity
+                and time.monotonic() - pending.get("started", 0) < 30):
+            return
+        kinds = {"status"} if context_only else {"status", "snapshot"}
         self._kimi_information_generation += 1
         generation = self._kimi_information_generation
         self._kimi_information_requests[identity[0]] = {
             "generation": generation, "identity": identity,
             "context_revision": int(chat.get("kimi_context_revision") or 0),
-            "visible_only": visible_only, "remaining": {"status", "snapshot"},
+            "visible_only": visible_only, "remaining": kinds.copy(),
+            "started": time.monotonic(), "dialog": dialog if visible_only else None,
+            "cache_owner": self._information_cache_owner(chat, "kimi"),
         }
 
         def _read() -> None:
@@ -2623,11 +2723,13 @@ class ChatFrame(wx.Frame):
                 client = self._ensure_kimi_client()
                 client.start()
             except Exception:
-                for kind in ("status", "snapshot"):
+                for kind in kinds:
                     self._call_after_if_alive(self._apply_kimi_chat_information_result,
                                               identity[0], generation, identity, kind, None, True)
                 return
             for kind, getter in (("status", client.get_status), ("snapshot", client.get_snapshot)):
+                if kind not in kinds:
+                    continue
                 try:
                     payload = getter(identity[2])
                     failed = False
@@ -2696,11 +2798,24 @@ class ChatFrame(wx.Frame):
         chat = owner[0]
         old_rows = self._chat_information_rows(chat, owner[1])
         account_id = str((payload or {}).get("_account_id") or "")
+        previous_account_id = str(chat.get("kimi_verified_account_id") or "")
+        kind = (payload or {}).get("kind")
+        quota_error = (payload or {}).get("error") or {}
+        confirmed_logout = kind == "unauthenticated" or (isinstance(quota_error, dict) and quota_error.get("code") == "unauthorized")
+        if not account_id and not confirmed_logout and (failed or kind == "error"):
+            account_id = previous_account_id
+        if kind == "not_applicable":
+            account_id = previous_account_id
         verified_changed = str(chat.get("kimi_verified_account_id") or "") != account_id
         if account_id != str(chat.get("kimi_quota_owner") or ""):
             chat.pop("kimi_quota_payload", None)
             chat.pop("kimi_quota_updated_at", None)
         chat["kimi_verified_account_id"] = account_id
+        if not previous_account_id and account_id and chat.get("kimi_usage_cache_owner"):
+            chat["kimi_usage_cache_owner"] = self._information_cache_owner(chat, "kimi")
+            pending = self._kimi_information_requests.get(identity[0])
+            if isinstance(pending, dict) and pending.get("identity") == identity:
+                pending["cache_owner"] = self._information_cache_owner(chat, "kimi")
         if (verified_changed or chat.get("kimi_quota_payload") != payload or bool(chat.get("kimi_quota_error")) != failed
                 or chat.get("kimi_quota_owner") != account_id):
             chat["kimi_quota_payload"] = payload
@@ -2708,6 +2823,8 @@ class ChatFrame(wx.Frame):
             chat["kimi_quota_owner"] = account_id
         if not failed and isinstance(payload, dict) and payload.get("kind") == "ok":
             chat["kimi_quota_updated_at"] = time.time()
+        else:
+            chat.pop("kimi_quota_updated_at", None)
         if self._chat_information_rows(chat, owner[1]) != old_rows:
             self._refresh_chat_information(chat)
 
@@ -2719,11 +2836,17 @@ class ChatFrame(wx.Frame):
         if not isinstance(request, dict) or request.get("generation") != generation or request.get("identity") != identity:
             return
         chat, _is_current = self._kimi_target_chat(chat_id)
-        if not isinstance(chat, dict) or self._chat_information_identity(chat, identity[1]) != identity:
+        if not isinstance(chat, dict):
+            return
+        self._validate_information_cache_owner(chat, "kimi")
+        if (self._chat_information_identity(chat, identity[1]) != identity
+                or self._kimi_information_requests.get(chat_id) is not request
+                or tuple(request.get("cache_owner", self._information_cache_owner(chat, "kimi"))) != self._information_cache_owner(chat, "kimi")):
             return
         if request.get("visible_only"):
             dialog = getattr(self, "_chat_information_dialog", None)
-            if dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity:
+            if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
+                    or request.get("dialog", dialog) is not dialog):
                 self._kimi_information_requests.pop(chat_id, None)
                 return
         changed = False
@@ -2734,16 +2857,17 @@ class ChatFrame(wx.Frame):
             })
             if usage is not None:
                 changed = self._set_chat_context_usage(chat, usage)
-            elif chat.get("context_usage") is not None:
-                chat["context_usage"] = None
-                changed = True
             if bool(chat.get("kimi_context_error")) != bool(failed):
                 chat["kimi_context_error"] = bool(failed)
                 changed = True
         elif kind == "snapshot":
             total = None if failed else kimi_snapshot_total_tokens(payload)
-            if chat.get("kimi_session_total_tokens") != total:
+            if total is not None and chat.get("kimi_session_total_tokens") != total:
                 chat["kimi_session_total_tokens"] = total
+                changed = True
+            if total is not None:
+                chat["kimi_total_observed_at"] = time.time()
+                chat["kimi_usage_cache_owner"] = self._information_cache_owner(chat, "kimi")
                 changed = True
             if bool(chat.get("kimi_snapshot_error")) != bool(failed):
                 chat["kimi_snapshot_error"] = bool(failed)
@@ -9641,6 +9765,10 @@ class ChatFrame(wx.Frame):
         preserve_total = bool(preserve and chat_id and self._codex_early_context_usage_owner.get((chat_id, preserve[0])) == preserve[1:])
         if not preserve_total:
             chat["codex_session_total_tokens"] = None
+            chat.pop("codex_total_observed_at", None)
+            chat.pop("codex_usage_cache_owner", None)
+        chat.pop("codex_context_error", None)
+        chat.pop("codex_snapshot_error", None)
         chat["codex_context_generation"] = int(chat.get("codex_context_generation") or 0) + 1
         if chat_id:
             for key in list(self._pending_context_usage_by_turn):
@@ -10399,6 +10527,8 @@ class ChatFrame(wx.Frame):
         if usage is not None and usage.source == "kimi":
             chat["context_usage"] = None
         chat["kimi_session_total_tokens"] = None
+        chat.pop("kimi_total_observed_at", None)
+        chat.pop("kimi_usage_cache_owner", None)
         chat["kimi_context_error"] = False
         chat["kimi_snapshot_error"] = False
         chat["kimi_information_generation"] = int(chat.get("kimi_information_generation") or 0) + 1
@@ -12810,11 +12940,16 @@ class ChatFrame(wx.Frame):
                 return
         if event_type == "token_count" and isinstance(identity_chat, dict):
             event_data = event.data if isinstance(event.data, dict) else {}
+            identity_chat["codex_usage_revision"] = int(identity_chat.get("codex_usage_revision") or 0) + 1
             total = event_data.get("session_total_tokens")
             if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
-                if identity_chat.get("codex_session_total_tokens") != total:
-                    identity_chat["codex_session_total_tokens"] = total
-                    self._refresh_chat_information(identity_chat)
+                identity_chat["codex_total_observed_at"] = time.time()
+                identity_chat["codex_snapshot_error"] = False
+                identity_chat["codex_usage_cache_owner"] = self._information_cache_owner(identity_chat, "codex")
+                total_changed = identity_chat.get("codex_session_total_tokens") != total
+                identity_chat["codex_session_total_tokens"] = total
+                self._refresh_chat_information(identity_chat)
+                if total_changed:
                     self._defer_codex_state_save()
             if not event.usage:
                 return
@@ -16734,6 +16869,10 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
             event.Skip()
             return
+        if alt_down and not ctrl_down and key in (ord("Y"), ord("y")):
+            self._chat_information_previous_focus = wx.Window.FindFocus()
+            self._show_chat_information()
+            return
         if self._handle_input_focus_space_shortcut(event):
             return
         self._touch_navigation_quiet_window(event)
@@ -18842,6 +18981,11 @@ class ChatFrame(wx.Frame):
         if hasattr(usage, "to_dict"):
             usage = usage.to_dict()
         if isinstance(usage, dict):
+            source = usage.get("source")
+            if source in {"codex", "kimi"}:
+                chat[f"{source}_usage_cache_owner"] = self._information_cache_owner(chat, source)
+            if source in {"codex", "kimi"}:
+                chat[f"{source}_context_error"] = False
             if not self._context_usage_payload_changed(chat.get("context_usage"), usage):
                 return False
             chat["context_usage"] = usage

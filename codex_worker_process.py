@@ -342,13 +342,24 @@ class CodexWorkerRuntime:
             self._emit_protocol_error(message, "read_chat_information requires payload.chat_id")
             return
         result: dict[str, Any] = {"chat_id": chat_id, "model": model, "identity": payload.get("identity"),
-                                  "generation": payload.get("generation")}
+                                  "generation": payload.get("generation"),
+                                  "context_only": bool(payload.get("context_only"))}
         try:
             client = self._client_for(chat_id, model)
         except Exception as exc:
+            result["usage_error"] = str(exc)
             result["account_error"] = str(exc)
             result["rate_limits_error"] = str(exc)
         else:
+            identity = payload.get("identity") or []
+            if len(identity) > 2 and identity[2]:
+                try:
+                    result["native_usage"] = client.read_native_usage(str(identity[2]))
+                except Exception as exc:
+                    result["usage_error"] = str(exc)
+            if result["context_only"]:
+                self.emit("chat_information", result, request_id=message.get("id"))
+                return
             try:
                 result["account"] = client.read_account(refresh_token=False)
             except Exception as exc:

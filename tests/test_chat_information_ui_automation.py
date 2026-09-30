@@ -12,9 +12,206 @@ _REAL_KIMI_INFORMATION_REQUEST = main.ChatFrame._request_kimi_chat_information
 _REAL_KIMI_QUOTA_REQUEST = main.ChatFrame._request_kimi_quota
 
 
+@pytest.mark.parametrize("model", ["codex/main", "kimi/main"])
+@pytest.mark.parametrize("control", ["input_edit", "answer_list", "history_list", "notes_editor"])
+def test_epic1_alt_y_restores_every_focus(frame, wx_app, model, control):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = model
+    frame.active_chat_id = "epic1"
+    frame._current_chat_state = {"id": "epic1", "model": model, "codex_thread_id": "native", "kimi_session_id": "native"}
+    frame._apply_detail_panel_mode("answers")
+    if control == "notes_editor":
+        frame.notes_controller.notes_view = "note_edit"
+        frame._notes_sync_view_visibility()
+    frame.Raise()
+    ctypes.WinDLL("user32", use_last_error=True).SetForegroundWindow(int(frame.GetHandle()))
+    wx_app.Yield()
+    target = getattr(frame, control)
+    target.SetFocus()
+    wx_app.Yield()
+    assert target.IsShownOnScreen() and target.IsEnabled()
+    assert main.wx.Window.FindFocus() is target
+    event = main.wx.KeyEvent(main.wx.wxEVT_CHAR_HOOK)
+    event.SetKeyCode(ord("Y"))
+    event.SetAltDown(True)
+    frame._on_char_hook(event)
+    dialog = frame._chat_information_dialog
+    assert dialog is not None
+    assert dialog.focus_target is target
+    wx_app.Yield()
+    assert main.wx.Window.FindFocus() is dialog.information_list
+    assert dialog.context_timer.GetInterval() == 10000
+    dialog._on_char_hook(SimpleNamespace(GetKeyCode=lambda: main.wx.WXK_ESCAPE))
+    wx_app.Yield()
+    assert frame._chat_information_dialog is None
+    assert main.wx.Window.FindFocus() is target
+
+
+@pytest.mark.parametrize("model", ["codex/main", "kimi/main"])
+def test_epic1_context_timer_and_closed_lifetime(frame, wx_app, monkeypatch, model):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = model
+    frame.active_chat_id = "epic1"
+    frame._current_chat_state = {"id": "epic1", "model": model, "codex_thread_id": "native", "kimi_session_id": "native"}
+    calls = []
+    method = "_request_codex_chat_information" if model.startswith("codex") else "_request_kimi_chat_information"
+    monkeypatch.setattr(frame, method, lambda *_a, **kw: calls.append(kw.get("context_only", False)))
+    assert frame._show_chat_information()
+    assert calls == [False]
+    dialog = frame._chat_information_dialog
+    dialog._on_context_timer(None)
+    assert calls == [False, True]
+    frame._chat_information_request = (None, 3, dialog.identity)
+    frame._kimi_information_requests["epic1"] = {"visible_only": True}
+    dialog.Close()
+    wx_app.Yield()
+    assert frame._chat_information_request is None
+    assert "epic1" not in frame._kimi_information_requests
+    dialog._on_context_timer(None)
+    assert calls == [False, True]
+
+
+def test_epic1_codex_pull_rejects_event_revision_and_keeps_failure_cache(frame, wx_app):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = "epic1"
+    chat = {"id": "epic1", "model": "codex/main", "codex_thread_id": "native"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    identity = frame._chat_information_dialog.identity
+    def apply(generation, usage=None, error=None):
+        frame._chat_information_request = (None, generation, identity)
+        frame._apply_codex_chat_information("epic1", {}, {"identity": list(identity), "generation": generation,
+            "context_only": True, "native_usage": usage or {}, "usage_error": error})
+    native = {"context_usage": {"source": "codex", "used_tokens": 120, "context_window": 1000},
+              "session_total_tokens": 900, "observed_at": "2026-09-30T01:00:00Z"}
+    apply(1, native)
+    assert chat["codex_session_total_tokens"] == 900
+    assert "12.0%" in frame._chat_information_dialog.information_list.GetString(0)
+    apply(2, error="offline")
+    assert "查询失败" in frame._chat_information_dialog.information_list.GetString(0)
+    assert chat["codex_session_total_tokens"] == 900
+    chat["codex_usage_revision"] = 1
+    apply(3, {"session_total_tokens": 9999})
+    assert chat["codex_session_total_tokens"] == 900
+    frame._codex_information_revision = 1
+    apply(4, native)
+    assert "查询失败" not in frame._chat_information_dialog.information_list.GetString(0)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi"])
+@pytest.mark.parametrize("field", ["session", "account"])
+def test_epic1_cached_usage_is_invalidated_without_callback(frame, provider, field):
+    model = provider + "/main"
+    native_key = "codex_thread_id" if provider == "codex" else "kimi_session_id"
+    chat = {"id": "epic1", "model": model, native_key: "old", provider + "_account_id": "a",
+            provider + "_session_total_tokens": 900}
+    frame._set_chat_context_usage(chat, {"source": provider, "used_tokens": 120, "context_window": 1000})
+    chat[native_key if field == "session" else provider + "_account_id"] = "new"
+    rows = frame._chat_information_rows(chat, model)
+    assert "暂不可用" in rows[0] and "暂不可用" in rows[1]
+    assert chat[provider + "_session_total_tokens"] is None
+
+
+def test_epic1_old_kimi_callback_does_not_clear_new_session_cache(frame):
+    chat = {"id": "epic1", "model": "kimi/main", "kimi_session_id": "new", "kimi_session_total_tokens": 900}
+    frame._current_chat_state = chat
+    frame.active_chat_id = frame.current_chat_id = "epic1"
+    frame._set_chat_context_usage(chat, {"source": "kimi", "used_tokens": 120, "context_window": 1000})
+    identity = ("epic1", "kimi/main", "old", "")
+    frame._kimi_information_requests["epic1"] = {"generation": 1, "identity": identity}
+    frame._apply_kimi_chat_information_result("epic1", 1, identity, "snapshot", None, True)
+    assert chat["kimi_session_total_tokens"] == 900
+
+
+def test_epic1_real_kimi_context_only_updates_status_without_snapshot(frame, wx_app, monkeypatch):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = frame.current_chat_id = "epic1"
+    chat = {"id": "epic1", "model": "kimi/main", "kimi_session_id": "native"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    calls = []
+    class Client:
+        def start(self):
+            pass
+        def get_status(self, session):
+            calls.append("status")
+            return {"context_tokens": 120, "max_context_tokens": 1000}
+        def get_snapshot(self, session):
+            calls.append("snapshot")
+            return {}
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_chat_information", _REAL_KIMI_INFORMATION_REQUEST)
+    frame._chat_information_dialog._on_context_timer(None)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and "12.0%" not in frame._chat_information_dialog.information_list.GetString(0):
+        wx_app.Yield()
+        time.sleep(.01)
+    assert calls == ["status"]
+    assert "12.0%" in frame._chat_information_dialog.information_list.GetString(0)
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
+@pytest.mark.parametrize("first_binding", [False, True])
+def test_epic1_quota_error_or_first_identity_does_not_delete_usage(frame, wx_app, first_binding):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "kimi/main"
+    frame.active_chat_id = frame.current_chat_id = "epic1"
+    chat = {"id": "epic1", "model": "kimi/main", "kimi_session_id": "native",
+            "kimi_session_total_tokens": 900, "kimi_total_observed_at": 1700000000,
+            "kimi_verified_account_id": "" if first_binding else "A"}
+    frame._current_chat_state = chat
+    frame._set_chat_context_usage(chat, {"source": "kimi", "used_tokens": 120,
+                                       "context_window": 1000, "updated_at": 1700000000})
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    before = list(dialog.information_list.GetStrings())[:2]
+    frame._kimi_quota_request = (1, dialog.identity)
+    payload = {"kind": "ok", "_account_id": "A", "quota": {}} if first_binding else None
+    frame._apply_kimi_quota(1, dialog.identity, payload, not first_binding)
+    assert chat["kimi_verified_account_id"] == "A"
+    assert list(dialog.information_list.GetStrings())[:2] == before
+    if not first_binding:
+        assert "查询失败" in dialog.information_list.GetString(2)
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_epic1_total_only_native_timestamp_and_send_failure(frame, wx_app):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = "epic1"
+    chat = {"id": "epic1", "model": "codex/main", "codex_thread_id": "native"}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    frame._chat_information_request = (None, 1, dialog.identity)
+    frame._apply_codex_chat_information("epic1", {}, {"identity": list(dialog.identity), "generation": 1,
+        "context_only": True, "native_usage": {"context_usage": None, "session_total_tokens": 900,
+                                                  "observed_at": "2026-09-30T01:00:00Z"}})
+    assert chat["codex_total_observed_at"] == main.datetime.fromisoformat("2026-09-30T01:00:00+00:00").timestamp()
+    previous_stamp = chat["codex_total_observed_at"]
+    frame._chat_information_request = (None, 2, dialog.identity)
+    frame._fail_codex_chat_information_request(2, dialog.identity)
+    assert "查询失败" in dialog.information_list.GetString(1)
+    assert chat["codex_session_total_tokens"] == 900 and chat["codex_total_observed_at"] == previous_stamp
+    dialog.Close()
+    wx_app.Yield()
+
+
 @pytest.fixture(autouse=True)
 def _disable_external_codex_information_reads(monkeypatch):
-    monkeypatch.setattr(main.ChatFrame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(main.ChatFrame, "_request_codex_chat_information", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main.ChatFrame, "_request_kimi_chat_information", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", lambda *_args, **_kwargs: None)
 
@@ -715,7 +912,14 @@ def test_codex_total_and_weekly_quota_rows_ignore_stale_reply(frame, wx_app, mon
         type="token_count", thread_id="thread-1", turn_id="turn-1",
         data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 789},
     ))
-    assert dialog.information_list.GetString(1) == "会话累计 token：789"
+    assert dialog.information_list.GetString(1).startswith("会话累计 token：789（缓存，上次观测于 ")
+    chat["codex_snapshot_error"] = True
+    frame._refresh_chat_information(chat)
+    assert "查询失败" in dialog.information_list.GetString(1)
+    frame._on_codex_event_for_chat("chat-1", main.CodexEvent(
+        type="token_count", thread_id="thread-1", turn_id="turn-1",
+        data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 789}))
+    assert "查询失败" not in dialog.information_list.GetString(1)
     frame._handle_codex_clear_command(chat)
     assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
     frame._on_codex_event_for_chat("chat-1", main.CodexEvent(
@@ -896,7 +1100,7 @@ def test_kimi_status_snapshot_and_session_clear_keep_focus_and_reject_old_result
                                                                       "output_tokens": 200,
                                                                       "cache_read_tokens": 999}}}, False)
     assert "25.0%" in dialog.information_list.GetString(0)
-    assert dialog.information_list.GetString(1) == "会话累计 token：900"
+    assert dialog.information_list.GetString(1).startswith("会话累计 token：900（缓存，上次观测于 ")
     assert dialog.information_list.GetSelection() == 1
     assert main.wx.Window.FindFocus() is dialog.information_list
 
@@ -915,8 +1119,10 @@ def test_kimi_status_snapshot_and_session_clear_keep_focus_and_reject_old_result
     frame._apply_kimi_chat_information_result("chat-1", 3, identity, "snapshot",
                                                {"session": {"usage": {"input_tokens": 80,
                                                                       "output_tokens": 20}}}, False)
-    assert dialog.information_list.GetString(0) == "当前上下文：查询失败"
-    assert dialog.information_list.GetString(1) == "会话累计 token：100"
+    assert "300 token，窗口未知" in dialog.information_list.GetString(0)
+    assert "查询失败" in dialog.information_list.GetString(0)
+    assert "上次观测于" in dialog.information_list.GetString(0)
+    assert dialog.information_list.GetString(1).startswith("会话累计 token：100（缓存，上次观测于 ")
     frame._kimi_information_requests["chat-1"] = {
         "generation": 4, "identity": identity, "context_revision": 0, "visible_only": True,
         "remaining": {"status", "snapshot"},
@@ -925,7 +1131,8 @@ def test_kimi_status_snapshot_and_session_clear_keep_focus_and_reject_old_result
                                                {"context_tokens": 200, "max_context_tokens": 1000}, False)
     frame._apply_kimi_chat_information_result("chat-1", 4, identity, "snapshot", None, True)
     assert "20.0%" in dialog.information_list.GetString(0)
-    assert dialog.information_list.GetString(1) == "会话累计 token：查询失败"
+    assert dialog.information_list.GetString(1).startswith("会话累计 token：100（缓存，上次观测于 ")
+    assert "查询失败" in dialog.information_list.GetString(1)
     frame._kimi_information_requests["chat-1"] = {
         "generation": 5, "identity": identity, "context_revision": 0, "visible_only": True,
         "remaining": {"status", "snapshot"},
@@ -1092,7 +1299,7 @@ def test_kimi_completion_refresh_starts_only_for_visible_information(frame, wx_a
     frame._request_kimi_chat_information(chat, "kimi/main", visible_only=True)
     wx_app.Yield()
     assert calls == ["start", ("status", "session-1"), ("snapshot", "session-1")]
-    assert frame._chat_information_dialog.information_list.GetString(1) == "会话累计 token：7"
+    assert frame._chat_information_dialog.information_list.GetString(1).startswith("会话累计 token：7（缓存，上次观测于 ")
     frame._chat_information_dialog.Close()
     wx_app.Yield()
 
@@ -1126,7 +1333,7 @@ def test_kimi_live_status_wins_over_older_panel_status_reply(frame, wx_app):
     assert "10.0%" in dialog.information_list.GetString(0)
     frame._apply_kimi_chat_information_result("chat-1", 1, identity, "snapshot",
                                                {"session": {"usage": {"input_tokens": 3, "output_tokens": 4}}}, False)
-    assert dialog.information_list.GetString(1) == "会话累计 token：7"
+    assert dialog.information_list.GetString(1).startswith("会话累计 token：7（缓存，上次观测于 ")
     dialog.Close()
     wx_app.Yield()
 

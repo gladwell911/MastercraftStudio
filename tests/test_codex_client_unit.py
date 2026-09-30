@@ -4,6 +4,60 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import codex_client
+import json
+import pytest
+
+
+def test_native_usage_reads_latest_complete_owned_record(tmp_path, monkeypatch):
+    path = tmp_path / "rollout.jsonl"
+    def record(last, total):
+        return {"type": "event_msg", "timestamp": "2026-09-30T01:00:00Z", "payload": {
+            "type": "token_count", "info": {"last_token_usage": {"total_tokens": last},
+            "total_token_usage": {"total_tokens": total}, "model_context_window": 1000}}}
+    rows = [{"type": "session_meta", "payload": {"id": "native"}}, record(300, 800), record(120, 900)]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n" + json.dumps(record(999, 9999)), encoding="utf-8")
+    client = codex_client.CodexAppServerClient()
+    calls = []
+    monkeypatch.setattr(client, "read_thread", lambda thread_id, include_turns: calls.append((thread_id, include_turns)) or {"thread": {"id": "native", "path": str(path)}})
+    result = client.read_native_usage("native")
+    assert calls == [("native", False)]
+    assert result["context_usage"]["used_tokens"] == 120
+    assert result["context_usage"]["context_window"] == 1000
+    assert result["session_total_tokens"] == 900
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "other"}}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="session identity"):
+        client.read_native_usage("native")
+
+
+def test_native_usage_missing_and_bounded_malformed_tail(tmp_path, monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    monkeypatch.setattr(client, "read_thread", lambda *_a, **_k: {"thread": {"id": "native"}})
+    assert client.read_native_usage("native") == {}
+    path = tmp_path / "rollout.jsonl"
+    header = json.dumps({"type": "session_meta", "payload": {"id": "native"}}) + "\n"
+    record = {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 900}}}}
+    path.write_text(header + json.dumps(record) + "\n" + "broken\n" * 200000, encoding="utf-8")
+    monkeypatch.setattr(client, "read_thread", lambda *_a, **_k: {"thread": {"id": "native", "path": str(path)}})
+    assert client.read_native_usage("native")["session_total_tokens"] == 900
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+    result = client.read_native_usage("native")
+    assert result["context_usage"] is None
+    assert result["session_total_tokens"] == 900
+
+
+def test_native_usage_skips_nonobject_json_and_reports_scan_limit(tmp_path, monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    path = tmp_path / "rollout.jsonl"
+    header = json.dumps({"type": "session_meta", "payload": {"id": "native"}}) + "\n"
+    record = {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 900}}}}
+    path.write_text(header + json.dumps(record) + "\nnull\n[]\n\"bad\"\n", encoding="utf-8")
+    monkeypatch.setattr(client, "read_thread", lambda *_a, **_k: {"thread": {"id": "native", "path": str(path)}})
+    assert client.read_native_usage("native")["session_total_tokens"] == 900
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("x" * (9 * 1048576))
+    with pytest.raises(ValueError, match="scan limit"):
+        client.read_native_usage("native")
 
 
 class _BrokenAppServerStdin:
