@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- Epic1“聊天信息准确与快速刷新”（CAP-1/8/9）已完成，实施提交 `7e8ba0a196101464ec26349b57e70f3832dc9290`：原生会话累计用量、可见窗口 10 秒上下文补查、缓存归属与新鲜度、Alt+Y 和焦点恢复。工程验证去重 309 项通过；5 项 Kimi 执行摘要集成失败已在改动前基线逐项复现。独立真实键盘与定时器 QA 10 项通过；未改手机端、未重新打包或验证生产 Live。详见[实施记录](../../_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)及 [QA 报告](../../_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)。
 - Codex/Kimi 聊天信息 Story 1.1–1.5 已提交；桌面执行页和手机端共享 execution_page_v3 canonical 可视投影。已有定向 GUI、客户端及跨端 Local 记录，不能据此宣称完整套件通过。
 - 本次跨端聊天修复已覆盖八项问题：清除权威确认、Codex 回合归属、持久化后终答补发及失败重试、手机历史补齐、常用命令返回收键盘、过滤无意义的 Not Loaded、执行页焦点与回答页播报、当前详情新答单次震动。RC 另修复加载旧历史分页误震；跨端 Local Codex/Kimi 已通过。真实 Live 和重新打包后的双机链路尚未验证。
 - 打包版常用命令改从个人 OneDrive\code\data\sj\common_commands.json 读取；源码运行仍用本地 history。打包版笔记改读同目录 notes.db，启动前校验存在性、SQLite 完整性和表结构；源码运行仍用 D:\code\note\notes.db。这些改动尚未重新打包。

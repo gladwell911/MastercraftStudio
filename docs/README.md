@@ -7,6 +7,7 @@
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [Epic1 实施记录](../../_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)与 [QA 报告](../../_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)：2026-09-30 聊天信息准确与快速刷新（CAP-1/8/9），含基线失败与真实键盘、定时器验证证据
 - [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
 - [`../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml`](../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml)：聊天信息五项任务；Story 1.1–1.5 已完成，后续进入发布验证
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
