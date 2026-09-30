@@ -1922,7 +1922,7 @@ class ChatFrame(wx.Frame):
         self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         self._codex_background_flush_scheduled = False
         self._codex_background_flush_dirty = False
-        self._pending_codex_ui_events: list[tuple[str, CodexEvent]] = []
+        self._pending_codex_ui_events: list[tuple] = []
         self._codex_ui_event_lock = threading.Lock()
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
@@ -9852,7 +9852,44 @@ class ChatFrame(wx.Frame):
             return
         resumed.discard(str(thread_id or "").strip())
 
+    def _capture_model_startup_request(self, chat_id: str, turn_idx: int):
+        _, turns, _ = self._chat_target_for_request(chat_id)
+        if not isinstance(turns, list) or not 0 <= turn_idx < len(turns):
+            return None
+        turn = turns[turn_idx]
+        if not isinstance(turn, dict):
+            return None
+        return (turn, turn.get("request_started_at"), turn.get("request_attempt_count"),
+                turn.get("codex_start_generation", turn.get("codex_context_generation")))
+
+    def _model_startup_request_is_current(self, chat_id: str, turn_idx: int, request) -> bool:
+        if request is None:
+            return False
+        current = self._capture_model_startup_request(chat_id, turn_idx)
+        return bool(current is not None and current[0] is request[0]
+                    and current[1:] == request[1:]
+                    and str(current[0].get("request_status") or "") in {"pending", "running"})
+
+    def _finish_model_startup_failure(self, chat_id: str, turn_idx: int, request,
+                                      message: str, model: str) -> None:
+        if not self._model_startup_request_is_current(chat_id, turn_idx, request):
+            return
+        if is_kimi_model(model):
+            self._clear_kimi_active_turn(chat_id, turn_idx)
+        self._on_done(turn_idx, "", message, model, "", chat_id)
+
+    def _apply_kimi_startup_state(self, chat_id: str, turn_idx: int, request, payload: dict) -> None:
+        if self._model_startup_request_is_current(chat_id, turn_idx, request):
+            self._apply_kimi_thread_state(chat_id, payload)
+
+    def _apply_codex_request_started(self, chat_id: str, turn_idx: int, request, *args) -> None:
+        if self._model_startup_request_is_current(chat_id, turn_idx, request):
+            self._mark_codex_worker_turn_request_started(chat_id, turn_idx, *args)
+
     def _run_codex_turn_worker(self, chat_id: str, turn_idx: int, question: str, model: str, from_recovery: bool = False) -> None:
+        startup_request = self._capture_model_startup_request(chat_id, turn_idx)
+        if startup_request is None:
+            return
         is_current_target = chat_id in {self.active_chat_id, self.current_chat_id, ""}
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
         if not isinstance(target_chat, dict):
@@ -9890,6 +9927,8 @@ class ChatFrame(wx.Frame):
             should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
             history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
             client.start()
+            if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
+                return
             client.start_turn(
                 chat_id=client_chat_id,
                 turn_idx=turn_idx,
@@ -9906,9 +9945,10 @@ class ChatFrame(wx.Frame):
                 history_turns=history_turns,
             )
             self._call_after_if_alive(
-                self._mark_codex_worker_turn_request_started,
+                self._apply_codex_request_started,
                 client_chat_id,
                 turn_idx,
+                startup_request,
                 service_tier,
                 thread_id,
                 turn_id,
@@ -9916,7 +9956,7 @@ class ChatFrame(wx.Frame):
                 recovery_context,
             )
         except Exception as exc:
-            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+            self._call_after_if_alive(self._finish_model_startup_failure, chat_id, turn_idx, startup_request, str(exc), model)
 
     def _mark_codex_worker_turn_request_started(
         self,
@@ -10608,6 +10648,10 @@ class ChatFrame(wx.Frame):
         return "\n".join(lines)
 
     def _run_kimi_turn_worker(self, chat_id: str, turn_idx: int, question: str, model: str, from_recovery: bool = False) -> None:
+        startup_request = self._capture_model_startup_request(chat_id, turn_idx)
+        if startup_request is None:
+            return
+        submission_intent = None
         is_current_target = chat_id in {self.active_chat_id, self.current_chat_id, ""}
         target_chat = self._current_chat_state if is_current_target else self._find_archived_chat(chat_id)
         if not isinstance(target_chat, dict):
@@ -10643,6 +10687,8 @@ class ChatFrame(wx.Frame):
             history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
             client = self._ensure_kimi_client()
             self._start_kimi_client_with_retry(client)
+            if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
+                return
             if session_id:
                 exists_error: Exception | None = None
                 for attempt in range(max(1, int(self._kimi_reconcile_attempts))):
@@ -10721,8 +10767,10 @@ class ChatFrame(wx.Frame):
                 }
                 self._register_kimi_prompt_owner(unresolved_owner)
                 self._call_after_if_alive(
-                    self._apply_kimi_thread_state,
+                    self._apply_kimi_startup_state,
                     client_chat_id,
+                    turn_idx,
+                    startup_request,
                     {
                         **unresolved_owner,
                         "active": True,
@@ -10794,8 +10842,10 @@ class ChatFrame(wx.Frame):
                 if isinstance(metadata, dict):
                     metadata.update(owner)
             self._call_after_if_alive(
-                self._apply_kimi_thread_state,
+                self._apply_kimi_startup_state,
                 client_chat_id,
+                turn_idx,
+                startup_request,
                 {
                     "session_id": session_id,
                     "prompt_id": str(prompt_id or "").strip(),
@@ -10814,12 +10864,11 @@ class ChatFrame(wx.Frame):
                 pending = self._kimi_pending_submissions.get(session_id, [])
                 pending[:] = [
                     intent for intent in pending
-                    if intent.get("turn_idx") != turn_idx or intent.get("chat_id") != client_chat_id
+                    if intent is not submission_intent
                 ]
                 if not pending:
                     self._kimi_pending_submissions.pop(session_id, None)
-            self._clear_kimi_active_turn(client_chat_id, turn_idx)
-            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+            self._call_after_if_alive(self._finish_model_startup_failure, chat_id, turn_idx, startup_request, str(exc), model)
         finally:
             if submission_lock is not None:
                 submission_lock.release()
@@ -12771,14 +12820,14 @@ class ChatFrame(wx.Frame):
     def _should_queue_codex_ui_event(self, chat_id: str, event: CodexEvent) -> bool:
         return True
 
-    def _dispatch_codex_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
+    def _dispatch_codex_event_to_ui(self, chat_id: str, event: CodexEvent, source_client: object = None) -> None:
         if not event or not self._should_queue_codex_ui_event(chat_id, event):
             return
         if not self._is_ui_alive():
             return
         should_schedule = False
         with self._codex_ui_event_lock:
-            self._pending_codex_ui_events.append((str(chat_id or "").strip(), event))
+            self._pending_codex_ui_events.append((str(chat_id or "").strip(), event, source_client))
             if not self._codex_ui_event_flush_scheduled:
                 self._codex_ui_event_flush_scheduled = True
                 should_schedule = True
@@ -12797,7 +12846,11 @@ class ChatFrame(wx.Frame):
             self._codex_ui_batch_depth += 1
             self._background_ui_update_depth += 1
             try:
-                for queued_chat_id, queued_event in batch:
+                for queued_entry in batch:
+                    queued_chat_id, queued_event = queued_entry[:2]
+                    source_client = queued_entry[2] if len(queued_entry) > 2 else None
+                    if source_client is not None and not self._codex_source_client_is_current(queued_chat_id, source_client):
+                        continue
                     self._on_codex_event_for_chat(queued_chat_id, queued_event)
             finally:
                 self._background_ui_update_depth = max(0, self._background_ui_update_depth - 1)
@@ -12911,6 +12964,11 @@ class ChatFrame(wx.Frame):
             if identity_idx < 0:
                 return
             identity_turn = identity_turns[identity_idx]
+            if str(identity_turn.get("request_status") or "") == "failed" and (
+                event_type in {"turn_completed", "subagent_result"}
+                or (event_type == "item_completed" and str(event.phase or "") == "final_answer")
+            ):
+                return
             bound_thread = str(identity_turn.get("codex_thread_id") or "").strip()
             if bound_thread and event_thread_id and bound_thread != event_thread_id:
                 return
@@ -15413,6 +15471,12 @@ class ChatFrame(wx.Frame):
         self._pending_remote_final_retry_scheduled = False
         self._flush_pending_remote_finals()
 
+    def _codex_source_client_is_current(self, chat_id: str, client) -> bool:
+        current = self._codex_clients.get(str(chat_id or "").strip())
+        if current is None and chat_id in {self.active_chat_id, self.current_chat_id, ""}:
+            current = getattr(self, "_codex_client", None)
+        return current is client
+
     def _on_codex_worker_message(
         self,
         default_chat_id: str,
@@ -15420,6 +15484,8 @@ class ChatFrame(wx.Frame):
         client: CodexWorkerClient | None = None,
     ) -> None:
         if not isinstance(message, dict):
+            return
+        if client is not None and not self._codex_source_client_is_current(default_chat_id, client):
             return
         message_type = str(message.get("type") or "").strip()
         if (
@@ -15443,7 +15509,10 @@ class ChatFrame(wx.Frame):
             except Exception:
                 return
             self._apply_codex_worker_event_scope(event, payload)
-            self._dispatch_codex_event_to_ui(chat_id, event)
+            if client is None:
+                self._dispatch_codex_event_to_ui(chat_id, event)
+            else:
+                self._dispatch_codex_event_to_ui(chat_id, event, client)
             return
         if message_type == "thread_state":
             self._apply_codex_worker_thread_state(chat_id, payload)
@@ -15457,6 +15526,7 @@ class ChatFrame(wx.Frame):
                 str(payload.get("message") or ""),
                 payload.get("turn_idx"),
                 payload.get("turn_id"),
+                context_generation=payload.get("context_generation"),
             )
             return
         if message_type == "protocol_error":
@@ -15633,7 +15703,7 @@ class ChatFrame(wx.Frame):
                 count += 1
         return count
 
-    def _apply_codex_worker_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None) -> None:
+    def _apply_codex_worker_error(self, chat_id: str, message: str, turn_idx=None, turn_id: str | None = None, *, context_generation=None) -> None:
         target_chat, is_current_target = self._codex_worker_target_chat(chat_id)
         if not isinstance(target_chat, dict):
             return
@@ -15661,6 +15731,23 @@ class ChatFrame(wx.Frame):
         turn = target_turns[target_idx]
         if not isinstance(turn, dict):
             return
+        known_turn_id = str(turn.get("codex_turn_id") or "").strip()
+        error_turn_id = str(turn_id or "").strip()
+        if error_turn_id and known_turn_id and error_turn_id != known_turn_id:
+            return
+        try:
+            generation = int(target_chat.get("codex_context_generation") or 0)
+            turn_generation = int(turn.get("codex_context_generation") or 0)
+            start_generation = int(turn.get("codex_start_generation", turn_generation))
+            if context_generation is not None:
+                if isinstance(context_generation, bool) or int(context_generation) != start_generation or turn_generation != generation:
+                    return
+            elif generation and (not error_turn_id or error_turn_id != known_turn_id):
+                return
+        except (TypeError, ValueError):
+            return
+        if str(turn.get("request_status") or "") in {"done", "failed"}:
+            return
         self._mark_turn_request_failed(turn, message)
         active_count = self._codex_active_request_turn_count(target_turns)
         target_chat["codex_turn_active"] = active_count > 0
@@ -15679,9 +15766,14 @@ class ChatFrame(wx.Frame):
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 
-    def _on_codex_worker_exit(self, chat_id: str, returncode) -> None:
+    def _on_codex_worker_exit(self, chat_id: str, returncode, source_client=None) -> None:
         if threading.current_thread() is not threading.main_thread():
-            self._call_after_if_alive(self._on_codex_worker_exit, chat_id, returncode)
+            if source_client is None:
+                self._call_after_if_alive(self._on_codex_worker_exit, chat_id, returncode)
+            else:
+                self._call_after_if_alive(self._on_codex_worker_exit, chat_id, returncode, source_client)
+            return
+        if source_client is not None and not self._codex_source_client_is_current(chat_id, source_client):
             return
         if returncode in {None, 0}:
             return
@@ -15709,7 +15801,7 @@ class ChatFrame(wx.Frame):
 
         client = CodexWorkerClient(
             on_message=_on_message,
-            on_exit=lambda code, cid=key: self._on_codex_worker_exit(cid, code),
+            on_exit=lambda code, cid=key, ref=client_ref: self._on_codex_worker_exit(cid, code, ref.get("client")),
         )
         client_ref["client"] = client
         setattr(client, "codex_model", codex_model)
@@ -15730,7 +15822,7 @@ class ChatFrame(wx.Frame):
 
         client = CodexWorkerClient(
             on_message=_on_message,
-            on_exit=lambda code, cid=key: self._on_codex_worker_exit(cid, code),
+            on_exit=lambda code, cid=key, ref=client_ref: self._on_codex_worker_exit(cid, code, ref.get("client")),
         )
         client_ref["client"] = client
         setattr(client, "codex_model", codex_model)

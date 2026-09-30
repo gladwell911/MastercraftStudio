@@ -701,3 +701,122 @@ def test_new_chat_preserves_previous_codex_session(frame, monkeypatch):
     assert archived["codex_thread_id"] == TEST_THREAD_ID
     assert archived["turns"][0]["question"] == "闂A"
 
+
+
+def test_codex_startup_failure_callback_rejects_reused_turn(frame, monkeypatch):
+    frame.model_combo.SetValue("codex")
+    frame.selected_model = "codex/main"
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+    frame._refresh_openclaw_sync_lifecycle = lambda **kw: None
+    frame._play_send_sound = lambda: None
+    callbacks = []
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *a, **kw: callbacks.append((fn,a,kw)))
+    class Client:
+        def start(self):
+            raise ConnectionError("old codex startup")
+    frame._get_or_create_codex_client = lambda *a: Client()
+    frame.input_edit.SetValue("old request")
+    frame._on_send_clicked(None)
+    replacement = dict(frame.active_session_turns[0], question="new request", request_status="pending", answer_md=main.REQUESTING_TEXT)
+    frame.active_session_turns[:] = [replacement]
+    for fn, a, kw in callbacks:
+        fn(*a, **kw)
+    assert replacement["request_status"] == "pending"
+
+
+def test_retired_codex_client_error_does_not_fail_current_turn(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question": "new", "request_status": "pending", "answer_md": main.REQUESTING_TEXT, "codex_context_generation": 2}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "scope-chat", "turns": frame.active_session_turns, "codex_context_generation": 2}
+    old_client, new_client = object(), object()
+    frame._codex_clients["scope-chat"] = new_client
+    frame._on_codex_worker_message("scope-chat", {"type":"error", "payload":{"chat_id":"scope-chat","turn_idx":0,"context_generation":1,"message":"old failure"}}, old_client)
+    assert turn["request_status"] == "pending"
+
+
+def test_queued_codex_final_rechecks_source_client_before_application(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question":"new", "request_status":"pending", "answer_md":main.REQUESTING_TEXT,
+            "codex_context_generation":3, "codex_start_generation":2,
+            "codex_turn_id":"native-new", "codex_thread_id":"thread-new"}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id":"scope-chat", "turns":frame.active_session_turns,
+        "codex_context_generation":3, "codex_thread_id":"thread-new", "codex_turn_id":"native-new"}
+    old, current = object(), object()
+    frame._codex_clients["scope-chat"] = old
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda *args, **kwargs: True)
+    event = CodexEvent(type="item_completed", thread_id="thread-new", turn_id="native-new",
+        phase="final_answer", text="queued final", status="completed",
+        data={"turn_idx":0, "context_generation":2})
+    message = {"type":"event", "payload":{"chat_id":"scope-chat", "turn_idx":0,
+        "context_generation":2, "event":main.codex_worker_protocol.event_to_payload(event)}}
+    frame._on_codex_worker_message("scope-chat", message, old)
+    assert len(frame._pending_codex_ui_events) == 1
+    frame._codex_clients["scope-chat"] = current
+    frame._drain_codex_ui_events()
+    assert turn["request_status"] == "pending"
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+    frame._on_codex_worker_message("scope-chat", message, current)
+    frame._drain_codex_ui_events()
+    assert turn["answer_md"] == "queued final"
+
+
+def test_old_codex_generation_error_does_not_fail_current_turn(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question": "new", "request_status": "pending", "answer_md": main.REQUESTING_TEXT, "codex_context_generation": 2}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id": "scope-chat", "turns": frame.active_session_turns, "codex_context_generation": 2}
+    frame._on_codex_worker_message("scope-chat", {"type":"error", "payload":{"chat_id":"scope-chat","turn_idx":0,"context_generation":1,"message":"old failure"}})
+    assert turn["request_status"] == "pending"
+
+
+def test_codex_current_start_generation_error_ends_bound_request(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question":"new", "request_status":"pending", "answer_md":main.REQUESTING_TEXT,
+            "codex_context_generation":3, "codex_start_generation":2, "codex_turn_id":"native-new"}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id":"scope-chat", "turns":frame.active_session_turns, "codex_context_generation":3}
+    frame._on_codex_worker_message("scope-chat", {"type":"error", "payload":{
+        "chat_id":"scope-chat", "turn_idx":0, "turn_id":"native-new", "context_generation":2,"message":"current startup failed"}})
+    assert turn["request_status"] == "failed"
+    assert turn["request_error"] == "current startup failed"
+
+
+def test_codex_error_invalid_generation_or_conflicting_turn_is_ignored(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question":"new", "request_status":"pending", "answer_md":main.REQUESTING_TEXT,
+            "codex_context_generation":3, "codex_start_generation":2, "codex_turn_id":"native-new"}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id":"scope-chat", "turns":frame.active_session_turns, "codex_context_generation":3}
+    for generation, turn_id in [("invalid", "native-new"), (True, "native-new"), (2, "native-old")]:
+        frame._on_codex_worker_message("scope-chat", {"type":"error", "payload":{
+            "chat_id":"scope-chat", "turn_idx":0, "turn_id":turn_id,"context_generation":generation,"message":"stale"}})
+        assert turn["request_status"] == "pending"
+
+
+def test_retired_codex_client_exit_keeps_current_request_pending(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question":"new", "request_status":"pending", "answer_md":main.REQUESTING_TEXT}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id":"scope-chat", "turns":frame.active_session_turns}
+    frame._codex_worker_active_turns["scope-chat"] = {"turn_idx":0}
+    old, current = object(), object()
+    frame._codex_clients["scope-chat"] = current
+    frame._on_codex_worker_exit("scope-chat", 23, old)
+    assert turn["request_status"] == "pending"
+    frame._on_codex_worker_exit("scope-chat", 23, current)
+    assert turn["request_status"] == "failed"
+
+
+def test_late_final_cannot_revive_failed_codex_request(frame):
+    frame.active_chat_id = frame.current_chat_id = "scope-chat"
+    turn = {"question":"new", "request_status":"failed", "request_error":"startup buffer overflow", "answer_md":"startup buffer overflow",
+            "codex_context_generation":3, "codex_start_generation":2, "codex_turn_id":"native-new", "codex_thread_id":"thread-new"}
+    frame.active_session_turns = [turn]
+    frame._current_chat_state = {"id":"scope-chat", "turns":frame.active_session_turns, "codex_context_generation":3, "codex_thread_id":"thread-new", "codex_turn_id":"native-new"}
+    for kind in ["item_completed", "turn_completed"]:
+        event = CodexEvent(type=kind, thread_id="thread-new", turn_id="native-new", phase="final_answer", text="late final", status="completed", data={"turn_idx":0,"context_generation":2})
+        frame._on_codex_event_for_chat("scope-chat", event)
+    assert turn["request_status"] == "failed"
+    assert turn["answer_md"] == "startup buffer overflow"

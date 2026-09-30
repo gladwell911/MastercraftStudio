@@ -7535,7 +7535,9 @@ def test_codex_worker_message_pending_drains_and_dispatches_event(frame, monkeyp
 
     monkeypatch.setattr(frame, "_dispatch_codex_event_to_ui", lambda chat_id, event: dispatched.append((chat_id, event)))
 
-    frame._on_codex_worker_message("chat-c", {"type": "messages_pending"}, client=_FakeWorkerClient())
+    client = _FakeWorkerClient()
+    frame._codex_clients["chat-c"] = client
+    frame._on_codex_worker_message("chat-c", {"type": "messages_pending"}, client=client)
 
     assert len(dispatched) == 1
     assert dispatched[0][0] == "chat-c"
@@ -17729,6 +17731,8 @@ def test_codex_worker_uses_target_chat_runtime_state_instead_of_current_chat(fra
     monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda _chat_id: _Client())
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request(archived_chat_id)
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._worker("", 0, "恢复旧聊天", "codex/main", False, archived_chat_id)
 
     assert sent
@@ -17768,6 +17772,8 @@ def test_run_codex_turn_worker_sends_start_turn_to_worker(frame, monkeypatch):
     ]
     frame.active_session_turns = frame._current_chat_state["turns"]
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 0, "问题", main.DEFAULT_CODEX_MODEL)
 
     assert sent
@@ -17812,7 +17818,7 @@ def test_run_codex_turn_worker_schedules_request_state_mutation(frame, monkeypat
     frame.current_chat_id = "chat-current"
     frame._current_chat_state.update({"id": "chat-current", "codex_service_tier": ""})
     frame._current_chat_state["turns"] = [
-        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL}
+        {"question": "问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1}
     ]
     frame.active_session_turns = frame._current_chat_state["turns"]
 
@@ -17870,6 +17876,8 @@ def test_codex_worker_recovers_missing_thread_by_creating_new_one(frame, monkeyp
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 0, "新的 Codex 问题", "codex/main")
 
     assert sent
@@ -17920,6 +17928,8 @@ def test_codex_worker_resumes_existing_thread_after_restart(frame, monkeypatch):
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[1].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 1, "第三轮", "codex/main")
 
     assert seen["started"] == 1
@@ -17967,6 +17977,8 @@ def test_codex_worker_passes_saved_fast_service_tier_to_thread_and_turn(frame, m
     monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 0, "快速执行", "codex/main")
 
     assert sent[0]["service_tier"] == "fast"
@@ -18017,6 +18029,8 @@ def test_codex_worker_rebuilds_context_when_saved_rollout_is_missing(frame, monk
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[2].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 2, "第三轮问题", "codex/main")
 
     assert sent[0]["thread_id"] == "thread-stale"
@@ -18074,6 +18088,8 @@ def test_codex_worker_does_not_reuse_stale_thread_after_new_chat_reset(frame, mo
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request(frame.active_chat_id)
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker(frame.active_chat_id, 0, "新问题", "codex/gpt-5.4-medium")
 
     assert sent[0]["thread_id"] == ""
@@ -18118,6 +18134,8 @@ def test_codex_worker_sends_local_image_items_for_successful_attachments(frame, 
     monkeypatch.setattr(frame, "_save_state", lambda: None)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *args, **kwargs: None)
 
+    _, request_turns, _ = frame._chat_target_for_request("chat-current")
+    request_turns[0].update({"request_status": "pending", "request_started_at": 1.0, "request_attempt_count": 1})
     frame._run_codex_turn_worker("chat-current", 0, "", "codex/main")
 
     assert sent[0]["input_items"] == [{"type": "localImage", "path": str(image_path)}]

@@ -8,3 +8,7 @@
 - 验证边界：Local、只读 Live、真实模型、模拟器和实体机分别记录；宽套件既有失败按精确用例复核，不用定向通过替代全量结论。
 
 案例、协议细节和其余经验见 [归档原文](archive/entry-context-2026-09-29/experience.md)。
+- Startup callbacks must verify the original turn/request identity on the UI thread; chat_id/turn_idx can be reused after clear. Codex start generation stays distinct from context generation after native thread binding. A fast answer must follow worker ownership ACK in delivery order; bounded startup overflow fails explicitly, and late final events cannot revive failed requests.
+
+
+Startup buffering must only defer newly unacknowledged events. Preserve prior native owners through new-request failure, and carry source client identity through every asynchronous boundary until actual UI application.

@@ -1237,7 +1237,7 @@ def test_prompt_events_buffer_until_owner_is_persisted_then_replay_in_order(fram
     original_call_after = frame._call_after_if_alive
 
     def defer_owner_landing(fn, *args, **kwargs):
-        if getattr(fn, "__name__", "") == "_apply_kimi_thread_state":
+        if getattr(fn, "__name__", "") in {"_apply_kimi_startup_state", "_apply_kimi_thread_state"}:
             deferred.append((fn, args, kwargs))
             return None
         return original_call_after(fn, *args, **kwargs)
@@ -2013,7 +2013,7 @@ def test_early_answer_fragments_are_not_truncated_at_legacy_bucket_limit(frame, 
     original_call_after = frame._call_after_if_alive
 
     def defer_landing(fn, *args, **kwargs):
-        if getattr(fn, "__name__", "") == "_apply_kimi_thread_state":
+        if getattr(fn, "__name__", "") in {"_apply_kimi_startup_state", "_apply_kimi_thread_state"}:
             deferred.append((fn, args, kwargs))
             return None
         return original_call_after(fn, *args, **kwargs)
@@ -2598,3 +2598,58 @@ def test_failed_tool_events_create_no_execution_row(frame, monkeypatch):
     steps = frame._current_chat_state.get("execution_steps") or []
     assert not any(step.get("kimi_summary") for step in steps)
     assert not any(str(step.get("display_kind") or "") in {"command", "tool"} for step in steps)
+
+
+def test_startup_failure_callback_cannot_fail_reused_turn_index(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    callbacks = []
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *a, **kw: callbacks.append((fn, a, kw)))
+    fake.start = lambda: (_ for _ in ()).throw(ConnectionError("old startup failed"))
+    _submit(frame, "old request")
+    old_turn = frame.active_session_turns[0]
+    replacement = dict(old_turn, question="new request", answer_md=main.REQUESTING_TEXT, request_status="pending")
+    frame.active_session_turns[:] = [replacement]
+    for fn, args, kwargs in callbacks:
+        fn(*args, **kwargs)
+    assert replacement["request_status"] == "pending"
+    assert replacement["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_startup_exhaustion_ends_turn_and_next_send_submits(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.start = lambda: (_ for _ in ()).throw(ConnectionError("controlled startup exhausted"))
+    _submit(frame, "failed request")
+    assert frame.active_session_turns[-1]["request_status"] == "failed"
+    assert "controlled startup exhausted" in frame.active_session_turns[-1]["answer_md"]
+    assert not frame.is_running
+    fake.start = lambda: None
+    _submit(frame, "recovered request")
+    assert len(fake.submitted) == 1
+    assert fake.submitted[0]["blocks"][0]["text"].endswith("recovered request")
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
+
+
+def test_kimi_successful_startup_callback_rejects_reused_turn(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    callbacks = []
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *a, **kw: callbacks.append((fn,a,kw)))
+    _submit(frame, "old request")
+    replacement = dict(frame.active_session_turns[0], question="new request", request_status="pending")
+    frame.active_session_turns[:] = [replacement]
+    for fn, a, kw in callbacks:
+        fn(*a, **kw)
+    assert not replacement.get("kimi_session_id")
+    assert not frame.active_kimi_session_id
+
+
+def test_model_startup_callback_cannot_revive_terminal_turn(frame, monkeypatch):
+    _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "request")
+    chat_id = _active_chat_id(frame)
+    request = frame._capture_model_startup_request(chat_id, 0)
+    turn = frame.active_session_turns[0]
+    turn["request_status"] = "done"
+    turn["answer_md"] = "final"
+    frame._finish_model_startup_failure(chat_id, 0, request, "late failure", "kimi/main")
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "final"

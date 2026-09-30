@@ -26,3 +26,12 @@
 当前验证：MC 合同11/11；RC 合同/相关widget26、Android unit47、native8及分组定向通过；Local受控Codex/Kimi真实UI退出0；最终私有NATS标准driver退出0，覆盖两聊天、改名、重复/逆序/重连、用户同步零通知和实际通知点击正确owner/current title。Android15 emulator-5554真实安全锁屏显示独立真实聊天标题及“新消息”，无private body；手机测试仅模拟器。一次dog四lens合并审查完成，两个低风险fixture守卫问题修复并复测。
 
 生产 Live 因缺真实 Endpoint/Token/DesktopChatTitle 未验证；上述私有服务和模拟器证据不代表生产 Live或实体设备。最终实施与QA记录位于工作区 `_bmad-output/implementation-artifacts/plan-epic2-mobile-notifications.md`、`qa-epic2-mobile-notifications.md`。未发布或重新打包生产应用。
+
+## Epic 3 - 2026-10-01
+
+Model startup callbacks now verify the original turn and request identity before applying failure or session state. Codex rejects retired client callbacks and obsolete error generations. Its worker buffers bounded startup events until authoritative thread/turn ACK, then releases them in order; this fixes fast second-turn answers arriving before identity. Buffer overflow is explicit failure, and late final events cannot revive failed requests.
+
+Controlled recovery QA exercises native wx send/Alt+A, actual Kimi subprocess startup failure and HTTP/WS recovery, and actual Codex worker/app-server protocols with private temporary data. Alt+A retains automatic resend of the first question. Final evidence and exact baseline failures are recorded in workspace `_bmad-output/implementation-artifacts/plan-epic3-model-session-recovery.md` and `qa-epic3-model-session-recovery.md`. Production Live, real model services, repackaging and physical-device acceptance remain unverified; RC is unchanged.
+
+
+Formal Epic3 review repaired prior-turn event isolation during another failed/overflowing startup and retained source-client ownership across UI queueing. Independent final review patch verification: worker/Codex 61 passed, native recovery GUI 3 passed, exact regressions 3 passed; affected compilation passed. Exact 13 baseline failures remain recorded; controlled protocols do not establish production Live.

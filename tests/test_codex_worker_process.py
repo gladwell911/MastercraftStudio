@@ -1,6 +1,7 @@
 import io
 import threading
 import time
+import pytest
 
 from codex_client import CodexEvent
 from codex_worker_process import CodexWorkerRuntime
@@ -203,7 +204,7 @@ def test_worker_events_keep_thread_scope_when_new_turn_or_model_starts():
     ]
 
 
-def test_worker_early_token_event_has_scope_before_thread_ack():
+def test_worker_early_token_event_preserves_scope_after_owner_ack():
     output = io.StringIO()
     runtime = CodexWorkerRuntime(client_factory=lambda callback, model: EarlyUsageCodexClient(callback, model), output=output)
     runtime.handle_message(make_ui_request(
@@ -212,9 +213,9 @@ def test_worker_early_token_event_has_scope_before_thread_ack():
          "context_generation": 7, "input_items": [{"type": "text", "text": "q"}]},
     ))
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
-    assert [item["type"] for item in messages[:3]] == ["event", "thread_state", "turn_started_ack"]
-    assert messages[0]["payload"]["turn_idx"] == 4
-    assert messages[0]["payload"]["context_generation"] == 7
+    assert [item["type"] for item in messages[:3]] == ["thread_state", "turn_started_ack", "event"]
+    assert messages[2]["payload"]["turn_idx"] == 4
+    assert messages[2]["payload"]["context_generation"] == 7
     assert messages[1]["payload"]["context_generation"] == 7
 
 
@@ -989,3 +990,83 @@ def test_context_only_information_does_not_query_account_or_quota():
     assert result["native_usage"]["session_total_tokens"] == 900
     assert "account" not in result and "rate_limits" not in result
     assert calls == []
+
+
+def test_immediate_terminal_events_are_emitted_after_owner_ack_in_order():
+    class ImmediateClient(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            for event in [
+                CodexEvent(type="turn_started", thread_id=thread_id, turn_id="immediate"),
+                CodexEvent(type="item_completed", thread_id=thread_id, turn_id="immediate", phase="final_answer", text="answer"),
+                CodexEvent(type="turn_completed", thread_id=thread_id, turn_id="immediate", status="completed"),
+            ]:
+                self.on_event(event)
+            return {"turn":{"id":"immediate"}}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: ImmediateClient(cb, model), output=output)
+    runtime.handle_message(make_ui_request("request", "start_turn", {"chat_id":"chat", "turn_idx":1,"context_generation":2,"question":"second"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert [m["type"] for m in messages] == ["thread_state", "turn_started_ack", "event", "event", "event"]
+    assert [m["payload"]["event"]["type"] for m in messages[2:]] == ["turn_started", "item_completed", "turn_completed"]
+    assert all(m["payload"]["turn_idx"] == 1 and m["payload"]["context_generation"] == 2 for m in messages[2:])
+    assert not runtime._startup_events
+
+
+def test_startup_event_overflow_is_explicit_failure_without_cached_final():
+    class OverflowClient(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            for _ in range(3):
+                self.on_event(CodexEvent(type="item_completed", phase="final_answer", thread_id=thread_id, turn_id="overflow", text="not accepted"))
+            return {"turn":{"id":"overflow"}}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: OverflowClient(cb, model), output=output)
+    runtime.MAX_STARTUP_EVENTS = 2
+    runtime.handle_message(make_ui_request("request", "start_turn", {"chat_id":"chat", "turn_idx":0,"context_generation":3,"question":"overflow"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert [m["type"] for m in messages] == ["thread_state", "turn_started_ack", "error"]
+    assert messages[-1]["payload"]["context_generation"] == 3
+    assert "buffer exceeded" in messages[-1]["payload"]["message"]
+    assert not runtime._startup_events
+
+
+def test_startup_exception_drops_unowned_events_and_preserves_error_generation():
+    class ErrorClient(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            self.on_event(CodexEvent(type="item_completed", phase="final_answer", thread_id=thread_id, turn_id="unowned", text="not accepted"))
+            raise RuntimeError("failed before owner acknowledgement")
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: ErrorClient(cb, model), output=output)
+    runtime.handle_message(make_ui_request("request", "start_turn", {"chat_id":"chat", "turn_idx":0,"context_generation":3,"question":"fail"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert len(messages) == 1 and messages[0]["type"] == "error"
+    assert messages[0]["payload"]["context_generation"] == 3
+    assert not runtime._startup_events
+
+
+@pytest.mark.parametrize("failure_mode", ["exception", "overflow"])
+def test_second_start_failure_preserves_prior_turn_completion(failure_mode):
+    class PriorClient(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            if not self.started_turns:
+                self.started_turns.append((thread_id, items, service_tier))
+                return {"turn":{"id":"prior"}}
+            self.on_event(CodexEvent(type="turn_completed", thread_id=thread_id, turn_id="prior", status="completed"))
+            for _ in range(3):
+                self.on_event(CodexEvent(type="item_completed", thread_id=thread_id, turn_id="unowned-new", phase="final_answer", text="discard"))
+            if failure_mode == "exception":
+                raise RuntimeError("second startup failed")
+            return {"turn":{"id":"unowned-new"}}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: PriorClient(cb, model), output=output)
+    runtime.MAX_STARTUP_EVENTS = 2
+    runtime.handle_message(make_ui_request("first", "start_turn", {"chat_id":"chat", "turn_idx":0,"context_generation":1,"question":"first"}))
+    output.seek(0); output.truncate()
+    runtime.handle_message(make_ui_request("second", "start_turn", {"chat_id":"chat", "turn_idx":1,"context_generation":2,"thread_id":"thread-1","question":"second"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert [m["type"] for m in messages] == (["event", "error"] if failure_mode == "exception" else ["event", "thread_state", "turn_started_ack", "error"])
+    assert messages[0]["payload"]["event"]["turn_id"] == "prior"
+    assert messages[0]["payload"]["turn_idx"] == 0
+    assert messages[0]["payload"]["context_generation"] == 1
+    assert messages[-1]["payload"]["turn_idx"] == 1
+    assert messages[-1]["payload"]["context_generation"] == 2
+    assert not runtime._startup_events

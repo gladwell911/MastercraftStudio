@@ -15,3 +15,7 @@
 - 首次在线备份完成后未显式关闭 SQLite 临时连接，Windows 拒绝重命名；下次使用 backup API 时显式关闭源和目标连接再放置文件。首次临时文件清理由自动审批以策略限制拒绝，未绕过。
 
 完整纠错记录见 [归档原文](archive/entry-context-2026-09-29/reflection.md)。
+- Recovery QA needs the complete authoritative final-answer protocol; a delta is insufficient. Native Alt+A automatically resends the first question, so a cleared empty-turn expectation is wrong. Activate the native GUI event loop and await visible answer rows after the existing navigation quiet interval; done status alone is not visible-answer evidence. Record the configured startup attempt budget, actual child exit and final request state.
+
+
+The final combined review found two asynchronous identity gaps missed by the initial recovery scenarios. Exception/overflow prior-owner regressions and paired retired/current client UI tests now cover both; the focused dog follow-up checks the repaired boundaries without restarting the entire review.

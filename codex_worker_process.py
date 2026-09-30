@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from collections import OrderedDict
@@ -20,6 +21,8 @@ ClientFactory = Callable[[Callable[[CodexEvent], None], str], CodexAppServerClie
 
 class CodexWorkerRuntime:
     MAX_EVENT_SCOPES = 256
+    MAX_STARTUP_EVENTS = 1024
+    MAX_STARTUP_EVENT_BYTES = 4 * 1024 * 1024
 
     def __init__(self, client_factory: ClientFactory | None = None, output: TextIO | None = None) -> None:
         self.client_factory = client_factory or self._default_client_factory
@@ -31,6 +34,7 @@ class CodexWorkerRuntime:
         self._turn_id_scopes: OrderedDict[tuple[str, str, str], tuple[int, int, str] | None] = OrderedDict()
         self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
         self._ambiguous_input_requests: set[tuple[str, str]] = set()
+        self._startup_events: dict[tuple[str, str], dict] = {}
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         line = encode_worker_message(make_worker_event(message_type, payload, request_id))
@@ -68,6 +72,7 @@ class CodexWorkerRuntime:
             self._turn_id_scopes.clear()
             self._input_request_clients.clear()
             self._ambiguous_input_requests.clear()
+            self._startup_events.clear()
         for client in clients:
             client.close()
 
@@ -86,6 +91,28 @@ class CodexWorkerRuntime:
             return self._clients[key]
 
     def _on_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
+        with self._lock:
+            pending = self._startup_events.get((chat_id, model))
+            if pending is not None:
+                turn_id = str(getattr(event, "turn_id", "") or "").strip()
+                prior_scope = self._turn_id_scopes.get((chat_id, model, turn_id))
+                event_thread = str(getattr(event, "thread_id", "") or "").strip()
+                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]):
+                    self._dispatch_event(chat_id, model, event)
+                    return
+                if pending["overflow"]:
+                    return
+                size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
+                if len(pending["events"]) >= self.MAX_STARTUP_EVENTS or pending["bytes"] + size > self.MAX_STARTUP_EVENT_BYTES:
+                    pending["events"].clear()
+                    pending["overflow"] = True
+                    return
+                pending["events"].append(event)
+                pending["bytes"] += size
+                return
+            self._dispatch_event(chat_id, model, event)
+
+    def _dispatch_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "model": model,
@@ -133,6 +160,14 @@ class CodexWorkerRuntime:
             self._emit_protocol_error(message, "start_turn requires payload.chat_id")
             return
 
+        startup_key = (chat_id, model)
+        with self._lock:
+            self._startup_events[startup_key] = {
+                "events": [], "bytes": 0, "overflow": False,
+                "prior_turn_ids": frozenset(key[2] for key, scope in self._turn_id_scopes.items()
+                                             if key[:2] == startup_key and scope is not None),
+            }
+        accepted = False
         try:
             client = self._client_for(chat_id, model)
             with self._lock:
@@ -216,8 +251,20 @@ class CodexWorkerRuntime:
                 },
                 request_id=message.get("id"),
             )
+            accepted = True
         except Exception as exc:
             self._emit_scoped_error(message, str(exc), chat_id, turn_idx, model)
+        finally:
+            # Keep the lock through the flush: newly arriving frames cannot
+            # overtake earlier frames or the authoritative request ack.
+            with self._lock:
+                pending = self._startup_events.pop(startup_key, None)
+                if accepted and pending is not None:
+                    if pending["overflow"]:
+                        self._emit_scoped_error(message, "Codex startup event buffer exceeded its limit", chat_id, turn_idx, model)
+                    else:
+                        for event in pending["events"]:
+                            self._dispatch_event(chat_id, model, event)
 
     def _remember_scope(self, scopes: OrderedDict, key: tuple, value: tuple | None) -> None:
         scopes.pop(key, None)
@@ -433,6 +480,7 @@ class CodexWorkerRuntime:
             {
                 "chat_id": chat_id,
                 "turn_idx": turn_idx,
+                "context_generation": int((message.get("payload") or {}).get("context_generation") or 0),
                 "model": model,
                 "message": error_message,
             },
