@@ -674,9 +674,9 @@ def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeyp
     assert sounds == ["reply"]
     assert pushed == [
         ("state", "chat-e2e"),
-        ("final_answer", "chat-e2e", "desktop received: hello from emulator"),
         ("history", "chat-e2e"),
     ]
+    assert ("chat-e2e", 0) in frame._pending_remote_finals
 
 def test_clear_context_active_chat_pushes_history_and_state_events(frame, monkeypatch):
     frame.active_chat_id = "chat-e2e"

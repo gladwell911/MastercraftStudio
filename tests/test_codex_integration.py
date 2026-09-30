@@ -213,6 +213,7 @@ def test_load_chat_clears_invalid_codex_runtime_state(frame):
 
 
 def test_codex_final_question_sets_pending_prompt_and_updates_answer(frame):
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
     frame.active_codex_turn_active = True
     frame.active_codex_thread_flags = ["waitingOnUserInput"]
     frame.active_session_turns = [
@@ -221,8 +222,11 @@ def test_codex_final_question_sets_pending_prompt_and_updates_answer(frame):
             "answer_md": main.REQUESTING_TEXT,
             "model": "codex/main",
             "created_at": time.time(),
+            "codex_turn_id": TEST_TURN_ID,
         }
     ]
+    frame._current_chat_state["id"] = "chat-current"
+    frame._current_chat_state["turns"] = frame.active_session_turns
 
     frame._on_codex_event(
         CodexEvent(
@@ -230,6 +234,8 @@ def test_codex_final_question_sets_pending_prompt_and_updates_answer(frame):
             status="agentMessage",
             phase="final_answer",
             text="璇锋彁渚涚洰鏍囨枃浠惰矾寰勶紵",
+            turn_id=TEST_TURN_ID,
+            data={"turn_idx": 0},
         )
     )
 
@@ -248,6 +254,7 @@ def test_codex_final_answer_appends_and_focuses_when_final_answer_arrives(frame,
             "answer_md": main.REQUESTING_TEXT,
             "model": "codex/main",
             "created_at": time.time(),
+            "codex_turn_id": TEST_TURN_ID,
         }
     ]
     frame._current_chat_state = {
@@ -268,6 +275,8 @@ def test_codex_final_answer_appends_and_focuses_when_final_answer_arrives(frame,
             status="agentMessage",
             phase="final_answer",
             text="done",
+            turn_id=TEST_TURN_ID,
+            data={"turn_idx": 0},
         )
     )
 
@@ -399,19 +408,42 @@ def test_codex_request_user_input_dialog_replies_through_worker(frame, monkeypat
 
 
 def test_codex_turn_completed_clears_busy_state(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame._current_chat_state["id"] = "chat-current"
     frame._active_request_count = 1
     frame.active_codex_turn_active = True
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [{"codex_turn_id": TEST_TURN_ID, "model": "codex/main", "request_status": "pending", "answer_md": main.REQUESTING_TEXT}]
+    frame._current_chat_state["turns"] = frame.active_session_turns
     played = {"n": 0}
     monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
 
     frame._on_codex_event(
-        CodexEvent(type="turn_completed", thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID, status="completed")
+        CodexEvent(type="turn_completed", thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID, status="completed", data={"turn_idx": 0})
     )
 
     assert frame._active_request_count == 0
     assert frame.active_codex_turn_active is False
     assert frame.is_running is False
     assert played["n"] == 1
+
+
+def test_ambiguous_codex_turn_id_does_not_target_a_turn(frame):
+    turns = [
+        {"codex_turn_id": TEST_TURN_ID, "answer_md": "first"},
+        {"codex_turn_id": TEST_TURN_ID, "answer_md": "second"},
+    ]
+    event = CodexEvent(type="item_completed", phase="final_answer", turn_id=TEST_TURN_ID, text="final")
+    assert frame._event_scoped_turn_index(turns, event) == -1
+    assert frame._event_turn_index(turns, event) == -1
+
+
+def test_execution_filters_only_empty_not_loaded_placeholder(frame):
+    placeholder = CodexEvent(type="item_completed", display_kind="info", text="Not Loaded")
+    failure = CodexEvent(type="item_completed", display_kind="error", status="failed", text="Not Loaded")
+    assert frame._build_execution_entry(placeholder) is None
+    assert frame._build_execution_entry(failure) is not None
+    assert not frame._should_show_execution_step({"text": "Not Loaded", "display_kind": "info"})
 
 
 def test_codex_server_request_plays_finish_sound(frame, monkeypatch):

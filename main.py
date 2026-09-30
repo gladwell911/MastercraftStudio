@@ -6680,31 +6680,32 @@ class ChatFrame(wx.Frame):
 
     def _event_scoped_turn_index(self, turns: list, event: CodexEvent) -> int:
         data_idx = self._event_data_turn_idx_value(event)
-        if isinstance(turns, list) and 0 <= data_idx < len(turns):
-            return data_idx
         turn_id = self._event_turn_id(event)
+        if isinstance(turns, list) and 0 <= data_idx < len(turns):
+            turn = turns[data_idx]
+            if isinstance(turn, dict):
+                bound_id = str(turn.get("codex_turn_id") or turn.get("turn_id") or "").strip()
+                if not turn_id or bound_id in {"", turn_id}:
+                    return data_idx
+            return -1
         if turn_id:
+            matches = []
             for idx, turn in enumerate(turns or []):
                 if not isinstance(turn, dict):
                     continue
                 for key in ("turn_id", "codex_turn_id", "id"):
                     if str(turn.get(key) or "").strip() == turn_id:
-                        return idx
+                        matches.append(idx)
+                        break
+            if len(matches) == 1:
+                return matches[0]
         return -1
 
     def _event_turn_index(self, turns: list, event: CodexEvent) -> int:
-        scoped_idx = self._event_scoped_turn_index(turns, event)
-        if scoped_idx >= 0:
-            return scoped_idx
-        return len(turns) - 1 if isinstance(turns, list) and turns else -1
+        return self._event_scoped_turn_index(turns, event)
 
     def _active_codex_event_target_index(self, event: CodexEvent) -> int:
-        scoped_idx = self._event_scoped_turn_index(self.active_session_turns, event)
-        if scoped_idx >= 0:
-            return scoped_idx
-        if 0 <= self.active_turn_idx < len(self.active_session_turns):
-            return self.active_turn_idx
-        return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
+        return self._event_scoped_turn_index(self.active_session_turns, event)
 
     def _known_codex_turn_ids_for_chat(self, chat: dict | None) -> set[str]:
         ids: set[str] = set()
@@ -6809,18 +6810,23 @@ class ChatFrame(wx.Frame):
         candidates.extend(chat for chat in (self.archived_chats or []) if isinstance(chat, dict))
 
         if turn_id:
+            matching_chat_ids = set()
             for chat in candidates:
                 chat_id = str(chat.get("id") or "").strip()
                 if not chat_id:
                     continue
                 if str(chat.get("codex_turn_id") or "").strip() == turn_id:
-                    return chat_id
+                    matching_chat_ids.add(chat_id)
                 turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
                 for turn in turns:
                     if not isinstance(turn, dict):
                         continue
                     if str(turn.get("codex_turn_id") or turn.get("turn_id") or turn.get("id") or "").strip() == turn_id:
-                        return chat_id
+                        matching_chat_ids.add(chat_id)
+            if len(matching_chat_ids) == 1:
+                return next(iter(matching_chat_ids))
+            if len(matching_chat_ids) > 1:
+                return ""
 
         if thread_id:
             for chat in candidates:
@@ -6842,6 +6848,8 @@ class ChatFrame(wx.Frame):
         known_chat_id = self._known_codex_event_chat_id(event)
         if known_chat_id:
             return known_chat_id
+        if self._codex_event_requires_known_turn(event):
+            return ""
         return self._active_codex_event_fallback_chat_id(event)
 
     def _active_codex_event_fallback_chat_id(self, event: CodexEvent) -> str:
@@ -7185,6 +7193,11 @@ class ChatFrame(wx.Frame):
             list_text = self._execution_command_list_text(event_type, title, command, exit_code, command_fallback)
         else:
             list_text = self._execution_list_text_from_detail(detail_text, display_kind)
+        if (display_kind != "error" and str(getattr(event, "status", "") or "").lower() not in {"failed", "error"}
+                and exit_code in (None, 0)
+                and str(getattr(event, "text", "") or "").strip().lower() == "not loaded"
+                and not title and not command):
+            return None
         safe_raw_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "raw_text", "") or ""))
         safe_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "text", "") or ""))
         safe_source_detail = {} if private_reasoning else self._safe_kimi_source_detail(item)
@@ -8193,6 +8206,14 @@ class ChatFrame(wx.Frame):
         return "\n".join(kept).strip()
 
     def _should_show_execution_step(self, step) -> bool:
+        if isinstance(step, dict):
+            status = str(step.get("status") or "").strip().lower()
+            display_kind = str(step.get("display_kind") or "").strip().lower()
+            if (display_kind != "error" and status not in {"failed", "error"}
+                    and step.get("exit_code") in (None, 0)
+                    and str(step.get("text") or step.get("raw_text") or "").strip().lower() == "not loaded"
+                    and not str(step.get("title") or step.get("command") or "").strip()):
+                return False
         return should_show_execution_step(step)
 
     def _execution_page_projection(self) -> tuple[list, list]:
@@ -10904,7 +10925,7 @@ class ChatFrame(wx.Frame):
                 loop = getattr(transport, "_loop", None)
                 if loop is not None and loop.is_running():
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
-                return
+                return True
             except ValueError as exc:
                 if str(exc) in {"EVENT_ID_CONFLICT", "STALE_REVISION"}:
                     return
@@ -10955,7 +10976,7 @@ class ChatFrame(wx.Frame):
             }
         )
 
-    def _push_remote_final_answer(self, chat_id: str, text: str, *, turn_index: int | None = None) -> None:
+    def _push_remote_final_answer(self, chat_id: str, text: str, *, turn_index: int | None = None) -> bool:
         resolved_chat_id = str(chat_id or "").strip()
         final_text = str(text or "").strip()
         # A Codex/Kimi delta can observe the persisted request placeholder before
@@ -10963,7 +10984,7 @@ class ChatFrame(wx.Frame):
         # assistant_final consumes the canonical message id and prevents the
         # later real final from reaching mobile clients.
         if not resolved_chat_id or not final_text or final_text == REQUESTING_TEXT:
-            return
+            return False
         transport = getattr(self, "_remote_nats_transport", None)
         store = getattr(self, "chat_store", None)
         # V2 notifications are an immutable projection of durable turn state,
@@ -10972,13 +10993,13 @@ class ChatFrame(wx.Frame):
         if store is not None and turn_index is not None:
             turns = store.load_turns(resolved_chat_id)
             if turn_index < 0 or turn_index >= len(turns):
-                return
+                return False
             persisted = turns[turn_index]
             if str(persisted.get("request_status") or "").strip() != "done":
-                return
+                return False
             final_text = str(persisted.get("answer_md") or "").strip()
             if not final_text or final_text == REQUESTING_TEXT:
-                return
+                return False
         if (
             resolved_chat_id
             and transport is not None
@@ -11017,7 +11038,7 @@ class ChatFrame(wx.Frame):
                 loop = getattr(transport, "_loop", None)
                 if loop is not None and loop.is_running():
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
-                return
+                return True
             except ValueError as exc:
                 if str(exc) != "EVENT_ID_CONFLICT":
                     try:
@@ -11026,7 +11047,7 @@ class ChatFrame(wx.Frame):
                         )
                     except Exception:
                         pass
-                return
+                return False
         self._publish_remote_nats_event(
             {
                 "type": "final_answer",
@@ -11036,6 +11057,7 @@ class ChatFrame(wx.Frame):
                 "ts": time.time(),
             }
         )
+        return True
 
     def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
         self._invalidate_remote_history_list_cache()
@@ -12753,6 +12775,24 @@ class ChatFrame(wx.Frame):
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        if self._codex_event_requires_known_turn(event):
+            identity_turns = identity_chat.get("turns") if isinstance(identity_chat, dict) and isinstance(identity_chat.get("turns"), list) else []
+            identity_idx = self._event_scoped_turn_index(identity_turns, event)
+            if identity_idx < 0:
+                return
+            identity_turn = identity_turns[identity_idx]
+            bound_thread = str(identity_turn.get("codex_thread_id") or "").strip()
+            if bound_thread and event_thread_id and bound_thread != event_thread_id:
+                return
+            event_data = event.data if isinstance(event.data, dict) else {}
+            if "context_generation" in event_data:
+                try:
+                    event_generation = int(event_data["context_generation"])
+                    turn_generation = int(identity_turn.get("codex_start_generation", identity_turn.get("codex_context_generation") or 0))
+                except (TypeError, ValueError):
+                    return
+                if event_generation != turn_generation:
+                    return
         early_codex_usage = False
         if event_type == "token_count" and isinstance(identity_chat, dict):
             if not self._codex_token_usage_matches_native_chat(identity_chat, event):
@@ -12865,6 +12905,7 @@ class ChatFrame(wx.Frame):
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._request_codex_chat_information(target_chat, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._complete_clear_operation_turn(turn, failed=False)
+                    self._queue_remote_final(chat_id, target_idx)
                     self._play_finish_sound()
                 self._mark_chat_turns_dirty(chat_id, target_idx)
                 if history_recency_changed:
@@ -12951,6 +12992,7 @@ class ChatFrame(wx.Frame):
                 else:
                     self._update_active_answer_row(target_idx)
                 self._mark_chat_turns_dirty(start_index=target_idx)
+                self._queue_remote_final(chat_id or self.active_chat_id or self.current_chat_id or "", target_idx)
                 self._request_execution_list_sync(self._current_chat_state)
             if is_current_chat:
                 self.is_running = False
@@ -15171,6 +15213,7 @@ class ChatFrame(wx.Frame):
             return
         self._codex_background_flush_dirty = False
         self._save_state()
+        self._flush_pending_remote_finals()
 
     def _defer_chat_state_save(self) -> None:
         self._chat_state_flush_dirty = True
@@ -15187,6 +15230,53 @@ class ChatFrame(wx.Frame):
             return
         self._chat_state_flush_dirty = False
         self._save_state()
+        self._flush_pending_remote_finals()
+
+    def _queue_remote_final(self, chat_id: str, turn_index: int) -> None:
+        if not chat_id or turn_index < 0:
+            return
+        pending = getattr(self, "_pending_remote_finals", None)
+        if pending is None:
+            pending = self._pending_remote_finals = set()
+        pending.add((str(chat_id), int(turn_index)))
+
+    def _flush_pending_remote_finals(self) -> None:
+        pending = getattr(self, "_pending_remote_finals", None)
+        if not pending:
+            return
+        store = getattr(self, "chat_store", None)
+        if store is None:
+            return
+        retry_needed = False
+        for chat_id, turn_index in tuple(pending):
+            try:
+                turns = store.load_turns(chat_id)
+                if not (0 <= turn_index < len(turns)):
+                    continue
+                turn = turns[turn_index]
+                if str(turn.get("request_status") or "") != "done":
+                    continue
+                answer = str(turn.get("answer_md") or "").strip()
+                if not answer or answer == REQUESTING_TEXT:
+                    continue
+                if not self._push_remote_final_answer(chat_id, answer, turn_index=turn_index):
+                    retry_needed = True
+                    continue
+                self._push_remote_history_changed(chat_id)
+            except Exception:
+                retry_needed = True
+                continue
+            pending.discard((chat_id, turn_index))
+        if retry_needed and not getattr(self, "_pending_remote_final_retry_scheduled", False):
+            schedule = getattr(self, "_call_later_if_alive", None)
+            if callable(schedule):
+                self._pending_remote_final_retry_scheduled = True
+                if schedule(1000, self._retry_pending_remote_finals) is None:
+                    self._pending_remote_final_retry_scheduled = False
+
+    def _retry_pending_remote_finals(self) -> None:
+        self._pending_remote_final_retry_scheduled = False
+        self._flush_pending_remote_finals()
 
     def _on_codex_worker_message(
         self,
@@ -18724,7 +18814,7 @@ class ChatFrame(wx.Frame):
             if not err and 0 <= turn_idx < len(target_turns):
                 final_text = str(target_turns[turn_idx].get("answer_md") or "").strip()
                 if final_text and final_text != REQUESTING_TEXT:
-                    self._push_remote_final_answer(resolved_chat_id, final_text, turn_index=turn_idx)
+                    self._queue_remote_final(resolved_chat_id, turn_idx)
             self._push_remote_history_changed(resolved_chat_id)
         self._defer_chat_state_save()
         if self._is_ui_alive():
