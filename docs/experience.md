@@ -1,7 +1,6 @@
 # 可复用经验
 
 - Epic5: treat send acceptance and first successful authoritative completed reply as activity facts. Provider `turn_completed` can also represent failure or interruption; gate recency on successful status while retaining existing terminal handling. Route OpenClaw's accepted visible sync facts through the same history dirty helper. Use the fact owner's monotonic `updated_at`, guard done-turn replay, and retain explicit pinned/unpinned state in slim persistence. Native tests need persisted owners, stable HWND/HasFocus/foreground checks and keys injected during the running event loop. Kimi receive activity needs a competing newer row and strict completion-time increase to distinguish it from send activity.
-- Epic5 final verification: native28/history85/models132 gives 245 unique passes; targeted10 overlaps native28. Two exact voice and five exact Kimi baseline failures remain, and all answer GUI nodes passed despite logged COM `0x8001010d`. Three formal-review repair groups are closed; one ordinary-worker failed→late-success path remains unverified/deferred. Four lenses in one president context do not provide independent-review diversity. Built awaits user acceptance; controlled evidence does not establish production Live, packaging or physical-device acceptance. Exact logs and boundaries are in the Epic5 plan/review.
 
 - OneDrive 数据：源码与打包版的笔记、常用命令路径不同。打包版须在初始化前验证目标存在、SQLite 完整且表结构属于已知笔记库。在线 SQLite 备份生成的是定时快照；先关闭备份连接，再校验并放置文件。跨机不并发运行 MC，换机先退出并等同步；不能直接用另一台旧库覆盖目标。
 - wx 可访问性：可见状态未变时不重绘列表、不移动焦点。后台事件先合并，再按 chat、turn、session 与 generation 复核归属；真实定时器测试负责完整清理。
@@ -16,11 +15,7 @@
 
 Startup buffering must only defer newly unacknowledged events. Preserve prior native owners through new-request failure, and carry source client identity through every asynchronous boundary until actual UI application.
 
+## 2026-10-01 验证方法
 
-## Epic4 final verified result (2026-10-01)
-
-Status built for user review; acceptance pending, not Done. This supersedes earlier pending/blocked results. MC final no-temporary-hook affected56/unit94/models121=271; unchanged RC widget159 gives430 scoped checks, with three exact fresh checks overlapping affected rather than counted again. Six exact reproduced baseline failures remain excluded, COM0x8001010d remains documented in native/baseline-class controls. Compile/diff checks exit0. Final current-tree Local standard integrationDriver retry exits0 and verifies mobile chat list, exact Codex/Kimi assistant role/content/session remoteModelId and desktop provider routes; no cache-specific test is claimed. Original flutter-test DDS/comparator failures and offline-device attempt remain historical evidence. Original Android15 AVD restored; temporary runner and owned harness/flutter processes cleaned.
-
-The test now requires exactly one actual clear after real SendInput4 rather than a mandatory menu: product CHAR_HOOK legitimately consumes A. Native HWND preparation replaces unstable wrapper identity while retaining foreground/HasFocus and final focus assertions. Light/heavy/native/current controls succeed, and all final durable/resend/newthread/stale-terminal/visible assertions pass without temporary WH hooks. Historical only-Alt cause remains unknown and currently unreproduced; no external cause or product keyboard regression is inferred. Final navigation accepted-to-visible1016ms preserves selection/focus; real frame destruction125ms cancels timers without callbacks while child destruction does not.
-
-Full evidence/18-finding triage/six repair groups: `D:/code/sj/_bmad-output/implementation-artifacts/qa-epic4-answer-presentation.md`, overall plan and review. Original source/ASR dirty change preserved; no commit/merge claimed until root records delivery. Production Live, actual provider services, physical-device accessibility/notifications/haptics and packaging remain unverified.
+- 先核对交付树 HEAD，不用主树或旧日志代替；锁屏可见像素、对象字段、跨端传输分别记录。
+- `Raise()` 和 wx 内部焦点不足以证明 Windows 前台。使用 `tests/owned_window_qa.py` 真实点击测试窗口标题栏，严格检查 HWND 后保留原键盘和焦点断言；finally 恢复置顶状态和鼠标，不添加全局键盘钩子。

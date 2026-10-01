@@ -1,59 +1,41 @@
 # 当前交接
 
-## Epic5 built, awaiting user acceptance — 2026-10-01
+截至 2026-10-01。当前为 `epic5-desktop-navigation` 交付树，测试基线 HEAD `8bc247d8954a4d0bcab24254a53da845f5847f0f`；手机对应 `D:/code/sj/.build-work/epic5/rc` HEAD `19cfe57182fe2b67857ed628c20a7bf623211a0f`。不能用 `D:/code/sj/mc` 主工作树代替本交付。
 
-The MC Epic5 worktree implements main-window Alt+C through the existing submission path with exact text “好的，继续”. Accepted sends and first authoritative Codex/Kimi/ordinary-worker completions update the owner's monotonic persisted activity clock and request the existing quiet history refresh. Pinned priority, selected chat identity and refresh focus handling are retained; provisional fragments, startup/status events, errors and duplicate completion do not produce new recency. The detail-window frozen continuation remains unchanged; RC is unchanged.
+## 本轮验证（2026-10-01）
 
-Active-state saves retain pinned state, including unpin roundtrips. Formal review's three repair groups are closed: failed/interrupted Codex terminals do not advance activity, accepted visible OpenClaw sync messages request history refresh, and actual Kimi completion has strict receive-time and visible-order coverage. No further review material remains; followup review is not recommended.
+五 Epic 核心桌面/模拟器范围通过，由 engineer 独立核对；不是完整产品套件。测试未修改产品代码，不自动改变 Epic4/5 用户验收、合并和发布状态。
 
-Final engineer verification supersedes the earlier counts: native desktop 28 passed in 29.06s (`epic5-review-native-final.log`); history/voice/store 85 passed and two exact existing voice failures in 37.65s (`epic5-review-history-final.log`); answer/Codex/Kimi 132 passed and five exact existing Kimi failures in 67.25s (`epic5-review-models-final.log`). These three final suites contain 245 unique passing checks; the 10 repair-targeted checks overlap the 28 native checks and are not added. Compilation and diff checks exited 0. All answer GUI nodes passed, although the model/answer log still prints COM `0x8001010d`; retain that log limitation. The seven baseline failures are the voice model-order and Ctrl+Right expectations and the five Kimi execution-summary cases named in the plan; the complete suite is not green.
+| 范围 | 最终结果 |
+|---|---|
+| Epic1 | 原生快捷键/真实10秒timer 10项，归属与用量UI 55项通过 |
+| Epic3/5 | 原生恢复3项、继续与排序28项通过，原严格前台/焦点/键盘断言保留 |
+| Epic4 | 桌面展示10项；Android累计299/300秒、未知、跨日、实际“更多”分页3场景通过 |
+| 跨端/通知 | Local双provider、私有NATS通知实际点击通过；独立安全锁屏可视通过 |
 
-One ordinary-worker prior-failed→late-success possibility remains unverified and deferred because no reachable same-request callback path was demonstrated. All four review lenses ran in one president context, so the review was not four independent reviews. Built awaits user acceptance; no merge or release is claimed. Controlled provider evidence does not establish production Live, actual model services, packaging or physical-device acceptance. Exact commands and review evidence are in `D:/code/sj/_bmad-output/implementation-artifacts/plan-epic5-desktop-navigation.md` and `review-epic5-desktop-navigation.md` in the same directory.
+通知传输/点击与锁屏 production-builder fixture 是独立场景；实际锁屏为两个准确标题各两条和“新消息”，无私密正文。完整命令、初失败、截图、清理证据在 `D:/code/sj/_bmad-output/implementation-artifacts/tests/test-summary.md`，非 Git 工作区产物不随仓库提交。
 
-截至 2026-09-30。逐项旧结果与哈希保存在 [归档快照](archive/entry-context-2026-09-29/handoff.md)。
+仍未验证生产 Live、真实模型服务、实体机 TalkBack/震动/后台全部行为、重新打包和双机；旧宽套件 voice/Kimi 精确失败仍按历史计划复核，COM日志限制保留。模拟器 QA PIN/通知清除，隐私设置恢复1/1，showing=false/secure=false；owned进程与adb reverse已清，个人数据库未改变。
 
-## 当前状态
+## 复现桌面测试
 
-- Epic1“聊天信息准确与快速刷新”（CAP-1/8/9）已完成，实施提交 `7e8ba0a196101464ec26349b57e70f3832dc9290`：原生会话累计用量、可见窗口 10 秒上下文补查、缓存归属与新鲜度、Alt+Y 和焦点恢复。工程验证去重 309 项通过；5 项 Kimi 执行摘要集成失败已在改动前基线逐项复现。独立真实键盘与定时器 QA 10 项通过；未改手机端、未重新打包或验证生产 Live。详见[实施记录](../../_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)及 [QA 报告](../../_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)。
-- Codex/Kimi 聊天信息 Story 1.1–1.5 已提交；桌面执行页和手机端共享 execution_page_v3 canonical 可视投影。已有定向 GUI、客户端及跨端 Local 记录，不能据此宣称完整套件通过。
-- 本次跨端聊天修复已覆盖八项问题：清除权威确认、Codex 回合归属、持久化后终答补发及失败重试、手机历史补齐、常用命令返回收键盘、过滤无意义的 Not Loaded、执行页焦点与回答页播报、当前详情新答单次震动。RC 另修复加载旧历史分页误震；跨端 Local Codex/Kimi 已通过。真实 Live 和重新打包后的双机链路尚未验证。
-- 打包版常用命令改从个人 OneDrive\code\data\sj\common_commands.json 读取；源码运行仍用本地 history。打包版笔记改读同目录 notes.db，启动前校验存在性、SQLite 完整性和表结构；源码运行仍用 D:\code\note\notes.db。这些改动尚未重新打包。
-- 2026-09-29 已在线备份一次笔记到 OneDrive：目标 86,016 字节，quick_check=ok，2 个 notebooks、2 个 entries，SHA-256 e47c3c1d6434c4f219abce011e3d7a1adb9206735b9fb989c489145663cdb48f。它是当时快照；已安装旧 MC 此后继续写本地源库。完整路径、时间和首次临时文件残留见归档。
-- 笔记定向测试 13 项通过；相关组合回归 128 项通过、2 项既有桌面 acceptance 断言失败，单独复跑仍失败。Kimi integration 另有 5 项旧执行摘要失败，宽套件不能视为通过。聊天信息只读 Live 2 项通过，但未发送模型请求；手机模拟器 E2E 使用受控服务。
+本仓库 cwd，使用已有 Python3.11 `D:/code/sj/mc/.venv/Scripts/python.exe`：
 
-## 下一步
+```powershell
+$env:PYTHONPATH=(Join-Path (Get-Location) 'tests')
+python -m pytest -p owned_window_qa tests/test_model_session_recovery_ui_automation.py tests/test_desktop_navigation_ui_automation.py -q -s
+python -m pytest tests/test_epic1_native_e2e.py -q -s
+python -m pytest tests/test_chat_information_ui_automation.py -q
+python -m pytest tests/test_answer_presentation_ui_automation.py -q
+```
 
-1. 切包前先处理笔记差异：从最新本地源库重新生成一致性备份并安全替换现存云端目标，或人工合并快照后的改动。当前没有自动安全替换工具。另一台电脑的独有旧笔记须先导出并合并，不能覆盖同步库。
-2. 重新打包 MC；在两台电脑验证常用命令和笔记同步。一次只运行一台 MC，换机先退出并等待 OneDrive 同步完成。
-3. 在真实配置中完成跨端 Live 和模型链路验收；复核已知宽回归基线，并完成手机实体设备 TalkBack、震动、后台通知和 ARM64 验收。RC 最终 widget 156/156、模拟器历史分页定向 1/1 通过，不代表上述真实环境验收。
+helper `tests/owned_window_qa.py` 为已验证源文件的逐字节副本，仅准备测试窗口前台，不替换原键盘或断言。wx GUI 串行；测试隔离 app/notes 数据。不要只反复 Raise 或绕过前台检查。
 
-详情见 [文档索引](README.md) 和 [归档快照](archive/entry-context-2026-09-29/handoff.md)。
+## 后续与有效背景
 
-## Epic 2 — 2026-09-30
+- Epic1 聊天信息、Epic2 通知事实、Epic3 恢复、Epic4 回答展示、Epic5 继续与排序已有实现；详细历史基线和 deferred 项见工作区相应 `plan-epic*`/`qa-*`/`review-*`。本轮未合并或发布。
+- 源码笔记为 `D:/code/note/notes.db`；打包版要求个人 OneDrive 下 `code/data/sj/notes.db` 已存在并通过完整性/表结构校验，常用命令同目录 `common_commands.json`。旧安装仍写源库，2026-09-29 云端备份仅是快照。切包前从最新源库一致性备份并安全替换或合并；其他电脑独有笔记先导出，一次只运行一台 MC，换机先退出并等同步。
+- 发布前按实际范围接续 Live、真实模型、实体设备和新包双机验证，不重复已有效定向测试。
+- Git 收尾：本分支无上游，不能推送；RC 测试树 detached HEAD，改动待明确分支处理。未自动调整 remote/上游或主树；主树已有 ASR 修改保持原状。
 
-手机通知标题与发送者过滤已开发并通过可执行的模拟器端到端 QA：新通知使用 canonical 聊天标题，改名后旧事实原样重放，新回答使用新名称；桌面本人消息同步但不提醒。Android 锁屏/publicVersion显示真实标题并隐藏正文，完整 pair/event 独立分组保留每条锁屏标题。
-
-当前验证：MC 合同11/11；RC 合同/相关widget26、Android unit47、native8及分组定向通过；Local受控Codex/Kimi真实UI退出0；最终私有NATS标准driver退出0，覆盖两聊天、改名、重复/逆序/重连、用户同步零通知和实际通知点击正确owner/current title。Android15 emulator-5554真实安全锁屏显示独立真实聊天标题及“新消息”，无private body；手机测试仅模拟器。一次dog四lens合并审查完成，两个低风险fixture守卫问题修复并复测。
-
-生产 Live 因缺真实 Endpoint/Token/DesktopChatTitle 未验证；上述私有服务和模拟器证据不代表生产 Live或实体设备。最终实施与QA记录位于工作区 `_bmad-output/implementation-artifacts/plan-epic2-mobile-notifications.md`、`qa-epic2-mobile-notifications.md`。未发布或重新打包生产应用。
-
-## Epic 3 - 2026-10-01
-
-Model startup callbacks now verify the original turn and request identity before applying failure or session state. Codex rejects retired client callbacks and obsolete error generations. Its worker buffers bounded startup events until authoritative thread/turn ACK, then releases them in order; this fixes fast second-turn answers arriving before identity. Buffer overflow is explicit failure, and late final events cannot revive failed requests.
-
-Controlled recovery QA exercises native wx send/Alt+A, actual Kimi subprocess startup failure and HTTP/WS recovery, and actual Codex worker/app-server protocols with private temporary data. Alt+A retains automatic resend of the first question. Final evidence and exact baseline failures are recorded in workspace `_bmad-output/implementation-artifacts/plan-epic3-model-session-recovery.md` and `qa-epic3-model-session-recovery.md`. Production Live, real model services, repackaging and physical-device acceptance remain unverified; RC is unchanged.
-
-
-Formal Epic3 review repaired prior-turn event isolation during another failed/overflowing startup and retained source-client ownership across UI queueing. Independent final review patch verification: worker/Codex 61 passed, native recovery GUI 3 passed, exact regressions 3 passed; affected compilation passed. Exact 13 baseline failures remain recorded; controlled protocols do not establish production Live.
-
-
-Epic3 user acceptance (2026-10-01): final closeout authorized Done for the whole Epic and both tickets. The controlled recovery evidence and exact 13 baseline failures remain documented; production Live, real models, packaging and physical devices are unverified. Epic4/5 remain pending, so the initiative stays open.
-
-
-## Epic4 final verified result (2026-10-01)
-
-Status built for user review; acceptance pending, not Done. This supersedes earlier pending/blocked results. MC final no-temporary-hook affected56/unit94/models121=271; unchanged RC widget159 gives430 scoped checks, with three exact fresh checks overlapping affected rather than counted again. Six exact reproduced baseline failures remain excluded, COM0x8001010d remains documented in native/baseline-class controls. Compile/diff checks exit0. Final current-tree Local standard integrationDriver retry exits0 and verifies mobile chat list, exact Codex/Kimi assistant role/content/session remoteModelId and desktop provider routes; no cache-specific test is claimed. Original flutter-test DDS/comparator failures and offline-device attempt remain historical evidence. Original Android15 AVD restored; temporary runner and owned harness/flutter processes cleaned.
-
-The test now requires exactly one actual clear after real SendInput4 rather than a mandatory menu: product CHAR_HOOK legitimately consumes A. Native HWND preparation replaces unstable wrapper identity while retaining foreground/HasFocus and final focus assertions. Light/heavy/native/current controls succeed, and all final durable/resend/newthread/stale-terminal/visible assertions pass without temporary WH hooks. Historical only-Alt cause remains unknown and currently unreproduced; no external cause or product keyboard regression is inferred. Final navigation accepted-to-visible1016ms preserves selection/focus; real frame destruction125ms cancels timers without callbacks while child destruction does not.
-
-Full evidence/18-finding triage/six repair groups: `D:/code/sj/_bmad-output/implementation-artifacts/qa-epic4-answer-presentation.md`, overall plan and review. Original source/ASR dirty change preserved; no commit/merge claimed until root records delivery. Production Live, actual provider services, physical-device accessibility/notifications/haptics and packaging remain unverified.
+[历史快照](archive/entry-context-2026-09-29/handoff.md)只证明当时版本。

@@ -4,10 +4,12 @@
 
 ## 当前有效
 
+2026-10-01 Epic1–5 核心 QA 和复现入口见 [交接](handoff.md)。完整报告为 `D:/code/sj/_bmad-output/implementation-artifacts/tests/test-summary.md`。
+
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
-- [Epic1 实施记录](../../_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)与 [QA 报告](../../_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)：2026-09-30 聊天信息准确与快速刷新（CAP-1/8/9），含基线失败与真实键盘、定时器验证证据
+- [Epic1 实施记录](D:/code/sj/_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)与 [QA 报告](D:/code/sj/_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)：2026-09-30 聊天信息准确与快速刷新（CAP-1/8/9），含基线失败与真实键盘、定时器验证证据
 - [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
 - [`../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml`](../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml)：聊天信息五项任务；Story 1.1–1.5 已完成，后续进入发布验证
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
@@ -16,7 +18,7 @@
 - [`../_bmad-output/implementation-artifacts/spec-fix-kimi-authoritative-completion-and-concurrent-chat-recovery.md`](../_bmad-output/implementation-artifacts/spec-fix-kimi-authoritative-completion-and-concurrent-chat-recovery.md)：Kimi 权威完成、回答延迟展示与多聊天恢复的验收规格
 - [`../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md`](../_bmad-output/implementation-artifacts/spec-localize-and-coalesce-kimi-f1-execution-steps.md)：Kimi F1 执行过程中文化与流式步骤归并的验收规格
 - [`../_bmad-output/implementation-artifacts/spec-fix-execution-ui-blockers.md`](../_bmad-output/implementation-artifacts/spec-fix-execution-ui-blockers.md)：2026-09-08 执行列表增量同步、异步历史分页、等待期归属与真实 GUI 验收；末尾为最终结果，frontmatter 为剩余限制
-- [`../../_bmad-output/implementation-artifacts/spec-2-4-synchronize-the-complete-execution-timeline-to-mobile.md`](../../_bmad-output/implementation-artifacts/spec-2-4-synchronize-the-complete-execution-timeline-to-mobile.md)：Story 2.4 跨端权威执行时间线、冻结分页、缺口恢复与验收结果
+- Story 2.4 跨端执行时间线：旧工作区规格当前未找到，不保留失效链接；以现有协议实现、测试及归档审查记录核对。
 - 2026-09-21 Epics 1–4 最终规格位于工作区 `_bmad-output/implementation-artifacts/`：`spec-1-1-restart-the-current-text-context-once-with-truthful-audio.md`、`spec-2-1-preserve-each-chats-selected-model.md`、`spec-2-2-create-and-name-a-new-chat-immediately.md`、`spec-3-1-show-meaningful-kimi-execution-stages.md`、`spec-3-2-coalesce-one-logical-provider-event-into-one-item.md`、`spec-3-3-group-every-execution-timeline-by-accessible-time.md`、`spec-4-1-edit-answer-detail-temporarily-without-saving.md`。
 - [`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)：2026-09-06 全量非实时测试的历史失败基线与复现范围
 

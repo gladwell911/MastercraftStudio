@@ -1,7 +1,6 @@
 # 纠错反思
 
 - Epic5: archived provisional output and Kimi startup/approval state must not advance recency. Preserve active pinned state during slim persistence and mark accepted legacy worker turns done to prevent repeated activity. Formal review caught unsuccessful Codex terminals mapped as `turn_completed`, OpenClaw visible sync bypassing history dirty, and Kimi's weak `>=` receipt assertion; all three repair groups are closed after protocol/surface tests. Initial native failures were focus/empty-owner/arrow-injection preconditions, retained as history rather than inferred product shortcut failures.
-- Final Epic5 checks: native28, history85 and models132 = 245 unique passes; targeted10 overlaps native28. Seven exact baseline failures remain (two voice, five Kimi); all answer GUI nodes passed but COM `0x8001010d` is still printed in the log. An ordinary-worker prior-failed→late-success callback possibility is deferred as unverified, without demonstrated reachability. Four lenses used one president context, not independent reviewers. Built awaits user acceptance; no merge/release, production Live, actual model services, physical devices or packaging validation is claimed.
 
 实际错误形成的下次检查点：
 
@@ -23,11 +22,9 @@
 
 The final combined review found two asynchronous identity gaps missed by the initial recovery scenarios. Exception/overflow prior-owner regressions and paired retired/current client UI tests now cover both; the focused dog follow-up checks the repaired boundaries without restarting the entire review.
 
+## 2026-10-01 用户纠正
 
-## Epic4 final verified result (2026-10-01)
-
-Status built for user review; acceptance pending, not Done. This supersedes earlier pending/blocked results. MC final no-temporary-hook affected56/unit94/models121=271; unchanged RC widget159 gives430 scoped checks, with three exact fresh checks overlapping affected rather than counted again. Six exact reproduced baseline failures remain excluded, COM0x8001010d remains documented in native/baseline-class controls. Compile/diff checks exit0. Final current-tree Local standard integrationDriver retry exits0 and verifies mobile chat list, exact Codex/Kimi assistant role/content/session remoteModelId and desktop provider routes; no cache-specific test is claimed. Original flutter-test DDS/comparator failures and offline-device attempt remain historical evidence. Original Android15 AVD restored; temporary runner and owned harness/flutter processes cleaned.
-
-The test now requires exactly one actual clear after real SendInput4 rather than a mandatory menu: product CHAR_HOOK legitimately consumes A. Native HWND preparation replaces unstable wrapper identity while retaining foreground/HasFocus and final focus assertions. Light/heavy/native/current controls succeed, and all final durable/resend/newthread/stale-terminal/visible assertions pass without temporary WH hooks. Historical only-Alt cause remains unknown and currently unreproduced; no external cause or product keyboard regression is inferred. Final navigation accepted-to-visible1016ms preserves selection/focus; real frame destruction125ms cancels timers without callbacks while child destruction does not.
-
-Full evidence/18-finding triage/six repair groups: `D:/code/sj/_bmad-output/implementation-artifacts/qa-epic4-answer-presentation.md`, overall plan and review. Original source/ASR dirty change preserved; no commit/merge claimed until root records delivery. Production Live, actual provider services, physical-device accessibility/notifications/haptics and packaging remain unverified.
+| 修改内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 首轮因原生前台阻塞过早结束，未完成五 Epic 覆盖，用户要求继续后才补齐 | 判断逻辑有问题 | 按逐 Epic 场景矩阵推进；环境失败先执行最小恢复方案，不以部分通过结束整个任务。 |
+| “测试完成”容易被理解为完整产品套件通过 | 判断逻辑有问题 | 明确本轮核心范围与未执行项；受控模型、模拟器、独立锁屏、生产 Live 和实体机分别表述。 |
