@@ -35,3 +35,6 @@ Controlled recovery QA exercises native wx send/Alt+A, actual Kimi subprocess st
 
 
 Formal Epic3 review repaired prior-turn event isolation during another failed/overflowing startup and retained source-client ownership across UI queueing. Independent final review patch verification: worker/Codex 61 passed, native recovery GUI 3 passed, exact regressions 3 passed; affected compilation passed. Exact 13 baseline failures remain recorded; controlled protocols do not establish production Live.
+
+
+Epic3 user acceptance (2026-10-01): final closeout authorized Done for the whole Epic and both tickets. The controlled recovery evidence and exact 13 baseline failures remain documented; production Live, real models, packaging and physical devices are unverified. Epic4/5 remain pending, so the initiative stays open.
