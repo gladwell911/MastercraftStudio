@@ -1275,7 +1275,7 @@ class ChatStore:
                     title=excluded.title,
                     model=excluded.model,
                     created_at=excluded.created_at,
-                    updated_at=excluded.updated_at,
+                    updated_at=MAX(chats.updated_at, excluded.updated_at),
                     pinned=excluded.pinned,
                     title_manual=excluded.title_manual,
                     title_source=excluded.title_source,

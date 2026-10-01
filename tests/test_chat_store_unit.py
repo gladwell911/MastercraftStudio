@@ -10,6 +10,27 @@ from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
 
+@pytest.mark.parametrize("active_pinned", [False, True])
+def test_activity_timestamp_is_monotonic_and_pinned_first(tmp_path, active_pinned):
+    store = ChatStore(tmp_path / "activity.db")
+    store.initialize()
+    for chat in [
+        {"id": "pinned", "pinned": True, "updated_at": 20.0},
+        {"id": "recent", "updated_at": 15.0},
+        {"id": "owner", "pinned": active_pinned, "updated_at": 1.0},
+    ]:
+        store.upsert_chat(dict(title=chat["id"], model="codex/main", created_at=1.0, **chat))
+    activity = {"id": "owner", "title": "owner", "model": "codex/main",
+                "created_at": 1.0, "updated_at": 30.0, "pinned": active_pinned}
+    store.upsert_chat(activity)
+    expected = ["owner", "pinned", "recent"] if active_pinned else ["pinned", "owner", "recent"]
+    assert [chat["id"] for chat in store.list_chat_summaries()] == expected
+    for stamp in [30.0, 2.0]:
+        store.upsert_chat(dict(activity, updated_at=stamp))
+        assert store.load_chat("owner")["updated_at"] == 30.0
+        assert [chat["id"] for chat in store.list_chat_summaries()] == expected
+
+
 def test_execution_replace_is_atomic_and_source_read_has_one_owner(tmp_path, monkeypatch):
     store = ChatStore(tmp_path / "atomic-execution.db")
     store.initialize()

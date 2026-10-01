@@ -1,5 +1,8 @@
 # 纠错反思
 
+- Epic5: archived provisional output and Kimi startup/approval state must not advance recency. Preserve active pinned state during slim persistence and mark accepted legacy worker turns done to prevent repeated activity. Formal review caught unsuccessful Codex terminals mapped as `turn_completed`, OpenClaw visible sync bypassing history dirty, and Kimi's weak `>=` receipt assertion; all three repair groups are closed after protocol/surface tests. Initial native failures were focus/empty-owner/arrow-injection preconditions, retained as history rather than inferred product shortcut failures.
+- Final Epic5 checks: native28, history85 and models132 = 245 unique passes; targeted10 overlaps native28. Seven exact baseline failures remain (two voice, five Kimi); all answer GUI nodes passed but COM `0x8001010d` is still printed in the log. An ordinary-worker prior-failed→late-success callback possibility is deferred as unverified, without demonstrated reachability. Four lenses used one president context, not independent reviewers. Built awaits user acceptance; no merge/release, production Live, actual model services, physical devices or packaging validation is claimed.
+
 实际错误形成的下次检查点：
 
 - 旧交接和票据不能单独证明 Story 完成；核对代码、提交、状态及测试。Live 验收需证明真实生产调用链和有效结果。

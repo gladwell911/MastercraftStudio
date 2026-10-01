@@ -1,5 +1,8 @@
 # 可复用经验
 
+- Epic5: treat send acceptance and first successful authoritative completed reply as activity facts. Provider `turn_completed` can also represent failure or interruption; gate recency on successful status while retaining existing terminal handling. Route OpenClaw's accepted visible sync facts through the same history dirty helper. Use the fact owner's monotonic `updated_at`, guard done-turn replay, and retain explicit pinned/unpinned state in slim persistence. Native tests need persisted owners, stable HWND/HasFocus/foreground checks and keys injected during the running event loop. Kimi receive activity needs a competing newer row and strict completion-time increase to distinguish it from send activity.
+- Epic5 final verification: native28/history85/models132 gives 245 unique passes; targeted10 overlaps native28. Two exact voice and five exact Kimi baseline failures remain, and all answer GUI nodes passed despite logged COM `0x8001010d`. Three formal-review repair groups are closed; one ordinary-worker failed→late-success path remains unverified/deferred. Four lenses in one president context do not provide independent-review diversity. Built awaits user acceptance; controlled evidence does not establish production Live, packaging or physical-device acceptance. Exact logs and boundaries are in the Epic5 plan/review.
+
 - OneDrive 数据：源码与打包版的笔记、常用命令路径不同。打包版须在初始化前验证目标存在、SQLite 完整且表结构属于已知笔记库。在线 SQLite 备份生成的是定时快照；先关闭备份连接，再校验并放置文件。跨机不并发运行 MC，换机先退出并等同步；不能直接用另一台旧库覆盖目标。
 - wx 可访问性：可见状态未变时不重绘列表、不移动焦点。后台事件先合并，再按 chat、turn、session 与 generation 复核归属；真实定时器测试负责完整清理。
 - 远程事件：provider 按规范化 model id 分派；可继续接收输入的 CLI 客户端绑定 chat_id。Kimi 文本来自 REST /messages，事件流用于活动触发；最终回答以持久化 done turn 为事实来源。

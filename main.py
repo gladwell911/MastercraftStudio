@@ -4025,6 +4025,7 @@ class ChatFrame(wx.Frame):
         slim = {
             "id": str(state.get("id") or self.active_chat_id or self.current_chat_id or "").strip(),
             "title": str(state.get("title") or EMPTY_CURRENT_CHAT_TITLE),
+            "pinned": bool(state.get("pinned")),
             "title_manual": title_manual,
             "title_source": str(state.get("title_source") or ("manual" if title_manual else "default")),
             "title_updated_at": float(state.get("title_updated_at") or state.get("updated_at") or now),
@@ -6151,6 +6152,12 @@ class ChatFrame(wx.Frame):
             self._idle_ui_refresh_scheduled = False
             return
         self._idle_ui_refresh_timer = timer
+
+    def _record_chat_activity(self, chat: dict, observed_at: float) -> None:
+        """Record an accepted message fact using the persisted history clock."""
+        chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), float(observed_at))
+        self._mark_history_list_dirty()
+        self._defer_chat_state_save()
 
     def _mark_history_list_dirty(self, keep_id: str | None = None) -> None:
         self._history_list_dirty = True
@@ -9170,7 +9177,7 @@ class ChatFrame(wx.Frame):
                 self.active_openclaw_last_event_id = last_event_id
         if changed:
             should_render = assistant_changed
-            target_chat["updated_at"] = time.time()
+            self._record_chat_activity(target_chat, time.time())
             if is_active_target and self.view_mode == "active" and should_render:
                 self._render_answer_list()
             self.SetStatusText("已同步 OpenClaw 主会话")
@@ -13178,7 +13185,6 @@ class ChatFrame(wx.Frame):
                 target_chat["codex_pending_request"] = self._codex_pending_request_from_event(chat_id, target_chat, event)
                 target_chat["request_kind"] = "user_input"
                 target_chat["codex_turn_active"] = True
-                target_chat["updated_at"] = time.time()
                 self._mark_history_list_dirty()
                 if target_idx >= 0:
                     self._mark_chat_turns_dirty(chat_id, target_idx)
@@ -13187,15 +13193,10 @@ class ChatFrame(wx.Frame):
                 return
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
-                history_recency_changed = False
                 if event_type == "item_completed" and str(event.phase or "") == "final_answer":
-                    if self._apply_codex_final_answer_to_turn(turn, str(event.text or "")):
-                        target_chat["updated_at"] = time.time()
-                        history_recency_changed = True
+                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
                 elif event_type == "subagent_result":
-                    if self._apply_codex_subagent_result_to_turn(turn, str(event.text or "")):
-                        target_chat["updated_at"] = time.time()
-                        history_recency_changed = True
+                    self._apply_codex_subagent_result_to_turn(turn, str(event.text or ""))
                 elif event_type == "turn_completed":
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
@@ -13205,16 +13206,14 @@ class ChatFrame(wx.Frame):
                         and str(event.text or "").strip()
                     ):
                         self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
-                    target_chat["updated_at"] = time.time()
-                    history_recency_changed = True
+                    if str(event.status or "").strip() in {"", "completed"}:
+                        self._record_chat_activity(target_chat, time.time())
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._request_codex_chat_information(target_chat, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._complete_clear_operation_turn(turn, failed=False)
                     self._queue_remote_final(chat_id, target_idx)
                     self._play_finish_sound()
                 self._mark_chat_turns_dirty(chat_id, target_idx)
-                if history_recency_changed:
-                    self._mark_history_list_dirty()
                 self._refresh_visible_history_chat(chat_id)
             self._defer_codex_state_save()
             return
@@ -13278,11 +13277,15 @@ class ChatFrame(wx.Frame):
             turn = {}
             if target_idx >= 0 and target_idx < len(self.active_session_turns):
                 turn = self.active_session_turns[target_idx]
+                if str(turn.get("request_status") or "") == "done":
+                    return
                 if not self._accept_clear_operation_result(turn, chat_id or self.active_chat_id):
                     self._clear_codex_worker_active_turn(chat_id or self.active_chat_id, target_idx, event_turn_id)
                     return
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
+                if str(event.status or "").strip() in {"", "completed"}:
+                    self._record_chat_activity(self._current_chat_state, time.time())
                 self._clear_codex_worker_active_turn(chat_id or self.active_chat_id or self.current_chat_id, target_idx, event_turn_id)
                 if (
                     (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
@@ -14617,7 +14620,6 @@ class ChatFrame(wx.Frame):
             if event_turn_id:
                 target_chat["kimi_turn_id"] = event_turn_id
             target_chat["kimi_turn_active"] = True
-            target_chat["updated_at"] = time.time()
             if not is_current_target:
                 self._mark_history_list_dirty()
         if is_current_target:
@@ -14778,7 +14780,10 @@ class ChatFrame(wx.Frame):
                 if not has_final_text:
                     self._recover_kimi_pending_owners(session_ids={event_session_id} if event_session_id else None)
                     return []
+                was_done = str(turn.get("request_status") or "") == "done"
                 self._apply_kimi_final_answer_to_turn(turn, final_text)
+                if not was_done:
+                    self._record_chat_activity(target_chat, time.time())
                 turn["request_status"] = "done"
                 turn["request_error"] = ""
                 turn["request_recovered_after_restart"] = False
@@ -14831,9 +14836,6 @@ class ChatFrame(wx.Frame):
         ]
         remaining_active = self._kimi_active_turns.get(str(chat_id or "").strip())
         target_chat["kimi_turn_active"] = bool(pending or isinstance(remaining_active, dict))
-        target_chat["updated_at"] = time.time()
-        if target_chat is not self._current_chat_state:
-            self._mark_history_list_dirty()
         if bool(event_data.get("stream_complete")) and event_session_id:
             with self._kimi_owner_lock:
                 if not self._kimi_pending_owners({event_session_id}):
@@ -15337,7 +15339,6 @@ class ChatFrame(wx.Frame):
                 return
             if event_type == "server_request" and str(event.method or "") == "approval":
                 target_chat["kimi_turn_active"] = True
-                target_chat["updated_at"] = time.time()
                 self._mark_history_list_dirty()
                 if target_idx >= 0:
                     self._mark_chat_turns_dirty(chat_id, target_idx)
@@ -17073,6 +17074,12 @@ class ChatFrame(wx.Frame):
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
             event.Skip()
             return
+        if not ctrl_down and self._is_continue_shortcut(key, alt_down):
+            self._suppress_tools_menu_open()
+            accepted, error = self._submit_question("好的，继续")
+            if not accepted and error:
+                self.SetStatusText(error)
+            return
         if alt_down and not ctrl_down and key in (ord("Y"), ord("y")):
             self._chat_information_previous_focus = wx.Window.FindFocus()
             self._show_chat_information()
@@ -18216,7 +18223,6 @@ class ChatFrame(wx.Frame):
         previous_updated_at = chat.get("updated_at")
         turns.append(turn)
         chat["model"] = resolved_model
-        chat["updated_at"] = turn["created_at"]
         self._mark_turn_request_pending(turn, resolved_model, text)
         try:
             if is_codex_model(resolved_model):
@@ -18245,7 +18251,7 @@ class ChatFrame(wx.Frame):
                 chat["updated_at"] = previous_updated_at
             return False, str(exc)
         self._play_send_sound()
-        self._mark_history_list_dirty()
+        self._record_chat_activity(chat, turn["created_at"])
         self._mark_chat_turns_dirty(owner_id, turn_idx)
         self._defer_chat_state_save()
         if turn_idx == 0:
@@ -18315,12 +18321,14 @@ class ChatFrame(wx.Frame):
         # was resolved above, including submissions originating in history.
         chat_id = submit_owner
         previous_committed_model = self._model_for_chat_selection(self._current_chat_state) or STARTUP_DEFAULT_MODEL_ID
+        previous_activity = self._current_chat_state.get("updated_at")
 
         def rollback_rejected_start(turn_idx: int, exc: Exception) -> tuple[bool, str]:
             if len(self.active_session_turns) > turn_idx:
                 del self.active_session_turns[turn_idx:]
             self.active_turn_idx = len(self.active_session_turns) - 1
             self._current_chat_state["model"] = previous_committed_model
+            self._current_chat_state["updated_at"] = previous_activity
             self.selected_model = previous_committed_model
             self.model_combo.SetValue(model_display_name(previous_committed_model))
             self.is_running = False
@@ -18371,7 +18379,6 @@ class ChatFrame(wx.Frame):
             self._mark_chat_turns_dirty(start_index=turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
-            self._current_chat_state["updated_at"] = now
             self._mark_turn_request_pending(turn, resolved_model, command_name)
             self.is_running = True
             self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
@@ -18404,6 +18411,7 @@ class ChatFrame(wx.Frame):
                     return rollback_rejected_start(turn_idx, exc)
             if turn_idx == 0:
                 self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._record_chat_activity(self._current_chat_state, turn["created_at"])
             return True, ""
         kimi_local_command = self._parse_kimi_local_command(q) if is_kimi_model(resolved_model) and not outgoing_attachments else None
         if kimi_local_command:
@@ -18425,7 +18433,6 @@ class ChatFrame(wx.Frame):
             self._mark_chat_turns_dirty(start_index=turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
-            self._current_chat_state["updated_at"] = now
             self._mark_turn_request_pending(turn, resolved_model, command_name)
             self.is_running = True
             self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
@@ -18458,6 +18465,7 @@ class ChatFrame(wx.Frame):
                     return rollback_rejected_start(turn_idx, exc)
             if turn_idx == 0:
                 self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._record_chat_activity(self._current_chat_state, turn["created_at"])
             return True, ""
         if (not success_attachments) and (not q):
             now = time.time()
@@ -18475,7 +18483,6 @@ class ChatFrame(wx.Frame):
             self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
-            self._current_chat_state["updated_at"] = now
             self._pending_input_attachments = []
             self.input_edit.SetValue("")
             self.input_edit.SetFocus()
@@ -18488,6 +18495,7 @@ class ChatFrame(wx.Frame):
                     self._render_answer_list_compat(refresh_execution=False)
                 else:
                     self._render_answer_list()
+            self._record_chat_activity(self._current_chat_state, turn["created_at"])
             return True, ""
         if is_openclaw_model(resolved_model):
             self._ensure_active_chat_id()
@@ -18508,7 +18516,6 @@ class ChatFrame(wx.Frame):
             self._mark_chat_turns_dirty(start_index=self.active_turn_idx)
             self._reset_answer_visible_row_limit()
             self._reset_current_turn_execution_view()
-            self._current_chat_state["updated_at"] = now
             self._mark_turn_request_pending(turn, resolved_model, worker_question)
             self.is_running = True
             self.input_edit.SetValue("")
@@ -18529,6 +18536,7 @@ class ChatFrame(wx.Frame):
             ).start()
             if self.active_turn_idx == 0:
                 self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
+            self._record_chat_activity(self._current_chat_state, turn["created_at"])
             return True, ""
 
         turn_idx = len(self.active_session_turns)
@@ -18551,7 +18559,6 @@ class ChatFrame(wx.Frame):
         self._mark_chat_turns_dirty(start_index=turn_idx)
         self._reset_answer_visible_row_limit()
         self._reset_current_turn_execution_view()
-        self._current_chat_state["updated_at"] = now
         self._mark_turn_request_pending(turn, resolved_model, worker_question)
         if is_claudecode_model(resolved_model):
             self.active_claudecode_session_id = str(self.active_claudecode_session_id or "").strip()
@@ -18604,6 +18611,7 @@ class ChatFrame(wx.Frame):
                 str(chat_id or self.active_chat_id or self.current_chat_id or ""),
                 getattr(self, "_clear_resend_revision", None),
             )
+        self._record_chat_activity(self._current_chat_state, turn["created_at"])
         return True, ""
 
     def _on_voice_state(self, text: str):
@@ -19160,7 +19168,10 @@ class ChatFrame(wx.Frame):
                             "chat_id": str(chat_id or ""),
                         })
                     return
+            was_done = str(target_turns[turn_idx].get("request_status") or "") == "done"
             clear_operation_id = str(target_turns[turn_idx].get("clear_operation_id") or "").strip()
+            if not err and not was_done and not is_openclaw_model(used_model):
+                self._record_chat_activity(target_chat, time.time())
             if used_model:
                 target_turns[turn_idx]["model"] = used_model
             if err:
@@ -19182,6 +19193,8 @@ class ChatFrame(wx.Frame):
                     self._mark_turn_request_failed(target_turns[turn_idx], err)
                 else:
                     self._mark_turn_request_done(target_turns[turn_idx])
+            elif not err and not is_openclaw_model(used_model):
+                self._mark_turn_request_done(target_turns[turn_idx])
             if clear_operation_id:
                 store = getattr(self, "chat_store", None)
                 if store is not None and hasattr(store, "transition_clear_operation"):
@@ -19198,7 +19211,6 @@ class ChatFrame(wx.Frame):
                 self._refresh_context_usage_after_done(target_chat, target_turns, turn_idx, used_model)
             self._active_request_count = 0
             if chat_id and chat_id not in {self.active_chat_id, self.current_chat_id, ""} and isinstance(target_chat, dict):
-                target_chat["updated_at"] = time.time()
                 title = self._summarize_last_turn_locally(target_turns)
                 if title and not target_chat.get("title_manual"):
                     target_chat["title"] = title

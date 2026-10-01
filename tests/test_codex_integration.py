@@ -10,6 +10,35 @@ TEST_THREAD_ID = "019d36ab-804a-73a2-a2dd-7a17e181628f"
 TEST_TURN_ID = "019d36b3-0a1c-7c61-aed9-387f6afbb9f9"
 
 
+def test_codex_archived_completion_records_only_new_authoritative_activity(frame, monkeypatch):
+    foreground = frame._current_chat_state
+    foreground["updated_at"] = 10.0
+    turn = {"question": "background", "answer_md": main.REQUESTING_TEXT,
+            "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
+            "codex_turn_id": TEST_TURN_ID, "codex_start_generation": 2}
+    archived = {"id": "background", "title": "background", "updated_at": 1.0,
+                "codex_context_generation": 2, "turns": [turn]}
+    frame.archived_chats = [archived]
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    def deliver(kind, generation=2):
+        frame._on_codex_event_for_chat("background", CodexEvent(
+            type=kind, turn_id=TEST_TURN_ID, phase="final_answer", text="accepted answer",
+            status="completed", data={"turn_idx": 0, "context_generation": generation},
+        ))
+    deliver("item_completed")
+    assert archived["updated_at"] == 1.0
+    deliver("turn_completed", 1)
+    assert archived["updated_at"] == 1.0
+    assert turn["request_status"] == "pending"
+    deliver("turn_completed")
+    accepted_at = archived["updated_at"]
+    assert accepted_at > 1.0 and turn["request_status"] == "done"
+    assert foreground["updated_at"] == 10.0
+    deliver("turn_completed")
+    assert archived["updated_at"] == accepted_at
+    assert foreground["updated_at"] == 10.0
+
+
 def test_codex_origin_timestamp_normalization_matches_provider_contract():
     seconds = 1_795_000_000.0
     assert codex_client._provider_origin_timestamp({"timestamp": seconds}) == seconds

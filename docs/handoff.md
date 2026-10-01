@@ -1,5 +1,15 @@
 # 当前交接
 
+## Epic5 built, awaiting user acceptance — 2026-10-01
+
+The MC Epic5 worktree implements main-window Alt+C through the existing submission path with exact text “好的，继续”. Accepted sends and first authoritative Codex/Kimi/ordinary-worker completions update the owner's monotonic persisted activity clock and request the existing quiet history refresh. Pinned priority, selected chat identity and refresh focus handling are retained; provisional fragments, startup/status events, errors and duplicate completion do not produce new recency. The detail-window frozen continuation remains unchanged; RC is unchanged.
+
+Active-state saves retain pinned state, including unpin roundtrips. Formal review's three repair groups are closed: failed/interrupted Codex terminals do not advance activity, accepted visible OpenClaw sync messages request history refresh, and actual Kimi completion has strict receive-time and visible-order coverage. No further review material remains; followup review is not recommended.
+
+Final engineer verification supersedes the earlier counts: native desktop 28 passed in 29.06s (`epic5-review-native-final.log`); history/voice/store 85 passed and two exact existing voice failures in 37.65s (`epic5-review-history-final.log`); answer/Codex/Kimi 132 passed and five exact existing Kimi failures in 67.25s (`epic5-review-models-final.log`). These three final suites contain 245 unique passing checks; the 10 repair-targeted checks overlap the 28 native checks and are not added. Compilation and diff checks exited 0. All answer GUI nodes passed, although the model/answer log still prints COM `0x8001010d`; retain that log limitation. The seven baseline failures are the voice model-order and Ctrl+Right expectations and the five Kimi execution-summary cases named in the plan; the complete suite is not green.
+
+One ordinary-worker prior-failed→late-success possibility remains unverified and deferred because no reachable same-request callback path was demonstrated. All four review lenses ran in one president context, so the review was not four independent reviews. Built awaits user acceptance; no merge or release is claimed. Controlled provider evidence does not establish production Live, actual model services, packaging or physical-device acceptance. Exact commands and review evidence are in `D:/code/sj/_bmad-output/implementation-artifacts/plan-epic5-desktop-navigation.md` and `review-epic5-desktop-navigation.md` in the same directory.
+
 截至 2026-09-30。逐项旧结果与哈希保存在 [归档快照](archive/entry-context-2026-09-29/handoff.md)。
 
 ## 当前状态
