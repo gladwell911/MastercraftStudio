@@ -36,6 +36,6 @@ helper `tests/owned_window_qa.py` 为已验证源文件的逐字节副本，仅�
 - Epic1 聊天信息、Epic2 通知事实、Epic3 恢复、Epic4 回答展示、Epic5 继续与排序已有实现；详细历史基线和 deferred 项见工作区相应 `plan-epic*`/`qa-*`/`review-*`。已经合并，尚未发布。
 - 源码笔记为 `D:/code/note/notes.db`；打包版要求个人 OneDrive 下 `code/data/sj/notes.db` 已存在并通过完整性/表结构校验，常用命令同目录 `common_commands.json`。旧安装仍写源库，2026-09-29 云端备份仅是快照。切包前从最新源库一致性备份并安全替换或合并；其他电脑独有笔记先导出，一次只运行一台 MC，换机先退出并等同步。
 - 发布前按实际范围接续 Live、真实模型、实体设备和新包双机验证，不重复已有效定向测试。
-- Git 收尾：Epic2/3 已在 main，Epic5 包含 Epic4；功能分支和工作树保留，旧 RC 备份不合并。RC 主树既有 ASR 修改保留且哈希不变；本次未推送。
+- Git 清理（2026-10-01）：全部已合并功能分支已删除，本仓库仅保留 main；测试工作树切为 detached HEAD，文件和构建数据保留。RC 旧备份历史已完整归档为 `D:/code/sj/.sync-backups/rc-pre-sync-20260906-add9e1d-20261001.bundle` 并通过 git bundle verify，原备份分支已删除。RC 主树 ASR 修改保留且哈希不变；未推送。
 
 [历史快照](archive/entry-context-2026-09-29/handoff.md)只证明当时版本。
