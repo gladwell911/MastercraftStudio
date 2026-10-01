@@ -1,10 +1,10 @@
 # 当前交接
 
-截至 2026-10-01。当前为 `epic5-desktop-navigation` 交付树，测试基线 HEAD `8bc247d8954a4d0bcab24254a53da845f5847f0f`；手机对应 `D:/code/sj/.build-work/epic5/rc` HEAD `19cfe57182fe2b67857ed628c20a7bf623211a0f`。不能用 `D:/code/sj/mc` 主工作树代替本交付。
+截至 2026-10-01。Epic4/5 与本轮 QA 已合入 `D:/code/sj/mc` 的 `main`，合并代码提交 `8bf197f540e3c375ec8d26b30ba49a94c34d30ef`；手机对应 `D:/code/sj/rc` 的 `master`，合并代码提交 `4f20ec54b08fc2fdfe1c8dcb534c489630743831`。以下 QA 数字来自先前同内容交付树的验证，主树合并后运行 `python -m pytest tests/test_answer_list_time_rows_unit.py tests/test_chat_store_unit.py -q`，76项通过。尚未推送、打包或发布。
 
 ## 本轮验证（2026-10-01）
 
-五 Epic 核心桌面/模拟器范围通过，由 engineer 独立核对；不是完整产品套件。测试未修改产品代码，不自动改变 Epic4/5 用户验收、合并和发布状态。
+五 Epic 核心桌面/模拟器范围通过，由 engineer 独立核对；不是完整产品套件。测试未修改产品代码，不等于生产发布验证。
 
 | 范围 | 最终结果 |
 |---|---|
@@ -33,9 +33,9 @@ helper `tests/owned_window_qa.py` 为已验证源文件的逐字节副本，仅�
 
 ## 后续与有效背景
 
-- Epic1 聊天信息、Epic2 通知事实、Epic3 恢复、Epic4 回答展示、Epic5 继续与排序已有实现；详细历史基线和 deferred 项见工作区相应 `plan-epic*`/`qa-*`/`review-*`。本轮未合并或发布。
+- Epic1 聊天信息、Epic2 通知事实、Epic3 恢复、Epic4 回答展示、Epic5 继续与排序已有实现；详细历史基线和 deferred 项见工作区相应 `plan-epic*`/`qa-*`/`review-*`。已经合并，尚未发布。
 - 源码笔记为 `D:/code/note/notes.db`；打包版要求个人 OneDrive 下 `code/data/sj/notes.db` 已存在并通过完整性/表结构校验，常用命令同目录 `common_commands.json`。旧安装仍写源库，2026-09-29 云端备份仅是快照。切包前从最新源库一致性备份并安全替换或合并；其他电脑独有笔记先导出，一次只运行一台 MC，换机先退出并等同步。
 - 发布前按实际范围接续 Live、真实模型、实体设备和新包双机验证，不重复已有效定向测试。
-- Git 收尾：本分支无上游，不能推送；RC 测试树 detached HEAD，改动待明确分支处理。未自动调整 remote/上游或主树；主树已有 ASR 修改保持原状。
+- Git 收尾：Epic2/3 已在 main，Epic5 包含 Epic4；功能分支和工作树保留，旧 RC 备份不合并。RC 主树既有 ASR 修改保留且哈希不变；本次未推送。
 
 [历史快照](archive/entry-context-2026-09-29/handoff.md)只证明当时版本。
