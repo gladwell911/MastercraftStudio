@@ -970,6 +970,8 @@ def test_worker_process_source_does_not_import_wx():
 
 
 def test_context_only_information_does_not_query_account_or_quota():
+    from codex_worker_client import CodexWorkerClient
+    import json
     calls = []
     class Client:
         def read_native_usage(self, thread):
@@ -983,9 +985,18 @@ def test_context_only_information_does_not_query_account_or_quota():
             return {}
     output = io.StringIO()
     runtime = CodexWorkerRuntime(client_factory=lambda on_event, codex_model: Client(), output=output)
-    runtime.handle_message(make_ui_request("read", "read_chat_information", {
-        "chat_id": "chat", "model": "codex/main", "identity": ["chat", "codex/main", "native", "account"],
-        "generation": 1, "context_only": True}))
+    pipe = io.StringIO()
+    class Process:
+        stdin = pipe
+        def poll(self):
+            return None
+    client = CodexWorkerClient(start_reader_threads=False)
+    client.process = Process()
+    client.read_chat_information(chat_id="chat", model="codex/main",
+        identity=["chat", "codex/main", "native", "account"], generation=1, context_only=True)
+    request = json.loads(pipe.getvalue())
+    assert request['payload']['context_only'] is True
+    runtime.handle_message(request)
     result = decode_worker_line(output.getvalue().strip() + "\n")["payload"]
     assert result["native_usage"]["session_total_tokens"] == 900
     assert "account" not in result and "rate_limits" not in result

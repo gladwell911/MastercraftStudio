@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-01 Epic1–5 核心 QA 和复现入口见 [交接](handoff.md)。完整报告为 `D:/code/sj/_bmad-output/implementation-artifacts/tests/test-summary.md`。
+2026-10-01 Epic1–5 核心 QA、深审修复和复现入口见 [交接](handoff.md)。此前跨端 QA 报告为 `D:/code/sj/_bmad-output/implementation-artifacts/tests/test-summary.md`；本轮深审证据已保存在仓库 `_bmad-output/implementation-artifacts/`。
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明

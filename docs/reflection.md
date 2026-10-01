@@ -1,5 +1,11 @@
 # 纠错反思
 
+## 2026-10-01 深审判断纠正
+
+| 修改内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 撤回“ACK 前新 generation 守卫导致请求卡住”的结论，候选留作既有行为验证 | 判断逻辑有问题 | 人工构造异步状态前，先证明每个字段的真实写入路径和事件顺序；ACK 才写入的 metadata 不可注入 ACK 前场景作为产品回归证据。 |
+
 - Epic5: archived provisional output and Kimi startup/approval state must not advance recency. Preserve active pinned state during slim persistence and mark accepted legacy worker turns done to prevent repeated activity. Formal review caught unsuccessful Codex terminals mapped as `turn_completed`, OpenClaw visible sync bypassing history dirty, and Kimi's weak `>=` receipt assertion; all three repair groups are closed after protocol/surface tests. Initial native failures were focus/empty-owner/arrow-injection preconditions, retained as history rather than inferred product shortcut failures.
 
 实际错误形成的下次检查点：

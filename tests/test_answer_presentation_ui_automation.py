@@ -130,9 +130,9 @@ def test_answer_text_viewer_plain_scratch_reopens_authoritative_markdown(frame):
                 visible = dialog.text_ctrl.GetValue()
                 print(f"DETAIL attempt={attempt} get_value_complete", flush=True)
                 assert "Heading\n\nbold and *literal* and C# \U0001f600" in visible
-                assert "alpha beta link code" in visible
+                assert "alpha beta link (https://example.test) code" in visible
                 assert "diagram description" in visible
-                assert "first\nsecond" in visible
+                assert "- first\n- second" in visible
                 assert "1. one\n2. two" in visible
                 assert "a*b # code\n\n\nlast" in visible
                 assert "**bold**" not in visible
@@ -581,3 +581,41 @@ def test_answer_text_viewer_already_visible_and_duplicate_deadlines_have_zero_na
         assert operations == []
     finally:
         stop_timers(frame)
+
+
+def test_review_detail_projection_native_and_cleanup(frame, monkeypatch):
+    stop_timers(frame)
+    canonical = ('<ol start="bad"><li>fallback</li></ol>\n\n'
+                 '[docs](https://example.com/docs)\n\nfirst<br><br>second\n\n'
+                 '<ul><li>outer<ul><li>inner</li></ul></li><li>next</li></ul>\n\n'
+                 '<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>')
+    for _ in range(2):
+        dialog = main.AnswerTextViewerDialog(frame, 'Details', canonical)
+        try:
+            dialog._set_answer_display_text()
+            dialog.Show()
+            run_native_for(25)
+            visible = dialog.text_ctrl.GetValue()
+            assert '1. fallback' in visible
+            assert 'docs (https://example.com/docs)' in visible
+            assert 'first\n\nsecond' in visible
+            assert '- outer\n  - inner\n- next' in visible
+            assert 'a\tb\nc\td' in visible
+            dialog.text_ctrl.SetValue('scratch')
+            assert dialog.canonical_text == canonical
+        finally:
+            dialog.Destroy()
+            run_native_for(25)
+    created = []
+    original = main.AnswerTextViewerDialog.__init__
+    def record(dialog, *args, **kwargs):
+        original(dialog, *args, **kwargs)
+        created.append(dialog)
+    monkeypatch.setattr(main.AnswerTextViewerDialog, '__init__', record)
+    def fail(_dialog):
+        raise ValueError('conversion failure')
+    monkeypatch.setattr(main.AnswerTextViewerDialog, '_set_answer_display_text', fail)
+    assert frame._open_answer_text_viewer('Details', canonical, _answer_markdown=True) is False
+    run_native_for(25)
+    assert not bool(created[0])
+    assert frame._answer_viewer_open is False

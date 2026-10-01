@@ -1,5 +1,8 @@
 # 可复用经验
 
+- 详情纯文本投影需保留链接目标、显式空行、列表层级和表格列，HTML 属性解析须允许无值或非法序号。用真实 Markdown 和 HTML 两类输入核对内容；窗口转换放在销毁 finally 的保护范围内。换行边界只维护末尾状态，避免每个段落拼接累计全文。
+- 上下文专用请求不能吞掉完整信息刷新：合并一次完整刷新意图，请求完成后重新核对 dialog/owner，再补发。分别覆盖成功、失败、关闭、owner 切换；IPC 标志通过实际 client 序列化到 worker 消费验证，不能只在测试里手造字段。
+
 - Epic5: treat send acceptance and first successful authoritative completed reply as activity facts. Provider `turn_completed` can also represent failure or interruption; gate recency on successful status while retaining existing terminal handling. Route OpenClaw's accepted visible sync facts through the same history dirty helper. Use the fact owner's monotonic `updated_at`, guard done-turn replay, and retain explicit pinned/unpinned state in slim persistence. Native tests need persisted owners, stable HWND/HasFocus/foreground checks and keys injected during the running event loop. Kimi receive activity needs a competing newer row and strict completion-time increase to distinguish it from send activity.
 
 - OneDrive 数据：源码与打包版的笔记、常用命令路径不同。打包版须在初始化前验证目标存在、SQLite 完整且表结构属于已知笔记库。在线 SQLite 备份生成的是定时快照；先关闭备份连接，再校验并放置文件。跨机不并发运行 MC，换机先退出并等同步；不能直接用另一台旧库覆盖目标。

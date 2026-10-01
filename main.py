@@ -607,37 +607,66 @@ class _ParagraphStripper(_Stripper):
         self._lists = []
         self._pre = False
         self._text_depth = 0
+        self._trailing_newlines = 0
+        self._links = []
+        self._table_column = 0
+
+    def _append(self, text):
+        if not text:
+            return
+        self.parts.append(text)
+        trailing = len(text) - len(text.rstrip("\n"))
+        self._trailing_newlines = self._trailing_newlines + trailing if trailing == len(text) else trailing
 
     def _boundary(self, count):
-        text = self.text()
-        missing = count - (len(text) - len(text.rstrip("\n")))
-        if text and missing > 0:
-            self.parts.append("\n" * missing)
+        missing = count - self._trailing_newlines
+        if self.parts and missing > 0:
+            self._append("\n" * missing)
 
     def handle_data(self, data):
-        if self._pre or self._text_depth or data.strip():
-            self.parts.append(data)
+        if self._pre or data.strip() or (self._text_depth and "\n" not in data):
+            self._append(data)
 
     def handle_starttag(self, tag, attrs):
         if tag in self._text_blocks:
             self._text_depth += 1
         if tag == "img":
-            self.parts.append(dict(attrs).get("alt", ""))
+            self._append(dict(attrs).get("alt") or "")
+        if tag == "a":
+            self._links.append((dict(attrs).get("href"), len(self.parts)))
         if tag in self._blocks:
-            self._boundary(2)
-        elif tag in {"li", "tr", "br"}:
+            self._boundary(1 if tag in {"ol", "ul"} and self._lists else 2)
+        elif tag == "br":
+            self._append("\n")
+        elif tag in {"li", "tr"}:
             self._boundary(1)
-        elif tag in {"td", "th"} and self.parts:
-            self.parts.append("\t")
+        if tag == "tr":
+            self._table_column = 0
+        elif tag in {"td", "th"}:
+            if self._table_column:
+                self._append("\t")
+            self._table_column += 1
         if tag in {"ol", "ul"}:
-            self._lists.append(int(dict(attrs).get("start", 1)) if tag == "ol" else None)
-        if tag == "li" and self._lists and self._lists[-1] is not None:
-            self.parts.append(f"{self._lists[-1]}. ")
-            self._lists[-1] += 1
+            try:
+                start = int(dict(attrs).get("start", 1))
+            except (ValueError, TypeError):
+                start = 1
+            self._lists.append(start if tag == "ol" else None)
+        if tag == "li" and self._lists:
+            self._append("  " * (len(self._lists) - 1))
+            if self._lists[-1] is None:
+                self._append("- ")
+            else:
+                self._append(f"{self._lists[-1]}. ")
+                self._lists[-1] += 1
         if tag == "pre":
             self._pre = True
 
     def handle_endtag(self, tag):
+        if tag == "a" and self._links:
+            target, start = self._links.pop()
+            if target and "".join(self.parts[start:]).strip() != target:
+                self._append(f" ({target})")
         if tag in self._text_blocks:
             self._text_depth -= 1
         if tag == "pre":
@@ -645,7 +674,7 @@ class _ParagraphStripper(_Stripper):
         if tag in {"ol", "ul"} and self._lists:
             self._lists.pop()
         if tag in self._blocks:
-            self._boundary(2)
+            self._boundary(1 if tag in {"ol", "ul"} and self._lists else 2)
         elif tag in {"li", "tr"}:
             self._boundary(1)
 
@@ -1763,6 +1792,7 @@ class ChatInformationDialog(wx.Dialog):
         self.refresh_timer.Stop()
         self.context_timer.Stop()
         self.owner._chat_information_request = None
+        self.owner._codex_information_full_refresh = None
         self.owner._kimi_quota_request = None
         request = self.owner._kimi_information_requests.get(self.identity[0])
         if isinstance(request, dict) and request.get("visible_only"):
@@ -2653,7 +2683,10 @@ class ChatFrame(wx.Frame):
         if (self._chat_information_request is not None
                 and self._chat_information_request[2] == identity
                 and time.monotonic() - getattr(self, "_codex_information_started", 0) < 30):
+            if not context_only and getattr(self, "_codex_information_context_only", False):
+                self._codex_information_full_refresh = (identity, dialog)
             return
+        self._codex_information_full_refresh = None
         self._codex_information_started = time.monotonic()
         self._codex_information_context_only = context_only
         self._codex_information_revision = int(chat.get("codex_usage_revision") or 0)
@@ -2696,6 +2729,16 @@ class ChatFrame(wx.Frame):
             chat["codex_chat_information_account_owner"] = identity[3]
         self._chat_information_request = None
         self._refresh_chat_information(chat)
+        self._resume_codex_information_full_refresh(chat, identity)
+
+    def _resume_codex_information_full_refresh(self, chat: dict, identity: tuple) -> None:
+        pending = getattr(self, "_codex_information_full_refresh", None)
+        self._codex_information_full_refresh = None
+        dialog = getattr(self, "_chat_information_dialog", None)
+        if (pending is not None and pending == (identity, dialog)
+                and dialog is not None and not dialog.IsBeingDeleted()
+                and dialog.identity == identity and self._chat_information_identity(chat, identity[1]) == identity):
+            self._request_codex_chat_information(chat, identity[1])
 
     def _apply_codex_chat_information(self, chat_id: str, message: dict, payload: dict) -> None:
         request = self._chat_information_request
@@ -2732,6 +2775,7 @@ class ChatFrame(wx.Frame):
             chat["codex_snapshot_error"] = bool(payload.get("usage_error"))
         if payload.get("context_only"):
             self._refresh_chat_information(chat)
+            self._resume_codex_information_full_refresh(chat, identity)
             return
         account_resp = payload.get("account") if isinstance(payload.get("account"), dict) else {}
         account = account_resp.get("account") if isinstance(account_resp.get("account"), dict) else None
@@ -2790,6 +2834,8 @@ class ChatFrame(wx.Frame):
         pending = self._kimi_information_requests.get(identity[0])
         if (isinstance(pending, dict) and pending.get("identity") == identity
                 and time.monotonic() - pending.get("started", 0) < 30):
+            if not context_only and pending.get("context_only"):
+                pending["full_refresh_dialog"] = dialog
             return
         kinds = {"status"} if context_only else {"status", "snapshot"}
         self._kimi_information_generation += 1
@@ -2798,6 +2844,7 @@ class ChatFrame(wx.Frame):
             "generation": generation, "identity": identity,
             "context_revision": int(chat.get("kimi_context_revision") or 0),
             "visible_only": visible_only, "remaining": kinds.copy(),
+            "context_only": context_only,
             "started": time.monotonic(), "dialog": dialog if visible_only else None,
             "cache_owner": self._information_cache_owner(chat, "kimi"),
         }
@@ -2961,6 +3008,11 @@ class ChatFrame(wx.Frame):
             remaining.discard(kind)
             if not remaining:
                 self._kimi_information_requests.pop(chat_id, None)
+                pending_dialog = request.get("full_refresh_dialog")
+                dialog = getattr(self, "_chat_information_dialog", None)
+                if (pending_dialog is not None and pending_dialog is dialog
+                        and not dialog.IsBeingDeleted() and dialog.identity == identity):
+                    self._request_kimi_chat_information(chat, identity[1], visible_only=True)
         if changed:
             self._refresh_chat_information(chat)
             self._defer_codex_state_save()
@@ -20009,11 +20061,11 @@ class ChatFrame(wx.Frame):
             payload=payload,
             on_continue=self._continue_from_answer_text_viewer if payload is not None else None,
         )
-        if _answer_markdown:
-            dlg._set_answer_display_text()
         self._answer_viewer_open = True
         shown = False
         try:
+            if _answer_markdown:
+                dlg._set_answer_display_text()
             dlg._shown_modally = True
             dlg.ShowModal()
             shown = True

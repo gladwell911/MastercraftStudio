@@ -1371,3 +1371,78 @@ def test_kimi_old_session_status_cannot_replace_current_session_usage(frame, wx_
     assert "10.0%" in dialog.information_list.GetString(0)
     dialog.Close()
     wx_app.Yield()
+
+
+@pytest.mark.parametrize('model', ['codex/main', 'kimi/main'])
+@pytest.mark.parametrize('retire', ['', 'close', 'owner'])
+@pytest.mark.parametrize('failed', [False, True])
+def test_full_refresh_queued_behind_context_request(frame, wx_app, monkeypatch, model, retire, failed):
+    frame.Show()
+    frame.view_mode = 'active'
+    frame.selected_model = model
+    frame.active_chat_id = frame.current_chat_id = 'review-info'
+    chat = {'id': 'review-info', 'model': model, 'codex_thread_id': 'native', 'kimi_session_id': 'native'}
+    frame._current_chat_state = chat
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    callbacks = []
+    calls = []
+    monkeypatch.setattr(frame, '_defer_codex_state_save', lambda: None)
+    monkeypatch.setattr(frame, '_call_after_if_alive', lambda func, *args: callbacks.append((func, args)))
+    class Client:
+        def start(self):
+            pass
+        def read_chat_information(self, **payload):
+            calls.append(payload)
+        def get_status(self, session):
+            calls.append('status')
+            if failed:
+                raise RuntimeError('offline')
+            return {'context_tokens': 12, 'max_context_tokens': 100}
+        def get_snapshot(self, session):
+            calls.append('snapshot')
+            return {}
+    if model.startswith('codex'):
+        monkeypatch.setattr(main.ChatFrame, '_request_codex_chat_information', _REAL_CODEX_INFORMATION_REQUEST)
+        monkeypatch.setattr(frame, '_get_or_create_codex_client', lambda *_a: Client())
+    else:
+        monkeypatch.setattr(main.ChatFrame, '_request_kimi_chat_information', _REAL_KIMI_INFORMATION_REQUEST)
+        monkeypatch.setattr(frame, '_ensure_kimi_client', lambda: Client())
+    def wait_for(predicate):
+        deadline = time.monotonic() + 2
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert predicate()
+    dialog._on_context_timer(None)
+    wait_for(lambda: len(calls) == 1)
+    dialog._on_refresh_timer(None)
+    dialog._on_refresh_timer(None)
+    assert len(calls) == 1
+    if retire == 'close':
+        dialog.Close()
+        wx_app.Yield()
+    elif retire == 'owner':
+        chat['codex_thread_id' if model.startswith('codex') else 'kimi_session_id'] = 'replacement'
+    if model.startswith('codex'):
+        payload = calls[0]
+        if failed:
+            frame._fail_codex_chat_information_request(payload['generation'], tuple(payload['identity']))
+        else:
+            frame._apply_codex_chat_information('review-info', {}, dict(payload, native_usage={}))
+        if not retire:
+            wait_for(lambda: len(calls) == 2)
+            assert calls[0]['context_only'] is True and calls[1]['context_only'] is False
+            frame._apply_codex_chat_information('review-info', {}, dict(calls[1], native_usage={}))
+    else:
+        wait_for(lambda: len(callbacks) >= 1)
+        func, args = callbacks.pop(0)
+        func(*args)
+        if not retire:
+            wait_for(lambda: len(calls) == 3 and len(callbacks) == 2)
+            for func, args in list(callbacks):
+                func(*args)
+            assert calls == ['status', 'status', 'snapshot']
+    assert len(calls) == (1 if retire else (2 if model.startswith('codex') else 3))
+    if not retire:
+        dialog.Close()
+        wx_app.Yield()
