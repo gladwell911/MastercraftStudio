@@ -597,6 +597,78 @@ def md_to_plain(md_text: str) -> str:
     return unescape(st.text()).strip()
 
 
+class _ParagraphStripper(_Stripper):
+    """Keep parser-decoded literal characters and block boundaries for scratch."""
+    _blocks = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "ul", "ol", "table"}
+    _text_blocks = {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th"}
+
+    def __init__(self):
+        super().__init__()
+        self._lists = []
+        self._pre = False
+        self._text_depth = 0
+
+    def _boundary(self, count):
+        text = self.text()
+        missing = count - (len(text) - len(text.rstrip("\n")))
+        if text and missing > 0:
+            self.parts.append("\n" * missing)
+
+    def handle_data(self, data):
+        if self._pre or self._text_depth or data.strip():
+            self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._text_blocks:
+            self._text_depth += 1
+        if tag == "img":
+            self.parts.append(dict(attrs).get("alt", ""))
+        if tag in self._blocks:
+            self._boundary(2)
+        elif tag in {"li", "tr", "br"}:
+            self._boundary(1)
+        elif tag in {"td", "th"} and self.parts:
+            self.parts.append("\t")
+        if tag in {"ol", "ul"}:
+            self._lists.append(int(dict(attrs).get("start", 1)) if tag == "ol" else None)
+        if tag == "li" and self._lists and self._lists[-1] is not None:
+            self.parts.append(f"{self._lists[-1]}. ")
+            self._lists[-1] += 1
+        if tag == "pre":
+            self._pre = True
+
+    def handle_endtag(self, tag):
+        if tag in self._text_blocks:
+            self._text_depth -= 1
+        if tag == "pre":
+            self._pre = False
+        if tag in {"ol", "ul"} and self._lists:
+            self._lists.pop()
+        if tag in self._blocks:
+            self._boundary(2)
+        elif tag in {"li", "tr"}:
+            self._boundary(1)
+
+
+def answer_detail_plain_text(md_text: str) -> str:
+    parser = _ParagraphStripper()
+    parser.feed(markdown.markdown(str(md_text or ""), extensions=["extra", "fenced_code", "tables", "sane_lists"]))
+    return parser.text().strip("\n")
+
+
+def answer_time_projection(timestamps) -> list[bool]:
+    """Unknown time emits a label without advancing the last shown trusted time."""
+    anchor = None
+    shown = []
+    for raw in timestamps:
+        timestamp = _finite_timestamp(raw)
+        show = timestamp is None or anchor is None or timestamp - anchor >= WECHAT_TIME_GAP_SECONDS
+        shown.append(show)
+        if show and timestamp is not None:
+            anchor = timestamp
+    return shown
+
+
 def md_to_plain_preserving_paragraphs(md_text: str) -> str:
     if not md_text:
         return ""
@@ -1108,6 +1180,13 @@ class AnswerTextViewerDialog(wx.Dialog):
             pass
         self.text_ctrl.SetFocus()
         self.continue_button.Enable(payload is not None and callable(on_continue))
+
+    def _set_answer_display_text(self) -> None:
+        display_text = self._display_prefix + answer_detail_plain_text(self.canonical_text).lstrip("\r\n")
+        self.text_ctrl.ChangeValue(display_text)
+        self._display_marker_offset = 0
+        self._scratch_previous_text = display_text
+        self._scratch_non_edit_key_pending = False
 
     def _on_close(self, _event=None):
         self._closing = True
@@ -1946,6 +2025,11 @@ class ChatFrame(wx.Frame):
         self._navigation_quiet_until = 0.0
         self._navigation_quiet_last_trigger = ""
         self._navigation_quiet_flush_timer = None
+        self._answer_refresh_deadline_timer = None
+        self._answer_refresh_deadline_owner = None
+        self._answer_refresh_deadline_turns = []
+        self._answer_refresh_destroy_window_id = self.GetId()
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._stop_answer_refresh_deadline)
         self._deferred_background_ui_counts = {}
         self._pending_execution_tail_appends = {}
         self.ui_perf_slow_threshold_ms = UI_PERF_SLOW_THRESHOLD_MS
@@ -5086,25 +5170,20 @@ class ChatFrame(wx.Frame):
                 self.answer_list.Append(label)
             self.answer_meta.append(meta)
 
-    def _turn_time_row_label(self, turn: dict, prev_turn: dict | None, now_ts: float) -> str:
-        ts_value = _finite_timestamp((turn or {}).get("created_at"))
-        prev_value = None
-        if prev_turn is not None:
-            prev_value = _finite_timestamp((prev_turn or {}).get("created_at"))
-        if not should_show_time(prev_value, ts_value):
-            return ""
-        return wechat_time_label(ts_value, now_ts)
-
     def _maybe_append_time_row_to_answer_list(self, turn_idx: int, turn: dict) -> None:
         for meta in list(getattr(self, "answer_meta", []) or []):
             if meta and len(meta) > 1 and meta[0] == "time" and meta[1] == int(turn_idx):
                 return
-        prev_turn = None
-        if turn_idx > 0:
-            turns = self._get_view_turns()
-            if isinstance(turns, list) and 0 <= turn_idx - 1 < len(turns):
-                prev_turn = turns[turn_idx - 1]
-        label = self._turn_time_row_label(turn, prev_turn, time.time())
+        # Derive the anchor from time rows actually present in this page.
+        turns = self._get_view_turns()
+        anchor = None
+        for meta in getattr(self, "answer_meta", []):
+            if meta and meta[0] == "time" and 0 <= meta[1] < len(turns):
+                timestamp = _finite_timestamp(turns[meta[1]].get("created_at"))
+                if timestamp is not None:
+                    anchor = timestamp
+        timestamp = _finite_timestamp((turn or {}).get("created_at"))
+        label = wechat_time_label(timestamp, time.time()) if answer_time_projection([anchor, timestamp])[-1] else ""
         if not label:
             return
         meta = ("time", int(turn_idx), label, "")
@@ -5774,6 +5853,32 @@ class ChatFrame(wx.Frame):
         if len(content_rows) > limit:
             content_rows = content_rows[-limit:]
             content_metas = content_metas[-limit:]
+        turns = self._get_view_turns()
+        content = [(row, meta) for row, meta in zip(content_rows, content_metas) if meta[0] != "time"]
+        def project_time_rows(content):
+            indices = list(dict.fromkeys(meta[1] for _, meta in content if meta[1] >= 0))
+            timestamps = [turns[index].get("created_at") if index < len(turns) else None for index in indices]
+            labels = {index: wechat_time_label(timestamp, time.time()) for index, timestamp, show
+                      in zip(indices, timestamps, answer_time_projection(timestamps)) if show}
+            projected_rows, projected_metas = [], []
+            emitted = set()
+            for row, meta in content:
+                index = meta[1]
+                if index in labels and index not in emitted:
+                    projected_rows.append(labels[index])
+                    projected_metas.append(("time", index, labels[index], ""))
+                    emitted.add(index)
+                projected_rows.append(row)
+                projected_metas.append(meta)
+            return projected_rows, projected_metas
+
+        content_rows, content_metas = project_time_rows(content)
+        while len(content_rows) > limit:
+            # A newly visible head can require an extra anchor. Budget that
+            # label too, then reproject from the surviving head of the page.
+            has_more = True
+            content = content[len(content_rows) - limit:]
+            content_rows, content_metas = project_time_rows(content)
         limited_rows: list[str] = []
         limited_metas: list[tuple] = []
         if has_more:
@@ -5846,7 +5951,8 @@ class ChatFrame(wx.Frame):
             else:
                 matched = meta == selected_meta
             if matched:
-                self.answer_list.SetSelection(new_idx)
+                if self.answer_list.GetSelection() != new_idx:
+                    self.answer_list.SetSelection(new_idx)
                 break
 
     def _render_answer_list_compat(self, refresh_execution: bool = True) -> None:
@@ -5900,6 +6006,7 @@ class ChatFrame(wx.Frame):
             visible_turns = turns[turn_offset:]
             force_has_more = True
         now_ts = time.time()
+        time_anchor = None
         for local_i, t in enumerate(visible_turns):
             i = turn_offset + local_i
             q = str(t.get("question") or "")
@@ -5919,8 +6026,10 @@ class ChatFrame(wx.Frame):
             should_show_user_label = show_user_rows and ((q.strip() and not attachment_only_summary) or bool(attachments))
             turn_emits_rows = should_show_user_label or bool(attachments) or show_pending_placeholder or bool(received_attachments)
             if turn_emits_rows:
-                prev_turn = turns[i - 1] if i > 0 else None
-                time_label = self._turn_time_row_label(t, prev_turn, now_ts)
+                timestamp = _finite_timestamp(t.get("created_at"))
+                time_label = wechat_time_label(timestamp, now_ts) if answer_time_projection([time_anchor, timestamp])[-1] else ""
+                if time_label and timestamp is not None:
+                    time_anchor = timestamp
                 if time_label:
                     rows.append(time_label)
                     metas.append(("time", i, time_label, ""))
@@ -7492,6 +7601,8 @@ class ChatFrame(wx.Frame):
         return self._request_execution_list_sync(target_chat)
 
     def _flush_pending_background_ui_updates(self) -> None:
+        if not self._is_ui_alive():
+            return
         if self._navigation_quiet_active():
             self._schedule_navigation_quiet_flush()
             return
@@ -9553,6 +9664,7 @@ class ChatFrame(wx.Frame):
         if current.strip() and current != REQUESTING_TEXT and not self._is_codex_subagent_result_answer(turn):
             return False
         turn["answer_md"] = answer
+        self._schedule_accepted_answer_refresh(str(self.active_chat_id or self.current_chat_id or ""), turn)
         if self._is_codex_subagent_result_answer(turn):
             turn.pop("answer_origin", None)
         return True
@@ -17094,7 +17206,16 @@ class ChatFrame(wx.Frame):
     def _navigation_quiet_active(self) -> bool:
         return time.monotonic() < float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0)
 
+    def _stop_navigation_quiet_flush(self) -> None:
+        timer = getattr(self, "_navigation_quiet_flush_timer", None)
+        if timer is not None:
+            timer.Stop()
+        self._navigation_quiet_flush_timer = None
+
     def _schedule_navigation_quiet_flush(self) -> None:
+        if not self._is_ui_alive():
+            return
+        self._stop_navigation_quiet_flush()
         remaining = max(0.0, float(getattr(self, "_navigation_quiet_until", 0.0) or 0.0) - time.monotonic())
         delay_ms = int(round(remaining * 1000))
         self._navigation_quiet_flush_timer = self._call_later_if_alive(delay_ms, self._flush_pending_background_ui_updates)
@@ -17104,6 +17225,66 @@ class ChatFrame(wx.Frame):
 
     def _background_ui_mutations_blocked(self) -> bool:
         return self._in_background_ui_update() and self._navigation_quiet_active()
+
+    def _schedule_accepted_answer_refresh(self, chat_id: str, turn: dict) -> None:
+        if self.view_mode != "active" or not any(item is turn for item in self.active_session_turns):
+            return
+        visible_id = str(self.active_chat_id or self.current_chat_id or "")
+        if str(chat_id or visible_id) != visible_id:
+            return
+        owner = (visible_id, id(self.active_session_turns))
+        if getattr(self, "_answer_refresh_deadline_owner", None) == owner:
+            if not any(item is turn for item in self._answer_refresh_deadline_turns):
+                self._answer_refresh_deadline_turns.append(turn)
+            return
+        timer = getattr(self, "_answer_refresh_deadline_timer", None)
+        if timer is not None:
+            timer.Stop()
+        self._answer_refresh_deadline_owner = owner
+        self._answer_refresh_deadline_turns = [turn]
+        self._answer_refresh_deadline_timer = self._call_later_if_alive(1000, self._flush_accepted_answer_refresh, owner)
+
+    def _flush_accepted_answer_refresh(self, owner) -> None:
+        if owner != getattr(self, "_answer_refresh_deadline_owner", None):
+            return
+        self._answer_refresh_deadline_timer = None
+        self._answer_refresh_deadline_owner = None
+        accepted_turns = self._answer_refresh_deadline_turns
+        self._answer_refresh_deadline_turns = []
+        current_owner = (str(self.active_chat_id or self.current_chat_id or ""), id(self.active_session_turns))
+        if self.view_mode != "active" or owner != current_owner or not self._is_ui_alive():
+            return
+        # Reconcile the current owner and selection at the deadline, independent
+        # of navigation quiet. Execution/history keep their existing schedule.
+        self._background_answer_list_dirty = False
+        if accepted_turns and all(self._accepted_answer_is_visible(turn) for turn in accepted_turns):
+            return
+        self._refresh_answer_list_preserving_selection(refresh_execution=False)
+
+    def _accepted_answer_is_visible(self, turn: dict) -> bool:
+        index = next((i for i, item in enumerate(self.active_session_turns) if item is turn), -1)
+        row = self._find_answer_row_index(index) if index >= 0 else -1
+        if row < 0 or row >= len(self.answer_meta) or not self._answer_list_structure_is_aligned():
+            return False
+        answer_md, answer_text = self._turn_answer_markdown(turn)
+        if self.answer_meta[row][2:4] != (answer_text, answer_md) or self.answer_list.GetString(row) != answer_text:
+            return False
+        received = turn.get("received_attachments") if isinstance(turn.get("received_attachments"), list) else []
+        return all(meta in self.answer_meta for _, meta in self._turn_attachment_rows(index, received, incoming=True))
+
+    def _stop_answer_refresh_deadline(self, event=None) -> None:
+        if event is not None and event.GetId() != getattr(self, "_answer_refresh_destroy_window_id", None):
+            event.Skip()
+            return
+        timer = getattr(self, "_answer_refresh_deadline_timer", None)
+        if timer is not None:
+            timer.Stop()
+        self._answer_refresh_deadline_timer = None
+        self._answer_refresh_deadline_owner = None
+        self._answer_refresh_deadline_turns = []
+        self._stop_navigation_quiet_flush()
+        if event is not None:
+            event.Skip()
 
     def _mark_background_answer_list_dirty(self) -> None:
         self._background_answer_list_dirty = True
@@ -19062,6 +19243,10 @@ class ChatFrame(wx.Frame):
             self._play_finish_sound()
         if should_render and self.view_mode == "active":
             turn = target_turns[turn_idx] if 0 <= turn_idx < len(target_turns) else {}
+            self._schedule_accepted_answer_refresh(resolved_chat_id, turn)
+            if self._navigation_quiet_active():
+                self._mark_background_answer_list_dirty()
+                return
             if self._append_completed_answer_to_answer_list(turn_idx, turn):
                 self._focus_latest_answer()
             else:
@@ -19800,7 +19985,8 @@ class ChatFrame(wx.Frame):
         return title, text
 
     def _open_answer_text_viewer(
-        self, title: str, text: str, payload: AnswerViewerPayload | None = None
+        self, title: str, text: str, payload: AnswerViewerPayload | None = None,
+        _answer_markdown: bool = False,
     ) -> bool:
         if bool(getattr(self, "_answer_viewer_open", False)):
             return False
@@ -19811,6 +19997,8 @@ class ChatFrame(wx.Frame):
             payload=payload,
             on_continue=self._continue_from_answer_text_viewer if payload is not None else None,
         )
+        if _answer_markdown:
+            dlg._set_answer_display_text()
         self._answer_viewer_open = True
         shown = False
         try:
@@ -19844,7 +20032,7 @@ class ChatFrame(wx.Frame):
             return False
         title, text = content
         payload = self._selected_answer_viewer_payload()
-        return self._open_answer_text_viewer(title, text, payload)
+        return self._open_answer_text_viewer(title, text, payload, self.answer_meta[idx][0] == "answer")
 
     def _visible_answer_owner_chat_id(self) -> str:
         if self.view_mode == "history":
@@ -22185,6 +22373,7 @@ class ChatFrame(wx.Frame):
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
         self._closing = True
+        self._stop_answer_refresh_deadline()
         self._release_execution_focus_lease()
         self._invalidate_execution_scan()
         self._flush_chat_state_save()

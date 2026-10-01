@@ -252,3 +252,69 @@ def test_duplicate_attachment_identity_keeps_rows_metadata_and_model_aligned(fra
     assert list(frame.answer_list.GetStrings()) == [
         frame.answer_list_model.labels_by_id[item_id] for item_id in frame.answer_list_model.visible_ids
     ]
+
+
+def test_answer_timestamp_shared_contract_matrix(frame):
+    import json
+    from pathlib import Path
+    fixture = Path(__file__).parent / "fixtures/answer_time_contract_matrix.json"
+    matrix = json.loads(fixture.read_text(encoding="utf-8"))
+    mobile = Path(__file__).resolve().parents[2] / "rc/test/fixtures/answer_time_contract_matrix.json"
+    if mobile.is_file():
+        assert fixture.read_bytes() == mobile.read_bytes()
+    for case in matrix["cases"]:
+        base = datetime.fromisoformat(case.get("base_local", "2026-09-30T12:00:00")).timestamp()
+        timestamps = [None if value is None else base + value for value in case["seconds"]]
+        assert main.answer_time_projection(timestamps) == case["shown"], case["name"]
+        frame.active_session_turns = [_make_turn(f"q{i}", f"a{i}", value) for i, value in enumerate(timestamps)]
+        frame._current_chat_state["turns"] = frame.active_session_turns
+        frame.view_mode = "active"
+        frame._render_answer_list()
+        assert [meta[1] for meta in frame.answer_meta if meta[0] == "time"] == [i for i, show in enumerate(case["shown"]) if show], case["name"]
+
+
+def test_cumulative_incremental_and_full_time_rows_agree(frame):
+    frame.active_session_turns = []
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    frame.view_mode = "active"
+    for index, seconds in enumerate([0, 200, 299, 300, 301, 600]):
+        turn = _make_turn(f"q{index}", "", 1000000 + seconds)
+        frame.active_session_turns.append(turn)
+        frame._append_submitted_question_to_answer_list(index, turn)
+        turn["answer_md"] = f"a{index}"
+        frame._append_completed_answer_to_answer_list(index, turn)
+    before = [(meta[0], meta[1]) for meta in frame.answer_meta]
+    frame._render_answer_list()
+    assert [(meta[0], meta[1]) for meta in frame.answer_meta] == before
+    assert [meta[1] for meta in frame.answer_meta if meta[0] == "time"] == [0, 3, 5]
+
+
+def test_answer_time_reconstruction_budgets_crop_inside_turn(frame):
+    base = time.time() - 3600
+    frame.active_session_turns = [
+        _make_turn(f"q{index}", f"a{index}", base + index * 600)
+        for index in range(21)
+    ]
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    rows, metas = [], []
+    for index, turn in enumerate(frame.active_session_turns):
+        label = main.wechat_time_label(turn["created_at"], time.time())
+        for kind, text in [("time", label), ("user", "user"), ("question", f"q{index}"),
+                           ("ai", "assistant"), ("answer", f"a{index}")]:
+            rows.append(text)
+            metas.append((kind, index, text, text if kind == "answer" else ""))
+    # Remove one tail row so the old 100-row crop begins inside a turn,
+    # requiring a regenerated time anchor that must consume page budget.
+    rows.pop()
+    metas.pop()
+    result_rows, result_metas, _ = frame._answer_rows_with_limit(rows, metas, 0)
+    assert result_metas[0][0] == "more"
+    content = result_metas[1:]
+    assert len(content) <= frame.answer_visible_row_limit
+    assert content[0][0] == "time"
+    assert content[0][1] == content[1][1]
+    indices = list(dict.fromkeys(meta[1] for meta in content if meta[0] != "time"))
+    expected = [index for index, shown in zip(indices, main.answer_time_projection(
+        [frame.active_session_turns[index]["created_at"] for index in indices])) if shown]
+    assert [meta[1] for meta in content if meta[0] == "time"] == expected
+    assert len(result_rows) == len(result_metas)

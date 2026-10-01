@@ -144,6 +144,33 @@ def _setup_kimi_frame(frame, monkeypatch):
     monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
     monkeypatch.setattr(main.wx, "CallLater", lambda _delay, fn, *a, **k: (fn(*a, **k), True)[1])
+    # Presentation deadlines stay deferred even though this provider fixture
+    # executes legacy callbacks immediately. Keep a real timer-handle contract.
+    immediate_call_later = frame._call_later_if_alive
+    frame._test_answer_deadline_handles = []
+
+    class DeferredDeadline:
+        def __init__(self, delay, callback, args, kwargs):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs
+            self.running = True
+
+        def Stop(self):
+            self.running = False
+
+        def IsRunning(self):
+            return self.running
+
+    def call_later(delay, callback, *args, **kwargs):
+        if callback == frame._flush_accepted_answer_refresh:
+            handle = DeferredDeadline(delay, callback, args, kwargs)
+            frame._test_answer_deadline_handles.append(handle)
+            return handle
+        return immediate_call_later(delay, callback, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_later_if_alive", call_later)
     frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
     frame._play_send_sound = lambda: None
     frame._schedule_first_question_auto_title = lambda *a, **k: None

@@ -19,3 +19,12 @@
 
 
 The final combined review found two asynchronous identity gaps missed by the initial recovery scenarios. Exception/overflow prior-owner regressions and paired retired/current client UI tests now cover both; the focused dog follow-up checks the repaired boundaries without restarting the entire review.
+
+
+## Epic4 final verified result (2026-10-01)
+
+Status built for user review; acceptance pending, not Done. This supersedes earlier pending/blocked results. MC final no-temporary-hook affected56/unit94/models121=271; unchanged RC widget159 gives430 scoped checks, with three exact fresh checks overlapping affected rather than counted again. Six exact reproduced baseline failures remain excluded, COM0x8001010d remains documented in native/baseline-class controls. Compile/diff checks exit0. Final current-tree Local standard integrationDriver retry exits0 and verifies mobile chat list, exact Codex/Kimi assistant role/content/session remoteModelId and desktop provider routes; no cache-specific test is claimed. Original flutter-test DDS/comparator failures and offline-device attempt remain historical evidence. Original Android15 AVD restored; temporary runner and owned harness/flutter processes cleaned.
+
+The test now requires exactly one actual clear after real SendInput4 rather than a mandatory menu: product CHAR_HOOK legitimately consumes A. Native HWND preparation replaces unstable wrapper identity while retaining foreground/HasFocus and final focus assertions. Light/heavy/native/current controls succeed, and all final durable/resend/newthread/stale-terminal/visible assertions pass without temporary WH hooks. Historical only-Alt cause remains unknown and currently unreproduced; no external cause or product keyboard regression is inferred. Final navigation accepted-to-visible1016ms preserves selection/focus; real frame destruction125ms cancels timers without callbacks while child destruction does not.
+
+Full evidence/18-finding triage/six repair groups: `D:/code/sj/_bmad-output/implementation-artifacts/qa-epic4-answer-presentation.md`, overall plan and review. Original source/ASR dirty change preserved; no commit/merge claimed until root records delivery. Production Live, actual provider services, physical-device accessibility/notifications/haptics and packaging remain unverified.

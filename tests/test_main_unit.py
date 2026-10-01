@@ -12440,6 +12440,28 @@ def test_completion_focus_does_not_return_from_execution_to_answer_list(frame, m
     monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
     monkeypatch.setattr(main.wx, "CallLater", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
+    immediate_call_later = frame._call_later_if_alive
+
+    class DeferredDeadline:
+        def __init__(self, delay, callback, args, kwargs):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs
+            self.running = True
+
+        def Stop(self):
+            self.running = False
+
+        def IsRunning(self):
+            return self.running
+
+    def call_later(delay, callback, *args, **kwargs):
+        if callback == frame._flush_accepted_answer_refresh:
+            return DeferredDeadline(delay, callback, args, kwargs)
+        return immediate_call_later(delay, callback, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_later_if_alive", call_later)
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     frame.execution_list.SetFocus()
 

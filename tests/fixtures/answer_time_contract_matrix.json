@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "cumulative_boundary",
+      "seconds": [
+        0,
+        200,
+        299,
+        300,
+        301,
+        600
+      ],
+      "shown": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "unknown_preserves_anchor",
+      "seconds": [
+        0,
+        null,
+        200,
+        300,
+        null,
+        301,
+        600
+      ],
+      "shown": [
+        true,
+        true,
+        false,
+        true,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "unknown_before_first",
+      "seconds": [
+        null,
+        null,
+        0,
+        299,
+        300
+      ],
+      "shown": [
+        true,
+        true,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "cross_midnight",
+      "seconds": [
+        0,
+        200,
+        300,
+        301,
+        600
+      ],
+      "base_local": "2026-09-30T23:58:00",
+      "shown": [
+        true,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "old_page",
+      "seconds": [
+        0,
+        200,
+        299
+      ],
+      "shown": [
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "name": "page_prepend",
+      "seconds": [
+        -300,
+        0,
+        200,
+        299,
+        300
+      ],
+      "shown": [
+        true,
+        true,
+        false,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "new_append",
+      "seconds": [
+        0,
+        200,
+        299,
+        300,
+        301,
+        600,
+        601
+      ],
+      "shown": [
+        true,
+        false,
+        false,
+        true,
+        false,
+        true,
+        false
+      ]
+    },
+    {
+      "name": "duplicate_time",
+      "seconds": [
+        0,
+        0,
+        300,
+        300,
+        600
+      ],
+      "shown": [
+        true,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "backwards",
+      "seconds": [
+        0,
+        -200,
+        299,
+        300
+      ],
+      "shown": [
+        true,
+        false,
+        false,
+        true
+      ]
+    }
+  ]
+}
