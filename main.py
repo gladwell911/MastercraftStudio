@@ -6832,7 +6832,8 @@ class ChatFrame(wx.Frame):
                 self._active_turn_index_value() if self.view_mode == "active" else None,
                 max(EXECUTION_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(self, "execution_visible_row_limit", 100))),
                 int(getattr(self, "_execution_scan_generation", 0)),
-                id(state), id(steps), len(steps) if isinstance(steps, list) else 0)
+                id(state), id(steps), len(steps) if isinstance(steps, list) else 0,
+                self._safe_int((state or {}).get("revision"), 1))
 
     def _invalidate_execution_scan(self) -> None:
         self._execution_latest_intent = None
@@ -6887,7 +6888,8 @@ class ChatFrame(wx.Frame):
         self._execution_scan_pending = None
         self._execution_list_dirty = True
         if error is not None:
-            self._schedule_idle_ui_refresh()
+            if self._execution_list_visible_for_updates():
+                self._schedule_idle_ui_refresh()
             return
         self._execution_scan_result = (key, rows)
         if self._execution_list_visible_for_updates() and not self._navigation_quiet_active():
@@ -6896,6 +6898,10 @@ class ChatFrame(wx.Frame):
             self._schedule_idle_ui_refresh()
 
     def _current_execution_steps_for_render(self) -> tuple[int, list]:
+        key = self._execution_scan_key()
+        cached = getattr(self, "_execution_scan_result", None)
+        if cached and cached[0] == key:
+            return len(cached[1]), cached[1]
         memory = list(self._current_execution_steps())
         key = self._execution_scan_key()
         chat_id, _mode, turn_idx, limit = key[:4]
@@ -7595,7 +7601,7 @@ class ChatFrame(wx.Frame):
             list_text = self._execution_list_text_from_detail(detail_text, display_kind)
         if (display_kind != "error" and str(getattr(event, "status", "") or "").lower() not in {"failed", "error"}
                 and exit_code in (None, 0)
-                and str(getattr(event, "text", "") or "").strip().lower() == "not loaded"
+                and str(getattr(event, "text", "") or "").strip().lower() in {"not loaded", "notloaded"}
                 and not title and not command):
             return None
         safe_raw_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "raw_text", "") or ""))
@@ -7801,7 +7807,8 @@ class ChatFrame(wx.Frame):
         if not pending:
             return
         if not self._execution_list_visible_for_updates():
-            self._mark_execution_list_dirty()
+            self._execution_list_dirty = True
+            self._prepare_execution_scan()
             return
         # Deferred entries have already been persisted in their owning chat.
         # Rebuild once from that authoritative owner rather than replaying
@@ -7812,7 +7819,8 @@ class ChatFrame(wx.Frame):
         if not bool(getattr(self, "_execution_list_deferred_repaint", False)):
             return
         if self._navigation_quiet_active() or not self._execution_list_visible_for_updates():
-            self._mark_execution_list_dirty()
+            self._execution_list_dirty = True
+            self._prepare_execution_scan()
             return
         # A batch can contain several repeated events.  Reconcile its final
         # visible state once rather than repainting the last incrementally
@@ -8613,7 +8621,7 @@ class ChatFrame(wx.Frame):
             display_kind = str(step.get("display_kind") or "").strip().lower()
             if (display_kind != "error" and status not in {"failed", "error"}
                     and step.get("exit_code") in (None, 0)
-                    and str(step.get("text") or step.get("raw_text") or "").strip().lower() == "not loaded"
+                    and str(step.get("text") or step.get("raw_text") or "").strip().lower() in {"not loaded", "notloaded"}
                     and not str(step.get("title") or step.get("command") or "").strip()):
                 return False
         return should_show_execution_step(step)
@@ -8875,9 +8883,55 @@ class ChatFrame(wx.Frame):
             return False
         return self._detail_panel_mode() == "execution"
 
+    def _prepare_execution_scan(self) -> None:
+        key = self._execution_scan_key()
+        cached = getattr(self, "_execution_scan_result", None)
+        pending = getattr(self, "_execution_scan_pending", None)
+        if (cached and cached[0] == key) or (pending and pending[0] == key):
+            return
+        store = getattr(self, "chat_store", None)
+        chat_id, _mode, turn_idx, limit = key[:4]
+        if not (getattr(self, "_chat_store_enabled", False) and store is not None
+                and chat_id and hasattr(store, "load_recent_execution_steps")):
+            return
+        if pending:
+            pending[1].set()
+        stop = threading.Event()
+        self._execution_scan_pending = (key, stop)
+        state = (self._find_archived_chat(self.view_history_id) if self.view_mode == "history"
+                 else getattr(self, "_current_chat_state", None))
+        memory_source = state.get("execution_steps", []) if isinstance(state, dict) else []
+
+        def scan():
+            rows = []
+            error = None
+            try:
+                memory = copy.deepcopy(memory_source) if isinstance(memory_source, list) else []
+                if _mode == "active" and any(isinstance(step, dict) and "turn_idx" in step for step in memory):
+                    memory = [step for step in memory if not isinstance(step, dict)
+                              or "turn_idx" not in step or self._safe_int(step.get("turn_idx"), -1) == turn_idx]
+                _total, page = store.load_recent_execution_steps(
+                    chat_id, turn_idx=turn_idx, limit=limit)
+                persisted = list(page)
+                rows = self._merge_execution_page(persisted, memory)
+                while (not stop.is_set() and page and len(page) == limit
+                       and "_store_step_index" in page[0] and len(rows) <= limit):
+                    _, page = store.load_recent_execution_steps(
+                        chat_id, turn_idx=turn_idx, limit=limit,
+                        before_step_index=page[0]["_store_step_index"], include_total=False)
+                    persisted = page + persisted
+                    rows = self._merge_execution_page(persisted, memory)
+                    persisted = [item for item in persisted if self._should_show_execution_step(item)]
+            except Exception as exc:
+                error = exc
+            if not stop.is_set():
+                wx.CallAfter(self._finish_execution_scan, key, stop, rows, error)
+        threading.Thread(target=scan, name="execution-prepare", daemon=True).start()
+
     def _mark_execution_list_dirty(self) -> None:
         self._invalidate_execution_scan()
         self._execution_list_dirty = True
+        self._prepare_execution_scan()
         if self._execution_list_visible_for_updates():
             self._schedule_idle_ui_refresh()
 
@@ -8885,7 +8939,8 @@ class ChatFrame(wx.Frame):
         if not hasattr(self, "execution_list"):
             return
         if not force and not self._execution_list_visible_for_updates():
-            self._mark_execution_list_dirty()
+            self._execution_list_dirty = True
+            self._prepare_execution_scan()
             return
         self._rebuild_execution_list_from_state()
 
@@ -8922,8 +8977,6 @@ class ChatFrame(wx.Frame):
     def _apply_detail_panel_mode(self, mode: str | None = None, refresh_execution: bool = False) -> str:
         previous_mode = self._detail_panel_mode()
         normalized = "execution" if str(mode or self._detail_panel_mode()).strip() == "execution" else "answers"
-        if previous_mode != normalized:
-            self._invalidate_execution_scan()
         if not isinstance(getattr(self, "_current_chat_state", None), dict):
             self._current_chat_state = {}
         if self.view_mode != "history":
@@ -10341,7 +10394,7 @@ class ChatFrame(wx.Frame):
                         time.sleep(delay)
         if first_error is not None:
             raise first_error
-        raise RuntimeError("Kimi Code client startup failed")
+        raise TimeoutError("Kimi recovery deadline exhausted")
 
     @staticmethod
     def _kimi_call_with_deadline(func, *args, deadline: float | None = None, **kwargs):
@@ -14039,6 +14092,8 @@ class ChatFrame(wx.Frame):
                             delay = min(delay, max(0.0, deadline - time.monotonic()))
                     if delay:
                         time.sleep(delay)
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 try:
                     client = self._ensure_kimi_client()
                     self._start_kimi_client_with_retry(client, deadline=deadline)
@@ -14159,7 +14214,12 @@ class ChatFrame(wx.Frame):
                     attempt += 1
                     if attempt >= max_attempts:
                         break
-        failure = original_error or (last_error if last_was_exception else (last_error or "Kimi Code 未返回任何内容。"))
+        fallback_error = (
+            "Kimi recovery deadline exhausted"
+            if deadline is not None and time.monotonic() >= deadline
+            else "Kimi Code 未返回任何内容。"
+        )
+        failure = original_error or last_error or fallback_error
         self._call_after_if_alive(
             self._apply_kimi_error,
             str(owner.get("chat_id") or "").strip(),

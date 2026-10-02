@@ -450,7 +450,10 @@ def _subagent_completed_text(status) -> str:
             text = str(status.get(key) or "").strip()
             if text:
                 return text
-    return str(status or "").strip()
+        if status and all(str(key).lower().replace(" ", "") == "notloaded" for key in status):
+            return ""
+    text = str(status or "").strip()
+    return "" if text.lower() in {"notloaded", "not loaded"} else text
 
 
 def _subagent_result_heading(agent: dict, fallback_id: str = "") -> str:

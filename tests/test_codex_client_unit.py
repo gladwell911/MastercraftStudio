@@ -1173,3 +1173,14 @@ def test_close_keeps_persistent_codex_home(tmp_path):
 
     assert codex_home.exists()
     assert (codex_home / "rollout.db").read_text(encoding="utf-8") == "keep"
+
+
+def test_collab_waiting_end_filters_only_not_loaded_agents():
+    from codex_client import _collab_waiting_end_text
+    text = _collab_waiting_end_text({"statuses": {
+        "empty": "notLoaded", "empty-spaced": "Not Loaded", "empty-dict": {"notLoaded": {}},
+        "complete": {"completed": "useful answer"}, "failed": {"failed": "notLoaded"},
+    }})
+    assert "empty" not in text
+    assert "useful answer" in text
+    assert "failed\nnotLoaded" in text

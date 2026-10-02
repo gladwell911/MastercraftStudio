@@ -473,7 +473,11 @@ def test_execution_filters_only_empty_not_loaded_placeholder(frame):
     failure = CodexEvent(type="item_completed", display_kind="error", status="failed", text="Not Loaded")
     assert frame._build_execution_entry(placeholder) is None
     assert frame._build_execution_entry(failure) is not None
-    assert not frame._should_show_execution_step({"text": "Not Loaded", "display_kind": "info"})
+    for text in ("Not Loaded", "notLoaded"):
+        assert frame._build_execution_entry(CodexEvent(type="item_completed", display_kind="info", text=text)) is None
+        assert not frame._should_show_execution_step({"text": text, "display_kind": "info"})
+        assert frame._should_show_execution_step({"text": text, "exit_code": 1})
+        assert frame._should_show_execution_step({"text": text, "title": "useful description"})
 
 
 def test_codex_server_request_plays_finish_sound(frame, monkeypatch):

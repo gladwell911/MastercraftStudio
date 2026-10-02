@@ -2773,3 +2773,40 @@ def test_clear_resend_rejects_old_submit_return_before_runtime_registration(fram
     assert frame.active_session_turns[0]["request_status"] == "done"
     assert frame.active_session_turns[0]["answer_md"] == "fresh final"
     assert sum("fresh final" in row for row in frame.answer_list.GetStrings()) == 1
+
+
+def test_startup_expired_deadline_reports_timeout(frame, monkeypatch):
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+    with pytest.raises(TimeoutError, match="deadline exhausted"):
+        frame._start_kimi_client_with_retry(object(), deadline=9.0)
+
+
+def test_reconcile_backoff_expiry_preserves_last_real_error(frame, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(main.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    frame._kimi_reconcile_attempts = 3
+    frame._kimi_reconcile_backoff = 2.0
+    calls = []
+    def ensure():
+        calls.append(True)
+        raise ConnectionError("original connection failure")
+    monkeypatch.setattr(frame, "_ensure_kimi_client", ensure)
+    errors = []
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: errors.append(args[1]))
+    assert frame._reconcile_kimi_owner_worker({"chat_id": "owner", "session_id": "session", "_recovery_deadline": 1.0}) == "done"
+    assert calls == [True]
+    assert errors == ["original connection failure"]
+
+
+def test_reconcile_expired_owner_deadline_reports_timeout(frame, monkeypatch):
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: pytest.fail("expired owner must not start a client"))
+    errors = []
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: errors.append(args[1]))
+    owner = {"chat_id": "owner", "session_id": "session", "_recovery_deadline": 9.0}
+    assert frame._reconcile_kimi_owner_worker(owner) == "done"
+    assert errors == ["Kimi recovery deadline exhausted"]
+    errors.clear()
+    assert frame._reconcile_kimi_owner_worker(owner, original_error="real provider error") == "done"
+    assert errors == ["real provider error"]

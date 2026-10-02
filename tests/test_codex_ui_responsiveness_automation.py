@@ -1107,6 +1107,8 @@ def test_real_ui_execution_mode_survives_completion_and_f1_toggles_back(frame, w
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_play_finish_sound", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_can_focus_completion_result", lambda: True)
+    monkeypatch.setattr(frame, "_primary_navigation_control_is_recently_active", lambda: False)
+    frame._navigation_quiet_until = 0
     monkeypatch.setattr(frame, "_call_later_if_alive", lambda _delay, fn, *args, **kwargs: fn(*args, **kwargs))
 
     frame.input_edit.SetFocusFromKbd()
@@ -1774,3 +1776,71 @@ def test_versioned_execution_snapshot_read_does_not_block_wx(frame, wx_app, tmp_
     assert _yield_until(wx_app, lambda: not worker.is_alive())
     worker.join(timeout=1)
     assert outcome[0][0] in {200, 409}
+
+
+def test_hidden_execution_prepares_slow_store_without_repeated_reads(frame, wx_app, monkeypatch, tmp_path):
+    store = main.ChatStore(str(tmp_path / "hidden-prepare.db"))
+    store.initialize()
+    store.upsert_chat({"id": "prepare-owner", "title": "owner"})
+    store.replace_turns("prepare-owner", [{"question": "q", "answer_md": "a"}])
+    store.append_execution_step("prepare-owner", {"turn_idx": 0, "display_kind": "commentary", "text": "prepared step", "list_text": "prepared step"})
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "prepare-owner", "revision": 1}]
+    frame.view_mode, frame.view_history_id = "history", "prepare-owner"
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    frame.input_edit.SetFocus()
+    before = list(frame.execution_list.GetStrings())
+    started, release = threading.Event(), threading.Event()
+    original = store.load_recent_execution_steps
+    reads = []
+    def read(*args, **kwargs):
+        reads.append(threading.current_thread() is threading.main_thread())
+        started.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    try:
+        frame._render_execution_list()
+        assert _yield_until(wx_app, started.is_set)
+        for _ in range(10):
+            frame._render_execution_list()
+        assert reads == [False]
+        assert list(frame.execution_list.GetStrings()) == before
+        assert frame.input_edit.HasFocus()
+        release.set()
+        assert _yield_until(wx_app, lambda: getattr(frame, "_execution_scan_result", None) is not None)
+        frame._apply_detail_panel_mode("execution", refresh_execution=True)
+        assert any("prepared step" in row for row in frame.execution_list.GetStrings()), (list(frame.execution_list.GetStrings()), frame._execution_scan_result, frame._execution_scan_key(), reads)
+        assert reads == [False]
+    finally:
+        release.set()
+        frame._invalidate_execution_scan()
+
+
+def test_hidden_execution_preparation_retries_failure_and_rejects_old_owner(frame, wx_app, monkeypatch):
+    class Store:
+        def __init__(self): self.calls = 0
+        def load_recent_execution_steps(self, owner, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("controlled store failure")
+            return 1, [{"display_kind": "plan", "list_text": owner, "detail_text": owner}]
+    store = Store()
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame._current_chat_state = {"id": "owner-a", "revision": 1, "detail_panel_mode": "answers", "execution_steps": []}
+    frame.view_mode = "active"
+    frame.current_chat_id = frame.active_chat_id = "owner-a"
+    frame._mark_execution_list_dirty()
+    assert _yield_until(wx_app, lambda: frame._execution_scan_pending is None)
+    assert frame._execution_scan_result is None
+    frame._render_execution_list()
+    assert _yield_until(wx_app, lambda: frame._execution_scan_result is not None)
+    old_key, old_rows = frame._execution_scan_result
+    frame._current_chat_state = {"id": "owner-b", "revision": 2, "detail_panel_mode": "answers", "execution_steps": []}
+    frame.current_chat_id = frame.active_chat_id = "owner-b"
+    frame._mark_execution_list_dirty()
+    frame._finish_execution_scan(old_key, threading.Event(), old_rows, None)
+    assert _yield_until(wx_app, lambda: frame._execution_scan_result is not None)
+    assert frame._execution_scan_result[0][0] == "owner-b"
+    assert frame._execution_scan_result[1][0]["list_text"] == "owner-b"
+    frame._invalidate_execution_scan()
