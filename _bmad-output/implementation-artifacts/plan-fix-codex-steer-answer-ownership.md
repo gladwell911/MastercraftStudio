@@ -121,12 +121,14 @@ deferred: []
 
 Code review complete. 0 decision-needed, 5 patch, 1 defer, 3 rejected. 确认产品缺陷 high 2 / medium 1，另2项medium测试缺口；只审不修，不提交/推送。详细逐条triage及边界见 [审查报告](review-codex-steer-98a0d34-dog-20261002.md)。
 
-- [ ] [Review][Patch][high] item缓存淘汰后旧回答归新输入 [codex_worker_process.py:154]
-- [ ] [Review][Patch][high] 失败steer丢弃既有任务首次出现的完成回答 [codex_worker_process.py:318]
-- [ ] [Review][Patch][medium] 失败completion错误消息追加进正式答文 [main.py:9907]
-- [ ] [Review][Patch][medium] worker→UI顶层completion_owners转换缺有辨别力的多pending owner回归 [main.py:15945]
-- [ ] [Review][Patch][medium] pending turn重载后item去重缺行为回归 [tests/test_codex_integration.py:58]
-- [x] [Review][Defer][maybe-false] 最新completion owner失败/失效可能阻断其他owner收尾 [main.py:13351] — deferred：缺少最新owner失效而较早owner仍有效的真实写入链；不能用手工注入scope证明产品缺陷。
+- [x] [Review][Patch][high] item缓存淘汰后旧回答归新输入 [codex_worker_process.py:154]
+- [x] [Review][Patch][high] 失败steer丢弃既有任务首次出现的完成回答 [codex_worker_process.py:318]
+- [x] [Review][Patch][medium] 失败completion错误消息追加进正式答文 [main.py:9907]
+- [x] [Review][Patch][medium] worker→UI顶层completion_owners转换缺有辨别力的多pending owner回归 [main.py:15945]
+- [x] [Review][Patch][medium] pending turn重载后item去重缺行为回归 [tests/test_codex_integration.py:58]
+- [x] [Review][Defer][resolved] 最新completion owner失败/失效阻断其他owner收尾 [main.py:13351] — 已由相关item容量错误链证实并修复；failed/stale守卫保留。
+
+修复结果见 [后续实施记录](plan-fix-codex-steer-review-findings.md)：独立验证 worker 41、定向integration 9、真实GUI 3通过；上述动作均已完成。
 
 Rejected：
 - false：第二steer边界之前归前owner符合按确认输入边界切换的契约，没有已属新输入的证据。

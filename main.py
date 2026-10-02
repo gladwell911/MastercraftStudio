@@ -9890,6 +9890,8 @@ class ChatFrame(wx.Frame):
         return True
 
     def _apply_codex_completed_answer_to_turn(self, turn: dict, event: CodexEvent) -> bool:
+        if event.type == "turn_completed" and str(event.status or "").strip() not in {"", "completed"}:
+            return False
         answer = str(event.text or "")
         if not answer.strip() or str(turn.get("request_status") or "") == "failed":
             return False
@@ -13342,6 +13344,37 @@ class ChatFrame(wx.Frame):
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        if event_type == "turn_completed":
+            event_data = event.data if isinstance(event.data, dict) else {}
+            completion_owners = event_data.get("completion_owners")
+            if isinstance(completion_owners, list):
+                if not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
+                    return
+                turns = identity_chat.get("turns") if isinstance(identity_chat, dict) else []
+                seen = set()
+                for owner in completion_owners:
+                    if not isinstance(owner, dict):
+                        continue
+                    idx = owner.get("turn_idx")
+                    if not isinstance(idx, int) or idx in seen or not isinstance(turns, list) or not 0 <= idx < len(turns):
+                        continue
+                    seen.add(idx)
+                    turn = turns[idx]
+                    if str(turn.get("request_status") or "") not in {"pending", "running"}:
+                        continue
+                    if str(turn.get("codex_turn_id") or "") != event_turn_id or str(turn.get("codex_thread_id") or "") != event_thread_id:
+                        continue
+                    if str(turn.get("model") or DEFAULT_CODEX_MODEL) != str(event_data.get("model") or turn.get("model") or DEFAULT_CODEX_MODEL):
+                        continue
+                    data = dict(event_data)
+                    data.pop("completion_owners", None)
+                    data.update(owner)
+                    scoped_event = copy.copy(event)
+                    scoped_event.data = data
+                    if idx != self._event_scoped_turn_index(turns, event):
+                        scoped_event.text = ""
+                    self._on_codex_event_for_chat(chat_id, scoped_event)
+                return
         if self._codex_event_requires_known_turn(event):
             identity_turns = identity_chat.get("turns") if isinstance(identity_chat, dict) and isinstance(identity_chat.get("turns"), list) else []
             identity_idx = self._event_scoped_turn_index(identity_turns, event)
@@ -13379,35 +13412,6 @@ class ChatFrame(wx.Frame):
                     self._codex_early_context_usage_owner[key] = (event_thread_id, event_turn_id)
         if isinstance(identity_chat, dict) and not early_codex_usage:
             if not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
-                return
-        if event_type == "turn_completed":
-            event_data = event.data if isinstance(event.data, dict) else {}
-            completion_owners = event_data.get("completion_owners")
-            if isinstance(completion_owners, list):
-                turns = identity_chat.get("turns") if isinstance(identity_chat, dict) else []
-                seen = set()
-                for owner in completion_owners:
-                    if not isinstance(owner, dict):
-                        continue
-                    idx = owner.get("turn_idx")
-                    if not isinstance(idx, int) or idx in seen or not isinstance(turns, list) or not 0 <= idx < len(turns):
-                        continue
-                    seen.add(idx)
-                    turn = turns[idx]
-                    if str(turn.get("request_status") or "") not in {"pending", "running"}:
-                        continue
-                    if str(turn.get("codex_turn_id") or "") != event_turn_id or str(turn.get("codex_thread_id") or "") != event_thread_id:
-                        continue
-                    if str(turn.get("model") or DEFAULT_CODEX_MODEL) != str(event_data.get("model") or turn.get("model") or DEFAULT_CODEX_MODEL):
-                        continue
-                    data = dict(event_data)
-                    data.pop("completion_owners", None)
-                    data.update(owner)
-                    scoped_event = copy.copy(event)
-                    scoped_event.data = data
-                    if idx != self._event_scoped_turn_index(turns, event):
-                        scoped_event.text = ""
-                    self._on_codex_event_for_chat(chat_id, scoped_event)
                 return
         if event_type == "token_count" and isinstance(identity_chat, dict):
             event_data = event.data if isinstance(event.data, dict) else {}

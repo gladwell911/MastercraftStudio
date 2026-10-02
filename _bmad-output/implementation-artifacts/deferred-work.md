@@ -18,4 +18,4 @@
 
 ## Deferred from: code review of plan-fix-codex-steer-answer-ownership (2026-10-02)
 
-- [unverified medium / maybe-false] main.py:13351 最新completion owner failed/generation失效会先于completion_owners fan-out整批return。需要证明真实运行中仅最新已接收owner失效、较早owner仍有效并收到native completion的写入链；失败steer不会注册新owner，不能作为复现。本轮只记录，不修复。详情：review-codex-steer-98a0d34-dog-20261002.md。
+- [resolved 2026-10-02] main.py:13351 最新owner失效阻断completion_owners的候选已由相关item容量错误的真实写入链证实并修复。逐owner收尾保留原身份及generation守卫；有效较早owner完成，failed/stale owner不复活。独立integration回归通过。原审查：review-codex-steer-98a0d34-dog-20261002.md；修复：plan-fix-codex-steer-review-findings.md。

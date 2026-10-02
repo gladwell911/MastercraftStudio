@@ -106,11 +106,19 @@ class CodexWorkerRuntime:
                 if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]) and (turn_id != pending["steer_turn_id"] or prior_item is not None):
                     self._dispatch_event(chat_id, model, event)
                     return
+                if turn_id == pending["steer_turn_id"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]):
+                    if str(getattr(event, "subtype", "") or "") == "userMessage" and prior_item is None:
+                        pending["boundary_seen"] = True
+                    if not pending["boundary_seen"] and not pending["prior_terminal_seen"]:
+                        self._dispatch_event(chat_id, model, event)
+                        if event.type == "turn_completed":
+                            pending["prior_terminal_seen"] = True
+                        return
                 if pending["overflow"]:
-                    if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
+                    if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not pending["boundary_seen"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
                         pending["prior_completions"].append(event)
                     return
-                if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
+                if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not pending["boundary_seen"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
                     pending["prior_completions"].append(event)
                 size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
                 if len(pending["events"]) >= self.MAX_STARTUP_EVENTS or pending["bytes"] + size > self.MAX_STARTUP_EVENT_BYTES:
@@ -166,8 +174,19 @@ class CodexWorkerRuntime:
                             native["current"] = boundaries.pop(0)["owner"]
                             native["steer_boundary_seen"] = True
                     scope = None if native["boundaries"] and not native["steer_boundary_seen"] else native["current"][:2]
-                    if item_id and scope is not None:
-                        self._remember_scope(self._item_owners, item_key, native["current"])
+                    relevant_item = str(getattr(event, "subtype", "") or "") in {"userMessage", "agentMessage"} or str(getattr(event, "phase", "") or "") == "final_answer" or event_type == "agent_message_delta"
+                    if item_id and scope is not None and relevant_item:
+                        item_ids = native.setdefault("item_ids", set())
+                        if len(item_ids) >= self.MAX_EVENT_SCOPES:
+                            scope = None
+                            if not native.get("item_limit_reported"):
+                                native["item_limit_reported"] = True
+                                self.emit("error", {"chat_id": chat_id, "model": model,
+                                    "turn_idx": native["current"][0], "context_generation": native["current"][1],
+                                    "message": "Codex item ownership limit exceeded"})
+                        else:
+                            item_ids.add(item_id)
+                            self._item_owners[item_key] = native["current"]
                 if event_type == "turn_completed":
                     scope = native["owners"][-1][:2]
                     payload["completion_owners"] = [
@@ -202,7 +221,7 @@ class CodexWorkerRuntime:
         with self._lock:
             self._startup_events[startup_key] = {
                 "events": [], "bytes": 0, "overflow": False,
-                "prior_completions": [],
+                "prior_completions": [], "boundary_seen": False, "prior_terminal_seen": False,
                 "prior_turn_ids": frozenset(key[2] for key, scope in self._turn_id_scopes.items()
                                              if key[:2] == startup_key and scope is not None),
                 "steer_turn_id": str(payload.get("turn_id") or "").strip() if payload.get("should_steer") else "",
@@ -325,7 +344,11 @@ class CodexWorkerRuntime:
         scopes.pop(key, None)
         scopes[key] = value
         while len(scopes) > self.MAX_EVENT_SCOPES:
-            scopes.popitem(last=False)
+            retired_key, _ = scopes.popitem(last=False)
+            if scopes is self._native_owners:
+                for item_key in list(self._item_owners):
+                    if item_key[:3] == retired_key:
+                        self._item_owners.pop(item_key, None)
 
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(

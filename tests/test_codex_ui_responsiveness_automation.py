@@ -22,7 +22,8 @@ def test_real_ui_steer_answer_order_and_native_completion(request, wx_app, monke
               "codex_start_generation": 1, "codex_thread_id": "steer-ui-thread",
               "codex_turn_id": "steer-ui-turn"}
              for question, answer, status in [("旧问题", "旧回答", "done"),
-                 ("群号187387007", main.REQUESTING_TEXT, "pending")]]
+                 ("群号187387007", main.REQUESTING_TEXT, "pending"),
+                 ("next input", main.REQUESTING_TEXT, "pending")]]
     frame.active_session_turns = turns
     frame._current_chat_state = {"id": owner, "title": "steer owner", "model": main.DEFAULT_CODEX_MODEL,
         "turns": turns, "codex_context_generation": 1, "codex_thread_id": "steer-ui-thread",
@@ -36,9 +37,9 @@ def test_real_ui_steer_answer_order_and_native_completion(request, wx_app, monke
     def deliver(kind, text="", item_id="", idx=1, **extra):
         event = main.CodexEvent(type=kind, phase="final_answer", subtype="agentMessage", text=text,
             item_id=item_id, thread_id="steer-ui-thread", turn_id="steer-ui-turn", status="completed")
-        frame._apply_codex_worker_event_scope(event, {"turn_idx": idx, "context_generation": 1,
-            "model": main.DEFAULT_CODEX_MODEL, **extra})
-        frame._dispatch_codex_event_to_ui(owner, event)
+        frame._on_codex_worker_message(owner, {"type": "event", "payload": {
+            "chat_id": owner, "turn_idx": idx, "context_generation": 1,
+            "model": main.DEFAULT_CODEX_MODEL, "event": main.codex_worker_protocol.event_to_payload(event), **extra}})
     try:
         deliver("item_completed", "真实群已连接并开始采集", "ask")
         assert _yield_until(wx_app, lambda: "真实群已连接并开始采集" in visible_texts())
@@ -57,8 +58,9 @@ def test_real_ui_steer_answer_order_and_native_completion(request, wx_app, monke
         deliver("item_completed", "真正终答：采集已完成", "final")
         deliver("item_completed", "迟到旧item不得覆盖", "old", idx=0)
         deliver("turn_completed", "真正终答：采集已完成", completion_owners=[
-            {"turn_idx": idx, "context_generation": 1} for idx in (0, 1)])
-        assert _yield_until(wx_app, lambda: (frame._find_archived_chat(owner) if switch_chat else frame._current_chat_state)["turns"][1]["request_status"] == "done")
+            {"turn_idx": idx, "context_generation": 1} for idx in (0, 1, 2)], idx=2)
+        assert _yield_until(wx_app, lambda: (frame._find_archived_chat(owner) if switch_chat else frame._current_chat_state)["turns"][1]["request_status"] == "done" and
+            (frame._find_archived_chat(owner) if switch_chat else frame._current_chat_state)["turns"][2]["request_status"] == "done")
         if switch_chat:
             assert visible_texts() == other_texts
             assert frame.input_edit.GetValue() == "other unsent draft"

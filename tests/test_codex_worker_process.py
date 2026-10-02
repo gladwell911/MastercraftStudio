@@ -964,7 +964,7 @@ def test_worker_runtime_unsupported_message_type_emits_valid_protocol_error():
 def test_worker_process_source_does_not_import_wx():
     import pathlib
 
-    source = pathlib.Path("codex_worker_process.py").read_text(encoding="utf-8")
+    source = (pathlib.Path(__file__).resolve().parents[1] / "codex_worker_process.py").read_text(encoding="utf-8")
     assert "import wx" not in source
     assert "from wx" not in source
 
@@ -1102,6 +1102,10 @@ def test_steer_user_boundary_keeps_old_items_and_two_accepted_owners(ack):
     client = runtime._clients[("chat", "codex/main")]
     client.on_event(CodexEvent(type="item_completed", thread_id="thread-1", turn_id="turn-1",
         item_id="old", phase="final_answer", text="old answer"))
+    for idx in range(runtime.MAX_EVENT_SCOPES + 20):
+        client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
+            "item": {"id": f"tool-{idx}", "type": "commandExecution", "command": "echo tool", "status": "completed"}}))
+    assert len(runtime._item_owners) == 1
     for idx in (1, 2):
         output.seek(0); output.truncate()
         runtime.handle_message(make_ui_request(f"steer-{idx}", "start_turn", {"chat_id": "chat", "turn_idx": idx,
@@ -1123,7 +1127,11 @@ def test_steer_user_boundary_keeps_old_items_and_two_accepted_owners(ack):
 def test_failed_steer_never_reassigns_new_items_and_keeps_prior_completion(failure_mode):
     class SteerClient(FakeCodexClient):
         def steer_turn_items(self, thread_id, turn_id, items):
+            self.on_event(_event_from_item("item/completed", {"threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "prior-first-final", "type": "agentMessage", "phase": "final_answer", "text": "prior legal final"}}))
             self.on_event(CodexEvent(type="turn_completed", thread_id=thread_id, turn_id=turn_id, status="completed"))
+            self.on_event(_event_from_item("item/started", {"threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "unaccepted-user", "type": "userMessage", "content": items}}))
             for idx in range(3):
                 self.on_event(CodexEvent(type="item_completed", thread_id=thread_id, turn_id=turn_id,
                     item_id=f"unaccepted-{idx}", phase="final_answer", text="discard"))
@@ -1141,9 +1149,10 @@ def test_failed_steer_never_reassigns_new_items_and_keeps_prior_completion(failu
         "question": "second"}))
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     events = [message["payload"] for message in messages if message["type"] == "event"]
-    assert len(events) == 1 and events[0]["event"]["type"] == "turn_completed"
+    assert len(events) == 2 and events[0]["event"]["text"] == "prior legal final"
+    assert events[1]["event"]["type"] == "turn_completed"
     assert events[0]["turn_idx"] == 0
-    assert events[0]["completion_owners"] == [{"turn_idx": 0, "context_generation": 2}]
+    assert events[1]["completion_owners"] == [{"turn_idx": 0, "context_generation": 2}]
     assert any(message["type"] == "error" for message in messages)
 
 
@@ -1205,3 +1214,20 @@ def test_two_acked_steers_with_delayed_user_boundaries_preserve_each_answer_owne
     assert [(event["event"]["item_id"], event.get("turn_idx")) for event in events] == [
         ("unknown-before-boundary", None), ("u1", 1), ("a1", 1), ("old", 0),
         ("u2", 2), ("a2", 2), ("old", 0)]
+
+
+def test_item_ownership_limit_preserves_known_owner_and_rejects_unknown():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: FakeCodexClient(cb, model), output=output)
+    runtime.handle_message(make_ui_request("first", "start_turn", {"chat_id": "chat", "turn_idx": 0,
+        "context_generation": 2, "question": "first"}))
+    runtime.MAX_EVENT_SCOPES = 2
+    client = runtime._clients[("chat", "codex/main")]
+    for item_id in ("old", "second", "excess", "old"):
+        client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
+            "item": {"id": item_id, "type": "agentMessage", "phase": "final_answer", "text": item_id}}))
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    events = [message["payload"] for message in messages if message["type"] == "event"]
+    assert [event.get("turn_idx") for event in events] == [0, 0, None, 0]
+    assert len(runtime._item_owners) == 2
+    assert any(message["type"] == "error" and "ownership limit" in message["payload"]["message"] for message in messages)

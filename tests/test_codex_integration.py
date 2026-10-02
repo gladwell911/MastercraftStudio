@@ -48,8 +48,12 @@ def test_codex_steer_completed_items_accumulate_and_reload(frame, monkeypatch, a
     deliver("item_completed", "true final answer", "final")
     deliver("item_completed", "old late overwrite", "old", idx=0)
     assert turns[0]["answer_md"] == "old answer"
-    deliver("turn_completed", "true final answer", completion_owners=[
-        {"turn_idx": idx, "context_generation": 2} for idx in range(3)])
+    frame._on_codex_worker_message(chat_id, {"type": "event", "payload": {
+        "chat_id": chat_id, "turn_idx": 2, "context_generation": 2, "model": main.DEFAULT_CODEX_MODEL,
+        "completion_owners": [{"turn_idx": idx, "context_generation": 2} for idx in range(3)],
+        "event": {"type": "turn_completed", "thread_id": TEST_THREAD_ID, "turn_id": TEST_TURN_ID,
+                  "status": "completed"}}})
+    wx.GetApp().Yield()
     assert turns[1]["answer_md"] == "group connected; collecting\n\ntrue final answer"
     assert [turn["request_status"] for turn in turns] == ["done", "done", "done"]
     if archived:
@@ -933,3 +937,82 @@ def test_late_final_cannot_revive_failed_codex_request(frame):
         frame._on_codex_event_for_chat("scope-chat", event)
     assert turn["request_status"] == "failed"
     assert turn["answer_md"] == "startup buffer overflow"
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_codex_failed_completion_preserves_body_and_metadata(frame, monkeypatch, archived):
+    chat_id = "completion-regression-owner"
+    frame.active_chat_id = frame.current_chat_id = chat_id
+    turn = {"question": "q", "answer_md": "formal answer", "request_status": "pending",
+        "model": main.DEFAULT_CODEX_MODEL, "codex_turn_id": TEST_TURN_ID,
+        "codex_thread_id": TEST_THREAD_ID, "codex_start_generation": 2, "codex_context_generation": 2,
+        "codex_completed_answers": [{"item_id": "answer", "text": "formal answer"}]}
+    chat = {"id": chat_id, "title": "failed", "model": main.DEFAULT_CODEX_MODEL,
+        "turns": [turn], "codex_context_generation": 2}
+    if archived:
+        chat_id = chat["id"] = "failed-archived"
+        frame.archived_chats = [chat]
+    else:
+        frame.active_session_turns = chat["turns"]
+        frame._current_chat_state = chat
+    frame.chat_store.upsert_chat(chat)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    frame._on_codex_event_for_chat(chat_id, CodexEvent(type="turn_completed", status="failed",
+        text="native error message", thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID,
+        data={"turn_idx": 0, "context_generation": 2}))
+    assert turn["answer_md"] == "formal answer"
+    assert turn["codex_completed_answers"] == [{"item_id": "answer", "text": "formal answer"}]
+    frame._persist_chat_history_to_store()
+    assert main.ChatStore(frame.chat_store.db_path).load_chat(chat_id)["turns"][0]["answer_md"] == "formal answer"
+
+
+def test_codex_reloaded_pending_completed_item_deduplicates_and_appends(frame, monkeypatch):
+    chat_id = "completion-regression-owner"
+    frame.active_chat_id = frame.current_chat_id = chat_id
+    turn = {"question": "q", "answer_md": "original text\n\nfirst part", "request_status": "pending",
+        "model": main.DEFAULT_CODEX_MODEL, "codex_turn_id": TEST_TURN_ID,
+        "codex_thread_id": TEST_THREAD_ID, "codex_start_generation": 2, "codex_context_generation": 2,
+        "codex_completed_answers": [{"item_id": "first", "text": "first part"}]}
+    chat = {"id": chat_id, "title": "pending", "model": main.DEFAULT_CODEX_MODEL,
+        "turns": [turn], "codex_context_generation": 2}
+    frame.chat_store.upsert_chat(chat)
+    frame.chat_store.replace_turns(chat_id, chat["turns"])
+    loaded = main.ChatStore(frame.chat_store.db_path).load_chat(chat_id)
+    frame.active_session_turns = loaded["turns"]
+    frame._current_chat_state = loaded
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    for item_id, text in (("first", "first part"), ("second", "second part")):
+        frame._on_codex_event_for_chat(chat_id, CodexEvent(type="item_completed", phase="final_answer",
+            item_id=item_id, text=text, thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID,
+            data={"turn_idx": 0, "context_generation": 2}))
+    assert loaded["turns"][0]["answer_md"] == "original text\n\nfirst part\n\nsecond part"
+    assert len(loaded["turns"][0]["codex_completed_answers"]) == 2
+
+
+@pytest.mark.parametrize("earlier_generation,expected_status", [(2, "done"), (1, "pending")])
+def test_codex_worker_completion_payload_finishes_prior_after_latest_scoped_error(frame, monkeypatch, earlier_generation, expected_status):
+    chat_id = "completion-error-owner"
+    frame.active_chat_id = frame.current_chat_id = chat_id
+    turns = [{"question": "input", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL,
+              "request_status": "pending", "codex_turn_id": TEST_TURN_ID, "codex_thread_id": TEST_THREAD_ID,
+              "codex_start_generation": 2, "codex_context_generation": 2} for _ in range(2)]
+    frame.active_session_turns = turns
+    frame._current_chat_state = {"id": chat_id, "title": "completion error", "turns": turns,
+        "model": main.DEFAULT_CODEX_MODEL, "codex_context_generation": 2,
+        "codex_thread_id": TEST_THREAD_ID, "codex_turn_id": TEST_TURN_ID}
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    frame._on_codex_worker_message(chat_id, {"type": "error", "payload": {
+        "chat_id": chat_id, "turn_idx": 1, "context_generation": 2,
+        "model": main.DEFAULT_CODEX_MODEL, "message": "Codex item ownership limit exceeded"}})
+    assert [turn["request_status"] for turn in turns] == ["pending", "failed"]
+    frame._on_codex_worker_message(chat_id, {"type": "event", "payload": {
+        "chat_id": chat_id, "turn_idx": 1, "context_generation": 2, "model": main.DEFAULT_CODEX_MODEL,
+        "completion_owners": [{"turn_idx": 0, "context_generation": earlier_generation},
+                              {"turn_idx": 1, "context_generation": 2}],
+        "event": {"type": "turn_completed", "thread_id": TEST_THREAD_ID,
+                  "turn_id": TEST_TURN_ID, "status": "completed"}}})
+    wx.GetApp().Yield()
+    assert [turn["request_status"] for turn in turns] == [expected_status, "failed"]
+    assert turns[1]["request_error"] == "Codex item ownership limit exceeded"
