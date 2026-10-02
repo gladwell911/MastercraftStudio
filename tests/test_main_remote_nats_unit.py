@@ -606,7 +606,7 @@ def test_remote_ui_route_from_worker_thread_is_marshaled_to_ui(frame, monkeypatc
     assert posted
 
 
-def test_remote_nats_callbacks_are_ui_marshaled(frame, monkeypatch):
+def test_remote_nats_callbacks_are_ui_marshaled(frame, monkeypatch, wx_app):
     captured = {}
 
     class _FakeNatsTransport:
@@ -624,6 +624,37 @@ def test_remote_nats_callbacks_are_ui_marshaled(frame, monkeypatch):
 
     assert callable(captured["on_message"])
     assert captured["on_message"]({"type": "message"}) == (299, {"callback": "_remote_api_message_ui"})
+    # Exercise production registration and the real bounded information route,
+    # not a manually wired transport callback.
+    desktop = {"id": "desktop-b", "model": "codex/main"}
+    target = {"id": "phone-a", "model": "codex/main", "codex_thread_id": "native-a",
+              "codex_session_total_tokens": 123}
+    frame._current_chat_state = desktop
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda key: target if key == "phone-a" else None)
+    monkeypatch.setattr(frame._information_subscriptions(), "request", lambda *_a, **_kw: True)
+    monkeypatch.setattr(frame, "_run_remote_ui_route", main.ChatFrame._run_remote_ui_route.__get__(frame))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda fn, *args: (main.wx.CallAfter(fn, *args), True)[1])
+    seen_threads = []
+    real_rows = frame._chat_information_rows
+    def rows(chat, model):
+        seen_threads.append(main.threading.current_thread())
+        return real_rows(chat, model)
+    monkeypatch.setattr(frame, "_chat_information_rows", rows)
+    result = []
+    worker = main.threading.Thread(target=lambda: result.append(captured["on_chat_information"]({
+        "type": "chat_information", "chat_id": "phone-a",
+        "body": {"subscription_id": "registered-page", "generation": 1}})), daemon=True)
+    worker.start()
+    import time
+    deadline = time.monotonic() + 2
+    while worker.is_alive() and time.monotonic() < deadline:
+        wx_app.Yield()
+        time.sleep(.01)
+    worker.join(timeout=.1)
+    assert result[0][0] == 200
+    assert result[0][1]["chat_id"] == "phone-a" and result[0][1]["rows"] == real_rows(target, "codex/main")
+    assert len(result[0][1]["rows"]) == 4 and seen_threads == [main.threading.main_thread()]
+    assert frame._current_chat_state is desktop and frame._chat_information_dialog is None
 
 
 def test_on_done_generic_model_publishes_remote_completion_events(frame, monkeypatch):

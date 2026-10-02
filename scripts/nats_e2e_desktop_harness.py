@@ -70,7 +70,17 @@ class CrossClientHarnessState:
             }
         }
         self.observed_messages: list[dict[str, str]] = []
+        self.observed_information: list[dict] = []
+        self.information_subscriptions: dict[str, dict] = {}
+        self.information_revisions: dict[str, int] = {}
+        self.information_full_reads: dict[str, int] = {}
         self._persist_chat(self.chats[CHAT_ID])
+        if os.environ.get("E2E_CHAT_INFORMATION") == "1":
+            kimi_information_chat = {"chat_id": "chat-e2e-kimi-information",
+                "title": seed_title + " Kimi information", "model": KIMI_MODEL,
+                "created_at": now, "updated_at": now, "turns": []}
+            self.chats[kimi_information_chat["chat_id"]] = kimi_information_chat
+            self._persist_chat(kimi_information_chat)
 
     def attach_transport(self, transport: RemoteNatsTransport) -> None:
         self.transport = transport
@@ -169,6 +179,48 @@ class CrossClientHarnessState:
                 return 404, {"accepted": False, "error": "chat_not_found"}
             return 200, _state_body(chat_id, chat["turns"])
 
+    def chat_information(self, payload: dict) -> tuple[int, dict]:
+        body = payload.get("body") or {}
+        chat_id = str(payload.get("chat_id") or "")
+        subscription_id = str(body.get("subscription_id") or "")
+        generation = body.get("generation", 0)
+        with self._lock:
+            chat = self.chats.get(chat_id)
+            if chat is None or not subscription_id:
+                return 404, {"error": "chat_not_found"}
+            self.observed_information.append({"chat_id": chat_id, "model": chat["model"], "subscription_id": subscription_id,
+                "generation": generation, "context_only": bool(body.get("context_only")),
+                "release": bool(body.get("release"))})
+            if body.get("release"):
+                self.information_subscriptions.pop(subscription_id, None)
+                self._write_result()
+                return 200, {"chat_id": chat_id, "subscription_id": subscription_id,
+                             "generation": generation, "released": True}
+            owner = {"chat_id": chat_id, "subscription_id": subscription_id, "generation": generation}
+            self.information_subscriptions[subscription_id] = owner
+            revision = self.information_revisions.setdefault(chat_id, 1)
+            def snapshot(value):
+                return {**owner, "identity": [chat_id, chat["model"], "fixture-native-" + chat_id, "fixture-account"],
+                    "owner_generation": 0, "revision": value,
+                    "rows": ["E2E information context " + chat["model"] + (" updated" if value > 1 else ""),
+                             "E2E information total", "E2E information quota", "E2E information reset"]}
+            result = snapshot(revision)
+            if not body.get("context_only"):
+                count = self.information_full_reads.get(chat_id, 0) + 1
+                self.information_full_reads[chat_id] = count
+                if count == 2:
+                    def updated():
+                        with self._lock:
+                            if self.information_subscriptions.get(subscription_id) != owner:
+                                return
+                            self.information_revisions[chat_id] = 2
+                            self.transport.publish_event_threadsafe(dict(snapshot(2), type="chat_information_changed"))
+                    timer = threading.Timer(.1, updated)
+                    timer.daemon = True
+                    timer.start()
+            self._write_result()
+            return 200, result
+
     def message(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         text = str(payload.get("text") or "").strip()
@@ -228,7 +280,9 @@ class CrossClientHarnessState:
     def _write_result(self) -> None:
         if self.result_file is None:
             return
-        payload = {"messages": list(self.observed_messages)}
+        payload = {"messages": list(self.observed_messages),
+                   "information_requests": list(self.observed_information),
+                   "selected_chat_id": CHAT_ID, "information_window_open": False}
         self.result_file.parent.mkdir(parents=True, exist_ok=True)
         self.result_file.write_text(
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
@@ -422,6 +476,7 @@ def main() -> None:
             on_model_list=state.model_list,
             on_history_list=state.history_list,
             on_history_read=state.history_read,
+            on_chat_information=state.chat_information,
             on_notes_changes=on_notes_changes,
             on_notes_bulk_docs=on_notes_bulk_docs,
             durable_store=durable_store,

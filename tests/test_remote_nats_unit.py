@@ -4,6 +4,18 @@ from chat_store import ChatStore
 from remote_nats import RemoteNatsTransport
 
 
+def test_transport_routes_scoped_chat_information_without_persistence():
+    calls = []
+    def read(payload):
+        calls.append(payload)
+        return 200, {"chat_id": "a", "rows": ["context", "total", "account", "quota"]}
+    transport = RemoteNatsTransport(pair_id="default", token="secret", on_chat_information=read)
+    payload = {"type": "chat_information", "chat_id": "a",
+               "body": {"subscription_id": "page", "generation": 2}}
+    status, response = transport._route_command(payload)
+    assert status == 200 and response["chat_id"] == "a" and calls == [payload]
+
+
 class FakeJetStream:
     def __init__(self):
         self.streams = []

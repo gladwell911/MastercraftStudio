@@ -51,6 +51,7 @@ class RemoteNatsTransport:
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
         on_execution_page: Callback | None = None,
+        on_chat_information: Callback | None = None,
         on_notes_changes: Callback | None = None,
         on_notes_bulk_docs: Callback | None = None,
         on_file_command: Callback | None = None,
@@ -83,6 +84,7 @@ class RemoteNatsTransport:
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
         self.on_execution_page = on_execution_page
+        self.on_chat_information = on_chat_information
         self.on_notes_changes = on_notes_changes
         self.on_notes_bulk_docs = on_notes_bulk_docs
         self.on_file_command = on_file_command
@@ -379,6 +381,8 @@ class RemoteNatsTransport:
 
     def _route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         command_type = str(payload.get("type") or "").strip().lower()
+        if command_type == "chat_information" and callable(self.on_chat_information):
+            return self.on_chat_information(payload)
         if command_type == "execution_page_v3" and callable(self.on_execution_page):
             return self.on_execution_page(payload)
         if command_type in {"execution_tail", "execution_history", "execution_snapshot"}:

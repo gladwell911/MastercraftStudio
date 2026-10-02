@@ -114,6 +114,7 @@ from openclaw_client import (
 )
 from nats_runtime import NatsRuntimeConfig, NatsServerProcess
 from remote_nats import RemoteNatsTransport
+from chat_information import ChatInformationSubscriptions
 from realtime_call import (
     DEFAULT_REALTIME_CALL_ROLE,
     DEFAULT_REALTIME_CALL_SPEECH_RATE,
@@ -2511,6 +2512,25 @@ class ChatFrame(wx.Frame):
             return None
         return chat, model
 
+    def _chat_information_owner_for_id(self, chat_id: str) -> tuple[dict, str] | None:
+        chat = self._current_chat_state
+        if not isinstance(chat, dict) or str(chat.get("id") or "") != chat_id:
+            chat = self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return None
+        model = normalize_model_id(str(chat.get("model") or ""), default="")
+        return (chat, model) if is_codex_model(model) or is_kimi_model(model) else None
+
+    def _information_subscriptions(self) -> ChatInformationSubscriptions:
+        subscriptions = getattr(self, "_scoped_chat_information", None)
+        if subscriptions is None:
+            subscriptions = ChatInformationSubscriptions(self)
+            self._scoped_chat_information = subscriptions
+        return subscriptions
+
+    def _remote_api_chat_information_ui(self, payload: dict) -> tuple[int, dict]:
+        return self._information_subscriptions().command(payload)
+
     def _chat_information_identity(self, chat: dict, model: str) -> tuple[str, str, str, str]:
         native_id = self._codex_thread_id_for_chat(chat) if is_codex_model(model) else self._kimi_session_id_for_chat(chat)
         account_id = str(chat.get("codex_account_id") or "").strip() if is_codex_model(model) else ""
@@ -2634,6 +2654,9 @@ class ChatFrame(wx.Frame):
         return result
 
     def _refresh_chat_information(self, chat: dict | None = None) -> None:
+        scoped = getattr(self, "_scoped_chat_information", None)
+        if scoped is not None:
+            scoped.changed(chat)
         dialog = getattr(self, "_chat_information_dialog", None)
         if dialog is None or dialog.IsBeingDeleted():
             return
@@ -2679,6 +2702,9 @@ class ChatFrame(wx.Frame):
         return True
 
     def _request_codex_chat_information(self, chat: dict, model: str, *, context_only: bool = False) -> None:
+        scoped = getattr(self, "_scoped_chat_information", None)
+        if scoped is not None and scoped.request(chat, model, context_only=context_only):
+            return
         self._validate_information_cache_owner(chat, "codex")
         dialog = getattr(self, "_chat_information_dialog", None)
         if dialog is None or dialog.IsBeingDeleted():
@@ -2719,6 +2745,14 @@ class ChatFrame(wx.Frame):
         threading.Thread(target=_read, daemon=True, name="codex-chat-information").start()
 
     def _fail_codex_chat_information_request(self, generation: int, identity: tuple[str, str, str, str]) -> None:
+        subscriptions = getattr(self, "_scoped_chat_information", None)
+        if subscriptions is not None:
+            pending = subscriptions.requests.get(identity[0])
+            if pending and pending["generation"] == generation:
+                subscriptions.apply_codex(identity[0], {}, {"generation": generation, "identity": list(identity),
+                    "context_only": pending["context_only"], "usage_error": True,
+                    "account_error": True, "rate_limits_error": True})
+                return
         request = self._chat_information_request
         dialog = getattr(self, "_chat_information_dialog", None)
         owner = self._visible_chat_information_owner()
@@ -2746,23 +2780,26 @@ class ChatFrame(wx.Frame):
                 and dialog.identity == identity and self._chat_information_identity(chat, identity[1]) == identity):
             self._request_codex_chat_information(chat, identity[1])
 
-    def _apply_codex_chat_information(self, chat_id: str, message: dict, payload: dict) -> None:
-        request = self._chat_information_request
+    def _apply_codex_chat_information(self, chat_id: str, message: dict, payload: dict, *, scoped: dict | None = None) -> None:
+        request = self._chat_information_request if scoped is None else (None, scoped["generation"], scoped["identity"])
         dialog = getattr(self, "_chat_information_dialog", None)
-        owner = self._visible_chat_information_owner()
-        if request is None or dialog is None or dialog.IsBeingDeleted() or owner is None:
+        owner = self._visible_chat_information_owner() if scoped is None else self._chat_information_owner_for_id(chat_id)
+        if request is None or owner is None or (scoped is None and (dialog is None or dialog.IsBeingDeleted())):
             return
         request_id, generation, identity = request
         chat, model = owner
         if ((request_id is not None and str(message.get("id") or "") != request_id) or chat_id != identity[0]
-                or self._chat_information_identity(chat, model) != identity or dialog.identity != identity
+                or self._chat_information_identity(chat, model) != identity or (scoped is None and dialog.identity != identity)
                 or list(payload.get("identity") or []) != list(identity)
                 or payload.get("generation") != generation):
             return
-        self._chat_information_request = None
+        if scoped is None:
+            self._chat_information_request = None
         native = payload.get("native_usage") or {}
-        if (int(chat.get("codex_usage_revision") or 0) == getattr(self, "_codex_information_revision", 0)
-                and int(chat.get("codex_context_generation") or 0) == getattr(self, "_codex_information_context_generation", 0)):
+        revision = scoped["revision"] if scoped else getattr(self, "_codex_information_revision", 0)
+        context_generation = scoped["owner"][3] if scoped else getattr(self, "_codex_information_context_generation", 0)
+        if (int(chat.get("codex_usage_revision") or 0) == revision
+                and int(chat.get("codex_context_generation") or 0) == context_generation):
             usage = native.get("context_usage")
             try:
                 observed_at = datetime.fromisoformat(str(native.get("observed_at")).replace("Z", "+00:00")).timestamp()
@@ -2781,7 +2818,8 @@ class ChatFrame(wx.Frame):
             chat["codex_snapshot_error"] = bool(payload.get("usage_error"))
         if payload.get("context_only"):
             self._refresh_chat_information(chat)
-            self._resume_codex_information_full_refresh(chat, identity)
+            if scoped is None:
+                self._resume_codex_information_full_refresh(chat, identity)
             return
         account_resp = payload.get("account") if isinstance(payload.get("account"), dict) else {}
         account = account_resp.get("account") if isinstance(account_resp.get("account"), dict) else None
@@ -2820,7 +2858,8 @@ class ChatFrame(wx.Frame):
                 chat["codex_account_id"] = new_account_id
                 if not identity[3] and chat.get("codex_usage_cache_owner"):
                     chat["codex_usage_cache_owner"] = self._information_cache_owner(chat, "codex")
-                dialog.identity = self._chat_information_identity(chat, model)
+                if dialog is not None and not dialog.IsBeingDeleted() and dialog.identity[0] == chat_id:
+                    dialog.identity = self._chat_information_identity(chat, model)
             chat["codex_account_label"] = account_label
             chat["codex_weekly_quota_label"] = quota_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
@@ -2829,7 +2868,10 @@ class ChatFrame(wx.Frame):
         self._refresh_chat_information(chat)
 
     def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False,
-                                       context_only: bool = False) -> None:
+                                       context_only: bool = False, scoped: bool = False) -> None:
+        subscriptions = getattr(self, "_scoped_chat_information", None)
+        if not scoped and subscriptions is not None and subscriptions.request(chat, model, context_only=context_only):
+            return
         self._validate_information_cache_owner(chat, "kimi")
         identity = self._chat_information_identity(chat, model)
         if not identity[0] or not identity[2]:
@@ -2853,6 +2895,7 @@ class ChatFrame(wx.Frame):
             "context_only": context_only,
             "started": time.monotonic(), "dialog": dialog if visible_only else None,
             "cache_owner": self._information_cache_owner(chat, "kimi"),
+            "scoped": scoped,
         }
 
         def _read() -> None:
@@ -2877,14 +2920,32 @@ class ChatFrame(wx.Frame):
 
         threading.Thread(target=_read, daemon=True).start()
 
-    def _request_kimi_quota(self, chat: dict, model: str) -> None:
+    def _request_kimi_quota(self, chat: dict, model: str, *, scoped: bool = False) -> None:
+        subscriptions = getattr(self, "_scoped_chat_information", None)
+        if not scoped and subscriptions is not None and subscriptions.interested(str(chat.get("id") or "")):
+            subscriptions.request(chat, model)
+            return
         dialog = getattr(self, "_chat_information_dialog", None)
         identity = self._chat_information_identity(chat, model)
-        if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity or not identity[0]):
+        if not identity[0] or (not scoped and (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity)):
+            return
+        legacy = getattr(self, "_kimi_quota_request", None)
+        if scoped and legacy is not None and legacy[1] == identity:
+            requests = getattr(self, "_scoped_kimi_quota_requests", None)
+            if requests is None:
+                requests = self._scoped_kimi_quota_requests = {}
+            requests[identity[0]] = (legacy[0], identity, self._information_cache_owner(chat, "kimi"))
+            self._kimi_quota_request = None
             return
         self._kimi_quota_generation = getattr(self, "_kimi_quota_generation", 0) + 1
         generation = self._kimi_quota_generation
-        self._kimi_quota_request = (generation, identity)
+        if scoped:
+            requests = getattr(self, "_scoped_kimi_quota_requests", None)
+            if requests is None:
+                requests = self._scoped_kimi_quota_requests = {}
+            requests[identity[0]] = (generation, identity, self._information_cache_owner(chat, "kimi"))
+        else:
+            self._kimi_quota_request = (generation, identity)
 
         def _read() -> None:
             try:
@@ -2919,19 +2980,29 @@ class ChatFrame(wx.Frame):
                 failed = payload is None
             except Exception:
                 payload, failed = None, True
-            self._call_after_if_alive(self._apply_kimi_quota, generation, identity, payload, failed)
+            self._call_after_if_alive(self._apply_kimi_quota, generation, identity, payload, failed, scoped)
 
         threading.Thread(target=_read, daemon=True, name="kimi-chat-quota").start()
 
     def _apply_kimi_quota(self, generation: int, identity: tuple[str, str, str, str],
-                          payload: dict | None, failed: bool) -> None:
+                          payload: dict | None, failed: bool, scoped: bool = False) -> None:
+        shared = getattr(self, "_scoped_kimi_quota_requests", {}).get(identity[0])
+        if not scoped and shared is not None and shared[:2] == (generation, identity):
+            scoped = True
         dialog = getattr(self, "_chat_information_dialog", None)
-        owner = self._visible_chat_information_owner()
-        if (getattr(self, "_kimi_quota_request", None) != (generation, identity)
-                or dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
+        owner = self._chat_information_owner_for_id(identity[0]) if scoped else self._visible_chat_information_owner()
+        request = getattr(self, "_scoped_kimi_quota_requests", {}).get(identity[0]) if scoped else getattr(self, "_kimi_quota_request", None)
+        if (request is None or request[:2] != (generation, identity)
+                or (not scoped and (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity))
                 or owner is None or self._chat_information_identity(*owner) != identity):
             return
-        self._kimi_quota_request = None
+        if scoped:
+            if (not self._information_subscriptions().interested(identity[0])
+                    or request[2] != self._information_cache_owner(owner[0], "kimi")):
+                return
+            self._scoped_kimi_quota_requests.pop(identity[0], None)
+        else:
+            self._kimi_quota_request = None
         chat = owner[0]
         old_rows = self._chat_information_rows(chat, owner[1])
         account_id = str((payload or {}).get("_account_id") or "")
@@ -2951,7 +3022,8 @@ class ChatFrame(wx.Frame):
         if not previous_account_id and account_id and chat.get("kimi_usage_cache_owner"):
             chat["kimi_usage_cache_owner"] = self._information_cache_owner(chat, "kimi")
             pending = self._kimi_information_requests.get(identity[0])
-            if isinstance(pending, dict) and pending.get("identity") == identity:
+            if (isinstance(pending, dict) and pending.get("identity") == identity
+                    and not (pending.get("scoped") or pending.get("scoped_observed"))):
                 pending["cache_owner"] = self._information_cache_owner(chat, "kimi")
         if (verified_changed or chat.get("kimi_quota_payload") != payload or bool(chat.get("kimi_quota_error")) != failed
                 or chat.get("kimi_quota_owner") != account_id):
@@ -2964,6 +3036,13 @@ class ChatFrame(wx.Frame):
             chat.pop("kimi_quota_updated_at", None)
         if self._chat_information_rows(chat, owner[1]) != old_rows:
             self._refresh_chat_information(chat)
+        if scoped:
+            subscriptions = self._information_subscriptions()
+            pending = subscriptions.requests.get(identity[0])
+            if pending is not None:
+                pending["quota_done"] = True
+                if pending.get("usage_done"):
+                    subscriptions.finished(identity[0], pending)
 
     def _apply_kimi_chat_information_result(
         self, chat_id: str, generation: int, identity: tuple[str, str, str, str],
@@ -2972,6 +3051,10 @@ class ChatFrame(wx.Frame):
         request = self._kimi_information_requests.get(chat_id)
         if not isinstance(request, dict) or request.get("generation") != generation or request.get("identity") != identity:
             return
+        if (request.get("scoped") or request.get("scoped_observed")) and not self._information_subscriptions().interested(chat_id):
+            self._kimi_information_requests.pop(chat_id, None)
+            self._information_subscriptions().requests.pop(chat_id, None)
+            return
         chat, _is_current = self._kimi_target_chat(chat_id)
         if not isinstance(chat, dict):
             return
@@ -2979,6 +3062,17 @@ class ChatFrame(wx.Frame):
         if (self._chat_information_identity(chat, identity[1]) != identity
                 or self._kimi_information_requests.get(chat_id) is not request
                 or tuple(request.get("cache_owner", self._information_cache_owner(chat, "kimi"))) != self._information_cache_owner(chat, "kimi")):
+            if request.get("scoped") or request.get("scoped_observed"):
+                if self._kimi_information_requests.get(chat_id) is request:
+                    self._kimi_information_requests.pop(chat_id, None)
+                subscriptions = self._information_subscriptions()
+                merger = subscriptions.requests.get(chat_id)
+                if (merger is not None and merger.get("identity") == identity
+                        and merger.get("owner") == tuple(request.get("cache_owner") or ())):
+                    subscriptions.requests.pop(chat_id, None)
+                owner = self._chat_information_owner_for_id(chat_id)
+                if owner is not None and subscriptions.interested(chat_id):
+                    subscriptions.request(*owner)
             return
         if request.get("visible_only"):
             dialog = getattr(self, "_chat_information_dialog", None)
@@ -3019,6 +3113,13 @@ class ChatFrame(wx.Frame):
                 if (pending_dialog is not None and pending_dialog is dialog
                         and not dialog.IsBeingDeleted() and dialog.identity == identity):
                     self._request_kimi_chat_information(chat, identity[1], visible_only=True)
+                subscriptions = getattr(self, "_scoped_chat_information", None)
+                if subscriptions is not None:
+                    pending = subscriptions.requests.get(chat_id)
+                    if (request.get("scoped") or request.get("scoped_observed")) and pending is not None:
+                        pending["usage_done"] = True
+                        if pending["context_only"] or pending.get("quota_done"):
+                            subscriptions.finished(chat_id, pending)
         if changed:
             self._refresh_chat_information(chat)
             self._defer_codex_state_save()
@@ -9957,6 +10058,11 @@ class ChatFrame(wx.Frame):
                     self._codex_early_context_usage_owner.pop(key, None)
 
     def _publish_codex_context_thread_change(self, chat: dict) -> None:
+        if getattr(self, "_scoped_chat_information", None) is not None:
+            if threading.current_thread() is threading.main_thread():
+                self._information_subscriptions().changed(chat)
+            else:
+                self._call_after_if_alive(self._information_subscriptions().changed, chat)
         if getattr(self, "_chat_information_dialog", None) is None:
             return
         if threading.current_thread() is threading.main_thread():
@@ -10766,6 +10872,8 @@ class ChatFrame(wx.Frame):
         if threading.current_thread() is not threading.main_thread():
             self._call_after_if_alive(self._publish_kimi_information_session_change, chat)
             return
+        if getattr(self, "_scoped_chat_information", None) is not None:
+            self._information_subscriptions().changed(chat)
         dialog = getattr(self, "_chat_information_dialog", None)
         owner = self._visible_chat_information_owner()
         if dialog is None or dialog.IsBeingDeleted() or owner is None or owner[0] is not chat:
@@ -15692,6 +15800,9 @@ class ChatFrame(wx.Frame):
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         chat_id = str(payload.get("chat_id") or default_chat_id or "").strip()
         if message_type == "chat_information":
+            subscriptions = getattr(self, "_scoped_chat_information", None)
+            if subscriptions is not None and subscriptions.apply_codex(chat_id, message, payload):
+                return
             self._apply_codex_chat_information(chat_id, message, payload)
             return
         if message_type == "event":
@@ -16477,6 +16588,7 @@ class ChatFrame(wx.Frame):
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_execution_page=lambda payload: self._remote_api_execution_page_ui(payload, secret=token),
+                    on_chat_information=lambda payload: self._run_remote_ui_route(self._remote_api_chat_information_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
                     on_file_command=lambda payload: self._run_remote_ui_route(self._remote_api_file_command_ui, payload),
