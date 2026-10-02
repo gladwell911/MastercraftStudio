@@ -2,6 +2,7 @@ import time
 from datetime import datetime
 
 import main
+import pytest
 
 
 def _ts(y, m, d, hh=0, mm=0):
@@ -15,6 +16,44 @@ def _make_turn(question, answer, created_at, model="openai/gpt-5.2"):
         "model": model,
         "created_at": created_at,
     }
+
+
+@pytest.mark.parametrize("gap,shown", [(299, False), (300, True), (1800, True)])
+def test_answer_time_is_independent_and_incremental_matches_rebuild(frame, gap, shown):
+    base = time.time() - 3600
+    turn = _make_turn("question", "answer", base)
+    turn["answer_at"] = base + gap
+    frame.active_session_turns = [turn]
+    frame._render_answer_list(refresh_execution=False)
+    headers = [meta for meta in frame.answer_meta if meta[0] == "time"]
+    assert len(headers) == 1 + int(shown)
+    if shown:
+        assert headers[-1][3] == "assistant"
+        assert headers[-1][2] == main.wechat_time_label(base + gap, time.time())
+        assert frame._answer_row_id(headers[0]) != frame._answer_row_id(headers[-1])
+    frame._replace_answer_list_rows([], [], None)
+    frame.answer_meta = []
+    frame._maybe_append_time_row_to_answer_list(0, turn)
+    frame._maybe_append_time_row_to_answer_list(0, turn, "assistant")
+    assert [meta for meta in frame.answer_meta if meta[0] == "time"] == headers
+
+
+def test_completion_time_and_remote_payload_cache_are_stable(frame, monkeypatch):
+    turn = _make_turn("q", "a", 1000)
+    turn["request_status"] = "pending"
+    monkeypatch.setattr(main.time, "time", lambda: 2800)
+    frame._mark_turn_request_done(turn)
+    assert turn["created_at"] == 1000
+    assert frame._remote_turn_payload(turn)["answer_at"] == 2800
+    monkeypatch.setattr(main.time, "time", lambda: 3000)
+    frame._mark_turn_request_done(turn)
+    assert turn["answer_at"] == 2800
+    turn["answer_at"] = 2900
+    assert frame._remote_turn_payload(turn)["answer_at"] == 2900
+    legacy = _make_turn("old", "answer", 100)
+    legacy["request_status"] = "done"
+    frame._mark_turn_request_done(legacy)
+    assert "answer_at" not in legacy
 
 
 def test_wechat_time_label_same_day():

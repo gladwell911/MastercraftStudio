@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from execution_projection import canonical_answer_timestamp
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -1468,7 +1469,26 @@ class ChatStore:
                 "SELECT payload_json FROM turns WHERE chat_id = ? ORDER BY turn_index",
                 (str(chat_id or "").strip(),),
             ).fetchall()
-        return [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
+        turns = [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
+        return self._restore_answer_times(chat_id, turns)
+
+    def _restore_answer_times(self, chat_id: str, turns: list[dict], start: int = 0) -> list[dict]:
+        missing = [start + index for index, turn in enumerate(turns)
+                   if turn.get("answer_at") is None and str(turn.get("answer_md") or "").strip()]
+        if not missing:
+            return turns
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM execution_steps WHERE chat_id=? AND turn_idx>=? AND turn_idx<=? "
+                "AND COALESCE(json_extract(payload_json,'$.raw_kind'),json_extract(payload_json,'$.kind'),json_extract(payload_json,'$.display_kind'))='final'",
+                (str(chat_id or "").strip(), min(missing), max(missing)),
+            ).fetchall()
+        steps = [self._json_dict(row["payload_json"]) for row in rows]
+        for index, turn in enumerate(turns):
+            timestamp = canonical_answer_timestamp(turn, steps, start + index)
+            if timestamp is not None:
+                turn["answer_at"] = timestamp
+        return turns
 
     def load_turns_page(
         self,
@@ -1501,7 +1521,8 @@ class ChatStore:
                 """,
                 (normalized, start, end),
             ).fetchall()
-        return total, [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
+        turns = [payload for payload in (self._json_dict(row["payload_json"]) for row in rows) if payload]
+        return total, self._restore_answer_times(normalized, turns, start)
 
     def append_execution_step(self, chat_id: str, step: dict[str, Any]) -> None:
         normalized = str(chat_id or "").strip()

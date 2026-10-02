@@ -56,6 +56,8 @@ def test_codex_steer_completed_items_accumulate_and_reload(frame, monkeypatch, a
     wx.GetApp().Yield()
     assert turns[1]["answer_md"] == "group connected; collecting\n\ntrue final answer"
     assert [turn["request_status"] for turn in turns] == ["done", "done", "done"]
+    assert "answer_at" not in turns[0]
+    assert all(turn.get("answer_at", 0) > 0 for turn in turns[1:])
     if archived:
         assert frame.active_session_turns is foreground_turns
     frame._persist_chat_history_to_store()
@@ -64,6 +66,7 @@ def test_codex_steer_completed_items_accumulate_and_reload(frame, monkeypatch, a
     assert [turn["answer_md"] for turn in loaded] == [turn["answer_md"] for turn in turns]
     assert [turn["request_status"] for turn in loaded] == ["done", "done", "done"]
     assert loaded[1]["codex_completed_answers"] == turns[1]["codex_completed_answers"]
+    assert [turn.get("answer_at") for turn in loaded] == [turn.get("answer_at") for turn in turns]
 
 
 def test_codex_legacy_completed_text_deduplicates_without_item_id_and_kimi_keeps_first_answer(frame):
@@ -520,25 +523,54 @@ def test_codex_request_user_input_dialog_replies_through_worker(frame, monkeypat
     assert replies == [("chat-current", "ask-1", {"reply": ["ok"]})]
 
 
-def test_codex_turn_completed_clears_busy_state(frame, monkeypatch):
+@pytest.mark.parametrize("navigation_quiet", [False, True])
+def test_codex_turn_completed_clears_busy_state(frame, monkeypatch, navigation_quiet):
     frame.active_chat_id = frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
     frame._active_request_count = 1
     frame.active_codex_turn_active = True
     frame.active_turn_idx = 0
-    frame.active_session_turns = [{"codex_turn_id": TEST_TURN_ID, "model": "codex/main", "request_status": "pending", "answer_md": main.REQUESTING_TEXT}]
+    frame.active_session_turns = [{"codex_turn_id": TEST_TURN_ID, "model": "codex/main", "request_status": "pending",
+                                  "question": "long question", "created_at": time.time() - 1800, "answer_md": "visible answer"}]
     frame._current_chat_state["turns"] = frame.active_session_turns
+    frame._render_answer_list(refresh_execution=False)
+    assert frame._find_answer_row_index(0) >= 0
+    selected = next(index for index, meta in enumerate(frame.answer_meta) if meta[0] == "question")
+    frame.answer_list.SetSelection(selected)
+    selected_id = frame._answer_row_id(frame.answer_meta[selected])
+    focus_before = wx.Window.FindFocus()
+    rendered = []
+    render = frame._render_answer_list
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: (rendered.append(True), render(*args, **kwargs))[1])
+    frame._on_codex_event(CodexEvent(type="agent_message_delta", thread_id=TEST_THREAD_ID,
+                                   turn_id=TEST_TURN_ID, text="delta", phase="final_answer", data={"turn_idx": 0}))
+    assert not rendered
+    frame._navigation_quiet_until = time.monotonic() + 30 if navigation_quiet else 0
+    monkeypatch.setattr(frame, "_schedule_navigation_quiet_flush", lambda: None)
     played = {"n": 0}
     monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
 
-    frame._on_codex_event(
+    frame._dispatch_codex_event_to_ui("chat-current",
         CodexEvent(type="turn_completed", thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID, status="completed", data={"turn_idx": 0})
     )
+    frame._drain_codex_ui_events()
 
     assert frame._active_request_count == 0
     assert frame.active_codex_turn_active is False
     assert frame.is_running is False
     assert played["n"] == 1
+    if navigation_quiet:
+        assert not any(meta[0] == "time" and meta[3] == "assistant" for meta in frame.answer_meta)
+    owner = frame._answer_refresh_deadline_owner
+    if owner is not None:
+        frame._flush_accepted_answer_refresh(owner)
+    ai = next(index for index, meta in enumerate(frame.answer_meta) if meta[0] == "ai")
+    assert frame.answer_meta[ai - 1][0:2] == ("time", 0)
+    assert frame.answer_meta[ai - 1][3] == "assistant"
+    assert frame.answer_list.GetString(ai - 1) == main.wechat_time_label(frame.active_session_turns[0]["answer_at"], time.time())
+    assert frame._answer_row_id(frame.answer_meta[frame.answer_list.GetSelection()]) == selected_id
+    assert wx.Window.FindFocus() is focus_before
+    assert frame._accepted_answer_is_visible(frame.active_session_turns[0])
 
 
 def test_ambiguous_codex_turn_id_does_not_target_a_turn(frame):

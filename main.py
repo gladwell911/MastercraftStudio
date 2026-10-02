@@ -5331,28 +5331,37 @@ class ChatFrame(wx.Frame):
                 self.answer_list.Append(label)
             self.answer_meta.append(meta)
 
-    def _maybe_append_time_row_to_answer_list(self, turn_idx: int, turn: dict) -> None:
+    def _maybe_append_time_row_to_answer_list(self, turn_idx: int, turn: dict, role: str = "user") -> None:
         for meta in list(getattr(self, "answer_meta", []) or []):
-            if meta and len(meta) > 1 and meta[0] == "time" and meta[1] == int(turn_idx):
+            if meta and len(meta) > 1 and meta[0] == "time" and meta[1] == int(turn_idx) and (meta[3] or "user") == role:
+                return
+            if role == "assistant" and _finite_timestamp(turn.get("answer_at")) is None and meta and meta[0] == "time" and meta[1] == int(turn_idx):
                 return
         # Derive the anchor from time rows actually present in this page.
         turns = self._get_view_turns()
         anchor = None
         for meta in getattr(self, "answer_meta", []):
             if meta and meta[0] == "time" and 0 <= meta[1] < len(turns):
-                timestamp = _finite_timestamp(turns[meta[1]].get("created_at"))
+                timestamp = self._answer_message_timestamp(turns[meta[1]], meta[3] or "user")
                 if timestamp is not None:
                     anchor = timestamp
-        timestamp = _finite_timestamp((turn or {}).get("created_at"))
+        timestamp = self._answer_message_timestamp(turn, role)
         label = wechat_time_label(timestamp, time.time()) if answer_time_projection([anchor, timestamp])[-1] else ""
         if not label:
             return
-        meta = ("time", int(turn_idx), label, "")
+        meta = ("time", int(turn_idx), label, "assistant" if role == "assistant" else "")
         if hasattr(self, "answer_list_model"):
             self.answer_list_model.append(self._answer_row_id(meta), label)
         else:
             self.answer_list.Append(label)
         self.answer_meta.append(meta)
+
+    def _answer_message_timestamp(self, turn: dict, role: str):
+        if role == "assistant":
+            answer_at = _finite_timestamp((turn or {}).get("answer_at"))
+            if answer_at is not None:
+                return answer_at
+        return _finite_timestamp((turn or {}).get("created_at"))
 
     def _input_attachment_marker_text(self, attachments: list[dict]) -> str:
         names = [str((item or {}).get("name") or "").strip() for item in attachments or [] if str((item or {}).get("name") or "").strip()]
@@ -6017,18 +6026,27 @@ class ChatFrame(wx.Frame):
         turns = self._get_view_turns()
         content = [(row, meta) for row, meta in zip(content_rows, content_metas) if meta[0] != "time"]
         def project_time_rows(content):
-            indices = list(dict.fromkeys(meta[1] for _, meta in content if meta[1] >= 0))
-            timestamps = [turns[index].get("created_at") if index < len(turns) else None for index in indices]
-            labels = {index: wechat_time_label(timestamp, time.time()) for index, timestamp, show
-                      in zip(indices, timestamps, answer_time_projection(timestamps)) if show}
             projected_rows, projected_metas = [], []
             emitted = set()
+            anchor = None
+            role = "user"
             for row, meta in content:
                 index = meta[1]
-                if index in labels and index not in emitted:
-                    projected_rows.append(labels[index])
-                    projected_metas.append(("time", index, labels[index], ""))
-                    emitted.add(index)
+                if meta[0] in {"user", "question"}:
+                    role = "user"
+                elif meta[0] in {"ai", "answer"}:
+                    role = "assistant"
+                key = (index, role)
+                if index >= 0 and key not in emitted:
+                    timestamp = self._answer_message_timestamp(turns[index], role) if index < len(turns) else None
+                    legacy_unknown = role == "assistant" and timestamp is None and (index, "user") in emitted
+                    if not legacy_unknown and answer_time_projection([anchor, timestamp])[-1]:
+                        label = wechat_time_label(timestamp, time.time())
+                        projected_rows.append(label)
+                        projected_metas.append(("time", index, label, "assistant" if role == "assistant" else ""))
+                        if timestamp is not None:
+                            anchor = timestamp
+                    emitted.add(key)
                 projected_rows.append(row)
                 projected_metas.append(meta)
             return projected_rows, projected_metas
@@ -6063,7 +6081,7 @@ class ChatFrame(wx.Frame):
         except Exception:
             turn_idx = -1
         if kind == "time":
-            return f"time:{turn_idx}"
+            return f"time:{turn_idx}:assistant" if len(meta) > 3 and meta[3] == "assistant" else f"time:{turn_idx}"
         if kind in {"user", "question", "ai", "answer", "attachment"}:
             detail = str(meta[3] if len(meta) > 3 else "")
             if kind == "attachment":
@@ -6108,7 +6126,7 @@ class ChatFrame(wx.Frame):
                 if selected_meta[0] == "current_model":
                     matched = meta[0] == "current_model"
                 if selected_meta[0] == "time":
-                    matched = meta[0] == "time" and len(meta) > 1 and len(selected_meta) > 1 and meta[1] == selected_meta[1]
+                    matched = meta[0] == "time" and self._answer_row_id(meta) == self._answer_row_id(selected_meta)
             else:
                 matched = meta == selected_meta
             if matched:
@@ -6590,7 +6608,7 @@ class ChatFrame(wx.Frame):
         if not answer_text:
             return False
         self._refresh_context_usage_header_rows()
-        self._maybe_append_time_row_to_answer_list(int(turn_idx), turn)
+        self._maybe_append_time_row_to_answer_list(int(turn_idx), turn, "assistant")
         meta = ("ai", int(turn_idx), "小诸葛", "")
         if hasattr(self, "answer_list_model"):
             self.answer_list_model.append(self._answer_row_id(meta), "小诸葛")
@@ -6619,6 +6637,11 @@ class ChatFrame(wx.Frame):
     def _update_active_answer_row(self, turn_idx: int, *, rebuild_if_missing: bool = True) -> bool:
         if self.view_mode != "active":
             return False
+        if (0 <= turn_idx < len(self.active_session_turns)
+                and self.active_session_turns[turn_idx].get("request_status") == "done"
+                and not self._answer_time_rows_are_current()):
+            self._refresh_answer_list_preserving_selection(refresh_execution=False)
+            self._active_answer_row_index = self._find_answer_row_index(turn_idx)
         if self._active_answer_turn_is_authoritative(turn_idx):
             # The submitted-question path already reconciles the full
             # canonical projection. Streaming deltas should update only their
@@ -9970,9 +9993,12 @@ class ChatFrame(wx.Frame):
         return bool(pending_prompt or "waitingOnUserInput" in (thread_flags or []))
 
     def _mark_turn_request_done(self, turn: dict) -> None:
+        if str(turn.get("request_status") or "") != "done" and _finite_timestamp(turn.get("answer_at")) is None:
+            turn["answer_at"] = time.time()
         turn["request_status"] = "done"
         turn["request_error"] = ""
         turn["request_recovered_after_restart"] = False
+        self._schedule_accepted_answer_refresh(str(self.active_chat_id or self.current_chat_id or ""), turn)
 
     def _mark_turn_request_failed(self, turn: dict, error: str) -> None:
         turn["request_status"] = "failed"
@@ -11709,6 +11735,7 @@ class ChatFrame(wx.Frame):
             answer_md,
             model,
             turn.get("created_at"),
+            turn.get("answer_at"),
             str(turn.get("request_status") or ""),
             str(turn.get("request_error") or ""),
         )
@@ -11733,6 +11760,9 @@ class ChatFrame(wx.Frame):
         created_at = _finite_timestamp(turn.get("created_at"))
         if created_at is not None:
             payload["created_at"] = created_at
+        answer_at = _finite_timestamp(turn.get("answer_at"))
+        if answer_at is not None:
+            payload["answer_at"] = answer_at
         cache[cache_key] = (signature, dict(payload))
         return payload
 
@@ -13496,7 +13526,7 @@ class ChatFrame(wx.Frame):
                 elif event_type == "subagent_result":
                     self._apply_codex_subagent_result_to_turn(turn, str(event.text or ""))
                 elif event_type == "turn_completed":
-                    turn["request_status"] = "done"
+                    self._mark_turn_request_done(turn)
                     turn["request_error"] = ""
                     self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
                     self._apply_codex_completed_answer_to_turn(turn, event)
@@ -13576,7 +13606,7 @@ class ChatFrame(wx.Frame):
                 if not self._accept_clear_operation_result(turn, chat_id or self.active_chat_id):
                     self._clear_codex_worker_active_turn(chat_id or self.active_chat_id, target_idx, event_turn_id)
                     return
-                turn["request_status"] = "done"
+                self._mark_turn_request_done(turn)
                 turn["request_error"] = ""
                 if str(event.status or "").strip() in {"", "completed"}:
                     self._record_chat_activity(self._current_chat_state, time.time())
@@ -15070,7 +15100,7 @@ class ChatFrame(wx.Frame):
                 self._apply_kimi_final_answer_to_turn(turn, final_text)
                 if not was_done:
                     self._record_chat_activity(target_chat, time.time())
-                turn["request_status"] = "done"
+                self._mark_turn_request_done(turn)
                 turn["request_error"] = ""
                 turn["request_recovered_after_restart"] = False
                 self._complete_clear_operation_turn(turn, failed=False)
@@ -17674,6 +17704,23 @@ class ChatFrame(wx.Frame):
             return
         self._refresh_answer_list_preserving_selection(refresh_execution=False)
 
+    def _answer_time_rows_are_current(self) -> bool:
+        if not self._answer_list_structure_is_aligned():
+            return False
+        content = [(self.answer_list.GetString(index), meta)
+                   for index, meta in enumerate(self.answer_meta) if meta[0] != "more"]
+        header_count = 0
+        for _, meta in content:
+            if meta[1] >= 0:
+                break
+            header_count += 1
+        _, projected, _ = self._answer_rows_with_limit(
+            [row for row, _ in content], [meta for _, meta in content], header_count,
+            force_has_more=any(meta[0] == "more" for meta in self.answer_meta),
+        )
+        return [(index, meta) for index, meta in enumerate(projected) if meta[0] == "time"] == [
+            (index, meta) for index, meta in enumerate(self.answer_meta) if meta[0] == "time"]
+
     def _accepted_answer_is_visible(self, turn: dict) -> bool:
         index = next((i for i, item in enumerate(self.active_session_turns) if item is turn), -1)
         row = self._find_answer_row_index(index) if index >= 0 else -1
@@ -17681,6 +17728,8 @@ class ChatFrame(wx.Frame):
             return False
         answer_md, answer_text = self._turn_answer_markdown(turn)
         if self.answer_meta[row][2:4] != (answer_text, answer_md) or self.answer_list.GetString(row) != answer_text:
+            return False
+        if not self._answer_time_rows_are_current():
             return False
         received = turn.get("received_attachments") if isinstance(turn.get("received_attachments"), list) else []
         return all(meta in self.answer_meta for _, meta in self._turn_attachment_rows(index, received, incoming=True))

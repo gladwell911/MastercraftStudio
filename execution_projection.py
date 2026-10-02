@@ -143,6 +143,28 @@ def _execution_timestamp(step):
     return created if created is not None else _finite_timestamp(step.get("ts"))
 
 
+def canonical_answer_timestamp(turn: dict, steps: list, turn_index: int):
+    """Prefer a persisted answer time, then this owner's canonical final fact."""
+    persisted = _finite_timestamp(turn.get("answer_at"))
+    if persisted is not None:
+        return persisted
+    for step in steps or []:
+        if not isinstance(step, dict):
+            continue
+        try:
+            index = int(step.get("turn_idx"))
+        except (TypeError, ValueError):
+            continue
+        if index != turn_index:
+            continue
+        kind = str(step.get("raw_kind") or step.get("kind") or step.get("display_kind") or "")
+        if kind == "final":
+            timestamp = _execution_timestamp(step)
+            if timestamp is not None:
+                return timestamp
+    return None
+
+
 def execution_turn_context_steps(
     steps: list,
     turns: list,
@@ -183,6 +205,10 @@ def execution_turn_context_steps(
         answer = answer_to_plain(answer_md, str(turn.get("model") or selected_model or "")).strip()
 
     def timestamp(raw_kind: str):
+        if raw_kind == "final":
+            value = canonical_answer_timestamp(turn, steps, index)
+            if value is not None:
+                return value
         for step in steps or []:
             if not isinstance(step, dict):
                 continue

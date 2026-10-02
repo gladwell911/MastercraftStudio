@@ -10,6 +10,25 @@ from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
 
+def test_answer_times_survive_store_and_recover_only_owner_final(tmp_path):
+    store = ChatStore(tmp_path / "answer-time.db")
+    store.initialize()
+    turns = [
+        {"question": "q0", "answer_md": "a0", "created_at": 100, "answer_at": 400},
+        {"question": "q1", "answer_md": "a1", "created_at": 500},
+        {"question": "q2", "answer_md": "a2", "created_at": 900},
+    ]
+    store.replace_turns("owner", turns)
+    store.replace_execution_steps("other", [{"turn_idx": 2, "raw_kind": "final", "ts": 9999}])
+    store.replace_execution_steps("owner", [{"turn_idx": 1, "raw_kind": "final", "ts": 800}])
+    loaded = store.load_turns("owner")
+    assert [turn.get("answer_at") for turn in loaded] == [400, 800, None]
+    assert [turn["created_at"] for turn in loaded] == [100, 500, 900]
+    total, page = store.load_turns_page("owner", limit=2)
+    assert total == 3
+    assert [turn.get("answer_at") for turn in page] == [800, None]
+
+
 @pytest.mark.parametrize("active_pinned", [False, True])
 def test_activity_timestamp_is_monotonic_and_pinned_first(tmp_path, active_pinned):
     store = ChatStore(tmp_path / "activity.db")

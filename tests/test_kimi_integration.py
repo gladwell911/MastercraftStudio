@@ -14,7 +14,7 @@ TEST_TURN_ID = "1"
 
 
 class _ImmediateThread:
-    def __init__(self, target=None, args=None, kwargs=None, daemon=None):
+    def __init__(self, target=None, args=None, kwargs=None, daemon=None, name=None):
         self._target = target
         self._args = args or ()
         self._kwargs = kwargs or {}
@@ -803,7 +803,9 @@ def test_completed_without_answer_stays_recoverable_and_does_not_mark_done(frame
     assert not turn.get("request_error")
 
 
-def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):
+@pytest.mark.parametrize("navigation_quiet", [False, True])
+def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch, navigation_quiet):
+    monkeypatch.setattr(wx, "MessageBox", lambda message, *_args, **_kwargs: pytest.fail(str(message)))
     fake = _setup_kimi_frame(frame, monkeypatch)
     played = {"n": 0}
     monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.__setitem__("n", played["n"] + 1))
@@ -811,10 +813,25 @@ def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):
     session_id = fake.created_sessions[0]["session_id"]
     assert frame.is_running is True
 
+    turn = frame.active_session_turns[-1]
+    turn["created_at"] = time.time() - 1800
+    turn["answer_md"] = "答案"
+    frame._render_answer_list(refresh_execution=False)
+    assert frame._find_answer_row_index(len(frame.active_session_turns) - 1) >= 0
+    selected = next(index for index, meta in enumerate(frame.answer_meta) if meta[0] == "question")
+    frame.answer_list.SetSelection(selected)
+    selected_id = frame._answer_row_id(frame.answer_meta[selected])
+    rendered = []
+    render = frame._render_answer_list
+    monkeypatch.setattr(frame, "_render_answer_list", lambda *args, **kwargs: (rendered.append(True), render(*args, **kwargs))[1])
+
     fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
     fake.push_event(
         KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=TEST_TURN_ID, text="答案", display_kind="assistant")
     )
+    assert not rendered
+    frame._navigation_quiet_until = time.monotonic() + 30 if navigation_quiet else 0
+    monkeypatch.setattr(frame, "_schedule_navigation_quiet_flush", lambda: None)
     fake.push_event(
         KimiEvent(type="turn_completed", thread_id=session_id, turn_id=TEST_TURN_ID, status="completed")
     )
@@ -825,6 +842,22 @@ def test_turn_completed_reenables_new_chat_and_plays_sound(frame, monkeypatch):
     assert played["n"] == 1
     assert frame.active_kimi_turn_active is False
     assert frame.active_session_turns[-1]["answer_md"] == "答案"
+    turn = frame.active_session_turns[-1]
+    assert turn["answer_at"] >= turn["created_at"]
+    completed_at = turn["answer_at"]
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id=TEST_TURN_ID, status="completed"))
+    assert turn["answer_at"] == completed_at
+    if navigation_quiet:
+        assert not any(meta[0] == "time" and meta[3] == "assistant" for meta in frame.answer_meta)
+    owner = frame._answer_refresh_deadline_owner
+    if owner is not None:
+        frame._flush_accepted_answer_refresh(owner)
+    ai = next(index for index, meta in enumerate(frame.answer_meta) if meta[0] == "ai")
+    assert frame.answer_meta[ai - 1][0] == "time"
+    assert frame.answer_meta[ai - 1][3] == "assistant"
+    assert frame.answer_list.GetString(ai - 1) == main.wechat_time_label(completed_at, time.time())
+    assert frame._answer_row_id(frame.answer_meta[frame.answer_list.GetSelection()]) == selected_id
+    assert frame._accepted_answer_is_visible(turn)
 
 
 def test_out_of_order_absolute_offsets_are_assembled_before_publish(frame, monkeypatch):
