@@ -7,6 +7,80 @@ import pytest
 import main
 
 
+@pytest.mark.parametrize("switch_chat", [False, True])
+def test_real_ui_steer_answer_order_and_native_completion(request, wx_app, monkeypatch, switch_chat):
+    from owned_window_qa import activate_owned_frame
+
+    cleanup = _track_ui_timers_for_test(monkeypatch)
+    frame = request.getfixturevalue("frame")
+    activate_owned_frame(frame)
+    owner = "steer-ui-owner"
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = owner
+    turns = [{"question": question, "answer_md": answer, "model": main.DEFAULT_CODEX_MODEL,
+              "request_status": status, "codex_context_generation": 1,
+              "codex_start_generation": 1, "codex_thread_id": "steer-ui-thread",
+              "codex_turn_id": "steer-ui-turn"}
+             for question, answer, status in [("旧问题", "旧回答", "done"),
+                 ("群号187387007", main.REQUESTING_TEXT, "pending")]]
+    frame.active_session_turns = turns
+    frame._current_chat_state = {"id": owner, "title": "steer owner", "model": main.DEFAULT_CODEX_MODEL,
+        "turns": turns, "codex_context_generation": 1, "codex_thread_id": "steer-ui-thread",
+        "codex_turn_id": "steer-ui-turn", "codex_turn_active": True}
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_schedule_async_archive_rename", lambda *_args: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    frame._render_answer_list_compat(refresh_execution=False)
+    def visible_texts():
+        return [frame.answer_list.GetString(idx) for idx in range(frame.answer_list.GetCount())]
+    def deliver(kind, text="", item_id="", idx=1, **extra):
+        event = main.CodexEvent(type=kind, phase="final_answer", subtype="agentMessage", text=text,
+            item_id=item_id, thread_id="steer-ui-thread", turn_id="steer-ui-turn", status="completed")
+        frame._apply_codex_worker_event_scope(event, {"turn_idx": idx, "context_generation": 1,
+            "model": main.DEFAULT_CODEX_MODEL, **extra})
+        frame._dispatch_codex_event_to_ui(owner, event)
+    try:
+        deliver("item_completed", "真实群已连接并开始采集", "ask")
+        assert _yield_until(wx_app, lambda: "真实群已连接并开始采集" in visible_texts())
+        texts = visible_texts()
+        assert texts.index("旧问题") < texts.index("旧回答") < texts.index("群号187387007") < texts.index("真实群已连接并开始采集")
+        if switch_chat:
+            frame.chat_store.upsert_chat({"id": "steer-other", "title": "other", "model": main.DEFAULT_CODEX_MODEL})
+            frame.archived_chats = [frame.chat_store.load_chat("steer-other")]
+            assert frame._switch_current_chat("steer-other")
+            frame.input_edit.SetValue("other unsent draft")
+            frame.input_edit.SetFocus()
+            wx_app.Yield()
+            other_texts = visible_texts()
+        deliver("agent_message_delta", "unfinished overwrite", "final")
+        deliver("item_completed", "真正终答：采集已完成", "final")
+        deliver("item_completed", "真正终答：采集已完成", "final")
+        deliver("item_completed", "迟到旧item不得覆盖", "old", idx=0)
+        deliver("turn_completed", "真正终答：采集已完成", completion_owners=[
+            {"turn_idx": idx, "context_generation": 1} for idx in (0, 1)])
+        assert _yield_until(wx_app, lambda: (frame._find_archived_chat(owner) if switch_chat else frame._current_chat_state)["turns"][1]["request_status"] == "done")
+        if switch_chat:
+            assert visible_texts() == other_texts
+            assert frame.input_edit.GetValue() == "other unsent draft"
+            assert frame.input_edit.HasFocus()
+            assert frame._switch_current_chat(owner)
+        assert _yield_until(wx_app, lambda: any("真正终答：采集已完成" in text for text in visible_texts()))
+        texts = visible_texts()
+        new_answer = next(text for text in texts if "真正终答：采集已完成" in text)
+        assert "真实群已连接并开始采集" in new_answer
+        assert new_answer.count("真正终答：采集已完成") == 1
+        assert "unfinished overwrite" not in new_answer
+        assert texts.index("旧问题") < texts.index("旧回答") < texts.index("群号187387007") < texts.index(new_answer)
+        frame._persist_chat_history_to_store()
+        loaded = main.ChatStore(frame.chat_store.db_path).load_chat(owner)["turns"]
+        assert loaded[0]["answer_md"] == "旧回答"
+        assert loaded[1]["answer_md"] == "真实群已连接并开始采集\n\n真正终答：采集已完成"
+        assert all(turn["request_status"] == "done" for turn in loaded)
+        assert frame.answer_list.IsShown()
+    finally:
+        cleanup(frame)
+
+
 def test_real_ui_switched_chat_final_visible_after_actual_switch(request, wx_app, monkeypatch):
     from owned_window_qa import activate_owned_frame
 

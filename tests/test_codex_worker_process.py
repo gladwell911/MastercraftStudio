@@ -3,7 +3,7 @@ import threading
 import time
 import pytest
 
-from codex_client import CodexEvent
+from codex_client import CodexEvent, _event_from_item
 from codex_worker_process import CodexWorkerRuntime
 from codex_worker_protocol import decode_worker_line, encode_worker_message, make_ui_request, validate_chat_scoped_message
 
@@ -1081,3 +1081,127 @@ def test_second_start_failure_preserves_prior_turn_completion(failure_mode):
     assert messages[-1]["payload"]["turn_idx"] == 1
     assert messages[-1]["payload"]["context_generation"] == 2
     assert not runtime._startup_events
+
+
+@pytest.mark.parametrize("ack", [{"turn": {"id": "turn-1"}}, {"turn_id": "turn-1"}, {"turnId": "turn-1"}, {}])
+def test_steer_user_boundary_keeps_old_items_and_two_accepted_owners(ack):
+    class SteerClient(FakeCodexClient):
+        def steer_turn_items(self, thread_id, turn_id, items):
+            self.on_event(CodexEvent(type="item_completed", thread_id=thread_id, turn_id=turn_id,
+                item_id="old", phase="final_answer", text="old replay"))
+            self.on_event(_event_from_item("item/started", {"threadId": thread_id, "turnId": turn_id,
+                "item": {"id": f"user-{items[0]['text']}", "type": "userMessage", "content": items}}))
+            self.on_event(_event_from_item("item/completed", {"threadId": thread_id, "turnId": turn_id,
+                "item": {"id": f"answer-{items[0]['text']}", "type": "agentMessage",
+                    "phase": "final_answer", "text": "new answer"}}))
+            return ack
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: SteerClient(cb, model), output=output)
+    runtime.handle_message(make_ui_request("first", "start_turn", {"chat_id": "chat", "turn_idx": 0,
+        "context_generation": 2, "question": "first"}))
+    client = runtime._clients[("chat", "codex/main")]
+    client.on_event(CodexEvent(type="item_completed", thread_id="thread-1", turn_id="turn-1",
+        item_id="old", phase="final_answer", text="old answer"))
+    for idx in (1, 2):
+        output.seek(0); output.truncate()
+        runtime.handle_message(make_ui_request(f"steer-{idx}", "start_turn", {"chat_id": "chat", "turn_idx": idx,
+            "context_generation": idx + 1, "thread_id": "thread-1", "turn_id": "turn-1", "should_steer": True,
+            "question": f"q{idx}"}))
+        messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+        assert [message["type"] for message in messages] == ["event", "thread_state", "turn_started_ack", "event", "event"]
+        assert messages[0]["payload"]["turn_idx"] == 0
+        assert messages[2]["payload"]["turn_id"] == "turn-1"
+        assert [message["payload"]["turn_idx"] for message in messages[3:]] == [idx, idx]
+        assert all(message["payload"]["context_generation"] == idx + 1 for message in messages[3:])
+    client.on_event(CodexEvent(type="turn_completed", thread_id="thread-1", turn_id="turn-1", status="completed"))
+    completed = decode_worker_line(output.getvalue().splitlines()[-1] + "\n")["payload"]
+    assert completed["turn_idx"] == 2
+    assert completed["completion_owners"] == [{"turn_idx": idx, "context_generation": max(2, idx + 1)} for idx in (0, 1, 2)]
+
+
+@pytest.mark.parametrize("failure_mode", ["exception", "overflow"])
+def test_failed_steer_never_reassigns_new_items_and_keeps_prior_completion(failure_mode):
+    class SteerClient(FakeCodexClient):
+        def steer_turn_items(self, thread_id, turn_id, items):
+            self.on_event(CodexEvent(type="turn_completed", thread_id=thread_id, turn_id=turn_id, status="completed"))
+            for idx in range(3):
+                self.on_event(CodexEvent(type="item_completed", thread_id=thread_id, turn_id=turn_id,
+                    item_id=f"unaccepted-{idx}", phase="final_answer", text="discard"))
+            if failure_mode == "exception":
+                raise RuntimeError("steer failed")
+            return {}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: SteerClient(cb, model), output=output)
+    runtime.handle_message(make_ui_request("first", "start_turn", {"chat_id": "chat", "turn_idx": 0,
+        "context_generation": 2, "question": "first"}))
+    runtime.MAX_STARTUP_EVENTS = 2
+    output.seek(0); output.truncate()
+    runtime.handle_message(make_ui_request("steer", "start_turn", {"chat_id": "chat", "turn_idx": 1,
+        "context_generation": 2, "thread_id": "thread-1", "turn_id": "turn-1", "should_steer": True,
+        "question": "second"}))
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    events = [message["payload"] for message in messages if message["type"] == "event"]
+    assert len(events) == 1 and events[0]["event"]["type"] == "turn_completed"
+    assert events[0]["turn_idx"] == 0
+    assert events[0]["completion_owners"] == [{"turn_idx": 0, "context_generation": 2}]
+    assert any(message["type"] == "error" for message in messages)
+
+
+def test_steer_without_matching_user_boundary_leaves_unknown_answer_unscoped():
+    class SteerClient(FakeCodexClient):
+        def steer_turn_items(self, *args):
+            return {}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: SteerClient(cb, model), output=output)
+    for idx in (0, 1):
+        runtime.handle_message(make_ui_request(str(idx), "start_turn", {"chat_id": "chat", "turn_idx": idx,
+            "context_generation": 2, "thread_id": "thread-1", "turn_id": "turn-1",
+            "should_steer": bool(idx), "question": f"q{idx}"}))
+    client = runtime._clients[("chat", "codex/main")]
+    client.on_event(CodexEvent(type="item_completed", thread_id="thread-1", turn_id="turn-1",
+        item_id="unknown", phase="final_answer", text="unconfirmed"))
+    event = decode_worker_line(output.getvalue().splitlines()[-1] + "\n")["payload"]
+    assert "turn_idx" not in event
+
+
+def test_steer_fallback_without_id_does_not_reuse_expected_turn():
+    class Client(NoActiveSteerCodexClient):
+        def start_turn_items(self, *args, **kwargs):
+            return {}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: Client(cb, model), output=output)
+    runtime.handle_message(make_ui_request("fallback", "start_turn", {"chat_id": "chat", "turn_idx": 0,
+        "context_generation": 2, "thread_id": "thread-1", "turn_id": "old", "should_steer": True, "question": "q"}))
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert messages[-1]["payload"]["turn_id"] == ""
+
+
+def test_two_acked_steers_with_delayed_user_boundaries_preserve_each_answer_owner():
+    class Client(FakeCodexClient):
+        def steer_turn_items(self, *args):
+            return {}
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: Client(cb, model), output=output)
+    for idx in (0, 1, 2):
+        runtime.handle_message(make_ui_request(str(idx), "start_turn", {"chat_id": "chat", "turn_idx": idx,
+            "context_generation": 2, "thread_id": "thread-1", "turn_id": "turn-1",
+            "should_steer": bool(idx), "question": f"q{idx}"}))
+        if idx == 0:
+            runtime._clients[("chat", "codex/main")].on_event(_event_from_item("item/started", {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {"id": "old", "type": "agentMessage", "text": "old"}}))
+    client = runtime._clients[("chat", "codex/main")]
+    output.seek(0); output.truncate()
+    client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
+        "item": {"id": "unknown-before-boundary", "type": "agentMessage", "phase": "final_answer", "text": "unknown"}}))
+    for idx in (1, 2):
+        client.on_event(_event_from_item("item/started", {"threadId": "thread-1", "turnId": "turn-1",
+            "item": {"id": f"u{idx}", "type": "userMessage", "content": [{"type": "text", "text": f"q{idx}"}]}}))
+        client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
+            "item": {"id": f"a{idx}", "type": "agentMessage", "phase": "final_answer", "text": f"answer {idx}"}}))
+        client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
+            "item": {"id": "old", "type": "agentMessage", "phase": "final_answer", "text": "old late"}}))
+    events = [decode_worker_line(line + "\n")["payload"] for line in output.getvalue().splitlines()]
+    assert [(event["event"]["item_id"], event.get("turn_idx")) for event in events] == [
+        ("unknown-before-boundary", None), ("u1", 1), ("a1", 1), ("old", 0),
+        ("u2", 2), ("a2", 2), ("old", 0)]

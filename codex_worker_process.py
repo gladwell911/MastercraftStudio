@@ -35,6 +35,8 @@ class CodexWorkerRuntime:
         self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
         self._ambiguous_input_requests: set[tuple[str, str]] = set()
         self._startup_events: dict[tuple[str, str], dict] = {}
+        self._native_owners: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
+        self._item_owners: OrderedDict[tuple[str, str, str, str], tuple[int, int, str]] = OrderedDict()
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         line = encode_worker_message(make_worker_event(message_type, payload, request_id))
@@ -73,6 +75,8 @@ class CodexWorkerRuntime:
             self._input_request_clients.clear()
             self._ambiguous_input_requests.clear()
             self._startup_events.clear()
+            self._native_owners.clear()
+            self._item_owners.clear()
         for client in clients:
             client.close()
 
@@ -97,11 +101,17 @@ class CodexWorkerRuntime:
                 turn_id = str(getattr(event, "turn_id", "") or "").strip()
                 prior_scope = self._turn_id_scopes.get((chat_id, model, turn_id))
                 event_thread = str(getattr(event, "thread_id", "") or "").strip()
-                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]):
+                item_id = str(getattr(event, "item_id", "") or "").strip()
+                prior_item = self._item_owners.get((chat_id, model, turn_id, item_id)) if item_id else None
+                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]) and (turn_id != pending["steer_turn_id"] or prior_item is not None):
                     self._dispatch_event(chat_id, model, event)
                     return
                 if pending["overflow"]:
+                    if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
+                        pending["prior_completions"].append(event)
                     return
+                if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
+                    pending["prior_completions"].append(event)
                 size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
                 if len(pending["events"]) >= self.MAX_STARTUP_EVENTS or pending["bytes"] + size > self.MAX_STARTUP_EVENT_BYTES:
                     pending["events"].clear()
@@ -136,6 +146,34 @@ class CodexWorkerRuntime:
                 scope = self._thread_turn_scopes.get(key)
                 if scope is not None:
                     self._thread_turn_scopes.move_to_end(key)
+            native = self._native_owners.get((chat_id, model, turn_id)) if turn_id else None
+            item_id = str(getattr(event, "item_id", "") or "").strip()
+            item_key = (chat_id, model, turn_id, item_id)
+            if native is not None and (not thread_id or thread_id == native["thread_id"]):
+                owner = self._item_owners.get(item_key) if item_id else None
+                if owner is not None:
+                    scope = owner[:2]
+                else:
+                    # Only the accepted user item establishes a steer boundary.
+                    if str(getattr(event, "subtype", "") or "") == "userMessage" and item_id:
+                        data = event.data if isinstance(event.data, dict) else {}
+                        content = data.get("content") or []
+                        text = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") in {"text", "inputText"})
+                        if not text:
+                            text = str(data.get("text") or event.text or "")
+                        boundaries = native["boundaries"]
+                        if boundaries and text.strip() == boundaries[0]["text"]:
+                            native["current"] = boundaries.pop(0)["owner"]
+                            native["steer_boundary_seen"] = True
+                    scope = None if native["boundaries"] and not native["steer_boundary_seen"] else native["current"][:2]
+                    if item_id and scope is not None:
+                        self._remember_scope(self._item_owners, item_key, native["current"])
+                if event_type == "turn_completed":
+                    scope = native["owners"][-1][:2]
+                    payload["completion_owners"] = [
+                        {"turn_idx": owner[0], "context_generation": owner[1]}
+                        for owner in native["owners"]
+                    ]
             if scope is not None:
                 payload["turn_idx"], payload["context_generation"] = scope
             if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
@@ -164,8 +202,10 @@ class CodexWorkerRuntime:
         with self._lock:
             self._startup_events[startup_key] = {
                 "events": [], "bytes": 0, "overflow": False,
+                "prior_completions": [],
                 "prior_turn_ids": frozenset(key[2] for key, scope in self._turn_id_scopes.items()
                                              if key[:2] == startup_key and scope is not None),
+                "steer_turn_id": str(payload.get("turn_id") or "").strip() if payload.get("should_steer") else "",
             }
         accepted = False
         try:
@@ -195,11 +235,8 @@ class CodexWorkerRuntime:
                     thread_id = self._start_thread(client, payload, service_tier_arg)
                     items = self._recovery_input_items(payload, items)
 
-            if thread_id and isinstance(turn_idx, int):
-                with self._lock:
-                    self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (turn_idx, context_generation))
-
             should_steer = bool(payload.get("should_steer")) and bool(str(payload.get("turn_id") or "").strip())
+            steered = False
             if should_steer and hasattr(client, "steer_turn_items"):
                 try:
                     turn_response = client.steer_turn_items(
@@ -207,6 +244,7 @@ class CodexWorkerRuntime:
                         str(payload.get("turn_id") or "").strip(),
                         items,
                     )
+                    steered = True
                 except Exception as exc:
                     if not self._is_no_active_turn_error(exc):
                         raise
@@ -214,17 +252,29 @@ class CodexWorkerRuntime:
             else:
                 turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
+            if steered and not turn_id:
+                turn_id = str(payload.get("turn_id") or "").strip()
             if turn_id and isinstance(turn_idx, int):
                 with self._lock:
                     key = (chat_id, model, turn_id)
                     value = (turn_idx, context_generation, thread_id)
-                    if key not in self._turn_id_scopes:
-                        stored = value
-                    elif self._turn_id_scopes[key] == value:
-                        stored = value
-                    else:
-                        stored = None
-                    self._remember_scope(self._turn_id_scopes, key, stored)
+                    overflow = self._startup_events[startup_key]["overflow"]
+                    native = self._native_owners.get(key)
+                    if not overflow:
+                        self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (turn_idx, context_generation))
+                        if steered and native is not None and native["thread_id"] == thread_id:
+                            if len(native["owners"]) >= self.MAX_EVENT_SCOPES:
+                                raise RuntimeError("Codex accepted input owner limit exceeded")
+                            native["owners"].append(value)
+                            input_text = "\n".join(str(item.get("text") or "") for item in items
+                                                   if isinstance(item, dict) and item.get("type") == "text")
+                            native["boundaries"].append({"owner": value, "text": input_text.strip()})
+                        elif not steered or native is None:
+                            if key in self._turn_id_scopes and self._turn_id_scopes[key] != value:
+                                self._remember_scope(self._turn_id_scopes, key, None)
+                            else:
+                                self._remember_scope(self._turn_id_scopes, key, value)
+                                self._remember_scope(self._native_owners, key, {"thread_id": thread_id, "current": value, "owners": [value], "boundaries": [], "steer_boundary_seen": False})
             self.emit(
                 "thread_state",
                 {
@@ -261,10 +311,15 @@ class CodexWorkerRuntime:
                 pending = self._startup_events.pop(startup_key, None)
                 if accepted and pending is not None:
                     if pending["overflow"]:
+                        for event in pending["prior_completions"]:
+                            self._dispatch_event(chat_id, model, event)
                         self._emit_scoped_error(message, "Codex startup event buffer exceeded its limit", chat_id, turn_idx, model)
                     else:
                         for event in pending["events"]:
                             self._dispatch_event(chat_id, model, event)
+                elif pending is not None:
+                    for event in pending["prior_completions"]:
+                        self._dispatch_event(chat_id, model, event)
 
     def _remember_scope(self, scopes: OrderedDict, key: tuple, value: tuple | None) -> None:
         scopes.pop(key, None)
@@ -449,7 +504,8 @@ class CodexWorkerRuntime:
         nested = response.get(object_key)
         if isinstance(nested, dict) and nested.get("id"):
             return str(nested.get("id") or "")
-        return str(response.get(flat_key) or response.get("id") or "")
+        camel_key = object_key + "Id"
+        return str(response.get(flat_key) or response.get(camel_key) or response.get("id") or "")
 
     def _client_key_for_reply(self, chat_id: str, request_id: Any) -> tuple[str, str] | None:
         if not chat_id:

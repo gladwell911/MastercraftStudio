@@ -9889,6 +9889,30 @@ class ChatFrame(wx.Frame):
             turn.pop("answer_origin", None)
         return True
 
+    def _apply_codex_completed_answer_to_turn(self, turn: dict, event: CodexEvent) -> bool:
+        answer = str(event.text or "")
+        if not answer.strip() or str(turn.get("request_status") or "") == "failed":
+            return False
+        item_id = str(event.item_id or "").strip()
+        completed = turn.setdefault("codex_completed_answers", [])
+        if any((item_id and item.get("item_id") == item_id) or item.get("text") == answer
+               for item in completed if isinstance(item, dict)):
+            return False
+        current = str(turn.get("answer_md") or "")
+        if current == answer:
+            completed.append({"item_id": item_id, "text": answer})
+            return False
+        if str(turn.get("request_status") or "") == "done" and event.type != "turn_completed":
+            return False
+        if current.strip() and current != REQUESTING_TEXT and not self._is_codex_subagent_result_answer(turn):
+            turn["answer_md"] = f"{current.rstrip()}\n\n{answer}"
+        else:
+            turn["answer_md"] = answer
+        completed.append({"item_id": item_id, "text": answer})
+        turn.pop("answer_origin", None)
+        self._schedule_accepted_answer_refresh(str(self.active_chat_id or self.current_chat_id or ""), turn)
+        return True
+
     @staticmethod
     def _codex_error_text(exc: Exception | str) -> str:
         return str(exc or "").strip().lower()
@@ -13356,6 +13380,35 @@ class ChatFrame(wx.Frame):
         if isinstance(identity_chat, dict) and not early_codex_usage:
             if not self._codex_event_turn_is_compatible_with_chat(identity_chat, event):
                 return
+        if event_type == "turn_completed":
+            event_data = event.data if isinstance(event.data, dict) else {}
+            completion_owners = event_data.get("completion_owners")
+            if isinstance(completion_owners, list):
+                turns = identity_chat.get("turns") if isinstance(identity_chat, dict) else []
+                seen = set()
+                for owner in completion_owners:
+                    if not isinstance(owner, dict):
+                        continue
+                    idx = owner.get("turn_idx")
+                    if not isinstance(idx, int) or idx in seen or not isinstance(turns, list) or not 0 <= idx < len(turns):
+                        continue
+                    seen.add(idx)
+                    turn = turns[idx]
+                    if str(turn.get("request_status") or "") not in {"pending", "running"}:
+                        continue
+                    if str(turn.get("codex_turn_id") or "") != event_turn_id or str(turn.get("codex_thread_id") or "") != event_thread_id:
+                        continue
+                    if str(turn.get("model") or DEFAULT_CODEX_MODEL) != str(event_data.get("model") or turn.get("model") or DEFAULT_CODEX_MODEL):
+                        continue
+                    data = dict(event_data)
+                    data.pop("completion_owners", None)
+                    data.update(owner)
+                    scoped_event = copy.copy(event)
+                    scoped_event.data = data
+                    if idx != self._event_scoped_turn_index(turns, event):
+                        scoped_event.text = ""
+                    self._on_codex_event_for_chat(chat_id, scoped_event)
+                return
         if event_type == "token_count" and isinstance(identity_chat, dict):
             event_data = event.data if isinstance(event.data, dict) else {}
             identity_chat["codex_usage_revision"] = int(identity_chat.get("codex_usage_revision") or 0) + 1
@@ -13435,18 +13488,14 @@ class ChatFrame(wx.Frame):
             if target_idx >= 0 and isinstance(target_chat, dict):
                 turn = target_turns[target_idx]
                 if event_type == "item_completed" and str(event.phase or "") == "final_answer":
-                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
+                    self._apply_codex_completed_answer_to_turn(turn, event)
                 elif event_type == "subagent_result":
                     self._apply_codex_subagent_result_to_turn(turn, str(event.text or ""))
                 elif event_type == "turn_completed":
                     turn["request_status"] = "done"
                     turn["request_error"] = ""
                     self._clear_codex_worker_active_turn(chat_id, target_idx, event_turn_id)
-                    if (
-                        (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
-                        and str(event.text or "").strip()
-                    ):
-                        self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
+                    self._apply_codex_completed_answer_to_turn(turn, event)
                     if str(event.status or "").strip() in {"", "completed"}:
                         self._record_chat_activity(target_chat, time.time())
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
@@ -13528,11 +13577,7 @@ class ChatFrame(wx.Frame):
                 if str(event.status or "").strip() in {"", "completed"}:
                     self._record_chat_activity(self._current_chat_state, time.time())
                 self._clear_codex_worker_active_turn(chat_id or self.active_chat_id or self.current_chat_id, target_idx, event_turn_id)
-                if (
-                    (str(turn.get("answer_md") or "").strip() == REQUESTING_TEXT or self._is_codex_subagent_result_answer(turn))
-                    and str(event.text or "").strip()
-                ):
-                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
+                self._apply_codex_completed_answer_to_turn(turn, event)
                 self._refresh_context_usage_after_done(self._current_chat_state, self.active_session_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._request_codex_chat_information(self._current_chat_state, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                 self._complete_clear_operation_turn(turn, failed=False)
@@ -13592,7 +13637,7 @@ class ChatFrame(wx.Frame):
                 target_idx = self._active_codex_event_target_index(event)
                 if target_idx >= 0 and target_idx < len(self.active_session_turns):
                     turn = self.active_session_turns[target_idx]
-                    self._apply_codex_final_answer_to_turn(turn, str(event.text or ""))
+                    self._apply_codex_completed_answer_to_turn(turn, event)
                     if self._background_ui_mutations_blocked():
                         self._mark_background_answer_list_dirty()
                     else:
@@ -13612,17 +13657,6 @@ class ChatFrame(wx.Frame):
                     self._render_answer_list_compat(refresh_execution=self._detail_panel_mode() != "execution")
                 return
             if event.text:
-                target_idx = self._active_codex_event_target_index(event)
-                if target_idx >= 0 and target_idx < len(self.active_session_turns):
-                    turn = self.active_session_turns[target_idx]
-                    if str(event.phase or "") == "final_answer":
-                        turn["answer_md"] = str(event.text or "")
-                    elif not str(turn.get("answer_md") or "").strip():
-                        turn["answer_md"] = REQUESTING_TEXT
-                    if self._background_ui_mutations_blocked():
-                        self._mark_background_answer_list_dirty()
-                    else:
-                        self._update_active_answer_row(target_idx)
                 self._defer_codex_state_save()
             return
 
@@ -15908,6 +15942,8 @@ class ChatFrame(wx.Frame):
             data["turn_idx"] = payload.get("turn_idx")
         if "context_generation" in payload:
             data["context_generation"] = payload.get("context_generation")
+        if "completion_owners" in payload:
+            data["completion_owners"] = payload.get("completion_owners")
         model = str(payload.get("model") or "").strip()
         if model and "model" not in data:
             data["model"] = model

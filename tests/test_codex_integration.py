@@ -1,6 +1,7 @@
 ﻿import time
 
 import wx
+import pytest
 
 import main
 from codex_client import CodexAppServerClient, CodexEvent, resolve_codex_launch_command
@@ -8,6 +9,84 @@ import codex_client
 
 TEST_THREAD_ID = "019d36ab-804a-73a2-a2dd-7a17e181628f"
 TEST_TURN_ID = "019d36b3-0a1c-7c61-aed9-387f6afbb9f9"
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_codex_steer_completed_items_accumulate_and_reload(frame, monkeypatch, archived):
+    chat_id = "steer-owner"
+    turns = [{"question": question, "answer_md": answer, "model": main.DEFAULT_CODEX_MODEL,
+              "request_status": status, "codex_turn_id": TEST_TURN_ID,
+              "codex_thread_id": TEST_THREAD_ID, "codex_start_generation": 2,
+              "codex_context_generation": 2}
+             for question, answer, status in [("old question", "old answer", "done"),
+                 ("group 187387007", main.REQUESTING_TEXT, "pending"),
+                 ("third accepted input", main.REQUESTING_TEXT, "pending")]]
+    chat = {"id": chat_id, "title": "steer", "model": main.DEFAULT_CODEX_MODEL,
+            "turns": turns, "codex_thread_id": TEST_THREAD_ID, "codex_turn_id": TEST_TURN_ID,
+            "codex_context_generation": 2}
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    foreground_turns = frame.active_session_turns
+    if archived:
+        frame.archived_chats = [chat]
+    else:
+        frame.active_chat_id = frame.current_chat_id = chat_id
+        frame.active_session_turns = turns
+        frame._current_chat_state = chat
+    frame.chat_store.upsert_chat(chat)
+    def deliver(kind, text="", item_id="", idx=1, generation=2, **data):
+        frame._on_codex_event_for_chat(chat_id, CodexEvent(type=kind, text=text, item_id=item_id,
+            thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID, phase="final_answer", subtype="agentMessage",
+            status="completed", data={"turn_idx": idx, "context_generation": generation,
+                "model": main.DEFAULT_CODEX_MODEL, **data}))
+    deliver("item_completed", "wrong generation", "bad", generation=1)
+    assert turns[1]["answer_md"] == main.REQUESTING_TEXT
+    deliver("item_completed", "group connected; collecting", "ask")
+    deliver("agent_message_delta", "partial must not overwrite", "final")
+    assert turns[1]["answer_md"] == "group connected; collecting"
+    deliver("item_completed", "true final answer", "final")
+    deliver("item_completed", "true final answer", "final")
+    deliver("item_completed", "old late overwrite", "old", idx=0)
+    assert turns[0]["answer_md"] == "old answer"
+    deliver("turn_completed", "true final answer", completion_owners=[
+        {"turn_idx": idx, "context_generation": 2} for idx in range(3)])
+    assert turns[1]["answer_md"] == "group connected; collecting\n\ntrue final answer"
+    assert [turn["request_status"] for turn in turns] == ["done", "done", "done"]
+    if archived:
+        assert frame.active_session_turns is foreground_turns
+    frame._persist_chat_history_to_store()
+    loaded = main.ChatStore(frame.chat_store.db_path).load_chat(chat_id)["turns"]
+    assert [turn["question"] for turn in loaded] == [turn["question"] for turn in turns]
+    assert [turn["answer_md"] for turn in loaded] == [turn["answer_md"] for turn in turns]
+    assert [turn["request_status"] for turn in loaded] == ["done", "done", "done"]
+    assert loaded[1]["codex_completed_answers"] == turns[1]["codex_completed_answers"]
+
+
+def test_codex_legacy_completed_text_deduplicates_without_item_id_and_kimi_keeps_first_answer(frame):
+    turn = {"answer_md": main.REQUESTING_TEXT, "request_status": "pending"}
+    for text in ("question", "question", "final", "final"):
+        frame._apply_codex_completed_answer_to_turn(turn, CodexEvent(type="item_completed", text=text))
+    assert turn["answer_md"] == "question\n\nfinal"
+    kimi = {"answer_md": "first answer"}
+    assert not frame._apply_kimi_final_answer_to_turn(kimi, "second answer")
+    assert kimi["answer_md"] == "first answer"
+
+
+def test_codex_native_completion_does_not_finish_unrelated_or_failed_owner(frame, monkeypatch):
+    turns = [{"question": "input", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_CODEX_MODEL,
+              "request_status": status, "codex_turn_id": native, "codex_thread_id": TEST_THREAD_ID,
+              "codex_start_generation": generation, "codex_context_generation": 2}
+             for status, native, generation in [("pending", TEST_TURN_ID, 2),
+                 ("pending", "other-native", 2), ("failed", TEST_TURN_ID, 2),
+                 ("pending", TEST_TURN_ID, 3)]]
+    frame.active_session_turns = turns
+    frame._current_chat_state.update({"turns": turns, "codex_context_generation": 2})
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    frame._on_codex_event_for_chat(frame.active_chat_id, CodexEvent(type="turn_completed",
+        thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID, status="completed",
+        data={"turn_idx": 0, "context_generation": 2, "completion_owners": [
+            {"turn_idx": idx, "context_generation": 2} for idx in range(4)]}))
+    assert [turn["request_status"] for turn in turns] == ["done", "pending", "failed", "pending"]
 
 
 def test_codex_archived_completion_records_only_new_authoritative_activity(frame, monkeypatch):
