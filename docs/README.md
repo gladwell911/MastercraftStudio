@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-01 Epic1–5 核心 QA、深审修复和复现入口见 [交接](handoff.md)。此前跨端 QA 报告为 `D:/code/sj/_bmad-output/implementation-artifacts/tests/test-summary.md`；本轮深审证据已保存在仓库 `_bmad-output/implementation-artifacts/`。
+2026-10-02 执行后台准备、模型状态误报和手机聊天刷新修复见 [交接](handoff.md)与[独立验证报告](../_bmad-output/implementation-artifacts/verify-five-chat-runtime-fixes-20261002.md)。2026-10-01 五 Epic 深审证据仍保留在本仓库，早期跨端 QA 原日志保留在工作区；它们只证明对应阶段。
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
@@ -24,7 +24,7 @@
 
 ## 关键当前事实
 
-- 源码运行的笔记数据库使用 `D:\code\note\notes.db`；打包版将使用个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\notes.db`。当前安装的旧包仍读本地库；切换门禁见 [`handoff.md`](./handoff.md)。
+- 源码运行的笔记数据库使用 `D:\code\note\notes.db`；打包版将使用个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\notes.db`。切换前核对实际运行包的数据路径；数据衔接步骤见 [`handoff.md`](./handoff.md)。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
 - Kimi 的 F1 执行过程列表以协议事件生成中文主要步骤；不要把原始英文 `thinking.delta`、状态通知或工具流片段直接作为列表行。
