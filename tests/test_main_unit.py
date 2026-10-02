@@ -20031,18 +20031,21 @@ def test_archived_mobile_result_interleaved_completion_survives_store_reopen(fra
             "chat_id": owner, "turn_idx": 1, "thread_id": f"new-{owner}",
             "turn_id": f"turn-{owner}", "context_generation": 0, "active": True,
         })
+        pending = frame._find_archived_chat(owner)["turns"][1]
+        assert pending["codex_start_generation"] == 0
+        assert pending["codex_context_generation"] == 1
     frame._flush_idle_ui_refreshes()
     assert frame._history_list_dirty is False
     for thread_id, turn_id in (("new-chat-c", "turn-chat-c"), ("new-chat-b", "stale-turn")):
         frame._on_codex_event_for_chat("chat-b", main.CodexEvent(
             type="item_completed", phase="final_answer", thread_id=thread_id,
-            turn_id=turn_id, data={"turn_idx": 1}, text="wrong owner answer"))
+            turn_id=turn_id, data={"turn_idx": 1, "context_generation": 0}, text="wrong owner answer"))
         assert frame._find_archived_chat("chat-b")["turns"][1]["answer_md"] == main.REQUESTING_TEXT
     for owner in ("chat-c", "chat-b"):
         chat = frame._find_archived_chat(owner)
         event = lambda kind, **kwargs: main.CodexEvent(
             type=kind, thread_id=f"new-{owner}", turn_id=f"turn-{owner}",
-            data={"turn_idx": 1}, **kwargs)
+            data={"turn_idx": 1, "context_generation": 0}, **kwargs)
         frame._on_codex_event_for_chat(owner, event("plan_updated", text=f"step {owner}"))
         assert frame._find_archived_chat(owner) is chat
         frame._on_codex_event_for_chat(owner, event("item_completed", phase="final_answer", text=f"answer {owner}"))
@@ -23117,3 +23120,43 @@ def test_non_store_private_latch_redacts_and_avoids_overlap_conflict(frame):
     frame._buffer_execution_delta("fallback-private", main.CodexEvent(**base, fragment_id="later", offset=3,
         text="LIC-CHANGED", data={"adapter":"kimi_server","source_kind":"thinking.delta"}))
     assert state["private_reasoning"] and len(state["conflicts"]) == before_conflicts
+
+
+def test_archived_clear_resend_real_ack_preserves_start_generation(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "active"
+    frame._current_chat_state = {"id": "active", "turns": []}
+    frame.chat_store.upsert_chat({"id": "cleared", "model": main.DEFAULT_CODEX_MODEL,
+                                  "codex_thread_id": "old-thread"})
+    frame.chat_store.replace_turns("cleared", [{"question": "first", "answer_md": "old answer",
+                                               "model": main.DEFAULT_CODEX_MODEL}])
+    frame.archived_chats = [frame.chat_store.load_chat("cleared")]
+    monkeypatch.setattr(main.threading, "Thread", lambda **_kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    assert frame._clear_context_for_chat_id("cleared", auto_resend_first=True) == "cleared"
+    chat = frame._find_archived_chat("cleared")
+    turn = chat["turns"][0]
+    start_generation = turn["codex_context_generation"]
+    frame._apply_codex_worker_thread_state("cleared", {
+        "chat_id": "cleared", "turn_idx": 0, "thread_id": "fresh-thread",
+        "turn_id": "fresh-turn", "context_generation": start_generation, "active": True,
+    })
+    assert turn["codex_context_generation"] == chat["codex_context_generation"]
+    assert turn["codex_context_generation"] == start_generation + 1
+    def event(kind, generation=start_generation, **kwargs):
+        return main.CodexEvent(type=kind, thread_id="fresh-thread", turn_id="fresh-turn",
+                               data={"turn_idx": 0, "context_generation": generation}, **kwargs)
+    frame._on_codex_event_for_chat("cleared", event("item_completed", start_generation - 1,
+                                                   phase="final_answer", text="stale"))
+    assert turn["answer_md"] == main.REQUESTING_TEXT
+    frame._on_codex_event_for_chat("cleared", event("item_completed", phase="final_answer", text="fresh answer"))
+    frame._on_codex_event_for_chat("cleared", event("turn_completed", status="completed"))
+    frame._on_codex_event_for_chat("cleared", event("turn_completed", status="completed"))
+    assert turn["request_status"] == "done"
+    assert frame.chat_store.get_clear_operation(turn["clear_operation_id"])["state"] == "completed_with_resend"
+    frame._persist_chat_history_to_store()
+    reopened = main.ChatStore(frame.chat_store.db_path)
+    loaded = reopened.load_chat("cleared")
+    assert len(loaded["turns"]) == 1
+    assert loaded["turns"][0]["answer_md"] == "fresh answer"
+    assert loaded["turns"][0]["request_status"] == "done"

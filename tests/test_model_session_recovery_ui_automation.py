@@ -468,7 +468,12 @@ def test_codex_native_alt_a_new_thread_and_stale_terminal(frame, monkeypatch, tm
         operation_id = str(operations[-1]["operation_id"])
         operation = frame.chat_store.get_clear_operation(operation_id)
         assert operation and operation["state"] == "completed_with_resend"
-        assert frame.answer_list.GetCount() > 0
+        wait_for(lambda: any("ANSWER:first" in row for row in frame.answer_list.GetStrings()), "codex-clear-answer-visible")
+        frame._on_new_chat_clicked(None)
+        assert frame._switch_current_chat(chat_id)
+        assert sum("ANSWER:first" in row for row in frame.answer_list.GetStrings()) == 1
+        frame.input_edit.SetFocus()
+        pump()
         send(frame, "post-clear-unique")
         wait_for(lambda: frame.active_session_turns and frame.active_session_turns[-1].get("request_status") == "done", "codex-new-context-final")
         assert frame.active_session_turns[-1]["answer_md"] == "ANSWER:post-clear-unique"
@@ -499,4 +504,49 @@ def test_codex_native_alt_a_new_thread_and_stale_terminal(frame, monkeypatch, tm
         frame.input_edit.Unbind(wx.EVT_SET_FOCUS, handler=observe_focus)
         frame.input_edit.Unbind(wx.EVT_KILL_FOCUS, handler=observe_focus)
         (folder / "release-old-codex").touch()
+        stop_owned(frame, clients)
+
+
+def test_kimi_clear_active_runtime_final_visible_after_switch(frame, monkeypatch, tmp_path):
+    clients = []
+    folder = tmp_path / "kimi-clear-private"
+    folder.mkdir()
+    def factory(on_message=None, on_exit=None, **kw):
+        client = KimiServerClient(on_message=on_message, on_exit=on_exit,
+            launch_command=[sys.executable, str(SCRIPT), "--kimi-fixture", str(folder)],
+            token="private-epic3", health_timeout=3, rest_timeout=3,
+            recovery_attempts=1, recovery_backoff=0)
+        clients.append(client)
+        return client
+    monkeypatch.setattr(main, "KimiServerClient", factory)
+    ready(frame, monkeypatch, "kimi/main")
+    frame._kimi_reconcile_backoff = 0
+    frame._kimi_reconcile_attempts = 2
+    try:
+        send(frame, "clear-kimi-unique")
+        chat_id = frame.active_chat_id
+        wait_for(lambda: any(item["kind"] == "kimi_submit" for item in events(folder)), "kimi-old-active-submit")
+        wait_for(lambda: bool(frame.active_kimi_session_id), "kimi-old-owner-ack")
+        old_session = frame.active_kimi_session_id
+        assert frame._clear_context_and_start_new_chat(auto_resend_first=True)
+        wait_for(lambda: len([item for item in events(folder) if item["kind"] == "kimi_submit"]) == 2,
+                 "kimi-clear-resend-submit")
+        wait_for(lambda: frame.active_kimi_session_id and frame.active_kimi_session_id != old_session,
+                 "kimi-clear-fresh-owner")
+        frame._on_new_chat_clicked(None)
+        away_id = frame.active_chat_id
+        (folder / "release-kimi").touch()
+        wait_for(lambda: frame._find_archived_chat(chat_id)["turns"][0].get("request_status") == "done",
+                 "kimi-clear-authoritative-final")
+        assert frame.active_chat_id == away_id
+        assert not any("ANSWER:clear-kimi-unique" in row for row in frame.answer_list.GetStrings())
+        assert frame._switch_current_chat(chat_id)
+        wait_for(lambda: any("ANSWER:clear-kimi-unique" in row for row in frame.answer_list.GetStrings()),
+                 "kimi-clear-final-visible")
+        assert len(frame.active_session_turns) == 1
+        assert sum("ANSWER:clear-kimi-unique" in row for row in frame.answer_list.GetStrings()) == 1
+        turn = frame.active_session_turns[0]
+        assert frame.chat_store.get_clear_operation(turn["clear_operation_id"])["state"] == "completed_with_resend"
+        assert frame.active_kimi_session_id != old_session
+    finally:
         stop_owned(frame, clients)

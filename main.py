@@ -10700,6 +10700,11 @@ class ChatFrame(wx.Frame):
             self._reset_active_kimi_session_state()
         if isinstance(chat, dict):
             self._publish_kimi_information_session_change(chat)
+        self._retire_kimi_chat_runtime(chat, cleared_session)
+        self._save_state()
+        return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
+
+    def _retire_kimi_chat_runtime(self, chat: dict, cleared_session: str) -> None:
         chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
         if chat_id:
             with self._kimi_owner_lock:
@@ -10736,8 +10741,6 @@ class ChatFrame(wx.Frame):
                     self._kimi_incomplete_streams = {
                         key for key in self._kimi_incomplete_streams if key[1] != cleared_session
                     }
-        self._save_state()
-        return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
 
     def _clear_kimi_information_for_session_change(self, chat: dict) -> None:
         usage = context_usage_from_dict(chat.get("context_usage"))
@@ -10840,6 +10843,18 @@ class ChatFrame(wx.Frame):
         if not client_chat_id:
             client_chat_id = self._ensure_active_chat_id()
         submission_lock = None
+        def discard_stale_submission(prompt_id="") -> bool:
+            if self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
+                return False
+            with self._kimi_owner_lock:
+                pending = self._kimi_pending_submissions.get(session_id, [])
+                pending[:] = [intent for intent in pending if intent is not submission_intent]
+                if not pending:
+                    self._kimi_pending_submissions.pop(session_id, None)
+                if prompt_id:
+                    self._add_kimi_tombstone((client_chat_id, session_id, str(prompt_id)))
+            return True
+
         try:
             with self._kimi_owner_lock:
                 known_active = self._kimi_active_turns.get(client_chat_id)
@@ -10933,6 +10948,8 @@ class ChatFrame(wx.Frame):
             except Exception as exc:
                 if not bool(getattr(exc, "result_unknown", False)):
                     raise
+                if discard_stale_submission():
+                    return
                 prompt_id = f"__unresolved__:{submission_intent['submission_intent_id']}"
                 unresolved_owner = {
                     **submission_intent,
@@ -10959,6 +10976,8 @@ class ChatFrame(wx.Frame):
                     session_ids={session_id},
                     original_error=str(exc),
                 )
+                return
+            if discard_stale_submission(prompt_id):
                 return
             queued_entry = None
             prompt_role = "active"
@@ -11007,6 +11026,8 @@ class ChatFrame(wx.Frame):
                 "created_at": submission_intent["created_at"],
                 "candidate_alias": prompt_role == "unresolved" and bool(should_steer),
             }
+            if discard_stale_submission(prompt_id):
+                return
             self._register_kimi_prompt_owner(owner)
             with self._kimi_owner_lock:
                 pending_submissions = self._kimi_pending_submissions.get(session_id, [])
@@ -13213,7 +13234,7 @@ class ChatFrame(wx.Frame):
                         return
                     if (
                         event_generation != int(turn.get("codex_start_generation", turn.get("codex_context_generation") or 0))
-                        or event_generation != int(target_chat.get("codex_context_generation") or 0)
+                        or int(turn.get("codex_context_generation") or 0) != int(target_chat.get("codex_context_generation") or 0)
                     ):
                         return
                 if not self._accept_clear_operation_result(turn, chat_id):
@@ -17899,6 +17920,9 @@ class ChatFrame(wx.Frame):
         if clear_operation is not None:
             first_payload = copy.deepcopy(clear_operation.get("snapshot"))
             first_question = str((first_payload or {}).get("question") or (first_payload or {}).get("text") or "")
+        self._retire_kimi_chat_runtime(
+            self._current_chat_state, str(self.active_kimi_session_id or self._current_chat_state.get("kimi_session_id") or "").strip()
+        )
         self.active_session_turns = []
         self.active_session_started_at = now
         self.active_turn_idx = -1
@@ -18281,6 +18305,7 @@ class ChatFrame(wx.Frame):
         return "cleared"
 
     def _clear_context_chat_state(self, chat: dict, chat_id: str, updated_at: float) -> None:
+        self._retire_kimi_chat_runtime(chat, str(chat.get("kimi_session_id") or "").strip())
         self._clear_codex_context_usage_for_thread_change(chat)
         chat["id"] = str(chat.get("id") or chat_id or "").strip()
         chat["turns"] = []

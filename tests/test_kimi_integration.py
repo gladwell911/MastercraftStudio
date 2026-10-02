@@ -2680,3 +2680,96 @@ def test_model_startup_callback_cannot_revive_terminal_turn(frame, monkeypatch):
     frame._finish_model_startup_failure(chat_id, 0, request, "late failure", "kimi/main")
     assert turn["request_status"] == "done"
     assert turn["answer_md"] == "final"
+
+
+@pytest.mark.parametrize("offscreen", [False, True])
+def test_durable_clear_resend_retires_old_runtime_and_completes(frame, monkeypatch, offscreen):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._chat_store_enabled = True
+    _submit(frame, "first question")
+    chat_id = _active_chat_id(frame)
+    old_session = fake.submitted[-1]["session_id"]
+    old_prompt = fake.submitted[-1]["prompt_id"]
+    old_owner = frame._find_kimi_prompt_owner(old_prompt, session_id=old_session)
+    old_key = frame._kimi_owner_key_for(old_owner)
+    frame._kimi_recovery_intents[old_session] = "recover"
+    frame._kimi_turn_answer_parts[(chat_id, old_session, old_prompt, "main")] = ["stale"]
+    frame._persist_chat_history_to_store()
+    if offscreen:
+        frame._on_new_chat_clicked(None)
+        _submit(frame, "other chat")
+        other_id = _active_chat_id(frame)
+        other_owner = dict(frame._kimi_active_turns[other_id])
+        assert frame._clear_context_for_chat_id(chat_id, auto_resend_first=True) == "cleared"
+    else:
+        assert frame._clear_context_and_start_new_chat(auto_resend_first=True)
+    new_session = fake.submitted[-1]["session_id"]
+    assert new_session != old_session
+    assert not fake.steer_calls
+    assert old_key not in frame._kimi_prompt_owners
+    assert old_session not in frame._kimi_recovery_intents
+    fake.push_event(KimiEvent(type="turn_started", thread_id=new_session, turn_id="new-turn"))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=new_session,
+                             turn_id="new-turn", text="fresh answer", display_kind="assistant"))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=new_session,
+                             turn_id="new-turn", status="completed"))
+    chat = frame._find_archived_chat(chat_id) if offscreen else frame._current_chat_state
+    assert chat["turns"][0]["answer_md"] == "fresh answer"
+    assert chat["turns"][0]["request_status"] == "done"
+    operation = frame.chat_store.get_clear_operation(chat["turns"][0]["clear_operation_id"])
+    assert operation["state"] == "completed_with_resend"
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=old_session,
+                             turn_id="old-turn", status="completed", text="stale answer"))
+    assert chat["turns"][0]["answer_md"] == "fresh answer"
+    if offscreen:
+        assert _active_chat_id(frame) == other_id
+        assert frame._kimi_active_turns[other_id] == other_owner
+
+
+@pytest.mark.parametrize("result_unknown", [False, True])
+def test_clear_resend_rejects_old_submit_return_before_runtime_registration(frame, monkeypatch, result_unknown):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    frame._chat_store_enabled = True
+    _submit(frame, "first question")
+    old_session = fake.submitted[-1]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=old_session, turn_id="first-turn"))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=old_session,
+                             turn_id="first-turn", text="first answer", display_kind="assistant"))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=old_session,
+                             turn_id="first-turn", status="completed"))
+    frame._persist_chat_history_to_store()
+    chat_id = _active_chat_id(frame)
+    original_submit = fake.submit_prompt
+    observed = {}
+    def held_submit(session_id, blocks):
+        prompt_id = original_submit(session_id, blocks)
+        if session_id != old_session:
+            return prompt_id
+        # Keep the old HTTP result outstanding while the actual clear/resend
+        # runs through the other session lock and lands its new owner.
+        observed["old_prompt"] = prompt_id
+        assert frame._clear_context_and_start_new_chat(auto_resend_first=True)
+        observed["new_owner"] = dict(frame._kimi_active_turns[chat_id])
+        observed["new_turn"] = dict(frame.active_session_turns[0])
+        if result_unknown:
+            raise KimiServerError("old response lost", result_unknown=True)
+        return prompt_id
+    monkeypatch.setattr(fake, "submit_prompt", held_submit)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: pytest.fail("retired request cannot recover"))
+    _submit(frame, "old outstanding request")
+    assert frame._kimi_active_turns[chat_id] == observed["new_owner"]
+    assert frame.active_session_turns[0] == observed["new_turn"]
+    assert not any(key[1] == old_session for key in frame._kimi_prompt_owners)
+    assert old_session not in frame._kimi_pending_submissions
+    new_session = observed["new_owner"]["session_id"]
+    assert new_session != old_session
+    fake.push_event(KimiEvent(type="turn_started", thread_id=new_session, turn_id="fresh-turn"))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=new_session,
+                             turn_id="fresh-turn", text="fresh final", display_kind="assistant"))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=new_session,
+                             turn_id="fresh-turn", status="completed"))
+    frame._navigation_quiet_until = 0
+    frame._flush_accepted_answer_refresh(frame._answer_refresh_deadline_owner)
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert frame.active_session_turns[0]["answer_md"] == "fresh final"
+    assert sum("fresh final" in row for row in frame.answer_list.GetStrings()) == 1
