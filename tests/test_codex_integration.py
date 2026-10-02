@@ -15,7 +15,8 @@ def test_codex_archived_completion_records_only_new_authoritative_activity(frame
     foreground["updated_at"] = 10.0
     turn = {"question": "background", "answer_md": main.REQUESTING_TEXT,
             "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
-            "codex_turn_id": TEST_TURN_ID, "codex_start_generation": 2}
+            "codex_turn_id": TEST_TURN_ID, "codex_start_generation": 2,
+            "codex_context_generation": 2}
     archived = {"id": "background", "title": "background", "updated_at": 1.0,
                 "codex_context_generation": 2, "turns": [turn]}
     frame.archived_chats = [archived]

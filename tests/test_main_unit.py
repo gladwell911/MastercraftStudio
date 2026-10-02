@@ -23160,3 +23160,94 @@ def test_archived_clear_resend_real_ack_preserves_start_generation(frame, monkey
     assert len(loaded["turns"]) == 1
     assert loaded["turns"][0]["answer_md"] == "fresh answer"
     assert loaded["turns"][0]["request_status"] == "done"
+
+
+def _prepare_switched_chat_final(frame, monkeypatch):
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "switch-owner"
+    frame.active_session_turns = [{
+        "question": "second request", "answer_md": main.REQUESTING_TEXT,
+        "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
+        "codex_context_generation": 1,
+    }]
+    frame._current_chat_state = {
+        "id": "switch-owner", "title": "owner", "model": main.DEFAULT_CODEX_MODEL,
+        "turns": frame.active_session_turns, "codex_context_generation": 1,
+    }
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    frame._apply_codex_worker_thread_state("switch-owner", {
+        "chat_id": "switch-owner", "turn_idx": 0, "thread_id": "switch-thread",
+        "turn_id": "switch-turn", "context_generation": 1, "active": True,
+    })
+    assert frame._current_chat_state["codex_context_generation"] == 2
+    assert frame.active_session_turns[0]["codex_start_generation"] == 1
+
+
+def _switched_chat_final_event(kind, generation=1, **kwargs):
+    return main.CodexEvent(
+        type=kind, thread_id="switch-thread", turn_id="switch-turn",
+        data={"turn_idx": 0, "context_generation": generation}, **kwargs,
+    )
+
+
+@pytest.mark.parametrize("existing_generation", [None, 1])
+def test_switched_chat_final_actual_archive_updates_generation(frame, monkeypatch, existing_generation):
+    _prepare_switched_chat_final(frame, monkeypatch)
+    if existing_generation is not None:
+        frame.archived_chats = [{"id": "switch-owner", "codex_context_generation": existing_generation}]
+    archived = frame._archive_active_session(quick_title=True)
+    frame.active_chat_id = frame.current_chat_id = "other-owner"
+    frame._current_chat_state = {"id": "other-owner", "turns": []}
+    turn = archived["turns"][0]
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "item_completed", phase="final_answer", text="accepted final"))
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "turn_completed", status="completed"))
+    assert turn["answer_md"] == "accepted final"
+    assert turn["request_status"] == "done"
+    assert archived["codex_context_generation"] == 2
+    frame._persist_chat_history_to_store()
+    loaded = main.ChatStore(frame.chat_store.db_path).load_chat("switch-owner")
+    assert loaded["codex_context_generation"] == 2
+    assert loaded["turns"][0]["answer_md"] == "accepted final"
+    assert loaded["turns"][0]["request_status"] == "done"
+
+
+def test_switched_chat_final_active_save_reload_keeps_ownership(frame, monkeypatch):
+    _prepare_switched_chat_final(frame, monkeypatch)
+    frame._persist_chat_history_to_store()
+    loaded = main.ChatStore(frame.chat_store.db_path).load_chat("switch-owner")
+    frame.archived_chats = [loaded]
+    frame.active_session_turns = []
+    frame.active_chat_id = frame.current_chat_id = "other-owner"
+    frame._current_chat_state = {"id": "other-owner", "turns": []}
+    turn = loaded["turns"][0]
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "item_completed", phase="final_answer", text="reloaded final"))
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "turn_completed", status="completed"))
+    assert turn["answer_md"] == "reloaded final"
+    assert turn["request_status"] == "done"
+    frame._persist_chat_history_to_store()
+    reopened = main.ChatStore(frame.chat_store.db_path).load_chat("switch-owner")
+    assert reopened["codex_context_generation"] == 2
+    assert reopened["turns"][0]["answer_md"] == "reloaded final"
+    assert reopened["turns"][0]["request_status"] == "done"
+
+
+@pytest.mark.parametrize("clear_context", [False, True])
+def test_switched_chat_final_rejects_stale_generation(frame, monkeypatch, clear_context):
+    _prepare_switched_chat_final(frame, monkeypatch)
+    archived = frame._archive_active_session(quick_title=True)
+    frame.active_chat_id = frame.current_chat_id = "other-owner"
+    frame._current_chat_state = {"id": "other-owner", "turns": []}
+    if clear_context:
+        assert frame._clear_context_for_chat_id("switch-owner", auto_resend_first=False) == "cleared"
+        assert archived["turns"] == []
+    before = [(turn.get("answer_md"), turn.get("request_status")) for turn in archived["turns"]]
+    generation = 1 if clear_context else 0
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "item_completed", generation, phase="final_answer", text="stale final"))
+    frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
+        "turn_completed", generation, status="completed"))
+    assert [(turn.get("answer_md"), turn.get("request_status")) for turn in archived["turns"]] == before

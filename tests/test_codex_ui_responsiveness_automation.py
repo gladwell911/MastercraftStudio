@@ -7,6 +7,68 @@ import pytest
 import main
 
 
+def test_real_ui_switched_chat_final_visible_after_actual_switch(request, wx_app, monkeypatch):
+    from owned_window_qa import activate_owned_frame
+
+    cleanup = _track_ui_timers_for_test(monkeypatch)
+    frame = request.getfixturevalue("frame")
+    activate_owned_frame(frame)
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "switch-owner"
+    frame.active_session_turns = [{
+        "question": "second question", "answer_md": main.REQUESTING_TEXT,
+        "model": main.DEFAULT_CODEX_MODEL, "request_status": "pending",
+        "codex_context_generation": 1,
+    }]
+    frame._current_chat_state = {
+        "id": "switch-owner", "title": "owner", "model": main.DEFAULT_CODEX_MODEL,
+        "turns": frame.active_session_turns, "codex_context_generation": 1,
+    }
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_args: None)
+    monkeypatch.setattr(frame, "_schedule_async_archive_rename", lambda *_args: None)
+    frame._apply_codex_worker_thread_state("switch-owner", {
+        "chat_id": "switch-owner", "turn_idx": 0, "thread_id": "switch-thread",
+        "turn_id": "switch-turn", "context_generation": 1, "active": True,
+    })
+    assert frame._current_chat_state["codex_context_generation"] == 2
+    frame.chat_store.upsert_chat({"id": "other-owner", "title": "other", "model": main.DEFAULT_CODEX_MODEL})
+    frame.archived_chats = [frame.chat_store.load_chat("other-owner")]
+    try:
+        assert frame._switch_current_chat("other-owner")
+        frame.input_edit.SetValue("unsent other draft")
+        frame.input_edit.SetFocus()
+        wx_app.Yield()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        assert int(user32.GetForegroundWindow() or 0) == int(frame.GetHandle())
+        assert frame.input_edit.HasFocus()
+        for kind, kwargs in (
+            ("item_completed", {"phase": "final_answer", "text": "switched final answer"}),
+            ("turn_completed", {"status": "completed"}),
+        ):
+            frame._dispatch_codex_event_to_ui("switch-owner", main.CodexEvent(
+                type=kind, thread_id="switch-thread", turn_id="switch-turn",
+                data={"turn_idx": 0, "context_generation": 1}, **kwargs,
+            ))
+        assert _yield_until(wx_app, lambda: frame._find_archived_chat("switch-owner")["turns"][0].get("request_status") == "done")
+        assert frame.current_chat_id == "other-owner"
+        assert frame.input_edit.HasFocus()
+        assert int(user32.GetForegroundWindow() or 0) == int(frame.GetHandle())
+        assert frame.input_edit.GetValue() == "unsent other draft"
+        frame._persist_chat_history_to_store()
+        loaded = main.ChatStore(frame.chat_store.db_path).load_chat("switch-owner")
+        assert loaded["turns"][0]["answer_md"] == "switched final answer"
+        assert loaded["turns"][0]["request_status"] == "done"
+        assert frame._switch_current_chat("switch-owner")
+        assert _yield_until(wx_app, lambda: any(
+            "switched final answer" in frame.answer_list.GetString(idx)
+            for idx in range(frame.answer_list.GetCount())
+        ))
+        assert frame.answer_list.IsShown()
+    finally:
+        cleanup(frame)
+
+
 def _send_listbox_key(window, key_code):
     _send_window_key(window, key_code)
 

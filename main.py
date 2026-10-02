@@ -4193,6 +4193,7 @@ class ChatFrame(wx.Frame):
             "created_at": float(state.get("created_at") or self.active_session_started_at or now),
             "updated_at": float(state.get("updated_at") or now),
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
+            "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
         if "context_usage" in state:
             slim["context_usage"] = copy.deepcopy(state.get("context_usage"))
@@ -19765,6 +19766,7 @@ class ChatFrame(wx.Frame):
             "openclaw_last_synced_at": self.active_openclaw_last_synced_at,
             "codex_thread_id": self.active_codex_thread_id,
             "codex_turn_id": self.active_codex_turn_id,
+            "codex_context_generation": int(self._current_chat_state.get("codex_context_generation") or 0),
             "codex_turn_active": self.active_codex_turn_active,
             "codex_pending_prompt": self.active_codex_pending_prompt,
             "codex_pending_request": self.active_codex_pending_request,
