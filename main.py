@@ -2026,6 +2026,10 @@ class ChatFrame(wx.Frame):
         self._codex_worker_active_turns: dict[str, dict] = {}
         self._remote_nats_process = None
         self._remote_nats_transport = None
+        self._remote_health_lock = threading.RLock()
+        self._remote_health_stop = threading.Event()
+        self._remote_health_generation = 0
+        self._remote_health_thread = None
         self._managed_cloudflared_process = None
         self._managed_cloudflared_log_handle = None
         self._remote_nats_websocket_port = DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
@@ -2359,6 +2363,8 @@ class ChatFrame(wx.Frame):
                 self._start_remote_nats_runtime_if_configured(ensure_connectivity=True)
             except Exception as exc:
                 wx_call_after_if_alive(self.SetStatusText, f"远程 NATS 启动失败：{exc}")
+            finally:
+                self._start_remote_health_monitor()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -16172,6 +16178,9 @@ class ChatFrame(wx.Frame):
         raise RuntimeError("NATS command handler returned invalid response")
 
     def _stop_remote_servers(self) -> None:
+        self._remote_health_stop.set()
+        with self._remote_health_lock:
+            self._remote_health_generation += 1
         self._stop_managed_cloudflared_process()
         self._stop_cloudflared_origin_proxy()
         transport = getattr(self, "_remote_nats_transport", None)
@@ -16189,6 +16198,92 @@ class ChatFrame(wx.Frame):
                 pass
         self._remote_nats_process = None
         self._set_remote_nats_runtime_status(enabled=False)
+
+    def _start_remote_health_monitor(self) -> None:
+        if getattr(self, "_closing", False) or self._remote_nats_transport is None:
+            return
+        if not self._remote_runtime_config()["fixed_domain_mode"] or not self._query_cloudflared_service().get("exists"):
+            return
+        with self._remote_health_lock:
+            if (
+                getattr(self, "_closing", False)
+                or self._remote_nats_transport is None
+            ):
+                return
+            if self._remote_health_thread is not None and self._remote_health_thread.is_alive():
+                return
+            self._remote_health_stop = threading.Event()
+            generation = self._remote_health_generation
+            stop = self._remote_health_stop
+            self._remote_health_thread = threading.Thread(
+                target=self._remote_health_worker, args=(stop, generation), daemon=True
+            )
+            self._remote_health_thread.start()
+
+    def _remote_health_current(self, stop, generation: int) -> bool:
+        return (
+            not stop.is_set()
+            and generation == self._remote_health_generation
+            and not getattr(self, "_closing", False)
+            and self._remote_nats_transport is not None
+        )
+
+    def _remote_health_worker(self, stop, generation: int) -> None:
+        failures = 0
+        last_restart = float("-inf")
+        while not stop.wait(30):
+            if not self._remote_health_current(stop, generation):
+                return
+            runtime = self._remote_runtime_config()
+            if not runtime["fixed_domain_mode"]:
+                return
+            token = self._read_remote_control_token() or self.remote_control_token
+            published_url = f"{runtime['published_base']}?token={quote(token)}"
+            local_url = str(self.remote_nats_runtime_status.get("websocket_url") or "")
+            port = int(urlsplit(local_url).port or DEFAULT_REMOTE_NATS_WEBSOCKET_PORT)
+            local_ok, detail = self._verify_remote_local_health(token, port)
+            local_ok = local_ok and self._remote_local_listener_ready(self._cloudflared_origin_port())
+            if not local_ok:
+                failures = 0
+                public_ok = False
+                detail = detail or "cloudflared origin 未监听。"
+            else:
+                public_ok, detail = self._verify_remote_public_ws(published_url)
+                failures = 0 if public_ok else failures + 1
+                if failures >= 2 and time.monotonic() - last_restart >= 120:
+                    if not self._query_cloudflared_service().get("exists"):
+                        return
+                    with self._remote_health_lock:
+                        if not self._remote_health_current(stop, generation):
+                            return
+                        last_restart = time.monotonic()
+                    restarted = self._restart_cloudflared_service(stop_event=stop)
+                    if not self._remote_health_current(stop, generation):
+                        return
+                    if restarted:
+                        public_ok, detail = self._verify_remote_public_ws(published_url)
+                        if public_ok:
+                            failures = 0
+                    else:
+                        detail = f"cloudflared 服务重启失败；{detail}"
+            detail = str(detail or "").replace(token, "<redacted>") if token else str(detail or "")
+            with self._remote_health_lock:
+                if not self._remote_health_current(stop, generation):
+                    return
+                previous = dict(self.remote_control_runtime_status)
+                status = dict(
+                    local_listener_ready=local_ok, public_ws_ready=public_ok,
+                    last_remote_error="" if public_ok else detail, published_url=published_url,
+                )
+                if all(previous.get(key) == value for key, value in status.items()):
+                    continue
+                self._set_remote_runtime_status(**status)
+
+                def notify(ready=public_ok, error=detail, expected=status):
+                    if self._remote_health_current(stop, generation) and self.remote_control_runtime_status == expected:
+                        self.SetStatusText("远程 NATS 公网连接已恢复" if ready else f"远程 NATS 连接降级：{error}")
+
+                self._call_after_if_alive(notify)
 
     def _stop_cloudflared_origin_proxy(self) -> None:
         proxy = getattr(self, "_cloudflared_origin_proxy", None)
@@ -16528,7 +16623,7 @@ class ChatFrame(wx.Frame):
             ],
         ):
             self._run_remote_check_command(delete_args, timeout=10.0)
-        if connect_port <= 0 or connect_port == listen_port:
+        if connect_port <= 0:
             return
         for add_args in (
             [
@@ -16554,6 +16649,9 @@ class ChatFrame(wx.Frame):
                 "connectaddress=127.0.0.1",
             ],
         ):
+            # The IPv4 origin already owns this port; IPv6 still needs its alias.
+            if connect_port == listen_port and "v4tov4" in add_args:
+                continue
             self._run_remote_check_command(add_args, timeout=10.0)
 
     def _run_remote_check_command(self, args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess | None:
@@ -16690,14 +16788,23 @@ class ChatFrame(wx.Frame):
             return True
         return self._cloudflared_process_targets_port(origin_port)
 
-    def _start_cloudflared_service(self) -> bool:
+    def _start_cloudflared_service(self, *, stop_event=None) -> bool:
+        def cancelled():
+            return stop_event is not None and (stop_event.is_set() or getattr(self, "_closing", False))
+
+        if cancelled():
+            return False
         state = self._query_cloudflared_service()
+        if cancelled():
+            return False
         if not state["exists"]:
             return False
         if state["running"]:
             return True
         deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
         while time.time() < deadline:
+            if cancelled():
+                return False
             result = self._run_remote_check_command(["sc.exe", "start", "cloudflared"], timeout=15.0)
             detail = ""
             if result is not None:
@@ -16707,10 +16814,12 @@ class ChatFrame(wx.Frame):
             time.sleep(0.2)
         deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
         while time.time() < deadline:
+            if cancelled():
+                return False
             if self._query_cloudflared_service()["running"]:
-                return True
+                return not cancelled()
             time.sleep(0.2)
-        return self._query_cloudflared_service()["running"]
+        return not cancelled() and self._query_cloudflared_service()["running"] and not cancelled()
 
     def _kill_cloudflared_processes(self) -> None:
         self._run_remote_check_command(["taskkill", "/F", "/IM", "cloudflared.exe"], timeout=15.0)
@@ -16719,18 +16828,29 @@ class ChatFrame(wx.Frame):
         self._kill_cloudflared_processes()
         return self._start_managed_cloudflared_process(origin_port)
 
-    def _restart_cloudflared_service(self) -> bool:
+    def _restart_cloudflared_service(self, *, stop_event=None) -> bool:
+        def cancelled():
+            return stop_event is not None and (stop_event.is_set() or getattr(self, "_closing", False))
+
+        if cancelled():
+            return False
         state = self._query_cloudflared_service()
         if not state["exists"]:
+            return False
+        if cancelled():
             return False
         self._run_remote_check_command(["sc.exe", "stop", "cloudflared"], timeout=15.0)
         deadline = time.time() + REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS
         while time.time() < deadline:
+            if cancelled():
+                return False
             if not self._query_cloudflared_service()["running"]:
                 break
             time.sleep(0.2)
-        if self._query_cloudflared_service()["running"]:
+        if cancelled() or self._query_cloudflared_service()["running"]:
             return False
+        if stop_event is not None:
+            return self._start_cloudflared_service(stop_event=stop_event)
         return self._start_cloudflared_service()
 
     def _managed_cloudflared_command_line(self, websocket_port: int) -> str:

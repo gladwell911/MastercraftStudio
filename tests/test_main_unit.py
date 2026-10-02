@@ -2102,6 +2102,13 @@ def test_public_file_route_uses_available_cloudflared_origin_port(frame, monkeyp
     frame.file_service.set_public_base_url("https://rc.tingyou.cc")
     started_ports = []
     configured_ports = []
+    commands = []
+
+    monkeypatch.setattr(
+        frame,
+        "_run_remote_check_command",
+        lambda args, **_kwargs: commands.append(tuple(args)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
 
     monkeypatch.setattr(frame, "_start_file_service_if_configured", lambda: True)
     monkeypatch.setattr(frame, "_can_bind_loopback_tcp_port", lambda port: port == 19080)
@@ -2132,6 +2139,7 @@ def test_public_file_route_uses_available_cloudflared_origin_port(frame, monkeyp
     assert frame._ensure_public_file_route_ready() is True
     assert started_ports == [19080]
     assert configured_ports == [19080]
+    assert any("add" in command and "v6tov4" in command and "connectport=19080" in command for command in commands)
 
 
 def test_remote_startup_uses_reconfigured_service_without_duplicate_managed_connector(frame, monkeypatch):
