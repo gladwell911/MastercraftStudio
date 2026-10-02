@@ -202,9 +202,13 @@ class CrossClientHarnessState:
             def snapshot(value):
                 return {**owner, "identity": [chat_id, chat["model"], "fixture-native-" + chat_id, "fixture-account"],
                     "owner_generation": 0, "revision": value,
-                    "rows": ["E2E information context " + chat["model"] + (" updated" if value > 1 else ""),
+                    "rows": ["E2E information context " + chat["model"] +
+                             (" updated" if value >= 3 else " context refreshed" if value == 2 else ""),
                              "E2E information total", "E2E information quota", "E2E information reset"]}
             result = snapshot(revision)
+            if body.get("context_only") and revision == 1:
+                self.information_revisions[chat_id] = 2
+                self.transport.publish_event_threadsafe(dict(snapshot(2), type="chat_information_changed"))
             if not body.get("context_only"):
                 count = self.information_full_reads.get(chat_id, 0) + 1
                 self.information_full_reads[chat_id] = count
@@ -213,8 +217,8 @@ class CrossClientHarnessState:
                         with self._lock:
                             if self.information_subscriptions.get(subscription_id) != owner:
                                 return
-                            self.information_revisions[chat_id] = 2
-                            self.transport.publish_event_threadsafe(dict(snapshot(2), type="chat_information_changed"))
+                            self.information_revisions[chat_id] = 3
+                            self.transport.publish_event_threadsafe(dict(snapshot(3), type="chat_information_changed"))
                     timer = threading.Timer(.1, updated)
                     timer.daemon = True
                     timer.start()
