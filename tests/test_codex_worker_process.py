@@ -40,6 +40,9 @@ class FakeCodexClient:
     def respond_tool_request_user_input(self, request_id, answers):
         self.replies.append((request_id, answers))
 
+    def respond_command_approval(self, request_id, decision):
+        self.replies.append((request_id, decision))
+
     def compact_thread(self, thread_id):
         self.compacted_threads.append(thread_id)
         return {}

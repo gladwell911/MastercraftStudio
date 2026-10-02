@@ -14,6 +14,7 @@ class CodexWorkerProtocolError(ValueError):
 CHAT_SCOPED_TYPES = {
     "start_turn",
     "reply_user_input",
+    "reply_command_approval",
     "cancel_turn",
     "read_chat_information",
     "chat_information",

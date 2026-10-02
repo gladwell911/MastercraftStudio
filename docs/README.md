@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-02 执行后台准备、模型状态误报和手机聊天刷新修复见 [交接](handoff.md)与[独立验证报告](../_bmad-output/implementation-artifacts/verify-five-chat-runtime-fixes-20261002.md)。2026-10-01 五 Epic 深审证据仍保留在本仓库，早期跨端 QA 原日志保留在工作区；它们只证明对应阶段。
+2026-10-02 最新通知、回答时间与执行语义修复见 [交接](handoff.md)和[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)；Codex 命令审批见[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)。较早缓存/模型状态/聊天刷新与 2026-10-01 五 Epic 证据保留，只证明各自阶段。
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
@@ -32,6 +32,7 @@
 - 执行列表的旧 15 项失败已在上述执行规格逐项归类并修复/更新契约；最终定向验收去重 467 项通过，不代表冻结基线的其他领域或全笔记领域已验证。
 - 旧 V2 远程执行事实流仍以 `durable_facts` 为来源；手机可视执行页优先使用 `execution_page_v3`，与桌面共用 canonical `execution_steps` 投影。v3 的 SQLite 快照行与分页游标按 chat/revision 隔离，V2 仍供旧客户端使用。
 - 桌面执行项按 owner/revision/turn/provider/native event 身份归并；时间节点以“上一次实际显示时间的过程”为累计 300 秒基准，而不是比较相邻行。
+- 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
 - 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。

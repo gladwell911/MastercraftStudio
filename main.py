@@ -1973,6 +1973,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
         self.codex_answer_english_filter_enabled = False
+        self.codex_approval_policy = "never"
         self.active_codex_thread_id = ""
         self.active_codex_turn_id = ""
         self.active_codex_turn_active = False
@@ -2164,6 +2165,7 @@ class ChatFrame(wx.Frame):
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
         self._codex_answer_filter_menu_id = wx.NewIdRef()
+        self._codex_approval_policy_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
         self._notes_move_entry_down_id = wx.NewIdRef()
         self._notes_move_entry_top_id = wx.NewIdRef()
@@ -2226,6 +2228,7 @@ class ChatFrame(wx.Frame):
         app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
         filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
         filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
+        app_menu.Append(int(self._codex_approval_policy_menu_id), "Codex 执行审批")
         menu_bar = wx.MenuBar()
         menu_bar.Append(app_menu, "应用(&A)")
         self.SetMenuBar(menu_bar)
@@ -2427,6 +2430,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_approval_policy(), id=int(self._codex_approval_policy_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=int(self._notes_move_entry_down_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_to_top(), id=int(self._notes_move_entry_top_id))
@@ -4393,6 +4397,7 @@ class ChatFrame(wx.Frame):
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
+        self.codex_approval_policy = "on-request" if data.get("codex_approval_policy") == "on-request" else "never"
 
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and getattr(self, "chat_store", None) is not None:
@@ -4585,6 +4590,7 @@ class ChatFrame(wx.Frame):
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
+            "codex_approval_policy": "on-request" if getattr(self, "codex_approval_policy", "never") == "on-request" else "never",
             "active_session_started_at": self.active_session_started_at,
             "realtime_call_role": self.realtime_call_role,
             "realtime_call_speech_rate": self.realtime_call_speech_rate,
@@ -10215,7 +10221,7 @@ class ChatFrame(wx.Frame):
             return
         client.resume_thread(
             thread_value,
-            approval_policy="never",
+            approval_policy="on-request" if getattr(self, "codex_approval_policy", "never") == "on-request" else "never",
             sandbox="danger-full-access",
             personality="pragmatic",
             cwd=self._workspace_dir_for_codex(),
@@ -10331,6 +10337,7 @@ class ChatFrame(wx.Frame):
                 attachments=turn_attachments,
                 service_tier=service_tier,
                 should_steer=should_steer,
+                approval_policy=getattr(self, "codex_approval_policy", "never"),
                 history_turns=history_turns,
             )
             self._call_after_if_alive(
@@ -11983,6 +11990,22 @@ class ChatFrame(wx.Frame):
     def _codex_answer_filter_menu_label(self) -> str:
         return "取消过滤英文内容" if self.codex_answer_english_filter_enabled else "在回答中过滤英文内容"
 
+    def _show_codex_approval_policy(self) -> None:
+        questions = [{"id": "policy", "header": "Codex 执行审批",
+            "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。",
+            "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}]}]
+        dlg = CodexUserInputDialog(self, questions)
+        dlg._controls[0]["radio"].SetSelection(1 if getattr(self, "codex_approval_policy", "never") == "on-request" else 0)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            values = dlg.get_answers().get("policy", [])
+            self.codex_approval_policy = "on-request" if values == ["on-request"] else "never"
+        finally:
+            dlg.Destroy()
+        self._save_state()
+        self.SetStatusText("Codex 执行审批已保存，将用于后续线程启动或恢复。")
+
     def _toggle_codex_answer_filter(self) -> None:
         self.codex_answer_english_filter_enabled = not self.codex_answer_english_filter_enabled
         self._save_state()
@@ -13329,6 +13352,9 @@ class ChatFrame(wx.Frame):
         self._on_codex_event_for_chat(chat_id, event)
 
     def _handle_codex_request_dialog(self, request: dict) -> None:
+        if request.get("method") == "item/commandExecution/requestApproval":
+            self._handle_codex_command_approval(request)
+            return
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
         questions = params.get("questions") if isinstance(params.get("questions"), list) else []
         dlg = CodexUserInputDialog(self, questions)
@@ -13346,6 +13372,59 @@ class ChatFrame(wx.Frame):
         if callable(start):
             start()
         client.reply_user_input(chat_id, request.get("request_id"), answers)
+
+    def _handle_codex_command_approval(self, request: dict) -> None:
+        chat_id = str(request.get("chat_id") or "")
+        client = getattr(self, "_codex_clients", {}).get(chat_id)
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        available = params.get("availableDecisions")
+        allowed = available if isinstance(available, list) else ["accept", "decline"]
+        fallback = "decline" if "decline" in allowed else "cancel" if "cancel" in allowed else None
+        turn_idx = request.get("turn_idx")
+        def current_owner():
+            chat = self._current_chat_state
+            turns = chat.get("turns", []) if isinstance(chat, dict) else []
+            if chat_id != self.current_chat_id or chat_id != self.active_chat_id or not isinstance(turn_idx, int) or not 0 <= turn_idx < len(turns):
+                return None
+            turn = turns[turn_idx]
+            if (getattr(self, "_codex_clients", {}).get(chat_id) is not client
+                or str(turn.get("model") or chat.get("model") or DEFAULT_CODEX_MODEL) != request.get("model")
+                or turn.get("codex_thread_id") != request.get("thread_id")
+                or turn.get("codex_turn_id") != request.get("turn_id")
+                or int(turn.get("codex_start_generation", turn.get("codex_context_generation") or 0)) != request.get("context_generation")
+                or int(chat.get("codex_context_generation") or 0) != int(turn.get("codex_context_generation") or 0)
+                or turn.get("request_status") not in {"pending", "running"}):
+                return None
+            return turn
+        owner = current_owner()
+        decision = fallback
+        if client is None:
+            return
+        if owner is not None:
+            options = []
+            if "decline" in allowed:
+                options.append({"label": "拒绝", "value": "decline"})
+            if "accept" in allowed:
+                options.append({"label": "批准一次", "value": "accept"})
+            if options:
+                questions = [{"id": "command_approval", "header": "Codex 命令执行审批",
+                    "question": f"命令：{params.get('command') or ''}\n工作目录：{params.get('cwd') or ''}\n原因：{params.get('reason') or ''}",
+                    "options": options}]
+                dlg = CodexUserInputDialog(self, questions)
+                try:
+                    if dlg.ShowModal() == wx.ID_OK:
+                        values = dlg.get_answers().get("command_approval", [])
+                        if len(values) == 1 and values[0] in ("accept", "decline") and values[0] in allowed:
+                            decision = values[0]
+                finally:
+                    dlg.Destroy()
+                if current_owner() is not owner:
+                    decision = fallback
+        if decision is None:
+            self.SetStatusText("此命令请求未提供可用的拒绝决定，未授权执行。")
+            return
+        client.reply_command_approval(**{key: request.get(key) for key in
+            ("chat_id", "model", "request_id", "thread_id", "turn_id", "turn_idx", "context_generation")}, decision=decision)
 
     def _codex_pending_request_from_event(self, chat_id: str, target_chat: dict | None, event: CodexEvent) -> dict:
         event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
@@ -13458,6 +13537,14 @@ class ChatFrame(wx.Frame):
                     self._defer_codex_state_save()
             if not event.usage:
                 return
+        if event_type == "server_request" and event.method == "item/commandExecution/requestApproval":
+            event_data = event.data if isinstance(event.data, dict) else {}
+            self._handle_codex_request_dialog({"chat_id": chat_id,
+                "model": event_data.get("model"), "request_id": event.request_id,
+                "method": event.method, "params": event.params,
+                "thread_id": event_thread_id, "turn_id": event_turn_id,
+                "turn_idx": event_data.get("turn_idx"), "context_generation": event_data.get("context_generation")})
+            return
         execution_entry = None if event_type == "agent_message_delta" else self._build_execution_entry(event)
         appended_execution_step = False
         if not is_current_chat:

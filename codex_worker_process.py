@@ -34,6 +34,9 @@ class CodexWorkerRuntime:
         self._turn_id_scopes: OrderedDict[tuple[str, str, str], tuple[int, int, str] | None] = OrderedDict()
         self._input_request_clients: dict[tuple[str, str], tuple[str, str]] = {}
         self._ambiguous_input_requests: set[tuple[str, str]] = set()
+        self._command_requests: dict[tuple[str, str, str], dict] = {}
+        self._answered_command_requests: set[tuple[str, str, str]] = set()
+        self._active_command_owners: dict[tuple[str, str], tuple] = {}
         self._startup_events: dict[tuple[str, str], dict] = {}
         self._native_owners: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
         self._item_owners: OrderedDict[tuple[str, str, str, str], tuple[int, int, str]] = OrderedDict()
@@ -50,6 +53,8 @@ class CodexWorkerRuntime:
             self._handle_start_turn(message)
         elif message_type == "reply_user_input":
             self._handle_reply_user_input(message)
+        elif message_type == "reply_command_approval":
+            self._handle_reply_command_approval(message)
         elif message_type == "compact_thread":
             self._handle_compact_thread(message)
         elif message_type == "cancel_turn":
@@ -74,6 +79,9 @@ class CodexWorkerRuntime:
             self._turn_id_scopes.clear()
             self._input_request_clients.clear()
             self._ambiguous_input_requests.clear()
+            self._command_requests.clear()
+            self._answered_command_requests.clear()
+            self._active_command_owners.clear()
             self._startup_events.clear()
             self._native_owners.clear()
             self._item_owners.clear()
@@ -86,16 +94,19 @@ class CodexWorkerRuntime:
         key = (normalized_chat_id, normalized_model)
         with self._lock:
             if key not in self._clients:
-                self._clients[key] = self.client_factory(
+                client = self.client_factory(
                     lambda event, chat_id=normalized_chat_id, model=normalized_model: self._on_event(
-                        chat_id, model, event
+                        chat_id, model, event, client
                     ),
                     normalized_model,
                 )
+                self._clients[key] = client
             return self._clients[key]
 
-    def _on_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
+    def _on_event(self, chat_id: str, model: str, event: CodexEvent, source_client=None) -> None:
         with self._lock:
+            if source_client is not None and self._clients.get((chat_id, model)) is not source_client:
+                return
             pending = self._startup_events.get((chat_id, model))
             if pending is not None:
                 turn_id = str(getattr(event, "turn_id", "") or "").strip()
@@ -195,6 +206,15 @@ class CodexWorkerRuntime:
                     ]
             if scope is not None:
                 payload["turn_idx"], payload["context_generation"] = scope
+            if event_type == "server_request" and method == "item/commandExecution/requestApproval" and request_id is not None and scope is not None and thread_id and turn_id:
+                request_key = (chat_id, model, str(request_id))
+                params = event.params if isinstance(event.params, dict) else {}
+                if request_key not in self._answered_command_requests:
+                    self._command_requests.setdefault(request_key, {
+                        "client": self._clients.get((chat_id, model)), "request_id": request_id,
+                        "thread_id": thread_id, "turn_id": turn_id, "turn_idx": scope[0],
+                        "context_generation": scope[1], "decisions": params.get("availableDecisions"),
+                    })
             if request_id is not None and (method == "item/tool/requestUserInput" or event_type == "server_request"):
                 request_key = (chat_id, str(request_id))
                 existing_key = self._input_request_clients.get(request_key)
@@ -203,6 +223,10 @@ class CodexWorkerRuntime:
                     self._input_request_clients.pop(request_key, None)
                 elif request_key not in self._ambiguous_input_requests:
                     self._input_request_clients[request_key] = key
+            if event_type == "turn_completed":
+                active_owner = self._active_command_owners.get((chat_id, model))
+                if active_owner is not None and active_owner[:2] == (thread_id, turn_id):
+                    self._active_command_owners.pop((chat_id, model), None)
         self.emit("event", payload)
 
     def _handle_start_turn(self, message: dict[str, Any]) -> None:
@@ -242,7 +266,7 @@ class CodexWorkerRuntime:
                 try:
                     client.resume_thread(
                         thread_id,
-                        approval_policy="never",
+                        approval_policy=self._approval_policy(payload),
                         sandbox="danger-full-access",
                         personality="pragmatic",
                         cwd=payload.get("cwd") or "",
@@ -280,6 +304,7 @@ class CodexWorkerRuntime:
                     overflow = self._startup_events[startup_key]["overflow"]
                     native = self._native_owners.get(key)
                     if not overflow:
+                        self._active_command_owners[(chat_id, model)] = (thread_id, turn_id, turn_idx, context_generation)
                         self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (turn_idx, context_generation))
                         if steered and native is not None and native["thread_id"] == thread_id:
                             if len(native["owners"]) >= self.MAX_EVENT_SCOPES:
@@ -353,7 +378,7 @@ class CodexWorkerRuntime:
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(
             cwd=payload.get("cwd") or "",
-            approval_policy="never",
+            approval_policy=self._approval_policy(payload),
             sandbox="danger-full-access",
             personality="pragmatic",
             service_tier=service_tier_arg,
@@ -411,6 +436,41 @@ class CodexWorkerRuntime:
     @classmethod
     def _is_no_active_turn_error(cls, exc: Exception | str) -> bool:
         return "no active turn to steer" in cls._error_text(exc)
+
+    @staticmethod
+    def _approval_policy(payload: dict) -> str:
+        return "on-request" if payload.get("approval_policy") == "on-request" else "never"
+
+    def _handle_reply_command_approval(self, message: dict[str, Any]) -> None:
+        payload = dict(message.get("payload") or {})
+        key = (str(payload.get("chat_id") or ""), str(payload.get("model") or ""), str(payload.get("request_id")))
+        with self._lock:
+            pending = self._command_requests.get(key)
+            if pending is None:
+                return
+            client = self._clients.get(key[:2])
+            if client is not pending["client"]:
+                self._command_requests.pop(key, None)
+                return
+            if any(payload.get(field) != pending[field] for field in ("thread_id", "turn_id", "turn_idx", "context_generation")):
+                return
+            scope = self._turn_id_scopes.get((key[0], key[1], pending["turn_id"]))
+            if scope != (pending["turn_idx"], pending["context_generation"], pending["thread_id"]):
+                return
+            if self._thread_turn_scopes.get((key[0], key[1], pending["thread_id"])) != scope[:2]:
+                return
+            if self._active_command_owners.get(key[:2]) != (pending["thread_id"], pending["turn_id"], pending["turn_idx"], pending["context_generation"]):
+                return
+            decision = payload.get("decision")
+            allowed = pending["decisions"] if isinstance(pending["decisions"], list) else ["accept", "decline"]
+            if decision not in ("accept", "decline", "cancel") or decision not in allowed:
+                return
+            self._command_requests.pop(key, None)
+            self._answered_command_requests.add(key)
+            try:
+                client.respond_command_approval(pending["request_id"], decision)
+            except Exception as exc:
+                self._emit_scoped_error(message, str(exc), key[0], pending["turn_idx"], key[1])
 
     def _handle_reply_user_input(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})

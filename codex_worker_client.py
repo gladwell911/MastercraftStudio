@@ -150,6 +150,11 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(message_id, "reply_user_input", payload))
         return message_id
 
+    def reply_command_approval(self, **payload: Any) -> str:
+        message_id = self._next_id()
+        self._send_message(make_ui_request(message_id, "reply_command_approval", payload))
+        return message_id
+
     def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "") -> str:
         request_id = self._next_id()
         payload = {"chat_id": str(chat_id or ""), "model": str(model or ""), "thread_id": str(thread_id or "")}

@@ -1,9 +1,13 @@
 # 当前交接
 
-截至 2026-10-02。MC main 功能提交为 4d63201，手机对应 RC master 的 054fe86。本轮修复执行列表等待、进入聊天反馈不一致、清后首答缺失，并诊断 Kimi 启动报错和 Codex 占位。确认的代码缺口已修复，engineer 独立验证通过。本轮仅在模拟器安装调试包，没有更新桌面安装包或实体手机应用。Git 同步状态以 git status -sb 为准。
+截至 2026-10-02。本轮完成锁屏收件解锁详情、通知目标错位、两端答案时间及 Codex 执行重复语义修复，MC 时间修复为 6138051、RC 对应为 df9ccd7。另将已独立验证的 Codex 命令审批实现纳入本次收尾。完整源码版本与同步状态以 git log -1、git status -sb 为准；桌面安装包和实体手机尚未更新，仅部署专用模拟器。
 
 ## 当前实现
 
+- 问题 created_at 与回答 answer_at 独立；首次权威完成写入答案时间，终结重放不刷新。旧历史仅从同 owner/turn 的 canonical final 恢复可信时间，无事实沿用原 fallback。远程 payload/cache 携带 answer_at。
+- 回答时间从上一实际显示时间累计 300 秒；重建、增量追加、已有流式回答完成及 accepted 延迟刷新均核对时间行位置，保留选中和焦点。pending delta 仍只更新正文。
+- 应用菜单“Codex 执行审批”默认“不询问”；主动选择“需要时询问”影响后续线程启动/恢复，不主动变更当前回合。命令审批展示 command/cwd/reason，只按原生可选决定单次批准或拒绝，关闭按拒绝；回复绑定 owner/generation/request/client，不自动批准。
+- RC 主通知保留正文、公版遮罩；点击以完整 pair/event URI 区分且不等待旧页关闭。无空白阶段包装的同正文语义只保留一次，不跨事件去重。
 - 隐藏执行页在后台准备有界缓存；重复隐藏刷新复用扫描，F1 切换不取消缓存。准备完成可直接查看；尚未完成的首次读取或存储失败仍可能等待。隐藏页不重绘、不移动输入焦点，结果按 owner、turn、revision、generation 校验。
 - 普通占位和子代理结果中的纯 notLoaded / Not Loaded 不显示；混合结果、失败、非零退出及有用描述保留。
 - Kimi 恢复退避后复核截止时间，共享预算耗尽报告恢复超时，原始错误优先；不能据此推定用户现场最初断连或启动的原因。
@@ -13,7 +17,15 @@
 
 ## 验证与复现
 
-逐命令结果、初失败和边界见 [独立报告](../_bmad-output/implementation-artifacts/verify-five-chat-runtime-fixes-20261002.md)。验证后没有产品或测试行为改动，文档收尾复用这些结果。
+本轮完整证据见 [四项独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)。时间/store 24、provider ordinary/quiet 完成 4、deadline/owner GUI 2、分页 GUI 1、Codex 活动/后台 2 项通过；RC 定向、Android、实际语义树、同条通知锁屏解锁、热 B/A/B/A、正常入口无进程冷 A/B 和 Local 跨端通过。模拟器不代表实体 TalkBack 发声。
+
+Codex 审批自验与独验均为 66 项，见 [实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)。本次收尾在最终工作树复跑以下命令，66 passed；未启动真实模型或重启运行包：
+
+~~~powershell
+.venv/Scripts/python.exe -m pytest tests/test_codex_command_approval_unit.py tests/test_codex_worker_process.py tests/test_codex_command_approval_ui_automation.py -q
+~~~
+
+较早阶段的缓存、占位和恢复预算验证见 [阶段报告](../_bmad-output/implementation-artifacts/verify-five-chat-runtime-fixes-20261002.md)。以下命令只对应该阶段；收尾未改产品行为，复用相应已有效证据。
 
 MC cwd，使用已有 Python 3.11 环境：
 
