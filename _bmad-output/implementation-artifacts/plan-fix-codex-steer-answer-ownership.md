@@ -114,3 +114,23 @@ deferred: []
 - Diff and cached diff checks passed. Tests isolated app/history/notes data and ran wx suites serially.
 - Limits: full integration did not finish after director observed Windows COM 0x8001010d; baseline causation was not independently established. The affected tests passed, but this is not a full-suite pass. No real-model end-to-end run, package rebuild/deployment or repair of existing production history was performed.
 - Finalization: local Git commit only; no push.
+
+## Code Review
+
+### 2026-10-02 — 新 dog 独立审查 commit 98a0d34
+
+Code review complete. 0 decision-needed, 5 patch, 1 defer, 3 rejected. 确认产品缺陷 high 2 / medium 1，另2项medium测试缺口；只审不修，不提交/推送。详细逐条triage及边界见 [审查报告](review-codex-steer-98a0d34-dog-20261002.md)。
+
+- [ ] [Review][Patch][high] item缓存淘汰后旧回答归新输入 [codex_worker_process.py:154]
+- [ ] [Review][Patch][high] 失败steer丢弃既有任务首次出现的完成回答 [codex_worker_process.py:318]
+- [ ] [Review][Patch][medium] 失败completion错误消息追加进正式答文 [main.py:9907]
+- [ ] [Review][Patch][medium] worker→UI顶层completion_owners转换缺有辨别力的多pending owner回归 [main.py:15945]
+- [ ] [Review][Patch][medium] pending turn重载后item去重缺行为回归 [tests/test_codex_integration.py:58]
+- [x] [Review][Defer][maybe-false] 最新completion owner失败/失效可能阻断其他owner收尾 [main.py:13351] — deferred：缺少最新owner失效而较早owner仍有效的真实写入链；不能用手工注入scope证明产品缺陷。
+
+Rejected：
+- false：第二steer边界之前归前owner符合按确认输入边界切换的契约，没有已属新输入的证据。
+- false：正常worker/UI队列FIFO，无final item因UI队列反序的触发路径。
+- maybe-false/低收益防护：非agent item带final_answer的真实provider组合未证实，不增加假设性guard。
+
+本轮为审查请求，保留为action items；不自动修复、不追加审查轮次。报告记录平台thread限制下reviewer线程复用及真实模型端到端未覆盖边界。

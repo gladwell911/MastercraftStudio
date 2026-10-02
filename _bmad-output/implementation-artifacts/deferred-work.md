@@ -15,3 +15,7 @@
 - Claude worker 仅在启动时属于当前聊天才登记客户端，后台聊天的运行中 worker 之后无法续写。
 - 新聊天、归档及上下文重置使用无条件清理，可能与另一个 Claude worker 的注册交错并清除替换客户端。
 - 同一聊天显式选择 Kimi、Codex 或 OpenRouter 模型时，活跃 Claude 客户端仍可能在模型解析前截获输入。
+
+## Deferred from: code review of plan-fix-codex-steer-answer-ownership (2026-10-02)
+
+- [unverified medium / maybe-false] main.py:13351 最新completion owner failed/generation失效会先于completion_owners fan-out整批return。需要证明真实运行中仅最新已接收owner失效、较早owner仍有效并收到native completion的写入链；失败steer不会注册新owner，不能作为复现。本轮只记录，不修复。详情：review-codex-steer-98a0d34-dog-20261002.md。
