@@ -2843,3 +2843,15 @@ def test_reconcile_expired_owner_deadline_reports_timeout(frame, monkeypatch):
     errors.clear()
     assert frame._reconcile_kimi_owner_worker(owner, original_error="real provider error") == "done"
     assert errors == ["real provider error"]
+
+
+def test_provider_error_with_reset_text_is_terminal_not_transport_retry(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "controlled provider failure")
+    session_id = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
+    fake.push_event(KimiEvent(type="error", thread_id=session_id, turn_id=TEST_TURN_ID,
+                             text="provider failed with 10054", subtype="provider_failure"))
+    assert frame.active_session_turns[-1]["request_status"] == "failed"
+    assert "10054" in frame.active_session_turns[-1]["request_error"]
+    assert len(fake.submitted) == 1

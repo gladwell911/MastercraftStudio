@@ -794,7 +794,10 @@ class KimiServerClient:
                         )
                     self._banner_thread = threading.Thread(target=self._banner_loop, daemon=True)
                     self._banner_thread.start()
-                    self._http = self.http_session_factory() if self.http_session_factory else requests.Session()
+                    http = self.http_session_factory() if self.http_session_factory else requests.Session()
+                    if not self.http_session_factory:
+                        http.trust_env = False
+                    self._http = http
             if not reusable:
                 self._wait_for_health(deadline=deadline)
                 if self.token is None:
@@ -1110,22 +1113,33 @@ class KimiServerClient:
     ):
         if self._http is None:
             raise KimiServerError("kimi client is not started")
-        try:
-            resp = self._http.request(
-                method,
-                f"{self.base_url}{path}",
-                json=json_body,
-                params=params,
-                headers=self._auth_headers(),
-                timeout=timeout or self.rest_timeout,
-            )
-        except KimiServerError:
-            raise
-        except Exception as exc:
-            raise KimiServerError(
-                f"kimi server {method} {path} failed: {exc}",
-                result_unknown=str(method).upper() == "POST",
-            ) from exc
+        budget = timeout if timeout is not None else self.rest_timeout
+        deadline = time.monotonic() + budget
+        for attempt in range(2):
+            try:
+                resp = self._http.request(
+                    method, f"{self.base_url}{path}", json=json_body, params=params,
+                    headers=self._auth_headers(), timeout=max(0.001, deadline - time.monotonic()),
+                )
+                break
+            except KimiServerError:
+                raise
+            except Exception as exc:
+                # Only safe reads retry a transport failure; an ambiguous POST
+                # remains owned by transcript reconciliation and is never replayed.
+                transport = isinstance(exc, (ConnectionResetError, requests.ConnectionError))
+                if (str(method).upper() == "GET" and transport and attempt == 0
+                        and time.monotonic() < deadline):
+                    if not self.http_session_factory:
+                        self._http.close()
+                        http = requests.Session()
+                        http.trust_env = False
+                        self._http = http
+                    continue
+                raise KimiServerError(
+                    f"kimi local REST {method} {path} failed: {exc}",
+                    result_unknown=str(method).upper() == "POST",
+                ) from exc
         status = getattr(resp, "status_code", 0)
         if status < 200 or status >= 300:
             raise KimiServerError(
@@ -1217,6 +1231,7 @@ class KimiServerClient:
                 candidate = websocket.create_connection(
                     url,
                     header=headers,
+                    http_no_proxy=["127.0.0.1", "localhost", "::1"],
                     timeout=min(self.ws_connect_timeout, timeout) if timeout is not None else self.ws_connect_timeout,
                 )
                 # The timeout is a handshake boundary, not an idle lifetime.

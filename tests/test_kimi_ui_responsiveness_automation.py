@@ -283,8 +283,8 @@ def test_background_events_do_not_repaint_lists(frame, wx_app, monkeypatch):
         return lambda *args, **kwargs: repaint_calls.append(name)
 
     for control in (frame.answer_list, frame.execution_list, frame.history_list):
-        monkeypatch.setattr(control, "Refresh", _spy(f"{control.GetName() or type(control).__name__}.Refresh"))
-        monkeypatch.setattr(control, "SetSelection", _spy(f"{control.GetName() or type(control).__name__}.SetSelection"))
+        monkeypatch.setattr(control, "Refresh", _spy(f"{'history' if control is frame.history_list else 'detail'}.Refresh"))
+        monkeypatch.setattr(control, "SetSelection", _spy(f"{'history' if control is frame.history_list else 'detail'}.SetSelection"))
 
     # 当前聊天的流式增量：只缓冲，不重绘
     _push_delta_events(frame, 60)
@@ -306,7 +306,9 @@ def test_background_events_do_not_repaint_lists(frame, wx_app, monkeypatch):
     _drain_all_kimi_events(frame)
     wx_app.Yield()
 
-    assert repaint_calls == []
+    # Successful background completion is a history activity fact; only its
+    # history row may repaint, with foreground detail/input untouched.
+    assert all("history" in label for label in repaint_calls)
     assert main.wx.Window.FindFocus() is focused_before
     assert archived_turns[0]["answer_md"] == "后台答案"
     assert archived_turns[0]["request_status"] == "done"

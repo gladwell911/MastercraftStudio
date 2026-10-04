@@ -423,7 +423,7 @@ def test_real_ui_execution_hidden_history_scan_releases_navigation_before_read_f
     try:
         frame._apply_detail_panel_mode("execution", refresh_execution=True)
         assert _yield_until(wx_app, blocked.is_set)
-        assert [on_ui for on_ui, _ in reads] == [True, True, False]
+        assert [on_ui for on_ui, _ in reads] == [False, False, False]
         assert list(frame.execution_list.GetStrings()) == ["正在加载执行过程"]
         assert frame._selected_execution_text_viewer_content() is None
         assert frame._try_open_selected_execution_detail() is False
@@ -468,7 +468,7 @@ def test_real_ui_execution_hidden_history_scan_releases_navigation_before_read_f
         assert len(reads) == 5
         assert all(kwargs["limit"] == 100 for _, kwargs in reads)
         assert all(kwargs.get("include_total") is False for _, kwargs in reads[1:])
-        print(f"execution blocked history: ui_queries=2, total_queries={len(reads)}, native_tab_ms={elapsed * 1000:.2f}")
+        print(f"execution blocked history: ui_queries=0, total_queries={len(reads)}, native_tab_ms={elapsed * 1000:.2f}")
     finally:
         release.set()
         del activator
@@ -1920,3 +1920,69 @@ def test_hidden_execution_preparation_retries_failure_and_rejects_old_owner(fram
     assert frame._execution_scan_result[0][0] == "owner-b"
     assert frame._execution_scan_result[1][0]["list_text"] == "owner-b"
     frame._invalidate_execution_scan()
+
+
+def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame, wx_app, monkeypatch, tmp_path):
+    event_loop = main.wx.GUIEventLoop()
+    activator = main.wx.EventLoopActivator(event_loop)
+    monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
+    _activate_frame(frame, wx_app)
+    store = main.ChatStore(str(tmp_path / "immediate-tail.db"), max_execution_steps_per_turn=5000)
+    store.initialize()
+    store.upsert_chat({"id": "cold-owner", "revision": 1})
+    store.replace_turns("cold-owner", [{"question": "q", "answer_md": "a"}])
+    store.append_execution_step("cold-owner", {"turn_idx": 0, "display_kind": "commentary", "list_text": "real persisted tail"})
+    store.replace_execution_steps("cold-owner", [{"turn_idx": 0, "display_kind": "commentary", "list_text": "real persisted tail"}]
+        + [{"turn_idx": 0, "display_kind": "commentary", "text": "notLoaded", "list_text": "notLoaded"} for _ in range(3000)])
+    frame.chat_store, frame._chat_store_enabled = store, True
+    frame.archived_chats = [{"id": "cold-owner", "revision": 1}]
+    # The normal chat-open hydration maintains a bounded real tail before F1.
+    import chat_store
+    calls = []
+    predicate = chat_store.should_show_execution_step
+    monkeypatch.setattr(chat_store, "should_show_execution_step", lambda row: calls.append(row) or predicate(row))
+    opened_at = time.perf_counter()
+    assert frame._show_history_chat("cold-owner")
+    assert time.perf_counter() - opened_at < 0.5
+    assert calls == []
+    assert [row["list_text"] for row in frame.archived_chats[0]["execution_steps"]] == ["real persisted tail"]
+    frame.view_mode, frame.view_history_id = "history", "cold-owner"
+    frame._apply_detail_panel_mode("answers", refresh_execution=False)
+    started, release = threading.Event(), threading.Event()
+    original = store.load_recent_execution_steps
+    def read(*args, **kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        started.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, "load_recent_execution_steps", read)
+    try:
+        frame._mark_execution_list_dirty()
+        assert _yield_until(wx_app, started.is_set)
+        frame.input_edit.SetFocusFromKbd()
+        wx_app.Yield()
+        hwnd = frame.input_edit.GetHandle()
+        main.wx.CallAfter(_dispatch_frame_key, frame, main.wx.WXK_F1)
+        assert _yield_until(wx_app, lambda: frame._detail_panel_mode() == "execution", timeout=0.5)
+        assert frame.input_edit.GetHandle() == hwnd
+        assert _yield_until(wx_app, frame.execution_list.HasFocus, timeout=0.5)
+        main.wx.CallAfter(_send_window_key, frame.execution_list, main.wx.WXK_TAB)
+        assert _yield_until(wx_app, frame.input_edit.HasFocus, timeout=0.5)
+        assert not release.is_set()
+        assert any("real persisted tail" in row for row in frame.execution_list.GetStrings())
+        assert "正在加载执行过程" not in frame.execution_list.GetStrings()
+        frame.archived_chats[0]["execution_steps"].append({"display_kind": "commentary", "list_text": "real new step"})
+        frame._mark_execution_list_dirty()
+        frame._apply_detail_panel_mode("answers", refresh_execution=False)
+        frame._apply_detail_panel_mode("execution", refresh_execution=True)
+        assert any("real new step" in row for row in frame.execution_list.GetStrings())
+        assert any("real persisted tail" in row for row in frame.execution_list.GetStrings())
+        frame.archived_chats[0]["revision"] = 2
+        frame.archived_chats[0]["execution_steps"] = []
+        frame._mark_execution_list_dirty()
+        frame._apply_detail_panel_mode("execution", refresh_execution=True)
+        assert not any("real persisted tail" in row or "real new step" in row for row in frame.execution_list.GetStrings())
+    finally:
+        release.set()
+        frame._invalidate_execution_scan()
+        del activator

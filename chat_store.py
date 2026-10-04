@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
-from execution_projection import canonical_answer_timestamp
+from execution_projection import canonical_answer_timestamp, should_show_execution_step
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -65,6 +65,7 @@ class ChatStore:
                     detail_text TEXT NOT NULL DEFAULT '',
                     payload_json TEXT NOT NULL,
                     logical_key TEXT NOT NULL DEFAULT '',
+                    visible INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (chat_id, step_index)
                 );
                 CREATE TABLE IF NOT EXISTS execution_assemblers (
@@ -182,10 +183,18 @@ class ChatStore:
                     ON clear_operations(chat_id, state, revision DESC);
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
             execution_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_steps)")}
             if "logical_key" not in execution_columns:
                 conn.execute("ALTER TABLE execution_steps ADD COLUMN logical_key TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_logical_key ON execution_steps(chat_id, logical_key) WHERE logical_key <> ''")
+            if "visible" not in execution_columns:
+                conn.execute("ALTER TABLE execution_steps ADD COLUMN visible INTEGER NOT NULL DEFAULT 0")
+                rows = conn.execute("SELECT chat_id,step_index,payload_json FROM execution_steps").fetchall()
+                conn.executemany("UPDATE execution_steps SET visible=? WHERE chat_id=? AND step_index=?",
+                    [(self._execution_visible(self._json_dict(row["payload_json"])), row["chat_id"], row["step_index"])
+                     for row in rows])
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_visible_tail ON execution_steps(chat_id,step_index) WHERE visible=1")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(clear_operations)")}
             if "pair_id" not in columns:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN pair_id TEXT NOT NULL DEFAULT 'default'")
@@ -1564,6 +1573,13 @@ class ChatStore:
             conn.execute("BEGIN IMMEDIATE")
             self._append_execution_step_on_conn(conn, normalized, step)
 
+    @staticmethod
+    def _execution_visible(payload: dict) -> int:
+        ready = payload.get("projection_ready")
+        if isinstance(ready, (int, float)) and ready == 0:
+            return 0
+        return int(should_show_execution_step(payload))
+
     def _append_execution_step_on_conn(self, conn, chat_id: str, step: dict[str, Any]) -> None:
         """Append one trusted canonical step inside the caller's transaction."""
         logical_key = str(step.get("logical_key") or "").strip()
@@ -1585,11 +1601,11 @@ class ChatStore:
             if existing is not None:
                 conn.execute(
                     """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,
-                       list_text=?,detail_text=?,payload_json=? WHERE chat_id=? AND logical_key=?""",
+                       list_text=?,detail_text=?,payload_json=?,visible=? WHERE chat_id=? AND logical_key=?""",
                     (self._optional_int(step.get("turn_idx")), str(step.get("event_type") or ""),
                      str(step.get("display_kind") or ""), str(step.get("list_text") or step.get("step") or ""),
                      str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
-                     json.dumps(step, ensure_ascii=False), chat_id, logical_key),
+                     json.dumps(step, ensure_ascii=False), self._execution_visible(step), chat_id, logical_key),
                 )
                 return
         turn_value = self._optional_int(step.get("turn_idx"))
@@ -1601,8 +1617,8 @@ class ChatStore:
         conn.execute(
             """
             INSERT INTO execution_steps(
-                chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json, logical_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chat_id, step_index, turn_idx, event_type, display_kind, list_text, detail_text, payload_json, visible, logical_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -1612,7 +1628,7 @@ class ChatStore:
                 str(step.get("display_kind") or ""),
                 str(step.get("list_text") or step.get("step") or ""),
                 str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
-                json.dumps(step, ensure_ascii=False),
+                json.dumps(step, ensure_ascii=False), self._execution_visible(step),
                 str(step.get("logical_key") or ""),
             ),
         )
@@ -1670,7 +1686,7 @@ class ChatStore:
             conn.execute(
                 """
                 UPDATE execution_steps
-                SET turn_idx=?, event_type=?, display_kind=?, list_text=?, detail_text=?, payload_json=?
+                SET turn_idx=?, event_type=?, display_kind=?, list_text=?, detail_text=?, payload_json=?,visible=?
                 WHERE chat_id=? AND step_index=?
                 """,
                 (
@@ -1679,7 +1695,7 @@ class ChatStore:
                     str(step.get("display_kind") or ""),
                     str(step.get("list_text") or step.get("step") or ""),
                     str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
-                    json.dumps(step, ensure_ascii=False),
+                    json.dumps(step, ensure_ascii=False), self._execution_visible(step),
                     normalized,
                     first_index,
                 ),
@@ -1708,11 +1724,11 @@ class ChatStore:
                         merged[key] = previous[key]
                 conn.execute(
                     """UPDATE execution_steps SET turn_idx=?, event_type=?, display_kind=?, list_text=?,
-                       detail_text=?, payload_json=? WHERE chat_id=? AND logical_key=?""",
+                       detail_text=?, payload_json=?,visible=? WHERE chat_id=? AND logical_key=?""",
                     (self._optional_int(merged.get("turn_idx")), str(merged.get("event_type") or ""),
                      str(merged.get("display_kind") or ""), str(merged.get("list_text") or merged.get("step") or ""),
                      str(merged.get("detail_text") or merged.get("message") or merged.get("step") or ""),
-                     json.dumps(merged, ensure_ascii=False), normalized, logical_key),
+                     json.dumps(merged, ensure_ascii=False), self._execution_visible(merged), normalized, logical_key),
                 )
                 return True
             rows = conn.execute(
@@ -1726,12 +1742,12 @@ class ChatStore:
                         and str(previous.get("thread_id") or "") == str(step.get("thread_id") or "")
                         and str(previous.get("turn_id") or "") == str(step.get("turn_id") or "")):
                     conn.execute(
-                        """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                        """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?,visible=?
                            WHERE chat_id=? AND step_index=?""",
                         (turn_value, str(step.get("event_type") or ""), str(step.get("display_kind") or ""),
                          str(step.get("list_text") or step.get("step") or ""),
                          str(step.get("detail_text") or step.get("message") or step.get("step") or ""),
-                         json.dumps(step, ensure_ascii=False), normalized, int(row["step_index"])),
+                         json.dumps(step, ensure_ascii=False), self._execution_visible(step), normalized, int(row["step_index"])),
                     )
                     return True
         return False
@@ -1776,23 +1792,23 @@ class ChatStore:
                         incoming[key] = previous[key]
                 step_index = int(row["step_index"])
                 conn.execute(
-                    """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                    """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?,visible=?
                        WHERE chat_id=? AND logical_key=?""",
                     (self._optional_int(incoming.get("turn_idx")), str(incoming.get("event_type") or ""),
                      str(incoming.get("display_kind") or ""), str(incoming.get("list_text") or incoming.get("step") or ""),
                      str(incoming.get("detail_text") or incoming.get("message") or incoming.get("step") or ""),
-                     json.dumps(incoming, ensure_ascii=False), normalized, logical_key),
+                     json.dumps(incoming, ensure_ascii=False), self._execution_visible(incoming), normalized, logical_key),
                 )
             else:
                 next_row = conn.execute("SELECT COALESCE(MAX(step_index),-1)+1 n FROM execution_steps WHERE chat_id=?", (normalized,)).fetchone()
                 step_index = int(next_row["n"] or 0)
                 conn.execute(
-                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,logical_key)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,visible,logical_key)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (normalized, step_index, self._optional_int(incoming.get("turn_idx")), str(incoming.get("event_type") or ""),
                      str(incoming.get("display_kind") or ""), str(incoming.get("list_text") or incoming.get("step") or ""),
                      str(incoming.get("detail_text") or incoming.get("message") or incoming.get("step") or ""),
-                     json.dumps(incoming, ensure_ascii=False), logical_key),
+                     json.dumps(incoming, ensure_ascii=False), self._execution_visible(incoming), logical_key),
                 )
         return incoming
 
@@ -1868,11 +1884,11 @@ class ChatStore:
                             payload[field] = projection_seed[field]
                     payload["projection_ready"] = True
                     conn.execute(
-                        """UPDATE execution_steps SET event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?
+                        """UPDATE execution_steps SET event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?,visible=?
                            WHERE chat_id=? AND logical_key=?""",
                         (str(payload.get("event_type") or ""), str(payload.get("display_kind") or ""),
                          str(payload.get("list_text") or ""), str(payload.get("detail_text") or ""),
-                        json.dumps(payload, ensure_ascii=False), normalized, logical_key),
+                        json.dumps(payload, ensure_ascii=False), self._execution_visible(payload), normalized, logical_key),
                     )
                 conn.execute(
                     """INSERT INTO execution_assemblers(chat_id,logical_key,scope_json,state_json,updated_at) VALUES(?,?,?,?,?)
@@ -1951,10 +1967,10 @@ class ChatStore:
                     "projection_ready": ready, "incomplete": bool(state.get("pending_gap")),
                 }
                 conn.execute(
-                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,logical_key)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO execution_steps(chat_id,step_index,turn_idx,event_type,display_kind,list_text,detail_text,payload_json,visible,logical_key)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (normalized, step_index, None, payload["event_type"], payload["display_kind"], payload["list_text"],
-                     payload["detail_text"], json.dumps(payload, ensure_ascii=False), logical_key),
+                     payload["detail_text"], json.dumps(payload, ensure_ascii=False), self._execution_visible(payload), logical_key),
                 )
             else:
                 payload = self._json_dict(projection["payload_json"])
@@ -1967,8 +1983,8 @@ class ChatStore:
                     payload["projection_ready"] = True
                 payload["incomplete"] = bool(state.get("pending_gap"))
                 conn.execute(
-                    "UPDATE execution_steps SET detail_text=?,payload_json=? WHERE chat_id=? AND logical_key=?",
-                    (payload["detail_text"], json.dumps(payload, ensure_ascii=False), normalized, logical_key),
+                    "UPDATE execution_steps SET detail_text=?,payload_json=?,visible=? WHERE chat_id=? AND logical_key=?",
+                    (payload["detail_text"], json.dumps(payload, ensure_ascii=False), self._execution_visible(payload), normalized, logical_key),
                 )
         return {"accepted": True, "projection": payload, **state}
 
@@ -2074,12 +2090,14 @@ class ChatStore:
         limit: int = 100,
         before_step_index: int | None = None,
         include_total: bool = True,
+        visible_only: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return 0, []
         params: list[Any] = [normalized]
-        where = "chat_id = ? AND COALESCE(json_extract(payload_json, '$.projection_ready'), 1) != 0"
+        where = ("chat_id = ? AND visible=1" if visible_only else
+                 "chat_id = ? AND COALESCE(json_extract(payload_json, '$.projection_ready'), 1) != 0")
         if turn_idx is not None:
             where += " AND turn_idx = ?"
             params.append(int(turn_idx))

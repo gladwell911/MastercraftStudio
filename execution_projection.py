@@ -52,6 +52,13 @@ def execution_step_detail_text(step) -> str:
 def should_show_execution_step(step) -> bool:
     if not isinstance(step, dict):
         return bool(str(step or "").strip())
+    status = str(step.get("status") or "").strip().lower()
+    kind = str(step.get("display_kind") or "").strip().lower()
+    if (kind != "error" and status not in {"failed", "error"}
+            and step.get("exit_code") in (None, 0)
+            and str(step.get("text") or step.get("raw_text") or "").strip().lower() in {"not loaded", "notloaded"}
+            and not str(step.get("title") or step.get("command") or "").strip()):
+        return False
     display_kind = str(step.get("display_kind") or "").strip()
     event_type = str(step.get("event_type") or "").strip()
     phase = str(step.get("phase") or "").strip()

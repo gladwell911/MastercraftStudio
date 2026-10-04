@@ -1403,3 +1403,110 @@ def test_list_messages_passes_before_id_as_query_param():
 
     assert client.list_messages("s1") == []
     assert http.calls[-1]["params"] is None
+
+
+@pytest.mark.parametrize("failure", [ConnectionResetError(10054, "controlled reset"), kimi_server_client.requests.ConnectionError("controlled reset")])
+def test_local_rest_reset_get_retries_once_with_remaining_budget(failure, monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(kimi_server_client.time, "monotonic", lambda: clock[0])
+    client = KimiServerClient(http_session_factory=lambda: None)
+    calls = []
+    class Http:
+        def request(self, method, url, **kwargs):
+            calls.append(kwargs["timeout"])
+            if len(calls) == 1:
+                clock[0] += 0.01
+                raise failure
+            return FakeResponse(200, {"ok": True})
+    client._http = Http()
+    assert client._request("GET", "/api/sessions", timeout=0.2).status_code == 200
+    assert len(calls) == 2
+    assert 0 < calls[1] < calls[0] <= 0.2
+
+
+@pytest.mark.parametrize("method, expected_calls", [("GET", 2), ("POST", 1)])
+def test_local_rest_reset_exhaustion_and_unknown_post_keep_original_error(method, expected_calls):
+    client = KimiServerClient(http_session_factory=lambda: None)
+    calls = []
+    class Http:
+        def request(self, *args, **kwargs):
+            calls.append(args)
+            raise ConnectionResetError(10054, "controlled reset")
+    client._http = Http()
+    with pytest.raises(KimiServerError) as caught:
+        client._request(method, "/api/prompt", timeout=0.2)
+    assert len(calls) == expected_calls
+    assert caught.value.result_unknown == (method == "POST")
+    assert f"local REST {method} /api/prompt" in str(caught.value)
+    assert "controlled reset" in str(caught.value)
+
+
+def test_owned_local_rest_session_ignores_environment_proxy(monkeypatch):
+    client, _proc, http, _ws, _calls = make_client()
+    client.http_session_factory = None
+    http.trust_env = True
+    monkeypatch.setattr(kimi_server_client.requests, "Session", lambda: http)
+    client.start()
+    assert http.trust_env is False
+    client.close()
+
+
+def test_local_rest_reset_exhausted_budget_does_not_retry(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(kimi_server_client.time, "monotonic", lambda: clock[0])
+    client = KimiServerClient(http_session_factory=lambda: None)
+    calls = []
+    class Http:
+        def request(self, *args, **kwargs):
+            calls.append(kwargs["timeout"])
+            clock[0] += 0.3
+            raise ConnectionResetError(10054, "budget exhausted reset")
+    client._http = Http()
+    with pytest.raises(KimiServerError, match="budget exhausted reset"):
+        client._request("GET", "/api/sessions", timeout=0.2)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("phase", ["start", "retry"])
+def test_owned_local_rest_session_is_configured_before_other_owners_can_observe_it(monkeypatch, phase):
+    configuring, release = threading.Event(), threading.Event()
+    class Session(FakeHttpSession):
+        def __init__(self):
+            super().__init__()
+            self._trust_env = True
+        @property
+        def trust_env(self): return self._trust_env
+        @trust_env.setter
+        def trust_env(self, value):
+            configuring.set()
+            assert release.wait(2)
+            self._trust_env = value
+    fresh = Session()
+    client, _proc, old, _ws, _calls = make_client()
+    client.http_session_factory = None
+    monkeypatch.setattr(kimi_server_client.requests, "Session", lambda: fresh)
+    if phase == "retry":
+        client._http = old
+        def reset(*args, **kwargs): raise ConnectionResetError(10054, "controlled reset")
+        monkeypatch.setattr(old, "request", reset)
+        monkeypatch.setattr(old, "close", lambda: None, raising=False)
+    expected = old if phase == "retry" else None
+    errors = []
+    def operation():
+        try:
+            if phase == "start": client.start()
+            else: client._request("GET", "/api/sessions", timeout=1)
+        except Exception as exc: errors.append(exc)
+    worker = threading.Thread(target=operation)
+    worker.start()
+    try:
+        assert configuring.wait(1)
+        assert client._http is expected
+        release.set()
+        worker.join(2)
+        assert not worker.is_alive() and errors == []
+        assert client._http is fresh and fresh.trust_env is False
+    finally:
+        release.set()
+        worker.join(2)
+        client.close()

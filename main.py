@@ -4359,6 +4359,20 @@ class ChatFrame(wx.Frame):
             return None
         if not getattr(self, "_chat_store_enabled", False):
             return chat
+        chat_id = str(chat.get("id") or "").strip()
+        store = getattr(self, "chat_store", None)
+        if not include_execution_steps and chat_id and not isinstance(chat.get("execution_steps"), list) and hasattr(store, "load_recent_execution_steps"):
+            try:
+                known = getattr(self, "_execution_known_tail", None)
+                if known and known[0][0] == chat_id and known[0][-1] == self._safe_int(chat.get("revision"), 1):
+                    tail = known[1]
+                else:
+                    _, tail = store.load_recent_execution_steps(
+                        chat_id, limit=EXECUTION_LIST_DEFAULT_VISIBLE_ROWS + 1,
+                        include_total=False, visible_only=True)
+                chat["execution_steps"] = list(tail)
+            except (sqlite3.Error, OSError):
+                pass
         turns = chat.get("turns")
         if isinstance(turns, list) and (
             not include_execution_steps or isinstance(chat.get("execution_steps"), list)
@@ -5252,7 +5266,7 @@ class ChatFrame(wx.Frame):
         except ValueError:
             return len(ids)
 
-    def _upsert_history_row(self, chat_id: str, *, allow_reorder: bool = True) -> bool:
+    def _upsert_history_row(self, chat_id: str, *, allow_reorder: bool = True, message_fact: bool = False) -> bool:
         if not hasattr(self, "history_list_model"):
             self._refresh_history(chat_id)
             return True
@@ -5267,7 +5281,7 @@ class ChatFrame(wx.Frame):
             changed = self.history_list_model.insert(item_id, label, index)
         else:
             changed = self.history_list_model.update_label(item_id, label)
-            if allow_reorder and not (self._navigation_quiet_active() or self._primary_navigation_control_is_recently_active()):
+            if allow_reorder and (message_fact or not (self._navigation_quiet_active() or self._primary_navigation_control_is_recently_active())):
                 changed = self.history_list_model.move(item_id, self._desired_history_index(item_id)) or changed
             elif allow_reorder:
                 self._pending_history_reorder = True
@@ -6340,7 +6354,7 @@ class ChatFrame(wx.Frame):
     def _record_chat_activity(self, chat: dict, observed_at: float) -> None:
         """Record an accepted message fact using the persisted history clock."""
         chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), float(observed_at))
-        self._mark_history_list_dirty()
+        self._upsert_history_row(str(chat.get("id") or ""), message_fact=True)
         self._defer_chat_state_save()
 
     def _mark_history_list_dirty(self, keep_id: str | None = None) -> None:
@@ -6920,7 +6934,9 @@ class ChatFrame(wx.Frame):
             if self._execution_list_visible_for_updates():
                 self._schedule_idle_ui_refresh()
             return
+        rows = rows[-(key[3] + 1):]
         self._execution_scan_result = (key, rows)
+        self._execution_known_tail = ((key[0], key[1], key[2], key[-1]), rows[-(key[3] + 1):])
         if self._execution_list_visible_for_updates() and not self._navigation_quiet_active():
             self._rebuild_execution_list_from_state()
         elif self._execution_list_visible_for_updates():
@@ -6931,64 +6947,31 @@ class ChatFrame(wx.Frame):
         cached = getattr(self, "_execution_scan_result", None)
         if cached and cached[0] == key:
             return len(cached[1]), cached[1]
-        memory = list(self._current_execution_steps())
-        key = self._execution_scan_key()
-        chat_id, _mode, turn_idx, limit = key[:4]
-        store = getattr(self, "chat_store", None)
-        if not (getattr(self, "_chat_store_enabled", False) and store is not None
-                and chat_id and hasattr(store, "load_recent_execution_steps")):
-            return len(memory), memory
-        cached = getattr(self, "_execution_scan_result", None)
-        if cached and cached[0] == key:
-            return len(cached[1]), cached[1]
-        pending = getattr(self, "_execution_scan_pending", None)
-        if pending and pending[0] == key:
+        # The first frame uses only the current owner's bounded known tail.
+        # Freshness changes never discard valid rows of the same revision.
+        state = (self._find_archived_chat(self.view_history_id) if self.view_mode == "history"
+                 else getattr(self, "_current_chat_state", None))
+        memory = (state or {}).get("execution_steps", [])
+        limit = key[3]
+        memory = list(memory[-(limit + 1):]) if isinstance(memory, list) else []
+        if key[1] == "active":
+            memory = [item for item in memory if not isinstance(item, dict)
+                      or "turn_idx" not in item or self._safe_int(item.get("turn_idx"), -1) == key[2]]
+        owner = (key[0], key[1], key[2], key[-1])
+        known = getattr(self, "_execution_known_tail", None)
+        known_rows = known[1] if known and known[0] == owner else []
+        memory_ids = {self._execution_merge_identity(item) for item in memory}
+        if all(self._execution_merge_identity(item) in memory_ids for item in known_rows):
+            rows = [item for item in memory if self._should_show_execution_step(item)]
+        else:
+            rows = self._merge_execution_page(known_rows, memory)
+        self._execution_known_tail = (owner, rows[-(limit + 1):])
+        self._prepare_execution_scan()
+        if (not rows and key[1] == "history"
+                and not isinstance((state or {}).get("execution_steps"), list)
+                and getattr(self, "_execution_scan_pending", None)):
             raise ExecutionPagePending()
-        if pending:
-            pending[1].set()
-        total, page = store.load_recent_execution_steps(chat_id, turn_idx=turn_idx, limit=limit)
-        complete_memory = len(memory) >= total and (
-            self.view_mode == "active" or len({item["_store_step_index"] for item in memory
-                if isinstance(item, dict) and "_store_step_index" in item}) >= total)
-        if complete_memory:
-            return len(memory), memory
-        persisted = list(page)
-        merged = self._merge_execution_page(persisted, memory)
-        def needs_more(page, merged):
-            return (bool(page) and "_store_step_index" in page[0]
-                    and len(page) == limit and len(merged) <= limit)
-        # At most two bounded reads on the GUI thread, even for a hidden tail.
-        if needs_more(page, merged):
-            _, page = store.load_recent_execution_steps(
-                chat_id, turn_idx=turn_idx, limit=limit,
-                before_step_index=page[0]["_store_step_index"], include_total=False)
-            persisted = page + persisted
-            merged = self._merge_execution_page(persisted, memory)
-        if not needs_more(page, merged):
-            return len(merged), merged
-        stop = threading.Event()
-        self._execution_scan_pending = (key, stop)
-        memory = copy.deepcopy(memory)
-        # Only the pure visibility/merge helpers run here; all wx access and
-        # state publication occurs in the guarded completion callback.
-        def scan():
-            nonlocal page, persisted, merged
-            error = None
-            try:
-                while not stop.is_set() and needs_more(page, merged):
-                    _, page = store.load_recent_execution_steps(
-                        chat_id, turn_idx=turn_idx, limit=limit,
-                        before_step_index=page[0]["_store_step_index"], include_total=False)
-                    persisted = page + persisted
-                    merged = self._merge_execution_page(persisted, memory)
-                    # Hidden rows are no longer needed once overrides applied.
-                    persisted = [item for item in persisted if self._should_show_execution_step(item)]
-            except Exception as exc:
-                error = exc
-            if not stop.is_set():
-                wx.CallAfter(self._finish_execution_scan, key, stop, merged, error)
-        threading.Thread(target=scan, name="execution-page", daemon=True).start()
-        raise ExecutionPagePending()
+        return len(rows), rows
 
     def _current_execution_steps(self) -> list:
         if self.view_mode == "history":
@@ -8645,14 +8628,6 @@ class ChatFrame(wx.Frame):
         return "\n".join(kept).strip()
 
     def _should_show_execution_step(self, step) -> bool:
-        if isinstance(step, dict):
-            status = str(step.get("status") or "").strip().lower()
-            display_kind = str(step.get("display_kind") or "").strip().lower()
-            if (display_kind != "error" and status not in {"failed", "error"}
-                    and step.get("exit_code") in (None, 0)
-                    and str(step.get("text") or step.get("raw_text") or "").strip().lower() in {"not loaded", "notloaded"}
-                    and not str(step.get("title") or step.get("command") or "").strip()):
-                return False
         return should_show_execution_step(step)
 
     def _execution_page_projection(self) -> tuple[list, list]:
@@ -8943,6 +8918,11 @@ class ChatFrame(wx.Frame):
                     chat_id, turn_idx=turn_idx, limit=limit)
                 persisted = list(page)
                 rows = self._merge_execution_page(persisted, memory)
+                if _mode == "active" and len(memory) >= _total:
+                    # Complete live memory owns insertion order, including
+                    # legacy rows without timestamps ahead of new stream rows.
+                    rows = [item for item in memory if self._should_show_execution_step(item)]
+                    page = []
                 while (not stop.is_set() and page and len(page) == limit
                        and "_store_step_index" in page[0] and len(rows) <= limit):
                     _, page = store.load_recent_execution_steps(

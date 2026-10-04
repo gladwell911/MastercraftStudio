@@ -62,13 +62,10 @@ def test_history_navigation_stays_stable_when_background_chat_title_updates(fram
     frame._on_done(0, "background answer", "", main.DEFAULT_CODEX_MODEL, "", "chat-old")
     wx_app.Yield()
 
-    assert frame.history_list.GetSelection() == 0
-    assert frame.history_ids == ["chat-active", "chat-old"]
-    assert frame.history_list.GetString(1)
-    frame._navigation_quiet_until = 0.0
-    frame._last_primary_interaction_at = 0.0
-    frame._flush_idle_ui_refreshes()
-    wx_app.Yield()
+    assert frame.history_list_model.selected_id() == "chat-active"
+    assert frame.history_ids == ["chat-old", "chat-active"]
+    assert frame.history_list.GetString(0)
+    assert frame._navigation_quiet_active()
     assert frame.history_ids == ["chat-old", "chat-active"]
     assert frame.history_list_model.selected_id() == "chat-active"
     assert _focused_control() is focus_before

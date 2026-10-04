@@ -1299,3 +1299,109 @@ def test_outbox_checkpoint_includes_legal_max_int64_ack(tmp_path):
     assert final["sync_sequence"] == MAX_INT64
     store.mark_outbox_acked(MAX_INT64, pair_id="pair", domain="events", consumer_id="publisher:pair")
     assert store.get_checkpoint("publisher:pair", "events", pair_id="pair") == MAX_INT64
+
+
+def test_visible_execution_tail_skips_hidden_suffix_and_preserves_owner_and_cursor(tmp_path, monkeypatch):
+    store = ChatStore(tmp_path / "visible-tail.db", max_execution_steps_per_turn=5000)
+    store.initialize()
+    for owner in ("owner", "other"):
+        store.append_execution_step(owner, {"turn_idx": 0, "display_kind": "commentary", "list_text": owner + " real visible"})
+    store.replace_execution_steps("owner", [{"turn_idx": 0, "display_kind": "commentary", "list_text": "owner real visible"}]
+        + [{"turn_idx": 0, "display_kind": "commentary", "text": "notLoaded", "list_text": "notLoaded"} for _ in range(3000)])
+    _, raw = store.load_recent_execution_steps("owner", limit=101, include_total=False)
+    assert len(raw) == 101 and all(row["text"] == "notLoaded" for row in raw)
+    import chat_store
+    monkeypatch.setattr(chat_store, "should_show_execution_step", lambda _row: (_ for _ in ()).throw(AssertionError("read invoked predicate")))
+    with store._connect() as conn:
+        query_plan = conn.execute("EXPLAIN QUERY PLAN SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? AND visible=1 ORDER BY step_index DESC LIMIT ?", ("owner", 101)).fetchall()
+    assert any("idx_execution_visible_tail" in row["detail"] for row in query_plan)
+    _, visible = store.load_recent_execution_steps("owner", limit=101, include_total=False, visible_only=True)
+    assert [row["list_text"] for row in visible] == ["owner real visible"]
+    assert visible[0]["_store_step_index"] == 0
+    _, empty = store.load_recent_execution_steps("owner", limit=101, include_total=False,
+        visible_only=True, before_step_index=visible[0]["_store_step_index"])
+    assert empty == []
+
+
+def test_execution_visibility_migration_backfills_once_and_rolls_back_failure(tmp_path, monkeypatch):
+    import chat_store
+    store = ChatStore(tmp_path / "visibility-migration.db")
+    store.initialize()
+    payloads = [{"display_kind": "commentary", "list_text": "visible"},
+        {"display_kind": "commentary", "list_text": "notLoaded", "text": "notLoaded"},
+        {"display_kind": "commentary", "list_text": "unready", "projection_ready": False}]
+    store.replace_execution_steps("owner", payloads)
+    with store._connect() as conn:
+        original = [tuple(row) for row in conn.execute("SELECT step_index,payload_json FROM execution_steps ORDER BY step_index")]
+        conn.execute("DROP INDEX idx_execution_visible_tail")
+        conn.execute("ALTER TABLE execution_steps DROP COLUMN visible")
+    predicate = chat_store.should_show_execution_step
+    monkeypatch.setattr(chat_store, "should_show_execution_step", lambda _p: (_ for _ in ()).throw(ValueError("migration failure")))
+    with pytest.raises(ValueError, match="migration failure"):
+        store.initialize()
+    with store._connect() as conn:
+        assert "visible" not in {row["name"] for row in conn.execute("PRAGMA table_info(execution_steps)")}
+        assert [tuple(row) for row in conn.execute("SELECT step_index,payload_json FROM execution_steps ORDER BY step_index")] == original
+    calls = []
+    monkeypatch.setattr(chat_store, "should_show_execution_step", lambda p: calls.append(p) or predicate(p))
+    store.initialize()
+    assert len(calls) == 2  # unready rows are rejected before the shared predicate
+    with store._connect() as conn:
+        assert [row["visible"] for row in conn.execute("SELECT visible FROM execution_steps ORDER BY step_index")] == [1, 0, 0]
+        assert [tuple(row) for row in conn.execute("SELECT step_index,payload_json FROM execution_steps ORDER BY step_index")] == original
+    calls.clear()
+    store.initialize()
+    assert calls == []
+
+
+@pytest.mark.parametrize("writer", ["append", "logical_append", "upsert", "identity", "logical_identity", "lifecycle"])
+def test_execution_visibility_writers_track_hidden_and_readiness_transitions(tmp_path, writer):
+    store = ChatStore(tmp_path / (writer + ".db"))
+    store.initialize()
+    scope = {"chat_id": "owner", "revision": 1, "thread_id": "session", "turn_id": "turn",
+        "provider": "kimi", "agent_id": "", "native_id": "item"}
+    key = store.execution_logical_key(scope)
+    base = {"turn_idx": 0, "thread_id": "session", "turn_id": "turn", "item_id": "item",
+        "event_type": "item_started", "source_kind": "tool.call.started", "display_kind": "commentary"}
+    if writer in {"logical_append", "upsert", "logical_identity"}:
+        base.update(logical_key=key, logical_scope=scope, provider="kimi", revision=1, agent_id="")
+    def write(payload, initial=False):
+        if writer == "append": store.replace_execution_steps("owner", [payload])
+        elif writer == "logical_append":
+            with store._connect() as conn: store._append_execution_step_on_conn(conn, "owner", payload)
+        elif writer == "upsert": store.upsert_execution_step("owner", payload)
+        elif initial: store.append_execution_step("owner", payload)
+        elif writer == "lifecycle":
+            store.replace_execution_steps("owner", [dict(payload, event_type="item_started")])
+            assert store.replace_execution_lifecycle_step("owner", dict(payload, event_type="item_completed"))
+        else: assert store.update_execution_step_by_identity("owner", payload)
+    for index, (ready, text, expected) in enumerate([(False, "real", 0), (True, "real", 1), (True, "notLoaded", 0), (True, "real again", 1)]):
+        write(dict(base, list_text=text, text=text, projection_ready=ready), initial=index == 0)
+        with store._connect() as conn:
+            rows = conn.execute("SELECT visible,payload_json FROM execution_steps WHERE chat_id='owner'").fetchall()
+        assert len(rows) == 1 and rows[0]["visible"] == expected
+        assert "visible" not in json.loads(rows[0]["payload_json"])
+        _, visible = store.load_recent_execution_steps("owner", visible_only=True, include_total=False)
+        assert len(visible) == expected
+
+
+def test_execution_visibility_fragment_seed_replay_and_existing_projection(tmp_path):
+    store = ChatStore(tmp_path / "visible-fragment.db")
+    store.initialize()
+    scope = {"chat_id": "owner", "revision": 1, "thread_id": "session", "turn_id": "turn",
+        "provider": "kimi", "agent_id": "", "native_id": "item"}
+    key = store.execution_logical_key(scope)
+    def visible():
+        with store._connect() as conn:
+            return conn.execute("SELECT visible FROM execution_steps WHERE chat_id='owner'").fetchone()["visible"]
+    store.apply_execution_fragment("owner", key, scope, fragment_id="first", offset=0, text="a")
+    assert visible() == 0
+    store.apply_execution_fragment("owner", key, scope, fragment_id="first", offset=0, text="a",
+        projection_seed={"list_text": "real", "text": "real", "display_kind": "commentary"})
+    assert visible() == 1
+    store.apply_execution_fragment("owner", key, scope, fragment_id="next", offset=1, text="b",
+        projection_seed={"list_text": "notLoaded", "text": "notLoaded", "display_kind": "commentary"})
+    assert visible() == 0
+    store.apply_execution_fragment("owner", key, scope, fragment_id="last", offset=2, text="c",
+        projection_seed={"list_text": "real again", "text": "real again", "display_kind": "commentary"})
+    assert visible() == 1
