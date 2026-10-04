@@ -1922,11 +1922,14 @@ def test_hidden_execution_preparation_retries_failure_and_rejects_old_owner(fram
     frame._invalidate_execution_scan()
 
 
-def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame, wx_app, monkeypatch, tmp_path):
+@pytest.mark.parametrize("owner_mode", ["history", "running"], ids=["persisted_history", "running_owner"])
+def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame, wx_app, monkeypatch, tmp_path, owner_mode):
+    from owned_window_qa import activate_owned_frame
     event_loop = main.wx.GUIEventLoop()
     activator = main.wx.EventLoopActivator(event_loop)
+    wx_app.SetTopWindow(frame)
     monkeypatch.setattr(main, "_wx_app_allows_ui_timers", lambda: True)
-    _activate_frame(frame, wx_app)
+    activate_owned_frame(frame)
     store = main.ChatStore(str(tmp_path / "immediate-tail.db"), max_execution_steps_per_turn=5000)
     store.initialize()
     store.upsert_chat({"id": "cold-owner", "revision": 1})
@@ -1942,11 +1945,18 @@ def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame
     predicate = chat_store.should_show_execution_step
     monkeypatch.setattr(chat_store, "should_show_execution_step", lambda row: calls.append(row) or predicate(row))
     opened_at = time.perf_counter()
-    assert frame._show_history_chat("cold-owner")
+    if owner_mode == "history":
+        assert frame._show_history_chat("cold-owner")
+    else:
+        assert frame._switch_current_chat("cold-owner")
+        frame._current_chat_state["turns"][0]["request_status"] = "pending"
+        frame.is_running = True
     assert time.perf_counter() - opened_at < 0.5
     assert calls == []
-    assert [row["list_text"] for row in frame.archived_chats[0]["execution_steps"]] == ["real persisted tail"]
-    frame.view_mode, frame.view_history_id = "history", "cold-owner"
+    chat = frame.archived_chats[0] if owner_mode == "history" else frame._current_chat_state
+    assert [row["list_text"] for row in chat["execution_steps"]] == ["real persisted tail"]
+    if owner_mode == "history":
+        frame.view_mode, frame.view_history_id = "history", "cold-owner"
     frame._apply_detail_panel_mode("answers", refresh_execution=False)
     started, release = threading.Event(), threading.Event()
     original = store.load_recent_execution_steps
@@ -1962,6 +1972,9 @@ def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame
         frame.input_edit.SetFocusFromKbd()
         wx_app.Yield()
         hwnd = frame.input_edit.GetHandle()
+        assert frame.input_edit.HasFocus()
+        # wx event injection covers the UI route; physical F1 injection is
+        # recorded separately as unavailable in this workstation session.
         main.wx.CallAfter(_dispatch_frame_key, frame, main.wx.WXK_F1)
         assert _yield_until(wx_app, lambda: frame._detail_panel_mode() == "execution", timeout=0.5)
         assert frame.input_edit.GetHandle() == hwnd
@@ -1971,14 +1984,14 @@ def test_f1_first_frame_uses_real_owner_tail_while_initial_scan_is_blocked(frame
         assert not release.is_set()
         assert any("real persisted tail" in row for row in frame.execution_list.GetStrings())
         assert "正在加载执行过程" not in frame.execution_list.GetStrings()
-        frame.archived_chats[0]["execution_steps"].append({"display_kind": "commentary", "list_text": "real new step"})
+        chat["execution_steps"].append({"display_kind": "commentary", "list_text": "real new step"})
         frame._mark_execution_list_dirty()
         frame._apply_detail_panel_mode("answers", refresh_execution=False)
         frame._apply_detail_panel_mode("execution", refresh_execution=True)
         assert any("real new step" in row for row in frame.execution_list.GetStrings())
         assert any("real persisted tail" in row for row in frame.execution_list.GetStrings())
-        frame.archived_chats[0]["revision"] = 2
-        frame.archived_chats[0]["execution_steps"] = []
+        chat["revision"] = 2
+        chat["execution_steps"] = []
         frame._mark_execution_list_dirty()
         frame._apply_detail_panel_mode("execution", refresh_execution=True)
         assert not any("real persisted tail" in row or "real new step" in row for row in frame.execution_list.GetStrings())

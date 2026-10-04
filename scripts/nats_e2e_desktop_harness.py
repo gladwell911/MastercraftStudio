@@ -75,6 +75,15 @@ class CrossClientHarnessState:
         self.information_revisions: dict[str, int] = {}
         self.information_full_reads: dict[str, int] = {}
         self._persist_chat(self.chats[CHAT_ID])
+        self.recency = os.environ.get("E2E_IMMEDIATE_RECENCY") == "1"
+        self.pending_recency: dict | None = None
+        if self.recency:
+            self.chats[CHAT_ID]["updated_at"] = now - 20
+            self._persist_chat(self.chats[CHAT_ID])
+            newer = {"chat_id": "chat-e2e-newer", "title": "QA newer competitor", "model": MODEL,
+                     "created_at": now - 10, "updated_at": now - 10, "turns": []}
+            self.chats[newer["chat_id"]] = newer
+            self._persist_chat(newer)
         if os.environ.get("E2E_CHAT_INFORMATION") == "1":
             kimi_information_chat = {"chat_id": "chat-e2e-kimi-information",
                 "title": seed_title + " Kimi information", "model": KIMI_MODEL,
@@ -240,6 +249,15 @@ class CrossClientHarnessState:
                 return 400, {"accepted": False, "error": "unsupported_model"}
             reply = self.kimi_reply if model == KIMI_MODEL else self.codex_reply
             now = time.time()
+            if self.recency and text == "QA staged send":
+                chat["updated_at"] = now
+                chat["turns"].append({"question": text, "answer_md": "", "model": model,
+                    "created_at": now, "pending": True, "request_status": "pending"})
+                self.pending_recency = chat
+                self._persist_chat(chat)
+                self.observed_messages.append({"chat_id": chat_id, "model": model, "text": text, "reply": "pending"})
+                self._write_result()
+                return 200, {"accepted": True, "chat_id": chat_id, "model": model}
             chat["model"] = model
             chat["updated_at"] = now
             chat["turns"].append(
@@ -271,7 +289,36 @@ class CrossClientHarnessState:
             )
             self._write_result()
             self._schedule_outbox_drain()
+            if self.recency and text == "QA release background final":
+                timer = threading.Timer(1, self._finish_recency)
+                timer.daemon = True
+                timer.start()
             return 200, {"accepted": True, "chat_id": chat_id, "model": model}
+
+    def _finish_recency(self) -> None:
+        with self._lock:
+            chat = self.pending_recency
+            if chat is None:
+                return
+            turn = chat["turns"][-1]
+            turn.update(answer_md=self.codex_reply, answer=self.codex_reply, pending=False,
+                        request_status="done", answer_at=time.time())
+            chat["updated_at"] = turn["answer_at"]
+            self._persist_chat(chat)
+            index = len(chat["turns"]) - 1
+            message_id = self.durable_store.resolve_canonical_message_by_turn(chat["chat_id"], role="assistant", turn_index=index)
+            self.durable_store.commit_message_notification_fact(pair_id=self.pair_id, domain="events",
+                chat_id=chat["chat_id"], message_id=message_id, notification_kind="assistant_final",
+                text="ignored fixture", chat_title="ignored fixture")
+            self.durable_store.commit_message_execution_projection(pair_id=self.pair_id, domain="events",
+                chat_id=chat["chat_id"], message_id=message_id, projection_kind="final")
+            self.transport.publish_event_threadsafe({"type": "history_changed", "chat_id": chat["chat_id"],
+                "event_id": "evt-" + uuid.uuid4().hex[:8], "ts": chat["updated_at"]})
+            self.observed_messages.append({"chat_id": chat["chat_id"], "model": chat["model"],
+                "text": turn["question"], "reply": self.codex_reply})
+            self.pending_recency = None
+            self._write_result()
+            self._schedule_outbox_drain()
 
     def _schedule_outbox_drain(self) -> None:
         transport = self.transport

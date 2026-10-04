@@ -4,7 +4,9 @@
 
 ## 当前有效
 
-2026-10-02 最新通知、回答时间与执行语义修复见 [交接](handoff.md)和[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)；Codex 命令审批见[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)。较早缓存/模型状态/聊天刷新与 2026-10-01 五 Epic 证据保留，只证明各自阶段。
+2026-10-04 当前状态见[交接](handoff.md)：F1 即时可视尾页与存储索引、Kimi 本机恢复、消息活动即时排序及新端到端测试。工作区报告位于 `D:/code/sj/_bmad-output/implementation-artifacts/` 的 `verify-immediate-execution-kimi-chat-recency.md` 和 `tests/immediate-e2e-20261004/verify.md`；复跑命令和验证边界已写入交接。
+
+既有通知、回答时间与执行语义的[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)、Codex 审批[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)保留，仅证明相应版本。
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
@@ -32,6 +34,8 @@
 - 执行列表的旧 15 项失败已在上述执行规格逐项归类并修复/更新契约；最终定向验收去重 467 项通过，不代表冻结基线的其他领域或全笔记领域已验证。
 - 旧 V2 远程执行事实流仍以 `durable_facts` 为来源；手机可视执行页优先使用 `execution_page_v3`，与桌面共用 canonical `execution_steps` 投影。v3 的 SQLite 快照行与分页游标按 chat/revision 隔离，V2 仍供旧客户端使用。
 - 桌面执行项按 owner/revision/turn/provider/native event 身份归并；时间节点以“上一次实际显示时间的过程”为累计 300 秒基准，而不是比较相邻行。
+- ChatStore 的 `execution_steps.visible` 在写入时按共享规则维护，旧库初始化一次原子回填；`idx_execution_visible_tail` 支持真实可视尾页有界读取。F1 复用同 owner/revision 的已知尾页，完整补齐在 worker，不能用原始行 LIMIT 或运行时 UDF 扫描假称前台工作量有界。
+- 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
 - 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
 - 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。

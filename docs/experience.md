@@ -25,3 +25,10 @@ Startup buffering must only defer newly unacknowledged events. Preserve prior na
 
 - 先核对交付树 HEAD，不用主树或旧日志代替；锁屏可见像素、对象字段、跨端传输分别记录。
 - `Raise()` 和 wx 内部焦点不足以证明 Windows 前台。使用 `tests/owned_window_qa.py` 真实点击测试窗口标题栏，严格检查 HWND 后保留原键盘和焦点断言；finally 恢复置顶状态和鼠标，不添加全局键盘钩子。
+
+## 2026-10-04 当前补充
+
+- 聊天活动：发送接受与首次成功权威终答直接更新对应历史行，绕过导航静默；失败、读取、元数据和重放不推进时间。保留置顶分组、行身份和焦点，用更新的竞争聊天验证终答再次置顶。此规则替代上文仅调用 history dirty helper 的旧做法。
+- 执行投影：写入维护 visible 位，初始化一次原子回填，部分索引获取可见尾部。LIMIT 不证明扫描工作有界；用大量隐藏后缀与 SQLite 指令数验证。F1 展示当前 owner/view/turn/revision 的真实尾页，dirty 只使扫描新鲜度失效，worker 补齐；冷打开通过可视索引获取真实内容。
+- Kimi 自有 REST Session 在共享前设置 trust_env=False，WS 绕过本机代理；GET 最多一次剩余预算内恢复，POST 结果不明不重发。provider 的 10054 仍是失败，不得根据错误文字假称恢复。
+- 桌面验证区分 HWND WM_CHAR/BM_CLICK、wx F1 事件、窗口键消息与物理 SendInput。本轮物理 F1 未证明；真实回环 TCP reset 恢复也不证明公网 Kimi 根因。
