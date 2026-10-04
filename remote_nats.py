@@ -14,6 +14,8 @@ from remote_nats_protocol import (
     build_error_response,
     build_response_event,
     encode_payload,
+    decode_payload,
+    validate_v2_durable,
     make_event_id,
     validate_v2_ephemeral,
 )
@@ -93,8 +95,9 @@ class RemoteNatsTransport:
         self.protocol_version = 1
         self.connection_epoch = uuid.uuid4().hex
         self._sessions: dict[tuple[str, str], tuple[int, str]] = {}
-        self._outbox_lock: asyncio.Lock | None = None
-        self._outbox_retry_task: asyncio.Task | None = None
+        self._outbox_locks = {lane: asyncio.Lock() for lane in ("notification", "other")}
+        self._outbox_tasks: dict[str, asyncio.Task] = {}
+        self._outbox_delays = {lane: 0.25 for lane in self._outbox_locks}
         self._nats_client: Any | None = None
         self._command_subscription: Any | None = None
         self._thread: threading.Thread | None = None
@@ -142,7 +145,7 @@ class RemoteNatsTransport:
             manual_ack=True,
             cb=self._handle_nats_message,
         )
-        await self.drain_outbox()
+        self._start_outbox_workers()
 
     def start_threaded(self, url: str = "nats://127.0.0.1:4222", timeout: float = 10) -> None:
         if self._thread and self._thread.is_alive():
@@ -265,45 +268,86 @@ class RemoteNatsTransport:
         subject = self.subjects.files if event_type.startswith("file_") else self.subjects.events
         await self.jetstream.publish(subject, encode_payload(event))
 
-    async def drain_outbox(self) -> int:
-        """Publish serially. A failed/poison row prevents all later rows bypassing it."""
-        if self.jetstream is None or self.durable_store is None:
-            return 0
-        if self._outbox_lock is None:
-            self._outbox_lock = asyncio.Lock()
-        if self._outbox_lock.locked():
-            return 0
-        published = 0
-        async with self._outbox_lock:
-          for row in self.durable_store.pending_outbox(pair_id=self.subjects.pair_id):
-            if row.get("blocked_reason"):
-                break
-            subject = self.subjects.files if row["subject_domain"] == "files" else self.subjects.events
-            try:
-                ack = await self.jetstream.publish(subject, bytes(row["payload"]))
-                # JetStream publish completion is the server ACK boundary.
-                if ack is None and type(self.jetstream).__module__.startswith("nats"):
-                    raise RuntimeError("missing_publish_ack")
-                self.durable_store.mark_outbox_acked(
-                    row["sync_sequence"], pair_id=row["pair_id"], domain=row["domain"],
-                    consumer_id=f"publisher:{row['pair_id']}",
-                )
-                published += 1
-            except Exception as exc:
-                self.durable_store.record_outbox_failure(row["sync_sequence"], str(exc), pair_id=row["pair_id"], domain=row["domain"])
-                latest = self.durable_store.pending_outbox(1, pair_id=self.subjects.pair_id)
-                if latest and not latest[0].get("blocked_reason"):
-                    self._schedule_outbox_retry()
-                break
-        return published
+    def _start_outbox_workers(self) -> list[asyncio.Future]:
+        if self._stop_requested or self.jetstream is None or self.durable_store is None:
+            return []
+        started = []
+        for lane in ("notification", "other"):
+            task = self._outbox_tasks.get(lane)
+            if task is None or task.done():
+                report = asyncio.get_running_loop().create_future()
+                task = asyncio.create_task(self._outbox_worker(lane, report))
+                self._outbox_tasks[lane] = task
+                started.append(report)
+        return started
 
-    def _schedule_outbox_retry(self) -> None:
-        if self._outbox_retry_task is not None and not self._outbox_retry_task.done():
-            return
-        async def retry() -> None:
-            await asyncio.sleep(0.25)
-            await self.drain_outbox()
-        self._outbox_retry_task = asyncio.create_task(retry())
+    async def drain_outbox(self) -> int:
+        """Await one bounded batch in each independent lane."""
+        reports = self._start_outbox_workers()
+        if not reports:
+            return 0
+        # Workers report their first batch while continuing backlog/retry in place.
+        results = await asyncio.gather(*reports)
+        return sum(results)
+
+    async def _outbox_worker(self, lane: str, report: asyncio.Future) -> None:
+        try:
+            while not self._stop_requested:
+                async with self._outbox_locks[lane]:
+                    count, retry, more = await self._drain_outbox_lane(lane)
+                if not report.done():
+                    report.set_result(count)
+                if count:
+                    self._outbox_delays[lane] = 0.25
+                if not retry and not more:
+                    return
+                if retry:
+                    await asyncio.sleep(self._outbox_delays[lane])
+                    self._outbox_delays[lane] = min(30.0, self._outbox_delays[lane] * 2)
+                else:
+                    await asyncio.sleep(0)
+        finally:
+            if not report.done():
+                report.set_result(0)
+
+    async def _drain_outbox_lane(self, lane: str) -> tuple[int, bool, bool]:
+        published = 0
+        try:
+            rows = self.durable_store.pending_outbox(pair_id=self.subjects.pair_id, lane=lane)
+            for row in rows:
+                if self._stop_requested:
+                    return published, False, False
+                if str(row.get("blocked_reason") or "").startswith("permanent:"):
+                    return published, False, False
+                identity = dict(pair_id=row["pair_id"], domain=row["domain"])
+                raw = bytes(row["payload"])
+                try:
+                    envelope = validate_v2_durable(decode_payload(raw))
+                    if row["subject_domain"] not in {"events", "files"}:
+                        raise ValueError("INVALID_SUBJECT_DOMAIN")
+                    if (envelope["event_id"] != row["event_id"] or
+                            envelope["domain"] != row["domain"] or
+                            envelope["sync_sequence"] != row["sync_sequence"]):
+                        raise ValueError("OUTBOX_IDENTITY_MISMATCH")
+                except (ValueError, TypeError, KeyError) as exc:
+                    self.durable_store.record_outbox_failure(row["sync_sequence"], str(exc), permanent=True, **identity)
+                    if lane == "other":
+                        return published, False, False
+                    continue
+                subject = self.subjects.files if row["subject_domain"] == "files" else self.subjects.events
+                try:
+                    ack = await self.jetstream.publish(subject, raw)
+                    if ack is None and type(self.jetstream).__module__.startswith("nats"):
+                        raise RuntimeError("missing_publish_ack")
+                    self.durable_store.mark_outbox_acked(row["sync_sequence"], consumer_id=f"publisher:{row['pair_id']}", **identity)
+                    published += 1
+                except Exception as exc:
+                    self.durable_store.record_outbox_failure(row["sync_sequence"], str(exc), **identity)
+                    return published, True, False
+            return published, False, published > 0 or len(rows) == 100
+        except Exception:
+            # A lane-local store failure must not cancel the other worker.
+            return published, True, False
 
     def repair_outbox_row(self, sync_sequence: int) -> None:
         if self.durable_store is None:
@@ -327,9 +371,13 @@ class RemoteNatsTransport:
         self._thread = None
 
     async def _close_async(self) -> None:
-        if self._outbox_retry_task is not None:
-            self._outbox_retry_task.cancel()
-            self._outbox_retry_task = None
+        self._stop_requested = True
+        tasks = list(self._outbox_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._outbox_tasks.clear()
         subscription = self._command_subscription
         self._command_subscription = None
         if subscription is not None:

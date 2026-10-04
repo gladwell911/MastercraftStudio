@@ -582,47 +582,67 @@ def test_transport_routes_file_commands_to_file_callback():
     assert seen == [{"type": "file_accept", "body": {"file_id": "file-1"}}]
 
 
-def test_outbox_ack_loss_retries_identical_bytes_poison_blocks_and_repair_resumes(tmp_path):
+def test_outbox_ack_loss_automatically_retries_beyond_five_identical_bytes(tmp_path):
     class AckLossJetStream(FakeJetStream):
-        def __init__(self):
-            super().__init__()
-            self.fail = True
-
         async def publish(self, subject, payload):
             self.published.append((subject, payload))
-            if self.fail:
+            if len(self.published) <= 6:
                 raise RuntimeError("ack lost")
             return {"stream": "ok"}
 
     async def run():
         store = ChatStore(tmp_path / "outbox.db")
         store.initialize()
-        first = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"first","kind":"status","chat_id":"chat","body":{"n":1}})
-        second = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"second","kind":"status","chat_id":"chat","body":{"n":2}})
+        first = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"first","kind":"assistant_final","chat_id":"chat","body":{"n":1}})
+        second = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"second","kind":"assistant_final","chat_id":"chat","body":{"n":2}})
         jetstream = AckLossJetStream()
         transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
-
-        for _ in range(5):
-            assert await transport.drain_outbox() == 0
-        assert len(jetstream.published) == 5
-        assert len({raw for _, raw in jetstream.published}) == 1
-        assert b'"event_id":"first"' in jetstream.published[0][1]
-        assert all(b'"event_id":"second"' not in raw for _, raw in jetstream.published)
-        assert store.get_checkpoint("publisher:default", "events") == 0
-        rows = store.pending_outbox(pair_id="default")
-        assert rows[0]["blocked_reason"] == "ack lost"
-
-        jetstream.fail = False
+        transport._outbox_delays["notification"] = 0.001
         assert await transport.drain_outbox() == 0
-        assert len(jetstream.published) == 5
-        transport.repair_outbox_row(first["sync_sequence"])
-        assert await transport.drain_outbox() == 2
-        assert b'"event_id":"first"' in jetstream.published[5][1]
-        assert b'"event_id":"second"' in jetstream.published[6][1]
-        assert store.get_checkpoint("publisher:default", "events") == second["sync_sequence"]
+        assert store.get_checkpoint("publisher:default", "events") == 0
+        for _ in range(200):
+            if not store.pending_outbox(pair_id="default"):
+                break
+            await asyncio.sleep(0.005)
         assert store.pending_outbox(pair_id="default") == []
+        assert len({raw for _, raw in jetstream.published[:7]}) == 1
+        assert all(b'"event_id":"second"' not in raw for _, raw in jetstream.published[:7])
+        assert store.get_checkpoint("publisher:default", "events") == second["sync_sequence"]
+        with store._connect() as conn:
+            row = conn.execute("SELECT * FROM publication_outbox WHERE event_id='first'").fetchone()
+            assert row["attempts"] == 6 and row["blocked_reason"] is None
+        await transport._close_async()
 
     asyncio.run(run())
+
+
+def test_notification_publish_is_independent_of_hanging_other_lane(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "lanes.db")
+        store.initialize()
+        first = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"other","kind":"status","chat_id":"chat","body":{}})
+        final = store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"final","kind":"assistant_final","chat_id":"chat","body":{}})
+        entered, notified, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class HangingJetStream(FakeJetStream):
+            async def publish(self, subject, payload):
+                if b'"event_id":"other"' in payload:
+                    entered.set()
+                    await release.wait()
+                else:
+                    notified.set()
+                return {"stream":"ok"}
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=HangingJetStream(), durable_store=store)
+        drain = asyncio.create_task(transport.drain_outbox())
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(notified.wait(), 1)
+        assert [r["event_id"] for r in store.pending_outbox()] == ["other"]
+        assert store.get_checkpoint("publisher:default", "events") == 0
+        release.set()
+        assert await drain == 2
+        assert store.get_checkpoint("publisher:default", "events") == final["sync_sequence"]
+        await transport._close_async()
+    asyncio.run(run())
+
 
 
 def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch(tmp_path):
@@ -662,4 +682,209 @@ def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch(tmp
         legacy = __import__("json").loads(jetstream.published[-1][1])
         assert "protocol_version" not in legacy
 
+    asyncio.run(run())
+
+
+def test_outbox_lanes_backlog_poison_and_restart_preserve_facts(tmp_path):
+    async def run():
+        path = tmp_path / "backlog.db"
+        store = ChatStore(path)
+        store.initialize()
+        with store._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO v2_feed_state(pair_id,domain,sync_sequence) VALUES('default','__pair__',73010)")
+        for n in range(151):
+            store.commit_durable_fact(pair_id="default", domain="files", envelope={"event_id":f"file-{n}","kind":"file_offer","chat_id":"chat","body":{"n":n}})
+        for n in range(102):
+            store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":f"final-{n}","kind":"assistant_final","chat_id":"chat","body":{"n":n}})
+        with store._connect() as conn:
+            conn.execute("UPDATE publication_outbox SET blocked_reason='nats: timeout',attempts=5 WHERE event_id='file-0'")
+            conn.execute("UPDATE publication_outbox SET payload=? WHERE event_id='final-0'", (b'invalid',))
+            original = [(r["event_id"],bytes(r["payload"])) for r in conn.execute("SELECT * FROM publication_outbox ORDER BY sync_sequence")]
+        assert len(store.pending_outbox(lane="notification")) == 100
+        assert all(r["event_id"].startswith("file-") for r in store.pending_outbox(lane="other"))
+        store = ChatStore(path)
+        store.initialize()
+        assert store.pending_outbox(lane="other")[0]["sync_sequence"] == 73011
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
+        await transport.drain_outbox()
+        await asyncio.gather(*transport._outbox_tasks.values())
+        pending = store.pending_outbox()
+        assert len(pending) == 1 and pending[0]["event_id"] == "final-0"
+        assert pending[0]["blocked_reason"].startswith("permanent:")
+        assert store.get_checkpoint("publisher:default", "events") == 0
+        with store._connect() as conn:
+            after = [(r["event_id"],bytes(r["payload"])) for r in conn.execute("SELECT * FROM publication_outbox ORDER BY sync_sequence")]
+            assert original == after
+            assert conn.execute("SELECT blocked_reason FROM publication_outbox WHERE event_id='file-0'").fetchone()[0] is None
+        assert len(jetstream.published) == 252
+        await transport._close_async()
+        reopened = ChatStore(path)
+        reopened.initialize()
+        restarted_js = FakeJetStream()
+        restarted = RemoteNatsTransport(pair_id="default", token="secret", jetstream=restarted_js, durable_store=reopened)
+        assert await restarted.drain_outbox() == 0
+        assert restarted_js.published == []
+        await restarted._close_async()
+    asyncio.run(run())
+
+
+def test_other_mark_failure_and_shutdown_do_not_block_notifications(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "mark.db")
+        store.initialize()
+        for kind in ("status", "assistant_final"):
+            store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":kind,"kind":kind,"chat_id":"chat","body":{}})
+        mark = store.mark_outbox_acked
+        def fail_other(sequence, **kwargs):
+            if sequence == 1:
+                raise RuntimeError("store unavailable for other")
+            return mark(sequence, **kwargs)
+        store.mark_outbox_acked = fail_other
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
+        assert await transport.drain_outbox() == 1
+        for _ in range(5):
+            assert await transport.drain_outbox() == 0
+        assert len(jetstream.published) == 2
+        assert [r["event_id"] for r in store.pending_outbox()] == ["status"]
+        tasks = list(transport._outbox_tasks.values())
+        await transport._close_async()
+        assert all(t.done() for t in tasks)
+        assert await transport.drain_outbox() == 0
+        assert len(jetstream.published) == 2
+    asyncio.run(run())
+
+
+def test_notification_enqueued_during_publish_drains_without_another_trigger(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "wake.db")
+        store.initialize()
+        def enqueue(identity):
+            store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":identity,"kind":"assistant_final","chat_id":"chat","body":{}})
+        enqueue("first")
+        entered, release, second = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class SuspendedJetStream(FakeJetStream):
+            async def publish(self, subject, payload):
+                self.published.append((subject, payload))
+                if b'"event_id":"first"' in payload:
+                    entered.set()
+                    await release.wait()
+                else:
+                    second.set()
+        js = SuspendedJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=js, durable_store=store)
+        initial = asyncio.create_task(transport.drain_outbox())
+        await entered.wait()
+        enqueue("second")
+        await transport.drain_outbox()
+        release.set()
+        await initial
+        await asyncio.wait_for(second.wait(), 1)
+        assert store.pending_outbox() == []
+        await transport._close_async()
+    asyncio.run(run())
+
+
+def test_success_resets_retry_delay_before_next_failure(tmp_path, monkeypatch):
+    async def run():
+        store = ChatStore(tmp_path / "delay.db")
+        store.initialize()
+        def enqueue(identity):
+            store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":identity,"kind":"assistant_final","chat_id":"chat","body":{}})
+        enqueue("success")
+        class FailingJetStream(FakeJetStream):
+            async def publish(self, subject, payload):
+                if b'"event_id":"failure"' in payload:
+                    raise RuntimeError("temporary")
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=FailingJetStream(), durable_store=store)
+        transport._outbox_delays["notification"] = 30
+        await transport.drain_outbox()
+        await asyncio.gather(*transport._outbox_tasks.values())
+        assert transport._outbox_delays["notification"] == 0.25
+        cooldown, release = asyncio.Event(), asyncio.Event()
+        observed = []
+        async def sleep(delay):
+            observed.append(delay)
+            cooldown.set()
+            await release.wait()
+        monkeypatch.setattr("remote_nats.asyncio.sleep", sleep)
+        enqueue("failure")
+        await transport.drain_outbox()
+        await cooldown.wait()
+        assert observed == [0.25]
+        await transport._close_async()
+    asyncio.run(run())
+
+
+def test_other_lane_query_failure_does_not_block_notification(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "query.db")
+        store.initialize()
+        store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"final","kind":"assistant_final","chat_id":"chat","body":{}})
+        pending = store.pending_outbox
+        def query(*args, **kwargs):
+            if kwargs.get("lane") == "other":
+                raise RuntimeError("other query unavailable")
+            return pending(*args, **kwargs)
+        store.pending_outbox = query
+        js = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=js, durable_store=store)
+        assert await transport.drain_outbox() == 1
+        assert len(js.published) == 1 and pending() == []
+        await transport._close_async()
+    asyncio.run(run())
+
+
+def test_close_cancels_hanging_publish_without_ack(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "cancel.db")
+        store.initialize()
+        store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"final","kind":"assistant_final","chat_id":"chat","body":{}})
+        entered, blocked, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class HangingJetStream(FakeJetStream):
+            async def publish(self, subject, payload):
+                entered.set()
+                try:
+                    await blocked.wait()
+                finally:
+                    cancelled.set()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=HangingJetStream(), durable_store=store)
+        drain = asyncio.create_task(transport.drain_outbox())
+        await entered.wait()
+        tasks = list(transport._outbox_tasks.values())
+        await asyncio.wait_for(transport._close_async(), 1)
+        assert await drain == 0
+        assert cancelled.is_set() and not blocked.is_set()
+        assert all(task.done() for task in tasks)
+        row = store.pending_outbox()[0]
+        assert row["attempts"] == 0 and row["published_at"] is None
+    asyncio.run(run())
+
+
+def test_start_returns_without_waiting_for_hanging_outbox(tmp_path, monkeypatch):
+    async def run():
+        import nats
+        store = ChatStore(tmp_path / "startup.db")
+        store.initialize()
+        store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"final","kind":"assistant_final","chat_id":"chat","body":{}})
+        entered, blocked = asyncio.Event(), asyncio.Event()
+        class HangingJetStream(FakeJetStream):
+            async def subscribe(self, *args, **kwargs):
+                return None
+            async def publish(self, subject, payload):
+                entered.set()
+                await blocked.wait()
+        js = HangingJetStream()
+        class Client:
+            def jetstream(self):
+                return js
+        async def connect(*args, **kwargs):
+            return Client()
+        monkeypatch.setattr(nats, "connect", connect)
+        transport = RemoteNatsTransport(pair_id="default", token="secret", durable_store=store)
+        await asyncio.wait_for(transport.start(), 1)
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not blocked.is_set() and len(store.pending_outbox()) == 1
+        await transport._close_async()
     asyncio.run(run())

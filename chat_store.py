@@ -912,12 +912,27 @@ class ChatStore:
     def quarantine(self, reason: str, payload: Any, event_id: str = "") -> None:
         with self._connect() as conn: self._quarantine_conn(conn, reason, payload, event_id)
 
-    def pending_outbox(self, limit: int = 100, *, pair_id: str | None = None, domain: str | None = None) -> list[dict[str, Any]]:
-        where, args = "published_at IS NULL", []
-        if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
-        if domain is not None: where += " AND domain=?"; args.append(str(domain))
+    def pending_outbox(self, limit: int = 100, *, pair_id: str | None = None,
+                       domain: str | None = None, lane: str | None = None) -> list[dict[str, Any]]:
+        where, args = "o.published_at IS NULL", []
+        if pair_id is not None:
+            where += " AND o.pair_id=?"; args.append(str(pair_id))
+        if domain is not None:
+            where += " AND o.domain=?"; args.append(str(domain))
+        if lane is not None:
+            if lane not in {"notification", "other"}:
+                raise ValueError("INVALID_OUTBOX_LANE")
+            where += (" AND f.kind='assistant_final'" if lane == "notification"
+                      else " AND (f.kind IS NULL OR f.kind<>'assistant_final')")
+            if lane == "notification":
+                where += " AND (o.blocked_reason IS NULL OR o.blocked_reason NOT LIKE 'permanent:%')"
         with self._connect() as conn:
-            rows=conn.execute(f"SELECT * FROM publication_outbox WHERE {where} ORDER BY sync_sequence LIMIT ?", tuple(args+[max(1,int(limit))])).fetchall()
+            rows = conn.execute(
+                f"SELECT o.* FROM publication_outbox o LEFT JOIN durable_facts f "
+                f"ON f.event_id=o.event_id AND f.pair_id=o.pair_id AND f.domain=o.domain "
+                f"WHERE {where} ORDER BY o.sync_sequence LIMIT ?",
+                tuple(args + [max(1, int(limit))]),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def mark_outbox_acked(self, sync_sequence: int, *, pair_id: str | None = None,
@@ -926,20 +941,34 @@ class ChatStore:
         if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
         if domain is not None: where += " AND domain=?"; args.append(str(domain))
         with self._connect() as conn:
-            conn.execute(f"UPDATE publication_outbox SET published_at=unixepoch() WHERE {where} AND published_at IS NULL", tuple(args))
+            conn.execute(f"UPDATE publication_outbox SET published_at=unixepoch(),blocked_reason=NULL WHERE {where} AND published_at IS NULL", tuple(args))
             if consumer_id is not None and domain is not None:
+                pair = str(pair_id or "default")
+                earliest_pending = conn.execute(
+                    "SELECT MIN(sync_sequence) n FROM publication_outbox "
+                    "WHERE pair_id=? AND domain=? AND published_at IS NULL",
+                    (pair, domain),
+                ).fetchone()["n"]
+                prefix = conn.execute(
+                    "SELECT COALESCE(MAX(sync_sequence),0) n FROM publication_outbox "
+                    "WHERE pair_id=? AND domain=? AND published_at IS NOT NULL "
+                    "AND (? IS NULL OR sync_sequence<?)",
+                    (pair, domain, earliest_pending, earliest_pending),
+                ).fetchone()["n"]
                 conn.execute(
                     "INSERT INTO v2_checkpoints(pair_id,consumer_id,domain,sync_sequence) VALUES(?,?,?,?) "
-                    "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=MAX(sync_sequence,excluded.sync_sequence)",
-                    (str(pair_id or "default"), str(consumer_id), str(domain), int(sync_sequence)),
+                    "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=excluded.sync_sequence",
+                    (pair, str(consumer_id), str(domain), int(prefix)),
                 )
 
-    def record_outbox_failure(self, sync_sequence: int, reason: str, *, pair_id: str | None = None, domain: str | None = None) -> None:
+    def record_outbox_failure(self, sync_sequence: int, reason: str, *, pair_id: str | None = None,
+                              domain: str | None = None, permanent: bool = False) -> None:
         where, args = "sync_sequence=?", [int(sync_sequence)]
         if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
         if domain is not None: where += " AND domain=?"; args.append(str(domain))
         with self._connect() as conn:
-            conn.execute(f"UPDATE publication_outbox SET attempts=attempts+1, blocked_reason=CASE WHEN attempts+1>=5 THEN ? ELSE blocked_reason END WHERE {where}", tuple([str(reason)]+args))
+            conn.execute(f"UPDATE publication_outbox SET attempts=attempts+1,blocked_reason=? WHERE {where}",
+                         tuple(["permanent:" + str(reason) if permanent else None] + args))
 
     def replay_after(self, *, domain: str, sync_sequence: int, pair_id: str = "default", limit: int = 100) -> list[bytes]:
         with self._connect() as conn:

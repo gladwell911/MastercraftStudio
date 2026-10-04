@@ -1272,3 +1272,30 @@ def test_hidden_exact_private_replay_persists_private_assembler_state(tmp_path):
     with store._connect() as conn:
         state_json = conn.execute("SELECT state_json FROM execution_assemblers WHERE chat_id='c' AND logical_key=?", (key,)).fetchone()["state_json"]
     assert "SECRET" not in state_json and json.loads(state_json)["private_reasoning"] is True
+
+
+def test_outbox_lane_orphans_and_sparse_checkpoint(tmp_path):
+    store = ChatStore(tmp_path / "lane-store.db")
+    store.initialize()
+    first = store.commit_durable_fact(pair_id="pair", domain="events", envelope={"event_id":"early","kind":"status","chat_id":"chat","body":{}})
+    store.commit_durable_fact(pair_id="pair", domain="files", envelope={"event_id":"file","kind":"file_offer","chat_id":"chat","body":{}})
+    final = store.commit_durable_fact(pair_id="pair", domain="events", envelope={"event_id":"late","kind":"assistant_final","chat_id":"chat","body":{}})
+    store.mark_outbox_acked(final["sync_sequence"], pair_id="pair", domain="events", consumer_id="publisher:pair")
+    assert store.get_checkpoint("publisher:pair", "events", pair_id="pair") == 0
+    store.mark_outbox_acked(first["sync_sequence"], pair_id="pair", domain="events", consumer_id="publisher:pair")
+    assert store.get_checkpoint("publisher:pair", "events", pair_id="pair") == final["sync_sequence"]
+    with store._connect() as conn:
+        conn.execute("DELETE FROM durable_facts WHERE event_id='file'")
+    assert [r["event_id"] for r in store.pending_outbox(lane="other")] == ["file"]
+    assert store.pending_outbox(lane="notification") == []
+
+
+def test_outbox_checkpoint_includes_legal_max_int64_ack(tmp_path):
+    store = ChatStore(tmp_path / "max-checkpoint.db")
+    store.initialize()
+    with store._connect() as conn:
+        conn.execute("INSERT INTO v2_feed_state(pair_id,domain,sync_sequence) VALUES('pair','__pair__',?)", (MAX_INT64 - 1,))
+    final = store.commit_durable_fact(pair_id="pair", domain="events", envelope={"event_id":"last","kind":"assistant_final","chat_id":"chat","body":{}})
+    assert final["sync_sequence"] == MAX_INT64
+    store.mark_outbox_acked(MAX_INT64, pair_id="pair", domain="events", consumer_id="publisher:pair")
+    assert store.get_checkpoint("publisher:pair", "events", pair_id="pair") == MAX_INT64
