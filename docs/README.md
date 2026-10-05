@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-04 当前状态见[交接](handoff.md)：F1 即时可视尾页与存储索引、Kimi 本机恢复、消息活动即时排序及新端到端测试。工作区报告位于 `D:/code/sj/_bmad-output/implementation-artifacts/` 的 `verify-immediate-execution-kimi-chat-recency.md` 和 `tests/immediate-e2e-20261004/verify.md`；复跑命令和验证边界已写入交接。
+2026-10-06 当前状态见[交接](handoff.md)：跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现，非桌面检查完成；完整矩阵与中文听验未完成，用户已停止桌面验收。工作区实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-cross-device-read-state.md`。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应报告 `verify-immediate-execution-kimi-chat-recency.md` 和 `tests/immediate-e2e-20261004/verify.md` 只证明当时版本。
 
 既有通知、回答时间与执行语义的[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)、Codex 审批[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)保留，仅证明相应版本。
 
@@ -36,6 +36,7 @@
 - 桌面执行项按 owner/revision/turn/provider/native event 身份归并；时间节点以“上一次实际显示时间的过程”为累计 300 秒基准，而不是比较相邻行。
 - ChatStore 的 `execution_steps.visible` 在写入时按共享规则维护，旧库初始化一次原子回填；`idx_execution_visible_tail` 支持真实可视尾页有界读取。F1 复用同 owner/revision 的已知尾页，完整补齐在 worker，不能用原始行 LIMIT 或运行时 UDF 扫描假称前台工作量有界。
 - 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
+- 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
 - 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
 - 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
@@ -50,7 +51,7 @@
 
 这些文档保留用于追溯历史决策，但默认不建议在新会话中优先加载。
 
-[`cross-client-codex-kimicode-audit-2026-09-06.md`](./cross-client-codex-kimicode-audit-2026-09-06.md) 是指定旧提交的跨端审查底稿，不是当前发布结论；开始后续跨端工作前须复核证据。跨端 durable 协议仍以 Story 2.4 规格和代码为准，2026-09-21 的桌面事件归并、时间投影和临时详情编辑以对应新规格和当前代码为准。
+[`cross-client-codex-kimicode-audit-2026-09-06.md`](./cross-client-codex-kimicode-audit-2026-09-06.md) 是指定旧提交的跨端审查底稿，不是当前发布结论；开始后续跨端工作前须复核证据。旧 Story 2.4 规格当前未找到，跨端 durable 合同以当前协议代码、定向测试和 RC 当前协议文档核对，不能引用缺失规格证明现状。2026-09-21 的桌面事件归并、时间投影和临时详情编辑以对应新规格和当前代码为准。
 
 ## 不再保留的内容
 
