@@ -52,6 +52,7 @@ class RemoteNatsTransport:
         on_common_commands_move_down: Callback | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
         on_history_read: Callback | None = None,
+        on_chat_read_changed: Callback | None = None,
         on_execution_page: Callback | None = None,
         on_chat_information: Callback | None = None,
         on_notes_changes: Callback | None = None,
@@ -85,6 +86,7 @@ class RemoteNatsTransport:
         self.on_common_commands_move_down = on_common_commands_move_down
         self.on_history_list = on_history_list
         self.on_history_read = on_history_read
+        self.on_chat_read_changed = on_chat_read_changed
         self.on_execution_page = on_execution_page
         self.on_chat_information = on_chat_information
         self.on_notes_changes = on_notes_changes
@@ -429,6 +431,23 @@ class RemoteNatsTransport:
 
     def _route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         command_type = str(payload.get("type") or "").strip().lower()
+        if command_type in {"mark_chat_read", "chat_read_state"}:
+            if self.durable_store is None:
+                return 503, {"error": "read_authority_unavailable"}
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+            owner = str(payload.get("chat_id") or body.get("chat_id") or "")
+            try:
+                if command_type == "chat_read_state":
+                    state = self.durable_store.get_chat_read_state(owner, pair_id=self.subjects.pair_id)
+                else:
+                    state = self.durable_store.mark_chat_read(pair_id=self.subjects.pair_id, chat_id=owner,
+                        generation=body.get("generation"), message_id=body.get("message_id"),
+                        answer_seq=body.get("answer_seq"), operation_id=body.get("operation_id"))
+                    if callable(self.on_chat_read_changed):
+                        self.on_chat_read_changed(state)
+                return 200, {"accepted": True, "read_state": state}
+            except (ValueError, TypeError) as exc:
+                return 409, {"accepted": False, "error": str(exc)}
         if command_type == "chat_information" and callable(self.on_chat_information):
             return self.on_chat_information(payload)
         if command_type == "execution_page_v3" and callable(self.on_execution_page):

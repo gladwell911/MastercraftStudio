@@ -108,6 +108,21 @@ class ChatStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS read_generations (
+                    chat_id TEXT PRIMARY KEY, generation TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS readable_answers (
+                    answer_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE, chat_id TEXT NOT NULL,
+                    generation TEXT NOT NULL, baseline INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_readable_owner
+                    ON readable_answers(chat_id,generation,answer_seq);
+                CREATE TABLE IF NOT EXISTS chat_read_state (
+                    pair_id TEXT NOT NULL, chat_id TEXT NOT NULL, generation TEXT NOT NULL,
+                    read_seq INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(pair_id,chat_id,generation)
+                );
                 CREATE INDEX IF NOT EXISTS idx_chats_order
                     ON chats(pinned, updated_at DESC, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_turns_chat
@@ -205,6 +220,12 @@ class ChatStore:
             if "sound_consumed_at" not in columns:
                 conn.execute("ALTER TABLE clear_operations ADD COLUMN sound_consumed_at REAL")
             self._advance_v2_migration(conn)
+            if conn.execute("SELECT 1 FROM meta WHERE key='read_state_initialized'").fetchone() is None:
+                for row in conn.execute("SELECT chat_id,turn_index,payload_json FROM turns").fetchall():
+                    self._backfill_canonical_turns_conn(conn, row["chat_id"],
+                        [self._json_dict(row["payload_json"])], int(row["turn_index"]))
+                conn.execute("UPDATE readable_answers SET baseline=1")
+                conn.execute("INSERT INTO meta(key,value) VALUES('read_state_initialized','1')")
             try:
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_execution_sequence "
@@ -377,6 +398,7 @@ class ChatStore:
             op_id = str(operation_id or f"clear-{uuid.uuid4().hex}").strip()
             initial_state = "clear_acknowledged" if snapshot is not None else "completed_no_message"
             conn.execute("UPDATE v2_chat_state SET revision=?,execution_sequence=0 WHERE chat_id=?", (revision, owner))
+            conn.execute("INSERT INTO read_generations(chat_id,generation) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET generation=excluded.generation", (owner, uuid.uuid4().hex))
             metadata = self._json_dict(chat["metadata_json"])
             metadata.update({
                 "openclaw_session_key": "openclaw/main", "openclaw_session_id": "", "openclaw_session_file": "",
@@ -892,6 +914,11 @@ class ChatStore:
                 "revision": int(state["revision"]),
                 "sync_sequence": sync_sequence,
             }
+            if expected_role == "assistant":
+                readable = conn.execute("SELECT a.answer_seq,a.generation FROM readable_answers a JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.message_id=?", (normalized_message,)).fetchone()
+                if readable is None or turn.get("request_status") != "done":
+                    raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
+                normalized["body"].update({"answer_seq": int(readable[0]), "generation": readable[1]})
             canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
             normalized["canonical_hash"] = digest
@@ -913,6 +940,61 @@ class ChatStore:
                  normalized_domain, canonical.encode("utf-8")),
             )
             return normalized
+
+    def _read_state_conn(self, conn, chat_id, pair_id):
+        if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
+            raise ValueError("CHAT_NOT_FOUND")
+        conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
+        generation = conn.execute("SELECT generation FROM read_generations WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        latest = conn.execute("SELECT a.answer_seq,a.message_id FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id WHERE a.chat_id=? AND a.generation=? ORDER BY a.answer_seq DESC LIMIT 1", (chat_id,generation)).fetchone()
+        baseline = conn.execute("SELECT COALESCE(MAX(answer_seq),0) FROM readable_answers WHERE chat_id=? AND generation=? AND baseline=1", (chat_id,generation)).fetchone()[0]
+        read = conn.execute("SELECT read_seq FROM chat_read_state WHERE pair_id=? AND chat_id=? AND generation=?", (pair_id,chat_id,generation)).fetchone()
+        revision = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+        return {"chat_id": chat_id, "generation": generation, "revision": int(revision[0]) if revision else 1, "latest_readable_seq": int(latest[0]) if latest else 0,
+                "latest_readable_message_id": str(latest[1]) if latest else "", "read_seq": max(int(baseline), int(read[0]) if read else 0)}
+
+    def get_chat_read_state(self, chat_id: str, *, pair_id: str = "default") -> dict:
+        with self._connect() as conn:
+            return self._read_state_conn(conn, self.normalize_chat_id(chat_id), str(pair_id))
+
+    def readable_answer(self, chat_id: str, *, turn_index: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT a.message_id,a.answer_seq,a.generation FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id,int(turn_index))).fetchone()
+        return dict(row) if row else None
+
+    def mark_chat_read(self, *, pair_id: str, chat_id: str, generation: str,
+                       message_id: str, answer_seq: int, operation_id: str, domain: str = "events") -> dict:
+        owner = self.normalize_chat_id(chat_id)
+        if isinstance(answer_seq, bool) or not isinstance(answer_seq, int) or answer_seq <= 0:
+            raise ValueError("INVALID_READ_TARGET")
+        if not isinstance(pair_id, str) or not pair_id.strip() or not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("INVALID_READ_SCOPE")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._read_state_conn(conn, owner, pair_id)
+            if generation != state["generation"]:
+                raise ValueError("STALE_READ_GENERATION")
+            row = conn.execute("SELECT a.answer_seq,t.payload_json FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id JOIN turns t ON t.chat_id=m.chat_id AND t.turn_index=m.legacy_turn_index WHERE a.message_id=? AND a.chat_id=? AND a.generation=?", (message_id,owner,generation)).fetchone()
+            if row is None or int(row[0]) != answer_seq or self._json_dict(row[1]).get("request_status") != "done":
+                raise ValueError("INVALID_READ_TARGET")
+            if answer_seq <= state["read_seq"]:
+                return state
+            conn.execute("INSERT INTO chat_read_state(pair_id,chat_id,generation,read_seq) VALUES(?,?,?,?) ON CONFLICT(pair_id,chat_id,generation) DO UPDATE SET read_seq=MAX(read_seq,excluded.read_seq)", (pair_id,owner,generation,answer_seq))
+            state["read_seq"] = answer_seq
+            conn.execute("INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,'__pair__')", (pair_id,))
+            sync = int(conn.execute("SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'", (pair_id,)).fetchone()[0]) + 1
+            revision = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            envelope = {"protocol_version": 2, "kind": "chat_read_changed", "event_id": "read-" + uuid.uuid4().hex,
+                        "chat_id": owner, "domain": domain, "sequence_domain": domain, "origin_client": "mc",
+                        "revision": int(revision[0]) if revision else 1, "sync_sequence": sync,
+                        "body": {**state, "message_id": message_id, "operation_id": operation_id}}
+            canonical = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            envelope["canonical_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            canonical = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            conn.execute("UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'", (sync,pair_id))
+            conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,revision,sync_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?)", (envelope["event_id"],envelope["canonical_hash"],envelope["kind"],pair_id,domain,owner,envelope["revision"],sync,canonical))
+            conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)", (pair_id,domain,sync,envelope["event_id"],domain,canonical.encode("utf-8")))
+            return state
 
     def _quarantine_conn(self, conn: sqlite3.Connection, reason: str, payload: Any, event_id: str = "") -> None:
         conn.execute("INSERT INTO identity_quarantine(reason,event_id,payload_json) VALUES(?,?,?)", (reason,event_id,json.dumps(payload,ensure_ascii=False,sort_keys=True)))
@@ -1489,6 +1571,9 @@ class ChatStore:
                     (f"message-{uuid.uuid4().hex}", str(canonical["turn_id"]), chat_id, role,
                      provider, str(payload.get(provider_key) or ""), start + offset),
                 )
+            if str(payload.get("request_status") or "") == "done" and str(payload.get("answer_md") or "").strip():
+                conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
+                conn.execute("INSERT OR IGNORE INTO readable_answers(message_id,chat_id,generation) SELECT m.message_id,m.chat_id,g.generation FROM canonical_messages m JOIN read_generations g ON g.chat_id=m.chat_id WHERE m.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id, start + offset))
 
     def count_turns(self, chat_id: str) -> int:
         normalized = str(chat_id or "").strip()

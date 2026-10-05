@@ -149,6 +149,7 @@ HOTKEY_ID_SHOW = 0xA112
 HOTKEY_ID_REALTIME_CALL = 0xA113
 HOTKEY_ID_REALTIME_CALL_ALT = 0xA114
 HOTKEY_ID_REALTIME_CALL_ALT2 = 0xA115
+HOTKEY_ID_UNREAD = 0xA116
 WM_QUIT = 0x0012
 
 WH_KEYBOARD_LL = 13
@@ -2391,6 +2392,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_ACTIVATE, self._on_application_activate)
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_SHOW)
+        self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_UNREAD)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL_ALT)
         self.Bind(wx.EVT_HOTKEY, self._on_global_hotkey, id=HOTKEY_ID_REALTIME_CALL_ALT2)
@@ -2398,6 +2400,7 @@ class ChatFrame(wx.Frame):
 
         self.answer_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("answer_key_down", self._on_answer_key_down))
         self.answer_list.Bind(wx.EVT_CHAR, self._on_answer_char)
+        self.answer_list.Bind(wx.EVT_LEFT_UP, self._on_answer_mouse_read)
         self.answer_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_answer_activate)
         self.execution_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("execution_key_down", self._on_execution_key_down))
         self.execution_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
@@ -4003,12 +4006,12 @@ class ChatFrame(wx.Frame):
         step["detail_page_path"] = str(page_path)
         return page_path
 
-    def _open_local_webpage(self, page_path: Path) -> None:
+    def _open_local_webpage(self, page_path: Path) -> bool:
         try:
             os.startfile(str(page_path))  # type: ignore[attr-defined]
-            return
+            return True
         except Exception:
-            webbrowser.open(page_path.resolve().as_uri())
+            return bool(webbrowser.open(page_path.resolve().as_uri()))
 
     def _show_ok_dialog(self, message: str, title: str = "提示") -> None:
         # 使用系统消息框样式，提升读屏自动朗读稳定性；同时将按钮改为中文“确定”。
@@ -4344,6 +4347,11 @@ class ChatFrame(wx.Frame):
             if loop is not None and loop.is_running():
                 asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
         self._chat_turn_dirty_from.pop(normalized, None)
+        self._call_after_if_alive(self._refresh_chat_read_row, normalized)
+
+    def _refresh_chat_read_row(self, owner):
+        self._invalidate_remote_history_list_cache()
+        self._upsert_history_row(owner, allow_reorder=False)
 
     def _chat_summary_by_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()
@@ -5222,12 +5230,13 @@ class ChatFrame(wx.Frame):
             self._request_listbox_repaint(self.history_list)
 
     def _history_chat_label(self, chat: dict, *, is_current: bool = False) -> str:
-        if is_current:
-            return self._current_history_title()
-        title = str((chat or {}).get("title") or "新聊天")
+        title = self._current_history_title() if is_current else str((chat or {}).get("title") or "新聊天")
         if self._is_default_chat_title(title):
             title = EMPTY_CURRENT_CHAT_TITLE
-        return f"[置顶] {title}" if (chat or {}).get("pinned") else title
+        if not is_current and (chat or {}).get("pinned"):
+            title = f"[置顶] {title}"
+        state = self._chat_read_state(str((chat or {}).get("id") or ""))
+        return f"[未读] {title}" if state and state["latest_readable_seq"] > state["read_seq"] else title
 
     def _history_chat_sort_key(self, chat_id: str) -> tuple:
         chat_id = str(chat_id or "").strip()
@@ -11753,6 +11762,15 @@ class ChatFrame(wx.Frame):
         cache[cache_key] = (signature, dict(payload))
         return payload
 
+    def _remote_readable_turn_payload(self, owner, index, turn):
+        payload = self._remote_turn_payload(turn)
+        store = getattr(self, "chat_store", None)
+        if store is not None and hasattr(store, "readable_answer"):
+            target = store.readable_answer(owner, turn_index=index)
+            if target:
+                payload.update(target)
+        return payload
+
     def _remote_chat_summary(self, chat: dict) -> dict:
         if not isinstance(chat, dict):
             return {
@@ -11802,6 +11820,9 @@ class ChatFrame(wx.Frame):
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
                 snapshot.update(store.get_clear_reconciliation_authority(chat_id))
+                read_state = self._chat_read_state(chat_id)
+                if read_state:
+                    snapshot["read_state"] = read_state
             except (ValueError, RuntimeError):
                 pass
         return snapshot
@@ -11863,13 +11884,17 @@ class ChatFrame(wx.Frame):
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
             "execution_steps": execution_steps,
             "execution_step_count": execution_step_count,
-            "turns": [self._remote_turn_payload(turn) for turn in turns if isinstance(turn, dict)],
+            "turns": [self._remote_readable_turn_payload(chat_id, index + int(chat.get("_turn_start_index") or 0), turn)
+                      for index, turn in enumerate(turns) if isinstance(turn, dict)],
             **self._codex_speed_payload_for_chat(chat),
         }
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
                 snapshot.update(store.get_clear_reconciliation_authority(chat_id))
+                read_state = self._chat_read_state(chat_id)
+                if read_state:
+                    snapshot["read_state"] = read_state
             except (ValueError, RuntimeError):
                 pass
         return snapshot
@@ -11896,6 +11921,7 @@ class ChatFrame(wx.Frame):
         start = max(0, end - limit)
         paged_chat = dict(chat) if isinstance(chat, dict) else {}
         paged_chat["turns"] = turns[start:end]
+        paged_chat["_turn_start_index"] = start
         snapshot = self._remote_chat_snapshot(paged_chat, include_execution_steps=include_execution_steps)
         snapshot["turn_count"] = total
         return snapshot, start > 0, (str(start) if start > 0 else "")
@@ -11925,6 +11951,7 @@ class ChatFrame(wx.Frame):
         paged_chat = dict(chat or {})
         paged_chat["id"] = chat_id
         paged_chat["turns"] = turns
+        paged_chat["_turn_start_index"] = start
         if bool(payload.get("include_execution_steps")) and "execution_steps" not in paged_chat:
             try:
                 paged_chat["execution_steps"] = store.load_execution_steps(chat_id)
@@ -16785,6 +16812,7 @@ class ChatFrame(wx.Frame):
                     on_common_commands_move_down=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_down_ui, payload),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
+                    on_chat_read_changed=lambda payload: wx.CallAfter(self._on_chat_read_changed, payload),
                     on_execution_page=lambda payload: self._remote_api_execution_page_ui(payload, secret=token),
                     on_chat_information=lambda payload: self._run_remote_ui_route(self._remote_api_chat_information_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,
@@ -17635,12 +17663,14 @@ class ChatFrame(wx.Frame):
             and not ctrl_down
             and not alt_down
         ):
+            read_target = self._selected_read_target()
             shift_down = getattr(event, "ShiftDown", None)
             if callable(shift_down) and shift_down():
                 handled = self._try_open_selected_answer_detail()
             else:
                 handled = self._open_selected_answer_text_viewer()
             if handled:
+                self._confirm_answer_read(read_target)
                 return
         if (
             key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
@@ -18100,6 +18130,20 @@ class ChatFrame(wx.Frame):
 
     def _register_global_hotkey(self):
         try:
+            if not getattr(self, "_unread_hotkey_registered", False):
+                # wxWidgets maps only its four modifier flags and drops
+                # Win32 MOD_NOREPEAT. Register this hotkey on the same HWND
+                # directly; WM_HOTKEY still reaches the existing wx binding.
+                register = ctypes.WinDLL("user32", use_last_error=True).RegisterHotKey
+                register.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+                register.restype = ctypes.c_int
+                self._unread_hotkey_registered = bool(register(self.GetHandle(), HOTKEY_ID_UNREAD, 0x4006, ord("X")))
+                self._unread_hotkey_registration_error = 0 if self._unread_hotkey_registered else ctypes.get_last_error()
+        except Exception:
+            self._unread_hotkey_registered = False
+        if not self._unread_hotkey_registered:
+            self.SetStatusText("Ctrl+Shift+X 注册失败，快捷键可能已被占用")
+        try:
             if not self._show_hotkey_registered:
                 self._show_hotkey_registered = bool(self.RegisterHotKey(HOTKEY_ID_SHOW, wx.MOD_CONTROL, wx.WXK_F12))
         except Exception:
@@ -18133,6 +18177,9 @@ class ChatFrame(wx.Frame):
         return vk_code or VK_OEM_5
 
     def _unregister_global_hotkey(self):
+        if getattr(self, "_unread_hotkey_registered", False):
+            self.UnregisterHotKey(HOTKEY_ID_UNREAD)
+            self._unread_hotkey_registered = False
         try:
             if self._show_hotkey_registered:
                 self.UnregisterHotKey(HOTKEY_ID_SHOW)
@@ -18148,6 +18195,9 @@ class ChatFrame(wx.Frame):
 
     def _on_global_hotkey(self, event):
         hotkey_id = event.GetId()
+        if hotkey_id == HOTKEY_ID_UNREAD:
+            self._jump_to_unread_chat()
+            return
         if hotkey_id == HOTKEY_ID_SHOW:
             self._restore_or_raise()
             return
@@ -20221,6 +20271,101 @@ class ChatFrame(wx.Frame):
         self._push_remote_history_changed(self.active_chat_id)
         return True
 
+    def _read_pair_id(self):
+        return str(getattr(getattr(getattr(self, "_remote_nats_transport", None), "subjects", None), "pair_id", "default") or "default")
+
+    def _chat_read_state(self, chat_id):
+        store = getattr(self, "chat_store", None)
+        if not chat_id or store is None or not hasattr(store, "get_chat_read_state"):
+            return None
+        try:
+            return store.get_chat_read_state(chat_id, pair_id=self._read_pair_id())
+        except ValueError:
+            return None
+
+    def _selected_read_target(self, index=None):
+        index = self.answer_list.GetSelection() if index is None else index
+        if index < 0 or index >= len(self.answer_meta) or self.answer_meta[index][0] != "answer":
+            return None
+        owner = self._visible_answer_owner_chat_id()
+        store = getattr(self, "chat_store", None)
+        if store is None or not hasattr(store, "readable_answer"):
+            return None
+        target = store.readable_answer(owner, turn_index=self.answer_meta[index][1])
+        return {**target, "chat_id": owner} if target else None
+
+    def _on_chat_read_changed(self, state):
+        if getattr(self, "_closing", False):
+            return
+        self._invalidate_remote_history_list_cache()
+        self._invalidate_remote_state_cache()
+        owner = str(state.get("chat_id") or "")
+        self._upsert_history_row(owner, allow_reorder=False)
+
+    def _confirm_answer_read(self, target):
+        if not target:
+            return
+        try:
+            state = self.chat_store.mark_chat_read(pair_id=self._read_pair_id(), chat_id=target["chat_id"],
+                generation=target["generation"], message_id=target["message_id"],
+                answer_seq=target["answer_seq"], operation_id=uuid.uuid4().hex)
+            self._on_chat_read_changed(state)
+            transport = getattr(self, "_remote_nats_transport", None)
+            loop = getattr(transport, "_loop", None)
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
+        except (ValueError, RuntimeError) as exc:
+            self.SetStatusText(f"已读确认失败：{exc}")
+
+    def _on_answer_mouse_read(self, event):
+        index = self.answer_list.HitTest(event.GetPosition())
+        target = self._selected_read_target(index)
+        event.Skip()
+        self._confirm_answer_read(target)
+
+    def _jump_to_unread_chat(self):
+        self._restore_or_raise()
+        candidates = list(getattr(self, "history_ids", []) or [])
+        current = self._visible_answer_owner_chat_id()
+        if current in candidates:
+            candidates.remove(current)
+            candidates.insert(0, current)
+        for owner in candidates:
+            chosen = self._chat_read_state(owner)
+            if not chosen or chosen["latest_readable_seq"] <= chosen["read_seq"]:
+                continue
+            # _show_history_chat hydrates real turns; the renderer limits older
+            # rows at the head, so its last row is always the actual tail.
+            if not self._show_history_chat(owner, focus_answer_list=False):
+                continue
+            current_state = self._chat_read_state(owner)
+            if (not current_state or current_state["generation"] != chosen["generation"]
+                    or current_state["read_seq"] >= chosen["latest_readable_seq"]):
+                continue
+            self._apply_detail_panel_mode("answers")
+            count = self.answer_list.GetCount()
+            if count <= 0:
+                self.SetStatusText("未读聊天定位失败：尚无实际尾页")
+                return
+            self.answer_list.SetSelection(count - 1)
+            self.answer_list.SetFocus()
+            if os.name == "nt":
+                user32 = ctypes.windll.user32
+                user32.SetForegroundWindow(ctypes.c_void_p(self.GetHandle()))
+                user32.GetForegroundWindow.restype = ctypes.c_void_p
+                if user32.GetForegroundWindow() != self.GetHandle() or not self.answer_list.HasFocus():
+                    self.SetStatusText("未读聊天定位失败：未获得前台或回答列表焦点")
+                    return
+            targets = [self._selected_read_target(index) for index in range(count)]
+            readable = [target for target in targets if target and target["generation"] == chosen["generation"]
+                        and target["answer_seq"] <= chosen["latest_readable_seq"]]
+            if readable:
+                self._confirm_answer_read(max(readable, key=lambda target: target["answer_seq"]))
+                return
+            self.SetStatusText("未读聊天定位失败：尾页没有可读回答")
+            return
+        self._speak_text_via_screen_reader("无未读聊天")
+
     def _on_answer_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
             return
@@ -20231,8 +20376,9 @@ class ChatFrame(wx.Frame):
         ctrl = self._event_control_down(event)
         alt = self._event_alt_down(event)
         shift = bool(getattr(event, "ShiftDown", lambda: False)())
-        if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END):
+        if not ctrl and not alt and key in (wx.WXK_UP, wx.WXK_DOWN, wx.WXK_HOME, wx.WXK_END, wx.WXK_PAGEUP, wx.WXK_PAGEDOWN):
             if self._move_answer_list_selection_for_key(key):
+                self._confirm_answer_read(self._selected_read_target())
                 return
         if self._handle_ctrl_history_navigation(event):
             return
@@ -20254,8 +20400,10 @@ class ChatFrame(wx.Frame):
             return
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             signature = self._answer_viewer_selection_signature()
+            read_target = self._selected_read_target()
             handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
             if handled:
+                self._confirm_answer_read(read_target)
                 self._answer_viewer_duplicate_owner = signature
                 self._answer_viewer_duplicate_until = time.monotonic() + 0.25
                 self._answer_viewer_duplicate_events = 2
@@ -20301,6 +20449,10 @@ class ChatFrame(wx.Frame):
             new_idx = 0
         elif key == wx.WXK_END:
             new_idx = count - 1
+        elif key == wx.WXK_PAGEUP:
+            new_idx = max(0, idx - max(1, self.answer_list.GetClientSize().height // max(1, self.answer_list.GetCharHeight())))
+        elif key == wx.WXK_PAGEDOWN:
+            new_idx = min(count - 1, idx + max(1, self.answer_list.GetClientSize().height // max(1, self.answer_list.GetCharHeight())))
         else:
             return False
         if new_idx == idx:
@@ -20319,8 +20471,10 @@ class ChatFrame(wx.Frame):
             if self._consume_answer_viewer_duplicate_event():
                 return
             shift = bool(getattr(event, "ShiftDown", lambda: False)())
+            read_target = self._selected_read_target()
             handled = self._try_open_selected_answer_detail() if shift else self._open_selected_answer_text_viewer()
             if handled:
+                self._confirm_answer_read(read_target)
                 return
         ch = self._extract_committed_char(event)
         if ch:
@@ -20330,7 +20484,9 @@ class ChatFrame(wx.Frame):
     def _on_answer_activate(self, _event):
         if self._consume_answer_viewer_duplicate_event():
             return
-        self._open_selected_answer_text_viewer()
+        read_target = self._selected_read_target()
+        if self._open_selected_answer_text_viewer():
+            self._confirm_answer_read(read_target)
 
     def _answer_viewer_selection_signature(self) -> tuple[str, str, int] | None:
         idx = self.answer_list.GetSelection()
@@ -20453,7 +20609,8 @@ class ChatFrame(wx.Frame):
             return False
         try:
             page_path = self._ensure_execution_detail_page(step, step_idx)
-            self._open_local_webpage(page_path)
+            if self._open_local_webpage(page_path) is False:
+                raise RuntimeError("详情网页未成功打开")
             self.SetStatusText("已打开执行过程详情网页")
             self._save_state()
         except Exception:
@@ -20526,6 +20683,7 @@ class ChatFrame(wx.Frame):
     def _open_answer_text_viewer(
         self, title: str, text: str, payload: AnswerViewerPayload | None = None,
         _answer_markdown: bool = False,
+        _read_target: dict | None = None,
     ) -> bool:
         if bool(getattr(self, "_answer_viewer_open", False)):
             return False
@@ -20538,6 +20696,12 @@ class ChatFrame(wx.Frame):
         )
         self._answer_viewer_open = True
         shown = False
+        if _read_target:
+            def on_shown(event):
+                if event.IsShown():
+                    self._confirm_answer_read(_read_target)
+                event.Skip()
+            dlg.Bind(wx.EVT_SHOW, on_shown)
         try:
             if _answer_markdown:
                 dlg._set_answer_display_text()
@@ -20571,7 +20735,7 @@ class ChatFrame(wx.Frame):
             return False
         title, text = content
         payload = self._selected_answer_viewer_payload()
-        return self._open_answer_text_viewer(title, text, payload, self.answer_meta[idx][0] == "answer")
+        return self._open_answer_text_viewer(title, text, payload, self.answer_meta[idx][0] == "answer", self._selected_read_target(idx))
 
     def _visible_answer_owner_chat_id(self) -> str:
         if self.view_mode == "history":
@@ -20791,6 +20955,7 @@ class ChatFrame(wx.Frame):
         return (str(turn.get("turn_id") or turn.get("id") or turn.get("answer_external_event_id") or "").strip(), "")
 
     def _try_open_selected_answer_detail(self) -> bool:
+        read_target = self._selected_read_target()
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return False
@@ -20833,9 +20998,12 @@ class ChatFrame(wx.Frame):
                     return False
                 page_path = self._ensure_answer_detail_page(turn, turn_idx)
                 status_text = "已打开回答详情网页"
-            self._open_local_webpage(page_path)
+            if self._open_local_webpage(page_path) is False:
+                raise RuntimeError("详情网页未成功打开")
             self.SetStatusText(status_text)
             self._save_state()
+            if item_type == "answer":
+                self._confirm_answer_read(read_target)
         except Exception:
             wx.MessageBox("打开详情网页失败。", "提示", wx.OK | wx.ICON_WARNING)
             return False
