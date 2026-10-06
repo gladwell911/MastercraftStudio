@@ -1,10 +1,11 @@
 ﻿# 当前交接
 
-截至2026-10-06。跨设备已读同步与 Ctrl+Shift+X 未读聊天跳转已实现，产品提交 MC `92b284b`、RC `9d57fa8`；后续文档提交以 `git log -1` 为准。完整跨端验收尚未通过，用户已明确停止桌面验收并要求不推送远端。未更新桌面运行包或实体手机，源码提交不代表已部署。
+截至2026-10-06。MC 源码已包含 Kimi 公开思考/进度修复（`171c3bc`）、Codex 全局技能复用与打包成功后自动启动（`7f78c2b`）。跨设备已读同步与 Ctrl+Shift+X 未读聊天跳转保留，对应功能提交 MC `92b284b`、RC `9d57fa8`。两仓库已合并并删除旧开发分支，当前分别使用 `main` 和 `master`；后续文档提交以 `git log -1` 为准。完整跨端验收尚未通过，用户已停止完整桌面验收。源码和 GitHub 提交不代表已部署；本次未实际打包、更新或启动日常安装版，也未更新实体手机。
 
 ## 当前实现
 
-- 2026-10-06 全局技能复用与打包后启动：隔离 `.codex-home` 的 `skills`、`plugins` 整目录链接当前用户 `.codex` 来源，旧普通目录迁移到同 home 唯一 `*.legacy-*` 路径；不存在的来源保留旧内容，链接失败报错且不退回复制，全局文件字节（含 BOM）不改。新任务在 start/resume/turn 前注册当前 `.agents/skills` 并 forceReload 原生技能清单；全局 plugins/marketplaces 配置变化才更新对应配置并保留 home 重启 app-server，再恢复原 thread。执行中 steer 不刷新或重启，明确无活动 turn 后才准备并恢复新任务。打包脚本先临时构建校验再更新，reparse 清理只操作节点，保留 `.codex-home`、内外 history 和 OneDrive 数据；最终产物校验后从最终目录启动一次，不等待 GUI 退出。失败非零且不启动旧包或临时包。本轮仅源码与隔离测试，未实际打包、更新或启动 `D:/code/cx/mc`，未调用真实模型、GUI 或个人数据。
+- Codex 全局技能复用：隔离 `.codex-home` 的 `skills`、`plugins` 整目录链接当前用户 `.codex` 来源，旧普通目录迁移到同 home 唯一 `*.legacy-*` 路径；来源缺失时保留旧内容，链接失败报错且不退回复制，全局文件字节（含 BOM）不改。每个新任务在 start/resume/turn 前注册当前 `.agents/skills` 并 forceReload 原生技能清单；全局 plugins/marketplaces 配置变化才更新对应配置并保留 home 重启 app-server，随后走原 thread 恢复链。执行中 steer 不刷新或重启，明确无活动 turn 后才准备新任务。同名技能选择与插件身份由原生 Codex 处理。
+- 打包成功后启动：`package_mc.ps1` 先临时构建校验再更新，reparse 清理只操作节点，保留 `.codex-home`、包内外 history 和 OneDrive 数据。最终产物校验后从最终目录启动一次，不等待 GUI 退出；失败返回非零且不启动旧包或临时包。默认最终目录为 `D:/code/cx/mc`，调用方法见 [README](../README.txt)。更新阶段失败可能留下部分程序文件，保留会话/history 且不启动，重新执行脚本完成更新；默认不创建旧包备份。
 - Kimi 2.1.1 真实无 messageId 的 thinking/assistant 流按 session、epoch、turn、agent、原生 step 与内容种类补充稳定身份；公开思考在生成中直接进入 canonical 执行投影，列表展示原文摘录、详情保留全文。相同 seq 的不同 offset、重放、缺口和过期 step/epoch 保持隔离。REST 只在完整 prompt 边界内按 assistant 步骤顺序补全既有行；晚到流不能覆盖完成快照。工具调用前的 assistant 原文转为 commentary，REST 的 text + tool_use 同样保留，权威终答排除这些中间说明。隐藏标记整段单调生效，已缓存与持久化组装内容也同步清除；主 REST 不补写子代理流。RC 继续消费 v3 的 list_text/detail_text，无 RC 产品改动。
 - 只有首次成功且非空的权威回答产生未读。稳定 canonical message_id 与首次完成 answer_seq 关联；首次启用的旧历史设为已读基线，清空才更换独立 generation。pair/chat/generation 下的 read_seq 只增不减，游标、durable fact 和 outbox 同事务提交。
 - 自动定位不确认已读；主动回答导航、全文显示及成功打开网页确认冻结范围。Ctrl+Shift+X 使用原生 MOD_NOREPEAT 注册，恢复实际前台和最后项焦点，按已显示且不超过冻结上限的最大完成序列确认；无候选调用 ZDSR 播报“无未读聊天”。Home 首行非回答时不误读。未读标签不改变消息活动排序。
@@ -17,7 +18,19 @@
 
 ## 验证与复现
 
-2026-10-06 Kimi 思考/进度修复最终独立复验已由 engineer 完成：MC 映射/客户端 179 项、定向集成 50 项、隔离 wx 4 项、共享执行投影 4 项，共 237 passed、0 failed、0 skipped；覆盖真实 SDK 无 ID envelope、生成中 list/detail、多步骤/代理、WS→REST 同行、缺口/重放/epoch、隐藏流、steering alias、终答分离与后台焦点，以及实际 execution 正文查看器 caller 和真实 AnswerTextViewerDialog 的公开全文显示、关闭销毁。wx 串行并清理构造至销毁期间的定时器；仅检查受影响界面，没有恢复完整桌面/设备验收。RC 无代码、夹具或环境变化，复用首轮现有 v3 两项定向检查（投影行身份及完整详情、读取投影不改写 V2 durable facts），最终验证范围共 239 项；集成 92 项与 wx 5 项为 deselected。工作区报告：`D:/code/sj/_bmad-output/implementation-artifacts/verification-kimi-thinking-progress.md`。未调用真实模型、未替换运行包、未推送；本轮通过不证明安装版、实体手机或现场 Kimi 输出已验证。
+### 全局技能与打包后启动（2026-10-06）
+
+engineer 独立复跑三个定向文件：122 passed、0 failed、0 skipped。覆盖真实 Windows Junction 降级、源目录增改删、legacy 保全/幂等/失败恢复、全局 BOM 字节不变、原生刷新顺序、执行中 steer、插件配置变化重启及 pending 请求结束。打包测试使用临时目录、假构建器和假启动，覆盖成功、构建失败、缺少/空 worker、更新失败、最终校验失败与启动失败七种路径；没有运行真实 PyInstaller 或 MC。五个 Python AST、PowerShell AST 与 diff 空白检查通过。
+
+```powershell
+.venv/Scripts/python.exe -m pytest --noconftest tests/test_codex_client_unit.py tests/test_codex_worker_process.py tests/test_packaging_specs.py -q -ra -o pythonpath=.
+```
+
+`--noconftest` 只用于上述纯测试，避免现有 autouse wx.App 启动 GUI；不能照搬到依赖 GUI/数据库夹具的套件。Codex 0.160.0 非模型原生协议探针另确认两个技能来源、相同 extraRoots 配置下的同名记录与顺序、普通及同版本插件技能增改删在同进程刷新、插件身份保留，以及启用配置变化时重启且保留私有 home。共 46 次非模型 RPC，没有 thread/turn/model 请求。写入、配置和认证均使用临时目录；Windows KnownFolder 仍让原生发现只读真实 `.agents/skills` 的 30 项元数据，因此不能称完全隔离。未验证模型最终同名选择、跨缓存版本升级、真实 thread 恢复或安装包。计划与结果见 [已完成实施记录](../_bmad-output/implementation-artifacts/plan-global-skills-package-start.md)。本次文档收尾复用以上未变更代码的证据，没有重复运行 GUI、原生探针或真实打包。
+
+### Kimi 思考与进度（2026-10-06）
+
+Kimi 思考/进度修复最终独立复验已由 engineer 完成：MC 映射/客户端 179 项、定向集成 50 项、隔离 wx 4 项、共享执行投影 4 项，共 237 passed、0 failed、0 skipped；覆盖真实 SDK 无 ID envelope、生成中 list/detail、多步骤/代理、WS→REST 同行、缺口/重放/epoch、隐藏流、steering alias、终答分离与后台焦点，以及实际 execution 正文查看器 caller 和真实 AnswerTextViewerDialog 的公开全文显示、关闭销毁。wx 串行并清理构造至销毁期间的定时器；仅检查受影响界面，没有恢复完整桌面/设备验收。RC 无代码、夹具或环境变化，复用首轮现有 v3 两项定向检查（投影行身份及完整详情、读取投影不改写 V2 durable facts），最终验证范围共 239 项；集成 92 项与 wx 5 项为 deselected。工作区报告：`D:/code/sj/_bmad-output/implementation-artifacts/verification-kimi-thinking-progress.md`。未调用真实模型、未替换运行包；该功能后续已并入 `main` 并推送 GitHub。定向通过不证明安装版、实体手机或现场 Kimi 输出已验证。
 
 ```powershell
 .venv/Scripts/python.exe -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py -q
@@ -66,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_cross_client_reg
 - 2026-10-04物理F1 SendInput未送达char-hook，独立旧AltY也未送达处理器；保留环境失败证据，不能以wx事件通过代替物理按键验收。
 - 用户现场Kimi10054具体诱因仍缺日志。本轮真实本机socket恢复通过，不证明真实Kimi启动/WS、公网Live或偶发断连消失；实体TalkBack、双机及完整产品套件未验证。
 - 后续交付先核对安装版本和实际数据路径，再构建、更新及实测；源码HEAD不证明运行包已更新。RC实体包最后已知安装为2026-10-03文件分享阶段，本轮只用专用模拟器。
-- 当前两仓库分支 `feat/cross-device-read-state` 未配置上游；用户要求不推送，保留本地提交，不自行修改 remote/upstream。
+- MC `main` 跟踪 `origin/main`，RC `master` 跟踪 `origin/master`，各仓库仅保留对应主分支。旧开发分支已合并、删除；此前“不推送”的阶段约束已被后续明确推送请求取代。提交/推送沿用现有 remote/upstream，不代表打包或安装已完成。
 - 源码笔记为`D:/code/note/notes.db`；打包版要求个人OneDrive的`code/data/sj/notes.db`存在并经完整性和已知表结构校验。2026-09-29云端库只是快照，切包前补齐后续变化，保留笔记、聊天及运行数据。跨机不并发运行MC，换机先退出等同步；默认不创建旧包备份。
 
 既有Codex审批66项及2026-10-02通知/时间验证见本仓库`_bmad-output/implementation-artifacts/`原报告，只证明相应版本。宽失败见[历史基线](non-live-regression-baseline-2026-09-06.md)，早期背景见[归档交接](archive/entry-context-2026-09-29/handoff.md)。

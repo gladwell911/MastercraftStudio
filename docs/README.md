@@ -6,6 +6,8 @@
 
 2026-10-06 当前状态见[交接](handoff.md)：Kimi 无消息 ID 的公开思考流已适配真实 step 生命周期，执行页及时显示原文摘录与全文；REST 补齐同一条目，工具前普通说明作为 commentary 保留。当前实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-kimi-thinking-progress.md`。跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现；完整矩阵与中文听验未完成，用户已停止完整桌面验收。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应历史报告只证明当时版本。
 
+Codex 通过整目录链接复用全局技能，在新任务前刷新原生清单；打包成功并校验最终产物后自动启动一次。三个定向文件独立验证 122 项通过，原生非模型探针确认技能/插件发现与刷新；此次未实际打包或更新安装版。方案及阶段验证见[全局技能与打包后启动实施记录](../_bmad-output/implementation-artifacts/plan-global-skills-package-start.md)，使用方法见[项目入口](../README.txt)。
+
 既有通知、回答时间与执行语义的[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)、Codex 审批[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)保留，仅证明相应版本。
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
@@ -27,6 +29,7 @@
 ## 关键当前事实
 
 - 源码运行的笔记数据库使用 `D:\code\note\notes.db`；打包版将使用个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\notes.db`。切换前核对实际运行包的数据路径；数据衔接步骤见 [`handoff.md`](./handoff.md)。
+- MC 当前主分支为 `main`，跟踪 `origin/main`；RC 为 `master`，跟踪 `origin/master`。旧开发分支已合并并删除；日常安装版版本另按交接核对。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
 - Kimi 的 F1 执行页保留 provider 实际公开的思考与已由工具调用确认的中间说明；列表取首个非空行、最多 80 字，全文详情保留完整公开正文。无消息 ID 的流按 session/epoch/turn/agent/step/kind 隔离，保留 offset 去重与缺口处理。REST 在明确的 prompt 边界内按 assistant 步骤顺序补齐原行；隐藏/private/non-disclosable 内容不进入可视投影，工具流水仍不生成执行行。
