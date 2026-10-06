@@ -20,6 +20,7 @@ Design: docs/superpowers/specs/2026-08-10-kimicode-server-chat-design.md
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import socket
@@ -305,7 +306,7 @@ def _agent_scope(body_type: str, agent_id: str) -> str:
     return "unknown"
 
 
-def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
+def map_session_event(message: dict[str, Any], *, step_scope: dict[str, Any] | None = None) -> KimiEvent | None:
     """Map one raw WebSocket message to a KimiEvent.
 
     The server envelope is flat: ``{"type": <event-type>, "seq": n,
@@ -345,6 +346,7 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
         ("nonDisclosable", "non_disclosable"),
         ("visibility", "visibility"),
         ("reasoningVisibility", "reasoning_visibility"),
+        ("hidden", "hidden"),
     ):
         if source_key in body:
             event_data[target_key] = body[source_key]
@@ -354,15 +356,26 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
     epoch = _str(message.get("epoch"))
     if epoch:
         event_data["epoch"] = epoch
+    for key in ("step_id", "step_number"):
+        if step_scope and step_scope.get(key) not in (None, ""):
+            event_data[key] = step_scope[key]
+    offset = body.get("offset") if isinstance(body.get("offset"), int) else message.get("offset")
+    event_data["offset"] = offset
+    native_id = _str(body.get("messageId") or body.get("itemId") or body.get("streamId") or body.get("eventId"))
+    if body_type in {"thinking.delta", "assistant.delta"} and not native_id and step_scope and step_scope.get("step_id"):
+        identity = [session_id, epoch or step_scope.get("epoch", ""), _str(body.get("turnId")),
+                    agent_id or "main", step_scope["step_id"], body_type.split(".", 1)[0]]
+        native_id = "kimi-stream:" + hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
+        event_data["lifecycle_stream"] = True
     base: dict[str, Any] = {
         "thread_id": session_id,
         "data": event_data,
         "provider": "kimi",
         "session_id": session_id,
-        "event_id": _str(body.get("eventId") or body.get("messageId") or body.get("toolCallId") or body.get("callId") or body.get("stepId") or body.get("id")),
+        "event_id": _str(body.get("eventId") or native_id or body.get("toolCallId") or body.get("callId") or body.get("stepId") or body.get("id")),
         "fragment_id": _str(body.get("fragmentId") or body.get("deltaId") or message.get("id")),
-        "offset": body.get("offset") if isinstance(body.get("offset"), int) else None,
-        "stream_id": _str(body.get("messageId") or body.get("toolCallId") or body.get("callId") or body.get("stepId")),
+        "offset": offset if isinstance(offset, int) else None,
+        "stream_id": native_id or _str(body.get("toolCallId") or body.get("callId") or body.get("stepId")),
         "tool_call_id": _str(body.get("toolCallId") or body.get("callId")),
         "origin_timestamp": origin_timestamp,
     }
@@ -376,18 +389,18 @@ def map_session_event(message: dict[str, Any]) -> KimiEvent | None:
             text=delta,
             raw_text=delta,
             turn_id=_str(body.get("turnId")),
-            item_id=_str(body.get("messageId") or body.get("itemId")),
+            item_id=native_id,
             display_kind="assistant",
             **base,
         )
     if body_type == "thinking.delta":
-        delta = _bounded_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
+        delta = _text_fragment(body.get("delta") if body.get("delta") is not None else body.get("text"))
         return KimiEvent(
             type="agent_message_delta",
             text=delta,
             raw_text=delta,
             turn_id=_str(body.get("turnId")),
-            item_id=_str(body.get("messageId") or body.get("itemId")),
+            item_id=native_id,
             display_kind="thinking",
             **base,
         )
@@ -742,6 +755,7 @@ class KimiServerClient:
         self._subscribed_sessions: set[str] = set()
         self._session_cursors: dict[str, dict[str, Any]] = {}
         self._stable_event_cursors: dict[str, tuple[str, int]] = {}
+        self._session_steps: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._volatile_replay_keys: set[tuple[Any, ...]] = set()
         self._volatile_replay_order: deque[tuple[Any, ...]] = deque()
         self._recovery_thread: threading.Thread | None = None
@@ -1470,11 +1484,50 @@ class KimiServerClient:
                 return False
         if not self._accept_session_event(message):
             return True
-        event = map_session_event(message)
+        event = self._map_session_event(message)
         if event is None:
             return True
         self._enqueue_event(event)
         return True
+
+    def _map_session_event(self, message: dict[str, Any]) -> KimiEvent | None:
+        """Bind SDK deltas to the real step lifecycle, never to a bare turn."""
+        body = _payload_of(message)
+        source_kind = _str(body.get("type") or message.get("type"))
+        session_id = _str(message.get("session_id"))
+        turn_id = _str(body.get("turnId"))
+        agent_id = _str(body.get("agentId")) or "main"
+        with self._lifecycle_lock:
+            epoch = _str(message.get("epoch") or self._session_cursors.get(session_id, {}).get("epoch"))
+            key = (session_id, epoch, turn_id, agent_id)
+            if source_kind == "turn.started":
+                for previous in list(self._session_steps):
+                    if previous[0] == session_id and previous[3] == agent_id:
+                        self._session_steps.pop(previous, None)
+            if source_kind == "turn.step.started":
+                self._session_steps[key] = {
+                    "epoch": epoch, "step_id": _str(body.get("stepId") or body.get("step")),
+                    "step_number": body.get("step"), "started_seq": message.get("seq"),
+                }
+            scope = self._session_steps.get(key)
+            if source_kind in {"thinking.delta", "assistant.delta"} and scope:
+                seq, started_seq = message.get("seq"), scope.get("started_seq")
+                if isinstance(seq, int) and isinstance(started_seq, int) and seq < started_seq:
+                    return None
+            event = map_session_event(message, step_scope=scope)
+            if source_kind in {"thinking.delta", "assistant.delta"} and scope and scope.get("closed") and event:
+                data = event.data
+                restricted = (data.get("disclosable") is False or data.get("private") is True
+                              or data.get("hidden") is True or data.get("non_disclosable") is True
+                              or _str(data.get("visibility") or data.get("reasoning_visibility")).lower()
+                              in {"private", "hidden", "non_disclosable", "non-disclosable"})
+                if not restricted:
+                    return None
+            if source_kind in {"turn.step.completed", "turn.step.interrupted"} and scope:
+                scope["closed"] = True
+            if source_kind in {"turn.ended", "prompt.completed", "prompt.aborted"}:
+                self._session_steps.pop(key, None)
+            return event
 
     def _invalidate_ws(
         self,
@@ -1655,6 +1708,21 @@ class KimiServerClient:
                         content_identity = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                     except (TypeError, ValueError):
                         content_identity = repr(body)
+                else:
+                    # A replay may withdraw disclosure without changing its
+                    # sequence/offset. Let that restriction reach the existing
+                    # monotonic redaction; exact metadata replays stay inert.
+                    restrictive = {
+                        key: body[key] for key, protected in (
+                            ("private", True), ("isPrivate", True), ("hidden", True),
+                            ("non_disclosable", True), ("nonDisclosable", True),
+                            ("disclosable", False), ("isDisclosable", False),
+                        ) if body.get(key) is protected
+                    }
+                    for key in ("visibility", "reasoningVisibility"):
+                        if _str(body.get(key)).lower() in {"private", "hidden", "non_disclosable", "non-disclosable"}:
+                            restrictive[key] = body[key]
+                    content_identity = json.dumps(restrictive, sort_keys=True)
                 replay_key = (
                     session_id,
                     effective_epoch,
@@ -1785,11 +1853,15 @@ class KimiServerClient:
                     previous_offset = previous_data.get("offset")
                     incoming_offset = (event.data or {}).get("offset") if isinstance(event.data, dict) else None
                     previous_text = str(previous_event.get("text") or "")
-                    # Coalescing must not erase an offset gap.  Preserve the
-                    # frame as its own queue entry so upper layers can mark
-                    # that specific stream incomplete and reconcile via REST.
+                    # Preserve gaps, reverse fragments and conflicting bytes
+                    # for the existing absolute-offset assembler.
                     if isinstance(previous_offset, int) and isinstance(incoming_offset, int):
-                        can_merge = incoming_offset <= previous_offset + len(previous_text)
+                        relative = incoming_offset - previous_offset
+                        overlap = min(max(0, len(previous_text) - relative), len(event.text))
+                        can_merge = (0 <= relative <= len(previous_text)
+                                     and previous_text[relative:relative + overlap] == event.text[:overlap])
+                    elif previous_offset is not None or incoming_offset is not None:
+                        can_merge = False
                 if can_merge:
                     merged = deepcopy(last_entry["message"])
                     merged_event = (merged.get("payload") or {}).get("event") or {}
@@ -1797,6 +1869,12 @@ class KimiServerClient:
                     incoming_text = event.text
                     existing_data = merged_event.get("data") if isinstance(merged_event.get("data"), dict) else {}
                     incoming_data = event.data if isinstance(event.data, dict) else {}
+                    for privacy_key, protected_value in (("private", True), ("hidden", True), ("non_disclosable", True), ("disclosable", False)):
+                        if incoming_data.get(privacy_key) is protected_value:
+                            existing_data[privacy_key] = protected_value
+                    for privacy_key in ("visibility", "reasoning_visibility"):
+                        if _str(incoming_data.get(privacy_key)).lower() in {"private", "hidden", "non_disclosable", "non-disclosable"}:
+                            existing_data[privacy_key] = incoming_data[privacy_key]
                     start_offset = existing_data.get("offset")
                     incoming_offset = incoming_data.get("offset")
                     if isinstance(start_offset, int) and isinstance(incoming_offset, int):

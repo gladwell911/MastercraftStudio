@@ -1,9 +1,20 @@
 import ctypes
 import time
 
+import pytest
+
 import main
-from kimi_server_client import KimiEvent, event_to_payload
-from test_kimi_integration import FakeKimiServerClient, _setup_kimi_frame
+from kimi_server_client import KimiEvent, KimiServerClient, event_to_payload
+from test_kimi_integration import FakeKimiServerClient, _setup_kimi_frame, _sdk_push
+from test_codex_ui_responsiveness_automation import _track_ui_timers_for_test
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_kimi_ui_timers(monkeypatch, request):
+    cleanup = _track_ui_timers_for_test(monkeypatch)
+    frame = request.getfixturevalue("frame")
+    yield
+    cleanup(frame)
 
 
 def _send_window_key(window, key_code):
@@ -109,6 +120,49 @@ def _push_delta_events(frame, count, *, chat_id="chat-kimi"):
 def _drain_all_kimi_events(frame):
     while frame._pending_kimi_ui_events:
         frame._drain_kimi_ui_events()
+
+
+def test_sdk_public_thinking_updates_execution_list_and_detail_without_moving_focus(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution")
+    monkeypatch.setattr(frame, "_maybe_trigger_kimi_thinking_sync", lambda *args: None)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    frame.input_edit.SetFocusFromKbd()
+    wx_app.Yield()
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, "session-1", "turn.step.started", 1, chat_id="chat-kimi", turnId="turn-1", step=1, stepId="native-step")
+    _sdk_push(frame, transport, "session-1", "thinking.delta", 1, chat_id="chat-kimi", turnId="turn-1", offset=0, delta="先检查输入。\n完整公开细节。")
+    assert _yield_until(wx_app, lambda: any(meta[0] == "execution" and meta[2] == "先检查输入。" for meta in frame.execution_meta))
+    assert frame.input_edit.HasFocus()
+    selected_id = frame.execution_list_model.selected_id()
+    _sdk_push(frame, transport, "session-1", "thinking.delta", 1, chat_id="chat-kimi", turnId="turn-1", offset=len("先检查输入。\n完整公开细节。"), delta="\n然后核对结果。")
+    assert _yield_until(wx_app, lambda: any(meta[0] == "execution" and meta[3] == "先检查输入。\n完整公开细节。\n然后核对结果。" for meta in frame.execution_meta))
+    assert frame.input_edit.HasFocus()
+    assert frame.execution_list_model.selected_id() == selected_id
+    counts = frame.execution_list.GetCount()
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda _control: pytest.fail("replay must not repaint"))
+    _sdk_push(frame, transport, "session-1", "thinking.delta", 1, chat_id="chat-kimi", turnId="turn-1", offset=0, delta="先检查输入。\n完整公开细节。")
+    wx_app.Yield()
+    assert frame.execution_list.GetCount() == counts
+    assert frame.input_edit.HasFocus()
+    # Exercise the real caller and dialog construction, using the existing
+    # modal harness so this isolated test never waits for desktop interaction.
+    opened = []
+    def show_modal(dialog):
+        dialog.Show()
+        wx_app.Yield()
+        opened.append((dialog, dialog.canonical_text, dialog.text_ctrl.GetValue()))
+        return main.wx.ID_CLOSE
+    monkeypatch.setattr(main.AnswerTextViewerDialog, "ShowModal", show_modal)
+    row = next(index for index, meta in enumerate(frame.execution_meta)
+               if meta[0] == "execution" and meta[2] == "先检查输入。")
+    frame.execution_list.SetSelection(row)
+    assert frame._open_selected_execution_text_viewer()
+    full_text = "先检查输入。\n完整公开细节。\n然后核对结果。"
+    assert [(canonical, text) for _dialog, canonical, text in opened] == [(full_text, "\n" + full_text)]
+    wx_app.Yield()
+    assert not opened[0][0]
+    assert not frame._answer_viewer_open
 
 
 # D1 — 事件风暴期间用户导航：焦点不被抢、列表选择不变
@@ -395,12 +449,12 @@ def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(fram
     _drain_all_kimi_events(frame)
 
     rows = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
-    assert rows.count("正在分析问题") == 1
+    assert rows.count("The user") == 1
     assert frame.input_edit.HasFocus()
     assert frame.execution_list.GetSelection() == 1
     copied = []
     monkeypatch.setattr(frame, "_set_clipboard_text", lambda text: copied.append(text) or True)
-    frame.execution_list.SetSelection(rows.index("正在分析问题"))
+    frame.execution_list.SetSelection(rows.index("The user"))
 
     class _CopyEvent:
         def GetKeyCode(self):
@@ -448,6 +502,10 @@ def test_background_structured_kimi_batch_persists_owner_without_foreground_repa
     _drain_all_kimi_events(frame)
     bg_steps = frame.archived_chats[0]["execution_steps"]
     assert bg_steps == []  # tool events never become F1 list rows
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, "session-bg", "turn.step.started", 1, chat_id="chat-bg", turnId="turn-bg", step=1, stepId="bg-step")
+    _sdk_push(frame, transport, "session-bg", "thinking.delta", 1, chat_id="chat-bg", turnId="turn-bg", offset=0, delta="后台真实思考。")
+    assert [step["detail_text"] for step in frame.archived_chats[0]["execution_steps"]] == ["后台真实思考。"]
     assert repaint == []
     assert frame.execution_list.GetSelection() == 1
     assert frame.input_edit.HasFocus()

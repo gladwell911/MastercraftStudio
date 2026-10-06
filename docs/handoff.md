@@ -4,6 +4,7 @@
 
 ## 当前实现
 
+- Kimi 2.1.1 真实无 messageId 的 thinking/assistant 流按 session、epoch、turn、agent、原生 step 与内容种类补充稳定身份；公开思考在生成中直接进入 canonical 执行投影，列表展示原文摘录、详情保留全文。相同 seq 的不同 offset、重放、缺口和过期 step/epoch 保持隔离。REST 只在完整 prompt 边界内按 assistant 步骤顺序补全既有行；晚到流不能覆盖完成快照。工具调用前的 assistant 原文转为 commentary，REST 的 text + tool_use 同样保留，权威终答排除这些中间说明。隐藏标记整段单调生效，已缓存与持久化组装内容也同步清除；主 REST 不补写子代理流。RC 继续消费 v3 的 list_text/detail_text，无 RC 产品改动。
 - 只有首次成功且非空的权威回答产生未读。稳定 canonical message_id 与首次完成 answer_seq 关联；首次启用的旧历史设为已读基线，清空才更换独立 generation。pair/chat/generation 下的 read_seq 只增不减，游标、durable fact 和 outbox 同事务提交。
 - 自动定位不确认已读；主动回答导航、全文显示及成功打开网页确认冻结范围。Ctrl+Shift+X 使用原生 MOD_NOREPEAT 注册，恢复实际前台和最后项焦点，按已显示且不超过冻结上限的最大完成序列确认；无候选调用 ZDSR 播报“无未读聊天”。Home 首行非回答时不误读。未读标签不改变消息活动排序。
 - RC 原生持久 pending 和范围通知取消已接入；后台目前固定 default pair，其他 pair 明确拒绝本地确认。旧通知缺少回答元数据时保留，不 cancelAll。协议和手机验收入口见 RC 的 `docs/current/remote-control.md` 与 `testing.md`。
@@ -14,6 +15,15 @@
 - created_at/answer_at、累计300秒时间标记、Codex命令审批、通知路由、聊天信息及跨端v3执行投影保留。纯notLoaded占位过滤与UI/存储共享可视规则，有用描述和对应失败内容保留。
 
 ## 验证与复现
+
+2026-10-06 Kimi 思考/进度修复最终独立复验已由 engineer 完成：MC 映射/客户端 179 项、定向集成 50 项、隔离 wx 4 项、共享执行投影 4 项，共 237 passed、0 failed、0 skipped；覆盖真实 SDK 无 ID envelope、生成中 list/detail、多步骤/代理、WS→REST 同行、缺口/重放/epoch、隐藏流、steering alias、终答分离与后台焦点，以及实际 execution 正文查看器 caller 和真实 AnswerTextViewerDialog 的公开全文显示、关闭销毁。wx 串行并清理构造至销毁期间的定时器；仅检查受影响界面，没有恢复完整桌面/设备验收。RC 无代码、夹具或环境变化，复用首轮现有 v3 两项定向检查（投影行身份及完整详情、读取投影不改写 V2 durable facts），最终验证范围共 239 项；集成 92 项与 wx 5 项为 deselected。工作区报告：`D:/code/sj/_bmad-output/implementation-artifacts/verification-kimi-thinking-progress.md`。未调用真实模型、未替换运行包、未推送；本轮通过不证明安装版、实体手机或现场 Kimi 输出已验证。
+
+```powershell
+.venv/Scripts/python.exe -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py -q
+.venv/Scripts/python.exe -m pytest tests/test_kimi_integration.py -k 'sdk_ or rest_progress_rejects or rest_steering_alias or rest_only_commentary or rest_answer_consumer or rest_mixed_thinking or rest_progress_requires or thinking_status_interleaving or mapped_private_reasoning or thinking_privacy_is_monotonic or rest_thinking_blocks_sync or thinking_sync_orders or thinking_fetch_worker or maybe_trigger_kimi_thinking or recovery_thinking or long_mapped_assistant or out_of_order_absolute_offsets or mapped_assistant_delta_whitespace or events_for_non_visible_chat_do_not_repaint' -q
+.venv/Scripts/python.exe -m pytest tests/test_kimi_ui_responsiveness_automation.py -k 'sdk_public_thinking or kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint or background_events_do_not_repaint_lists or background_structured_kimi_batch_persists_owner_without_foreground_repaint' -q
+.venv/Scripts/python.exe -m pytest tests/test_execution_projection.py -q
+```
 
 2026-10-05 已读功能独验：MC 10 项、RC 已读 Flutter 7 项、连接关闭/重连 6 项、Android 原生 5 项通过，touched analyze/编译/解析通过。MC 受影响回归 138 passed、6 failed，六项在精确旧基线复现，不算全回归通过。MC cwd 可复跑非桌面定向检查：
 

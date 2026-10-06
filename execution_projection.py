@@ -52,6 +52,8 @@ def execution_step_detail_text(step) -> str:
 def should_show_execution_step(step) -> bool:
     if not isinstance(step, dict):
         return bool(str(step or "").strip())
+    if step.get("private_reasoning"):
+        return False
     status = str(step.get("status") or "").strip().lower()
     kind = str(step.get("display_kind") or "").strip().lower()
     if (kind != "error" and status not in {"failed", "error"}

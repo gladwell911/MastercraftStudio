@@ -7,7 +7,8 @@ import wx
 
 import main
 from codex_client import CodexEvent
-from kimi_server_client import KimiEvent, KimiServerError, event_to_payload, map_session_event
+from kimi_server_client import KimiEvent, KimiServerClient, KimiServerError, event_to_payload, map_session_event
+from execution_projection import project_execution_rows, should_show_execution_step
 
 TEST_SESSION_ID = "session-test-1"
 TEST_TURN_ID = "1"
@@ -189,6 +190,386 @@ def _active_chat_id(frame):
     return str(frame.active_chat_id or frame.current_chat_id or "").strip()
 
 
+def _sdk_push(frame, transport, session_id, kind, seq, *, agent="main", offset=None, chat_id=None, **body):
+    message = {"type": kind, "session_id": session_id, "epoch": "sdk-epoch", "seq": seq,
+               "payload": {"type": kind, "agentId": agent, "turnId": 1, **body}}
+    if offset is not None:
+        message.update(offset=offset, volatile=True)
+    transport._handle_ws_message(message)
+    for queued in transport.drain_pending_messages(100):
+        frame._on_kimi_event_for_chat(chat_id or _active_chat_id(frame), main.CodexEvent(**queued["payload"]["event"]))
+    return message
+
+
+def _canonical_kimi_rows(frame):
+    frame._flush_execution_step_persists_sync()
+    source = frame.chat_store.read_execution_projection_source(_active_chat_id(frame))
+    rows = project_execution_rows(
+        chat_id=_active_chat_id(frame), revision=source["revision"], steps=source["steps"], turns=source["turns"],
+        view_mode="history", active_turn_index=-1, selected_model="kimi/main", requesting_text=main.REQUESTING_TEXT,
+        answer_to_plain=lambda answer, _model: answer,
+    )
+    return [row for row in rows if ":logical:" in row["row_id"]]
+
+
+def test_sdk_thinking_is_visible_before_step_completion_with_empty_rest(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "真实流思考")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="sdk-step-1")
+    text = "先核对现有实现。\n\n" + "这是公开的完整细节。" * 350
+    replay = _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta=text)
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=len(text), delta="然后验证受影响行为。")
+    assert fake.messages_by_session.get(session_id, []) == []
+    row = next(row for row in _canonical_kimi_rows(frame) if row.get("kind") != "time")
+    assert row["list_text"] == "先核对现有实现。"
+    assert row["detail_text"] == text + "然后验证受影响行为。"
+    before = frame._current_chat_state["execution_steps"][:]
+    transport._handle_ws_message(replay)
+    assert transport.drain_pending_messages(10) == []
+    assert frame._current_chat_state["execution_steps"] == before
+    assert frame.active_session_turns[0]["answer_md"] == main.REQUESTING_TEXT
+
+
+def test_sdk_step_agent_streams_reconcile_rest_once_and_keep_final_answer_separate(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "检查代码")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="main-step-1")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta="先检查接口。")
+    _sdk_push(frame, transport, session_id, "turn.step.started", 3, agent="worker", step=1, stepId="worker-step")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 3, agent="worker", offset=0, delta="子任务只核对日志。")
+    _sdk_push(frame, transport, session_id, "assistant.delta", 3, offset=0, delta="接口已有线索，我会读取实现。")
+    _sdk_push(frame, transport, session_id, "tool.call.started", 4, toolCallId="read-1", name="Read")
+    _sdk_push(frame, transport, session_id, "turn.step.completed", 5, step=1, stepId="main-step-1")
+    _sdk_push(frame, transport, session_id, "turn.step.started", 6, step=2, stepId="main-step-2")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 6, offset=0, delta="现在验证返回值。")
+    _sdk_push(frame, transport, session_id, "assistant.delta", 6, offset=0, delta="这是最终回答。")
+    chat_id = _active_chat_id(frame)
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    assert frame._kimi_answer_parts(chat_id, session_id, owner["prompt_id"]) == "这是最终回答。"
+    before = {step["item_id"]: step["canonical_item_id"] for step in frame._current_chat_state["execution_steps"]}
+    messages = [
+        {"id": owner["prompt_id"], "role": "user", "created_at": "2026-10-06T00:00:00Z", "content": []},
+        {"id": "rest-step-1", "role": "assistant", "created_at": "2026-10-06T00:00:01Z", "content": [
+            {"type": "thinking", "thinking": "先检查接口。\n完整补齐细节。"},
+            {"type": "thinking", "thinking": "第二段公开思路。"},
+            {"type": "text", "text": "接口已有线索，我会读取实现。"},
+            {"type": "tool_use", "tool_call_id": "read-1", "tool_name": "Read", "input": {}},
+        ]},
+        {"id": "rest-tool", "role": "tool", "created_at": "2026-10-06T00:00:02Z", "content": []},
+        {"id": "rest-step-2", "role": "assistant", "created_at": "2026-10-06T00:00:03Z", "content": [
+            {"type": "thinking", "thinking": "现在验证返回值。\n完整验证细节。"},
+            {"type": "text", "text": "这是最终回答。"},
+        ]},
+    ]
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, list(reversed(messages)))
+    assert not frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    steps = [step for step in frame._current_chat_state["execution_steps"] if should_show_execution_step(step)]
+    assert len(steps) == 4
+    assert all(before[step["item_id"]] == step["canonical_item_id"] for step in steps)
+    assert [step["detail_text"] for step in steps] == [
+        "先检查接口。\n完整补齐细节。\n第二段公开思路。", "子任务只核对日志。",
+        "接口已有线索，我会读取实现。", "现在验证返回值。\n完整验证细节。",
+    ]
+    projected = [row for row in _canonical_kimi_rows(frame) if row.get("kind") != "time"]
+    assert [row["detail_text"] for row in projected] == [step["detail_text"] for step in steps]
+    assert frame._kimi_rest_answer_for_prompt(messages, owner["prompt_id"]) == "这是最终回答。"
+    assert frame._kimi_rest_answer_for_prompt(messages[:2], owner["prompt_id"]) == ""
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="1", text="这是最终回答。", status="completed",
+                             data={"source_kind": "rest.reconciled", "stream_complete": True, "prompt_id": owner["prompt_id"],
+                                   "owner_generation": owner["generation"], "idle_verified": True}))
+    assert frame.active_session_turns[0]["answer_md"] == "这是最终回答。"
+
+
+@pytest.mark.parametrize("private_fragment", [0, 1])
+def test_sdk_hidden_stream_redacts_live_row_and_durable_assembler(frame, monkeypatch, private_fragment):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "隐私边界")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="private-step")
+    offset = 0
+    for index, text in enumerate(("EARLY SECRET ", "LATE SECRET")):
+        _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=offset, delta=text, hidden=index == private_fragment)
+        offset += len(text)
+    assert not [step for step in frame._current_chat_state["execution_steps"] if should_show_execution_step(step)]
+    assert "SECRET" not in str(frame._current_chat_state["execution_steps"])
+    _canonical_kimi_rows(frame)
+    with frame.chat_store._connect() as connection:
+        states = connection.execute("SELECT state_json FROM execution_assemblers WHERE chat_id=?", (_active_chat_id(frame),)).fetchall()
+    assert states and "SECRET" not in str([row["state_json"] for row in states])
+
+
+def test_rest_progress_rejects_stale_owner_and_later_prompt_content(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "本轮")
+    session_id = fake.created_sessions[0]["session_id"]
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "next-prompt", "role": "user", "content": []},
+                {"id": "other-turn", "role": "assistant", "content": [{"type": "thinking", "thinking": "别轮内容"}]}]
+    assert not frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
+    assert not frame._kimi_sync_thinking_rows(_active_chat_id(frame), dict(owner, revision=-1), messages)
+    assert "别轮内容" not in str(frame._current_chat_state["execution_steps"])
+
+
+def test_sdk_gap_waits_for_prefix_and_rest_completion_survives_late_delta(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "补齐片段")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="gap-step")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=3, delta="后半段")
+    assert not _canonical_kimi_rows(frame)
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta="前三字")
+    assert _canonical_kimi_rows(frame)[0]["detail_text"] == "前三字后半段"
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "rest-complete", "role": "assistant", "content": [{"type": "thinking", "thinking": "前三字后半段完整完成。"}]}]
+    assert frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=7, delta="晚到片段")
+    rows = _canonical_kimi_rows(frame)
+    assert len(rows) == 1 and rows[0]["detail_text"] == "前三字后半段完整完成。"
+    messages[1]["content"][0]["hidden"] = True
+    frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
+    assert not _canonical_kimi_rows(frame)
+    assert "前三字" not in str(frame.chat_store.load_execution_steps(_active_chat_id(frame)))
+    with frame.chat_store._connect() as connection:
+        states = connection.execute("SELECT state_json FROM execution_assemblers WHERE chat_id=?", (_active_chat_id(frame),)).fetchall()
+    assert "前三字" not in str([row["state_json"] for row in states])
+
+
+@pytest.mark.parametrize("after_finalization", [False, True])
+def test_rest_steering_alias_keeps_original_step_ownership(frame, monkeypatch, after_finalization):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "原始问题")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="original-step")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta="原始步骤。")
+    _sdk_push(frame, transport, session_id, "turn.step.completed", 3, step=1, stepId="original-step")
+    _submit(frame, "追加要求")
+    _sdk_push(frame, transport, session_id, "turn.step.started", 4, step=2, stepId="steered-step")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 4, offset=0, delta="追加步骤。")
+    original = fake.submitted[0]["prompt_id"]
+    alias = fake.submitted[1]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(original, session_id=session_id)
+    messages = [{"id": original, "role": "user", "content": []},
+                {"id": "first", "role": "assistant", "content": [{"type": "thinking", "thinking": "原始步骤。全文。"}]},
+                {"id": alias, "role": "user", "content": []},
+                {"id": "second", "role": "assistant", "content": [{"type": "thinking", "thinking": "追加步骤。全文。"}]}]
+    if after_finalization:
+        fake.messages_by_session[session_id] = messages
+        callbacks = []
+        original_call_after = frame._call_after_if_alive
+        def defer_sync(fn, *args, **kwargs):
+            if fn == frame._kimi_sync_thinking_rows:
+                callbacks.append((fn, args, kwargs))
+                return
+            return original_call_after(fn, *args, **kwargs)
+        monkeypatch.setattr(frame, "_call_after_if_alive", defer_sync)
+        frame._kimi_thinking_fetch_worker(owner)
+        assert len(callbacks) == 1
+        fake.push_event(KimiEvent(type="turn_completed", thread_id=session_id, turn_id="1", text="Final answer", status="completed",
+                                 data={"source_kind": "rest.reconciled", "stream_complete": True, "prompt_id": original,
+                                       "owner_generation": owner["generation"], "idle_verified": True}))
+        assert not frame._kimi_prompt_owners
+        fn, args, kwargs = callbacks[0]
+        assert fn(*args, **kwargs)
+    else:
+        assert frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
+    steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("display_kind") == "thinking"]
+    assert [(step["kimi_step_id"], step["detail_text"]) for step in steps] == [
+        ("original-step", "原始步骤。全文。"), ("steered-step", "追加步骤。全文。")]
+
+
+def test_sdk_reverse_fragments_in_one_batch_reach_store_in_absolute_order(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "Order")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1)
+    for offset, text in ((3, "BBB"), (0, "AAA")):
+        transport._handle_ws_message({"type": "thinking.delta", "session_id": session_id, "epoch": "sdk-epoch", "seq": 2,
+                                      "offset": offset, "volatile": True,
+                                      "payload": {"type": "thinking.delta", "turnId": 1, "agentId": "main", "delta": text}})
+    queued = transport.drain_pending_messages(10)
+    assert len(queued) == 2
+    for message in queued:
+        frame._on_kimi_event_for_chat(_active_chat_id(frame), CodexEvent(**message["payload"]["event"]))
+    assert [row["detail_text"] for row in _canonical_kimi_rows(frame)] == ["AAABBB"]
+
+
+@pytest.mark.parametrize("initially_private,after_tool", [(False, False), (False, True), (True, False)])
+def test_sdk_assistant_privacy_redacts_commentary_cache_and_answer_segments(frame, monkeypatch, initially_private, after_tool):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "Privacy")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="assistant-step")
+    _sdk_push(frame, transport, session_id, "assistant.delta", 2, offset=0, delta="SECRET prose", hidden=initially_private)
+    if not initially_private:
+        assert frame._kimi_answer_parts(_active_chat_id(frame), session_id) == "SECRET prose"
+        if after_tool:
+            _sdk_push(frame, transport, session_id, "tool.call.started", 3, toolCallId="read", name="Read")
+            assert any(row["detail_text"] == "SECRET prose" for row in _canonical_kimi_rows(frame))
+        _sdk_push(frame, transport, session_id, "assistant.delta", 2, offset=0, delta="SECRET prose", hidden=True)
+    assert "SECRET" not in str(frame._execution_delta_buffer)
+    assert "SECRET" not in str(frame._kimi_turn_answer_parts)
+    assert "SECRET" not in str(frame._kimi_turn_answer_segments)
+    if not after_tool:
+        _sdk_push(frame, transport, session_id, "tool.call.started", 3, toolCallId="read", name="Read")
+    assert not [row for row in _canonical_kimi_rows(frame) if "SECRET" in row["detail_text"]]
+    assert "SECRET" not in str(frame.chat_store.load_execution_steps(_active_chat_id(frame)))
+    assert frame._kimi_answer_parts(_active_chat_id(frame), session_id) == ""
+    with frame.chat_store._connect() as connection:
+        states = connection.execute("SELECT state_json FROM execution_assemblers WHERE chat_id=?", (_active_chat_id(frame),)).fetchall()
+    assert "SECRET" not in str([row["state_json"] for row in states])
+    _sdk_push(frame, transport, session_id, "turn.step.started", 4, step=2, stepId="final-step")
+    _sdk_push(frame, transport, session_id, "assistant.delta", 4, offset=0, delta="Public final answer")
+    assert frame._kimi_answer_parts(_active_chat_id(frame), session_id) == "Public final answer"
+
+
+@pytest.mark.parametrize("target,flag,value", [
+    (target, flag, value) for target in ("message", "block")
+    for flag, value in (("hidden", True), ("private", True), ("disclosable", False))
+])
+def test_rest_only_commentary_withdraws_changed_privacy_before_dedupe(frame, monkeypatch, target, flag, value):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "REST only")
+    session_id = fake.created_sessions[0]["session_id"]
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    prose = ("Commentary excerpt.\n" + "Complete public detail. " * 120).strip()
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "rest-commentary", "role": "assistant", "content": [
+                    {"type": "text", "text": prose}, {"type": "tool_use", "tool_name": "Read"}]},
+                {"id": "rest-final", "role": "assistant", "content": [{"type": "text", "text": "Final public answer"}]}]
+    chat_id = _active_chat_id(frame)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert not frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    rows = _canonical_kimi_rows(frame)
+    assert len(rows) == 1
+    assert rows[0]["list_text"] == "Commentary excerpt."
+    assert rows[0]["detail_text"] == prose
+    assert frame._kimi_rest_answer_for_prompt(messages, owner["prompt_id"]) == "Final public answer"
+    protected = messages[1] if target == "message" else messages[1]["content"][0]
+    protected[flag] = value
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert not _canonical_kimi_rows(frame)
+    assert "Commentary excerpt" not in str(frame.chat_store.load_execution_steps(chat_id))
+    assert frame._kimi_rest_answer_for_prompt(messages, owner["prompt_id"]) == "Final public answer"
+
+
+@pytest.mark.parametrize("target", ["message", "block"])
+@pytest.mark.parametrize("restriction", [
+    {"hidden": True}, {"private": True}, {"non_disclosable": True}, {"disclosable": False},
+    {"visibility": "hidden"}, {"reasoning_visibility": "non-disclosable"},
+])
+def test_rest_answer_consumer_excludes_restrictive_message_or_text_block(frame, target, restriction):
+    answer = {"id": "answer", "role": "assistant", "content": [
+        {"type": "text", "text": "PUBLIC "}, {"type": "text", "text": "PROTECTED"}]}
+    messages = [{"id": "prompt", "role": "user", "content": []}, answer]
+    assert frame._kimi_rest_answer_for_prompt(messages, "prompt") == "PUBLIC PROTECTED"
+    (answer if target == "message" else answer["content"][1]).update(restriction)
+    assert frame._kimi_rest_answer_for_prompt(messages, "prompt") == ("" if target == "message" else "PUBLIC")
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_rest_mixed_thinking_block_privacy_withdraws_persisted_matching_narrative(frame, monkeypatch, aggregate):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "Mixed blocks")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="mixed-step")
+    if aggregate:
+        _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta="SECRET and public")
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "mixed", "role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "SECRET block"},
+                    {"type": "thinking", "thinking": "Public sibling"}]}]
+    chat_id = _active_chat_id(frame)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert len(_canonical_kimi_rows(frame)) == (1 if aggregate else 2)
+    messages[1]["content"][0]["hidden"] = True
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert [row["detail_text"] for row in _canonical_kimi_rows(frame)] == ([] if aggregate else ["Public sibling"])
+    assert "SECRET" not in str(frame.chat_store.load_execution_steps(chat_id))
+
+
+@pytest.mark.parametrize("kind", ["thinking", "assistant"])
+def test_sdk_rest_first_privacy_reaches_completed_row_with_different_stream_id(frame, monkeypatch, kind):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "REST first")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="rest-first-step")
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    content = ([{"type": "thinking", "thinking": "SECRET complete"}] if kind == "thinking" else
+               [{"type": "text", "text": "SECRET complete"}, {"type": "tool_use", "tool_name": "Read"}])
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "rest-first", "role": "assistant", "content": content}]
+    chat_id = _active_chat_id(frame)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    row_id = _canonical_kimi_rows(frame)[0]["row_id"]
+    _sdk_push(frame, transport, session_id, f"{kind}.delta", 2, offset=0, delta="SECRET complete", hidden=True)
+    assert not _canonical_kimi_rows(frame)
+    assert "SECRET" not in str(frame.chat_store.load_execution_steps(chat_id))
+    assert any(row_id.endswith(step["canonical_item_id"].removeprefix("execution-")) and step.get("private_reasoning")
+               for step in frame._current_chat_state["execution_steps"])
+
+
+@pytest.mark.parametrize("missing_owner", [False, True])
+def test_rest_progress_requires_explicit_complete_owning_prompt_boundary(frame, monkeypatch, missing_owner):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "New turn")
+    session_id = fake.created_sessions[0]["session_id"]
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    messages = [{"id": "previous", "role": "assistant", "content": [{"type": "thinking", "thinking": "Previous turn"}]}]
+    if missing_owner:
+        owner = dict(owner, prompt_id="", owner_prompt_id="")
+    assert not frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
+    assert not _canonical_kimi_rows(frame)
+    assert "Previous turn" not in str(frame.chat_store.load_execution_steps(_active_chat_id(frame)))
+
+
+def test_sdk_rest_append_failure_keeps_live_buffer_and_successful_retry(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "Retry")
+    session_id = fake.created_sessions[0]["session_id"]
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, session_id, "turn.started", 1)
+    _sdk_push(frame, transport, session_id, "turn.step.started", 2, step=1, stepId="retry-step")
+    _sdk_push(frame, transport, session_id, "thinking.delta", 2, offset=0, delta="Live prefix")
+    owner = frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id)
+    chat_id = _active_chat_id(frame)
+    row_id = _canonical_kimi_rows(frame)[0]["row_id"]
+    messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
+                {"id": "retry", "role": "assistant", "content": [{"type": "thinking", "thinking": "Live prefix complete"}]}]
+    original_persist = frame._persist_execution_step_or_queue
+    monkeypatch.setattr(frame, "_persist_execution_step_or_queue", lambda *_args: False)
+    assert not frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert frame._execution_delta_buffer
+    assert not any("retry:thinking" in keys for keys in frame._kimi_thinking_synced.values())
+    monkeypatch.setattr(frame, "_persist_execution_step_or_queue", original_persist)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert not frame._execution_delta_buffer
+    rows = _canonical_kimi_rows(frame)
+    assert [(row["row_id"], row["detail_text"]) for row in rows] == [(row_id, "Live prefix complete")]
+
+
 def test_model_combo_contains_kimi(frame):
     choices = [frame.model_combo.GetString(i) for i in range(frame.model_combo.GetCount())]
     assert "Kimi Code" in choices
@@ -343,7 +724,7 @@ def test_thinking_status_interleaving_creates_one_chinese_execution_step(frame, 
 
     steps = frame._current_chat_state.get("execution_steps") or []
     summaries = [step.get("list_text") for step in steps if step.get("kimi_summary")]
-    assert summaries == ["正在分析问题"]
+    assert summaries == ["The user"]
     assert [step["detail_text"] for step in steps if step.get("kimi_summary")] == ["The user"]
     assert all("progress" not in str(step.get("list_text") or "") for step in steps)
     assert not frame._execution_delta_buffer
@@ -356,13 +737,14 @@ def test_mapped_private_reasoning_is_withheld_through_store(frame, monkeypatch):
     session_id = fake.created_sessions[0]["session_id"]
     fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=TEST_TURN_ID))
     mapped = map_session_event({
-        "type": "thinking.delta", "session_id": session_id,
+        "type": "thinking.delta", "session_id": session_id, "seq": 1, "offset": 0, "volatile": True,
         "payload": {"type": "thinking.delta", "turnId": TEST_TURN_ID, "delta": "PRIVATE COT", "private": True},
-    })
+    }, step_scope={"step_id": "private-step", "step_number": 1, "epoch": "private-epoch"})
     frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(mapped)))
     frame._flush_execution_delta(_active_chat_id(frame), TEST_TURN_ID)
-    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary"))
-    assert step["list_text"] == "正在分析问题"
+    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("private_reasoning"))
+    assert step["list_text"] == ""
+    assert not should_show_execution_step(step)
     assert step["detail_text"] == ""
     assert step["source_detail"] == {}
     assert "PRIVATE COT" not in str(step)
@@ -389,8 +771,9 @@ def test_thinking_privacy_is_monotonic_across_buffered_fragments_and_restart(fra
         frame._on_kimi_event_for_chat(_active_chat_id(frame), main.CodexEvent(**event_to_payload(mapped)))
         offset += len(fragment)
     frame._flush_execution_delta(_active_chat_id(frame), TEST_TURN_ID)
-    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("kimi_summary"))
-    assert step["list_text"] == "正在分析问题"
+    step = next(step for step in frame._current_chat_state["execution_steps"] if step.get("private_reasoning"))
+    assert step["list_text"] == ""
+    assert not should_show_execution_step(step)
     assert step["detail_text"] == ""
     assert step["source_detail"] == {}
     assert "SECRET" not in str(step)
@@ -1867,17 +2250,9 @@ def test_events_for_non_visible_chat_do_not_repaint(frame, monkeypatch):
 
     fake.on_message = frame._on_kimi_client_message
     frame._kimi_client = fake
-    fake.push_event(
-        KimiEvent(
-            type="agent_message_delta",
-            thread_id="session-bg",
-            turn_id="bg-turn",
-            text="The",
-            raw_text="The",
-            display_kind="thinking",
-            data={"source_kind": "thinking.delta", "offset": 0},
-        )
-    )
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, "session-bg", "turn.step.started", 1, chat_id="chat-bg", turnId="bg-turn", step=1, stepId="background-step")
+    _sdk_push(frame, transport, "session-bg", "thinking.delta", 1, chat_id="chat-bg", turnId="bg-turn", offset=0, delta="The")
     fake.push_event(KimiEvent(type="thread_status_changed", thread_id="session-bg", turn_id="bg-turn", status="streaming"))
     fake.push_event(
         KimiEvent(type="agent_message_delta", thread_id="session-bg", turn_id="bg-turn", text="后台答案", display_kind="assistant")
@@ -1889,14 +2264,14 @@ def test_events_for_non_visible_chat_do_not_repaint(frame, monkeypatch):
     assert archived_turns[0]["answer_md"] == "后台答案"
     assert archived_turns[0]["request_status"] == "done"
     background_steps = frame.archived_chats[0]["execution_steps"]
-    assert [step["list_text"] for step in background_steps if step.get("kimi_summary")] == ["正在分析问题"]
+    assert [step["list_text"] for step in background_steps if step.get("kimi_summary")] == ["The"]
     assert rendered["n"] == 0
     assert refreshed["n"] == 0
     frame.view_mode = "history"
     frame.view_history_id = "chat-bg"
     frame._current_chat_state["detail_panel_mode"] = "execution"
     frame._rebuild_execution_list_from_state()
-    assert "正在分析问题" in [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
+    assert "The" in [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
 
 
 def test_help_excludes_compact_and_compact_is_unsupported(frame, monkeypatch):

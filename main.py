@@ -7486,6 +7486,7 @@ class ChatFrame(wx.Frame):
         return (
             data.get("disclosable") is False
             or data.get("private") is True
+            or data.get("hidden") is True
             or data.get("non_disclosable") is True
             or visibility in {"private", "hidden", "non_disclosable", "non-disclosable"}
         )
@@ -7549,7 +7550,9 @@ class ChatFrame(wx.Frame):
         if source_kind in {"tool.progress", "shell.output"}:
             return ""
         if display_kind == "thinking":
-            return "正在分析问题"
+            return "" if ChatFrame._kimi_private_reasoning(data) else ChatFrame._kimi_thinking_excerpt(event.raw_text or event.text)
+        if display_kind == "commentary" and source_kind == "assistant.delta":
+            return "" if ChatFrame._kimi_private_reasoning(data) else ChatFrame._kimi_thinking_excerpt(event.raw_text or event.text)
         if display_kind == "assistant":
             return ""
         if display_kind == "warning":
@@ -7561,7 +7564,7 @@ class ChatFrame(wx.Frame):
         # waiting ones (the generic 执行失败/正在等待 labels below must not
         # resurrect them). Turn-level errors and waiting states keep their
         # rows because those display kinds are not tool kinds. Thinking
-        # narrative rows come from the REST message sync instead.
+        # narrative rows come from public streams and REST reconciliation.
         if display_kind in {"command", "tool", "file", "diff", "search", "test", "skill", "agent"}:
             return ""
         if any(name in tool_name for name in ("search", "grep", "glob", "find", "read", "cat", "write", "edit", "patch", "shell", "bash", "command", "powershell")):
@@ -7589,15 +7592,21 @@ class ChatFrame(wx.Frame):
         display_kind = self._execution_display_kind(event)
         kimi_summary = self._kimi_execution_summary(event)
         item = event.data if isinstance(event.data, dict) else {}
-        private_reasoning = display_kind == "thinking" and self._kimi_private_reasoning(item)
+        narrative = self._kimi_protocol_event(event) and (
+            display_kind in {"thinking", "assistant"}
+            or (display_kind == "commentary" and item.get("source_kind") == "assistant.delta")
+        )
+        private_reasoning = (display_kind == "thinking" or narrative) and self._kimi_private_reasoning(item)
         if private_reasoning:
             detail_text = ""
         elif self._kimi_protocol_event(event):
             original_raw = str(getattr(event, "raw_text", "") or "")
-            detail_text = self._bounded_kimi_diagnostic(original_raw if original_raw else detail_text)
-        if self._kimi_protocol_event(event) and not kimi_summary:
+            detail_text = original_raw if original_raw else detail_text
+            if not narrative:
+                detail_text = self._bounded_kimi_diagnostic(detail_text)
+        if self._kimi_protocol_event(event) and not kimi_summary and not private_reasoning:
             return None
-        if not detail_text and not kimi_summary:
+        if not detail_text and not kimi_summary and not private_reasoning:
             return None
         event_type = str(getattr(event, "type", "") or "").strip()
         if display_kind == "error":
@@ -7620,13 +7629,18 @@ class ChatFrame(wx.Frame):
             list_text = self._execution_command_list_text(event_type, title, command, exit_code, command_fallback)
         else:
             list_text = self._execution_list_text_from_detail(detail_text, display_kind)
+        if private_reasoning:
+            list_text = ""
         if (display_kind != "error" and str(getattr(event, "status", "") or "").lower() not in {"failed", "error"}
                 and exit_code in (None, 0)
                 and str(getattr(event, "text", "") or "").strip().lower() in {"not loaded", "notloaded"}
                 and not title and not command):
             return None
-        safe_raw_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "raw_text", "") or ""))
-        safe_text = "" if private_reasoning else self._bounded_kimi_diagnostic(str(getattr(event, "text", "") or ""))
+        safe_raw_text = "" if private_reasoning else str(getattr(event, "raw_text", "") or "")
+        safe_text = "" if private_reasoning else str(getattr(event, "text", "") or "")
+        if not narrative:
+            safe_raw_text = self._bounded_kimi_diagnostic(safe_raw_text)
+            safe_text = self._bounded_kimi_diagnostic(safe_text)
         safe_source_detail = {} if private_reasoning else self._safe_kimi_source_detail(item)
         origin_timestamp = _finite_timestamp(getattr(event, "origin_timestamp", None))
         entry = {
@@ -7661,6 +7675,11 @@ class ChatFrame(wx.Frame):
         }
         if kimi_summary:
             entry["kimi_summary"] = kimi_summary
+        if narrative:
+            entry["narrative_snapshot"] = True
+            entry["kimi_step_id"] = str(item.get("step_id") or "")
+            entry["kimi_step_number"] = item.get("step_number")
+            entry["kimi_epoch"] = str(item.get("epoch") or "")
         turn_idx = self._event_data_turn_idx_value(event)
         if turn_idx >= 0:
             entry["turn_idx"] = turn_idx
@@ -7986,7 +8005,7 @@ class ChatFrame(wx.Frame):
                         updated[key] = previous[key]
                 previous_detail = str(previous.get("detail_text") or "")
                 incoming_detail = str(updated.get("detail_text") or "")
-                if previous_detail and incoming_detail and not incoming_detail.startswith(previous_detail):
+                if not updated.get("narrative_snapshot") and previous_detail and incoming_detail and not incoming_detail.startswith(previous_detail):
                     updated["detail_text"] = previous_detail + incoming_detail
                 for history_key in ("source_detail_history", "diagnostic_history"):
                     combined = list(previous.get(history_key) or [])
@@ -8000,6 +8019,9 @@ class ChatFrame(wx.Frame):
                 for keep_key in ("operation_kind", "source_detail"):
                     if not updated.get(keep_key) and previous.get(keep_key):
                         updated[keep_key] = copy.deepcopy(previous[keep_key])
+                if updated.get("private_reasoning"):
+                    updated.update(list_text="", kimi_summary="", detail_text="", raw_text="", text="",
+                                   source_detail={}, source_detail_history=[], diagnostic_history=[])
                 if updated == previous:
                     return False
                 steps[index] = copy.deepcopy(updated)
@@ -8297,13 +8319,50 @@ class ChatFrame(wx.Frame):
         remove = set(matching_indexes[:overflow])
         chat["execution_steps"] = [step for idx, step in enumerate(steps) if idx not in remove]
 
+    def _redact_kimi_answer_stream(self, chat_id: str, session_id: str, agent_id: str, item_id: str) -> None:
+        for key, segments in self._kimi_turn_answer_segments.items():
+            if key[0] != chat_id or key[1] != session_id or key[3] != agent_id or key[4] != item_id:
+                continue
+            segments.clear()
+            # Legacy aliases share this list. Remove protected bytes from the
+            # cache as well as the segmented answer consumer.
+            parts = self._kimi_turn_answer_parts.get(key[:4])
+            if isinstance(parts, list):
+                parts[:] = [text for other, values in self._kimi_turn_answer_segments.items()
+                            if other[:4] == key[:4] for text in values.values()]
+
+    def _redact_kimi_narrative(self, chat_id: str, previous: dict) -> bool:
+        safe = dict(previous, private_reasoning=True, narrative_snapshot=True,
+                    list_text="", kimi_summary="", detail_text="", raw_text="", text="",
+                    source_detail={}, source_detail_history=[], diagnostic_history=[])
+        item_id = str(previous.get("item_id") or "")
+        session_id = str(previous.get("session_id") or previous.get("thread_id") or "")
+        agent_id = str(previous.get("agent_id") or "main")
+        self._redact_kimi_answer_stream(chat_id, session_id, agent_id, item_id)
+        for key, state in self._execution_delta_buffer.items():
+            if (key[:3] != (chat_id, str(previous.get("turn_id") or ""), item_id)
+                    or (key[4] or "main") != agent_id):
+                continue
+            state.update(parts=[], segments={}, conflicts=[], private_reasoning=True, pending_gap=False)
+            base = state.get("event")
+            if isinstance(base, CodexEvent):
+                base = copy.copy(base)
+                base.text = base.raw_text = ""
+                base.data = {**base.data, "non_disclosable": True}
+                state["event"] = base
+        store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
+        if store is not None and previous.get("logical_key") and previous.get("logical_scope"):
+            store.apply_execution_fragment(chat_id, previous["logical_key"], previous["logical_scope"],
+                                           fragment_id="", offset=0, text="", projection_seed=safe)
+        return self._append_execution_entry_to_chat(chat_id, safe, save_state=True)
+
     def _buffer_execution_delta(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
         display_kind = str(getattr(event, "display_kind", "") or "").strip()
-        if display_kind == "assistant":
-            return
         event_data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+        if display_kind == "assistant" and not (self._kimi_protocol_event(event) and event_data.get("step_id")):
+            return
         agent_id = str(event_data.get("agent_id") or event_data.get("agentId") or "").strip()
         source_kind = str(event_data.get("source_kind") or "").strip().split(".", 1)[0]
         native_id = str(getattr(event, "tool_call_id", "") or getattr(event, "item_id", "")
@@ -8322,8 +8381,37 @@ class ChatFrame(wx.Frame):
         provider = str(getattr(event, "provider", "") or event_data.get("adapter") or "codex").replace("_server", "").strip()
         if not thread_scope or not turn_scope:
             return
+        if event_data.get("lifecycle_stream") and self._kimi_event_is_authoritative(event):
+            turns = target_chat.get("turns", [])
+            turn_idx = self._kimi_event_turn_index(turns, event)
+            if turn_idx < 0:
+                return
+            if (str(turns[turn_idx].get("request_status") or "") in {"done", "failed"}
+                    and not self._kimi_private_reasoning(event_data)):
+                return
         scope_values = [str(chat_id or "").strip(), revision, thread_scope, turn_scope, provider, agent_id, native_id]
         logical_key = hashlib.sha256(json.dumps(scope_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        previous = next((step for step in target_chat.get("execution_steps", [])
+                         if isinstance(step, dict) and step.get("logical_key") == logical_key), {})
+        narrative_private = (self._kimi_protocol_event(event) and display_kind in {"thinking", "assistant", "commentary"}
+                             and self._kimi_private_reasoning(event_data))
+        completed_kind = "commentary" if display_kind == "assistant" else display_kind
+        completed = [step for step in target_chat.get("execution_steps", []) if isinstance(step, dict)
+                     and step.get("rest_message_id") and event_data.get("step_number") is not None
+                     and step.get("kimi_step_number") == event_data["step_number"]
+                     and str(step.get("session_id") or "") == thread_scope and str(step.get("turn_id") or "") == turn_scope
+                     and str(step.get("agent_id") or "main") == (agent_id or "main")
+                     and step.get("revision", revision) == revision
+                     and step.get("display_kind") == completed_kind]
+        if narrative_private:
+            for step in completed or ([previous] if previous else []):
+                self._redact_kimi_narrative(chat_id, step)
+            if completed:
+                return
+        if completed and not self._kimi_private_reasoning(event_data):
+            return
+        if previous.get("rest_message_id") and not self._kimi_private_reasoning(event_data):
+            return
         key = (str(chat_id or ""), turn_scope, native_id, display_kind, agent_id, source_kind)
         offset = getattr(event, "offset", None) if getattr(event, "offset", None) is not None else event_data.get("offset")
         accepted_origin = _finite_timestamp(getattr(event, "origin_timestamp", None))
@@ -8333,7 +8421,9 @@ class ChatFrame(wx.Frame):
              "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False,
              "origin_timestamp": accepted_origin if accepted_origin is not None else time.time()},
         )
-        if display_kind == "thinking" and self._kimi_private_reasoning(event_data):
+        if narrative_private or (display_kind == "thinking" and self._kimi_private_reasoning(event_data)):
+            state["private_reasoning"] = True
+        if previous.get("private_reasoning"):
             state["private_reasoning"] = True
         effective_private = bool(state.get("private_reasoning"))
         if effective_private and not state.get("segments_redacted"):
@@ -8342,6 +8432,10 @@ class ChatFrame(wx.Frame):
             state["segments_redacted"] = True
         fragment = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
         stored_fragment = "\0" * len(fragment) if effective_private else fragment
+        if effective_private:
+            event = copy.copy(event)
+            event.text = event.raw_text = ""
+            event.data = {**event_data, "non_disclosable": True}
         fragment_id = str(getattr(event, "fragment_id", "") or event_data.get("fragment_id") or event_data.get("fragmentId") or "").strip()
         store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
         if store is not None and hasattr(store, "apply_execution_fragment"):
@@ -8349,6 +8443,10 @@ class ChatFrame(wx.Frame):
                      "turn_id": turn_scope, "provider": provider, "agent_id": agent_id, "native_id": native_id}
             try:
                 projection_seed = self._build_execution_entry(event)
+                if self._kimi_protocol_event(event) and display_kind in {"thinking", "assistant"} and not state.get("private_reasoning"):
+                    # A fragment is not a contiguous snapshot. Publish only
+                    # after assembly, so an offset gap cannot reveal a suffix.
+                    projection_seed = None
                 if bool(state.get("private_reasoning")) and isinstance(projection_seed, dict):
                     projection_seed = dict(projection_seed, detail_text="", raw_text="", text="",
                                            source_detail={}, private_reasoning=True)
@@ -8362,6 +8460,7 @@ class ChatFrame(wx.Frame):
             state["parts"] = [str(result.get("assembled") or "")]
             state["pending_gap"] = bool(result.get("pending_gap"))
             state["logical_key"] = logical_key
+            state["private_reasoning"] = bool(result.get("private_reasoning"))
             state["event"] = event
             state["last_event_at"] = time.time()
             return
@@ -8451,8 +8550,39 @@ class ChatFrame(wx.Frame):
             return True
         return False
 
+    def _promote_kimi_interim_assistant(self, chat_id: str, event: CodexEvent) -> None:
+        """A real tool boundary identifies the preceding step's prose as commentary."""
+        data = event.data if isinstance(event.data, dict) else {}
+        if data.get("source_kind") not in {"tool.call.started", "shell.started"} or not data.get("step_id"):
+            return
+        for key, state in list(self._execution_delta_buffer.items()):
+            base = state.get("event")
+            if not isinstance(base, CodexEvent) or key[0] != chat_id or key[3] != "assistant":
+                continue
+            base_data = base.data if isinstance(base.data, dict) else {}
+            if (self._event_thread_id(base) != self._event_thread_id(event)
+                    or self._event_turn_id(base) != self._event_turn_id(event)
+                    or self._kimi_event_agent_id(base) != self._kimi_event_agent_id(event)
+                    or base_data.get("step_id") != data["step_id"]):
+                continue
+            promoted = copy.copy(base)
+            promoted.display_kind = "commentary"
+            promoted.phase = "commentary"
+            state["event"] = promoted
+            self._execution_delta_buffer.pop(key)
+            commentary_key = (*key[:3], "commentary", *key[4:])
+            self._execution_delta_buffer[commentary_key] = state
+            # Keep the empty segmented stream as a boundary: legacy part lists
+            # still contain these fragments, but must never become final text.
+            for answer_key in list(self._kimi_turn_answer_segments):
+                if (answer_key[0] == chat_id and answer_key[1] == self._event_thread_id(base)
+                        and answer_key[3] == self._kimi_event_agent_id(base) and answer_key[4] == key[2]):
+                    self._kimi_turn_answer_segments[answer_key] = {}
+            self._flush_execution_delta(chat_id, key[1], key[2], "commentary")
+
     def _flush_execution_delta(
-        self, chat_id: str, turn_id: str | None = None, item_id: str | None = None, display_kind: str | None = None
+        self, chat_id: str, turn_id: str | None = None, item_id: str | None = None, display_kind: str | None = None,
+        *, retain: bool = False
     ) -> bool:
         flushed = False
         normalized_chat_id = str(chat_id or "")
@@ -8474,7 +8604,8 @@ class ChatFrame(wx.Frame):
                 continue
             if bool(state.get("pending_gap")):
                 continue
-            self._execution_delta_buffer.pop(key, None)
+            if not retain:
+                self._execution_delta_buffer.pop(key, None)
             text = "".join(str(part or "") for part in (state.get("parts") or []))
             base_event = state.get("event")
             if not text.strip() or not isinstance(base_event, CodexEvent):
@@ -13887,6 +14018,8 @@ class ChatFrame(wx.Frame):
 
     @staticmethod
     def _kimi_message_text(message: dict) -> str:
+        if ChatFrame._kimi_private_reasoning(message):
+            return ""
         content = message.get("content")
         if isinstance(content, str):
             return content.strip()
@@ -13894,6 +14027,8 @@ class ChatFrame(wx.Frame):
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
+                    continue
+                if ChatFrame._kimi_private_reasoning(block):
                     continue
                 if str(block.get("type") or "").strip() not in {"", "text", "output_text"}:
                     continue
@@ -14026,15 +14161,11 @@ class ChatFrame(wx.Frame):
         return True
 
     def _kimi_sync_thinking_rows(self, chat_id: str, owner: dict, messages: list[dict]) -> bool:
-        """Append one F1 execution row per new transcript thinking block.
+        """Complete owned public streams from the main-agent REST transcript.
 
-        Rows flow through ``_append_execution_entry_to_chat`` like any other
-        execution entry; the ``item_id`` carries the (message id, block index)
-        dedupe key, and the ``_kimi_thinking_synced`` set ensures each block is
-        appended at most once per process life (a refetch of the same block is
-        skipped, not re-upserted). Runs on the UI thread (via ``wx.CallAfter``),
-        sorts newest-first endpoint pages into transcript order, and never lets
-        a shape failure escape as an unhandled UI-thread exception.
+        SDK REST messages have no step ID. Within a complete prompt boundary,
+        assistant order is the step order; text/tool_use explicitly identifies
+        commentary. No prose matching or subagent-to-main fallback is used.
         """
         try:
             chat_id = str(chat_id or "").strip()
@@ -14042,51 +14173,153 @@ class ChatFrame(wx.Frame):
             turn_idx = (owner or {}).get("turn_idx")
             if not chat_id or not session_id or not isinstance(turn_idx, int) or turn_idx < 0:
                 return False
-            synced_key = (chat_id, session_id)
+            chat = self._chat_state_for_execution_steps(chat_id)
+            turns = chat.get("turns", []) if isinstance(chat, dict) else []
+            if turn_idx >= len(turns) or not isinstance(turns[turn_idx], dict):
+                return False
+            turn = turns[turn_idx]
+            revision = self._safe_int(chat.get("revision", 1), 1)
+            turn_id = str(owner.get("turn_id") or turn.get("kimi_turn_id") or turn_idx)
+            prompt_id = str(owner.get("owner_prompt_id") or owner.get("prompt_id") or "").strip()
+            if not prompt_id:
+                return False
+            if (str(turn.get("kimi_session_id") or "") != session_id
+                    or (owner.get("turn_id") and str(turn.get("kimi_turn_id") or "") != str(owner["turn_id"]))
+                    or prompt_id != str(turn.get("kimi_owner_prompt_id") or turn.get("kimi_prompt_id") or "")
+                    or (owner.get("revision") is not None and self._safe_int(owner["revision"], -1) != revision)):
+                return False
+            synced_key = (chat_id, f"{revision}:{session_id}:{turn_id}")
             with self._kimi_owner_lock:
                 synced = self._kimi_thinking_synced.setdefault(synced_key, set())
             rows = [row for row in (messages or []) if isinstance(row, dict)]
             if rows and all(str(row.get("created_at") or "").strip() for row in rows):
                 rows = [row for _idx, row in sorted(enumerate(rows), key=lambda pair: (str(pair[1].get("created_at")), pair[0]))]
+            # Steering aliases share the same native turn and step numbering.
+            # Start from the owning prompt, never restart ordinal 1 at an alias.
+            boundary_id = prompt_id
+            with self._kimi_owner_lock:
+                aliases = {str(candidate.get("prompt_id") or "") for candidate in self._kimi_prompt_owners.values()
+                           if candidate.get("chat_id") == chat_id and candidate.get("session_id") == session_id
+                           and str(candidate.get("owner_prompt_id") or candidate.get("prompt_id") or "") == prompt_id}
+            # Finalization retires live owners; accepted alias relationships
+            # remain on their persisted turns for an already queued REST sync.
+            aliases.update(str(candidate.get("kimi_prompt_id") or "") for candidate in turns
+                           if isinstance(candidate, dict) and candidate.get("kimi_session_id") == session_id
+                           and str(candidate.get("kimi_owner_prompt_id") or candidate.get("kimi_prompt_id") or "") == prompt_id
+                           and candidate.get("kimi_prompt_role") == "alias")
+            boundary = next((index for index, row in enumerate(rows)
+                             if row.get("role") == "user" and str(row.get("id") or "") == boundary_id), None)
+            if boundary is None:
+                return False
+            rows = rows[boundary + 1:]
             changed = False
+            step_number = 0
             for message in rows:
-                message_id = str(message.get("id") or "").strip()
-                if not message_id:
+                if message.get("role") == "user":
+                    if str(message.get("id") or "") in aliases:
+                        continue
+                    break
+                if message.get("role") != "assistant":
                     continue
-                for block_index, text in enumerate(self._kimi_message_thinking(message)):
-                    dedupe_key = f"{message_id}:{block_index}"
-                    if dedupe_key in synced:
-                        continue
-                    excerpt = self._kimi_thinking_excerpt(text)
-                    if not excerpt:
-                        # Nothing displayable: mark synced so we do not rescan
-                        # this block on every pass.
-                        synced.add(dedupe_key)
-                        continue
-                    entry = {
-                        "event_type": "thinking_synced",
-                        "display_kind": "thinking",
-                        "list_text": excerpt,
-                        "detail_text": text,
-                        "kimi_summary": excerpt,
-                        "thread_id": session_id,
-                        "session_id": session_id,
-                        "turn_idx": turn_idx,
-                        # Prefer the owner's Kimi turn id; an empty id falls back
-                        # to the turn index so the entry still matches the
-                        # logical scope computed by ``_append_execution_entry_to_chat``.
-                        "turn_id": str((owner or {}).get("turn_id") or turn_idx),
-                        "item_id": f"kimi-thinking:{message_id}:{block_index}",
-                        "source_kind": "rest.thinking",
-                        "status": "completed",
-                        "created_at": time.time(),
+                step_number += 1
+                message_id = str(message.get("id") or "").strip()
+                if not message_id or message.get("session_id", session_id) != session_id:
+                    continue
+                content = message.get("content") if isinstance(message.get("content"), list) else []
+                commentary = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
+                if commentary:
+                    for key, state in list(self._execution_delta_buffer.items()):
+                        base = state.get("event")
+                        if (key[0] == chat_id and key[3] == "assistant" and isinstance(base, CodexEvent)
+                                and self._event_thread_id(base) == session_id and self._event_turn_id(base) == turn_id
+                                and self._kimi_event_agent_id(base) == "main" and base.data.get("step_number") == step_number):
+                            tool_boundary = copy.copy(base)
+                            tool_boundary.data = {**base.data, "source_kind": "tool.call.started"}
+                            self._promote_kimi_interim_assistant(chat_id, tool_boundary)
+                narratives = [(index, "thinking", str(block.get("text") or block.get("thinking") or "").strip())
+                              for index, block in enumerate(content) if isinstance(block, dict)
+                              and block.get("type") == "thinking" and not self._kimi_private_reasoning(block)]
+                if commentary:
+                    narratives.append(("commentary", "commentary", self._kimi_message_text(message)))
+                for kind in ("thinking", "commentary"):
+                    blocks = [(index, text) for index, block_kind, text in narratives if block_kind == kind and text]
+                    candidates = [step for step in chat.get("execution_steps", []) if isinstance(step, dict)
+                                  and str(step.get("session_id") or step.get("thread_id") or "") == session_id
+                                  and str(step.get("turn_id") or "") == turn_id and step.get("revision", revision) == revision
+                                  and str(step.get("agent_id") or "main") == "main" and step.get("display_kind") == kind
+                                  and (step.get("rest_message_id") == message_id or step.get("item_id") == message_id
+                                       or step.get("kimi_step_number") == step_number)]
+                    aggregate = len(candidates) == 1 and (
+                        kind == "commentary" or candidates[0].get("kimi_rest_aggregate")
+                        or bool(candidates[0].get("kimi_step_id"))
+                    )
+                    protected_indexes = {
+                        index for index, block in enumerate(content) if isinstance(block, dict)
+                        and block.get("type") in ({"thinking"} if kind == "thinking" else {"text", "output_text", ""})
+                        and self._kimi_private_reasoning(block)
                     }
-                    # Register the dedupe key only after a successful append so
-                    # a rejected entry can be retried on a later pass instead of
-                    # silently dropping the block forever.
-                    if self._append_execution_entry_to_chat(chat_id, entry, save_state=True):
+                    message_private = self._kimi_private_reasoning(message)
+                    # Withdraw disclosure before dedupe. An aggregate cannot
+                    # separate its protected block; individually keyed REST
+                    # thinking rows keep their unaffected public siblings.
+                    for previous in candidates:
+                        block_index = previous.get("kimi_rest_block_index")
+                        if block_index is None and kind == "thinking":
+                            suffix = str(previous.get("item_id") or "").removeprefix(f"kimi-thinking:{message_id}:")
+                            block_index = int(suffix) if suffix.isdigit() else None
+                        if message_private or (protected_indexes and (
+                                aggregate or block_index in protected_indexes or block_index is None)):
+                            changed = self._redact_kimi_narrative(chat_id, previous) or changed
+                    if message_private:
+                        continue
+                    if aggregate:
+                        blocks = [(kind, "\n".join(text for _index, text in blocks))] if blocks else []
+                    for block_index, text in blocks:
+                        dedupe_key = f"{message_id}:{block_index}"
+                        if dedupe_key in synced:
+                            continue
+                        previous = candidates[0] if aggregate else next((step for step in candidates
+                            if step.get("kimi_rest_block_index") == block_index
+                            or step.get("item_id") == f"kimi-{kind}:{message_id}:{block_index}"), {})
+                        # Redaction replaces the row in the chat; do not reuse
+                        # the stale public candidate captured above.
+                        previous = next((step for step in chat.get("execution_steps", [])
+                                         if previous and step.get("item_id") == previous.get("item_id")
+                                         and step.get("logical_key") == previous.get("logical_key")), previous)
+                        if previous.get("private_reasoning"):
+                            synced.add(dedupe_key)
+                            continue
+                        excerpt = self._kimi_thinking_excerpt(text)
+                        entry = {
+                            **previous, "event_type": f"{kind}_synced", "display_kind": kind,
+                            "list_text": excerpt, "detail_text": text, "kimi_summary": excerpt,
+                            "raw_text": text, "text": text, "narrative_snapshot": True,
+                            "thread_id": session_id, "session_id": session_id, "turn_idx": turn_idx,
+                            "turn_id": turn_id, "revision": revision, "provider": "kimi", "agent_id": "main",
+                            "item_id": previous.get("item_id") or f"kimi-{kind}:{message_id}:{block_index}",
+                            "source_kind": f"rest.{kind}", "status": "completed", "rest_message_id": message_id,
+                            "kimi_step_number": step_number, "kimi_rest_block_index": block_index,
+                            "kimi_rest_aggregate": bool(aggregate or kind == "commentary"),
+                        }
+                        appended = self._append_execution_entry_to_chat(chat_id, entry, save_state=True)
+                        if appended:
+                            changed = True
+                        elif not any(step.get("item_id") == entry["item_id"]
+                                     and step.get("rest_message_id") == message_id and step.get("status") == "completed"
+                                     and step.get("display_kind") == kind and step.get("detail_text") == text
+                                     and step.get("raw_text") == text and step.get("list_text") == excerpt
+                                     and step.get("revision", revision) == revision
+                                     and str(step.get("session_id") or "") == session_id
+                                     and str(step.get("turn_id") or "") == turn_id
+                                     and str(step.get("agent_id") or "main") == "main"
+                                     and step.get("provider") == "kimi" and step.get("source_kind") == f"rest.{kind}"
+                                     for step in chat.get("execution_steps", []) if isinstance(step, dict)):
+                            continue
+                        for buffer_key in list(self._execution_delta_buffer):
+                            if (buffer_key[:3] == (chat_id, turn_id, entry["item_id"])
+                                    and buffer_key[3] == kind and buffer_key[4] in {"", "main"}):
+                                self._execution_delta_buffer.pop(buffer_key, None)
                         synced.add(dedupe_key)
-                        changed = True
             return changed
         except Exception:
             # The sync is marshalled to the UI thread; never surface a fetch /
@@ -14118,6 +14351,9 @@ class ChatFrame(wx.Frame):
                 closed = True
                 break
             if role == "assistant":
+                content = row.get("content")
+                if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content):
+                    continue
                 text = self._kimi_message_text(row)
                 if text:
                     answer = text
@@ -14821,8 +15057,6 @@ class ChatFrame(wx.Frame):
 
     def _accumulate_kimi_answer_delta(self, chat_id: str, event: CodexEvent) -> None:
         text = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
-        if not text:
-            return
         turn_id = self._event_turn_id(event)
         session_id = self._event_thread_id(event)
         metadata = self._kimi_owner_for_event(event) or self._kimi_active_turns.get(str(chat_id or "").strip())
@@ -14839,14 +15073,27 @@ class ChatFrame(wx.Frame):
             return
         key = (str(chat_id or ""), session_id, owner_key, self._kimi_event_agent_id(event))
         event_data = event.data if isinstance(event.data, dict) else {}
+        stream = str(getattr(event, "item_id", "") or event_data.get("source_kind")
+                     or getattr(event, "display_kind", "") or "assistant").strip()
+        private_stream = self._kimi_private_reasoning(event_data) or any(
+            buffer_key[:3] == (str(chat_id or ""), turn_id, stream) and state.get("private_reasoning")
+            for buffer_key, state in self._execution_delta_buffer.items()
+        )
+        target_chat = self._chat_state_for_execution_steps(chat_id) or {}
+        private_stream = private_stream or any(
+            step.get("private_reasoning") and step.get("item_id") == stream
+            and str(step.get("session_id") or step.get("thread_id") or "") == session_id
+            and str(step.get("turn_id") or "") == turn_id
+            for step in target_chat.get("execution_steps", []) if isinstance(step, dict)
+        )
+        if private_stream:
+            self._kimi_turn_answer_segments.setdefault((*key, stream), {})
+            self._redact_kimi_answer_stream(str(chat_id or ""), session_id, key[3], stream)
+            return
+        if not text:
+            return
         offset = event_data.get("offset")
         if isinstance(offset, int):
-            stream = str(
-                getattr(event, "item_id", "")
-                or event_data.get("source_kind")
-                or getattr(event, "display_kind", "")
-                or "assistant"
-            ).strip()
             segment_key = (*key, stream)
             self._kimi_turn_answer_segments.setdefault(segment_key, {}).setdefault(offset, text)
             parts = self._kimi_turn_answer_parts.setdefault(key, [])
@@ -15583,11 +15830,18 @@ class ChatFrame(wx.Frame):
             if not isinstance(turn_idx, int) or turn_idx < 0:
                 # Without a valid turn index the sync would silently no-op.
                 return
+            target_chat = self._chat_state_for_execution_steps(chat_id) or {}
+            turns = target_chat.get("turns", [])
+            turn = turns[turn_idx] if turn_idx < len(turns) and isinstance(turns[turn_idx], dict) else {}
             owner = {
+                **active,
                 "chat_id": chat_id,
                 "session_id": session_id,
                 "turn_idx": turn_idx,
                 "turn_id": str(active.get("turn_id") or "").strip(),
+                "prompt_id": str(active.get("prompt_id") or turn.get("kimi_prompt_id") or ""),
+                "owner_prompt_id": str(active.get("owner_prompt_id") or turn.get("kimi_owner_prompt_id") or turn.get("kimi_prompt_id") or ""),
+                "revision": self._safe_int(target_chat.get("revision", 1), 1),
             }
         except Exception:
             return
@@ -15618,20 +15872,10 @@ class ChatFrame(wx.Frame):
                 messages = client.list_messages(session_id)
             if not isinstance(messages, list) or not messages:
                 return
-            # The endpoint returns newest-first and the window may still hold
-            # the previous turn's tail: only sync messages newer than the last
-            # user (prompt) message so prior-turn thinking blocks are not
-            # stamped with this turn's index. With no user message in the
-            # window the whole page belongs to the current turn.
-            boundary_index = next(
-                (index for index, row in enumerate(messages)
-                 if isinstance(row, dict) and str(row.get("role") or "").strip() == "user"),
-                None,
+            messages = self._kimi_messages_back_to_boundary(
+                client, session_id, str(owner.get("owner_prompt_id") or owner.get("prompt_id") or ""), messages=messages,
+                deadline=time.monotonic() + float(timeout),
             )
-            if boundary_index is not None:
-                messages = messages[:boundary_index]
-            if not messages:
-                return
             self._call_after_if_alive(self._kimi_sync_thinking_rows, chat_id, owner, messages)
         except Exception:
             pass
@@ -15662,6 +15906,7 @@ class ChatFrame(wx.Frame):
         authoritative = self._kimi_event_is_authoritative(event)
         if authoritative:
             self._apply_kimi_event_scope(chat_id, event)
+        self._promote_kimi_interim_assistant(chat_id, event)
         self._maybe_trigger_kimi_thinking_sync(chat_id, event)
         event_turn_id = self._event_turn_id(event)
         silent_notification = (
@@ -15673,14 +15918,14 @@ class ChatFrame(wx.Frame):
             execution_entry = self._build_execution_entry(event)
         delta_kind = str(getattr(event, "display_kind", "") or "").strip()
         if event_type == "agent_message_delta" and delta_kind == "assistant" and authoritative:
-            # Final answer starts a separate, summarized execution phase.
-            # Flush every Kimi stream in this turn before it, including tool
-            # progress, so no residual fragment crosses the boundary.
+            # Thinking and assistant prose are separate streams. Keep the
+            # latter until a tool boundary can identify interim commentary.
             if self._kimi_protocol_event(event):
-                self._flush_execution_delta(chat_id, event_turn_id or None)
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking")
                 execution_entry = self._build_execution_entry(event)
             else:
                 self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking")
+            self._buffer_execution_delta(chat_id, event)
             self._accumulate_kimi_answer_delta(chat_id, event)
         elif event_type == "agent_message_delta" and delta_kind == "assistant" and not authoritative:
             # Explicit subagent prose is execution progress. It must neither
@@ -15715,6 +15960,7 @@ class ChatFrame(wx.Frame):
             if event_type == "agent_message_delta":
                 if delta_kind == "thinking":
                     self._buffer_execution_delta(chat_id, event)
+                    self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True)
                 elif delta_kind == "commentary":
                     self._append_kimi_tool_diagnostic(chat_id, event)
                 elif execution_entry:
@@ -15802,6 +16048,7 @@ class ChatFrame(wx.Frame):
         if event_type == "agent_message_delta":
             if delta_kind == "thinking":
                 self._buffer_execution_delta(chat_id, event)
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True)
             elif delta_kind == "commentary":
                 self._append_kimi_tool_diagnostic(chat_id, event)
             elif execution_entry:

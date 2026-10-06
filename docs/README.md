@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-06 当前状态见[交接](handoff.md)：跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现，非桌面检查完成；完整矩阵与中文听验未完成，用户已停止桌面验收。工作区实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-cross-device-read-state.md`。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应报告 `verify-immediate-execution-kimi-chat-recency.md` 和 `tests/immediate-e2e-20261004/verify.md` 只证明当时版本。
+2026-10-06 当前状态见[交接](handoff.md)：Kimi 无消息 ID 的公开思考流已适配真实 step 生命周期，执行页及时显示原文摘录与全文；REST 补齐同一条目，工具前普通说明作为 commentary 保留。当前实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-kimi-thinking-progress.md`。跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现；完整矩阵与中文听验未完成，用户已停止完整桌面验收。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应历史报告只证明当时版本。
 
 既有通知、回答时间与执行语义的[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)、Codex 审批[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)保留，仅证明相应版本。
 
@@ -29,7 +29,7 @@
 - 源码运行的笔记数据库使用 `D:\code\note\notes.db`；打包版将使用个人版 OneDrive 根目录下的 `OneDrive\code\data\sj\notes.db`。切换前核对实际运行包的数据路径；数据衔接步骤见 [`handoff.md`](./handoff.md)。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
-- Kimi 的 F1 执行过程列表以协议事件生成中文主要步骤；不要把原始英文 `thinking.delta`、状态通知或工具流片段直接作为列表行。
+- Kimi 的 F1 执行页保留 provider 实际公开的思考与已由工具调用确认的中间说明；列表取首个非空行、最多 80 字，全文详情保留完整公开正文。无消息 ID 的流按 session/epoch/turn/agent/step/kind 隔离，保留 offset 去重与缺口处理。REST 在明确的 prompt 边界内按 assistant 步骤顺序补齐原行；隐藏/private/non-disclosable 内容不进入可视投影，工具流水仍不生成执行行。
 - Kimi 的回答列表仅在主代理最终正文获得权威完成确认后更新；子代理过程、不完整流片段和失败终态只保留在执行过程或错误状态，不能提前显示为回答或播放完成音。
 - 执行列表的旧 15 项失败已在上述执行规格逐项归类并修复/更新契约；最终定向验收去重 467 项通过，不代表冻结基线的其他领域或全笔记领域已验证。
 - 旧 V2 远程执行事实流仍以 `durable_facts` 为来源；手机可视执行页优先使用 `execution_page_v3`，与桌面共用 canonical `execution_steps` 投影。v3 的 SQLite 快照行与分页游标按 chat/revision 隔离，V2 仍供旧客户端使用。

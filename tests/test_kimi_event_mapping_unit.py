@@ -144,7 +144,25 @@ def test_delta_preserves_whitespace_and_stream_identity_metadata():
 
     assert event.text == " user"
     assert event.raw_text == " user"
+    assert event.offset == 3
     assert event.data == {"adapter": "kimi_server", "seq": 9, "offset": 3, "agent_id": "main", "agent_scope": "main", "source_kind": "thinking.delta"}
+
+
+@pytest.mark.parametrize("kind", ["thinking", "assistant"])
+def test_sdk_delta_uses_lifecycle_identity_without_provider_message_ids(kind):
+    message = {"type": f"{kind}.delta", "session_id": "s", "epoch": "e", "seq": 7, "offset": 0,
+               "payload": {"type": f"{kind}.delta", "turnId": 0, "agentId": "main", "delta": "公开原文" * 800}}
+    scope = {"step_id": "native-step", "step_number": 1, "epoch": "e"}
+    first = map_session_event(message, step_scope=scope)
+    replay = map_session_event(dict(message, offset=4), step_scope=scope)
+    assert first.item_id == first.stream_id == replay.item_id
+    assert first.item_id.startswith("kimi-stream:")
+    assert first.text == message["payload"]["delta"]
+    assert first.data["step_id"] == "native-step"
+    assert first.offset == 0 and replay.offset == 4
+    assert map_session_event(message, step_scope={**scope, "step_id": "other-step"}).item_id != first.item_id
+    explicit = dict(message, payload={**message["payload"], "messageId": "provider-message"})
+    assert map_session_event(explicit, step_scope=scope).item_id == "provider-message"
 
 
 def test_thinking_privacy_markers_and_structured_test_operation_are_preserved():

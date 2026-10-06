@@ -776,6 +776,96 @@ def test_exact_volatile_offset_replay_is_dropped_across_queue_drains():
     assert event["text"] == "B"
 
 
+def test_sdk_lifecycle_isolates_steps_agents_and_stale_volatile_frames():
+    client = KimiServerClient()
+
+    def push(kind, seq, *, agent="main", offset=None, **body):
+        message = {"type": kind, "session_id": "s", "epoch": "e", "seq": seq,
+                   "payload": {"type": kind, "turnId": 0, "agentId": agent, **body}}
+        if offset is not None:
+            message.update(volatile=True, offset=offset)
+        client._handle_ws_message(message)
+        return message
+
+    push("turn.step.started", 1, step=1, stepId="step-a")
+    first = push("thinking.delta", 1, offset=0, delta="A")
+    push("thinking.delta", 1, offset=1, delta="B")
+    push("turn.step.started", 2, agent="worker", step=1, stepId="worker-step")
+    push("thinking.delta", 2, agent="worker", offset=0, delta="C")
+    push("turn.step.completed", 3, step=1, stepId="step-a")
+    push("turn.step.started", 4, step=2, stepId="step-b")
+    push("thinking.delta", 4, offset=0, delta="D")
+    push("thinking.delta", 1, offset=2, delta="STALE")
+    client._handle_ws_message(first)
+    deltas = [message["payload"]["event"] for message in client.drain_pending_messages(30)
+              if message["payload"]["event"]["type"] == "agent_message_delta"]
+    assert [event["text"] for event in deltas] == ["AB", "C", "D"]
+    assert len({event["item_id"] for event in deltas}) == 3
+    assert [event["data"]["step_id"] for event in deltas] == ["step-a", "worker-step", "step-b"]
+
+
+def test_coalesced_sdk_thinking_keeps_a_later_hidden_marker():
+    client = KimiServerClient()
+    client._handle_ws_message({"type": "turn.step.started", "session_id": "s", "epoch": "e", "seq": 1,
+                               "payload": {"type": "turn.step.started", "turnId": 0, "agentId": "main", "step": 1, "stepId": "step"}})
+    for offset, hidden in ((0, False), (1, True)):
+        client._handle_ws_message({"type": "thinking.delta", "session_id": "s", "epoch": "e", "seq": 1,
+                                  "offset": offset, "volatile": True,
+                                  "payload": {"type": "thinking.delta", "turnId": 0, "agentId": "main", "delta": "X", "hidden": hidden}})
+    delta = client.drain_pending_messages(10)[-1]["payload"]["event"]
+    assert delta["text"] == "XX"
+    assert delta["data"]["hidden"] is True
+
+
+@pytest.mark.parametrize("flag,value,mapped", [
+    ("hidden", True, "hidden"), ("isPrivate", True, "private"),
+    ("nonDisclosable", True, "non_disclosable"), ("isDisclosable", False, "disclosable"),
+    ("visibility", "private", "visibility"), ("reasoningVisibility", "hidden", "reasoning_visibility"),
+])
+@pytest.mark.parametrize("closed_step", [False, True])
+def test_sdk_same_offset_replay_accepts_restrictive_metadata_once(flag, value, mapped, closed_step):
+    client = KimiServerClient()
+    client._handle_ws_message({"type": "turn.step.started", "session_id": "s", "epoch": "e", "seq": 1,
+                               "payload": {"type": "turn.step.started", "turnId": 0, "agentId": "main", "step": 1}})
+    original = {"type": "thinking.delta", "session_id": "s", "epoch": "e", "seq": 1,
+                "offset": 0, "volatile": True,
+                "payload": {"type": "thinking.delta", "turnId": 0, "agentId": "main", "delta": "SECRET"}}
+    client._handle_ws_message(original)
+    first = client.drain_pending_messages(10)[-1]["payload"]["event"]
+    if closed_step:
+        client._handle_ws_message({"type": "turn.step.completed", "session_id": "s", "epoch": "e", "seq": 2,
+                                   "payload": {"type": "turn.step.completed", "turnId": 0, "agentId": "main", "step": 1}})
+        client.drain_pending_messages(10)
+    restricted = dict(original, payload={**original["payload"], flag: value})
+    client._handle_ws_message(restricted)
+    changed = client.drain_pending_messages(10)
+    assert len(changed) == 1
+    assert changed[0]["payload"]["event"]["data"][mapped] == value
+    assert changed[0]["payload"]["event"]["item_id"] == first["item_id"]
+    client._handle_ws_message(restricted)
+    assert not client.drain_pending_messages(10)
+
+
+def test_sdk_epoch_reset_does_not_reuse_stream_or_accept_old_epoch():
+    client = KimiServerClient()
+    def event(kind, epoch, seq, **body):
+        return {"type": kind, "session_id": "s", "epoch": epoch, "seq": seq,
+                "payload": {"type": kind, "agentId": "main", "turnId": 0, **body}}
+    client._handle_ws_message(event("turn.step.started", "old", 1, step=1, stepId="native-step"))
+    old = dict(event("thinking.delta", "old", 1, delta="OLD"), offset=0, volatile=True)
+    client._handle_ws_message(old)
+    old_id = client.drain_pending_messages(10)[-1]["payload"]["event"]["item_id"]
+    client._hello_ids[client._ws_generation] = "hello-reset"
+    client._handle_ws_message({"type": "ack", "id": "hello-reset", "payload": {"cursors": {"s": {"epoch": "new", "seq": 0}}}})
+    client._handle_ws_message(event("turn.step.started", "new", 1, step=1, stepId="native-step"))
+    client._handle_ws_message(dict(event("thinking.delta", "new", 1, delta="NEW"), offset=0, volatile=True))
+    client._handle_ws_message(old)
+    deltas = [item["payload"]["event"] for item in client.drain_pending_messages(10)
+              if item["type"] == "event" and item["payload"]["event"]["type"] == "agent_message_delta"]
+    assert len(deltas) == 1 and deltas[0]["text"] == "NEW"
+    assert deltas[0]["item_id"] != old_id
+
+
 def test_ack_resync_required_emits_explicit_control_message():
     client, *_ = started_client()
 
@@ -960,6 +1050,20 @@ def test_delta_coalescing_preserves_offset_gap_for_owner_completeness_check():
     drained = client.drain_pending_messages(limit=10)
     assert [message["payload"]["event"]["text"] for message in drained] == ["abc", "F"]
     assert [message["payload"]["event"]["data"]["offset"] for message in drained] == [0, 5]
+
+
+@pytest.mark.parametrize("fragments,expected", [
+    ([(3, "BBB"), (0, "AAA")], [(3, "BBB"), (0, "AAA")]),
+    ([(0, "abc"), (1, "XX")], [(0, "abc"), (1, "XX")]),
+    ([(0, "abc"), (2, "cd")], [(0, "abcd")]),
+    ([(None, "AAA"), (3, "BBB")], [(None, "AAA"), (3, "BBB")]),
+])
+def test_delta_coalescing_preserves_reverse_or_conflicting_same_batch_fragments(fragments, expected):
+    client = KimiServerClient()
+    for offset, text in fragments:
+        client._enqueue_event(_delta(text, kind="thinking", data={"offset": offset}))
+    events = [message["payload"]["event"] for message in client.drain_pending_messages(10)]
+    assert [(event["data"]["offset"], event["text"]) for event in events] == expected
 
 
 # ----------------------------------------------------------------------
