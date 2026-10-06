@@ -260,27 +260,11 @@ class CodexWorkerRuntime:
             items = list(payload.get("input_items") or [])
             if not items and payload.get("question"):
                 items = [{"type": "text", "text": str(payload.get("question") or "")}]
-            if not thread_id:
-                thread_id = self._start_thread(client, payload, service_tier_arg)
-            elif hasattr(client, "resume_thread"):
-                try:
-                    client.resume_thread(
-                        thread_id,
-                        approval_policy=self._approval_policy(payload),
-                        sandbox="danger-full-access",
-                        personality="pragmatic",
-                        cwd=payload.get("cwd") or "",
-                        service_tier=service_tier_arg,
-                    )
-                except Exception as exc:
-                    if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
-                        raise
-                    thread_id = self._start_thread(client, payload, service_tier_arg)
-                    items = self._recovery_input_items(payload, items)
-
-            should_steer = bool(payload.get("should_steer")) and bool(str(payload.get("turn_id") or "").strip())
+            should_steer = (bool(payload.get("should_steer")) and bool(thread_id)
+                            and bool(str(payload.get("turn_id") or "").strip())
+                            and hasattr(client, "steer_turn_items"))
             steered = False
-            if should_steer and hasattr(client, "steer_turn_items"):
+            if should_steer:
                 try:
                     turn_response = client.steer_turn_items(
                         thread_id,
@@ -291,8 +275,27 @@ class CodexWorkerRuntime:
                 except Exception as exc:
                     if not self._is_no_active_turn_error(exc):
                         raise
-                    turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
-            else:
+                    should_steer = False
+            if not should_steer:
+                if hasattr(client, "prepare_task"):
+                    client.prepare_task(payload.get("cwd") or "")
+                if not thread_id:
+                    thread_id = self._start_thread(client, payload, service_tier_arg)
+                elif hasattr(client, "resume_thread"):
+                    try:
+                        client.resume_thread(
+                            thread_id,
+                            approval_policy=self._approval_policy(payload),
+                            sandbox="danger-full-access",
+                            personality="pragmatic",
+                            cwd=payload.get("cwd") or "",
+                            service_tier=service_tier_arg,
+                        )
+                    except Exception as exc:
+                        if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
+                            raise
+                        thread_id = self._start_thread(client, payload, service_tier_arg)
+                        items = self._recovery_input_items(payload, items)
                 turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
             if steered and not turn_id:

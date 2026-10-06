@@ -4,6 +4,7 @@
 
 ## 当前实现
 
+- 2026-10-06 全局技能复用与打包后启动：隔离 `.codex-home` 的 `skills`、`plugins` 整目录链接当前用户 `.codex` 来源，旧普通目录迁移到同 home 唯一 `*.legacy-*` 路径；不存在的来源保留旧内容，链接失败报错且不退回复制，全局文件字节（含 BOM）不改。新任务在 start/resume/turn 前注册当前 `.agents/skills` 并 forceReload 原生技能清单；全局 plugins/marketplaces 配置变化才更新对应配置并保留 home 重启 app-server，再恢复原 thread。执行中 steer 不刷新或重启，明确无活动 turn 后才准备并恢复新任务。打包脚本先临时构建校验再更新，reparse 清理只操作节点，保留 `.codex-home`、内外 history 和 OneDrive 数据；最终产物校验后从最终目录启动一次，不等待 GUI 退出。失败非零且不启动旧包或临时包。本轮仅源码与隔离测试，未实际打包、更新或启动 `D:/code/cx/mc`，未调用真实模型、GUI 或个人数据。
 - Kimi 2.1.1 真实无 messageId 的 thinking/assistant 流按 session、epoch、turn、agent、原生 step 与内容种类补充稳定身份；公开思考在生成中直接进入 canonical 执行投影，列表展示原文摘录、详情保留全文。相同 seq 的不同 offset、重放、缺口和过期 step/epoch 保持隔离。REST 只在完整 prompt 边界内按 assistant 步骤顺序补全既有行；晚到流不能覆盖完成快照。工具调用前的 assistant 原文转为 commentary，REST 的 text + tool_use 同样保留，权威终答排除这些中间说明。隐藏标记整段单调生效，已缓存与持久化组装内容也同步清除；主 REST 不补写子代理流。RC 继续消费 v3 的 list_text/detail_text，无 RC 产品改动。
 - 只有首次成功且非空的权威回答产生未读。稳定 canonical message_id 与首次完成 answer_seq 关联；首次启用的旧历史设为已读基线，清空才更换独立 generation。pair/chat/generation 下的 read_seq 只增不减，游标、durable fact 和 outbox 同事务提交。
 - 自动定位不确认已读；主动回答导航、全文显示及成功打开网页确认冻结范围。Ctrl+Shift+X 使用原生 MOD_NOREPEAT 注册，恢复实际前台和最后项焦点，按已显示且不超过冻结上限的最大完成序列确认；无候选调用 ZDSR 播报“无未读聊天”。Home 首行非回答时不误读。未读标签不改变消息活动排序。

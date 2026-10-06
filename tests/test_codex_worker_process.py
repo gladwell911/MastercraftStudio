@@ -19,21 +19,29 @@ class FakeCodexClient:
         self.compacted_threads = []
         self.interrupted_turns = []
         self.replies = []
+        self.operations = []
         self.closed = False
 
+    def prepare_task(self, cwd):
+        self.operations.append(("prepare", cwd))
+
     def start_thread(self, **kwargs):
+        self.operations.append(("start_thread", kwargs.get("cwd")))
         self.started_threads.append(kwargs)
         return {"thread": {"id": "thread-1"}}
 
     def resume_thread(self, thread_id, **kwargs):
+        self.operations.append(("resume_thread", thread_id))
         self.resumed_threads.append((thread_id, kwargs))
         return {"thread": {"id": thread_id}}
 
     def start_turn_items(self, thread_id, items, service_tier=None):
+        self.operations.append(("start_turn", thread_id))
         self.started_turns.append((thread_id, items, service_tier))
         return {"turn": {"id": "turn-1"}}
 
     def steer_turn_items(self, thread_id, turn_id, items):
+        self.operations.append(("steer", thread_id))
         self.steered_turns.append((thread_id, turn_id, items))
         return {"turn": {"id": "turn-steered"}}
 
@@ -58,6 +66,38 @@ class FakeCodexClient:
 class RaisingTurnCodexClient(FakeCodexClient):
     def start_turn_items(self, thread_id, items, service_tier=None):
         raise RuntimeError("turn failed")
+
+
+def test_each_new_task_prepares_before_thread_start_or_resume_and_turn():
+    client = FakeCodexClient()
+    runtime = CodexWorkerRuntime(client_factory=lambda *_: client, output=io.StringIO())
+    for index, thread_id in enumerate(("", "thread-1", "thread-1")):
+        runtime.handle_message(make_ui_request(str(index), "start_turn", {
+            "chat_id": "chat", "turn_idx": index, "question": "next", "cwd": "C:/workspace",
+            "thread_id": thread_id,
+        }))
+    assert client.operations == [
+        ("prepare", "C:/workspace"), ("start_thread", "C:/workspace"), ("start_turn", "thread-1"),
+        ("prepare", "C:/workspace"), ("resume_thread", "thread-1"), ("start_turn", "thread-1"),
+        ("prepare", "C:/workspace"), ("resume_thread", "thread-1"), ("start_turn", "thread-1"),
+    ]
+
+
+def test_failed_task_preparation_does_not_resume_or_start_turn():
+    class FailedPreparationClient(FakeCodexClient):
+        def prepare_task(self, cwd):
+            raise RuntimeError("skills refresh failed")
+    client = FailedPreparationClient()
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda *_: client, output=output)
+    runtime.handle_message(make_ui_request("new", "start_turn", {
+        "chat_id": "chat", "turn_idx": 0, "thread_id": "existing", "question": "next",
+    }))
+    assert client.resumed_threads == []
+    assert client.started_turns == []
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert [message["type"] for message in messages] == ["error"]
+    assert "skills refresh failed" in messages[0]["payload"]["message"]
 
 
 class EarlyUsageCodexClient(FakeCodexClient):
@@ -103,6 +143,7 @@ class MissingResumeCodexClient(FakeCodexClient):
 
 class NoActiveSteerCodexClient(FakeCodexClient):
     def steer_turn_items(self, thread_id, turn_id, items):
+        self.operations.append(("steer", thread_id))
         self.steered_turns.append((thread_id, turn_id, items))
         raise RuntimeError("no active turn to steer")
 
@@ -848,6 +889,8 @@ def test_worker_runtime_start_turn_steers_existing_active_turn():
 
     assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
     assert created[0].started_turns == []
+    assert created[0].resumed_threads == []
+    assert created[0].operations == [("steer", "thread-existing")]
 
 
 def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
@@ -883,6 +926,8 @@ def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
     assert created[0].started_turns == [("thread-existing", [{"type": "text", "text": "继续"}], "fast")]
+    assert created[0].operations == [("steer", "thread-existing"), ("prepare", "c:/code/sj"),
+                                      ("resume_thread", "thread-existing"), ("start_turn", "thread-existing")]
     assert any(item["type"] == "turn_started_ack" for item in messages)
 
 

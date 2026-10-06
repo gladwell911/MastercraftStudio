@@ -890,7 +890,8 @@ def test_resolve_codex_launch_command_prefers_exe_over_cmd(monkeypatch):
     assert command == [r"C:\tools\codex.exe"]
 
 
-def test_ensure_started_uses_resolved_launch_command(monkeypatch):
+def test_ensure_started_uses_resolved_launch_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     client = codex_client.CodexAppServerClient()
     seen = {}
 
@@ -929,7 +930,8 @@ def test_ensure_started_uses_resolved_launch_command(monkeypatch):
     assert seen["initialized"] is True
 
 
-def test_ensure_started_hides_windows_console_for_codex(monkeypatch):
+def test_ensure_started_hides_windows_console_for_codex(monkeypatch, tmp_path):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     client = codex_client.CodexAppServerClient()
     seen = {}
 
@@ -1083,7 +1085,7 @@ def test_build_codex_app_server_env_reuses_persistent_workspace_home(tmp_path, m
     assert (codex_home / "auth.json").read_text(encoding="utf-8") == "{\"token\": \"x\"}"
 
 
-def test_build_codex_app_server_env_links_missing_user_skills_into_workspace_home(tmp_path, monkeypatch):
+def test_build_codex_app_server_env_links_whole_user_skills_and_preserves_legacy(tmp_path, monkeypatch):
     source_home = tmp_path / ".codex"
     source_home.mkdir()
     source_skills = source_home / "skills"
@@ -1106,10 +1108,15 @@ def test_build_codex_app_server_env_links_missing_user_skills_into_workspace_hom
     assert env["CODEX_HOME"] == str(codex_home)
     assert linked_skill.exists()
     assert (linked_skill / "SKILL.md").read_text(encoding="utf-8") == "skill"
-    assert (reused_home / "skills" / ".system").exists()
+    assert codex_client._is_directory_link(reused_home / "skills")
+    legacy = list(reused_home.glob("skills.legacy-*"))
+    assert len(legacy) == 1
+    assert (legacy[0] / ".system").exists()
+    codex_client.build_codex_app_server_env(str(workspace))
+    assert list(reused_home.glob("skills.legacy-*")) == legacy
 
 
-def test_build_codex_app_server_env_strips_utf8_bom_from_merged_skill_markdown(tmp_path, monkeypatch):
+def test_build_codex_app_server_env_preserves_global_skill_bytes_including_bom(tmp_path, monkeypatch):
     source_home = tmp_path / ".codex"
     source_home.mkdir()
     source_skills = source_home / "skills"
@@ -1124,7 +1131,8 @@ def test_build_codex_app_server_env_strips_utf8_bom_from_merged_skill_markdown(t
     _, reused_home = codex_client.build_codex_app_server_env(str(workspace))
 
     merged_skill = reused_home / "skills" / "planning-with-files-zh" / "SKILL.md"
-    assert merged_skill.read_bytes().startswith(b"---\n")
+    assert merged_skill.read_bytes() == (planning_skill / "SKILL.md").read_bytes()
+    assert merged_skill.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 def test_build_codex_app_server_env_keeps_existing_workspace_skill_entries(tmp_path, monkeypatch):
@@ -1146,7 +1154,9 @@ def test_build_codex_app_server_env_keeps_existing_workspace_skill_entries(tmp_p
 
     _, reused_home = codex_client.build_codex_app_server_env(str(workspace))
 
-    assert (reused_home / "skills" / "using-superpowers" / "SKILL.md").read_text(encoding="utf-8") == "workspace-skill"
+    assert (reused_home / "skills" / "using-superpowers" / "SKILL.md").read_text(encoding="utf-8") == "user-skill"
+    legacy = next(reused_home.glob("skills.legacy-*"))
+    assert (legacy / "using-superpowers" / "SKILL.md").read_text(encoding="utf-8") == "workspace-skill"
 
 
 def test_close_keeps_persistent_codex_home(tmp_path):
@@ -1173,6 +1183,162 @@ def test_close_keeps_persistent_codex_home(tmp_path):
 
     assert codex_home.exists()
     assert (codex_home / "rollout.db").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("name", ["skills", "plugins"])
+def test_global_directory_link_exposes_add_modify_delete_and_keeps_wrong_link_target(tmp_path, monkeypatch, name):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    source = tmp_path / "user" / ".codex" / name
+    source.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_bytes(b"outside")
+    workspace = tmp_path / "workspace"
+    target = workspace / ".codex-home" / name
+    target.parent.mkdir(parents=True)
+    codex_client._create_directory_link(outside, target)
+    _, home = codex_client.build_codex_app_server_env(str(workspace))
+    item = source / "new"
+    item.mkdir()
+    (item / "SKILL.md").write_bytes(b"\xef\xbb\xbffirst")
+    assert (home / name / "new" / "SKILL.md").read_bytes() == b"\xef\xbb\xbffirst"
+    (item / "SKILL.md").write_bytes(b"second")
+    assert (target / "new" / "SKILL.md").read_bytes() == b"second"
+    (item / "SKILL.md").unlink()
+    item.rmdir()
+    assert not (target / "new").exists()
+    assert sentinel.read_bytes() == b"outside"
+    assert not list(home.glob(f"{name}.legacy-*"))
+
+
+def test_missing_global_source_preserves_old_contents_and_link_failure_restores_legacy(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    target = tmp_path / "workspace" / ".codex-home" / "skills"
+    target.mkdir(parents=True)
+    (target / "local").write_bytes(b"unique")
+    codex_client.build_codex_app_server_env(str(target.parent.parent))
+    assert (target / "local").read_bytes() == b"unique"
+    source = tmp_path / "user" / ".codex" / "skills"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(codex_client, "_create_directory_link", lambda *_: (_ for _ in ()).throw(RuntimeError("denied")))
+    with pytest.raises(RuntimeError, match="denied"):
+        codex_client.build_codex_app_server_env(str(target.parent.parent))
+    assert (target / "local").read_bytes() == b"unique"
+    assert not list(target.parent.glob("skills.legacy-*"))
+
+
+@pytest.mark.skipif(codex_client.os.name != "nt", reason="Windows Junction fallback")
+def test_directory_link_falls_back_to_real_junction_without_copying(tmp_path, monkeypatch):
+    source, target = tmp_path / "global", tmp_path / "link"
+    source.mkdir()
+    def denied(*args, **kwargs):
+        raise OSError("symlink privilege unavailable")
+    monkeypatch.setattr(Path, "symlink_to", denied)
+    calls = []
+    real_run = codex_client.subprocess.run
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        return real_run(*args, **kwargs)
+    monkeypatch.setattr(codex_client.subprocess, "run", run)
+    codex_client._create_directory_link(source, target)
+    assert codex_client._is_directory_link(target)
+    assert not target.is_symlink()
+    assert calls[0]["creationflags"] & codex_client.subprocess.CREATE_NO_WINDOW
+    (source / "new").write_bytes(b"live")
+    assert (target / "new").read_bytes() == b"live"
+    (source / "new").unlink()
+    assert not (target / "new").exists()
+    target.rmdir()
+    assert source.is_dir()
+
+
+def test_prepare_task_refreshes_native_roots_and_restarts_only_changed_plugin_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    source = tmp_path / "user" / ".codex"
+    source.mkdir(parents=True)
+    (source / "skills").mkdir()
+    (source / "plugins").mkdir()
+    agents = tmp_path / "user" / ".agents" / "skills"
+    agents.mkdir(parents=True)
+    config = source / "config.toml"
+    config.write_text('model = "global-model"\n[plugins."old@market"]\nenabled = true\n', encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    client = codex_client.CodexAppServerClient()
+    client._build_launch_env()
+    home = client._codex_home_dir
+    (home / "rollout.db").write_bytes(b"session")
+    (home / "config.toml").write_text('model = "local-provider"\n[plugins."old@market"]\nenabled = true\n', encoding="utf-8")
+    calls, restarts = [], []
+    monkeypatch.setattr(client, "_ensure_started", lambda: None)
+    monkeypatch.setattr(client, "_request_internal", lambda method, params=None, timeout=None: calls.append((method, params)) or {})
+    monkeypatch.setattr(client, "_stop_process", lambda: restarts.append("restart"))
+    client.prepare_task(str(workspace))
+    assert calls == [("skills/extraRoots/set", {"extraRoots": [str(agents.resolve())]}),
+                     ("skills/list", {"cwds": [str(workspace.resolve())], "forceReload": True})]
+    assert restarts == []
+    config.write_text('model = "new-global-model"\n[plugins."new@market"]\nenabled = true\n[marketplaces.market]\nsource = "local"\n', encoding="utf-8")
+    before = config.read_bytes()
+    client.prepare_task(str(workspace))
+    assert restarts == ["restart"]
+    updated = codex_client.tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+    assert updated["model"] == "local-provider"
+    assert updated["plugins"] == {"new@market": {"enabled": True}}
+    assert updated["marketplaces"] == {"market": {"source": "local"}}
+    assert (home / "rollout.db").read_bytes() == b"session"
+    assert config.read_bytes() == before
+    client.prepare_task(str(workspace))
+    assert restarts == ["restart"]
+    agents.rmdir()
+    config.write_text('model = "third-model"\n', encoding="utf-8")
+    client.prepare_task(str(workspace))
+    assert restarts == ["restart", "restart"]
+    assert calls[-2] == ("skills/extraRoots/set", {"extraRoots": []})
+    assert codex_client.tomllib.loads((home / "config.toml").read_text(encoding="utf-8")) == {"model": "local-provider"}
+
+
+def test_update_plugin_settings_keeps_other_multiline_values(tmp_path):
+    config = tmp_path / "config.toml"
+    original = 'model = "local"\nplugins = { old = { enabled = true } }\ntext = """\n[ordinary text]\n"""\n[other]\nitems = [\n  "one",\n]\n[plugins."old"]\n'
+    # A valid config with root plugins already defined cannot reopen the same table.
+    original = original.replace('[plugins."old"]\n', '[marketplaces.market]\nsource = "old"\n')
+    config.write_text(original, encoding="utf-8")
+    codex_client._update_plugin_settings(tmp_path, {"plugins": {"new@market": {"enabled": True}}})
+    actual = codex_client.tomllib.loads(config.read_text(encoding="utf-8"))
+    assert actual == {"model": "local", "text": "[ordinary text]\n", "other": {"items": ["one"]},
+                      "plugins": {"new@market": {"enabled": True}}}
+
+
+def test_stopping_app_server_wakes_old_pending_and_stale_reader_cannot_fail_new_pending(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    old = SimpleNamespace(stdout=iter(()), terminate=lambda: None, wait=lambda **_: None)
+    client._proc = old
+    sent, errors = threading.Event(), []
+    monkeypatch.setattr(client, "_send_json", lambda _: sent.set())
+    def request():
+        try:
+            client._request_internal("thread/read", timeout=30)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    worker = threading.Thread(target=request, daemon=True)
+    worker.start()
+    assert sent.wait(timeout=1)
+    old_state = client._pending_requests[1]
+    client._stop_process()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert errors == ["Codex app-server request failed: thread/read: Codex app-server stopped."]
+    assert old_state["event"].is_set()
+    assert old_state["error"]["message"] == "Codex app-server stopped."
+    client._pending_requests.clear()
+    new_waiter = threading.Event()
+    client._pending_requests[2] = {"event": new_waiter, "error": None}
+    client._proc = SimpleNamespace()
+    client._stdout_loop(old)
+    assert not new_waiter.is_set()
+    assert client._pending_requests[2]["error"] is None
 
 
 def test_collab_waiting_end_filters_only_not_loaded_agents():

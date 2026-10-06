@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import threading
 import tomllib
@@ -128,70 +130,133 @@ def _copy_codex_home_seed(source_home: Path, target_home: Path) -> None:
             pass
 
 
-def _link_or_copy_path(source: Path, target: Path) -> None:
+def _user_home() -> Path:
+    return Path(os.environ.get("USERPROFILE") or str(Path.home()))
+
+
+def _is_directory_link(path: Path) -> bool:
     try:
-        if source.is_dir():
-            target.symlink_to(source, target_is_directory=True)
+        return path.is_symlink() or bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except AttributeError:
+        return path.is_symlink()
+    except FileNotFoundError:
+        return False
+
+
+def _create_directory_link(source: Path, target: Path) -> None:
+    try:
+        target.symlink_to(source, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt":
+            raise RuntimeError(f"Cannot link Codex directory {target} to {source}: {exc}") from exc
+    # Junction creation does not require the symlink privilege or Developer Mode.
+    quoted_target = str(target).replace("'", "''")
+    quoted_source = str(source).replace("'", "''")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+         f"New-Item -ItemType Junction -Path '{quoted_target}' -Target '{quoted_source}' -ErrorAction Stop | Out-Null"],
+        capture_output=True, text=True, **_windows_popen_kwargs(),
+    )
+    if result.returncode or not _is_directory_link(target):
+        raise RuntimeError(f"Cannot link Codex directory {target} to {source}: {result.stderr.strip()}")
+
+
+def _link_user_directory(source: Path, target: Path) -> None:
+    if not source.is_dir():
+        return
+    source = source.resolve()
+    if source == target.absolute():
+        raise RuntimeError(f"Codex directory cannot link to itself: {target}")
+    linked = _is_directory_link(target)
+    if linked and target.resolve() == source:
+        return
+    legacy = None
+    if linked:
+        # Remove only the reparse node; never enumerate its target.
+        if target.is_symlink():
+            target.unlink()
         else:
-            target.symlink_to(source)
-        return
-    except Exception:
-        pass
+            target.rmdir()
+    elif os.path.lexists(target):
+        suffix = 0
+        legacy = target.with_name(f"{target.name}.legacy-{datetime.now():%Y%m%d%H%M%S%f}")
+        while os.path.lexists(legacy):
+            suffix += 1
+            legacy = target.with_name(f"{target.name}.legacy-{suffix}")
+        target.rename(legacy)
     try:
-        if source.is_dir():
-            shutil.copytree(source, target)
-        else:
-            shutil.copy2(source, target)
+        _create_directory_link(source, target)
     except Exception:
-        pass
+        if legacy is not None and not os.path.lexists(target):
+            legacy.rename(target)
+        raise
 
 
-def _merge_user_skills_into_codex_home(source_home: Path, target_home: Path) -> None:
-    source_skills = source_home / "skills"
-    if not source_skills.exists() or not source_skills.is_dir():
-        return
-    try:
-        target_skills = target_home / "skills"
-        target_skills.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return
-    try:
-        entries = list(source_skills.iterdir())
-    except Exception:
-        return
-    for source_entry in entries:
-        target_entry = target_skills / source_entry.name
-        if target_entry.exists() or target_entry.is_symlink():
-            continue
-        _link_or_copy_path(source_entry, target_entry)
+def _link_user_codex_directories(source_home: Path, target_home: Path) -> None:
+    for name in ("skills", "plugins"):
+        _link_user_directory(source_home / name, target_home / name)
 
 
-def _strip_utf8_bom_from_skill_markdown(skills_root: Path) -> None:
-    if not skills_root.exists() or not skills_root.is_dir():
-        return
-    try:
-        entries = list(skills_root.iterdir())
-    except Exception:
-        return
-    skill_files = []
-    direct_skill = skills_root / "SKILL.md"
-    if direct_skill.exists() and direct_skill.is_file():
-        skill_files.append(direct_skill)
-    for entry in entries:
-        candidate = entry / "SKILL.md"
-        if candidate.exists() and candidate.is_file():
-            skill_files.append(candidate)
-    for skill_file in skill_files:
-        try:
-            data = skill_file.read_bytes()
-        except Exception:
+def _plugin_settings(source_home: Path) -> dict:
+    config = source_home / "config.toml"
+    data = tomllib.loads(config.read_text(encoding="utf-8-sig")) if config.is_file() else {}
+    return {key: data[key] for key in ("plugins", "marketplaces") if key in data}
+
+
+def _toml_inline(value) -> str:
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{json.dumps(key, ensure_ascii=False)} = {_toml_inline(item)}" for key, item in value.items()) + " }"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_inline(item) for item in value) + "]"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value).lower()
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    return value.isoformat()
+
+
+def _update_plugin_settings(target_home: Path, settings: dict) -> None:
+    config = target_home / "config.toml"
+    text = config.read_text(encoding="utf-8-sig") if config.is_file() else ""
+    existing = tomllib.loads(text)
+    kept = []
+    section = None
+    pending = ""
+    keep_pending = False
+    for line in text.splitlines(keepends=True):
+        if pending:
+            pending += line
+            if keep_pending:
+                kept.append(line)
+            try:
+                tomllib.loads(pending)
+            except tomllib.TOMLDecodeError:
+                continue
+            pending = ""
             continue
-        if not data.startswith(b"\xef\xbb\xbf"):
-            continue
-        try:
-            skill_file.write_bytes(data[3:])
-        except Exception:
-            continue
+        if line.lstrip().startswith("["):
+            # Parsing the table header also handles quoted names and array tables.
+            section = next(iter(tomllib.loads(line)), None)
+        remove_root = section is None and re.match(r'^\s*(?:plugins|marketplaces|"plugins"|"marketplaces")\s*[.=]', line)
+        keep_pending = section not in {"plugins", "marketplaces"} and not remove_root
+        if "=" in line and not line.lstrip().startswith(("#", "[")):
+            try:
+                tomllib.loads(line)
+            except tomllib.TOMLDecodeError:
+                pending = line
+        if keep_pending:
+            kept.append(line)
+    updated = "".join(f"{key} = {_toml_inline(value)}\n" for key, value in settings.items()) + "".join(kept)
+    expected = {key: value for key, value in existing.items() if key not in {"plugins", "marketplaces"}}
+    expected.update(settings)
+    if tomllib.loads(updated) != expected:
+        raise RuntimeError("Cannot update Codex plugin configuration without changing other settings")
+    temporary = config.with_suffix(".toml.tmp")
+    temporary.write_text(updated, encoding="utf-8")
+    temporary.replace(config)
 
 
 def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], Path | None]:
@@ -202,10 +267,9 @@ def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], 
         codex_home.mkdir(parents=True, exist_ok=True)
     except Exception:
         codex_home = Path(tempfile.mkdtemp(prefix=".codex-home-"))
-    source_home = Path(os.environ.get("USERPROFILE") or str(Path.home())) / ".codex"
+    source_home = _user_home() / ".codex"
     _copy_codex_home_seed(source_home, codex_home)
-    _merge_user_skills_into_codex_home(source_home, codex_home)
-    _strip_utf8_bom_from_skill_markdown(codex_home / "skills")
+    _link_user_codex_directories(source_home, codex_home)
     env["CODEX_HOME"] = str(codex_home)
     return env, codex_home
 
@@ -515,11 +579,26 @@ class CodexAppServerClient:
         self._closed = False
         self._codex_home_dir: Path | None = None
         self._owns_codex_home_dir = False
+        self._global_plugin_settings: dict | None = None
         self._stderr_tail: deque[str] = deque(maxlen=40)
 
     def close(self) -> None:
         self._closed = True
+        self._stop_process()
+        codex_home_dir = self._codex_home_dir
+        self._codex_home_dir = None
+        owns_codex_home_dir = bool(self._owns_codex_home_dir)
+        self._owns_codex_home_dir = False
+        if codex_home_dir is not None and owns_codex_home_dir:
+            try:
+                shutil.rmtree(codex_home_dir)
+            except Exception:
+                pass
+
+    def _stop_process(self) -> None:
         proc = self._proc
+        self._proc = None
+        self._fail_pending_requests("Codex app-server stopped.")
         if proc is not None:
             try:
                 proc.terminate()
@@ -530,18 +609,29 @@ class CodexAppServerClient:
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
-        self._proc = None
-        codex_home_dir = self._codex_home_dir
-        self._codex_home_dir = None
-        owns_codex_home_dir = bool(self._owns_codex_home_dir)
-        self._owns_codex_home_dir = False
-        if codex_home_dir is not None and owns_codex_home_dir:
-            try:
-                shutil.rmtree(codex_home_dir)
-            except Exception:
-                pass
+        for reader in (self._stdout_thread, self._stderr_thread):
+            if reader is not None and reader is not threading.current_thread():
+                reader.join(timeout=2)
+        self._initialized = False
+
+    def prepare_task(self, cwd: str | None = None) -> None:
+        """Refresh native skill discovery before starting or resuming a new task."""
+        source_home = _user_home() / ".codex"
+        settings = _plugin_settings(source_home)
+        if self._codex_home_dir is None:
+            self._build_launch_env()
+        _link_user_codex_directories(source_home, self._codex_home_dir)
+        if self._global_plugin_settings != settings:
+            _update_plugin_settings(self._codex_home_dir, settings)
+            self._stop_process()
+            self._global_plugin_settings = settings
+        self._ensure_started()
+        skill_root = (_user_home() / ".agents" / "skills").resolve()
+        self.request("skills/extraRoots/set", {"extraRoots": [str(skill_root)] if skill_root.is_dir() else []})
+        self.request("skills/list", {"cwds": [str(Path(cwd or Path.cwd()).resolve())], "forceReload": True})
 
     def start_thread(
         self,
@@ -773,17 +863,22 @@ class CodexAppServerClient:
             env=self._build_launch_env(),
             **_windows_popen_kwargs(),
         )
-        self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
-        self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+        self._stdout_thread = threading.Thread(target=self._stdout_loop, args=(self._proc,), daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, args=(self._proc,), daemon=True)
         self._stdout_thread.start()
         self._stderr_thread.start()
         self._initialized = False
         self._initialize()
 
     def _build_launch_env(self) -> dict[str, str]:
-        env, codex_home_dir = build_codex_app_server_env()
-        self._codex_home_dir = codex_home_dir
-        self._owns_codex_home_dir = bool(codex_home_dir and codex_home_dir.name.startswith(".codex-home-"))
+        if self._codex_home_dir is None:
+            env, codex_home_dir = build_codex_app_server_env()
+            self._codex_home_dir = codex_home_dir
+            self._owns_codex_home_dir = bool(codex_home_dir and codex_home_dir.name.startswith(".codex-home-"))
+            self._global_plugin_settings = _plugin_settings(codex_home_dir) if codex_home_dir else {}
+        else:
+            env = os.environ.copy()
+            env["CODEX_HOME"] = str(self._codex_home_dir)
         return env
 
     def _initialize(self) -> None:
@@ -850,12 +945,14 @@ class CodexAppServerClient:
         suffix = f" Stderr: {stderr}" if stderr else ""
         return f"Codex app-server is not running{detail}.{suffix}"
 
-    def _stdout_loop(self) -> None:
-        proc = self._proc
+    def _stdout_loop(self, proc=None) -> None:
+        proc = proc if proc is not None else self._proc
         if proc is None or proc.stdout is None:
             return
         try:
             for raw_line in proc.stdout:
+                if proc is not self._proc:
+                    break
                 line = str(raw_line or "").strip()
                 if not line:
                     continue
@@ -865,15 +962,18 @@ class CodexAppServerClient:
                     continue
                 self._handle_message(message)
         finally:
-            if not self._closed:
-                self._emit_event(CodexEvent(type="transport_error", text="Codex app-server disconnected."))
-            self._fail_pending_requests("Codex app-server disconnected.")
+            if proc is self._proc:
+                if not self._closed:
+                    self._emit_event(CodexEvent(type="transport_error", text="Codex app-server disconnected."))
+                self._fail_pending_requests("Codex app-server disconnected.")
 
-    def _stderr_loop(self) -> None:
-        proc = self._proc
+    def _stderr_loop(self, proc=None) -> None:
+        proc = proc if proc is not None else self._proc
         if proc is None or proc.stderr is None:
             return
         for raw_line in proc.stderr:
+            if proc is not self._proc:
+                break
             line = str(raw_line or "").strip()
             if line:
                 self._stderr_tail.append(line)
