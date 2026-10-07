@@ -7,6 +7,7 @@
 - Codex 私有 home 通过整目录链接复用全局 skills/plugins，新任务刷新原生清单，活动 turn 的 steer 不重启。不得沿链接改写全局技能文件或退回长期副本；来源与验证边界见 docs/handoff.md。
 - UI 变更至少运行相关 tests/test_*ui_automation.py 和受影响模型流程测试。wx GUI 套件串行运行；真实定时器从 frame 构造到销毁全程清理。
 - CLI 后续输入、异步状态及结果必须按 chat、turn、session、account 和 request generation 归属；按规范化 model id 分派 provider。执行页保持 owner、revision 与有界前台读取，重工作放后台。
+- Kimi REST 回答、思考、分页与旧 owner 恢复共用结构化 prompt 边界判定；仅明确标记的 injection 可跳过。metadata.origin 的优先级与未知值保守规则见 docs/README.md，不能按消息正文识别注入。
 - 源码笔记路径为 D:\code\note\notes.db；打包版需要现存且经完整性校验的个人 OneDrive\code\data\sj\notes.db，缺失时在初始化前停止。测试须 monkeypatch resolve_notes_data_dir()。
 - 切包门禁：2026-09-29 的 OneDrive 数据库只是一次快照，早期安装包曾写本地源库。新包启用前核对实际运行包的数据路径，补齐之后的改动并安全替换或合并；跨机只运行一台 MC，换机前退出并等同步。当前步骤见 docs/handoff.md。
 

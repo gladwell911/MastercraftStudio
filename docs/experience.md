@@ -1,5 +1,9 @@
 # 可复用经验
 
+- Kimi prompt 边界：REST 的 origin 通常位于 metadata.origin；存在该键时优先使用，仅缺失时兼容顶层 origin。role=user 且字典 origin.kind 精确为 injection 才跳过，未知或畸形值保守作为真实问题。回答、思考、分页与旧 owner/alias 恢复共用判定；用真实外层 frame、保存及 SQLite done 状态检查完整恢复链，真实下一问题仍须隔离。
+- BMAD 旧模板兼容：在 renderer 输入端规范化旧配置、workflow 和 snapshot 标记，保留严格缺值/链接检查；已解析内容不再作为模板递归渲染。配置答案放项目本地忽略文件，不沿技能链接改写全局来源。兼容用例须覆盖正文中的运行时占位符和不透明配置值。
+- Windows 中文修改：PowerShell 管道的默认编码可能让 Python stdin 中文变成问号；采用 apply_patch 或明确 UTF-8 文件输入。文本替换之后检查实际 diff 和正文，再报告完成。
+
 - 回答时间：问题与权威答案分别记录，完成重放不刷新。验证必须经过已有流式回答行的真实 provider 完成和 quiet/deadline；字段已写或重载后正确不能代替实时表面检查。投影重算保留选中和焦点，pending delta 不全量重建。
 - Codex 命令审批：主动策略选择作用于后续启动/恢复，实际 request 和 reply 均复核 owner/generation/client；关闭按拒绝处理。单独修改启动策略不能代替完整的交互回复链。
 - 详情纯文本投影需保留链接目标、显式空行、列表层级和表格列，HTML 属性解析须允许无值或非法序号。用真实 Markdown 和 HTML 两类输入核对内容；窗口转换放在销毁 finally 的保护范围内。换行边界只维护末尾状态，避免每个段落拼接累计全文。

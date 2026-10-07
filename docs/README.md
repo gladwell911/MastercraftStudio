@@ -4,6 +4,8 @@
 
 ## 当前有效
 
+2026-10-07：Kimi 系统注入不再截断当前 prompt 的回答、思考及恢复范围；统一按结构化 origin 判断边界，272 项定向测试通过。BMAD 旧模板兼容修复另有 5 项通过。源码修复与现场安装版分开核对：本轮未重新打包，也未恢复旧失败记录。详情见[当前交接](handoff.md)与[注入边界修复规格](../_bmad-output/implementation-artifacts/spec-fix-kimi-injected-message-boundaries.md)。
+
 2026-10-06 当前状态见[交接](handoff.md)：Kimi 无消息 ID 的公开思考流已适配真实 step 生命周期，执行页及时显示原文摘录与全文；REST 补齐同一条目，工具前普通说明作为 commentary 保留。当前实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-kimi-thinking-progress.md`。跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现；完整矩阵与中文听验未完成，用户已停止完整桌面验收。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应历史报告只证明当时版本。
 
 Codex 通过整目录链接复用全局技能，在新任务前刷新原生清单；打包成功并校验最终产物后自动启动一次。三个定向文件独立验证 122 项通过，原生非模型探针确认技能/插件发现与刷新；此次未实际打包或更新安装版。方案及阶段验证见[全局技能与打包后启动实施记录](../_bmad-output/implementation-artifacts/plan-global-skills-package-start.md)，使用方法见[项目入口](../README.txt)。
@@ -13,7 +15,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
-- [Epic1 实施记录](D:/code/sj/_bmad-output/implementation-artifacts/plan-epic1-chat-information.md)与 [QA 报告](D:/code/sj/_bmad-output/implementation-artifacts/qa-epic1-chat-information.md)：2026-09-30 聊天信息准确与快速刷新（CAP-1/8/9），含基线失败与真实键盘、定时器验证证据
+- Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
 - [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
 - [`../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml`](../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml)：聊天信息五项任务；Story 1.1–1.5 已完成，后续进入发布验证
 - [`reflection.md`](./reflection.md)：本轮真实纠错记录
@@ -32,6 +34,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - MC 当前主分支为 `main`，跟踪 `origin/main`；RC 为 `master`，跟踪 `origin/master`。旧开发分支已合并并删除；日常安装版版本另按交接核对。
 - 修改笔记存储、同步或测试夹具时，优先通过 `resolve_notes_data_dir()` 注入测试路径，不要让测试写入真实笔记库。
 - Kimi 的 `turn_id` 只在 session 内唯一；携带 `session_id` 的事件必须按会话隔离，不能仅凭 turn 在聊天之间路由。
+- Kimi REST 的 user 消息仅在结构化 `origin.kind == "injection"` 时跳过 prompt 边界；优先采用存在的 `metadata.origin`，仅其缺失时兼容顶层 `origin`。未知或畸形 origin 保守视为真实问题，不能按正文猜测系统注入。
 - Kimi 的 F1 执行页保留 provider 实际公开的思考与已由工具调用确认的中间说明；列表取首个非空行、最多 80 字，全文详情保留完整公开正文。无消息 ID 的流按 session/epoch/turn/agent/step/kind 隔离，保留 offset 去重与缺口处理。REST 在明确的 prompt 边界内按 assistant 步骤顺序补齐原行；隐藏/private/non-disclosable 内容不进入可视投影，工具流水仍不生成执行行。
 - Kimi 的回答列表仅在主代理最终正文获得权威完成确认后更新；子代理过程、不完整流片段和失败终态只保留在执行过程或错误状态，不能提前显示为回答或播放完成音。
 - 执行列表的旧 15 项失败已在上述执行规格逐项归类并修复/更新契约；最终定向验收去重 467 项通过，不代表冻结基线的其他领域或全笔记领域已验证。

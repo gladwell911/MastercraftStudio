@@ -1,9 +1,11 @@
 ﻿# 当前交接
 
-截至2026-10-06。MC 源码已包含 Kimi 公开思考/进度修复（`171c3bc`）、Codex 全局技能复用与打包成功后自动启动（`7f78c2b`）。跨设备已读同步与 Ctrl+Shift+X 未读聊天跳转保留，对应功能提交 MC `92b284b`、RC `9d57fa8`。两仓库已合并并删除旧开发分支，当前分别使用 `main` 和 `master`；后续文档提交以 `git log -1` 为准。完整跨端验收尚未通过，用户已停止完整桌面验收。源码和 GitHub 提交不代表已部署；本次未实际打包、更新或启动日常安装版，也未更新实体手机。
+截至2026-10-07。MC 新增 Kimi 系统注入边界修复（`497f24d`）和 BMAD 旧模板渲染兼容修复（`21413cf`）；既有 Kimi 公开思考/进度（`171c3bc`）、Codex 全局技能复用与打包后启动（`7f78c2b`）保留。跨设备已读同步与 Ctrl+Shift+X 未读聊天跳转保留，对应 MC `92b284b`、RC `9d57fa8`。MC 使用 `main`，RC 使用 `master`；后续文档提交以 `git log -1` 为准。完整跨端验收尚未通过，用户已停止完整桌面验收。源码和 GitHub 提交不代表已部署；本轮未实际打包、更新或启动日常安装版，也未改动现场失败记录或实体手机。
 
 ## 当前实现
 
+- Kimi 的 `_kimi_is_user_prompt` 统一回答、思考、分页与旧 owner/alias 恢复的七处边界判断。REST 的 `metadata.origin` 存在时优先使用，仅缺失时兼容顶层 `origin`；只有字典 origin 的 kind 精确为 injection 才跳过 user 消息。未知、缺失或畸形值保守保留边界，隐藏正文、tool_use、权威完成与 owner/generation 隔离规则保留。
+- BMAD renderer 仅规范化旧模板源中的配置、workflow 与 snapshot 标记，不递归渲染已解析内容；缺配置和遗漏链接仍严格失败。项目忽略文件 `_bmad/custom/config.user.toml` 补齐既有安装答案 `modules.bmm.user_skill_level=intermediate`，不修改全局技能；新机器须在本地提供该配置。
 - Codex 全局技能复用：隔离 `.codex-home` 的 `skills`、`plugins` 整目录链接当前用户 `.codex` 来源，旧普通目录迁移到同 home 唯一 `*.legacy-*` 路径；来源缺失时保留旧内容，链接失败报错且不退回复制，全局文件字节（含 BOM）不改。每个新任务在 start/resume/turn 前注册当前 `.agents/skills` 并 forceReload 原生技能清单；全局 plugins/marketplaces 配置变化才更新对应配置并保留 home 重启 app-server，随后走原 thread 恢复链。执行中 steer 不刷新或重启，明确无活动 turn 后才准备新任务。同名技能选择与插件身份由原生 Codex 处理。
 - 打包成功后启动：`package_mc.ps1` 先临时构建校验再更新，reparse 清理只操作节点，保留 `.codex-home`、包内外 history 和 OneDrive 数据。最终产物校验后从最终目录启动一次，不等待 GUI 退出；失败返回非零且不启动旧包或临时包。默认最终目录为 `D:/code/cx/mc`，调用方法见 [README](../README.txt)。更新阶段失败可能留下部分程序文件，保留会话/history 且不启动，重新执行脚本完成更新；默认不创建旧包备份。
 - Kimi 2.1.1 真实无 messageId 的 thinking/assistant 流按 session、epoch、turn、agent、原生 step 与内容种类补充稳定身份；公开思考在生成中直接进入 canonical 执行投影，列表展示原文摘录、详情保留全文。相同 seq 的不同 offset、重放、缺口和过期 step/epoch 保持隔离。REST 只在完整 prompt 边界内按 assistant 步骤顺序补全既有行；晚到流不能覆盖完成快照。工具调用前的 assistant 原文转为 commentary，REST 的 text + tool_use 同样保留，权威终答排除这些中间说明。隐藏标记整段单调生效，已缓存与持久化组装内容也同步清除；主 REST 不补写子代理流。RC 继续消费 v3 的 list_text/detail_text，无 RC 产品改动。
@@ -17,6 +19,22 @@
 - created_at/answer_at、累计300秒时间标记、Codex命令审批、通知路由、聊天信息及跨端v3执行投影保留。纯notLoaded占位过滤与UI/存储共享可视规则，有用描述和对应失败内容保留。
 
 ## 验证与复现
+
+### Kimi 注入边界与 BMAD 兼容（2026-10-07）
+
+“继续教育学习”现场 turn 27 的 Kimi 实际已正常完成，wire 中存在 1142 字终答；中途 AGENTS 注入被旧 MC 当作下一条 user 问题，截断答案。离线按真实 REST 投影重放，修复后取到与 wire 完全相同的 1142 字正文。REST 的 metadata.origin 包装通过已安装 kimi.EXE 内嵌 messageProjection.ts 核实。
+
+最终定向验证：集成 87 项、wx 4 项、映射/客户端 179 项、并发 session 隔离 2 项，共 272 passed、0 failed、0 skipped；另有 renderer 兼容 5 项通过。四层审查及详细矩阵见[已完成修复规格](../_bmad-output/implementation-artifacts/spec-fix-kimi-injected-message-boundaries.md)。本次文档收尾复用代码未变后的结果，不重复运行模型、GUI 或真实打包。可复跑命令：
+
+```powershell
+.venv/Scripts/python.exe -m pytest tests/test_kimi_integration.py -k 'rest or recovery or legacy_owner or subagent_terminal or subagent_event or transport or resync or replay or alias or injection' -q -ra
+.venv/Scripts/python.exe -m pytest tests/test_kimi_ui_responsiveness_automation.py -k 'sdk_public_thinking or kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint or background_events_do_not_repaint_lists or background_structured_kimi_batch_persists_owner_without_foreground_repaint' -q -ra
+.venv/Scripts/python.exe -m pytest tests/test_kimi_event_mapping_unit.py tests/test_kimi_server_client_unit.py -q -ra
+.venv/Scripts/python.exe -m pytest tests/test_kimi_integration.py -k 'interleaved_same_turn_id_routes_by_session or same_chat_reused_turn_id_keeps_sessions_isolated' -q -ra
+.venv/Scripts/python.exe _bmad/scripts/tests/test_render_skill_legacy.py
+```
+
+只读检查 `D:/code/cx/mc/mc.exe` 的 PyInstaller main 字节码，确认缺少 `_kimi_is_user_prompt`，而源码已有该函数，因此当前安装版未包含修复。现场聊天 ID 为 `f1594a0f-e603-443e-825d-ef9ab9cbe87d`，session 为 `session_ecf88af0-90eb-4443-b138-06c8579ce165`，prompt 为 `msg_01M4AP1HFJZSTK32C6CDND4MFW`，本地 turn_index 为 17。日志位于用户 `.kimi-code/server/events/` 及 `.kimi-code/sessions/wd__internal_fcfe2895237e/` 对应 session。部署后若处理旧失败记录，须先核对原始 owner 与恢复入口；尚未证明普通重启会自动修复该记录，不应重发问题或直接改库冒充验证。
 
 ### 全局技能与打包后启动（2026-10-06）
 
@@ -79,6 +97,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_cross_client_reg
 - 2026-10-04物理F1 SendInput未送达char-hook，独立旧AltY也未送达处理器；保留环境失败证据，不能以wx事件通过代替物理按键验收。
 - 用户现场Kimi10054具体诱因仍缺日志。本轮真实本机socket恢复通过，不证明真实Kimi启动/WS、公网Live或偶发断连消失；实体TalkBack、双机及完整产品套件未验证。
 - 后续交付先核对安装版本和实际数据路径，再构建、更新及实测；源码HEAD不证明运行包已更新。RC实体包最后已知安装为2026-10-03文件分享阶段，本轮只用专用模拟器。
+- 本轮 Kimi 修复的下一步是安装版交付：在部署任务中正常关闭安装版 MC 及 worker，核对笔记/OneDrive 数据衔接后使用现有打包脚本；再验证注入场景及旧失败记录的安全恢复。此次 neat-freak 仅整理、提交和推送，不执行部署或历史修复。
 - MC `main` 跟踪 `origin/main`，RC `master` 跟踪 `origin/master`，各仓库仅保留对应主分支。旧开发分支已合并、删除；此前“不推送”的阶段约束已被后续明确推送请求取代。提交/推送沿用现有 remote/upstream，不代表打包或安装已完成。
 - 源码笔记为`D:/code/note/notes.db`；打包版要求个人OneDrive的`code/data/sj/notes.db`存在并经完整性和已知表结构校验。2026-09-29云端库只是快照，切包前补齐后续变化，保留笔记、聊天及运行数据。跨机不并发运行MC，换机先退出等同步；默认不创建旧包备份。
 
