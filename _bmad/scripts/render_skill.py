@@ -458,11 +458,33 @@ def _template_location(error: BaseException, source_names: set[str]) -> str | No
     return location
 
 
+def _normalize_legacy_source(content: str) -> str:
+    """Translate installed pre-Jinja placeholders without re-rendering resolved values."""
+    content = re.sub(
+        r"\{\{\s*\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}",
+        lambda match: "{{ config." + match[1] + " }}",
+        content,
+    )
+    content = re.sub(
+        r"(?<!\{)\{(workflow\.[A-Za-z_][A-Za-z0-9_.]*)\}(?!\})",
+        lambda match: "{{ " + match[1] + " }}",
+        content,
+    )
+    return re.sub(
+        r"\[\[bmad-snapshot:([^\]\r\n]+)\]\]",
+        lambda match: "{{ rendered(" + json.dumps(match[1]) + ") }}",
+        content,
+    )
+
+
 def _render_sources(sources: dict[str, str], skill_dir: Path, context: _RenderContext) -> dict[str, str]:
     """Render every source as a Jinja2 template against the context; return the non-empty outputs."""
     # Skill sources name their bundled non-Markdown files (scripts, assets)
     # through {skill-root}; those stay in the installed skill directory.
-    bound = {name: content.replace("{skill-root}", skill_dir.as_posix()) for name, content in sources.items()}
+    bound = {
+        name: _normalize_legacy_source(content).replace("{skill-root}", skill_dir.as_posix())
+        for name, content in sources.items()
+    }
     environment = jinja2.Environment(
         loader=_SourceLoader(bound),
         undefined=jinja2.StrictUndefined,
