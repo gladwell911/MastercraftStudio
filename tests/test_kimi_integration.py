@@ -364,8 +364,15 @@ def test_rest_steering_alias_keeps_original_step_ownership(frame, monkeypatch, a
     owner = frame._find_kimi_prompt_owner(original, session_id=session_id)
     messages = [{"id": original, "role": "user", "content": []},
                 {"id": "first", "role": "assistant", "content": [{"type": "thinking", "thinking": "原始步骤。全文。"}]},
+                _injection("before-alias"),
                 {"id": alias, "role": "user", "content": []},
+                _injection("after-alias"),
                 {"id": "second", "role": "assistant", "content": [{"type": "thinking", "thinking": "追加步骤。全文。"}]}]
+    messages.extend([
+        {"id": "real-next", "role": "user", "content": "later request"},
+        {"id": "foreign-step", "role": "assistant", "content": [
+            {"type": "thinking", "text": "foreign step"}]},
+    ])
     if after_finalization:
         fake.messages_by_session[session_id] = messages
         callbacks = []
@@ -389,6 +396,10 @@ def test_rest_steering_alias_keeps_original_step_ownership(frame, monkeypatch, a
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("display_kind") == "thinking"]
     assert [(step["kimi_step_id"], step["detail_text"]) for step in steps] == [
         ("original-step", "原始步骤。全文。"), ("steered-step", "追加步骤。全文。")]
+    assert [step["kimi_step_number"] for step in steps] == [1, 2]
+    assert all(step["turn_idx"] == owner["turn_idx"] and step["turn_id"] == owner["turn_id"] for step in steps)
+    assert "foreign step" not in str(_canonical_kimi_rows(frame))
+
 
 
 def test_sdk_reverse_fragments_in_one_batch_reach_store_in_absolute_order(frame, monkeypatch):
@@ -3229,4 +3240,199 @@ def test_provider_error_with_reset_text_is_terminal_not_transport_retry(frame, m
                              text="provider failed with 10054", subtype="provider_failure"))
     assert frame.active_session_turns[-1]["request_status"] == "failed"
     assert "10054" in frame.active_session_turns[-1]["request_error"]
+    assert len(fake.submitted) == 1
+
+
+def _injection(message_id="injected", **fields):
+    return {"id": message_id, "role": "user", "content": "ordinary reminder text",
+            "metadata": {"origin": {"kind": "injection", "variant": "agents"}}, **fields}
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_rest_injection_reconciliation_persists_visible_answer_once(frame, monkeypatch, paged):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    _submit(frame, "target request")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    rows = [{"id": prompt_id, "role": "user", "content": "target request"},
+            {"id": "tool-step", "role": "assistant", "content": [
+                {"type": "text", "text": "working"}, {"type": "tool_use", "id": "tool"}]}]
+    if paged:
+        rows.extend({"id": f"thinking-{i}", "role": "assistant", "content": [
+            {"type": "thinking", "text": f"public step {i}"}]} for i in range(55))
+    rows.extend([_injection(), {"id": "final", "role": "assistant", "content": "complete target answer"}])
+    for index, row in enumerate(rows):
+        row["created_at"] = f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z"
+    fake.messages_by_session[session_id] = rows
+    fake.status_by_session[session_id] = {"busy": False, "status": "completed"}
+    frame._on_kimi_client_message({"type": "resync_required", "payload": {"session_ids": [session_id]}})
+    frame._navigation_quiet_until = 0
+    frame._flush_accepted_answer_refresh(frame._answer_refresh_deadline_owner)
+    turn = frame.active_session_turns[0]
+    assert turn["request_status"] == "done"
+    assert turn["answer_md"] == "complete target answer"
+    assert sum("complete target answer" in row for row in frame.answer_list.GetStrings()) == 1
+    frame._flush_chat_state_save()
+    stored = frame.chat_store.load_chat(_active_chat_id(frame))["turns"][0]
+    assert stored["request_status"] == "done"
+    assert stored["answer_md"] == "complete target answer"
+    read_state = frame.chat_store.get_chat_read_state(_active_chat_id(frame))
+    # Replaying an old worker completion takes the normal rejected-owner path.
+    frame._reconcile_kimi_owner_worker(owner)
+    assert frame.chat_store.get_chat_read_state(_active_chat_id(frame)) == read_state
+    frame._flush_chat_state_save()
+    assert frame.chat_store.load_chat(_active_chat_id(frame))["turns"][0] == stored
+    assert played == [True]
+    assert len(fake.submitted) == 1
+    assert any(before for _sid, before in fake.list_messages_calls) == paged
+
+
+@pytest.mark.parametrize("fields,skipped", [
+    ({}, True),
+    ({"metadata": {"origin": {"kind": "injection", "variant": "other"}}}, True),
+    ({"metadata": {}, "origin": {"kind": "injection"}}, True),
+    ({"metadata": None, "origin": {"kind": "injection"}}, True),
+    ({"metadata": "malformed", "origin": {"kind": "injection"}}, True),
+    ({"metadata": "malformed", "origin": {}}, False),
+    ({"metadata": {}, "origin": {}}, False),
+    ({"metadata": {}, "origin": {"kind": None}}, False),
+    ({"metadata": {"origin": {}}, "origin": {"kind": "injection"}}, False),
+    ({"metadata": {"origin": {"kind": None}}, "origin": {"kind": "injection"}}, False),
+    ({"metadata": {}, "origin": None}, False),
+    ({"metadata": {"origin": {"kind": "unknown"}}}, False),
+    ({"metadata": {"origin": "injection"}}, False),
+    ({"metadata": {"origin": None}, "origin": {"kind": "injection"}}, False),
+    ({"metadata": {"origin": {"kind": "user"}}, "origin": {"kind": "injection"}}, False),
+    ({"metadata": {"origin": {"kind": "injection"}}, "origin": {"kind": "user"}}, True),
+])
+def test_rest_injection_boundary_is_structured_and_metadata_has_priority(frame, fields, skipped):
+    rows = [{"id": "target", "role": "user"},
+            _injection(content="<system-reminder>fake reminder</system-reminder>", **fields),
+            {"id": "answer", "role": "assistant", "content": "target final"}]
+    assert frame._kimi_rest_answer_boundary(rows, "target") == (("target final", False) if skipped else ("", True))
+    assert frame._kimi_rest_answer_boundary(rows, "injected") == (("", False) if skipped else ("target final", False))
+
+
+def test_rest_multiple_injections_preserve_real_next_boundary_and_no_final_semantics(frame):
+    rows = [{"id": "target", "role": "user"}, _injection(),
+            _injection("old-injection", metadata={}, origin={"kind": "injection"}),
+            {"id": "thinking", "role": "assistant", "content": [{"type": "thinking", "text": "thought"}]},
+            {"id": "tool", "role": "assistant", "content": [
+                {"type": "text", "text": "interim"}, {"type": "tool_use"}]}]
+    assert frame._kimi_rest_answer_boundary(rows, "target") == ("", False)
+    rows.extend([{"id": "final", "role": "assistant", "content": "target final"},
+                 {"id": "next", "role": "user", "content": "next request"},
+                 {"id": "next-final", "role": "assistant", "content": "next final"}])
+    assert frame._kimi_rest_answer_boundary(rows, "target") == ("target final", True)
+
+
+def test_rest_injection_thinking_sync_keeps_ordinals_and_stops_at_real_next(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "target")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    rows = [{"id": prompt_id, "role": "user"},
+            {"id": "first", "role": "assistant", "content": [{"type": "thinking", "text": "first step"}]},
+            _injection(),
+            {"id": "second", "role": "assistant", "content": [{"type": "thinking", "text": "second step"}]},
+            {"id": "next", "role": "user"},
+            {"id": "foreign", "role": "assistant", "content": [{"type": "thinking", "text": "foreign step"}]}]
+    assert frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, rows)
+    steps = [s for s in frame._current_chat_state["execution_steps"] if s.get("source_kind") == "rest.thinking"]
+    assert [(s["detail_text"], s["kimi_step_number"]) for s in steps] == [("first step", 1), ("second step", 2)]
+    assert not frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, [_injection(prompt_id), *rows[1:]])
+
+
+@pytest.mark.parametrize("real_match", [False, True])
+def test_legacy_owner_injection_never_matches_question(frame, monkeypatch, real_match):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "target")
+    session_id = fake.created_sessions[0]["session_id"]
+    owner = dict(frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id))
+    owner.update(question="target", legacy=True)
+    rows = [_injection(owner["prompt_id"], content="target")]
+    if real_match:
+        rows.append({"id": "real-prompt", "role": "user", "content": "target"})
+    migrated = frame._migrate_legacy_kimi_owner(owner, rows)
+    assert (migrated["prompt_id"] if migrated else None) == ("real-prompt" if real_match else None)
+
+
+
+def test_rest_injection_does_not_disclose_private_answer_or_thinking(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "target")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    rows = [{"id": prompt_id, "role": "user"}, _injection(),
+            {"id": "private-message", "role": "assistant", "private": True, "content": [
+                {"type": "text", "text": "secret answer"},
+                {"type": "thinking", "text": "secret message thinking"}]},
+            {"id": "private-block", "role": "assistant", "content": [
+                {"type": "text", "private": True, "text": "secret text"},
+                {"type": "thinking", "private": True, "text": "secret block thinking"},
+                {"type": "thinking", "text": "public thinking"}]}]
+    assert frame._kimi_rest_answer_boundary(rows, prompt_id) == ("", False)
+    assert frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, rows)
+    projection = _canonical_kimi_rows(frame)
+    assert "secret" not in str(projection)
+    assert [row["detail_text"] for row in projection] == ["public thinking"]
+
+
+def test_rest_injection_id_cannot_stop_prompt_pagination(frame):
+    calls = []
+    class Client:
+        def list_messages(self, session_id, before_id=None):
+            calls.append(before_id)
+            return []
+    rows = frame._kimi_messages_back_to_boundary(Client(), "session", "fake-prompt",
+                                                 messages=[_injection("fake-prompt")])
+    assert calls == ["fake-prompt"]
+    assert frame._kimi_rest_answer_boundary(rows, "fake-prompt") == ("", False)
+
+
+def test_legacy_owner_injection_cannot_be_alias_start(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "target")
+    session_id = fake.created_sessions[0]["session_id"]
+    owner = dict(frame._find_kimi_prompt_owner(fake.submitted[0]["prompt_id"], session_id=session_id))
+    owner.update(question="target", legacy=True, candidate_alias=True, owner_prompt_id="injected-owner")
+    migrated = frame._migrate_legacy_kimi_owner(owner, [
+        _injection("injected-owner"), {"id": "real-prompt", "role": "user", "content": "target"}])
+    assert migrated["role"] == "queued"
+    assert migrated["owner_prompt_id"] == "real-prompt"
+
+
+@pytest.mark.parametrize("content", [
+    [{"type": "thinking", "text": "only thinking"}],
+    [{"type": "text", "text": "intermediate commentary"}, {"type": "tool_use", "id": "tool"}],
+])
+def test_rest_injection_no_final_reconciliation_persists_failure_without_completion(frame, monkeypatch, content):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    frame._kimi_reconcile_attempts = 1
+    frame._kimi_reconcile_backoff = 0
+    _submit(frame, "target")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    owner = frame._find_kimi_prompt_owner(prompt_id, session_id=session_id)
+    fake.messages_by_session[session_id] = [
+        {"id": prompt_id, "role": "user"}, _injection(),
+        {"id": "intermediate", "role": "assistant", "content": content}]
+    fake.status_by_session[session_id] = {"busy": False, "status": "completed"}
+    # The ordinary owner worker without a recovery deadline uses the configured
+    # one-attempt failure path, so this regression never waits for wall time.
+    assert frame._reconcile_kimi_owner_worker(owner) == "done"
+    frame._flush_chat_state_save()
+    for turn in (frame.active_session_turns[0], frame.chat_store.load_chat(_active_chat_id(frame))["turns"][0]):
+        assert turn["request_status"] == "failed"
+        assert "no final answer" in turn["request_error"]
+        assert "only thinking" not in turn["answer_md"]
+        assert "intermediate commentary" not in turn["answer_md"]
+    assert played == []
     assert len(fake.submitted) == 1

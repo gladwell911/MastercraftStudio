@@ -14038,6 +14038,16 @@ class ChatFrame(wx.Frame):
         return "".join(parts).strip()
 
     @staticmethod
+    def _kimi_is_user_prompt(message: dict) -> bool:
+        """Only an explicit structured injection may bypass a user boundary."""
+        if not isinstance(message, dict) or str(message.get("role") or "").strip() != "user":
+            return False
+        metadata = message.get("metadata")
+        origin = (metadata["origin"] if isinstance(metadata, dict) and "origin" in metadata
+                  else message.get("origin"))
+        return not (isinstance(origin, dict) and origin.get("kind") == "injection")
+
+    @staticmethod
     def _kimi_message_thinking(message: dict) -> list[str]:
         """Return the thinking block texts of a transcript message.
 
@@ -14115,7 +14125,7 @@ class ChatFrame(wx.Frame):
         while prompt_id and pages < max(1, int(max_pages)):
             if any(
                 isinstance(row, dict)
-                and str(row.get("role") or "").strip() == "user"
+                and self._kimi_is_user_prompt(row)
                 and str(row.get("id") or "").strip() == prompt_id
                 for row in rows
             ):
@@ -14208,14 +14218,14 @@ class ChatFrame(wx.Frame):
                            and str(candidate.get("kimi_owner_prompt_id") or candidate.get("kimi_prompt_id") or "") == prompt_id
                            and candidate.get("kimi_prompt_role") == "alias")
             boundary = next((index for index, row in enumerate(rows)
-                             if row.get("role") == "user" and str(row.get("id") or "") == boundary_id), None)
+                             if self._kimi_is_user_prompt(row) and str(row.get("id") or "") == boundary_id), None)
             if boundary is None:
                 return False
             rows = rows[boundary + 1:]
             changed = False
             step_number = 0
             for message in rows:
-                if message.get("role") == "user":
+                if self._kimi_is_user_prompt(message):
                     if str(message.get("id") or "") in aliases:
                         continue
                     break
@@ -14338,7 +14348,7 @@ class ChatFrame(wx.Frame):
             rows = [row for _idx, row in sorted(enumerate(rows), key=lambda pair: (str(pair[1].get("created_at")), pair[0]))]
         boundary = -1
         for idx, row in enumerate(rows):
-            if str(row.get("role") or "").strip() == "user" and str(row.get("id") or "").strip() == prompt_id:
+            if self._kimi_is_user_prompt(row) and str(row.get("id") or "").strip() == prompt_id:
                 boundary = idx
                 break
         if boundary < 0:
@@ -14347,7 +14357,7 @@ class ChatFrame(wx.Frame):
         closed = False
         for row in rows[boundary + 1:]:
             role = str(row.get("role") or "").strip()
-            if role == "user":
+            if self._kimi_is_user_prompt(row):
                 closed = True
                 break
             if role == "assistant":
@@ -14661,7 +14671,7 @@ class ChatFrame(wx.Frame):
         matches = [
             row for row in rows
             if isinstance(row, dict)
-            and str(row.get("role") or "").strip() == "user"
+            and self._kimi_is_user_prompt(row)
             and self._kimi_message_text(row) == question
             and str(row.get("id") or "").strip()
         ]
@@ -14696,7 +14706,7 @@ class ChatFrame(wx.Frame):
             positions = {
                 str(row.get("id") or "").strip(): idx
                 for idx, row in enumerate(rows)
-                if isinstance(row, dict) and str(row.get("id") or "").strip()
+                if self._kimi_is_user_prompt(row) and str(row.get("id") or "").strip()
             }
             start = positions.get(candidate_owner_id)
             current = positions.get(prompt_id)
