@@ -1,0 +1,48 @@
+"""Machine-local identity for the two fixed remote-control computers."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+
+def normalize_pair(value: str) -> str:
+    pair = str(value or "default").strip().lower()
+    if pair not in {"default", "laptop"}:
+        raise ValueError("remote pair must be default or laptop")
+    return pair
+
+
+def load_machine_config(path: Path, *, default_domain: str, default_token: str,
+                        environ=None) -> dict[str, str]:
+    env = os.environ if environ is None else environ
+    try:
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(persisted, dict):
+            persisted = {}
+    except (OSError, ValueError):
+        persisted = {}
+    def setting(name, fallback):
+        for key in (f"REMOTE_CONTROL_{name}", f"CLAUDECODE_REMOTE_CONTROL_{name}"):
+            if key in env:
+                return str(env[key]).strip()
+        return str(persisted.get(name.lower(), fallback) or "").strip()
+    pair = normalize_pair(setting("PAIR_ID", "default"))
+    if str(persisted.get("pair_id", "default")).strip().lower() != pair:
+        persisted = {}
+    domain = setting("DOMAIN", default_domain if pair == "default" else "")
+    if domain:
+        uri = urlsplit(domain if "://" in domain else "wss://" + domain)
+        scheme = {"https": "wss", "http": "ws"}.get(uri.scheme, uri.scheme)
+        if scheme not in {"ws", "wss", "nats"} or not uri.hostname or uri.username or uri.password:
+            raise ValueError("invalid remote machine domain")
+        domain = urlunsplit((scheme, uri.netloc, "" if scheme == "nats" else "/nats", "", ""))
+    token = "".join(setting("TOKEN", default_token if pair == "default" else "").split())
+    config = {"pair_id": pair, "domain": domain, "token": token}
+    if config != persisted:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    return config

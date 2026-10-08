@@ -145,8 +145,15 @@ class CrossClientHarnessState:
             )
             return 200, {
                 "accepted": True,
-                "chats": [self._summary(chat) for chat in chats],
+                "chats": [{**self._summary(chat), "read_state": self.durable_store.get_chat_read_state(
+                    chat["chat_id"], pair_id=self.pair_id)} for chat in chats],
             }
+
+    def _readable_turns(self, chat: dict) -> list[dict]:
+        # Match the production history/state payload using canonical store facts.
+        return [{**turn, **(self.durable_store.readable_answer(
+            chat["chat_id"], turn_index=index) or {})}
+            for index, turn in enumerate(chat["turns"])]
 
     def history_read(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
@@ -156,7 +163,8 @@ class CrossClientHarnessState:
                 return 404, {"accepted": False, "error": "chat_not_found"}
             return 200, {
                 "accepted": True,
-                "chat": {**self._summary(chat), "turns": list(chat["turns"])},
+                "chat": {**self._summary(chat), "turns": self._readable_turns(chat),
+                         "read_state": self.durable_store.get_chat_read_state(chat_id, pair_id=self.pair_id)},
                 "has_more": False,
                 "oldest_cursor": "",
             }
@@ -186,7 +194,9 @@ class CrossClientHarnessState:
             chat = self.chats.get(chat_id)
             if chat is None:
                 return 404, {"accepted": False, "error": "chat_not_found"}
-            return 200, _state_body(chat_id, chat["turns"])
+            body = _state_body(chat_id, self._readable_turns(chat))
+            body["read_state"] = self.durable_store.get_chat_read_state(chat_id, pair_id=self.pair_id)
+            return 200, body
 
     def chat_information(self, payload: dict) -> tuple[int, dict]:
         body = payload.get("body") or {}
@@ -268,6 +278,7 @@ class CrossClientHarnessState:
                     "model": model,
                     "created_at": now,
                     "pending": False,
+                    "request_status": "done",
                 }
             )
             self._persist_chat(chat)

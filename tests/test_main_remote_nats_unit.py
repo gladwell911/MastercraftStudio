@@ -4,6 +4,36 @@ from types import SimpleNamespace
 import main
 
 
+def test_laptop_machine_settings_reach_actual_transport_startup(frame, monkeypatch, tmp_path):
+    from remote_nats_protocol import NatsSubjects
+    monkeypatch.setenv('REMOTE_CONTROL_PAIR_ID', 'laptop')
+    monkeypatch.setenv('REMOTE_CONTROL_DOMAIN', 'https://laptop.example')
+    monkeypatch.setenv('REMOTE_CONTROL_TOKEN', 'laptop-secret')
+    frame.app_data_dir = tmp_path
+    frame._initialize_remote_control_settings()
+    captured = {}
+    class Process:
+        def __init__(self, config, bundled_dir=None): pass
+        def start(self, timeout=10): return SimpleNamespace()
+        def stop(self): pass
+    class Transport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.subjects = NatsSubjects.from_pair_id(kwargs['pair_id'])
+        def start_threaded(self, url, timeout=10): captured['url'] = url
+        def stop(self): pass
+    monkeypatch.setattr(main, 'NatsServerProcess', Process)
+    monkeypatch.setattr(main, 'RemoteNatsTransport', Transport)
+    monkeypatch.setattr(frame, '_ensure_cloudflared_origin_bridge', lambda: None)
+    frame._start_remote_nats_server_if_configured(token=frame._read_remote_control_token(), host='127.0.0.1')
+    assert captured['pair_id'] == 'laptop'
+    assert captured['token'] == 'laptop-secret'
+    assert frame._remote_nats_transport.subjects.commands == 'zgwd.laptop.commands'
+    assert frame.remote_nats_runtime_status['cloudflared_url'] == 'wss://laptop.example/nats'
+    assert frame._build_remote_nats_url() == 'wss://laptop.example/nats?token=laptop-secret'
+    assert frame._cloudflare_file_public_base_url() == 'https://laptop.example'
+
+
 def test_v2_broadcast_commits_owner_fact_to_outbox_instead_of_direct_publish(frame, monkeypatch):
     committed = []
     direct = []

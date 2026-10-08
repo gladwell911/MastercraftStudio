@@ -45,6 +45,7 @@ from common_commands_store import (
     DesktopCommonCommandsStore,
 )
 from chat_store import ChatStore
+from remote_machine_config import load_machine_config
 from execution_projection import (
     collapse_kimi_execution_lifecycle,
     execution_command_list_text,
@@ -4653,6 +4654,13 @@ class ChatFrame(wx.Frame):
         return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
     def _initialize_remote_control_settings(self) -> None:
+        machine_path = self.app_data_dir / "remote_machine.json"
+        machine = load_machine_config(machine_path,
+                                      default_domain=self.remote_control_domain or DEFAULT_REMOTE_CONTROL_DOMAIN,
+                                      default_token=self.remote_control_token or DEFAULT_REMOTE_CONTROL_TOKEN)
+        self.remote_control_pair_id = machine["pair_id"]
+        self.remote_control_domain = machine["domain"]
+        self.remote_control_token = machine["token"]
         changed = False
         has_domain_env = self._has_remote_control_env(
             "REMOTE_CONTROL_DOMAIN",
@@ -4672,9 +4680,9 @@ class ChatFrame(wx.Frame):
         token = self._read_remote_control_setting(
             "REMOTE_CONTROL_TOKEN",
             "CLAUDECODE_REMOTE_CONTROL_TOKEN",
-            default=DEFAULT_REMOTE_CONTROL_TOKEN,
+            default=self.remote_control_token,
         )
-        if not token:
+        if not token and self.remote_control_pair_id == "default":
             token = DEFAULT_REMOTE_CONTROL_TOKEN
         if token != self.remote_control_token:
             self.remote_control_token = token
@@ -4691,7 +4699,7 @@ class ChatFrame(wx.Frame):
             domain = normalize_remote_nats_endpoint(domain, default_scheme="wss")
         if (
             not domain
-            and not has_local_binding_env
+            and not has_local_binding_env and self._read_pair_id() == "default"
         ):
             domain = DEFAULT_REMOTE_CONTROL_DOMAIN
         if domain != self.remote_control_domain:
@@ -4772,7 +4780,7 @@ class ChatFrame(wx.Frame):
             domain = ""
         if (
             not domain
-            and not has_local_binding_env
+            and not has_local_binding_env and self._read_pair_id() == "default"
         ):
             domain = DEFAULT_REMOTE_CONTROL_DOMAIN
         fixed_domain_mode = bool(domain)
@@ -4812,6 +4820,7 @@ class ChatFrame(wx.Frame):
                 default_scheme="ws",
             )
         return {
+            "domain": domain,
             "fixed_domain_mode": fixed_domain_mode,
             "host": host,
             "port": port,
@@ -13035,7 +13044,7 @@ class ChatFrame(wx.Frame):
         body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
         if not owner:
             return 400, {"error": "chat_id_required"}
-        pair_id = "default"
+        pair_id = self._read_pair_id()
         if not secret:
             return 503, {"error": "cursor_secret_unavailable"}
         domain = str(body.get("sequence_domain") or "events")
@@ -16657,7 +16666,7 @@ class ChatFrame(wx.Frame):
         return self._read_remote_control_setting(
             "REMOTE_CONTROL_TOKEN",
             "CLAUDECODE_REMOTE_CONTROL_TOKEN",
-            default=DEFAULT_REMOTE_CONTROL_TOKEN,
+            default=getattr(self, "remote_control_token", DEFAULT_REMOTE_CONTROL_TOKEN),
         )
 
     def _is_process_elevated(self) -> bool:
@@ -16746,7 +16755,7 @@ class ChatFrame(wx.Frame):
         status = getattr(self, "remote_nats_runtime_status", {}) or {}
         if not status.get("enabled"):
             return ""
-        remote_url = str(status.get("cloudflared_url") or DEFAULT_REMOTE_NATS_CLOUDFLARED_URL or "").strip()
+        remote_url = str(status.get("cloudflared_url") or self._remote_runtime_config()["domain"] or "").strip()
         if not remote_url:
             return ""
         try:
@@ -16975,7 +16984,9 @@ class ChatFrame(wx.Frame):
         token = self._read_remote_control_token()
         if not token:
             return ""
-        base = getattr(self, "remote_nats_runtime_status", {}).get("cloudflared_url") or DEFAULT_REMOTE_NATS_CLOUDFLARED_URL
+        base = getattr(self, "remote_nats_runtime_status", {}).get("cloudflared_url") or self._remote_runtime_config()["domain"]
+        if not base:
+            return ""
         return f"{base}?token={token}"
 
     def _on_copy_remote_nats_url(self, _event) -> None:
@@ -17047,7 +17058,7 @@ class ChatFrame(wx.Frame):
                     self._remote_nats_websocket_port = websocket_port
                     websocket_url = f"ws://127.0.0.1:{websocket_port}/nats"
                 transport = RemoteNatsTransport(
-                    pair_id="default",
+                    pair_id=self._read_pair_id(),
                     token=token,
                     on_message=lambda payload: self._run_remote_ui_route(self._remote_api_message_ui, payload),
                     on_new_chat=lambda payload: self._run_remote_ui_route(self._remote_api_new_chat_ui, payload),
@@ -17100,7 +17111,7 @@ class ChatFrame(wx.Frame):
                     enabled=False,
                     tcp_url=tcp_url,
                     websocket_url=websocket_url,
-                    cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+                    cloudflared_url=self._remote_runtime_config()["domain"],
                     last_error=last_error,
                 )
                 return
@@ -17111,7 +17122,7 @@ class ChatFrame(wx.Frame):
                 enabled=True,
                 tcp_url=tcp_url,
                 websocket_url=websocket_url,
-                cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+                cloudflared_url=self._remote_runtime_config()["domain"],
                 last_error="",
             )
             if reused_existing_runtime:
@@ -17121,7 +17132,7 @@ class ChatFrame(wx.Frame):
             enabled=False,
             tcp_url=f"nats://127.0.0.1:{DEFAULT_REMOTE_NATS_PORT}",
             websocket_url=f"ws://127.0.0.1:{self._remote_nats_websocket_port}/nats",
-            cloudflared_url=DEFAULT_REMOTE_NATS_CLOUDFLARED_URL,
+            cloudflared_url=self._remote_runtime_config()["domain"],
             last_error=last_error or "远程 NATS 运行时未成功启动。",
         )
         return
@@ -18607,7 +18618,7 @@ class ChatFrame(wx.Frame):
         if not (getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "begin_clear_operation")):
             return None
         transport = getattr(self, "_remote_nats_transport", None)
-        pair_id = str(getattr(getattr(transport, "subjects", None), "pair_id", "default") or "default")
+        pair_id = self._read_pair_id()
         if hasattr(store, "load_chat"):
             target, turns, _is_current = self._chat_target_for_request(chat_id)
             if not isinstance(target, dict):
@@ -20529,7 +20540,7 @@ class ChatFrame(wx.Frame):
         return True
 
     def _read_pair_id(self):
-        return str(getattr(getattr(getattr(self, "_remote_nats_transport", None), "subjects", None), "pair_id", "default") or "default")
+        return str(getattr(getattr(getattr(self, "_remote_nats_transport", None), "subjects", None), "pair_id", None) or getattr(self, "remote_control_pair_id", "default"))
 
     def _chat_read_state(self, chat_id):
         store = getattr(self, "chat_store", None)
