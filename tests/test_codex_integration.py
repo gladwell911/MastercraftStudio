@@ -140,7 +140,7 @@ def test_codex_origin_timestamp_normalization_matches_provider_contract():
 
 
 class _ImmediateThread:
-    def __init__(self, target=None, args=None, kwargs=None, daemon=None):
+    def __init__(self, target=None, args=None, kwargs=None, daemon=None, name=None):
         self._target = target
         self._args = args or ()
         self._kwargs = kwargs or {}
@@ -232,6 +232,52 @@ def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):
     assert payload["should_steer"] is True
     assert frame._active_request_count == 1
     assert frame.active_session_turns[-1]["question"] == "src/app.py"
+
+
+@pytest.mark.parametrize("native_owner_active", [False, True])
+def test_send_after_failed_codex_placeholder_starts_new_request(frame, monkeypatch, native_owner_active):
+    frame.model_combo.SetValue("codex")
+    frame.selected_model = "codex/main"
+    frame.active_codex_thread_id = TEST_THREAD_ID
+    frame.active_codex_turn_id = TEST_TURN_ID
+    frame.active_codex_turn_active = True
+    frame.active_codex_pending_prompt = "stale prompt"
+    frame.active_codex_thread_flags = ["waitingOnUserInput"]
+    frame.active_session_turns.append({
+        "question": "failed question", "answer_md": main.REQUESTING_TEXT,
+        "request_status": "failed", "model": main.DEFAULT_CODEX_MODEL,
+        "codex_turn_id": TEST_TURN_ID,
+    })
+    frame._current_chat_state["turns"] = frame.active_session_turns
+    if native_owner_active:
+        frame._codex_worker_active_turns[frame._ensure_active_chat_id()] = {
+            "turn_id": TEST_TURN_ID, "turn_idx": 0}
+    frame._active_request_count = 1
+    frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
+    frame._play_send_sound = lambda: None
+    monkeypatch.setattr(main.threading, "Thread", _ImmediateThread)
+
+    seen = {}
+
+    class _Client:
+        def start(self):
+            pass
+
+        def start_turn(self, **payload):
+            seen["payload"] = payload
+            return "request-retry"
+
+    frame._get_or_create_codex_client = lambda _chat_id, _model="": _Client()
+    assert frame._codex_active_request_turn_count(frame.active_session_turns) == 0
+    frame.input_edit.SetValue("retry question")
+
+    frame._on_send_clicked(None)
+
+    assert seen["payload"]["should_steer"] is native_owner_active
+    assert seen["payload"]["thread_id"] == TEST_THREAD_ID
+    assert seen["payload"]["question"] == "retry question"
+    assert frame.active_session_turns[-1]["request_status"] == "pending"
+    assert frame._active_request_count == 1
 
 
 def test_send_click_routes_codex_steer_when_waiting_on_user_input_without_prompt(frame, monkeypatch):

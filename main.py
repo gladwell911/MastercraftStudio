@@ -10450,6 +10450,13 @@ class ChatFrame(wx.Frame):
             input_items = self._build_codex_input_items(send_question, turn_attachments)
             should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
             history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+            if (should_steer and history_turns and isinstance(history_turns[-1], dict)
+                    and str(history_turns[-1].get("request_status") or "") == "failed"
+                    and self._codex_active_request_turn_count(history_turns) == 0):
+                native_owner = self._codex_worker_active_turns.get(client_chat_id)
+                if not (isinstance(native_owner, dict)
+                        and str(native_owner.get("turn_id") or "").strip() == turn_id):
+                    should_steer = False
             client.start()
             if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
                 return
@@ -16492,6 +16499,8 @@ class ChatFrame(wx.Frame):
             if not isinstance(turn, dict):
                 continue
             status = str(turn.get("request_status") or "").strip()
+            if status in {"done", "failed"}:
+                continue
             answer_md = str(turn.get("answer_md") or "").strip()
             if status in {"pending", "running"} or answer_md == REQUESTING_TEXT:
                 count += 1
@@ -16552,8 +16561,13 @@ class ChatFrame(wx.Frame):
                 self._active_request_count = active_count
             else:
                 self.active_codex_pending_request = None
+                self.active_codex_pending_prompt = ""
+                self.active_codex_thread_flags = []
                 self.is_running = False
                 self._active_request_count = 0
+        if active_count == 0:
+            target_chat["codex_pending_prompt"] = ""
+            target_chat["codex_thread_flags"] = []
         self._clear_codex_worker_active_turn(chat_id, target_idx, turn.get("codex_turn_id"))
         self._mark_chat_turns_dirty(None if is_current_target else chat_id, target_idx)
         if not is_current_target:

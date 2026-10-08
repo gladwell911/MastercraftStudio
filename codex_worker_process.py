@@ -264,6 +264,31 @@ class CodexWorkerRuntime:
                             and bool(str(payload.get("turn_id") or "").strip())
                             and hasattr(client, "steer_turn_items"))
             steered = False
+            prepared = False
+            resumed = False
+            recover_missing_thread = False
+            # A saved active flag can outlive the worker. Restore the thread in
+            # this process before asking the app server to steer its old turn.
+            native_key = (chat_id, model, str(payload.get("turn_id") or "").strip())
+            if should_steer and native_key not in self._native_owners:
+                if hasattr(client, "prepare_task"):
+                    client.prepare_task(payload.get("cwd") or "")
+                prepared = True
+                try:
+                    client.resume_thread(
+                        thread_id,
+                        approval_policy=self._approval_policy(payload),
+                        sandbox="danger-full-access",
+                        personality="pragmatic",
+                        cwd=payload.get("cwd") or "",
+                        service_tier=service_tier_arg,
+                    )
+                    resumed = True
+                except Exception as exc:
+                    if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
+                        raise
+                    should_steer = False
+                    recover_missing_thread = True
             if should_steer:
                 try:
                     turn_response = client.steer_turn_items(
@@ -273,15 +298,20 @@ class CodexWorkerRuntime:
                     )
                     steered = True
                 except Exception as exc:
-                    if not self._is_no_active_turn_error(exc):
+                    if self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc):
+                        recover_missing_thread = True
+                    elif not self._is_no_active_turn_error(exc):
                         raise
                     should_steer = False
             if not should_steer:
-                if hasattr(client, "prepare_task"):
+                if not prepared and hasattr(client, "prepare_task"):
                     client.prepare_task(payload.get("cwd") or "")
-                if not thread_id:
+                if recover_missing_thread:
                     thread_id = self._start_thread(client, payload, service_tier_arg)
-                elif hasattr(client, "resume_thread"):
+                    items = self._recovery_input_items(payload, items)
+                elif not thread_id:
+                    thread_id = self._start_thread(client, payload, service_tier_arg)
+                elif not resumed and hasattr(client, "resume_thread"):
                     try:
                         client.resume_thread(
                             thread_id,

@@ -797,7 +797,8 @@ def test_worker_runtime_resume_thread_not_found_starts_new_thread_and_emits_stat
                 "model": "model-a",
                 "cwd": "c:/code/sj",
                 "thread_id": "thread-stale",
-                "turn_id": "",
+                "turn_id": "turn-stale",
+                "should_steer": True,
                 "input_items": [{"type": "text", "text": "第三轮问题"}],
                 "attachments": [],
                 "service_tier": "",
@@ -889,8 +890,54 @@ def test_worker_runtime_start_turn_steers_existing_active_turn():
 
     assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
     assert created[0].started_turns == []
-    assert created[0].resumed_threads == []
-    assert created[0].operations == [("steer", "thread-existing")]
+    assert created[0].resumed_threads[0][0] == "thread-existing"
+    assert created[0].operations == [("prepare", "c:/code/sj"), ("resume_thread", "thread-existing"),
+                                     ("steer", "thread-existing")]
+
+
+def test_worker_runtime_live_turn_steers_without_resuming_again():
+    client = FakeCodexClient()
+    runtime = CodexWorkerRuntime(client_factory=lambda *_: client, output=io.StringIO())
+    runtime.handle_message(make_ui_request("first", "start_turn", {
+        "chat_id": "chat", "turn_idx": 0, "question": "first"}))
+    client.operations.clear()
+
+    runtime.handle_message(make_ui_request("followup", "start_turn", {
+        "chat_id": "chat", "turn_idx": 1, "thread_id": "thread-1", "turn_id": "turn-1",
+        "should_steer": True, "question": "followup"}))
+
+    assert client.operations == [("steer", "thread-1")]
+    assert client.steered_turns[-1][2] == [{"type": "text", "text": "followup"}]
+
+
+def test_worker_runtime_stale_steer_thread_missing_recovers_once():
+    class MissingSteerClient(FakeCodexClient):
+        def start_thread(self, **kwargs):
+            self.operations.append(("start_thread", kwargs.get("cwd")))
+            return {"thread": {"id": "thread-recovered"}}
+
+        def steer_turn_items(self, thread_id, turn_id, items):
+            self.operations.append(("steer", thread_id))
+            raise RuntimeError("turn/steer: thread not found")
+
+    client = MissingSteerClient()
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda *_: client, output=output)
+    runtime.handle_message(make_ui_request("stale", "start_turn", {
+        "chat_id": "chat", "turn_idx": 1, "thread_id": "thread-stale", "turn_id": "turn-old",
+        "should_steer": True, "question": "new question",
+        "history_turns": [{"question": "old question", "answer_md": "old answer"}]}))
+
+    assert client.operations == [("prepare", ""), ("resume_thread", "thread-stale"),
+                                 ("steer", "thread-stale"), ("start_thread", ""),
+                                 ("start_turn", "thread-recovered")]
+    assert len(client.started_turns) == 1
+    prompt = client.started_turns[0][1][0]["text"]
+    assert prompt.count("new question") == 1
+    assert "old answer" in prompt
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    assert any(item["type"] == "turn_started_ack" and item["payload"]["thread_id"] == "thread-recovered"
+               for item in messages)
 
 
 def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
@@ -926,8 +973,8 @@ def test_worker_runtime_no_active_steer_falls_back_to_start_turn_items():
     messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
     assert created[0].steered_turns == [("thread-existing", "turn-active", [{"type": "text", "text": "继续"}])]
     assert created[0].started_turns == [("thread-existing", [{"type": "text", "text": "继续"}], "fast")]
-    assert created[0].operations == [("steer", "thread-existing"), ("prepare", "c:/code/sj"),
-                                      ("resume_thread", "thread-existing"), ("start_turn", "thread-existing")]
+    assert created[0].operations == [("prepare", "c:/code/sj"), ("resume_thread", "thread-existing"),
+                                      ("steer", "thread-existing"), ("start_turn", "thread-existing")]
     assert any(item["type"] == "turn_started_ack" for item in messages)
 
 
