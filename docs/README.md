@@ -4,6 +4,8 @@
 
 ## 当前有效
 
+2026-10-08：双电脑远程身份及手机三标签、通知消息计数完成串行审查和独立复验。MC 83 项、RC 定向和原生测试及双 broker Local 通过；真实笔记本隧道和实体机尚未验收。详见[双电脑配置](remote-control.md)和[当前交接](handoff.md)。旧完整桌面验收停止状态保持。
+
 2026-10-07：Kimi 系统注入不再截断当前 prompt 的回答、思考及恢复范围；统一按结构化 origin 判断边界，272 项定向测试通过。BMAD 旧模板兼容修复另有 5 项通过。源码修复与现场安装版分开核对：本轮未重新打包，也未恢复旧失败记录。详情见[当前交接](handoff.md)与[注入边界修复规格](../_bmad-output/implementation-artifacts/spec-fix-kimi-injected-message-boundaries.md)。
 
 2026-10-06 当前状态见[交接](handoff.md)：Kimi 无消息 ID 的公开思考流已适配真实 step 生命周期，执行页及时显示原文摘录与全文；REST 补齐同一条目，工具前普通说明作为 commentary 保留。当前实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-kimi-thinking-progress.md`。跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现；完整矩阵与中文听验未完成，用户已停止完整桌面验收。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应历史报告只证明当时版本。
@@ -15,6 +17,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
 - Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
 - [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
 - [`../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml`](../_bmad-output/initiative-chat-information/epic-codex-kimi-chat-information/tickets.toml)：聊天信息五项任务；Story 1.1–1.5 已完成，后续进入发布验证
@@ -43,6 +46,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - ChatStore 的 `execution_steps.visible` 在写入时按共享规则维护，旧库初始化一次原子回填；`idx_execution_visible_tail` 支持真实可视尾页有界读取。F1 复用同 owner/revision 的已知尾页，完整补齐在 worker，不能用原始行 LIMIT 或运行时 UDF 扫描假称前台工作量有界。
 - 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
 - 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
+- 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token，环境变量优先；笔记本没有台式机凭据回退。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
 - 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
