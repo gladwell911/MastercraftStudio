@@ -4,7 +4,7 @@
 
 ## 当前有效
 
-2026-10-08：双电脑远程身份及手机三标签、通知消息计数完成串行审查和独立复验。MC 83 项、RC 定向和原生测试及双 broker Local 通过；真实笔记本隧道和实体机尚未验收。详见[双电脑配置](remote-control.md)和[当前交接](handoff.md)。旧完整桌面验收停止状态保持。
+2026-10-09：双电脑远程身份及手机三标签已部署，笔记本独立隧道和实体手机双公网各一次真实问答通过；来源过滤和单侧已读清零实测通过。此前 MC 83 项、RC 定向和原生测试及双 broker Local 的结果仍对应各自版本。文件下载、单机断连、锁屏通知点击及 TalkBack 尚待验。详见[双电脑配置](remote-control.md)和[当前交接](handoff.md)。旧完整桌面验收停止状态保持。
 
 2026-10-07：Kimi 系统注入不再截断当前 prompt 的回答、思考及恢复范围；统一按结构化 origin 判断边界，272 项定向测试通过。BMAD 旧模板兼容修复另有 5 项通过。源码修复与现场安装版分开核对：本轮未重新打包，也未恢复旧失败记录。详情见[当前交接](handoff.md)与[注入边界修复规格](../_bmad-output/implementation-artifacts/spec-fix-kimi-injected-message-boundaries.md)。
 
@@ -46,7 +46,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - ChatStore 的 `execution_steps.visible` 在写入时按共享规则维护，旧库初始化一次原子回填；`idx_execution_visible_tail` 支持真实可视尾页有界读取。F1 复用同 owner/revision 的已知尾页，完整补齐在 worker，不能用原始行 LIMIT 或运行时 UDF 扫描假称前台工作量有界。
 - 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
 - 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
-- 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token，环境变量优先；笔记本没有台式机凭据回退。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
+- 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
 - 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。

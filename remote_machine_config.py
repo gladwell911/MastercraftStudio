@@ -28,7 +28,12 @@ def load_machine_config(path: Path, *, default_domain: str, default_token: str,
             if key in env:
                 return str(env[key]).strip()
         return str(persisted.get(name.lower(), fallback) or "").strip()
-    pair = normalize_pair(setting("PAIR_ID", "default"))
+    explicit_pair = next((str(env[key]).strip() for key in (
+        "REMOTE_CONTROL_PAIR_ID", "CLAUDECODE_REMOTE_CONTROL_PAIR_ID") if key in env), None)
+    computer_pair = {"emperorcomputer": "default", "emperorlaptop": "laptop"}.get(
+        str(env.get("COMPUTERNAME") or "").strip().casefold())
+    pair = normalize_pair(explicit_pair if explicit_pair is not None else
+                          computer_pair or persisted.get("pair_id", "default"))
     if str(persisted.get("pair_id", "default")).strip().lower() != pair:
         persisted = {}
     domain = setting("DOMAIN", default_domain if pair == "default" else "")

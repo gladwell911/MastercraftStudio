@@ -23,6 +23,8 @@ def wx_app():
 def disable_system_hooks(monkeypatch):
     monkeypatch.setattr(main.GlobalCtrlTapHook, "start", lambda self: None)
     monkeypatch.setattr(main.GlobalCtrlTapHook, "stop", lambda self: None)
+    # Keep default-identity fixtures independent of the developer's computer name.
+    monkeypatch.setenv("COMPUTERNAME", "test-unknown-host")
     monkeypatch.setenv("AUTO_START_QUICK_TUNNEL", "0")
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "0")
     monkeypatch.setenv("DESKTOP_FILE_SERVICE_AUTOSTART", "0")
