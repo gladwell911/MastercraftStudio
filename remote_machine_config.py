@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -42,12 +43,21 @@ def load_machine_config(path: Path, *, default_domain: str, default_token: str,
         scheme = {"https": "wss", "http": "ws"}.get(uri.scheme, uri.scheme)
         if scheme not in {"ws", "wss", "nats"} or not uri.hostname or uri.username or uri.password:
             raise ValueError("invalid remote machine domain")
+        # Parsing the authority alone does not validate numeric/ranged ports.
+        uri.port
         domain = urlunsplit((scheme, uri.netloc, "" if scheme == "nats" else "/nats", "", ""))
     token = "".join(setting("TOKEN", default_token if pair == "default" else "").split())
     config = {"pair_id": pair, "domain": domain, "token": token}
     if config != persisted:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(json.dumps(config, indent=2))
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return config
