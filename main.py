@@ -198,6 +198,9 @@ REMOTE_CLOUDFLARED_ORIGIN_PORT_FALLBACKS = (
 )
 DEFAULT_REMOTE_NATS_CLOUDFLARED_URL = "wss://rc.tingyou.cc/nats"
 REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS = 5
+# aiohttp allows heartbeat / 2 for a PONG. The local startup probe budget
+# must not impose a 2.5-second deadline on mobile connections.
+REMOTE_CONTROL_WEBSOCKET_HEARTBEAT_SECONDS = 30
 VK_PROCESSKEY = 0xE5
 VK_PACKET = 0xE7
 VK_V = 0x56
@@ -1530,37 +1533,45 @@ class CloudflaredOriginProxy:
         return await self._proxy_file_request(request)
 
     async def _proxy_websocket(self, request: web.Request) -> web.WebSocketResponse:
-        downstream = web.WebSocketResponse(heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+        downstream = web.WebSocketResponse(heartbeat=REMOTE_CONTROL_WEBSOCKET_HEARTBEAT_SECONDS)
         await downstream.prepare(request)
-        async with ClientSession() as session:
-            async with session.ws_connect(self.nats_ws_url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as upstream:
-                async def client_to_upstream() -> None:
-                    async for msg in downstream:
-                        if msg.type == WSMsgType.TEXT:
-                            await upstream.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await upstream.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.CLOSE:
-                            await upstream.close()
+        tasks = []
+        try:
+            async with ClientSession() as session:
+                async with session.ws_connect(self.nats_ws_url, heartbeat=REMOTE_CONTROL_WEBSOCKET_HEARTBEAT_SECONDS) as upstream:
+                    async def client_to_upstream() -> None:
+                        async for msg in downstream:
+                            if msg.type == WSMsgType.TEXT:
+                                await upstream.send_str(msg.data)
+                            elif msg.type == WSMsgType.BINARY:
+                                await upstream.send_bytes(msg.data)
+                            elif msg.type == WSMsgType.CLOSE:
+                                await upstream.close()
 
-                async def upstream_to_client() -> None:
-                    async for msg in upstream:
-                        if msg.type == WSMsgType.TEXT:
-                            await downstream.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await downstream.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.CLOSE:
-                            await downstream.close()
+                    async def upstream_to_client() -> None:
+                        async for msg in upstream:
+                            if msg.type == WSMsgType.TEXT:
+                                await downstream.send_str(msg.data)
+                            elif msg.type == WSMsgType.BINARY:
+                                await downstream.send_bytes(msg.data)
+                            elif msg.type == WSMsgType.CLOSE:
+                                await downstream.close()
 
-                tasks = [
-                    asyncio.create_task(client_to_upstream()),
-                    asyncio.create_task(upstream_to_client()),
-                ]
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-                for task in done:
-                    task.result()
+                    tasks = [
+                        asyncio.create_task(client_to_upstream()),
+                        asyncio.create_task(upstream_to_client()),
+                    ]
+                    try:
+                        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            task.result()
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await downstream.close()
         return downstream
 
     async def _proxy_file_request(self, request: web.Request) -> web.Response:

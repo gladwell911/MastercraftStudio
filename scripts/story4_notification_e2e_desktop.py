@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import urlparse
 
 import nats
 
@@ -23,6 +24,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from chat_store import ChatStore
 from remote_nats import RemoteNatsTransport
+
+
+def fixture_history_chat(store: ChatStore, chat: dict, pair_id: str) -> dict:
+    """Expose the same canonical reading facts the background service consumes."""
+    chat_id = str(chat["id"])
+    return {
+        **chat, "chat_id": chat_id, "running": False,
+        "request_kind": "", "current": False, "active": False,
+        "read_state": store.get_chat_read_state(chat_id, pair_id=pair_id),
+        "turns": [
+            {**turn, "answer": turn.get("answer_md", ""),
+             **(store.readable_answer(chat_id, turn_index=index) or {})}
+            for index, turn in enumerate(chat.get("turns", []))
+        ],
+    }
+
+
+def append_fixture_turn(store: ChatStore, chat_id: str, text: str, kind: str) -> int:
+    index = len(store.load_turns(chat_id))
+    store.replace_turns_from(chat_id, [{
+        "question": text if kind == "user_message" else "",
+        "answer_md": text if kind == "assistant_final" else "",
+        "request_status": "done" if kind == "assistant_final" else "pending",
+    }], start_index=index)
+    return index
 
 
 def update_fixture_chat_title(store: ChatStore, chat_id: str, title: str) -> None:
@@ -59,12 +85,10 @@ def prepare_fixture_title(store: ChatStore, payload: dict, fact: dict | None) ->
 
 
 async def run() -> None:
-    endpoint = os.environ.get(
-        "NATS_E2E_ENDPOINT", "wss://rc.tingyou.cc/nats"
-    ).strip()
-    token = os.environ.get(
-        "NATS_E2E_TOKEN", "h9k2m7p4q8x1z6v3t5n9c2r7d4s8j1f6"
-    ).strip()
+    endpoint = os.environ.get("NATS_E2E_ENDPOINT", "").strip()
+    token = os.environ.get("NATS_E2E_TOKEN", "").strip()
+    if not endpoint or not token or urlparse(endpoint).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise RuntimeError("Explicit isolated loopback NATS_E2E_ENDPOINT and NATS_E2E_TOKEN are required")
     pair_id = os.environ.get(
         "NATS_E2E_PAIR_ID", "default"
     ).strip()
@@ -74,7 +98,7 @@ async def run() -> None:
     store.initialize()
     seed_chat_id = f"story4-pre-handshake-owner-{uuid.uuid4().hex}"
     store.upsert_chat({"id": seed_chat_id, "title": "Story 4 pre-handshake seed"})
-    store.replace_turns(seed_chat_id, [{"question": "", "answer_md": "pre-handshake watermark seed"}])
+    append_fixture_turn(store, seed_chat_id, "pre-handshake watermark seed", "assistant_final")
     seed_message_id = store.resolve_canonical_message_by_turn(
         seed_chat_id, role="assistant", turn_index=0
     )
@@ -91,10 +115,7 @@ async def run() -> None:
     connection = await nats.connect(endpoint, token=token)
 
     def history_chat(chat: dict) -> dict:
-        return {**chat, "chat_id": chat["id"], "running": False,
-                "request_kind": "", "current": False, "active": False,
-                "turns": [{**turn, "answer": turn.get("answer_md", "")}
-                          for turn in chat.get("turns", [])]}
+        return fixture_history_chat(store, chat, pair_id)
 
     def history_list() -> tuple[int, dict]:
         return 200, {"accepted": True, "chats": [history_chat(chat)
@@ -140,12 +161,7 @@ async def run() -> None:
             if kind is None:
                 return
             if fact is None:
-                turns = store.load_turns(chat_id)
-                turn_index = len(turns)
-                store.replace_turns_from(chat_id, [{
-                    "question": text if kind == "user_message" else "",
-                    "answer_md": text if kind == "assistant_final" else "",
-                }], start_index=turn_index)
+                turn_index = append_fixture_turn(store, chat_id, text, kind)
                 message_id = store.resolve_canonical_message_by_turn(
                     chat_id, role="user" if kind == "user_message" else "assistant", turn_index=turn_index
                 )
