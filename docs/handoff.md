@@ -1,5 +1,7 @@
 # 当前交接
 
+截至 2026-10-12，主分支为 `main`。2026-10-11 的轻量 `readiness` 协议及请求边界测试已纳入主分支：hello 宣告能力，readiness 校验 device/session/epoch，不进入 wx 或加载聊天历史。远程配置拒绝无效端口，并用独立临时文件原子持久化，避免重叠启动争用同一临时文件。三个辅助分支的提交均已包含在主分支；旧审查目录的两个未提交文件与主分支完全一致，无需再次合并。Git 发布与 MC 安装版独立，本轮不重新打包或重启日常 MC。以下 2026-10-09 部署记录保留为历史背景。
+
 截至 2026-10-09。双电脑远程控制已部署到笔记本 MC 和实体 ARM64 手机：笔记本独立隧道、自动机器名识别、手机到两台电脑的公网连接及各一次真实模型问答通过。实体通知点击、文件下载、单机断连恢复和 TalkBack 听验尚未验收。实测细节见工作区 `D:/code/sj/_bmad-output/implementation-artifacts/dual-physical-deployment-20261009.md`。
 
 ## 目标与当前实现
@@ -12,6 +14,8 @@
 - Codex 私有 home 通过整目录链接复用全局 skills/plugins，新任务刷新原生清单，活动 turn 的追加输入不重启。打包脚本先临时构建和校验，再更新并自动启动最终产物；用户已自行重包并手动重启日常 MC。当前日常 MC 的后续退出/重启必须由用户本人操作，不能由 agent 自动进行。`package_mc_current_temp.ps1` 是本地未跟踪临时脚本，本轮不提交或删除。
 
 ## 本阶段验证
+
+2026-10-12 分支收尾定向回归：`.venv/Scripts/python.exe -m pytest tests/test_remote_machine_config.py tests/test_remote_readiness.py tests/test_remote_readiness_qa.py -q`，24 项通过；仅纯配置与协议测试，没有恢复已停止的完整桌面验收。
 
 四个审查层按用户要求逐个运行，23 条意见逐项核对，10 组修复完成；父代理复验另外发现并补齐缓存详情的已读确认。MC 最终 83 passed，1 个已在精确旧基线复现的无关用例排除。RC 定向 Flutter 118、文件/通知回归 104、实际详情/设置/删除 widget 14 项通过；Android 单元 56、专用模拟器 instrumentation 16 项通过；静态分析与空白检查通过。
 

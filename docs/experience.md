@@ -1,5 +1,7 @@
 # 可复用经验
 
+- 辅助 worktree 的 dirty 文件不一定包含遗漏功能：先比较最终文件和主分支、确认提交祖先，再保留补丁并删除已合并分支。推送后核对远端主分支 SHA，避免把本地提交或安装完成当作 GitHub 同步完成。
+
 - 实际隧道验收要同时核新 NATS 进程的 token 与监听端口，再用同一应用 token 比较新 broker 直连、MC 18080 bridge、公网 `/nats` 三处 `INFO.server_id` 并完成 `PING/PONG`。旧 broker 占用 18081 时，新进程可能选择 18082；只看到公网 WebSocket 打开不足以证明连到当前 MC。默认代理可能使 WebSocket 探针失败，本次仅对请求禁用代理后链路成功，不改系统代理。
 - 双机身份换名后的启动配置按显式 pair 环境变量、已知计算机名、同身份持久值/default 顺序核对；切到新身份时先确认旧 domain/token 未继承。运行中的 MC 不会因修改 `remote_machine.json` 自动重载，本次由用户手动重启后才验证运行配置。
 
