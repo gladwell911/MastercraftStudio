@@ -231,7 +231,7 @@ class RemoteNatsTransport:
                 )
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
-                    "capabilities": ["canonical-owner", "durable-outbox", "replay"],
+                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness"],
                     "epoch": negotiated_epoch,
                     **watermark,
                 }, chat_id=chat_id)
@@ -241,7 +241,12 @@ class RemoteNatsTransport:
                 raise ValueError("STALE_EPOCH")
             if negotiated_version == 2:
                 validate_v2_ephemeral(payload, expected_epoch=negotiated_epoch)
-            status, body = await asyncio.to_thread(self._invoke_route_command, payload)
+            if str(payload.get("type") or "").lower() == "readiness":
+                # Session validation above remains authoritative. This probe must
+                # never enter wx, read history, or renegotiate the session epoch.
+                status, body = 200, {"ready": True}
+            else:
+                status, body = await asyncio.to_thread(self._invoke_route_command, payload)
             event = build_response_event(
                 request_id=request_id,
                 status=status,

@@ -660,6 +660,7 @@ def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch(tmp
         })
         hello = __import__("json").loads(jetstream.published[-1][1])
         assert hello["body"]["protocol_version"] == 2
+        assert "lightweight-readiness" in hello["body"]["capabilities"]
         assert hello["body"]["sequence_domain"] == "events"
         assert hello["body"]["high_sync_sequence"] == 0
         epoch = hello["body"]["epoch"]

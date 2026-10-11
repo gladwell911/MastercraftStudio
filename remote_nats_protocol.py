@@ -138,6 +138,7 @@ def validate_execution_body(body: dict) -> dict:
 
 
 _V2_GLOBAL_COMMAND_TYPES = frozenset({
+    "readiness",
     "common_commands_create",
     "common_commands_delete",
     "common_commands_list",
