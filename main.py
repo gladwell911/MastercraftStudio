@@ -10125,18 +10125,9 @@ class ChatFrame(wx.Frame):
         )
 
     def _codex_should_steer_turn(self, target_chat: dict, is_current_target: bool) -> bool:
-        if not is_current_target:
-            return False
-        if not bool(target_chat.get("codex_turn_active")) and not self.active_codex_turn_active:
-            return False
-        pending_prompt = str(
-            (target_chat.get("codex_pending_prompt") if isinstance(target_chat, dict) else "") or
-            (self.active_codex_pending_prompt if is_current_target else "")
-        ).strip()
-        thread_flags = target_chat.get("codex_thread_flags") if isinstance(target_chat, dict) else []
-        if is_current_target and not pending_prompt:
-            thread_flags = self.active_codex_thread_flags
-        return bool(pending_prompt or "waitingOnUserInput" in (thread_flags or []))
+        return bool(target_chat.get("codex_turn_active")) or (
+            is_current_target and bool(self.active_codex_turn_active)
+        )
 
     def _mark_turn_request_done(self, turn: dict) -> None:
         if str(turn.get("request_status") or "") != "done" and _finite_timestamp(turn.get("answer_at")) is None:
@@ -13640,14 +13631,47 @@ class ChatFrame(wx.Frame):
                         continue
                     if str(turn.get("model") or DEFAULT_CODEX_MODEL) != str(event_data.get("model") or turn.get("model") or DEFAULT_CODEX_MODEL):
                         continue
+                    if owner.get("context_generation") != turn.get("codex_start_generation", turn.get("codex_context_generation") or 0):
+                        continue
+                    if not event_data.get("ownership_error") and idx != self._event_scoped_turn_index(turns, event) and str(turn.get("answer_md") or "") in {"", REQUESTING_TEXT}:
+                        turn["answer_md"] = ""
+                        turn["request_carried_forward_to"] = self._event_scoped_turn_index(turns, event)
                     data = dict(event_data)
                     data.pop("completion_owners", None)
                     data.update(owner)
                     scoped_event = copy.copy(event)
                     scoped_event.data = data
+                    if event_data.get("ownership_error"):
+                        error = str(event_data["ownership_error"])
+                        turn["codex_ownership_error"] = error
+                        completed_answers = turn.get("codex_completed_answers")
+                        valid_final = isinstance(completed_answers, list) and any(
+                            isinstance(item, dict) and isinstance(item.get("text"), str)
+                            and item["text"].strip() for item in completed_answers)
+                        if not valid_final:
+                            self._mark_turn_request_failed(turn, error)
+                            partial = str(turn.get("answer_md") or "")
+                            turn["answer_md"] = error if partial in {"", REQUESTING_TEXT} else f"{partial.rstrip()}\n\n{error}"
+                            self._clear_codex_worker_active_turn(chat_id, idx, event_turn_id)
+                            self._mark_chat_turns_dirty(chat_id, idx)
+                            if is_current_chat:
+                                self._update_active_answer_row(idx)
+                            continue
                     if idx != self._event_scoped_turn_index(turns, event):
                         scoped_event.text = ""
                     self._on_codex_event_for_chat(chat_id, scoped_event)
+                pending_owners = [turn for turn in turns if isinstance(turn, dict)
+                    and is_codex_model(str(turn.get("model") or ""))
+                    and str(turn.get("request_status") or "") in {"pending", "running"}]
+                identity_chat["codex_turn_active"] = bool(pending_owners)
+                if is_current_chat:
+                    self.active_codex_turn_active = bool(pending_owners)
+                    inflight = [turn for turn in turns if isinstance(turn, dict) and (
+                        str(turn.get("request_status") or "") in {"pending", "running"} or
+                        (not turn.get("request_status") and turn.get("answer_md") == REQUESTING_TEXT))]
+                    self.is_running = bool(inflight)
+                    self._active_request_count = len(inflight)
+                self._defer_codex_state_save()
                 return
         if self._codex_event_requires_known_turn(event):
             identity_turns = identity_chat.get("turns") if isinstance(identity_chat, dict) and isinstance(identity_chat.get("turns"), list) else []

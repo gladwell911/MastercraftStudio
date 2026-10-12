@@ -4,10 +4,11 @@ import json
 import sys
 import threading
 from collections import OrderedDict
+import copy
 import traceback
 from typing import Any, Callable, TextIO
 
-from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL
+from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL, _event_from_item
 from codex_worker_protocol import (
     decode_worker_line,
     encode_worker_message,
@@ -23,6 +24,7 @@ class CodexWorkerRuntime:
     MAX_EVENT_SCOPES = 256
     MAX_STARTUP_EVENTS = 1024
     MAX_STARTUP_EVENT_BYTES = 4 * 1024 * 1024
+    MAX_PRIOR_TERMINAL_BYTES = 256 * 1024
 
     def __init__(self, client_factory: ClientFactory | None = None, output: TextIO | None = None) -> None:
         self.client_factory = client_factory or self._default_client_factory
@@ -114,9 +116,49 @@ class CodexWorkerRuntime:
                 event_thread = str(getattr(event, "thread_id", "") or "").strip()
                 item_id = str(getattr(event, "item_id", "") or "").strip()
                 prior_item = self._item_owners.get((chat_id, model, turn_id, item_id)) if item_id else None
-                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]) and (turn_id != pending["steer_turn_id"] or prior_item is not None):
+                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]) and prior_item is not None:
                     self._dispatch_event(chat_id, model, event)
                     return
+                if turn_id in pending["prior_turn_ids"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]):
+                    if str(getattr(event, "subtype", "") or "") == "userMessage" and prior_item is None:
+                        text = self._user_item_text(event)
+                        if text.strip() == pending["question"]:
+                            pending["boundary_seen"] = True
+                    if not pending["boundary_seen"] and turn_id != pending["steer_turn_id"]:
+                        size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
+                        if (not pending["prior_overflow"] and
+                            (len(pending["prior_events"]) >= self.MAX_STARTUP_EVENTS or
+                             pending["prior_bytes"] + size > self.MAX_STARTUP_EVENT_BYTES)):
+                            pending["overflow"] = True
+                            pending["events"].clear()
+                            pending["prior_overflow"] = True
+                            self.emit("diagnostic", {"chat_id": chat_id, "model": model,
+                                "turn_idx": prior_scope[0], "context_generation": prior_scope[1],
+                                "phase": "prior_event_preservation", "reason": "buffer_overflow"})
+                            pending["prior_events"].clear()
+                            pending["prior_bytes"] = 0
+                            native = self._native_owners.get((chat_id, model, turn_id))
+                            if native is not None:
+                                native["ownership_error"] = "Codex prior event preservation overflow; owner attribution unresolved"
+                        if pending["prior_overflow"]:
+                            # Keep known item routing above. Unknown payloads are
+                            # isolated, never guessed into the previous owner.
+                            if event.type == "turn_completed" and not any(item.turn_id == turn_id for item in pending["prior_completions"]):
+                                terminal = copy.copy(event)
+                                terminal.text = terminal.raw_text = ""
+                                terminal.data = {"ownership_error": "Codex prior event preservation overflow; owner attribution unresolved"}
+                                terminal_bytes = len(json.dumps(event_to_payload(terminal), ensure_ascii=False).encode("utf-8"))
+                                if (len(pending["prior_completions"]) >= self.MAX_EVENT_SCOPES or
+                                    pending["prior_terminal_bytes"] + terminal_bytes > self.MAX_PRIOR_TERMINAL_BYTES):
+                                    self.emit("error", {"chat_id": chat_id, "model": model,
+                                        "turn_idx": prior_scope[0], "context_generation": prior_scope[1],
+                                        "message": "Codex prior terminal preservation limit exceeded; ownership unresolved"})
+                                else:
+                                    pending["prior_completions"].append(terminal)
+                                    pending["prior_terminal_bytes"] += terminal_bytes
+                            return
+                        pending["prior_events"].append(event)
+                        pending["prior_bytes"] += size
                 if turn_id == pending["steer_turn_id"] and prior_scope is not None and (not event_thread or event_thread == prior_scope[2]):
                     if str(getattr(event, "subtype", "") or "") == "userMessage" and prior_item is None:
                         pending["boundary_seen"] = True
@@ -126,11 +168,7 @@ class CodexWorkerRuntime:
                             pending["prior_terminal_seen"] = True
                         return
                 if pending["overflow"]:
-                    if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not pending["boundary_seen"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
-                        pending["prior_completions"].append(event)
                     return
-                if event.type == "turn_completed" and turn_id in pending["prior_turn_ids"] and not pending["boundary_seen"] and not any(previous.turn_id == turn_id for previous in pending["prior_completions"]):
-                    pending["prior_completions"].append(event)
                 size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
                 if len(pending["events"]) >= self.MAX_STARTUP_EVENTS or pending["bytes"] + size > self.MAX_STARTUP_EVENT_BYTES:
                     pending["events"].clear()
@@ -141,7 +179,22 @@ class CodexWorkerRuntime:
                 return
             self._dispatch_event(chat_id, model, event)
 
+    @staticmethod
+    def _user_item_text(event: CodexEvent) -> str:
+        data = event.data if isinstance(event.data, dict) else {}
+        content = data.get("content")
+        content = content if isinstance(content, list) else []
+        text = "\n".join(str(part.get("text") or "") for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "inputText"})
+        return text or str(data.get("text") or event.text or "")
+
     def _dispatch_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
+        if event.type == "turn_completed" and isinstance(event.data, dict):
+            for item in event.data.get("items") or []:
+                if isinstance(item, dict) and item.get("id"):
+                    self._dispatch_event(chat_id, model, _event_from_item("item/completed", {
+                        "threadId": event.thread_id, "turnId": event.turn_id, "item": item,
+                    }))
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "model": model,
@@ -175,24 +228,24 @@ class CodexWorkerRuntime:
                 else:
                     # Only the accepted user item establishes a steer boundary.
                     if str(getattr(event, "subtype", "") or "") == "userMessage" and item_id:
-                        data = event.data if isinstance(event.data, dict) else {}
-                        content = data.get("content") or []
-                        text = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") in {"text", "inputText"})
-                        if not text:
-                            text = str(data.get("text") or event.text or "")
+                        text = self._user_item_text(event)
                         boundaries = native["boundaries"]
                         if boundaries and text.strip() == boundaries[0]["text"]:
                             native["current"] = boundaries.pop(0)["owner"]
                             native["steer_boundary_seen"] = True
                     scope = None if native["boundaries"] and not native["steer_boundary_seen"] else native["current"][:2]
                     relevant_item = str(getattr(event, "subtype", "") or "") in {"userMessage", "agentMessage"} or str(getattr(event, "phase", "") or "") == "final_answer" or event_type == "agent_message_delta"
-                    if item_id and scope is not None and relevant_item:
-                        item_ids = native.setdefault("item_ids", set())
-                        if len(item_ids) >= self.MAX_EVENT_SCOPES:
+                    if item_id and scope is not None:
+                        answer_item_ids = native.setdefault("answer_item_ids", set())
+                        tool_item_ids = native.setdefault("tool_item_ids", set())
+                        item_ids = answer_item_ids if relevant_item else tool_item_ids
+                        capacity = self.MAX_EVENT_SCOPES if relevant_item else self.MAX_EVENT_SCOPES * 4
+                        if len(item_ids) >= capacity:
                             scope = None
-                            if not native.get("item_limit_reported"):
-                                native["item_limit_reported"] = True
-                                self.emit("error", {"chat_id": chat_id, "model": model,
+                            limit_key = "answer_limit_reported" if relevant_item else "tool_limit_reported"
+                            if not native.get(limit_key):
+                                native[limit_key] = True
+                                self.emit("error" if relevant_item else "diagnostic", {"chat_id": chat_id, "model": model,
                                     "turn_idx": native["current"][0], "context_generation": native["current"][1],
                                     "message": "Codex item ownership limit exceeded"})
                         else:
@@ -200,6 +253,14 @@ class CodexWorkerRuntime:
                             self._item_owners[item_key] = native["current"]
                 if event_type == "turn_completed":
                     scope = native["owners"][-1][:2]
+                    payload["event"]["data"] = dict(payload["event"].get("data") or {})
+                    payload["event"]["data"]["ownership_phase"] = "completed"
+                    payload["event"]["data"]["accepted_owner_count"] = len(native["owners"])
+                    if native["boundaries"]:
+                        payload["event"]["text"] = ""
+                        payload["event"]["data"]["ownership_error"] = "Accepted input boundary unresolved at native completion"
+                    elif native.get("ownership_error"):
+                        payload["event"]["data"]["ownership_error"] = native["ownership_error"]
                     payload["completion_owners"] = [
                         {"turn_idx": owner[0], "context_generation": owner[1]}
                         for owner in native["owners"]
@@ -245,7 +306,11 @@ class CodexWorkerRuntime:
         with self._lock:
             self._startup_events[startup_key] = {
                 "events": [], "bytes": 0, "overflow": False,
-                "prior_completions": [], "boundary_seen": False, "prior_terminal_seen": False,
+                "prior_events": [], "prior_completions": [], "prior_bytes": 0, "prior_terminal_bytes": 0,
+                "prior_overflow": False, "question": str(payload.get("question") or
+                    "\n".join(str(item.get("text") or "") for item in payload.get("input_items", [])
+                        if isinstance(item, dict) and item.get("type") == "text")).strip(),
+                "boundary_seen": False, "prior_terminal_seen": False,
                 "prior_turn_ids": frozenset(key[2] for key, scope in self._turn_id_scopes.items()
                                              if key[:2] == startup_key and scope is not None),
                 "steer_turn_id": str(payload.get("turn_id") or "").strip() if payload.get("should_steer") else "",
@@ -337,16 +402,18 @@ class CodexWorkerRuntime:
                     overflow = self._startup_events[startup_key]["overflow"]
                     native = self._native_owners.get(key)
                     if not overflow:
+                        if native is not None and native["thread_id"] != thread_id:
+                            raise RuntimeError("Codex native turn identity conflicts with accepted owner")
+                        if native is not None and len(native["owners"]) >= self.MAX_EVENT_SCOPES:
+                            raise RuntimeError("Codex accepted input owner limit exceeded")
                         self._active_command_owners[(chat_id, model)] = (thread_id, turn_id, turn_idx, context_generation)
                         self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (turn_idx, context_generation))
-                        if steered and native is not None and native["thread_id"] == thread_id:
-                            if len(native["owners"]) >= self.MAX_EVENT_SCOPES:
-                                raise RuntimeError("Codex accepted input owner limit exceeded")
+                        if native is not None and native["thread_id"] == thread_id:
                             native["owners"].append(value)
                             input_text = "\n".join(str(item.get("text") or "") for item in items
                                                    if isinstance(item, dict) and item.get("type") == "text")
                             native["boundaries"].append({"owner": value, "text": input_text.strip()})
-                        elif not steered or native is None:
+                        else:
                             if key in self._turn_id_scopes and self._turn_id_scopes[key] != value:
                                 self._remember_scope(self._turn_id_scopes, key, None)
                             else:
@@ -388,6 +455,8 @@ class CodexWorkerRuntime:
                 pending = self._startup_events.pop(startup_key, None)
                 if accepted and pending is not None:
                     if pending["overflow"]:
+                        for event in pending["prior_events"]:
+                            self._dispatch_event(chat_id, model, event)
                         for event in pending["prior_completions"]:
                             self._dispatch_event(chat_id, model, event)
                         self._emit_scoped_error(message, "Codex startup event buffer exceeded its limit", chat_id, turn_idx, model)
@@ -395,6 +464,8 @@ class CodexWorkerRuntime:
                         for event in pending["events"]:
                             self._dispatch_event(chat_id, model, event)
                 elif pending is not None:
+                    for event in pending["prior_events"]:
+                        self._dispatch_event(chat_id, model, event)
                     for event in pending["prior_completions"]:
                         self._dispatch_event(chat_id, model, event)
 

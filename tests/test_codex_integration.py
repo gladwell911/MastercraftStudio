@@ -96,6 +96,22 @@ def test_codex_native_completion_does_not_finish_unrelated_or_failed_owner(frame
     assert [turn["request_status"] for turn in turns] == ["done", "pending", "failed", "pending"]
 
 
+def test_codex_completion_preserves_other_model_inflight_state(frame, monkeypatch):
+    owner = frame._ensure_active_chat_id()
+    turns = [{"question":"codex","model":"codex/main","answer_md":"valid final","request_status":"pending",
+        "codex_completed_answers":[{"item_id":"final","text":"valid final"}],
+        "codex_turn_id":TEST_TURN_ID,"codex_thread_id":TEST_THREAD_ID,"codex_start_generation":2,"codex_context_generation":2},
+        {"question":"other model","model":"kimi/main","answer_md":main.REQUESTING_TEXT,"request_status":"running"}]
+    frame.active_session_turns = turns
+    frame._current_chat_state.update(turns=turns,codex_context_generation=2)
+    monkeypatch.setattr(frame,"_request_codex_chat_information",lambda *_:None)
+    frame._on_codex_event_for_chat(owner,CodexEvent(type="turn_completed",thread_id=TEST_THREAD_ID,turn_id=TEST_TURN_ID,status="completed",
+        data={"turn_idx":0,"context_generation":2,"completion_owners":[{"turn_idx":0,"context_generation":2}]}))
+    assert turns[0]["request_status"] == "done" and turns[1]["request_status"] == "running"
+    assert not frame.active_codex_turn_active
+    assert frame.is_running and frame._active_request_count == 1
+
+
 def test_codex_archived_completion_records_only_new_authoritative_activity(frame, monkeypatch):
     foreground = frame._current_chat_state
     foreground["updated_at"] = 10.0
@@ -196,6 +212,34 @@ def test_send_click_routes_codex_start(frame, monkeypatch):
     assert payload["cwd"] == frame._workspace_dir_for_codex()
     assert frame.active_session_turns[-1]["answer_md"] == main.REQUESTING_TEXT
     assert frame._active_request_count == 1
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_ordinary_active_codex_routes_append_to_its_running_owner(frame, monkeypatch, current):
+    chat_id = frame._ensure_active_chat_id() if current else "background-running"
+    chat = frame._current_chat_state if current else {"id":chat_id,"turns":[],"model":"codex/main"}
+    chat.update(codex_turn_active=True, codex_thread_id=TEST_THREAD_ID, codex_turn_id=TEST_TURN_ID,
+        codex_pending_prompt="", codex_thread_flags=[])
+    chat["turns"] = [{"question":"ordinary append","model":"codex/main","request_status":"pending",
+        "answer_md":main.REQUESTING_TEXT,"codex_context_generation":0}]
+    if current: frame.active_session_turns = chat["turns"]
+    if current:
+        frame.active_codex_thread_id = TEST_THREAD_ID
+        frame.active_codex_turn_id = TEST_TURN_ID
+        frame.active_codex_turn_active = True
+        frame.active_codex_pending_prompt = ""
+        frame.active_codex_thread_flags = []
+    else:
+        frame.archived_chats = [chat]
+    seen = {}
+    class Client:
+        def start(self): pass
+        def start_turn(self, **payload): seen.update(payload); return "request"
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda *_: Client())
+    monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: "")
+    frame._run_codex_turn_worker(chat_id, 0, "ordinary append", "codex/main")
+    assert seen["should_steer"] is True
+    assert seen["chat_id"] == chat_id and seen["turn_id"] == TEST_TURN_ID
 
 
 def test_send_click_routes_codex_steer_when_pending_prompt(frame, monkeypatch):

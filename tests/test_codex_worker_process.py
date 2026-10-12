@@ -63,6 +63,134 @@ class FakeCodexClient:
         self.closed = True
 
 
+def test_reused_start_completed_only_items_and_late_tool_keep_each_accepted_owner():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: FakeCodexClient(cb, model), output=output)
+    for idx in (2, 3):
+        runtime.handle_message(make_ui_request(str(idx), "start_turn", {"chat_id":"chat", "turn_idx":idx,
+            "context_generation":37, "thread_id":"thread-1", "question":f"q{idx}"}))
+        if idx == 2:
+            runtime._clients[("chat","codex/main")].on_event(_event_from_item("item/started", {
+                "threadId":"thread-1","turnId":"turn-1","item":{"id":"old-tool","type":"commandExecution","command":"fixture"}}))
+    client = runtime._clients[("chat","codex/main")]
+    completion = CodexEvent(type="turn_completed",thread_id="thread-1",turn_id="turn-1",status="completed",
+        data={"items":[{"id":"accepted","type":"userMessage","content":[{"type":"text","text":"q3"}]},
+            {"id":"final","type":"agentMessage","phase":"final_answer","text":"fresh final"}]})
+    output.seek(0); output.truncate()
+    client.on_event(completion)
+    client.on_event(_event_from_item("item/completed", {"threadId":"thread-1","turnId":"turn-1",
+        "item":{"id":"old-tool","type":"commandExecution","command":"fixture","status":"completed"}}))
+    messages = [decode_worker_line(line+"\n")["payload"] for line in output.getvalue().splitlines()]
+    assert [message["turn_idx"] for message in messages] == [3, 3, 3, 2]
+    assert messages[2]["completion_owners"] == [{"turn_idx":idx,"context_generation":37} for idx in (2, 3)]
+    assert "ownership_error" not in messages[2]["event"]["data"]
+
+
+def test_failed_reused_start_preserves_unseen_old_final_without_registering_append():
+    class Provider(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            if self.started_turns:
+                self.on_event(_event_from_item("item/completed", {"threadId":thread_id,"turnId":"turn-1",
+                    "item":{"id":"prior-final","type":"agentMessage","phase":"final_answer","text":"prior final"}}))
+                raise RuntimeError("append rejected")
+            return super().start_turn_items(thread_id, items, service_tier)
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: Provider(cb, model), output=output)
+    for idx in (0, 1):
+        runtime.handle_message(make_ui_request(str(idx),"start_turn", {"chat_id":"chat","turn_idx":idx,
+            "context_generation":37,"thread_id":"thread-1","question":f"q{idx}"}))
+    runtime._clients[("chat","codex/main")].on_event(CodexEvent(type="turn_completed",thread_id="thread-1",turn_id="turn-1",status="completed"))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    final = next(message["payload"] for message in messages if message["type"] == "event" and message["payload"]["event"].get("text") == "prior final")
+    assert final["turn_idx"] == 0
+    assert messages[-1]["payload"]["completion_owners"] == [{"turn_idx":0,"context_generation":37}]
+
+
+@pytest.mark.parametrize("content", [None, "not a list", {"text":"q1"}])
+def test_reused_ack_normalizes_nonlist_user_content_consistently(content):
+    class Provider(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            if self.started_turns:
+                self.on_event(CodexEvent(type="item_completed",subtype="userMessage",item_id="accepted",
+                    thread_id=thread_id,turn_id="turn-1",text="q1",data={"content":content}))
+            return super().start_turn_items(thread_id, items, service_tier)
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: Provider(cb, model), output=output)
+    for idx in (0,1):
+        runtime.handle_message(make_ui_request(str(idx), "start_turn", {"chat_id":"chat", "turn_idx":idx,
+            "context_generation":37,"thread_id":"thread-1","question":f"q{idx}"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert not any(message["type"] == "error" for message in messages)
+    assert messages[-1]["payload"]["turn_idx"] == 1
+
+
+def test_tool_capacity_does_not_consume_reserved_final_ownership():
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: FakeCodexClient(cb, model), output=output)
+    runtime.MAX_EVENT_SCOPES = 2
+    runtime.handle_message(make_ui_request("first","start_turn", {"chat_id":"chat","turn_idx":0,"question":"q"}))
+    client = runtime._clients[("chat","codex/main")]
+    for idx in range(9):
+        client.on_event(_event_from_item("item/completed", {"threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":f"tool-{idx}","type":"commandExecution","command":"fixture"}}))
+    client.on_event(_event_from_item("item/completed", {"threadId":"thread-1","turnId":"turn-1",
+        "item":{"id":"final","type":"agentMessage","phase":"final_answer","text":"reserved final"}}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert any(message["type"] == "diagnostic" for message in messages)
+    assert not any(message["type"] == "error" for message in messages)
+    assert messages[-1]["payload"]["turn_idx"] == 0
+    assert messages[-1]["payload"]["event"]["text"] == "reserved final"
+
+
+@pytest.mark.parametrize("conflict", ["owner_limit", "thread"])
+def test_rejected_ack_keeps_original_command_and_thread_routing(conflict):
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: FakeCodexClient(cb, model), output=output)
+    if conflict == "owner_limit": runtime.MAX_EVENT_SCOPES = 1
+    runtime.handle_message(make_ui_request("first","start_turn", {"chat_id":"chat","turn_idx":0,"question":"q0"}))
+    before_command = dict(runtime._active_command_owners)
+    before_thread = dict(runtime._thread_turn_scopes)
+    runtime.handle_message(make_ui_request("second","start_turn", {"chat_id":"chat","turn_idx":1,
+        "thread_id":"other-thread" if conflict == "thread" else "thread-1","question":"q1"}))
+    assert runtime._active_command_owners == before_command
+    assert runtime._thread_turn_scopes == before_thread
+    runtime._clients[("chat","codex/main")].on_event(CodexEvent(type="token_count",thread_id="thread-1"))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert any(message["type"] == "error" for message in messages)
+    assert messages[-1]["payload"]["turn_idx"] == 0
+
+
+@pytest.mark.parametrize("failure", ["exception", "overflow"])
+def test_prior_preservation_overflow_isolates_unknown_and_keeps_known_terminal(failure):
+    class Provider(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            if self.started_turns:
+                self.on_event(CodexEvent(type="item_completed",thread_id=thread_id,turn_id="turn-1",item_id="unknown",
+                    subtype="agentMessage",phase="final_answer",text="ambiguous" * 300))
+                pending = runtime._startup_events[("chat","codex/main")]
+                assert pending["prior_bytes"] <= runtime.MAX_STARTUP_EVENT_BYTES
+                assert pending["prior_overflow"]
+                self.on_event(CodexEvent(type="item_completed",thread_id=thread_id,turn_id="turn-1",item_id="known-final",
+                    subtype="agentMessage",phase="final_answer",text="known prior final"))
+                self.on_event(CodexEvent(type="turn_completed",thread_id=thread_id,turn_id="turn-1",status="completed"))
+                if failure == "exception": raise RuntimeError("append rejected")
+            return super().start_turn_items(thread_id, items, service_tier)
+    output = io.StringIO()
+    runtime = CodexWorkerRuntime(client_factory=lambda cb, model: Provider(cb, model), output=output)
+    runtime.handle_message(make_ui_request("first","start_turn", {"chat_id":"chat","turn_idx":0,"question":"q0"}))
+    runtime._clients[("chat","codex/main")].on_event(CodexEvent(type="item_started",thread_id="thread-1",turn_id="turn-1",
+        item_id="known-final",subtype="agentMessage"))
+    runtime.MAX_STARTUP_EVENT_BYTES = 400
+    runtime.handle_message(make_ui_request("second","start_turn", {"chat_id":"chat","turn_idx":1,"thread_id":"thread-1","question":"q1"}))
+    messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
+    assert any(message["type"] == "diagnostic" and message["payload"]["reason"] == "buffer_overflow" for message in messages)
+    finals = [message["payload"] for message in messages if message["type"] == "event" and message["payload"]["event"]["text"]]
+    assert len(finals) == 1 and finals[0]["turn_idx"] == 0 and finals[0]["event"]["text"] == "known prior final"
+    completion = next(message["payload"] for message in messages if message["type"] == "event" and message["payload"]["event"]["type"] == "turn_completed")
+    assert completion["completion_owners"] == [{"turn_idx":0,"context_generation":0}]
+    assert "overflow" in completion["event"]["data"]["ownership_error"]
+
+
 class RaisingTurnCodexClient(FakeCodexClient):
     def start_turn_items(self, thread_id, items, service_tier=None):
         raise RuntimeError("turn failed")
@@ -217,10 +345,14 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
 
 
 def test_worker_events_keep_thread_scope_when_new_turn_or_model_starts():
+    class ScopedClient(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None):
+            super().start_turn_items(thread_id, items, service_tier)
+            return {"turn": {"id": f"turn-{thread_id}"}}
     output = io.StringIO()
     created = []
     runtime = CodexWorkerRuntime(
-        client_factory=lambda on_event, codex_model: created.append(FakeCodexClient(on_event, codex_model))
+        client_factory=lambda on_event, codex_model: created.append(ScopedClient(on_event, codex_model))
         or created[-1],
         output=output,
     )
@@ -1169,12 +1301,14 @@ def test_second_start_failure_preserves_prior_turn_completion(failure_mode):
     output.seek(0); output.truncate()
     runtime.handle_message(make_ui_request("second", "start_turn", {"chat_id":"chat", "turn_idx":1,"context_generation":2,"thread_id":"thread-1","question":"second"}))
     messages = [decode_worker_line(line+"\n") for line in output.getvalue().splitlines()]
-    assert [m["type"] for m in messages] == (["event", "error"] if failure_mode == "exception" else ["event", "thread_state", "turn_started_ack", "error"])
-    assert messages[0]["payload"]["event"]["turn_id"] == "prior"
-    assert messages[0]["payload"]["turn_idx"] == 0
-    assert messages[0]["payload"]["context_generation"] == 1
-    assert messages[-1]["payload"]["turn_idx"] == 1
-    assert messages[-1]["payload"]["context_generation"] == 2
+    assert [m["type"] for m in messages] == (["error", "event"] if failure_mode == "exception" else ["thread_state", "turn_started_ack", "event", "error"])
+    completion = next(m["payload"] for m in messages if m["type"] == "event")
+    error = next(m["payload"] for m in messages if m["type"] == "error")
+    assert completion["event"]["turn_id"] == "prior"
+    assert completion["turn_idx"] == 0
+    assert completion["context_generation"] == 1
+    assert error["turn_idx"] == 1
+    assert error["context_generation"] == 2
     assert not runtime._startup_events
 
 
@@ -1200,7 +1334,7 @@ def test_steer_user_boundary_keeps_old_items_and_two_accepted_owners(ack):
     for idx in range(runtime.MAX_EVENT_SCOPES + 20):
         client.on_event(_event_from_item("item/completed", {"threadId": "thread-1", "turnId": "turn-1",
             "item": {"id": f"tool-{idx}", "type": "commandExecution", "command": "echo tool", "status": "completed"}}))
-    assert len(runtime._item_owners) == 1
+    assert len(runtime._item_owners) == runtime.MAX_EVENT_SCOPES + 21
     for idx in (1, 2):
         output.seek(0); output.truncate()
         runtime.handle_message(make_ui_request(f"steer-{idx}", "start_turn", {"chat_id": "chat", "turn_idx": idx,
