@@ -10,6 +10,21 @@ from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
 
+def test_client_send_id_survives_accepted_turn_storage_and_paging(tmp_path):
+    store = ChatStore(tmp_path / "send-alias.db")
+    store.initialize()
+    turns = [
+        {"question": "same", "answer_md": "", "model": "codex/main", "client_send_id": "first"},
+        {"question": "same", "answer_md": "", "model": "codex/main", "client_send_id": "second"},
+        {"question": "desktop", "answer_md": "", "model": "codex/main"},
+    ]
+    store.replace_turns("owner", turns)
+    assert [turn.get("client_send_id") for turn in store.load_turns("owner")] == ["first", "second", None]
+    _, page = store.load_turns_page("owner", limit=3)
+    assert [turn.get("client_send_id") for turn in page] == ["first", "second", None]
+    assert store.load_turns("other") == []
+
+
 def test_answer_times_survive_store_and_recover_only_owner_final(tmp_path):
     store = ChatStore(tmp_path / "answer-time.db")
     store.initialize()

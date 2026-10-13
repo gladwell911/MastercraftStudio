@@ -4,6 +4,37 @@ from types import SimpleNamespace
 import main
 
 
+def test_correlated_remote_send_persists_actual_accepted_turn_and_response(frame, monkeypatch):
+    target = {"id": "archived-alias", "model": "codex/main", "turns": []}
+    frame.active_chat_id = frame.current_chat_id = "visible"
+    frame._current_chat_state = {"id": "visible", "model": "codex/main", "turns": []}
+    frame.archived_chats = [target]
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_: True)
+    monkeypatch.setattr(frame, "_push_remote_state", lambda *_: None)
+    monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *_: None)
+    for alias in ["first", "second"]:
+        status, response = frame._remote_api_message_ui({"chat_id": "archived-alias",
+            "text": "same", "client_send_id": alias})
+        assert status == 200 and response["accepted"] is True
+        assert response["client_send_id"] == alias
+    assert [turn["client_send_id"] for turn in target["turns"]] == ["first", "second"]
+    assert frame._remote_turn_payload(target["turns"][0])["client_send_id"] == "first"
+    assert frame.active_chat_id == "visible"
+
+
+def test_correlated_rejected_provider_does_not_return_or_persist_alias(frame, monkeypatch):
+    target = {"id": "rejected-alias", "model": "codex/main", "turns": []}
+    frame.active_chat_id = frame.current_chat_id = "visible"
+    frame._current_chat_state = {"id": "visible", "model": "codex/main", "turns": []}
+    frame.archived_chats = [target]
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *_: False)
+    status, response = frame._remote_api_message_ui({"chat_id": "rejected-alias",
+        "text": "same", "client_send_id": "rejected"})
+    assert status == 400 and response["accepted"] is False
+    assert "client_send_id" not in response
+    assert target["turns"] == []
+
+
 def test_laptop_machine_settings_reach_actual_transport_startup(frame, monkeypatch, tmp_path):
     from remote_nats_protocol import NatsSubjects
     monkeypatch.setenv('REMOTE_CONTROL_PAIR_ID', 'laptop')

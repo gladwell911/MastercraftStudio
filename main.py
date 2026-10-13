@@ -2234,7 +2234,7 @@ class ChatFrame(wx.Frame):
         app_menu = wx.Menu()
         app_menu.Append(int(self._clear_context_id), "清空上下文\tAlt+A")
         app_menu.Append(int(self._common_commands_menu_id), "常用命令\tAlt+Z")
-        app_menu.Append(int(self._chat_information_menu_id), "查看聊天信息\tAlt+Y")
+        app_menu.Append(int(self._chat_information_menu_id), "聊天信息\tAlt+Y")
         app_menu.Append(int(self._file_manager_menu_id), "文件管理")
         app_menu.AppendSeparator()
         app_menu.Append(int(self._realtime_call_settings_menu_id), "语音通话设置")
@@ -11883,6 +11883,7 @@ class ChatFrame(wx.Frame):
             turn.get("answer_at"),
             str(turn.get("request_status") or ""),
             str(turn.get("request_error") or ""),
+            str(turn.get("client_send_id") or ""),
         )
         cache = getattr(self, "_remote_turn_payload_cache", None)
         if not isinstance(cache, dict):
@@ -11895,6 +11896,7 @@ class ChatFrame(wx.Frame):
         answer = answer_md
         payload = {
             "question": question,
+            "client_send_id": str(turn.get("client_send_id") or ""),
             "answer": answer,
             "model": model,
             "assistant_only": (not question.strip()) and bool(answer_md.strip()),
@@ -12447,9 +12449,9 @@ class ChatFrame(wx.Frame):
             except Exception:
                 title_revision_before = 0
         if archived_target is not None:
-            ok, message = self._submit_archived_remote_question(archived_target, text, model)
+            ok, message = self._submit_archived_remote_question(archived_target, text, model, client_send_id=str(payload.get("client_send_id") or ""))
         else:
-            ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id)
+            ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id, client_send_id=str(payload.get("client_send_id") or ""))
         restore_previous_owner = False
         if restore_previous_owner and previous_owner_id in {
             str((chat or {}).get("id") or "").strip() for chat in self.archived_chats if isinstance(chat, dict)
@@ -12493,7 +12495,15 @@ class ChatFrame(wx.Frame):
                 self._push_remote_history_changed(chat_id)
         if restore_previous_owner and previous_focus is not None and threading.current_thread() is threading.main_thread():
             previous_focus.SetFocus()
-        return 200 if ok else 400, {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
+        response = {"accepted": ok, "message": message, "chat_id": chat_id, "model": model}
+        if ok and isinstance(target_chat, dict):
+            correlation = str(payload.get("client_send_id") or "")
+            if correlation and any(
+                isinstance(turn, dict) and turn.get("client_send_id") == correlation
+                for turn in target_chat.get("turns", [])
+            ):
+                response["client_send_id"] = correlation
+        return 200 if ok else 400, response
 
     def _resolve_remote_message_model(
         self,
@@ -19085,7 +19095,7 @@ class ChatFrame(wx.Frame):
     def _on_send_clicked(self, _):
         return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
-    def _submit_archived_remote_question(self, chat: dict, question: str, model: str) -> tuple[bool, str]:
+    def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *, client_send_id: str = "") -> tuple[bool, str]:
         """Accept a remote turn for an off-screen owner without projecting it."""
         owner_id = str((chat or {}).get("id") or "").strip()
         resolved_model = normalize_model_id(model or "", default="")
@@ -19112,6 +19122,7 @@ class ChatFrame(wx.Frame):
             "model": resolved_model,
             "created_at": time.time(),
             "question_origin": "rc",
+            "client_send_id": client_send_id,
         }
         previous_updated_at = chat.get("updated_at")
         turns.append(turn)
@@ -19151,7 +19162,7 @@ class ChatFrame(wx.Frame):
             self._schedule_first_question_auto_title(owner_id, text)
         return True, ""
 
-    def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "") -> tuple[bool, str]:
+    def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "", *, client_send_id: str = "") -> tuple[bool, str]:
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         raw_question = str(question or "")
@@ -19263,6 +19274,7 @@ class ChatFrame(wx.Frame):
                 "model": resolved_model,
                 "created_at": now,
                 "question_origin": question_origin,
+                "client_send_id": client_send_id,
                 "local_command": command_name,
                 "local_command_args": command_args,
                 "codex_service_tier": codex_service_tier,
@@ -19318,6 +19330,7 @@ class ChatFrame(wx.Frame):
                 "model": resolved_model,
                 "created_at": now,
                 "question_origin": question_origin,
+                "client_send_id": client_send_id,
                 "local_command": command_name,
                 "local_command_args": command_args,
             }
@@ -19368,6 +19381,7 @@ class ChatFrame(wx.Frame):
                 "model": resolved_model,
                 "created_at": now,
                 "question_origin": question_origin,
+                "client_send_id": client_send_id,
                 "attachments": outgoing_attachments,
                 "suppress_empty_answer_row": True,
             }
@@ -19401,6 +19415,7 @@ class ChatFrame(wx.Frame):
                 "created_at": now,
                 "origin": "local" if source == "local" else source,
                 "question_origin": question_origin,
+                "client_send_id": client_send_id,
                 "attachments": outgoing_attachments,
                 "openclaw_session_id": openclaw_session_id,
             }
@@ -19440,6 +19455,7 @@ class ChatFrame(wx.Frame):
             "model": resolved_model,
             "created_at": now,
             "question_origin": question_origin,
+            "client_send_id": client_send_id,
             "attachments": outgoing_attachments,
         }
         if automatic_clear_resend:

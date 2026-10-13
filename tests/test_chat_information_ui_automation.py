@@ -12,6 +12,26 @@ _REAL_KIMI_INFORMATION_REQUEST = main.ChatFrame._request_kimi_chat_information
 _REAL_KIMI_QUOTA_REQUEST = main.ChatFrame._request_kimi_quota
 
 
+def test_chat_information_menu_name_retains_alt_y_and_opens_dialog(frame, wx_app):
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = frame.current_chat_id = "menu-owner"
+    frame._current_chat_state = {"id": "menu-owner", "model": "codex/main"}
+    frame._on_chat_information_menu_open(SimpleNamespace(Skip=lambda: None))
+    item = frame.GetMenuBar().FindItemById(int(frame._chat_information_menu_id))
+    assert item.GetItemLabel() == "聊天信息\tAlt+Y"
+    accelerator = item.GetAccel()
+    assert accelerator.GetFlags() & main.wx.ACCEL_ALT
+    assert accelerator.GetKeyCode() == ord("Y")
+    event = main.wx.CommandEvent(main.wx.EVT_MENU.typeId, int(frame._chat_information_menu_id))
+    frame.ProcessWindowEvent(event)
+    wx_app.Yield()
+    assert frame._chat_information_dialog.GetTitle() == "聊天信息"
+    frame._chat_information_dialog.Close()
+    wx_app.Yield()
+
+
 def _scoped_information_fixture(frame, monkeypatch, model="codex/main"):
     desktop = {"id": "desktop-b", "model": "codex/main", "codex_thread_id": "thread-b"}
     target = {"id": "phone-a", "model": model, "codex_thread_id": "thread-a", "kimi_session_id": "session-a"}
