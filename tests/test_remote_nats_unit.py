@@ -27,6 +27,14 @@ class FakeJetStream:
     async def publish(self, subject, payload):
         self.published.append((subject, payload))
 
+    async def stream_info(self, name):
+        if not any(stream["name"] == name for stream in self.streams):
+            raise ValueError("not_found")
+        return {"name": name}
+
+    async def update_stream(self, **kwargs):
+        return kwargs
+
 
 class FakeJetStreamExisting:
     def __init__(self):
@@ -39,6 +47,9 @@ class FakeJetStreamExisting:
 
     async def add_stream(self, **kwargs):
         raise AssertionError(f"add_stream should not be called for {kwargs['name']}")
+
+    async def update_stream(self, **kwargs):
+        return kwargs
 
 
 def test_transport_initializes_streams():
@@ -72,6 +83,8 @@ def test_transport_initialize_streams_skips_existing_streams():
         assert jetstream.info_calls == [
             "ZGWD_COMMANDS_default",
             "ZGWD_EVENTS_default",
+            "ZGWD_NOTIFY_default",
+            "ZGWD_NOTIFY_default",
         ]
         assert jetstream.streams == []
 
@@ -868,7 +881,11 @@ def test_start_returns_without_waiting_for_hanging_outbox(tmp_path, monkeypatch)
         import nats
         store = ChatStore(tmp_path / "startup.db")
         store.initialize()
-        store.commit_durable_fact(pair_id="default", domain="events", envelope={"event_id":"final","kind":"assistant_final","chat_id":"chat","body":{}})
+        store.upsert_chat({"id": "chat", "title": "Chat"})
+        store.replace_turns("chat", [{"question": "q", "answer_md": "answer", "request_status": "done"}])
+        target = store.readable_answer("chat", turn_index=0)
+        store.commit_message_notification_fact(pair_id="default", domain="events", chat_id="chat",
+            message_id=target["message_id"], notification_kind="assistant_final", text="answer", chat_title="Chat")
         entered, blocked = asyncio.Event(), asyncio.Event()
         class HangingJetStream(FakeJetStream):
             async def subscribe(self, *args, **kwargs):
@@ -880,6 +897,10 @@ def test_start_returns_without_waiting_for_hanging_outbox(tmp_path, monkeypatch)
         class Client:
             def jetstream(self):
                 return js
+            async def subscribe(self, *args, **kwargs):
+                return None
+            async def flush(self):
+                return None
         async def connect(*args, **kwargs):
             return Client()
         monkeypatch.setattr(nats, "connect", connect)

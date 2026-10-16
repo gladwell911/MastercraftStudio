@@ -162,3 +162,13 @@ def test_execution_routes_delegate_to_authority_and_structure_errors():
     status, body = transport._route_command({"type": "execution_backfill", "chat_id": "chat",
                                               "revision": {}, "from_sequence": 2, "to_sequence": 3})
     assert status == 409 and body["recovery"] == "SNAPSHOT_REQUIRED"
+
+
+def test_compact_read_fixture_preserves_native_merge_body_scope():
+    from remote_nats_protocol import compact_notification, canonical_durable_hash
+    fixture = json.loads((Path(__file__).resolve().parents[2] / "rc/android/app/src/androidTest/assets/compact_read_changed.json").read_text())
+    fact = {key: value for key, value in fixture.items() if key not in {"pair_id", "projection_version", "fact_hash", "canonical_hash"}}
+    fact["body"] = {key: value for key, value in fact["body"].items() if key != "chat_title"}
+    fact["canonical_hash"] = canonical_durable_hash(fact)
+    assert compact_notification(fact, pair_id="laptop") == fixture
+    assert fixture["body"]["chat_id"] == "a" and fixture["body"]["revision"] == 3

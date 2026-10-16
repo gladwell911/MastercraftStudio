@@ -87,6 +87,8 @@ def main() -> None:
         NatsRuntimeConfig(
             app_data_dir=work_dir,
             token=token,
+            role_permissions=True,
+            pair_id=pair_id,
             host="0.0.0.0",
             port=tcp_port,
             websocket_host="127.0.0.1",
@@ -177,6 +179,7 @@ def main() -> None:
         transport = RemoteNatsTransport(
             pair_id=pair_id,
             token=token,
+            desktop_password=server.config.desktop_password,
             on_file_command=on_file_command,
         )
         transport.start_threaded(f"nats://127.0.0.1:{tcp_port}", timeout=15)

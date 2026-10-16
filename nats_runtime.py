@@ -7,6 +7,8 @@ import socket
 import subprocess
 import sys
 import time
+import json
+import secrets
 
 
 NATS_SERVER_ENV = "ZGWD_NATS_SERVER_PATH"
@@ -21,6 +23,22 @@ class NatsRuntimeConfig:
     port: int = 4222
     websocket_host: str = "127.0.0.1"
     websocket_port: int = 18080
+    role_permissions: bool = False
+    pair_id: str = "default"
+
+    @property
+    def desktop_password(self) -> str:
+        path = self.runtime_dir / "desktop-auth.secret"
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(secrets.token_urlsafe(48))
+        except FileExistsError:
+            pass
+        value = path.read_text(encoding="utf-8").strip()
+        if not value:
+            raise RuntimeError("DESKTOP_ROLE_SECRET_UNAVAILABLE")
+        return value
 
     @property
     def runtime_dir(self) -> Path:
@@ -56,6 +74,21 @@ websocket {{
   no_tls: true
 }}
 """
+        if self.role_permissions:
+            from remote_nats_protocol import NatsSubjects
+            subjects = NatsSubjects.from_pair_id(self.pair_id)
+            notify = subjects.notification_stream
+            allowed = [subjects.rpc, f"$JS.API.STREAM.INFO.{notify}",
+                f"$JS.API.CONSUMER.INFO.{notify}.>", f"$JS.API.CONSUMER.CREATE.{notify}.>",
+                f"$JS.API.CONSUMER.DURABLE.CREATE.{notify}.>", f"$JS.API.CONSUMER.MSG.NEXT.{notify}.>",
+                f"$JS.ACK.{notify}.>"]
+            authorization = "authorization {\n timeout: 30\n users: [\n" + \
+                " {user: mc, password: " + json.dumps(self.desktop_password) + "},\n" + \
+                " {user: mobile, password: " + json.dumps(self.token) + ", permissions: {publish: " + json.dumps(allowed) + \
+                ", subscribe: " + json.dumps(["_INBOX.>", f"zgwd.{subjects.pair_id}.rpc-reply.>",
+                    subjects.hints, f"zgwd.{subjects.pair_id}.owner-hints.>", f"zgwd.{subjects.pair_id}.live-files"]) + "}}\n ]\n}"
+            old = f'authorization {{\n  timeout: 30\n  token: "{escaped_token}"\n}}'
+            contents = contents.replace(old, authorization)
         self.config_path.write_text(contents, encoding="utf-8")
         return self.config_path
 

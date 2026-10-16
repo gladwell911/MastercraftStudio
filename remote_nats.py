@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import asyncio
 from collections.abc import Callable
 import contextlib
@@ -18,6 +19,11 @@ from remote_nats_protocol import (
     validate_v2_durable,
     make_event_id,
     validate_v2_ephemeral,
+    rpc_reply_subject,
+    RPC_CAPABILITY,
+    NOTIFY_CAPABILITY,
+    NOTIFY_KINDS,
+    compact_notification,
 )
 
 
@@ -51,6 +57,7 @@ class RemoteNatsTransport:
         on_common_commands_move_up: Callback | None = None,
         on_common_commands_move_down: Callback | None = None,
         on_history_list: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        on_history_page: Callback | None = None,
         on_history_read: Callback | None = None,
         on_chat_read_changed: Callback | None = None,
         on_execution_page: Callback | None = None,
@@ -61,9 +68,11 @@ class RemoteNatsTransport:
         event_loop: asyncio.AbstractEventLoop | None = None,
         invoke_callback: CallbackInvoker | None = None,
         durable_store: Any | None = None,
+        desktop_password: str = "",
     ) -> None:
         self.subjects = NatsSubjects.from_pair_id(pair_id)
         self.token = token
+        self.desktop_password = desktop_password
         self.jetstream = jetstream
         self._loop = event_loop
         self.on_message = on_message
@@ -85,6 +94,7 @@ class RemoteNatsTransport:
         self.on_common_commands_move_up = on_common_commands_move_up
         self.on_common_commands_move_down = on_common_commands_move_down
         self.on_history_list = on_history_list
+        self.on_history_page = on_history_page
         self.on_history_read = on_history_read
         self.on_chat_read_changed = on_chat_read_changed
         self.on_execution_page = on_execution_page
@@ -102,6 +112,8 @@ class RemoteNatsTransport:
         self._outbox_delays = {lane: 0.25 for lane in self._outbox_locks}
         self._nats_client: Any | None = None
         self._command_subscription: Any | None = None
+        self._rpc_subscription: Any | None = None
+        self.notification_incarnation = ""
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
         self._startup_error: BaseException | None = None
@@ -119,6 +131,22 @@ class RemoteNatsTransport:
             name=self.subjects.event_stream,
             subjects=[self.subjects.events, self.subjects.files],
         )
+        # Only MC manages this stream. Existing policy is updated and read back;
+        # a phone must never widen these limits during consumer setup.
+        policy = dict(name=self.subjects.notification_stream, subjects=[self.subjects.notifications],
+                      storage="file", max_age=7 * 24 * 3600, max_bytes=32 * 1024 * 1024, max_msgs=20000)
+        try:
+            await self.jetstream.stream_info(self.subjects.notification_stream)
+        except Exception:
+            await self.jetstream.add_stream(**policy)
+        else:
+            await self.jetstream.update_stream(**policy)
+        info = await self.jetstream.stream_info(self.subjects.notification_stream)
+        config = getattr(info, "config", None)
+        if config is not None and any(getattr(config, key) != value for key, value in
+                (("max_age", policy["max_age"]), ("max_bytes", policy["max_bytes"]), ("max_msgs", policy["max_msgs"]))):
+            raise RuntimeError("NOTIFICATION_STREAM_POLICY_MISMATCH")
+        self.notification_incarnation = str(getattr(info, "created", ""))
 
     async def _ensure_stream(self, *, name: str, subjects: list[str]) -> None:
         stream_info = getattr(self.jetstream, "stream_info", None)
@@ -138,15 +166,14 @@ class RemoteNatsTransport:
     async def start(self, url: str = "nats://127.0.0.1:4222") -> None:
         import nats
 
-        self._nats_client = await nats.connect(url, token=self.token)
+        credentials = {"user": "mc", "password": self.desktop_password} if self.desktop_password else {"token": self.token}
+        self._nats_client = await nats.connect(url, **credentials)
         self.jetstream = self._nats_client.jetstream()
         await self.initialize_streams()
-        self._command_subscription = await self.jetstream.subscribe(
-            self.subjects.commands,
-            durable="desktop",
-            manual_ack=True,
-            cb=self._handle_nats_message,
-        )
+        self._rpc_subscription = await self._nats_client.subscribe(self.subjects.rpc, cb=self._handle_rpc_message)
+        await self._nats_client.flush()
+        # Coordinated cutover never resumes the legacy retained command queue.
+        # Unknown business outcomes are reconciled by operation identity.
         self._start_outbox_workers()
 
     def start_threaded(self, url: str = "nats://127.0.0.1:4222", timeout: float = 10) -> None:
@@ -198,7 +225,21 @@ class RemoteNatsTransport:
                 if asyncio.iscoroutine(result):
                     await result
 
-    async def handle_command(self, payload: dict[str, Any]) -> None:
+    async def _handle_rpc_message(self, message: Any) -> None:
+        try:
+            payload = decode_payload(bytes(message.data))
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            expected = rpc_reply_subject(self.subjects.pair_id,
+                str(payload.get("device_id") or body.get("device_id") or ""),
+                str(payload.get("session_id") or body.get("session_id") or ""), str(payload.get("id") or ""))
+            # A client cannot trick MC into publishing to an arbitrary subject.
+            if payload.get("reply_subject") != expected:
+                return
+            await self.handle_command(payload, reply_subject=expected)
+        except (ValueError, TypeError):
+            return
+
+    async def handle_command(self, payload: dict[str, Any], *, reply_subject: str = "") -> None:
         request_id = str(payload.get("id") or "")
         chat_id = str(payload.get("chat_id") or "")
         body_payload = payload.get("body") if isinstance(payload.get("body"), dict) else {}
@@ -207,6 +248,8 @@ class RemoteNatsTransport:
         session_key = (device_id, session_id)
         negotiated_version, negotiated_epoch = self._sessions.get(session_key, (1, ""))
         try:
+            if reply_subject and str(payload.get("type") or "").lower() != "hello" and negotiated_version != 2:
+                raise ValueError("V2_HANDSHAKE_REQUIRED")
             if str(payload.get("type") or "").lower() == "hello":
                 offered = payload.get("protocol_versions", body_payload.get("protocol_versions", []))
                 can_negotiate_v2 = (
@@ -221,6 +264,10 @@ class RemoteNatsTransport:
                 negotiated_epoch = uuid.uuid4().hex if negotiated_version == 2 else ""
                 self._sessions[session_key] = (negotiated_version, negotiated_epoch)
                 self.protocol_version = max((state[0] for state in self._sessions.values()), default=1)
+                if negotiated_version == 2 and reply_subject:
+                    # Build canonical-final gaps before a new installation takes
+                    # its enable baseline, rather than making old answers new.
+                    await asyncio.to_thread(self._prepare_notification_facts)
                 watermark = (
                     self.durable_store.paired_feed_high_water(
                         pair_id=self.subjects.pair_id,
@@ -231,11 +278,12 @@ class RemoteNatsTransport:
                 )
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
-                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness"],
+                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness", RPC_CAPABILITY, NOTIFY_CAPABILITY],
+                    "notification_incarnation": self.notification_incarnation,
                     "epoch": negotiated_epoch,
                     **watermark,
                 }, chat_id=chat_id)
-                await self.publish_event(event)
+                await self._publish_response(event, reply_subject)
                 return
             if negotiated_version == 2 and payload.get("epoch") != negotiated_epoch:
                 raise ValueError("STALE_EPOCH")
@@ -245,8 +293,17 @@ class RemoteNatsTransport:
                 # Session validation above remains authoritative. This probe must
                 # never enter wx, read history, or renegotiate the session epoch.
                 status, body = 200, {"ready": True}
+                if reply_subject and self.durable_store is not None:
+                    body.update(self.durable_store.paired_feed_high_water(pair_id=self.subjects.pair_id, domain="events"))
             else:
-                status, body = await asyncio.to_thread(self._invoke_route_command, payload)
+                route = asyncio.to_thread(self._invoke_route_command, payload)
+                if payload.get("type") in {"history_list", "history_read", "execution_page_v3", "content_page"}:
+                    try:
+                        status, body = await asyncio.wait_for(route, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        status, body = 503, {"accepted": False, "error": "READ_DEADLINE_EXCEEDED"}
+                else:
+                    status, body = await route
             event = build_response_event(
                 request_id=request_id,
                 status=status,
@@ -262,6 +319,24 @@ class RemoteNatsTransport:
                 event.update({"protocol_version": 2, "epoch": negotiated_epoch,
                               "request_id": request_id, "chat_id": chat_id,
                               "body": {"error": str(exc) or "error"}})
+        await self._publish_response(event, reply_subject)
+
+    def _prepare_notification_facts(self) -> None:
+        self.durable_store.reconcile_notification_finals(self.subjects.pair_id)
+
+    async def _publish_response(self, event: dict, reply_subject: str) -> None:
+        if reply_subject:
+            # Core publish deliberately bypasses JetStream even for large pages.
+            if self._nats_client is not None:
+                encoded = encode_payload(event)
+                if len(encoded) > 128 * 1024:
+                    error = build_error_response(str(event.get("request_id") or ""), 413, "RESPONSE_BUDGET_EXCEEDED")
+                    for field in ("protocol_version", "epoch", "chat_id"):
+                        if field in event:
+                            error[field] = event[field]
+                    encoded = encode_payload(error)
+                await self._nats_client.publish(reply_subject, encoded)
+            return
         await self.publish_event(event)
 
     async def publish_event(self, payload: dict[str, Any]) -> None:
@@ -273,7 +348,11 @@ class RemoteNatsTransport:
         if not event.get("event_id"):
             event["event_id"] = make_event_id(event_type)
         subject = self.subjects.files if event_type.startswith("file_") else self.subjects.events
-        await self.jetstream.publish(subject, encode_payload(event))
+        if self._nats_client is not None:
+            live_subject = f"zgwd.{self.subjects.pair_id}.live-files" if event_type.startswith("file_") else self.subjects.hints
+            await self._nats_client.publish(live_subject, encode_payload(event))
+        else:
+            await self.jetstream.publish(subject, encode_payload(event))
 
     def _start_outbox_workers(self) -> list[asyncio.Future]:
         if self._stop_requested or self.jetstream is None or self.durable_store is None:
@@ -319,6 +398,7 @@ class RemoteNatsTransport:
 
     async def _drain_outbox_lane(self, lane: str) -> tuple[int, bool, bool]:
         published = 0
+        owner_hints = {}
         try:
             rows = self.durable_store.pending_outbox(pair_id=self.subjects.pair_id, lane=lane)
             for row in rows:
@@ -343,7 +423,35 @@ class RemoteNatsTransport:
                     continue
                 subject = self.subjects.files if row["subject_domain"] == "files" else self.subjects.events
                 try:
-                    ack = await self.jetstream.publish(subject, raw)
+                    if self._nats_client is not None:
+                        eligible = envelope["kind"] in NOTIFY_KINDS
+                        if envelope["kind"] in {"assistant_final", "action_required", "failed"}:
+                            try:
+                                authority = self.durable_store.get_chat_read_state(envelope["chat_id"], pair_id=self.subjects.pair_id)
+                                eligible = envelope["body"].get("generation") == authority["generation"]
+                            except ValueError:
+                                eligible = False
+                        if eligible:
+                            ack = await self.jetstream.publish(self.subjects.notifications,
+                                encode_payload(compact_notification(envelope, pair_id=self.subjects.pair_id)))
+                        else:
+                            ack = True
+                        if envelope["kind"] == "execution_entry":
+                            hint = {"type": "execution_changed", "chat_id": envelope["chat_id"],
+                                    "revision": envelope["revision"], "sync_sequence": envelope["sync_sequence"]}
+                            owner_hints[envelope["chat_id"]] = hint
+                        elif envelope["kind"] in {"assistant_final", "user_message"}:
+                            await self._nats_client.publish(self.subjects.hints, encode_payload({
+                                "type": "history_changed", "chat_id": envelope["chat_id"],
+                                "event_id": envelope["event_id"] + ":hint", "revision": envelope["revision"]}))
+                        elif envelope["kind"] in {"state", "state_changed"}:
+                            await self._nats_client.publish(f"zgwd.{self.subjects.pair_id}.owner-hints." + hashlib.sha256(envelope["chat_id"].encode()).hexdigest(), encode_payload({
+                                "type": "state_hint", "chat_id": envelope["chat_id"],
+                                "revision": envelope["revision"], "sync_sequence": envelope["sync_sequence"]}))
+                        else:
+                            await self._nats_client.publish(self.subjects.hints, raw)
+                    else:
+                        ack = await self.jetstream.publish(subject, raw)
                     if ack is None and type(self.jetstream).__module__.startswith("nats"):
                         raise RuntimeError("missing_publish_ack")
                     self.durable_store.mark_outbox_acked(row["sync_sequence"], consumer_id=f"publisher:{row['pair_id']}", **identity)
@@ -351,6 +459,9 @@ class RemoteNatsTransport:
                 except Exception as exc:
                     self.durable_store.record_outbox_failure(row["sync_sequence"], str(exc), **identity)
                     return published, True, False
+            for owner, hint in owner_hints.items():
+                subject = f"zgwd.{self.subjects.pair_id}.owner-hints." + hashlib.sha256(owner.encode()).hexdigest()
+                await self._nats_client.publish(subject, encode_payload(hint))
             return published, False, published > 0 or len(rows) == 100
         except Exception:
             # A lane-local store failure must not cancel the other worker.
@@ -385,6 +496,10 @@ class RemoteNatsTransport:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._outbox_tasks.clear()
+        if self._rpc_subscription is not None:
+            with contextlib.suppress(Exception):
+                await self._rpc_subscription.unsubscribe()
+            self._rpc_subscription = None
         subscription = self._command_subscription
         self._command_subscription = None
         if subscription is not None:
@@ -436,6 +551,37 @@ class RemoteNatsTransport:
 
     def _route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         command_type = str(payload.get("type") or "").strip().lower()
+        if command_type == "content_page" and self.durable_store is not None:
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            try:
+                return 200, self.durable_store.read_content_page(chat_id=str(payload.get("chat_id") or ""),
+                    cursor=str(body.get("cursor") or ""), secret=self.token)
+            except (ValueError, TypeError) as exc:
+                return 409, {"error": str(exc)}
+        if command_type in {"notification_sync", "notification_sync_complete", "read_state_sync"}:
+            if self.durable_store is None:
+                return 503, {"error": "notification_authority_unavailable"}
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            try:
+                if command_type == "read_state_sync":
+                    snapshot = self.durable_store.notification_sync(pair_id=self.subjects.pair_id,
+                        device_id=str(payload.get("device_id") or "") + ":read-authority",
+                        incarnation=self.notification_incarnation, baseline=0, secret=self.token,
+                        cursor=str(body.get("cursor") or ""), read_only=True)
+                    return 200, {"accepted": True, "partial": not snapshot["done"],
+                        "has_more": not snapshot["done"], "next_cursor": snapshot["cursor"],
+                        "chats": [{"chat_id": state["chat_id"], "read_state": state} for state in snapshot["records"]]}
+                scope = dict(pair_id=self.subjects.pair_id, device_id=str(payload.get("device_id") or ""),
+                             incarnation=str(body.get("incarnation") or ""), secret=self.token)
+                if scope["incarnation"] != self.notification_incarnation:
+                    raise ValueError("STALE_NOTIFICATION_INCARNATION")
+                if command_type == "notification_sync_complete":
+                    return 200, {"processed_sequence": self.durable_store.complete_notification_sync(
+                        **scope, completion_token=str(body.get("completion_token") or ""))}
+                return 200, self.durable_store.notification_sync(**scope, baseline=body.get("baseline", 0),
+                    cursor=str(body.get("cursor") or ""), limit=body.get("limit", 100))
+            except (ValueError, TypeError) as exc:
+                return 409, {"error": str(exc)}
         if command_type in {"mark_chat_read", "chat_read_state"}:
             if self.durable_store is None:
                 return 503, {"error": "read_authority_unavailable"}
@@ -523,6 +669,9 @@ class RemoteNatsTransport:
             return self.on_set_speed(payload)
         if command_type == "clear_context" and callable(self.on_clear_context):
             return self.on_clear_context(payload)
+        if command_type == "history_list" and callable(self.on_history_page):
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+            return self.on_history_page(body)
         if command_type == "history_list" and callable(self.on_history_list):
             return self.on_history_list()
         if command_type == "history_read" and callable(self.on_history_read):
@@ -536,6 +685,8 @@ class RemoteNatsTransport:
         return 404, {"accepted": False, "error": "unknown_type"}
 
     def _invoke_route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if payload.get("type") in {"notification_sync", "notification_sync_complete", "read_state_sync", "content_page"}:
+            return self._route_command(payload)
         if self._invoke_callback is None:
             return self._route_command(payload)
         return self._invoke_callback(lambda: self._route_command(payload))

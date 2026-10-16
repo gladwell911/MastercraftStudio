@@ -143,7 +143,7 @@ ANSWER_LIST_DEFAULT_VISIBLE_ROWS = 100
 ANSWER_LIST_EXPAND_ROWS = 100
 EXECUTION_LIST_DEFAULT_VISIBLE_ROWS = 100
 EXECUTION_LIST_EXPAND_ROWS = 100
-REMOTE_STATE_DEFAULT_TURN_LIMIT = 100
+REMOTE_STATE_DEFAULT_TURN_LIMIT = 10
 NOTES_ENTRY_LABEL_MAX_CHARS = 160
 CONTEXT_USAGE_SYNC_TURN_LIMIT = 120
 HOTKEY_ID_SHOW = 0xA112
@@ -4322,6 +4322,10 @@ class ChatFrame(wx.Frame):
             chat_title = str((chat_summary or {}).get("title") or "").strip()
             for index in range(start_index, len(turns or [])):
                 turn = turns[index] if isinstance(turns[index], dict) else {}
+                if str(turn.get("request_status") or "") == "failed":
+                    self._push_remote_attention(normalized, "failed",
+                        str(turn.get("client_send_id") or f"turn-{index}"),
+                        str(turn.get("request_error") or "\u8bf7\u6c42\u5931\u8d25"))
                 for role, kind, content_key in (("user", "question", "question"),
                                                 ("assistant", "final", "answer_md")):
                     content = str(turn.get(content_key) or "")
@@ -11685,6 +11689,20 @@ class ChatFrame(wx.Frame):
                 return
         self._publish_remote_nats_event(payload)
 
+    def _push_remote_attention(self, chat_id: str, kind: str, operation_id: str, text: str) -> None:
+        transport = getattr(self, "_remote_nats_transport", None)
+        store = getattr(self, "chat_store", None)
+        if transport is None or store is None or int(getattr(transport, "protocol_version", 1)) < 2:
+            return
+        try:
+            store.commit_attention_notification(pair_id=transport.subjects.pair_id, chat_id=chat_id,
+                kind=kind, operation_id=operation_id, text=text)
+            loop = getattr(transport, "_loop", None)
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
+        except (ValueError, RuntimeError):
+            return
+
     def _push_remote_status(self, status: str, request_kind: str = "") -> None:
         self._invalidate_remote_state_cache()
         payload = {
@@ -11842,7 +11860,11 @@ class ChatFrame(wx.Frame):
         done = threading.Event()
         result: dict[str, object] = {}
 
+        cancelled = threading.Event()
+
         def _invoke() -> None:
+            if cancelled.is_set():
+                return
             try:
                 result["value"] = callback(payload) if payload is not None else callback()
             except Exception as exc:
@@ -11852,7 +11874,8 @@ class ChatFrame(wx.Frame):
 
         if not self._call_after_if_alive(_invoke):
             return 503, {"accepted": False, "error": "ui_unavailable"}
-        if not done.wait(15.0):
+        if not done.wait(5.0):
+            cancelled.set()
             return 503, {"accepted": False, "error": "ui_timeout"}
         if "error" in result:
             raise result["error"]  # type: ignore[misc]
@@ -12059,7 +12082,8 @@ class ChatFrame(wx.Frame):
         except Exception:
             limit = 0
         if limit <= 0:
-            return self._remote_chat_snapshot(chat, include_execution_steps=include_execution_steps), False, ""
+            limit = REMOTE_STATE_DEFAULT_TURN_LIMIT
+        limit = min(10, limit)
         raw_turns = chat.get("turns") if isinstance(chat, dict) and isinstance(chat.get("turns"), list) else []
         turns = [turn for turn in raw_turns if isinstance(turn, dict)]
         total = len(turns)
@@ -12075,7 +12099,26 @@ class ChatFrame(wx.Frame):
         paged_chat["_turn_start_index"] = start
         snapshot = self._remote_chat_snapshot(paged_chat, include_execution_steps=include_execution_steps)
         snapshot["turn_count"] = total
+        self._bound_remote_chat_content(snapshot)
+        while len(snapshot.get("turns", [])) > 1 and len(json.dumps(snapshot, ensure_ascii=True).encode("utf-8")) > 96 * 1024:
+            snapshot["turns"].pop(0)
+            start += 1
         return snapshot, start > 0, (str(start) if start > 0 else "")
+
+    def _bound_remote_chat_content(self, snapshot: dict) -> None:
+        store = getattr(self, "chat_store", None)
+        if store is None or not hasattr(store, "content_continuation"):
+            return
+        for turn in snapshot.get("turns", []):
+            for field in ("question", "answer"):
+                text = str(turn.get(field) or "")
+                prefix, cursor = store.content_continuation(chat_id=snapshot["chat_id"], text=text,
+                    secret=str(self.remote_control_token or "content"), prefix_bytes=512)
+                if cursor:
+                    turn[field], turn[field + "_continuation"] = prefix, cursor
+                    if field == "answer":
+                        turn["complete_answer_seq"] = turn.get("answer_seq", 0)
+                        turn["answer_seq"] = 0
 
     def _remote_chat_snapshot_page_from_store(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
         payload = dict(payload or {})
@@ -12090,6 +12133,7 @@ class ChatFrame(wx.Frame):
             limit = 0
         if limit <= 0:
             limit = REMOTE_STATE_DEFAULT_TURN_LIMIT
+        limit = min(10, limit)
         before_raw = payload.get("before_turn_index")
         try:
             before_turn_index = int(before_raw) if before_raw is not None else None
@@ -12113,6 +12157,10 @@ class ChatFrame(wx.Frame):
             include_execution_steps=bool(payload.get("include_execution_steps")),
         )
         snapshot["turn_count"] = int(total or 0)
+        self._bound_remote_chat_content(snapshot)
+        while len(snapshot.get("turns", [])) > 1 and len(json.dumps(snapshot, ensure_ascii=True).encode("utf-8")) > 96 * 1024:
+            snapshot["turns"].pop(0)
+            start += 1
         return snapshot, start > 0, (str(start) if start > 0 else "")
 
     def _current_chat_snapshot(self, *, include_execution_steps: bool = False) -> dict:
@@ -12981,6 +13029,8 @@ class ChatFrame(wx.Frame):
         }
 
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        if (_payload or {}).get("collection_page"):
+            return self._remote_api_history_collection_ui(_payload)
         cached = getattr(self, "_remote_history_list_cache", None)
         if isinstance(cached, dict):
             return 200, copy.deepcopy(cached)
@@ -13005,8 +13055,128 @@ class ChatFrame(wx.Frame):
         self._remote_history_list_cache = copy.deepcopy(body)
         return 200, body
 
+    def _remote_api_history_collection_ui(self, payload: dict) -> tuple[int, dict]:
+        """Summarize only the requested collection page; never hydrate bodies."""
+        from chat_store import ChatStore
+        revision = int(getattr(self, "_remote_collection_revision", 0))
+        query = str(payload.get("query") or "").strip().casefold()
+        section = str(payload.get("section") or "recent")
+        if section not in {"recent", "pinned", "running"}:
+            return 400, {"error": "INVALID_COLLECTION_SECTION"}
+        if payload.get("if_revision") == revision and not payload.get("cursor"):
+            return 200, {"accepted": True, "not_modified": True, "collection_revision": revision}
+        secret = str(self.remote_control_token or "collection")
+        offset = 0
+        if payload.get("cursor"):
+            try:
+                cursor = ChatStore._decode_execution_cursor(str(payload["cursor"]), secret)
+                if cursor.get("revision") != revision or cursor.get("query") != query or cursor.get("section") != section:
+                    raise ValueError("STALE_COLLECTION_CURSOR")
+                offset = int(cursor["offset"])
+                if offset < 0:
+                    raise ValueError("INVALID_COLLECTION_CURSOR")
+            except (ValueError, KeyError, TypeError) as exc:
+                return 409, {"error": str(exc), "recovery": "REFRESH_COLLECTION"}
+        current = dict(getattr(self, "_current_chat_state", {}) or {})
+        current_id = str(self.active_chat_id or self.current_chat_id or "")
+        current.update({"id": current_id, "turns": self.active_session_turns})
+        candidates = {str(chat.get("id") or ""): chat for chat in self.archived_chats if chat.get("id")}
+        if current_id:
+            candidates[current_id] = current
+        rows = [chat for chat in candidates.values() if
+                (not query or query in str(chat.get("title") or "").casefold()) and
+                (section != "pinned" or chat.get("pinned")) and
+                (section != "running" or (chat.get("id") == current_id and self.is_running))]
+        rows.sort(key=lambda chat: (float(chat.get("updated_at") or chat.get("created_at") or 0),
+                                    str(chat.get("id") or "")), reverse=True)
+        limit = max(1, min(30, int(payload.get("limit") or 30)))
+        summaries = []
+        for chat in rows[offset:offset + limit]:
+            summary = self._remote_chat_summary(chat)
+            if str(chat.get("id")) == current_id:
+                summary["running"] = bool(self.is_running)
+            # Budget includes UTF-8 and conservative envelope/continuation room.
+            if len(json.dumps(summaries + [summary], ensure_ascii=False).encode("utf-8")) > 120 * 1024:
+                break
+            summaries.append(summary)
+        end = offset + len(summaries)
+        more = end < len(rows)
+        cursor = ChatStore._execution_cursor_token({"revision": revision, "query": query,
+            "section": section, "offset": end}, secret) if more else ""
+        return 200, {"accepted": True, "chats": summaries, "partial": True, "has_more": more,
+                     "next_cursor": cursor, "collection_revision": revision, "section": section}
+
+    def _remote_api_history_collection_worker(self, payload: dict) -> tuple[int, dict]:
+        if not payload.get("collection_page") or not getattr(self, "_chat_store_enabled", False):
+            return self._run_remote_ui_route(self._remote_api_history_list_ui, payload)
+        from chat_store import ChatStore
+        revision = int(getattr(self, "_remote_collection_revision", 0))
+        query = str(payload.get("query") or "").strip()
+        section = str(payload.get("section") or "recent")
+        if section not in {"recent", "pinned", "running"}:
+            return 400, {"error": "INVALID_COLLECTION_SECTION"}
+        secret = str(self.remote_control_token or "collection")
+        offset = 0
+        if payload.get("cursor"):
+            try:
+                cursor = ChatStore._decode_execution_cursor(str(payload["cursor"]), secret)
+                if cursor.get("revision") != revision or cursor.get("query") != query or cursor.get("section") != section:
+                    raise ValueError("STALE_COLLECTION_CURSOR")
+                offset = int(cursor["offset"])
+                if offset < 0:
+                    raise ValueError("INVALID_COLLECTION_CURSOR")
+            except (ValueError, KeyError, TypeError) as exc:
+                return 409, {"error": str(exc), "recovery": "REFRESH_COLLECTION"}
+        elif payload.get("if_revision") == revision:
+            return 200, {"accepted": True, "not_modified": True, "collection_revision": revision}
+        # UI captures one live owner only. Indexed SQLite paging, hydration and
+        # metadata authority stay on this worker rather than walking all archives.
+        def capture(_payload=None):
+            live = dict(getattr(self, "_current_chat_state", {}) or {})
+            live.update({"id": str(self.active_chat_id or self.current_chat_id or ""),
+                         "turn_count": len(self.active_session_turns), "running": bool(self.is_running)})
+            live.pop("turns", None)
+            live.pop("execution_steps", None)
+            return 200, live
+        status, current = self._run_remote_ui_route(capture)
+        if status != 200:
+            return status, current
+        if section == "running":
+            selected = [current] if current.get("id") and current.get("running") else []
+            more, end = False, 0
+        else:
+            include_current = not offset and bool(current.get("id")) and (not query or query.casefold() in str(current.get("title") or "").casefold()) and (section != "pinned" or current.get("pinned"))
+            size = min(30, max(1, int(payload.get("limit") or 30)))
+            rows, more = self.chat_store.list_chat_summaries_page(limit=max(1, size - int(include_current)),
+                offset=offset, query=query, pinned=section == "pinned")
+            end = offset + len(rows)
+            selected = ([current] if include_current else []) + [row for row in rows if not include_current or row.get("id") != current.get("id")]
+        summaries = [self._remote_chat_summary(row) for row in selected]
+        for summary in summaries:
+            # IDs remain exact; presentation metadata can be bounded independently
+            # of the complete canonical chat retained in SQLite.
+            for key, value in list(summary.items()):
+                if isinstance(value, str) and key != "chat_id":
+                    summary[key] = value.encode("utf-8")[:256].decode("utf-8", errors="ignore")
+            while len(json.dumps(summary, ensure_ascii=True).encode("utf-8")) > 2048:
+                candidates = [key for key, value in summary.items() if isinstance(value, str) and key != "chat_id" and value]
+                if not candidates:
+                    break
+                key = max(candidates, key=lambda key: len(summary[key]))
+                summary[key] = summary[key][:len(summary[key]) // 2]
+        for summary in summaries:
+            if summary.get("chat_id") == current.get("id"):
+                summary["running"] = current.get("running", False)
+        if revision != int(getattr(self, "_remote_collection_revision", 0)):
+            return 409, {"error": "STALE_COLLECTION_REVISION", "recovery": "REFRESH_COLLECTION"}
+        cursor = ChatStore._execution_cursor_token({"revision": revision, "query": query,
+            "section": section, "offset": end}, secret) if more else ""
+        return 200, {"accepted": True, "chats": summaries, "partial": True, "has_more": more,
+                     "next_cursor": cursor, "collection_revision": revision, "section": section}
+
     def _invalidate_remote_history_list_cache(self) -> None:
         self._remote_history_list_cache = None
+        self._remote_collection_revision = int(getattr(self, "_remote_collection_revision", 0)) + 1
 
     def _invalidate_remote_state_cache(self) -> None:
         self._remote_state_cache = None
@@ -13518,6 +13688,8 @@ class ChatFrame(wx.Frame):
         self._on_codex_event_for_chat(chat_id, event)
 
     def _handle_codex_request_dialog(self, request: dict) -> None:
+        self._push_remote_attention(str(request.get("chat_id") or ""), "action_required",
+            str(request.get("request_id") or ""), "\u9700\u8981\u60a8\u7684\u786e\u8ba4\u6216\u8f93\u5165")
         if request.get("method") == "item/commandExecution/requestApproval":
             self._handle_codex_command_approval(request)
             return
@@ -13798,6 +13970,7 @@ class ChatFrame(wx.Frame):
             ):
                 target_chat["codex_pending_request"] = self._codex_pending_request_from_event(chat_id, target_chat, event)
                 target_chat["request_kind"] = "user_input"
+                self._push_remote_attention(chat_id, "action_required", str(event.request_id or ""), "\u9700\u8981\u60a8\u7684\u786e\u8ba4\u6216\u8f93\u5165")
                 target_chat["codex_turn_active"] = True
                 self._mark_history_list_dirty()
                 if target_idx >= 0:
@@ -15753,6 +15926,8 @@ class ChatFrame(wx.Frame):
         self._defer_codex_state_save()
 
     def _handle_kimi_request_dialog(self, request: dict) -> None:
+        self._push_remote_attention(str(request.get("chat_id") or ""), "action_required",
+            str(request.get("request_id") or ""), "\u9700\u8981\u60a8\u7684\u786e\u8ba4\u6216\u8f93\u5165")
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
         session_id = str(request.get("session_id") or "").strip()
         chat_id = str(request.get("chat_id") or "").strip()
@@ -16884,7 +17059,7 @@ class ChatFrame(wx.Frame):
     def _start_remote_health_monitor(self) -> None:
         if getattr(self, "_closing", False) or self._remote_nats_transport is None:
             return
-        if not self._remote_runtime_config()["fixed_domain_mode"] or not self._query_cloudflared_service().get("exists"):
+        if not self._remote_runtime_config()["fixed_domain_mode"]:
             return
         with self._remote_health_lock:
             if (
@@ -16911,6 +17086,8 @@ class ChatFrame(wx.Frame):
         )
 
     def _remote_health_worker(self, stop, generation: int) -> None:
+        from tunnel_policy import TunnelRestartBudget
+        restart_budget = TunnelRestartBudget()
         failures = 0
         last_restart = float("-inf")
         while not stop.wait(30):
@@ -16926,20 +17103,32 @@ class ChatFrame(wx.Frame):
             local_ok, detail = self._verify_remote_local_health(token, port)
             local_ok = local_ok and self._remote_local_listener_ready(self._cloudflared_origin_port())
             if not local_ok:
+                restart_budget.allow(time.monotonic(), origin_healthy=False,
+                    network_available=False, channels_healthy=False)
                 failures = 0
                 public_ok = False
                 detail = detail or "cloudflared origin 未监听。"
             else:
                 public_ok, detail = self._verify_remote_public_ws(published_url)
+                if not self._remote_health_current(stop, generation):
+                    return
                 failures = 0 if public_ok else failures + 1
-                if failures >= 2 and time.monotonic() - last_restart >= 120:
-                    if not self._query_cloudflared_service().get("exists"):
-                        return
+                channels = self._owned_cloudflared_channel_count()
+                network_available = public_ok or self._remote_external_route_ready(published_url)
+                if restart_budget.allow(time.monotonic(), origin_healthy=local_ok,
+                        network_available=network_available, channels_healthy=public_ok or channels is None or channels > 0):
                     with self._remote_health_lock:
                         if not self._remote_health_current(stop, generation):
                             return
                         last_restart = time.monotonic()
-                    restarted = self._restart_cloudflared_service(stop_event=stop)
+                    owned = getattr(self, "_managed_cloudflared_process", None)
+                    if owned is not None or getattr(self, "_managed_cloudflared_start_failed", False):
+                        self._stop_managed_cloudflared_process()
+                        restarted = self._start_managed_cloudflared_process(self._cloudflared_origin_port())
+                    elif os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") == "service":
+                        restarted = self._restart_cloudflared_service(stop_event=stop)
+                    else:
+                        restarted = False
                     if not self._remote_health_current(stop, generation):
                         return
                     if restarted:
@@ -16966,6 +17155,60 @@ class ChatFrame(wx.Frame):
                         self.SetStatusText("远程 NATS 公网连接已恢复" if ready else f"远程 NATS 连接降级：{error}")
 
                 self._call_after_if_alive(notify)
+
+    def _remote_external_route_ready(self, published_url: str) -> bool:
+        """A DNS/TCP route probe gates restart; it never asserts UDP health."""
+        host = urlsplit(published_url).hostname
+        if not host:
+            return False
+        try:
+            with socket.create_connection((host, 443), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def _owned_cloudflared_channel_count(self) -> int | None:
+        process = getattr(self, "_managed_cloudflared_process", None)
+        if process is None:
+            if getattr(self, "_managed_cloudflared_start_failed", False):
+                return 0
+            if os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") != "service":
+                return None
+            return None if self._query_cloudflared_service().get("running") else 0
+        if process.poll() is not None:
+            return 0
+        # A positive registration is never negated by a generic HTTP failure.
+        # Missing channel evidence is unknown and cannot authorize restart.
+        process_id = getattr(process, "pid", None)
+        if getattr(self, "_managed_cloudflared_channel_pid", None) != process_id:
+            self._managed_cloudflared_channel_pid = process_id
+            self._managed_cloudflared_channels = {}
+            self._managed_cloudflared_channel_offset = 0
+        channels = getattr(self, "_managed_cloudflared_channels", {})
+        offset = int(getattr(self, "_managed_cloudflared_channel_offset", 0))
+        try:
+            with self._managed_cloudflared_log_path().open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                size = log.tell()
+                if size < offset or size - offset > 1024 * 1024:
+                    self._managed_cloudflared_channels = {}
+                    self._managed_cloudflared_channel_offset = size
+                    return None
+                log.seek(offset)
+                fresh = log.read().decode("utf-8", errors="replace")
+                self._managed_cloudflared_channel_offset = size
+        except OSError:
+            return None
+        for line in fresh.splitlines():
+            index = re.search(r"connIndex=(\d+)", line)
+            if index is None:
+                continue
+            if "Registered tunnel connection" in line:
+                channels[index.group(1)] = True
+            elif "Unregistered tunnel connection" in line or "Connection terminated" in line:
+                channels[index.group(1)] = False
+        self._managed_cloudflared_channels = channels
+        return sum(channels.values()) if channels else None
 
     def _stop_cloudflared_origin_proxy(self) -> None:
         proxy = getattr(self, "_cloudflared_origin_proxy", None)
@@ -17086,6 +17329,8 @@ class ChatFrame(wx.Frame):
                 port=tcp_port,
                 websocket_host="127.0.0.1",
                 websocket_port=websocket_port,
+                role_permissions=True,
+                pair_id=self._read_pair_id(),
             )
             tcp_url = f"nats://127.0.0.1:{config.port}"
             websocket_url = f"ws://127.0.0.1:{config.websocket_port}/nats"
@@ -17119,6 +17364,7 @@ class ChatFrame(wx.Frame):
                 transport = RemoteNatsTransport(
                     pair_id=self._read_pair_id(),
                     token=token,
+                    desktop_password=config.desktop_password,
                     on_message=lambda payload: self._run_remote_ui_route(self._remote_api_message_ui, payload),
                     on_new_chat=lambda payload: self._run_remote_ui_route(self._remote_api_new_chat_ui, payload),
                     on_reply_request=lambda payload: self._run_remote_ui_route(self._remote_api_reply_request_ui, payload),
@@ -17138,6 +17384,7 @@ class ChatFrame(wx.Frame):
                     on_common_commands_move_up=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_up_ui, payload),
                     on_common_commands_move_down=lambda payload: self._run_remote_ui_route(self._remote_api_common_commands_move_down_ui, payload),
                     on_history_list=lambda: self._run_remote_ui_route(self._remote_api_history_list_ui),
+                    on_history_page=self._remote_api_history_collection_worker,
                     on_history_read=lambda payload: self._run_remote_ui_route(self._remote_api_history_read_ui, payload),
                     on_chat_read_changed=lambda payload: wx.CallAfter(self._on_chat_read_changed, payload),
                     on_execution_page=lambda payload: self._remote_api_execution_page_ui(payload, secret=token),
@@ -17459,6 +17706,12 @@ class ChatFrame(wx.Frame):
         rewritten, changed = self._replace_cloudflared_service_url(current_bin_path, websocket_port)
         if rewritten is None:
             return self._cloudflared_process_targets_port(websocket_port), False
+        requested_protocol = os.environ.get("REMOTE_CONTROL_CLOUDFLARED_PROTOCOL")
+        if requested_protocol is not None:
+            from tunnel_policy import connector_argv
+            rewritten = subprocess.list2cmdline(connector_argv(rewritten, origin_port=websocket_port,
+                protocol=requested_protocol.strip().lower()))
+            changed = rewritten != current_bin_path
         if not changed:
             return True, False
         if not self._set_cloudflared_service_bin_path(rewritten):
@@ -17508,7 +17761,9 @@ class ChatFrame(wx.Frame):
         return not cancelled() and self._query_cloudflared_service()["running"] and not cancelled()
 
     def _kill_cloudflared_processes(self) -> None:
-        self._run_remote_check_command(["taskkill", "/F", "/IM", "cloudflared.exe"], timeout=15.0)
+        # Only the child handle created by this window conveys ownership. A
+        # process name or matching origin never authorizes killing another tunnel.
+        self._stop_managed_cloudflared_process()
 
     def _replace_stale_cloudflared_with_managed(self, origin_port: int) -> bool:
         self._kill_cloudflared_processes()
@@ -17541,30 +17796,50 @@ class ChatFrame(wx.Frame):
 
     def _managed_cloudflared_command_line(self, websocket_port: int) -> str:
         state = self._query_cloudflared_service()
-        command_line = str(state.get("binary_path") or "").strip()
+        command_line = str(os.environ.get("REMOTE_CONTROL_CLOUDFLARED_COMMAND") or state.get("binary_path") or "").strip()
         if not command_line:
             for candidate in self._query_cloudflared_process_command_lines():
-                if " tunnel run " in f" {candidate} ".lower():
+                matched, changed = self._replace_cloudflared_service_url(candidate, websocket_port)
+                if matched is not None and not changed and " tunnel run " in f" {candidate} ".lower():
                     command_line = candidate
                     break
         if not command_line:
             return ""
-        rewritten, _changed = self._replace_cloudflared_service_url(command_line, websocket_port)
-        if rewritten is not None:
-            return rewritten
-        return f'{command_line} --url http://127.0.0.1:{int(websocket_port)}'
+        from tunnel_policy import connector_argv
+        argv = connector_argv(command_line, origin_port=websocket_port,
+            protocol=os.environ.get("REMOTE_CONTROL_CLOUDFLARED_PROTOCOL", "auto").strip().lower())
+        return subprocess.list2cmdline(argv)
 
     def _start_managed_cloudflared_process(self, websocket_port: int) -> bool:
         existing = getattr(self, "_managed_cloudflared_process", None)
         if existing is not None and existing.poll() is None:
             return True
-        command_line = self._managed_cloudflared_command_line(websocket_port)
-        if not command_line:
+        from tunnel_policy import ConnectorLease
+        try:
+            command_line = self._managed_cloudflared_command_line(websocket_port)
+            if not command_line:
+                return False
+            lease = ConnectorLease(resolve_app_data_dir() / "cloudflared" / "owners", self._read_pair_id(), command_line)
+        except (ValueError, OSError):
+            self._set_status_text_safe("cloudflared connector configuration or credential unavailable")
             return False
-        log_path = self._managed_cloudflared_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._close_managed_cloudflared_log()
-        self._managed_cloudflared_log_handle = log_path.open("ab", buffering=0)
+        try:
+            lease.acquire()
+        except OSError:
+            self._set_status_text_safe("cloudflared connector owner already active")
+            return False
+        self._managed_cloudflared_lease = lease
+        try:
+            log_path = self._managed_cloudflared_log_path()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._close_managed_cloudflared_log()
+            if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
+                log_path.replace(log_path.with_suffix(".log.1"))
+            self._managed_cloudflared_log_handle = log_path.open("ab", buffering=0)
+        except OSError:
+            lease.close()
+            self._managed_cloudflared_lease = None
+            return False
         popen_kwargs = {
             "stdin": subprocess.DEVNULL,
             "stdout": self._managed_cloudflared_log_handle,
@@ -17577,6 +17852,7 @@ class ChatFrame(wx.Frame):
             popen_kwargs["startupinfo"] = startupinfo
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
+            self._managed_cloudflared_start_failed = True
             self._managed_cloudflared_process = subprocess.Popen(command_line, **popen_kwargs)
             deadline = time.monotonic() + 0.5
             while time.monotonic() < deadline:
@@ -17584,11 +17860,14 @@ class ChatFrame(wx.Frame):
                     detail = self._managed_cloudflared_diagnostic()
                     self._set_status_text_safe(f"cloudflared process exited during startup; {detail}")
                     self._managed_cloudflared_process = None
+                    lease.close()
                     self._close_managed_cloudflared_log()
                     return False
                 time.sleep(0.05)
+            self._managed_cloudflared_start_failed = False
             return True
         except Exception as exc:
+            lease.close()
             self._managed_cloudflared_process = None
             detail = self._managed_cloudflared_diagnostic()
             self._set_status_text_safe(f"cloudflared process failed to start: {exc}; {detail}")
@@ -17619,6 +17898,8 @@ class ChatFrame(wx.Frame):
         """
         state = self._query_cloudflared_service()
         if state.get("exists"):
+            if os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") != "service":
+                return False, "service", "cloudflared service ownership requires explicit REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE=service deployment configuration"
             configured, reconfigured = self._ensure_cloudflared_service_url(origin_port)
             if not configured:
                 return (
@@ -17665,6 +17946,8 @@ class ChatFrame(wx.Frame):
         process = getattr(self, "_managed_cloudflared_process", None)
         exit_code = process.poll() if process is not None else None
         return (
+            f"owner=mc:{getattr(self, 'remote_nats_pair_id', 'default')}; pid={getattr(process, 'pid', None)}; "
+            f"protocol={os.environ.get('REMOTE_CONTROL_CLOUDFLARED_PROTOCOL', 'auto')}; "
             f"exit_code={exit_code}; log: {self._managed_cloudflared_log_path()}; "
             f"tail: {self._managed_cloudflared_log_tail()}"
         )
@@ -17679,9 +17962,13 @@ class ChatFrame(wx.Frame):
                 pass
 
     def _stop_managed_cloudflared_process(self) -> None:
+        lease = getattr(self, "_managed_cloudflared_lease", None)
+        self._managed_cloudflared_lease = None
         process = getattr(self, "_managed_cloudflared_process", None)
         self._managed_cloudflared_process = None
         if process is None or process.poll() is not None:
+            if lease is not None:
+                lease.close()
             self._close_managed_cloudflared_log()
             return
         try:
@@ -17694,6 +17981,8 @@ class ChatFrame(wx.Frame):
             except Exception:
                 pass
         finally:
+            if lease is not None:
+                lease.close()
             self._close_managed_cloudflared_log()
 
     def _remote_runtime_probe_host(self) -> str:
@@ -17743,7 +18032,7 @@ class ChatFrame(wx.Frame):
                         if not nats_token:
                             return False, "公网 NATS 隧道认证令牌缺失。"
                         await ws.send_str(
-                            f"CONNECT {json.dumps({'auth_token': nats_token, 'verbose': False}, separators=(',', ':'))}\r\nPING\r\n"
+                            f"CONNECT {json.dumps({'user': 'mobile', 'pass': nats_token, 'verbose': False}, separators=(',', ':'))}\r\nPING\r\n"
                         )
                         while True:
                             message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)

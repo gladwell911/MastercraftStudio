@@ -1895,6 +1895,7 @@ def test_fixed_domain_remote_reenables_autostart_after_stale_disabled_state(fram
 
 
 def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_failure(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
     frame._remote_nats_transport = object()
@@ -1940,6 +1941,7 @@ def test_remote_startup_connectivity_restarts_cloudflared_after_public_probe_fai
 
 
 def test_remote_startup_connectivity_uses_managed_cloudflared_when_service_is_missing(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18081/nats"
@@ -1987,6 +1989,7 @@ def test_remote_startup_connectivity_uses_managed_cloudflared_when_service_is_mi
 
 
 def test_remote_startup_connectivity_targets_cloudflared_origin_proxy(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18081/nats"
@@ -1997,6 +2000,7 @@ def test_remote_startup_connectivity_targets_cloudflared_origin_proxy(frame, mon
         "websocket_url": "ws://127.0.0.1:18081/nats",
         "cloudflared_url": "wss://rc.tingyou.cc/nats",
     }
+    monkeypatch.setattr(frame, "_query_cloudflared_service", lambda: {"exists": True, "running": True})
     configured_ports = []
     started_proxy = []
     monkeypatch.setattr(
@@ -2093,6 +2097,7 @@ def test_remote_startup_connectivity_fails_before_public_probe_when_service_is_s
 
 
 def test_public_file_route_uses_available_cloudflared_origin_port(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_port = 18080
     frame.remote_nats_runtime_status = {
         "enabled": True,
@@ -2177,6 +2182,7 @@ def test_remote_startup_uses_reconfigured_service_without_duplicate_managed_conn
 
 
 def test_managed_cloudflared_verification_checks_its_own_pid_command_line(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame._managed_cloudflared_process = SimpleNamespace(pid=1234, poll=lambda: None)
     frame._cloudflared_origin_proxy_port = 19080
     monkeypatch.setattr(frame, "_query_process_command_line", lambda pid: "cloudflared tunnel --url http://127.0.0.1:4200")
@@ -2231,6 +2237,7 @@ def test_public_file_route_refuses_duplicate_connector_when_stale_service_cannot
 
 
 def test_remote_startup_connectivity_waits_for_managed_cloudflared_process_public_probe(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18080/nats"
     frame._remote_nats_transport = object()
@@ -2434,6 +2441,7 @@ def test_verify_remote_public_ws_rejects_non_info_nats_greeting(frame, monkeypat
 
 
 def test_restart_cloudflared_service_does_not_kill_unrelated_connectors_when_stop_sticks(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     monkeypatch.setattr(
         frame,
         "_query_cloudflared_service",
@@ -2453,6 +2461,7 @@ def test_restart_cloudflared_service_does_not_kill_unrelated_connectors_when_sto
 
 
 def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     qc_output = (
         "SERVICE_NAME: cloudflared\r\n"
         "        TYPE              : 10  WIN32_OWN_PROCESS\r\n"
@@ -2488,6 +2497,7 @@ def test_cloudflared_service_rewrites_stale_url(frame, monkeypatch):
 
 
 def test_cloudflared_service_rewrites_equals_style_stale_url(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     state = {
         "exists": True,
         "running": True,
@@ -2511,6 +2521,7 @@ def test_cloudflared_service_rewrites_equals_style_stale_url(frame, monkeypatch)
 
 
 def test_remote_startup_reconfigures_stale_running_cloudflared_service(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_host = "0.0.0.0"
     frame.remote_control_port = 18080
     frame.remote_control_runtime_bind = "ws://127.0.0.1:18082/nats"
@@ -2541,6 +2552,7 @@ def test_remote_startup_reconfigures_stale_running_cloudflared_service(frame, mo
 
 
 def test_cloudflared_process_can_satisfy_origin_when_service_is_missing(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     monkeypatch.setattr(
         frame,
         "_query_cloudflared_service",
@@ -2561,6 +2573,7 @@ def test_cloudflared_process_can_satisfy_origin_when_service_is_missing(frame, m
 
 
 def test_cloudflared_origin_bridge_repoints_portproxy_to_origin_proxy(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_port = 18080
     frame._remote_nats_websocket_port = 18081
     frame._cloudflared_origin_proxy_port = 19080
@@ -2617,6 +2630,7 @@ def test_cloudflared_origin_bridge_repoints_portproxy_to_origin_proxy(frame, mon
 
 
 def test_cloudflared_origin_port_prefers_existing_portproxy_target(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_port = 18080
 
     def fake_run(args, timeout=10.0):
@@ -2648,6 +2662,7 @@ def test_cloudflared_origin_port_prefers_existing_portproxy_target(frame, monkey
 
 
 def test_cloudflared_origin_port_keeps_current_proxy_when_portproxy_points_to_it(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
     frame.remote_control_port = 18080
     frame._cloudflared_origin_proxy = SimpleNamespace(listen_port=19081)
 
@@ -23251,3 +23266,40 @@ def test_switched_chat_final_rejects_stale_generation(frame, monkeypatch, clear_
     frame._on_codex_event_for_chat("switch-owner", _switched_chat_final_event(
         "turn_completed", generation, status="completed"))
     assert [(turn.get("answer_md"), turn.get("request_status")) for turn in archived["turns"]] == before
+
+
+def test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lease(frame, monkeypatch, tmp_path):
+    import base64
+    from tunnel_policy import ConnectorLease, split_command_line
+    token_file = tmp_path / "cloudflared-laptop" / "token.txt"
+    token_file.parent.mkdir()
+    token_file.write_text(base64.b64encode(json.dumps({"a": "fixture", "t":
+        "3ac4c76d-ded4-438b-92a8-8d5c2aff037c", "s": "private-test-secret"}).encode()).decode(), encoding="utf-8")
+    command = main.subprocess.list2cmdline(["cloudflared.exe", "tunnel", "run", "--token-file",
+        token_file.as_posix(), "--url", "http://127.0.0.1:4200"])
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_COMMAND", command)
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_PROTOCOL", "http2")
+    monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(frame, "_read_pair_id", lambda: "laptop")
+    monkeypatch.setattr(frame, "_managed_cloudflared_log_path", lambda: tmp_path / "connector.log")
+    monkeypatch.setattr(frame, "_query_cloudflared_service", lambda: {"exists": False})
+    calls, statuses = [], []
+    process = SimpleNamespace(pid=4242, poll=lambda: None, terminate=lambda: calls.append("terminate"),
+        wait=lambda timeout: None)
+    monkeypatch.setattr(main.subprocess, "Popen", lambda argv, **kwargs: calls.append(argv) or process)
+    monkeypatch.setattr(frame, "_set_status_text_safe", statuses.append)
+    assert frame._start_managed_cloudflared_process(18080)
+    argv = split_command_line(calls[0])
+    assert argv[argv.index("--token-file") + 1] == token_file.as_posix()
+    assert argv[-2:] == ["--url", "http://127.0.0.1:18080"]
+    assert argv[argv.index("--protocol") + 1] == "http2"
+    competing = ConnectorLease(tmp_path / "cloudflared" / "owners", "laptop", command)
+    with pytest.raises(OSError):
+        competing.acquire()
+    frame._stop_managed_cloudflared_process()
+    competing.acquire()
+    competing.close()
+    token_file.unlink()
+    assert frame._start_managed_cloudflared_process(18080) is False
+    assert len([value for value in calls if value != "terminate"]) == 1
+    assert all("private-test-secret" not in value and str(token_file) not in value for value in statuses)

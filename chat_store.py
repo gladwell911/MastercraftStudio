@@ -33,6 +33,7 @@ class ChatStore:
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS chats (
@@ -167,6 +168,41 @@ class ChatStore:
                     pair_id TEXT NOT NULL, consumer_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL,
                     PRIMARY KEY(pair_id, consumer_id, domain)
                 );
+                CREATE TABLE IF NOT EXISTS notification_devices (
+                    pair_id TEXT NOT NULL, device_id TEXT NOT NULL, baseline INTEGER NOT NULL,
+                    processed_sequence INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(pair_id,device_id)
+                );
+                CREATE TABLE IF NOT EXISTS remote_content_pages (
+                    content_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, content TEXT NOT NULL, expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS notification_snapshots (
+                    snapshot_id TEXT PRIMARY KEY, pair_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                    high_water INTEGER NOT NULL, incarnation TEXT NOT NULL, row_count INTEGER NOT NULL,
+                    delivered_count INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE TABLE IF NOT EXISTS notification_snapshot_rows (
+                    snapshot_id TEXT NOT NULL, row_index INTEGER NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id,row_index)
+                );
+                CREATE TABLE IF NOT EXISTS authority_cache_revision (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO authority_cache_revision VALUES(1,0);
+                CREATE TRIGGER IF NOT EXISTS authority_chats_insert AFTER INSERT ON chats BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_chats_delete AFTER DELETE ON chats BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_read_generations_insert AFTER INSERT ON read_generations BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_read_generations_update AFTER UPDATE ON read_generations BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_read_generations_delete AFTER DELETE ON read_generations BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_readable_answers_insert AFTER INSERT ON readable_answers BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_readable_answers_update AFTER UPDATE ON readable_answers BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_readable_answers_delete AFTER DELETE ON readable_answers BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_chat_read_state_insert AFTER INSERT ON chat_read_state BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_chat_read_state_update AFTER UPDATE ON chat_read_state BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_chat_read_state_delete AFTER DELETE ON chat_read_state BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
+                CREATE TRIGGER IF NOT EXISTS authority_owner_revision AFTER UPDATE OF revision ON v2_chat_state WHEN OLD.revision<>NEW.revision BEGIN UPDATE authority_cache_revision SET revision=revision+1 WHERE singleton=1; END;
                 CREATE TABLE IF NOT EXISTS identity_quarantine (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL, event_id TEXT,
                     payload_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch())
@@ -431,7 +467,8 @@ class ChatStore:
             return created
 
     def _insert_clear_fact_conn(self, conn: sqlite3.Connection, pair_id: str, domain: str,
-                                operation_id: str, chat_id: str, revision: int, state: str) -> None:
+                                operation_id: str, chat_id: str, revision: int, state: str,
+                                *, kind: str = "clear_context") -> None:
         conn.execute("INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)", (pair_id, "__pair__"))
         feed = conn.execute("SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'", (pair_id,)).fetchone()
         if int(feed["sync_sequence"]) >= MAX_INT64:
@@ -443,7 +480,7 @@ class ChatStore:
             (event_base, f"{event_base}-%"),
         ).fetchone()["n"])
         event_id = event_base if occurrence == 0 else f"{event_base}-{occurrence + 1}"
-        envelope = {"protocol_version": 2, "event_id": event_id, "kind": "clear_context", "chat_id": chat_id,
+        envelope = {"protocol_version": 2, "event_id": event_id, "kind": kind, "chat_id": chat_id,
                     "domain": domain, "sequence_domain": domain, "origin_client": "mc",
                     "revision": revision, "sync_sequence": sync,
                     "body": {"operation_id": operation_id, "state": state}}
@@ -453,7 +490,7 @@ class ChatStore:
         payload = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         conn.execute("UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'", (sync, pair_id))
         conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,revision,sync_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                     (event_id, digest, "clear_context", pair_id, domain, chat_id, revision, sync, payload))
+                     (event_id, digest, kind, pair_id, domain, chat_id, revision, sync, payload))
         conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)",
                      (pair_id, domain, sync, event_id, domain, payload.encode("utf-8")))
 
@@ -792,6 +829,29 @@ class ChatStore:
             conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)", (str(pair_id),str(domain),sync,event_id,str(domain),payload))
             return normalized
 
+    def commit_attention_notification(self, *, pair_id: str, chat_id: str, kind: str,
+                                      operation_id: str, text: str) -> dict[str, Any]:
+        """An actionable fact has event identity, never an answer read sequence."""
+        if kind not in {"action_required", "failed"} or not str(operation_id).strip():
+            raise ValueError("INVALID_ATTENTION_NOTIFICATION")
+        owner = self.normalize_chat_id(chat_id)
+        state = self.get_chat_read_state(owner, pair_id=pair_id)
+        with self._connect() as conn:
+            row = conn.execute("SELECT title FROM chats WHERE id=?", (owner,)).fetchone()
+        if row is None:
+            raise ValueError("CHAT_NOT_FOUND")
+        event_id = "attention:" + hashlib.sha256(json.dumps(
+            [pair_id, owner, state["generation"], kind, operation_id], separators=(",", ":")).encode()).hexdigest()
+        # Retries return the immutable original, including its original title.
+        with self._connect() as conn:
+            existing = conn.execute("SELECT envelope_json FROM durable_facts WHERE event_id=?", (event_id,)).fetchone()
+        if existing:
+            return json.loads(existing[0])
+        return self.commit_durable_fact(pair_id=pair_id, domain="events", envelope={
+            "event_id": event_id, "kind": kind, "chat_id": owner, "origin_client": "mc",
+            "body": {"generation": state["generation"], "chat_title": str(row[0] or "Chat"),
+                     "text": str(text).strip(), "operation_id": str(operation_id)}})
+
     def paired_feed_high_water(self, *, pair_id: str, domain: str = "events") -> dict[str, Any]:
         """Return one authoritative paired-feed watermark for a v2 startup handshake."""
         normalized_pair = str(pair_id or "").strip()
@@ -803,7 +863,9 @@ class ChatStore:
                 "SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'",
                 (normalized_pair,),
             ).fetchone()
+            authority = int(conn.execute("SELECT revision FROM authority_cache_revision WHERE singleton=1").fetchone()[0])
         return {
+            "authority_high_sync_sequence": authority,
             "sequence_domain": normalized_domain,
             "high_sync_sequence": int(row["sync_sequence"]) if row else 0,
         }
@@ -821,6 +883,22 @@ class ChatStore:
         origin_client: str = "mc",
     ) -> dict[str, Any]:
         """Commit one pair-scoped notification fact backed by a canonical message."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return self._commit_message_notification_fact_conn(conn, pair_id=pair_id, domain=domain, chat_id=chat_id, message_id=message_id, notification_kind=notification_kind, text=text, chat_title=chat_title, origin_client=origin_client)
+
+    def _commit_message_notification_fact_conn(
+        self, conn: sqlite3.Connection,
+        *,
+        pair_id: str,
+        domain: str,
+        chat_id: str,
+        message_id: str,
+        notification_kind: str,
+        text: str,
+        chat_title: str,
+        origin_client: str = "mc",
+    ) -> dict[str, Any]:
         if not self.v2_writes_enabled:
             raise RuntimeError("V2_READ_ONLY_RECOVERY")
         owner = self.normalize_chat_id(chat_id)
@@ -834,117 +912,316 @@ class ChatStore:
         if (not normalized_pair or not normalized_domain or not normalized_message
                 or expected_role is None or "\x00" in normalized_pair + normalized_domain):
             raise ValueError("INVALID_NOTIFICATION_FACT")
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index,t.payload_json,c.title "
-                "FROM canonical_messages cm "
-                "JOIN turns t ON t.chat_id=cm.chat_id AND t.turn_index=cm.legacy_turn_index "
-                "JOIN chats c ON c.id=cm.chat_id WHERE cm.message_id=?",
-                (normalized_message,),
-            ).fetchone()
-            if row is None or str(row["chat_id"]) != owner or str(row["role"]) != expected_role:
-                raise ValueError("STALE_CANONICAL_NOTIFICATION")
-            turn = self._json_dict(row["payload_json"])
-            canonical_text = str(turn.get("question" if expected_role == "user" else "answer_md") or "")
-            normalized_origin = str(origin_client or "mc").strip().lower()
-            if not normalized_origin or "\x00" in normalized_origin:
-                raise ValueError("INVALID_ORIGIN_CLIENT")
-            event_id = f"notification:{normalized_pair}:{normalized_message}:{normalized_kind}"
-            existing = conn.execute(
-                "SELECT envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?",
-                (event_id,),
-            ).fetchone()
-            if existing:
-                original = json.loads(existing["envelope_json"])
-                # A rename changes current presentation, never a committed fact.
-                # Still validate every immutable owner and canonical message field.
-                immutable = {
-                    "protocol_version": 2, "event_id": event_id,
-                    "kind": normalized_kind, "chat_id": owner,
-                    "turn_id": str(row["turn_id"]), "domain": normalized_domain,
-                    "sequence_domain": normalized_domain,
-                    "origin_client": normalized_origin,
-                }
-                original_body = original.get("body", {})
-                if (existing["pair_id"] != normalized_pair
-                        or existing["domain"] != normalized_domain
-                        or any(original.get(key) != value for key, value in immutable.items())
-                        or original_body.get("message_id") != normalized_message
-                        or original_body.get("text") != canonical_text):
-                    self._quarantine_conn(conn, "EVENT_ID_CONFLICT", immutable, event_id)
-                    conn.commit()
-                    raise ValueError("EVENT_ID_CONFLICT")
-                return original
-            canonical_title = str(row["title"] or "").strip()
-            if not canonical_text.strip() or not canonical_title:
-                raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
-            envelope = {
-                "protocol_version": 2,
-                "event_id": event_id,
-                "kind": normalized_kind,
-                "chat_id": owner,
-                "turn_id": str(row["turn_id"]),
-                "domain": normalized_domain,
+        row = conn.execute(
+            "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index,t.payload_json,c.title "
+            "FROM canonical_messages cm "
+            "JOIN turns t ON t.chat_id=cm.chat_id AND t.turn_index=cm.legacy_turn_index "
+            "JOIN chats c ON c.id=cm.chat_id WHERE cm.message_id=?",
+            (normalized_message,),
+        ).fetchone()
+        if row is None or str(row["chat_id"]) != owner or str(row["role"]) != expected_role:
+            raise ValueError("STALE_CANONICAL_NOTIFICATION")
+        turn = self._json_dict(row["payload_json"])
+        canonical_text = str(turn.get("question" if expected_role == "user" else "answer_md") or "")
+        normalized_origin = str(origin_client or "mc").strip().lower()
+        if not normalized_origin or "\x00" in normalized_origin:
+            raise ValueError("INVALID_ORIGIN_CLIENT")
+        event_id = f"notification:{normalized_pair}:{normalized_message}:{normalized_kind}"
+        existing = conn.execute(
+            "SELECT envelope_json,pair_id,domain FROM durable_facts WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if existing:
+            original = json.loads(existing["envelope_json"])
+            # A rename changes current presentation, never a committed fact.
+            # Still validate every immutable owner and canonical message field.
+            immutable = {
+                "protocol_version": 2, "event_id": event_id,
+                "kind": normalized_kind, "chat_id": owner,
+                "turn_id": str(row["turn_id"]), "domain": normalized_domain,
                 "sequence_domain": normalized_domain,
                 "origin_client": normalized_origin,
-                "body": {
-                    "message_id": normalized_message,
-                    "text": canonical_text,
-                    "chat_title": canonical_title,
-                },
             }
-            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
-            state = conn.execute(
-                "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
-            ).fetchone()
-            conn.execute(
-                "INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)",
-                (normalized_pair, "__pair__"),
-            )
-            feed = conn.execute(
-                "SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'",
-                (normalized_pair,),
-            ).fetchone()
-            if int(feed["sync_sequence"]) >= MAX_INT64:
-                raise OverflowError("SYNC_SEQUENCE_OVERFLOW")
-            sync_sequence = int(feed["sync_sequence"]) + 1
-            normalized = {
-                **envelope,
-                "revision": int(state["revision"]),
-                "sync_sequence": sync_sequence,
-            }
-            if expected_role == "assistant":
-                readable = conn.execute("SELECT a.answer_seq,a.generation FROM readable_answers a JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.message_id=?", (normalized_message,)).fetchone()
-                if readable is None or turn.get("request_status") != "done":
-                    raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
-                normalized["body"].update({"answer_seq": int(readable[0]), "generation": readable[1]})
-            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-            normalized["canonical_hash"] = digest
-            canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            conn.execute(
-                "UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'",
-                (sync_sequence, normalized_pair),
-            )
-            conn.execute(
-                "INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (event_id, digest, normalized_kind, normalized_pair, normalized_domain,
-                 owner, str(row["turn_id"]), int(state["revision"]), sync_sequence,
-                 None, canonical),
-            )
-            conn.execute(
-                "INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)",
-                (normalized_pair, normalized_domain, sync_sequence, event_id,
-                 normalized_domain, canonical.encode("utf-8")),
-            )
-            return normalized
+            original_body = original.get("body", {})
+            if (existing["pair_id"] != normalized_pair
+                    or existing["domain"] != normalized_domain
+                    or any(original.get(key) != value for key, value in immutable.items())
+                    or original_body.get("message_id") != normalized_message
+                    or original_body.get("text") != canonical_text):
+                self._quarantine_conn(conn, "EVENT_ID_CONFLICT", immutable, event_id)
+                conn.commit()
+                raise ValueError("EVENT_ID_CONFLICT")
+            return original
+        canonical_title = str(row["title"] or "").strip()
+        if not canonical_text.strip() or not canonical_title:
+            raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
+        envelope = {
+            "protocol_version": 2,
+            "event_id": event_id,
+            "kind": normalized_kind,
+            "chat_id": owner,
+            "turn_id": str(row["turn_id"]),
+            "domain": normalized_domain,
+            "sequence_domain": normalized_domain,
+            "origin_client": normalized_origin,
+            "body": {
+                "message_id": normalized_message,
+                "text": canonical_text,
+                "chat_title": canonical_title,
+            },
+        }
+        conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
+        state = conn.execute(
+            "SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)
+        ).fetchone()
+        conn.execute(
+            "INSERT OR IGNORE INTO v2_feed_state(pair_id,domain) VALUES(?,?)",
+            (normalized_pair, "__pair__"),
+        )
+        feed = conn.execute(
+            "SELECT sync_sequence FROM v2_feed_state WHERE pair_id=? AND domain='__pair__'",
+            (normalized_pair,),
+        ).fetchone()
+        if int(feed["sync_sequence"]) >= MAX_INT64:
+            raise OverflowError("SYNC_SEQUENCE_OVERFLOW")
+        sync_sequence = int(feed["sync_sequence"]) + 1
+        normalized = {
+            **envelope,
+            "revision": int(state["revision"]),
+            "sync_sequence": sync_sequence,
+        }
+        if expected_role == "assistant":
+            readable = conn.execute("SELECT a.answer_seq,a.generation FROM readable_answers a JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.message_id=?", (normalized_message,)).fetchone()
+            if readable is None or turn.get("request_status") != "done":
+                raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
+            normalized["body"].update({"answer_seq": int(readable[0]), "generation": readable[1]})
+        canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        normalized["canonical_hash"] = digest
+        canonical = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "UPDATE v2_feed_state SET sync_sequence=? WHERE pair_id=? AND domain='__pair__'",
+            (sync_sequence, normalized_pair),
+        )
+        conn.execute(
+            "INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, digest, normalized_kind, normalized_pair, normalized_domain,
+             owner, str(row["turn_id"]), int(state["revision"]), sync_sequence,
+             None, canonical),
+        )
+        conn.execute(
+            "INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)",
+            (normalized_pair, normalized_domain, sync_sequence, event_id,
+             normalized_domain, canonical.encode("utf-8")),
+        )
+        return normalized
+
+    def notification_sync(
+        self, *, pair_id: str, device_id: str, baseline: int, incarnation: str,
+        secret: str, cursor: str = "", limit: int = 100, read_only: bool = False,
+    ) -> dict[str, Any]:
+        """Materialize authority at business H; delivery is never a read receipt.
+
+        Rows survive process death and delayed outbox publication. A continuation is
+        authenticated and bound to the original installation and stream incarnation.
+        Only an explicit completion receipt advances the installation checkpoint.
+        """
+        from remote_nats_protocol import compact_notification, NOTIFY_KINDS
+        pair, device = str(pair_id).strip(), str(device_id).strip()
+        if not pair or not device or not incarnation or isinstance(baseline, bool) or not 0 <= int(baseline) <= MAX_INT64:
+            raise ValueError("INVALID_NOTIFICATION_SCOPE")
+        page_limit = max(1, min(100, int(limit)))
+        with self._connect() as conn:
+            if "authority_high" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
+                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN authority_high INTEGER NOT NULL DEFAULT 0")
+            if "processed_floor" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
+                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN processed_floor INTEGER NOT NULL DEFAULT 0")
+            if "read_only" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
+                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0")
+            # Expire abandoned and completed snapshots equally. A reset never
+            # advances the installation checkpoint, so all eligible facts remain.
+            expired = "SELECT snapshot_id FROM notification_snapshots WHERE created_at<? OR snapshot_id NOT IN (SELECT snapshot_id FROM notification_snapshots ORDER BY created_at DESC,rowid DESC LIMIT 32)"
+            conn.execute("DELETE FROM notification_snapshot_rows WHERE snapshot_id IN (" + expired + ")", (time.time() - 86400,))
+            conn.execute("DELETE FROM notification_snapshots WHERE snapshot_id IN (" + expired + ")", (time.time() - 86400,))
+            fresh = conn.execute("INSERT OR IGNORE INTO notification_devices(pair_id,device_id,baseline) VALUES(?,?,?)", (pair, device, int(baseline))).rowcount > 0
+            installation = conn.execute("SELECT * FROM notification_devices WHERE pair_id=? AND device_id=?", (pair, device)).fetchone()
+            original_baseline = int(installation["baseline"])
+            processed_floor = max(original_baseline, int(installation["processed_sequence"]))
+            conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) SELECT id,lower(hex(randomblob(16))) FROM chats")
+        if not read_only and not cursor:
+            self.reconcile_notification_finals(pair)
+        if cursor:
+            position = self._decode_execution_cursor(cursor, secret)
+            snapshot_id, offset = str(position.get("snapshot_id", "")), position.get("offset")
+        else:
+            # A WAL read transaction captures H and every authority row without
+            # retaining a database write lock while scanning the full inventory.
+            with self._connect() as source:
+                source.execute("BEGIN")
+                high_water = int(source.execute("SELECT COALESCE(MAX(sync_sequence),0) FROM durable_facts WHERE pair_id=?", (pair,)).fetchone()[0])
+                authority_high = int(source.execute("SELECT revision FROM authority_cache_revision WHERE singleton=1").fetchone()[0])
+                reusable = source.execute("SELECT * FROM notification_snapshots WHERE pair_id=? AND device_id=? AND incarnation=? AND ((?=1 AND authority_high=?) OR (?=0 AND high_water=?)) AND read_only=? AND row_count>=0 AND (?=1 OR (completed=0 AND processed_floor=?)) ORDER BY created_at DESC LIMIT 1", (pair, device, incarnation, int(read_only), authority_high, int(read_only), high_water, int(read_only), int(read_only), processed_floor)).fetchone()
+                snapshot_id, offset = (str(reusable["snapshot_id"]) if reusable else uuid.uuid4().hex), 0
+                if reusable is None:
+                    with self._connect() as writer:
+                        writer.execute("INSERT INTO notification_snapshots(snapshot_id,pair_id,device_id,high_water,incarnation,row_count,read_only,processed_floor,authority_high) VALUES(?,?,?,?,?,-1,?,?,?)", (snapshot_id, pair, device, high_water, incarnation, int(read_only), processed_floor, authority_high))
+                    def records():
+                        placeholders = ",".join("?" for _ in NOTIFY_KINDS)
+                        if not read_only:
+                            for row in source.execute(f"SELECT envelope_json FROM durable_facts WHERE pair_id=? AND sync_sequence>? AND sync_sequence<=? AND kind IN ({placeholders}) ORDER BY sync_sequence", (pair, processed_floor, high_water, *sorted(NOTIFY_KINDS))):
+                                fact = json.loads(row[0])
+                                current = source.execute("SELECT generation FROM read_generations WHERE chat_id=?", (fact["chat_id"],)).fetchone()
+                                exists = source.execute("SELECT 1 FROM chats WHERE id=?", (fact["chat_id"],)).fetchone()
+                                if not exists or (fact["kind"] in {"assistant_final", "action_required", "failed"} and (current is None or fact["body"].get("generation") != current[0])):
+                                    yield {"type": "notification_tombstone", "event_id": fact["event_id"], "chat_id": fact["chat_id"], "sync_sequence": fact["sync_sequence"]}
+                                else:
+                                    yield compact_notification(fact, pair_id=pair)
+                        for row in source.execute("SELECT id FROM chats ORDER BY id"):
+                            yield {"type": "read_state", **self._read_state_conn(source, row[0], pair)}
+                    batch, count = [], 0
+                    for record in records():
+                        batch.append((snapshot_id, count, json.dumps(record, ensure_ascii=False, separators=(",", ":"))))
+                        count += 1
+                        if len(batch) == 100:
+                            with self._connect() as writer:
+                                writer.executemany("INSERT INTO notification_snapshot_rows VALUES(?,?,?)", batch)
+                            batch.clear()
+                    with self._connect() as writer:
+                        writer.executemany("INSERT INTO notification_snapshot_rows VALUES(?,?,?)", batch)
+                        writer.execute("UPDATE notification_snapshots SET row_count=? WHERE snapshot_id=?", (count, snapshot_id))
+        with self._connect() as conn:
+            snapshot = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=?", (snapshot_id, pair, device)).fetchone()
+            if (snapshot is None or snapshot["incarnation"] != incarnation or isinstance(offset, bool)
+                    or not isinstance(offset, int) or not 0 <= offset <= snapshot["row_count"]):
+                raise ValueError("INVALID_NOTIFICATION_CURSOR")
+            result = {"snapshot_id": snapshot_id, "high_water": int(snapshot["high_water"]), "incarnation": incarnation, "baseline": original_baseline, "records": []}
+            # Reserve continuation/envelope overhead; UTF-8 byte accounting is the
+            # actual serialized payload, not a character estimate.
+            budget = 60 * 1024
+            size = 0
+            for row in conn.execute("SELECT payload FROM notification_snapshot_rows WHERE snapshot_id=? AND row_index>=? ORDER BY row_index LIMIT ?", (snapshot_id, offset, page_limit)):
+                encoded = str(row[0]).encode("utf-8")
+                if size + len(encoded) > budget:
+                    break
+                result["records"].append(json.loads(row[0]))
+                size += len(encoded)
+            if not result["records"] and offset < int(snapshot["row_count"]):
+                raise ValueError("NOTIFICATION_ROW_BUDGET_EXCEEDED")
+            end = offset + len(result["records"])
+            done = end == int(snapshot["row_count"])
+            token = self._execution_cursor_token({"snapshot_id": snapshot_id, "offset": end}, secret)
+            result.update({"done": done, "cursor": "" if done else token, "completion_token": token if done else ""})
+            conn.execute("UPDATE notification_snapshots SET delivered_count=MAX(delivered_count,?) WHERE snapshot_id=?", (end, snapshot_id))
+            if read_only and done:
+                conn.execute("UPDATE notification_snapshots SET completed=1 WHERE snapshot_id=?", (snapshot_id,))
+            return result
+
+    def complete_notification_sync(self, *, pair_id: str, device_id: str, incarnation: str, completion_token: str, secret: str) -> int:
+        receipt = self._decode_execution_cursor(completion_token, secret)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=? AND incarnation=?", (receipt.get("snapshot_id"), pair_id, device_id, incarnation)).fetchone()
+            if row is None or receipt.get("offset") != row["row_count"] or row["delivered_count"] != row["row_count"]:
+                raise ValueError("INCOMPLETE_NOTIFICATION_SNAPSHOT")
+            conn.execute("UPDATE notification_devices SET processed_sequence=MAX(processed_sequence,?) WHERE pair_id=? AND device_id=?", (row["high_water"], pair_id, device_id))
+            conn.execute("UPDATE notification_snapshots SET completed=1 WHERE snapshot_id=?", (row["snapshot_id"],))
+            return int(row["high_water"])
+
+    def reconcile_notification_finals(self, pair_id: str) -> None:
+        while True:
+            with self._connect() as conn:
+                count = self._reconcile_notification_finals_conn(conn, pair_id)
+            if count < 100:
+                return
+
+    def _reconcile_notification_finals_conn(self, conn: sqlite3.Connection, pair_id: str, chat_id: str | None = None) -> int:
+        sql = "SELECT a.message_id,a.chat_id,t.payload_json,c.title FROM readable_answers a JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation JOIN canonical_messages m ON m.message_id=a.message_id JOIN turns t ON t.chat_id=m.chat_id AND t.turn_index=m.legacy_turn_index JOIN chats c ON c.id=a.chat_id WHERE NOT EXISTS (SELECT 1 FROM durable_facts f WHERE f.event_id='notification:' || ? || ':' || a.message_id || ':assistant_final')"
+        args = (pair_id,)
+        if chat_id is not None:
+            sql = sql.replace("WHERE NOT EXISTS", "WHERE a.chat_id=? AND NOT EXISTS", 1)
+            args = (chat_id, pair_id)
+        candidates = conn.execute(sql + " AND json_extract(t.payload_json,'$.request_status')='done' AND length(trim(json_extract(t.payload_json,'$.answer_md')))>0 AND length(trim(c.title))>0 LIMIT 100", args).fetchall()
+        for row in candidates:
+            turn = self._json_dict(row["payload_json"])
+            if turn.get("request_status") == "done" and str(turn.get("answer_md") or "").strip():
+                self._commit_message_notification_fact_conn(conn, pair_id=pair_id, domain="events", chat_id=row["chat_id"], message_id=row["message_id"], notification_kind="assistant_final", text=turn["answer_md"], chat_title=row["title"])
+
+        return len(candidates)
+
+    def content_continuation(self, *, chat_id: str, text: str, secret: str, prefix_bytes: int = 4096) -> tuple[str, str]:
+        encoded = text.encode("utf-8")
+        if len(encoded) <= prefix_bytes:
+            return text, ""
+        prefix = encoded[:prefix_bytes].decode("utf-8", errors="ignore")
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (chat_id,))
+            state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+            revision = int(state[0]) if state else 1
+            conn.execute("DELETE FROM remote_content_pages WHERE expires_at<?", (time.time(),))
+            content_id = hashlib.sha256(json.dumps([chat_id, revision, text], ensure_ascii=False).encode()).hexdigest()
+            cached = "\x00raw:" + text if text.startswith("\x00") else text
+            if len(encoded) > 64 * 1024 * 1024:
+                reference = None
+                for field in ("question", "answer_md"):
+                    row = conn.execute("SELECT turn_index FROM turns WHERE chat_id=? AND json_extract(payload_json,?)=? LIMIT 1", (chat_id, "$." + field, text)).fetchone()
+                    if row:
+                        reference = {"table": "turns", "key": row[0], "field": field}
+                        break
+                if reference is None:
+                    for field in ("list_text", "detail_text"):
+                        row = conn.execute(f"SELECT step_index FROM execution_steps WHERE chat_id=? AND {field}=? LIMIT 1", (chat_id, text)).fetchone()
+                        if row:
+                            reference = {"table": "execution_steps", "key": row[0], "field": field}
+                            break
+                if reference is None:
+                    raise ValueError("CONTENT_CACHE_BUDGET_EXCEEDED")
+                cached = "\x00canonical:" + json.dumps(reference)
+            conn.execute("INSERT INTO remote_content_pages VALUES(?,?,?,?,?) ON CONFLICT(content_id) DO UPDATE SET expires_at=excluded.expires_at", (content_id, chat_id, revision, cached, time.time() + 86400))
+            # Bound disposable cache to 64 MiB; canonical text is never removed.
+            conn.execute("DELETE FROM remote_content_pages WHERE content_id IN (SELECT content_id FROM (SELECT content_id, SUM(length(CAST(content AS BLOB))) OVER (ORDER BY expires_at DESC,content_id) total FROM remote_content_pages) WHERE total>67108864) AND content_id<>?", (content_id,))
+        token = self._execution_cursor_token({"content_id": content_id, "chat_id": chat_id,
+            "revision": revision, "offset": len(prefix)}, secret)
+        return prefix, token
+
+    def read_content_page(self, *, chat_id: str, cursor: str, secret: str) -> dict:
+        position = self._decode_execution_cursor(cursor, secret)
+        if position.get("chat_id") != chat_id:
+            raise ValueError("CONTENT_OWNER_MISMATCH")
+        with self._connect() as conn:
+            row = conn.execute("SELECT p.*,s.revision current_revision FROM remote_content_pages p JOIN v2_chat_state s ON s.chat_id=p.chat_id WHERE p.content_id=? AND p.chat_id=?", (position.get("content_id"), chat_id)).fetchone()
+        if row is None or row["expires_at"] < time.time() or row["revision"] != row["current_revision"]:
+            raise ValueError("STALE_CONTENT_CURSOR")
+        text, offset = row["content"], position.get("offset")
+        if text.startswith("\x00raw:"):
+            text = text[len("\x00raw:"):]
+        elif text.startswith("\x00canonical:"):
+            reference = json.loads(text[len("\x00canonical:"):])
+            with self._connect() as conn:
+                if reference["table"] == "turns" and reference["field"] in {"question", "answer_md"}:
+                    value = conn.execute("SELECT json_extract(payload_json,?) FROM turns WHERE chat_id=? AND turn_index=?", ("$." + reference["field"], chat_id, reference["key"])).fetchone()
+                elif reference["table"] == "execution_steps" and reference["field"] in {"list_text", "detail_text"}:
+                    value = conn.execute(f"SELECT {reference['field']} FROM execution_steps WHERE chat_id=? AND step_index=?", (chat_id, reference["key"])).fetchone()
+                else:
+                    raise ValueError("STALE_CONTENT_CURSOR")
+            if value is None:
+                raise ValueError("STALE_CONTENT_CURSOR")
+            text = str(value[0] or "")
+            expected = hashlib.sha256(json.dumps([chat_id, row["revision"], text], ensure_ascii=False).encode()).hexdigest()
+            if expected != position.get("content_id"):
+                raise ValueError("STALE_CONTENT_CURSOR")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= len(text):
+            raise ValueError("INVALID_CONTENT_CURSOR")
+        chunk = text[offset:].encode("utf-8")[:16384].decode("utf-8", errors="ignore")
+        end = offset + len(chunk)
+        return {"chat_id": chat_id, "text": chunk, "complete": end == len(text),
+                "cursor": "" if end == len(text) else self._execution_cursor_token({**position, "offset": end}, secret)}
 
     def _read_state_conn(self, conn, chat_id, pair_id):
         if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
             raise ValueError("CHAT_NOT_FOUND")
-        conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
+        if conn.execute("SELECT 1 FROM read_generations WHERE chat_id=?", (chat_id,)).fetchone() is None:
+            conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
         generation = conn.execute("SELECT generation FROM read_generations WHERE chat_id=?", (chat_id,)).fetchone()[0]
         latest = conn.execute("SELECT a.answer_seq,a.message_id FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id WHERE a.chat_id=? AND a.generation=? ORDER BY a.answer_seq DESC LIMIT 1", (chat_id,generation)).fetchone()
         baseline = conn.execute("SELECT COALESCE(MAX(answer_seq),0) FROM readable_answers WHERE chat_id=? AND generation=? AND baseline=1", (chat_id,generation)).fetchone()[0]
@@ -1203,13 +1480,13 @@ class ChatStore:
 
     def load_execution_projection_page(
         self, *, pair_id: str, domain: str, chat_id: str,
-        secret: str | bytes, snapshot_id: str, limit: int = 100,
+        secret: str | bytes, snapshot_id: str, limit: int = 50,
         cursor: str = "", now: float | None = None,
     ) -> dict[str, Any]:
         """Page an immutable projection with an owner/revision-bound cursor."""
         owner = self.normalize_chat_id(chat_id)
         current_time = time.time() if now is None else float(now)
-        page_limit = min(100, max(1, int(limit)))
+        page_limit = min(50, max(1, int(limit)))
         with self._connect() as conn:
             state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
             current_revision = int(state["revision"]) if state else 0
@@ -1252,6 +1529,13 @@ class ChatStore:
                 (snapshot_id, start, before, page_limit),
             ).fetchall()]
         has_more = start > 0
+        for projected in selected:
+            for field in ("list_text", "detail_text"):
+                prefix, continuation = self.content_continuation(chat_id=owner,
+                    text=str(projected.get(field) or ""), secret=secret, prefix_bytes=1024)
+                if continuation:
+                    projected[field] = prefix
+                    projected[field + "_continuation"] = continuation
         next_cursor = self._execution_cursor_token({
             "v": 3, "pair": pair_id, "domain": domain, "chat": owner,
             "revision": revision, "snapshot": snapshot_id,
@@ -1364,6 +1648,7 @@ class ChatStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.create_function("unicode_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         try:
             yield conn
             conn.commit()
@@ -1434,6 +1719,16 @@ class ChatStore:
             ).fetchall()
         return [self._summary_from_row(row) for row in rows]
 
+    def list_chat_summaries_page(self, *, limit: int = 30, offset: int = 0,
+                                 query: str = "", pinned: bool = False) -> tuple[list[dict], bool]:
+        size = max(1, min(30, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute("SELECT c.*,(SELECT COUNT(*) FROM turns t WHERE t.chat_id=c.id) turn_count "
+                "FROM chats c WHERE (?='' OR instr(unicode_casefold(c.title),unicode_casefold(?))>0) AND (?=0 OR c.pinned=1) "
+                "ORDER BY c.updated_at DESC,c.id DESC LIMIT ? OFFSET ?",
+                (query, query, int(pinned), size + 1, max(0, int(offset)))).fetchall()
+        return [self._summary_from_row(row) for row in rows[:size]], len(rows) > size
+
     def load_chat(self, chat_id: str, *, include_execution_steps: bool = True) -> dict[str, Any] | None:
         normalized = str(chat_id or "").strip()
         if not normalized:
@@ -1463,6 +1758,7 @@ class ChatStore:
         if not normalized:
             return
         with self._connect() as conn:
+            self._commit_chat_delete_conn(conn, normalized)
             conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM v2_chat_state WHERE chat_id=?", (normalized,))
@@ -1476,12 +1772,24 @@ class ChatStore:
         if not normalized_ids:
             return
         with self._connect() as conn:
+            for chat_id in normalized_ids:
+                self._commit_chat_delete_conn(conn, chat_id)
             conn.executemany("DELETE FROM canonical_messages WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM canonical_turns WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM v2_chat_state WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM execution_steps WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM turns WHERE chat_id = ?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM chats WHERE id = ?", [(chat_id,) for chat_id in normalized_ids])
+
+    def _commit_chat_delete_conn(self, conn: sqlite3.Connection, chat_id: str) -> None:
+        if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
+            return
+        row = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+        revision = int(row[0]) + 1 if row else 1
+        pairs = conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM v2_feed_state WHERE domain='__pair__'").fetchall()
+        for pair in pairs:
+            self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
+                revision, "deleted", kind="chat_deleted")
 
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
@@ -1574,6 +1882,9 @@ class ChatStore:
             if str(payload.get("request_status") or "") == "done" and str(payload.get("answer_md") or "").strip():
                 conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
                 conn.execute("INSERT OR IGNORE INTO readable_answers(message_id,chat_id,generation) SELECT m.message_id,m.chat_id,g.generation FROM canonical_messages m JOIN read_generations g ON g.chat_id=m.chat_id WHERE m.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id, start + offset))
+
+        for pair in conn.execute("SELECT DISTINCT pair_id FROM notification_devices").fetchall():
+            self._reconcile_notification_finals_conn(conn, pair[0], chat_id)
 
     def count_turns(self, chat_id: str) -> int:
         normalized = str(chat_id or "").strip()

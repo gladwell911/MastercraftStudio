@@ -4,6 +4,31 @@ from types import SimpleNamespace
 import main
 
 
+def test_recent_collection_pages_search_and_stale_cursor_preserve_canonical_chats(frame):
+    frame.active_chat_id = frame.current_chat_id = ""
+    frame.active_session_turns = []
+    frame.archived_chats = [{"id": f"chat-{index}", "title": f"Archive {index}",
+                             "updated_at": index + 1, "turn_count": 100}
+                            for index in range(100)]
+    first_status, first = frame._remote_api_history_list_ui({"collection_page": True})
+    assert first_status == 200 and len(first["chats"]) == 30
+    assert first["partial"] and first["has_more"]
+    assert len(json.dumps(first, ensure_ascii=False).encode()) < 64 * 1024
+    seen = {chat["chat_id"] for chat in first["chats"]}
+    cursor = first["next_cursor"]
+    while cursor:
+        status, page = frame._remote_api_history_list_ui({"collection_page": True, "cursor": cursor})
+        assert status == 200 and len(page["chats"]) <= 30
+        seen.update(chat["chat_id"] for chat in page["chats"])
+        cursor = page["next_cursor"]
+    assert len(seen) == len(frame.archived_chats) == 100
+    _, found = frame._remote_api_history_list_ui({"collection_page": True, "query": "Archive 0"})
+    assert found["chats"][0]["chat_id"] == "chat-0"
+    frame._invalidate_remote_history_list_cache()
+    status, stale = frame._remote_api_history_list_ui({"collection_page": True, "cursor": first["next_cursor"]})
+    assert status == 409 and stale["recovery"] == "REFRESH_COLLECTION"
+
+
 def test_correlated_remote_send_persists_actual_accepted_turn_and_response(frame, monkeypatch):
     target = {"id": "archived-alias", "model": "codex/main", "turns": []}
     frame.active_chat_id = frame.current_chat_id = "visible"
@@ -838,3 +863,70 @@ def test_execution_authority_routes_and_structured_errors():
     )
     assert versioned._route_command({"type": "execution_page_v3", "chat_id": "chat"}) == (
         200, {"version": 3, "chat_id": "chat"})
+
+
+def test_remote_ui_deadline_cancels_queued_callback(frame, monkeypatch):
+    callbacks, waits = [], []
+    class Event:
+        value = False
+        def is_set(self): return self.value
+        def set(self): self.value = True
+        def wait(self, timeout): waits.append(timeout); return False
+    monkeypatch.setattr(main.threading, "Event", Event)
+    monkeypatch.setattr(main.threading, "current_thread", lambda: object())
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda callback: callbacks.append(callback) or True)
+    invoked = []
+    status, result = frame._run_remote_ui_route(lambda: invoked.append(True))
+    assert status == 503 and result["error"] == "ui_timeout"
+    assert waits == [5.0]
+    callbacks[0]()
+    assert invoked == []
+
+
+def test_sqlite_collection_worker_budgets_escaped_titles_and_unicode_search(frame, tmp_path, monkeypatch):
+    from chat_store import ChatStore
+    store = ChatStore(tmp_path / "collection.db")
+    store.initialize()
+    for index in range(45):
+        store.upsert_chat({"id": f"chat-{index}", "title": ("Stra\u00dfe" if index == 0 else "x" * 100000 + "\x01" * 10000), "updated_at": index})
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = ""
+    frame.active_session_turns = []
+    frame._current_chat_state = {}
+    monkeypatch.setattr(frame, "_run_remote_ui_route", lambda callback, payload=None: callback(payload))
+    status, first = frame._remote_api_history_collection_worker({"collection_page": True})
+    assert status == 200 and len(first["chats"]) == 30
+    assert len(json.dumps(first).encode()) < 128 * 1024
+    status, next_page = frame._remote_api_history_collection_worker({"collection_page": True, "cursor": first["next_cursor"]})
+    assert status == 200 and len(next_page["chats"]) == 15
+    _, searched = frame._remote_api_history_collection_worker({"collection_page": True, "query": "STRASSE"})
+    assert searched["chats"][0]["chat_id"] == "chat-0"
+
+
+def test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor(frame, tmp_path):
+    import asyncio
+    from chat_store import ChatStore
+    from remote_nats import RemoteNatsTransport
+    from remote_nats_protocol import encode_payload
+    store = ChatStore(tmp_path / "escaped-history.db")
+    store.initialize()
+    store.upsert_chat({"id": "escaped", "title": "Escaped"})
+    store.replace_turns("escaped", [{"question": "\x01" * 20000, "answer_md": "\x02" * 20000, "request_status": "done"} for _ in range(15)])
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = ""
+    frame.archived_chats = store.list_chat_summaries()
+    frame.active_session_turns = []
+    frame._current_chat_state = {}
+    responses = []
+    transport = RemoteNatsTransport(pair_id="fixture", token="fixture", on_history_read=frame._remote_api_history_read_ui)
+    async def capture(event, reply=None): responses.append(event)
+    transport._publish_response = capture
+    asyncio.run(transport.handle_command({"id": "history", "type": "history_read", "chat_id": "escaped"}))
+    response = responses[0]
+    assert response["status"] == 200
+    assert len(encode_payload(response)) < 128 * 1024
+    assert response["body"]["has_more"] and response["body"]["oldest_cursor"]
+    turns = response["body"]["chat"]["turns"]
+    assert len(turns) <= 10 and all(turn["answer_continuation"] and turn["answer_seq"] == 0 for turn in turns)

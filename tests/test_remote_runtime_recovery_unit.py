@@ -5,6 +5,13 @@ import threading
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_tunnel_network(monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE", "service")
+    monkeypatch.setattr("main.ChatFrame._remote_external_route_ready", lambda *_: True)
+    monkeypatch.setattr("main.ChatFrame._owned_cloudflared_channel_count", lambda *_: 0)
+
+
 def test_cloudflared_same_port_origin_preserves_ipv6_alias_without_ipv4_loop(frame, monkeypatch):
     frame.remote_control_port = 18080
     frame._cloudflared_origin_proxy_port = 18080
@@ -41,7 +48,7 @@ class _ProbeClock:
     "responses,cycles,local_ok,restarts,ready",
     [([True], 3, True, 0, True),
      ([False, True], 2, True, 0, True),
-     ([False, False, True], 2, True, 1, True),
+     ([False, False, False, True], 3, True, 1, True),
      ([False], 6, True, 2, False),
      ([False], 3, False, 0, False)],
 )
@@ -68,7 +75,7 @@ def test_remote_health_recovery_matrix(frame, monkeypatch, responses, cycles, lo
     frame._remote_health_worker(clock, frame._remote_health_generation)
     assert len(restart_times) == restarts
     if len(restart_times) > 1:
-        assert restart_times[1] - restart_times[0] >= 120
+        assert restart_times[1] - restart_times[0] >= 60
     assert frame.remote_control_runtime_status["public_ws_ready"] is ready
     assert "fixture-token" not in frame.remote_control_runtime_status["last_remote_error"]
     assert len(notifications) <= 2
@@ -100,7 +107,8 @@ def test_remote_health_discards_probe_after_stop_or_close(frame, monkeypatch, cl
 
 
 def test_remote_stop_does_not_wait_for_blocked_service_recovery(frame, monkeypatch):
-    stop = _ProbeClock(2)
+    stop = _ProbeClock(3)
+    monkeypatch.setattr("main.time.monotonic", lambda: stop.now)
     frame._remote_health_stop = stop
     frame._remote_nats_transport = object()
     frame.remote_nats_runtime_status = {"websocket_url": "ws://127.0.0.1:19080/nats"}
@@ -140,7 +148,7 @@ def test_remote_stop_does_not_wait_for_blocked_service_recovery(frame, monkeypat
     assert frame.remote_control_runtime_status == status_after_failure
 
 
-@pytest.mark.parametrize("fixed,service,expected", [(True, True, 1), (False, True, 0), (True, False, 0)])
+@pytest.mark.parametrize("fixed,service,expected", [(True, True, 1), (False, True, 0), (True, False, 1)])
 def test_remote_health_only_starts_one_service_worker(frame, monkeypatch, fixed, service, expected):
     workers = []
     class Worker:
@@ -260,7 +268,7 @@ def test_managed_cloudflared_immediate_exit_is_failure_with_redacted_diagnostic(
         )
         return _ImmediateExitProcess()
 
-    monkeypatch.setattr(frame, "_managed_cloudflared_command_line", lambda _port: "cloudflared fake")
+    monkeypatch.setattr(frame, "_managed_cloudflared_command_line", lambda _port: "cloudflared tunnel run fixture")
     monkeypatch.setattr(frame, "_read_remote_control_token", lambda: synthetic_token)
     monkeypatch.setattr(frame, "_set_status_text_safe", statuses.append)
     monkeypatch.setattr("main.subprocess.Popen", fake_popen)
@@ -281,7 +289,7 @@ def test_managed_cloudflared_live_process_is_retained_and_log_closed_on_stop(
     monkeypatch,
 ) -> None:
     live = _LiveProcess()
-    monkeypatch.setattr(frame, "_managed_cloudflared_command_line", lambda _port: "cloudflared fake")
+    monkeypatch.setattr(frame, "_managed_cloudflared_command_line", lambda _port: "cloudflared tunnel run fixture")
     monkeypatch.setattr("main.subprocess.Popen", lambda *_args, **_kwargs: live)
 
     assert frame._start_managed_cloudflared_process(19080) is True

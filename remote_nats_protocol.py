@@ -11,6 +11,35 @@ import uuid
 DEFAULT_PAIR_ID = "default"
 PROTOCOL_V2 = 2
 MAX_SIGNED_64 = (1 << 63) - 1
+RPC_CAPABILITY = "rpc-inbox-v1"
+NOTIFY_CAPABILITY = "notification-sync-v1"
+NOTIFY_KINDS = frozenset({"assistant_final", "chat_read_changed", "clear_context", "chat_deleted", "action_required", "failed"})
+
+
+def compact_notification(fact: dict, *, pair_id: str) -> dict:
+    """A wire projection has its own hash; never alter an immutable fact."""
+    validate_v2_durable(fact)
+    if fact["kind"] not in NOTIFY_KINDS:
+        raise ValueError("NOT_A_NOTIFICATION")
+    body = fact["body"]
+    projected = {key: body[key] for key in (
+        "chat_id", "revision", "message_id", "answer_seq", "generation", "read_seq", "latest_readable_seq",
+        "latest_readable_message_id", "operation_id", "state",
+    ) if key in body}
+    preview = str(body.get("text") or "").encode("utf-8")[:512].decode("utf-8", errors="ignore")
+    if preview:
+        projected["preview"] = preview
+    projected["chat_title"] = str(body.get("chat_title") or "").encode("utf-8")[:128].decode("utf-8", errors="ignore")
+    wire = {key: fact[key] for key in (
+        "protocol_version", "event_id", "kind", "chat_id", "domain", "sequence_domain",
+        "origin_client", "revision", "sync_sequence",
+    )}
+    wire.update({"pair_id": normalize_pair_id(pair_id), "projection_version": 1,
+                 "fact_hash": fact["canonical_hash"], "body": projected})
+    wire["canonical_hash"] = canonical_durable_hash(wire)
+    if len(encode_payload(wire)) > 2048:
+        raise ValueError("NOTIFICATION_METADATA_TOO_LARGE")
+    return wire
 
 
 def normalize_pair_id(value: str) -> str:
@@ -23,6 +52,13 @@ def stream_name(prefix: str, pair_id: str) -> str:
     return f"{prefix}_{normalize_pair_id(pair_id).replace('-', '_')}"
 
 
+def rpc_reply_subject(pair_id: str, device_id: str, session_id: str, request_id: str) -> str:
+    if not all(isinstance(part, str) and part.strip() and "\x00" not in part for part in (device_id, session_id, request_id)):
+        raise ValueError("INVALID_RPC_SCOPE")
+    scope = [hashlib.sha256(part.encode("utf-8")).hexdigest() for part in (device_id, session_id, request_id)]
+    return f"zgwd.{normalize_pair_id(pair_id)}.rpc-reply." + ".".join(scope)
+
+
 @dataclass(frozen=True)
 class NatsSubjects:
     pair_id: str
@@ -31,6 +67,22 @@ class NatsSubjects:
     files: str
     command_stream: str
     event_stream: str
+
+    @property
+    def rpc(self) -> str:
+        return f"zgwd.{self.pair_id}.rpc"
+
+    @property
+    def notifications(self) -> str:
+        return f"zgwd.{self.pair_id}.notify"
+
+    @property
+    def notification_stream(self) -> str:
+        return stream_name("ZGWD_NOTIFY", self.pair_id)
+
+    @property
+    def hints(self) -> str:
+        return f"zgwd.{self.pair_id}.hints"
 
     @classmethod
     def from_pair_id(cls, pair_id: str) -> "NatsSubjects":
@@ -138,6 +190,9 @@ def validate_execution_body(body: dict) -> dict:
 
 
 _V2_GLOBAL_COMMAND_TYPES = frozenset({
+    "notification_sync",
+    "notification_sync_complete",
+    "read_state_sync",
     "readiness",
     "common_commands_create",
     "common_commands_delete",

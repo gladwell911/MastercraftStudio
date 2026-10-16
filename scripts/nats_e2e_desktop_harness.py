@@ -495,6 +495,8 @@ def main() -> None:
         NatsRuntimeConfig(
             app_data_dir=app_data,
             token=token,
+            role_permissions=True,
+            pair_id=pair_id,
             host="0.0.0.0",
             port=port,
             websocket_host="127.0.0.1",
@@ -532,6 +534,7 @@ def main() -> None:
         transport = RemoteNatsTransport(
             pair_id=pair_id,
             token=token,
+            desktop_password=server.config.desktop_password,
             on_state=state.state,
             on_message=state.message,
             on_new_chat=state.new_chat,
