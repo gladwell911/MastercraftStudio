@@ -74,7 +74,7 @@ def test_package_script_builds_and_validates_before_updating_and_launching_final
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell packaging on Windows")
-@pytest.mark.parametrize("mode", ["success", "build_fail", "missing_worker", "empty_worker", "update_fail", "final_invalid", "start_fail"])
+@pytest.mark.parametrize("mode", ["success", "build_only", "build_fail", "missing_worker", "empty_worker", "update_fail", "final_invalid", "start_fail"])
 def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     import codex_client
 
@@ -156,7 +156,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
            "Microsoft.PowerShell.Management\\Copy-Item @PSBoundParameters\n"
            "if ($Destination.EndsWith('mc_worker.exe')) { [IO.File]::WriteAllBytes($Destination, [byte[]]@()) }\n}\n"
            if mode == "final_invalid" else "")
-        + f"& {quote(script)} -DistPath {quote(dist)} -WorkPath {quote(tmp_path / 'work')} -SpecPath {quote(spec)} -PythonExe {quote(fake_python)}\n"
+        + f"& {quote(script)} -DistPath {quote(dist)} -WorkPath {quote(tmp_path / 'work')} -SpecPath {quote(spec)} -PythonExe {quote(fake_python)}{' -BuildOnly' if mode == 'build_only' else ''}\n"
         + "exit $LASTEXITCODE\n",
         encoding="utf-8-sig",
     )
@@ -164,7 +164,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         [shutil.which("powershell.exe"), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
         capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    assert result.returncode == (0 if mode == "success" else 1), result.stdout + result.stderr
+    assert result.returncode == (0 if mode in {"success", "build_only"} else 1), result.stdout + result.stderr
     launch_rows = [json.loads(line) for line in launches.read_text(encoding="utf-8-sig").splitlines()] if launches.exists() else []
     assert launch_rows == ([{"file": str(package / "mc.exe"), "cwd": str(package)}] if mode == "success" else [])
     assert (home / "rollout.db").read_bytes() == b"keep-session"
@@ -180,7 +180,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     if mode in {"build_fail", "missing_worker", "empty_worker"}:
         assert (package / "mc.exe").read_bytes() == b"old-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"old-worker"
-    if mode == "success":
+    if mode in {"success", "build_only"}:
         assert (package / "mc.exe").read_bytes() == b"new-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"new-worker"
         assert not cache.exists()

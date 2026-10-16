@@ -2,7 +2,8 @@ param(
     [string]$DistPath = "D:\code\cx",
     [string]$WorkPath = "build_pyinstaller",
     [string]$SpecPath = "zgwd.spec",
-    [string]$PythonExe = ".venv\Scripts\python.exe"
+    [string]$PythonExe = ".venv\Scripts\python.exe",
+    [switch]$BuildOnly
 )
 
 Set-StrictMode -Version Latest
@@ -139,7 +140,9 @@ try {
     Remove-PackageNode -Root $resolvedDistPath -Path $stagingPath
     Assert-PackageArtifacts -PackagePath $finalPackage
     # Launch once from the final directory, without waiting for the GUI to exit.
-    Start-Process -FilePath (Join-Path $finalPackage 'mc.exe') -WorkingDirectory $finalPackage -ErrorAction Stop | Out-Null
+    if (-not $BuildOnly) {
+        Start-Process -FilePath (Join-Path $finalPackage 'mc.exe') -WorkingDirectory $finalPackage -ErrorAction Stop | Out-Null
+    }
     $exitCode = 0
 } catch {
     Write-Error -Message $_ -ErrorAction Continue

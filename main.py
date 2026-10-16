@@ -23819,9 +23819,17 @@ class ChatFrame(wx.Frame):
         winsound.MessageBeep(winsound.MB_ICONHAND)
 
 
+def app_instance_key() -> str:
+    # Separate installed copies have separate chat stores. Prevent two writers
+    # to the same store without blocking a copy installed in another directory.
+    data_path = os.path.normcase(str(resolve_app_data_dir().resolve()))
+    scope = hashlib.sha256(data_path.encode("utf-8")).hexdigest()[:24]
+    return APP_WINDOW_TITLE + "_single_instance_" + scope
+
+
 class ChatApp(wx.App):
     def OnInit(self):
-        self._checker = wx.SingleInstanceChecker(APP_WINDOW_TITLE + "_single_instance")
+        self._checker = wx.SingleInstanceChecker(app_instance_key())
         if self._checker.IsAnotherRunning():
             self._activate_existing_window()
             return False

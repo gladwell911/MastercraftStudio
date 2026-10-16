@@ -11,6 +11,8 @@
 
 ## 当前状态与入口
 
+2026-10-16：远程精简协议和 `mc`/`mobile` 角色认证需要电脑、手机配套升级；旧 auth_token broker 不接受新手机认证。笔记本新版已在独立 `D:\code\cz\mc` 测试通过，日常 `cx` 保持运行，台式机暂不部署。手机连接的是临时测试入口，正式切换仍须恢复私有构建配置。当前验证与限制见 docs/handoff.md。
+
 2026-10-09：手机已通过公网同时控制台式机与笔记本 MC，固定 default/laptop 身份及各自地址/token；`emperorComputer`、`emperorLaptop` 自动识别对应身份。笔记本独立 cloudflared 和实体 ARM64 手机双来源各一次真实问答通过，三标签过滤及单侧已读清零实测通过；文件下载、单机断连恢复、锁屏通知点击和 TalkBack 尚待验。配置见[双电脑远程身份](docs/remote-control.md)。
 
 2026-10-07：已修复 Kimi 系统注入被误判为下一条问题、导致已有终答报“no final answer”的源码问题；覆盖回答、思考、分页和旧 owner 恢复边界，272 项定向测试通过。BMAD 旧模板渲染兼容修复另有 5 项测试通过。2026-10-07 当时安装版未包含该修复；此后用户已重包笔记本 MC，但现场旧失败记录未改动，也未据此宣称公网 Kimi 恢复通过。范围、证据和接续见[当前交接](docs/handoff.md)。
@@ -23,13 +25,13 @@ F1 即时可视尾页与索引、消息活动即时排序、Kimi 本机安全 GE
 
 Codex 隔离 home 通过整目录 symlink/Junction 复用当前用户的 `.codex/skills` 和 `.codex/plugins`；`.agents/skills` 在每个新任务前向原生发现注册并刷新。同名技能优先级及插件身份由 Codex 处理。旧普通目录保存在同 home 的 `skills.legacy-*` / `plugins.legacy-*`，源缺失时保留旧内容；链接失败明确报错，不退回复制，不改全局文件（包括 BOM）。插件或 marketplaces 配置变化在新任务前更新对应配置并重启 app-server，通过原 thread 恢复；执行中追加输入保持当前任务。
 
-`package_mc.ps1` 先在临时目录构建和校验，再更新最终目录；保留包内 Codex 会话与 history、包外 history 和 OneDrive 数据，清理外链只移除链接节点。最终 `mc.exe`、`mc_worker.exe` 和标题规则校验通过后，从最终目录自动启动 MC 一次；失败返回非零，不启动旧包或临时包。本轮仅更新源码并运行隔离假构建/假启动测试，未实际打包、替换或启动日常安装版。
+`package_mc.ps1` 先在临时目录构建和校验，再更新最终目录；保留包内 Codex 会话与 history、包外 history 和 OneDrive 数据，清理外链只移除链接节点。默认在最终产物校验后自动启动 MC 一次；传 `-BuildOnly` 则不启动，但仍会更新 `-DistPath` 下的 mc 目录。失败返回非零。不同聊天数据目录的安装副本可以并行运行，同目录仍共用单实例锁。
 
 以后需要实际打包时，先关闭安装版 MC 及其 worker，再在源码目录的普通非管理员 PowerShell 执行以下命令；默认更新 `D:\code\cx\mc` 并在成功后自动运行：
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\package_mc.ps1
 
-此次没有执行该命令。更新阶段失败可能留下部分程序文件，重新执行脚本完成更新；会话/history 保留，失败时不启动程序。默认不备份旧程序包。
+更新阶段失败可能留下部分程序文件，重新执行脚本完成更新；会话/history 保留，失败时不启动程序。默认不备份旧程序包。2026-10-16 实际构建仅用于独立 cz 副本，没有替换日常 cx。
 
 聊天信息 Story 1.1–1.5 已提交；跨端 v3 执行投影、Kimi/Codex 聊天信息与 OneDrive 数据路径已有实现。2026-09-29 的云端文件只是快照；切包前核对实际安装包的数据路径，并按 docs/handoff.md 补齐之后的改动及验证。宽回归有已知基线失败，不能把定向通过称作全量通过。
 

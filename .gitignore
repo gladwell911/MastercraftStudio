@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 build_pyinstaller/
+build_connection_upgrade/
+build_cz_test/
 build_repair/
 dist_repair/
 /dist_cz_portfix/

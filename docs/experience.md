@@ -1,5 +1,8 @@
 # 可复用经验
 
+- 认证诊断要在同一入口、同一 token 下比较实际 CONNECT 字段并收到 PONG。HTTP101/INFO 只证明到达 broker；旧 `auth_token` 与新 `mobile/password` 不兼容时，不能把认证拒绝归为网络超时。运行配置和安装包必须独立于 Git 源码核对。
+- 并行测试使用不同父目录和聊天库，单实例键绑定规范化数据路径；独立端口和临时 connector 不接管日常隧道。`-BuildOnly` 仍更新给定目标目录，必须先确认目标独立，再关闭自动启动。
+
 - 辅助 worktree 的 dirty 文件不一定包含遗漏功能：先比较最终文件和主分支、确认提交祖先，再保留补丁并删除已合并分支。推送后核对远端主分支 SHA，避免把本地提交或安装完成当作 GitHub 同步完成。
 
 - 实际隧道验收要同时核新 NATS 进程的 token 与监听端口，再用同一应用 token 比较新 broker 直连、MC 18080 bridge、公网 `/nats` 三处 `INFO.server_id` 并完成 `PING/PONG`。旧 broker 占用 18081 时，新进程可能选择 18082；只看到公网 WebSocket 打开不足以证明连到当前 MC。默认代理可能使 WebSocket 探针失败，本次仅对请求禁用代理后链路成功，不改系统代理。
