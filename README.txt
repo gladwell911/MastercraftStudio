@@ -11,7 +11,7 @@
 
 ## 当前状态与入口
 
-2026-10-16：远程精简协议和 `mc`/`mobile` 角色认证需要电脑、手机配套升级；旧 auth_token broker 不接受新手机认证。笔记本新版已在独立 `D:\code\cz\mc` 测试通过，日常 `cx` 保持运行，台式机暂不部署。手机连接的是临时测试入口，正式切换仍须恢复私有构建配置。当前验证与限制见 docs/handoff.md。
+2026-10-17：用户已重包 CX，正式笔记本认证、实体手机列表读取及重开自动连接通过。手机已从 CZ 临时入口恢复正式私有构建；电脑重包不会修改手机地址。原目录保留 history，新目录需迁移配置；具体步骤见 docs/remote-control.md。当前版本模型问答及长时稳定性尚待验，见 docs/handoff.md。
 
 2026-10-09：手机已通过公网同时控制台式机与笔记本 MC，固定 default/laptop 身份及各自地址/token；`emperorComputer`、`emperorLaptop` 自动识别对应身份。笔记本独立 cloudflared 和实体 ARM64 手机双来源各一次真实问答通过，三标签过滤及单侧已读清零实测通过；文件下载、单机断连恢复、锁屏通知点击和 TalkBack 尚待验。配置见[双电脑远程身份](docs/remote-control.md)。
 
