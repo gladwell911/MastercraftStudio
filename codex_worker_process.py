@@ -8,7 +8,7 @@ import copy
 import traceback
 from typing import Any, Callable, TextIO
 
-from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL, _event_from_item
+from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL, _event_from_item, codex_approval_parameters
 from codex_worker_protocol import (
     decode_worker_line,
     encode_worker_message,
@@ -342,8 +342,7 @@ class CodexWorkerRuntime:
                 try:
                     client.resume_thread(
                         thread_id,
-                        approval_policy=self._approval_policy(payload),
-                        sandbox="danger-full-access",
+                        **codex_approval_parameters(payload.get("approval_policy")),
                         personality="pragmatic",
                         cwd=payload.get("cwd") or "",
                         service_tier=service_tier_arg,
@@ -380,8 +379,7 @@ class CodexWorkerRuntime:
                     try:
                         client.resume_thread(
                             thread_id,
-                            approval_policy=self._approval_policy(payload),
-                            sandbox="danger-full-access",
+                            **codex_approval_parameters(payload.get("approval_policy")),
                             personality="pragmatic",
                             cwd=payload.get("cwd") or "",
                             service_tier=service_tier_arg,
@@ -482,8 +480,7 @@ class CodexWorkerRuntime:
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(
             cwd=payload.get("cwd") or "",
-            approval_policy=self._approval_policy(payload),
-            sandbox="danger-full-access",
+            **codex_approval_parameters(payload.get("approval_policy")),
             personality="pragmatic",
             service_tier=service_tier_arg,
         )
@@ -540,10 +537,6 @@ class CodexWorkerRuntime:
     @classmethod
     def _is_no_active_turn_error(cls, exc: Exception | str) -> bool:
         return "no active turn to steer" in cls._error_text(exc)
-
-    @staticmethod
-    def _approval_policy(payload: dict) -> str:
-        return "on-request" if payload.get("approval_policy") == "on-request" else "never"
 
     def _handle_reply_command_approval(self, message: dict[str, Any]) -> None:
         payload = dict(message.get("payload") or {})

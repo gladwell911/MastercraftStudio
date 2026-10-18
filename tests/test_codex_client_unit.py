@@ -1350,3 +1350,21 @@ def test_collab_waiting_end_filters_only_not_loaded_agents():
     assert "empty" not in text
     assert "useful answer" in text
     assert "failed\nnotLoaded" in text
+
+
+def test_thread_requests_explicitly_clear_auto_reviewer_by_default(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    sent = []
+    monkeypatch.setattr(client, '_ensure_started', lambda: None)
+    def send(message):
+        sent.append(message)
+        client._handle_message({'id': message['id'], 'result': {'thread': {'id': 'thread'}}})
+    monkeypatch.setattr(client, '_send_json', send)
+    client.start_thread('C:/temporary', **codex_client.codex_approval_parameters('auto-review'))
+    client.resume_thread('thread')
+    client.start_thread('C:/temporary')
+    assert sent[0]['params']['approvalsReviewer'] == 'auto_review'
+    for message in sent[1:]:
+        assert message['params']['approvalsReviewer'] == 'user'
+        assert message['params']['approvalPolicy'] == 'never'
+        assert message['params']['sandbox'] == 'danger-full-access'

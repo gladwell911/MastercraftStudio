@@ -897,6 +897,7 @@ def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
             "thread-existing",
             {
                 "approval_policy": "never",
+                "approvals_reviewer": "user",
                 "sandbox": "danger-full-access",
                 "personality": "pragmatic",
                 "cwd": "c:/code/sj",

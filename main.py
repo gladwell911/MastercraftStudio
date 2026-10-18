@@ -61,6 +61,9 @@ from claudecode_client import ClaudeCodeClient, DEFAULT_CLAUDECODE_MODEL, is_cla
 from cli_agent_manager import get_default_cli_agent_manager
 from codex_client import (
     CodexEvent,
+    CODEX_APPROVAL_MODES,
+    normalize_codex_approval_mode,
+    codex_approval_parameters,
     DEFAULT_CODEX_MODEL,
     codex_model_label_for_model,
     codex_service_tier_label,
@@ -4435,7 +4438,7 @@ class ChatFrame(wx.Frame):
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
-        self.codex_approval_policy = "on-request" if data.get("codex_approval_policy") == "on-request" else "never"
+        self.codex_approval_policy = normalize_codex_approval_mode(data.get("codex_approval_policy"))
 
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and getattr(self, "chat_store", None) is not None:
@@ -4628,7 +4631,7 @@ class ChatFrame(wx.Frame):
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
-            "codex_approval_policy": "on-request" if getattr(self, "codex_approval_policy", "never") == "on-request" else "never",
+            "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", "never")),
             "active_session_started_at": self.active_session_started_at,
             "realtime_call_role": self.realtime_call_role,
             "realtime_call_speech_rate": self.realtime_call_speech_rate,
@@ -10356,8 +10359,7 @@ class ChatFrame(wx.Frame):
             return
         client.resume_thread(
             thread_value,
-            approval_policy="on-request" if getattr(self, "codex_approval_policy", "never") == "on-request" else "never",
-            sandbox="danger-full-access",
+            **codex_approval_parameters(getattr(self, "codex_approval_policy", "never")),
             personality="pragmatic",
             cwd=self._workspace_dir_for_codex(),
             service_tier=service_tier,
@@ -12198,15 +12200,15 @@ class ChatFrame(wx.Frame):
 
     def _show_codex_approval_policy(self) -> None:
         questions = [{"id": "policy", "header": "Codex 执行审批",
-            "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。",
-            "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}]}]
+            "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。自动审查使用工作区沙箱，由 Codex 审核请求，不保证全部批准。",
+            "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}, {"label": "自动审查（工作区沙箱）", "value": "auto-review"}]}]
         dlg = CodexUserInputDialog(self, questions)
-        dlg._controls[0]["radio"].SetSelection(1 if getattr(self, "codex_approval_policy", "never") == "on-request" else 0)
+        dlg._controls[0]["radio"].SetSelection(CODEX_APPROVAL_MODES.index(normalize_codex_approval_mode(getattr(self, "codex_approval_policy", "never"))))
         try:
             if dlg.ShowModal() != wx.ID_OK:
                 return
             values = dlg.get_answers().get("policy", [])
-            self.codex_approval_policy = "on-request" if values == ["on-request"] else "never"
+            self.codex_approval_policy = normalize_codex_approval_mode(values[0] if len(values) == 1 else None)
         finally:
             dlg.Destroy()
         self._save_state()

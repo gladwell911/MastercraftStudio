@@ -8,7 +8,7 @@ from codex_worker_protocol import make_ui_request
 from test_codex_worker_process import FakeCodexClient
 
 
-@pytest.mark.parametrize('policy,expected', [(None, 'never'), ('invalid', 'never'), ('on-request', 'on-request')])
+@pytest.mark.parametrize('policy,expected', [(None, 'never'), ('invalid', 'never'), ('on-request', 'on-request'), ('auto-review', 'on-request')])
 @pytest.mark.parametrize('resume', [False, True])
 def test_command_policy_applies_only_to_future_thread_start_or_resume(policy, expected, resume):
     created = []
@@ -21,6 +21,8 @@ def test_command_policy_applies_only_to_future_thread_start_or_resume(policy, ex
     client = created[0]
     args = client.resumed_threads[0][1] if resume else client.started_threads[0]
     assert args['approval_policy'] == expected
+    assert args['sandbox'] == ('workspace-write' if policy == 'auto-review' else 'danger-full-access')
+    assert args['approvals_reviewer'] == ('auto_review' if policy == 'auto-review' else 'user')
     assert client.replies == []
     runtime.close()
 
@@ -93,3 +95,44 @@ def test_command_decision_serialization_preserves_native_id_and_owner(monkeypatc
     monkeypatch.setattr(client, '_send_json', native.append)
     client.respond_command_approval(7, 'accept')
     assert native == [{'id': 7, 'result': {'decision': 'accept'}}]
+
+
+@pytest.mark.parametrize('manual', ['never', 'on-request'])
+@pytest.mark.parametrize('resume,active,missing', [(False, False, False), (True, False, False), (True, True, False), (True, False, True), (True, True, True)])
+def test_ipc_to_native_thread_messages_reset_reviewer(monkeypatch, manual, resume, active, missing):
+    from codex_client import CodexAppServerClient
+    from codex_worker_client import CodexWorkerClient
+    from codex_worker_protocol import encode_worker_message, decode_worker_line
+    native = []
+    client = CodexAppServerClient()
+    monkeypatch.setattr(client, '_ensure_started', lambda: None)
+    monkeypatch.setattr(client, 'prepare_task', lambda cwd: None)
+    def send(message):
+        native.append(message)
+        if missing and message['method'] == 'thread/resume':
+            client._handle_message({'id': message['id'], 'error': {'code': -32000, 'message': 'thread not found'}})
+        else:
+            client._handle_message({'id': message['id'], 'result': {'thread': {'id': 'thread'}, 'turn': {'id': 'turn'}}})
+    monkeypatch.setattr(client, '_send_json', send)
+    runtime = CodexWorkerRuntime(lambda callback, model: client, io.StringIO())
+    worker = CodexWorkerClient()
+    monkeypatch.setattr(worker, '_send_message', lambda message: runtime.handle_message(decode_worker_line(encode_worker_message(message))))
+    for index, mode in enumerate(['auto-review', manual]):
+        payload = {'chat_id': 'chat', 'model': 'codex/main', 'turn_idx': index, 'question': 'hello', 'approval_policy': mode}
+        if resume:
+            payload['thread_id'] = 'existing'
+        if active:
+            payload.update(turn_id='old-turn', should_steer=True)
+        worker.start_turn(**payload)
+    threads = [message for message in native if message['method'] in ('thread/start', 'thread/resume')]
+    assert len(threads) == (4 if missing else 2)
+    if active and not missing:
+        assert any(message['method'] == 'turn/steer' for message in native)
+    split = len(threads) // 2
+    for index, message in enumerate(threads):
+        params = message['params']
+        auto = index < split
+        assert params['approvalPolicy'] == ('on-request' if auto else manual)
+        assert params['sandbox'] == ('workspace-write' if auto else 'danger-full-access')
+        assert params['approvalsReviewer'] == ('auto_review' if auto else 'user')
+    runtime.close()

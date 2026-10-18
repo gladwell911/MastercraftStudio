@@ -1,5 +1,7 @@
 # 可复用经验
 
+- Codex 执行审批沿用 `codex_approval_policy` 保存三种模式：`never` → `never / danger-full-access / user`，`on-request` → `on-request / danger-full-access / user`，`auto-review` → `on-request / workspace-write / auto_review`，依次对应 approvalPolicy、sandbox、approvalsReviewer。缺失或未知值回退 `never`；只影响后续创建/恢复，切回旧模式显式发送 `user`。自动审查由 app-server 内置审核决定，不保证批准。隔离 wx 菜单与 IPC 至 JSON-RPC 请求验证不代表可见浏览器端到端通过；本轮未打包、重启或启用生产配置。
+
 - 临时入口切回正式安装时，同时核对手机实际 endpoint、编译期 StartupOverride、电脑运行身份及隧道指向。电脑重打包不会修改手机目标；完整 RC 启动参数优先于持久偏好。用同 token 的直连/桥接/公网 PONG 与相同 server_id 核准电脑，再以实体列表和应用重开验证手机。
 
 - 认证诊断要在同一入口、同一 token 下比较实际 CONNECT 字段并收到 PONG。HTTP101/INFO 只证明到达 broker；旧 `auth_token` 与新 `mobile/password` 不兼容时，不能把认证拒绝归为网络超时。运行配置和安装包必须独立于 Git 源码核对。

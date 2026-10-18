@@ -33,25 +33,47 @@ def modal_selection(monkeypatch, value, *, close=False, mutation=None, observed=
     monkeypatch.setattr(main, 'CodexUserInputDialog', create)
 
 
-def test_menu_policy_is_saved_for_future_threads_without_touching_live_turn(approval_frame, monkeypatch):
+@pytest.mark.parametrize('policy', ['never', 'on-request', 'auto-review'])
+def test_menu_policy_is_saved_for_future_threads_without_touching_live_turn(approval_frame, monkeypatch, policy):
     frame = approval_frame
+    real_dialog = main.CodexUserInputDialog
     frame.active_codex_turn_active = True
     frame.active_codex_turn_id = 'live-never-turn'
-    modal_selection(monkeypatch, 'on-request')
+    observed = []
+    modal_selection(monkeypatch, policy, observed=observed)
     item = frame.GetMenuBar().FindItemById(int(frame._codex_approval_policy_menu_id))
     assert item.GetItemLabelText() == 'Codex 执行审批'
     frame.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, int(frame._codex_approval_policy_menu_id)))
-    assert frame.codex_approval_policy == 'on-request'
-    assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == 'on-request'
+    assert frame.codex_approval_policy == policy
+    assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == policy
+    assert '工作区沙箱' in observed[0]['question']
+    assert [item['value'] for item in observed[0]['options']] == ['never', 'on-request', 'auto-review']
     assert frame.active_codex_turn_active and frame.active_codex_turn_id == 'live-never-turn'
     frame.codex_approval_policy = 'never'
     frame._load_state()
-    assert frame.codex_approval_policy == 'on-request'
+    assert frame.codex_approval_policy == policy
+    # Reopen the actual dialog and verify its initial selection, then cancel.
+    def reopen(parent, questions):
+        dialog = real_dialog(parent, questions)
+        def cancel():
+            control = dialog._controls[0]
+            assert control['values'][control['radio'].GetSelection()] == policy
+            control['radio'].SetSelection((control['radio'].GetSelection() + 1) % 3)
+            dialog.EndModal(wx.ID_CANCEL)
+        wx.CallAfter(cancel)
+        return dialog
+    monkeypatch.setattr(main, 'CodexUserInputDialog', reopen)
+    before = frame.state_path.read_bytes()
+    frame._show_codex_approval_policy()
+    assert frame.codex_approval_policy == policy
+    assert frame.state_path.read_bytes() == before
     saved = json.loads(frame.state_path.read_text(encoding='utf-8'))
     saved['codex_approval_policy'] = 'invalid'
     frame.state_path.write_text(json.dumps(saved), encoding='utf-8')
     frame._load_state()
     assert frame.codex_approval_policy == 'never'
+    frame._save_state()
+    assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == 'never'
 
 
 @pytest.mark.parametrize('value,close,changed,expected', [('accept', False, '', 'accept'),

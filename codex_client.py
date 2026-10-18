@@ -41,6 +41,22 @@ CODEX_SERVICE_TIER_FAST = "fast"
 CODEX_SERVICE_TIER_STANDARD = ""
 
 
+CODEX_APPROVAL_MODES = ("never", "on-request", "auto-review")
+
+
+def normalize_codex_approval_mode(value: str | None) -> str:
+    return value if value in CODEX_APPROVAL_MODES else "never"
+
+
+def codex_approval_parameters(value: str | None) -> dict[str, str]:
+    mode = normalize_codex_approval_mode(value)
+    return {
+        "approval_policy": "on-request" if mode == "auto-review" else mode,
+        "sandbox": "workspace-write" if mode == "auto-review" else "danger-full-access",
+        "approvals_reviewer": "auto_review" if mode == "auto-review" else "user",
+    }
+
+
 def is_codex_model(model: str) -> bool:
     return str(model or "").strip().startswith(CODEX_MODEL_PREFIX)
 
@@ -641,10 +657,12 @@ class CodexAppServerClient:
         personality: str = "pragmatic",
         ephemeral: bool = False,
         service_tier: str | None = None,
+        approvals_reviewer: str = "user",
     ) -> dict:
         params = {
             "cwd": str(cwd or "").strip() or str(Path.cwd()),
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": approvals_reviewer,
             "sandbox": sandbox,
             "personality": personality,
             "ephemeral": bool(ephemeral),
@@ -660,10 +678,12 @@ class CodexAppServerClient:
         personality: str = "pragmatic",
         cwd: str | None = None,
         service_tier: str | None = None,
+        approvals_reviewer: str = "user",
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": approvals_reviewer,
             "sandbox": sandbox,
             "personality": personality,
             "serviceTier": normalize_codex_service_tier(service_tier) or None,
