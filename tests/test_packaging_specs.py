@@ -74,7 +74,7 @@ def test_package_script_builds_and_validates_before_updating_and_launching_final
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell packaging on Windows")
-@pytest.mark.parametrize("mode", ["success", "build_only", "build_fail", "missing_worker", "empty_worker", "update_fail", "final_invalid", "start_fail"])
+@pytest.mark.parametrize("mode", ["success", "build_only", "build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill", "update_fail", "final_invalid", "start_fail"])
 def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     import codex_client
 
@@ -131,6 +131,9 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         "(package / 'mc.exe').write_bytes(b'new-gui')\n"
         "if mode != 'missing_worker': (package / 'mc_worker.exe').write_bytes(b'' if mode == 'empty_worker' else b'new-worker')\n"
         "(package / '_internal' / 'assets' / 'chat_title_rules.json').write_text('{}')\n"
+        "skill = package / '_internal' / 'assets' / 'codex-skills' / 'mc-browser-open' / 'SKILL.md'\n"
+        "skill.parent.mkdir(parents=True)\n"
+        "if mode != 'missing_skill': skill.write_bytes(b'' if mode == 'empty_skill' else b'skill')\n"
         "for name in ['history', '.codex-home']:\n"
         "    folder = package / '_internal' / name\n"
         "    folder.mkdir()\n"
@@ -177,7 +180,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     assert sentinel.stat().st_file_attributes == attributes
     assert not list(dist.glob(".mc-build-*"))
     assert not (home / "unwanted-build-state").exists()
-    if mode in {"build_fail", "missing_worker", "empty_worker"}:
+    if mode in {"build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill"}:
         assert (package / "mc.exe").read_bytes() == b"old-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"old-worker"
     if mode in {"success", "build_only"}:

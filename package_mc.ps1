@@ -49,7 +49,7 @@ function Remove-PackageNode {
 
 function Assert-PackageArtifacts {
     param([string]$PackagePath)
-    foreach ($relativePath in @('mc.exe', 'mc_worker.exe', '_internal\assets\chat_title_rules.json')) {
+    foreach ($relativePath in @('mc.exe', 'mc_worker.exe', '_internal\assets\chat_title_rules.json', '_internal\assets\codex-skills\mc-browser-open\SKILL.md')) {
         $artifact = Join-Path $PackagePath $relativePath
         $item = Get-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
         if ($null -eq $item -or $item.PSIsContainer -or $item.Length -eq 0 -or

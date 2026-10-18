@@ -1276,7 +1276,7 @@ def test_prepare_task_refreshes_native_roots_and_restarts_only_changed_plugin_co
     monkeypatch.setattr(client, "_request_internal", lambda method, params=None, timeout=None: calls.append((method, params)) or {})
     monkeypatch.setattr(client, "_stop_process", lambda: restarts.append("restart"))
     client.prepare_task(str(workspace))
-    assert calls == [("skills/extraRoots/set", {"extraRoots": [str(agents.resolve())]}),
+    assert calls == [("skills/extraRoots/set", {"extraRoots": [str(agents.resolve()), str(codex_client.bundled_skill_root().resolve())]}),
                      ("skills/list", {"cwds": [str(workspace.resolve())], "forceReload": True})]
     assert restarts == []
     config.write_text('model = "new-global-model"\n[plugins."new@market"]\nenabled = true\n[marketplaces.market]\nsource = "local"\n', encoding="utf-8")
@@ -1295,7 +1295,7 @@ def test_prepare_task_refreshes_native_roots_and_restarts_only_changed_plugin_co
     config.write_text('model = "third-model"\n', encoding="utf-8")
     client.prepare_task(str(workspace))
     assert restarts == ["restart", "restart"]
-    assert calls[-2] == ("skills/extraRoots/set", {"extraRoots": []})
+    assert calls[-2] == ("skills/extraRoots/set", {"extraRoots": [str(codex_client.bundled_skill_root().resolve())]})
     assert codex_client.tomllib.loads((home / "config.toml").read_text(encoding="utf-8")) == {"model": "local-provider"}
 
 
@@ -1352,7 +1352,7 @@ def test_collab_waiting_end_filters_only_not_loaded_agents():
     assert "failed\nnotLoaded" in text
 
 
-def test_thread_requests_explicitly_clear_auto_reviewer_by_default(monkeypatch):
+def test_thread_requests_default_to_auto_reviewer(monkeypatch):
     client = codex_client.CodexAppServerClient()
     sent = []
     monkeypatch.setattr(client, '_ensure_started', lambda: None)
@@ -1365,6 +1365,6 @@ def test_thread_requests_explicitly_clear_auto_reviewer_by_default(monkeypatch):
     client.start_thread('C:/temporary')
     assert sent[0]['params']['approvalsReviewer'] == 'auto_review'
     for message in sent[1:]:
-        assert message['params']['approvalsReviewer'] == 'user'
-        assert message['params']['approvalPolicy'] == 'never'
-        assert message['params']['sandbox'] == 'danger-full-access'
+        assert message['params']['approvalsReviewer'] == 'auto_review'
+        assert message['params']['approvalPolicy'] == 'on-request'
+        assert message['params']['sandbox'] == 'workspace-write'

@@ -63,6 +63,7 @@ from codex_client import (
     CodexEvent,
     CODEX_APPROVAL_MODES,
     normalize_codex_approval_mode,
+    DEFAULT_CODEX_APPROVAL_MODE,
     codex_approval_parameters,
     DEFAULT_CODEX_MODEL,
     codex_model_label_for_model,
@@ -1989,7 +1990,8 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
         self.codex_answer_english_filter_enabled = False
-        self.codex_approval_policy = "never"
+        self.codex_approval_policy = DEFAULT_CODEX_APPROVAL_MODE
+        self.codex_approval_defaults_version = 1
         self.active_codex_thread_id = ""
         self.active_codex_turn_id = ""
         self.active_codex_turn_active = False
@@ -4438,7 +4440,11 @@ class ChatFrame(wx.Frame):
         if not is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
-        self.codex_approval_policy = normalize_codex_approval_mode(data.get("codex_approval_policy"))
+        version = data.get("codex_approval_defaults_version")
+        version = version if type(version) is int and version >= 1 else 0
+        self.codex_approval_defaults_version = max(1, version)
+        self.codex_approval_policy = normalize_codex_approval_mode(data.get("codex_approval_policy")) if version else DEFAULT_CODEX_APPROVAL_MODE
+        approval_changed = not version or data.get("codex_approval_policy") != self.codex_approval_policy
 
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and getattr(self, "chat_store", None) is not None:
@@ -4451,7 +4457,7 @@ class ChatFrame(wx.Frame):
                 legacy = data.get("chats")
                 if isinstance(legacy, list):
                     self.archived_chats = legacy
-        changed = False
+        changed = approval_changed
         if not use_chat_store:
             for chat in self.archived_chats:
                 if isinstance(chat, dict) and self._normalize_archived_chat(chat):
@@ -4631,7 +4637,8 @@ class ChatFrame(wx.Frame):
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
-            "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", "never")),
+            "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
+            "codex_approval_defaults_version": max(1, getattr(self, "codex_approval_defaults_version", 1)),
             "active_session_started_at": self.active_session_started_at,
             "realtime_call_role": self.realtime_call_role,
             "realtime_call_speech_rate": self.realtime_call_speech_rate,
@@ -10359,7 +10366,7 @@ class ChatFrame(wx.Frame):
             return
         client.resume_thread(
             thread_value,
-            **codex_approval_parameters(getattr(self, "codex_approval_policy", "never")),
+            **codex_approval_parameters(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
             personality="pragmatic",
             cwd=self._workspace_dir_for_codex(),
             service_tier=service_tier,
@@ -10481,7 +10488,7 @@ class ChatFrame(wx.Frame):
                 attachments=turn_attachments,
                 service_tier=service_tier,
                 should_steer=should_steer,
-                approval_policy=getattr(self, "codex_approval_policy", "never"),
+                approval_policy=getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE),
                 history_turns=history_turns,
             )
             self._call_after_if_alive(
@@ -12203,7 +12210,7 @@ class ChatFrame(wx.Frame):
             "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。自动审查使用工作区沙箱，由 Codex 审核请求，不保证全部批准。",
             "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}, {"label": "自动审查（工作区沙箱）", "value": "auto-review"}]}]
         dlg = CodexUserInputDialog(self, questions)
-        dlg._controls[0]["radio"].SetSelection(CODEX_APPROVAL_MODES.index(normalize_codex_approval_mode(getattr(self, "codex_approval_policy", "never"))))
+        dlg._controls[0]["radio"].SetSelection(CODEX_APPROVAL_MODES.index(normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE))))
         try:
             if dlg.ShowModal() != wx.ID_OK:
                 return

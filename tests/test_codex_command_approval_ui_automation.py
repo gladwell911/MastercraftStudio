@@ -15,6 +15,39 @@ def approval_frame(request, monkeypatch):
     cleanup(frame)
 
 
+@pytest.mark.parametrize('version,mode,expected,expected_version', [
+    (None, 'never', 'auto-review', 1),
+    (None, 'on-request', 'auto-review', 1),
+    (None, None, 'auto-review', 1),
+    (0, 'never', 'auto-review', 1),
+    (1, 'never', 'never', 1),
+    (1, 'on-request', 'on-request', 1),
+    (1, 'auto-review', 'auto-review', 1),
+    (3, 'never', 'never', 3),
+    (1, ['invalid'], 'auto-review', 1),
+])
+def test_one_time_default_migration_preserves_restored_state(approval_frame, version, mode, expected, expected_version):
+    frame = approval_frame
+    frame._save_state()
+    state = json.loads(frame.state_path.read_text(encoding='utf-8'))
+    state['codex_approval_policy'] = mode
+    if version is None:
+        state.pop('codex_approval_defaults_version', None)
+    else:
+        state['codex_approval_defaults_version'] = version
+    frame.state_path.write_text(json.dumps(state), encoding='utf-8')
+    frame._load_state()
+    assert frame.codex_approval_policy == expected
+    assert frame.codex_approval_defaults_version == expected_version
+    frame._save_state()
+    saved = json.loads(frame.state_path.read_text(encoding='utf-8'))
+    assert saved['codex_approval_defaults_version'] == expected_version
+    assert saved['codex_approval_policy'] == expected
+    assert saved['active_chat_id'] == state['active_chat_id']
+    frame._load_state()
+    assert frame.codex_approval_policy == expected
+
+
 def modal_selection(monkeypatch, value, *, close=False, mutation=None, observed=None):
     original = main.CodexUserInputDialog
     def create(parent, questions):
@@ -71,9 +104,9 @@ def test_menu_policy_is_saved_for_future_threads_without_touching_live_turn(appr
     saved['codex_approval_policy'] = 'invalid'
     frame.state_path.write_text(json.dumps(saved), encoding='utf-8')
     frame._load_state()
-    assert frame.codex_approval_policy == 'never'
+    assert frame.codex_approval_policy == 'auto-review'
     frame._save_state()
-    assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == 'never'
+    assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == 'auto-review'
 
 
 @pytest.mark.parametrize('value,close,changed,expected', [('accept', False, '', 'accept'),

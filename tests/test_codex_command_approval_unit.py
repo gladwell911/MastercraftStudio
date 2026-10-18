@@ -8,7 +8,7 @@ from codex_worker_protocol import make_ui_request
 from test_codex_worker_process import FakeCodexClient
 
 
-@pytest.mark.parametrize('policy,expected', [(None, 'never'), ('invalid', 'never'), ('on-request', 'on-request'), ('auto-review', 'on-request')])
+@pytest.mark.parametrize('policy,expected', [(None, 'on-request'), ('invalid', 'on-request'), ('never', 'never'), ('on-request', 'on-request'), ('auto-review', 'on-request')])
 @pytest.mark.parametrize('resume', [False, True])
 def test_command_policy_applies_only_to_future_thread_start_or_resume(policy, expected, resume):
     created = []
@@ -21,8 +21,8 @@ def test_command_policy_applies_only_to_future_thread_start_or_resume(policy, ex
     client = created[0]
     args = client.resumed_threads[0][1] if resume else client.started_threads[0]
     assert args['approval_policy'] == expected
-    assert args['sandbox'] == ('workspace-write' if policy == 'auto-review' else 'danger-full-access')
-    assert args['approvals_reviewer'] == ('auto_review' if policy == 'auto-review' else 'user')
+    assert args['sandbox'] == ('workspace-write' if policy in (None, 'invalid', 'auto-review') else 'danger-full-access')
+    assert args['approvals_reviewer'] == ('auto_review' if policy in (None, 'invalid', 'auto-review') else 'user')
     assert client.replies == []
     runtime.close()
 

@@ -1,6 +1,8 @@
 # 可复用经验
 
-- Codex 执行审批沿用 `codex_approval_policy` 保存三种模式：`never` → `never / danger-full-access / user`，`on-request` → `on-request / danger-full-access / user`，`auto-review` → `on-request / workspace-write / auto_review`，依次对应 approvalPolicy、sandbox、approvalsReviewer。缺失或未知值回退 `never`；只影响后续创建/恢复，切回旧模式显式发送 `user`。自动审查由 app-server 内置审核决定，不保证批准。隔离 wx 菜单与 IPC 至 JSON-RPC 请求验证不代表可见浏览器端到端通过；本轮未打包、重启或启用生产配置。
+- Codex 执行审批沿用 `codex_approval_policy` 保存三种模式：`never` → `never / danger-full-access / user`，`on-request` → `on-request / danger-full-access / user`，`auto-review` → `on-request / workspace-write / auto_review`，依次对应 approvalPolicy、sandbox、approvalsReviewer。缺失或未知值回退 `auto-review`；旧无版本配置一次迁移并保存 `codex_approval_defaults_version: 1`，以后保留手选。只影响后续创建/恢复，切回旧模式显式发送 `user`。自动审查由 app-server 内置审核决定，不保证批准。隔离 wx 菜单与 IPC 至 JSON-RPC 请求验证不代表可见浏览器端到端通过。
+
+- 可携带网页入口使用运行态 `MC_BROWSER_OPEN_ARGV` JSON 数组，PowerShell call operator 展开参数；源码/frozen 路径与 cwd 分离。用户技能根与随包根合并去重、forceReload；安装包由 console worker 提前分派 helper，不输出 worker ready。自有 target 创建后立即 flush ID，后续失败只续验该目标；最终以同一 HWND 可见、非最小化及真实 foreground 判断。跨机首启和焦点效果须在目标机实际验收。
 
 - 临时入口切回正式安装时，同时核对手机实际 endpoint、编译期 StartupOverride、电脑运行身份及隧道指向。电脑重打包不会修改手机目标；完整 RC 启动参数优先于持久偏好。用同 token 的直连/桥接/公网 PONG 与相同 server_id 核准电脑，再以实体列表和应用重开验证手机。
 

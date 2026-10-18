@@ -338,8 +338,8 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
     assert any(item["type"] == "turn_started_ack" and item["payload"]["turn_id"] == "turn-1" for item in messages)
     assert not any(item["type"] == "turn_finished" for item in messages)
     assert created[0].started_threads[0]["cwd"] == "c:/code/sj"
-    assert created[0].started_threads[0]["approval_policy"] == "never"
-    assert created[0].started_threads[0]["sandbox"] == "danger-full-access"
+    assert created[0].started_threads[0]["approval_policy"] == "on-request"
+    assert created[0].started_threads[0]["sandbox"] == "workspace-write"
     assert created[0].started_threads[0]["personality"] == "pragmatic"
     assert created[0].started_turns[0][2] == "fast"
 
@@ -896,9 +896,9 @@ def test_worker_runtime_start_turn_resumes_existing_thread_before_turn_items():
         (
             "thread-existing",
             {
-                "approval_policy": "never",
-                "approvals_reviewer": "user",
-                "sandbox": "danger-full-access",
+                "approval_policy": "on-request",
+                "approvals_reviewer": "auto_review",
+                "sandbox": "workspace-write",
                 "personality": "pragmatic",
                 "cwd": "c:/code/sj",
                 "service_tier": "fast",

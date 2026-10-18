@@ -1,6 +1,20 @@
 # 当前交接
 
-## 2026-10-18 下一会话优先任务：可携带的网页打开与前台显示
+## 2026-10-18 可携带网页入口实现
+
+已集成 `browser_open.py`、随包 `mc-browser-open` 技能、技能根合并刷新与 `MC_BROWSER_OPEN_ARGV`。源码调用 `.venv/Scripts/python.exe browser_open.py --url <HTTP(S) URL>`；默认 onedir 包使用 `mc_worker.exe --browser-open --url <URL>`，不依赖系统 Python。helper 保留专用实例与已有标签，只创建/续验自己的 target；失败返回 targetId 后只用同 URL 加 `--target-id` 续验，不能盲目重建。
+
+新配置和旧无版本配置默认 `auto-review`，原生三元组为 `on-request / workspace-write / auto_review`。状态标记 `codex_approval_defaults_version: 1` 只迁移一次，此后菜单手选保留，不重启活动 turn。真实审核拒绝立即停止，不降级审批或代答 accept。
+
+定向验证：核心 helper/client/worker/packaging 原 164 项分段通过（163 项通过、1 项旧预期修正后精确复验通过）；审批迁移、菜单、IPC 串行 50 项通过。helper 真实执行问题修复后曾有 27 项通过，审查局部补丁完成后 director 与 engineer 最终均复验 46 项通过。engineer 已完成最终非管理员隔离重构建（exit 0）及打包 worker `--browser-open --help`。
+
+含空格源码目录的原生技能发现、自然语言读取随包技能并调用 helper、真实 `auto_review approved` 已实测；源码首次网页 complete、可见且非最小化，但 `foreground=false`，helper 正确报错，该次不记为置前成功。engineer 已核对最终重构建包真实 `commandExecution` exit 0、随包技能与用户技能并存，同一自有 target 续验 `status=ok / complete / visible=true / minimized=false / foreground=true`、`HWND == foregroundHwnd` 且 `preexistingTargetsPreserved=true`，真实自动审查为 approved；证据见仓库外最终报告 `D:/code/sj/_bmad-output/implementation-artifacts/verify-portable-browser-open-engineer.md`。首次全新 profile 启动、另一台电脑的 sandbox 前置状态及焦点行为、正式 MC GUI 自然语言链仍待实际验收，本机隔离验证不能替代。以下旧真实浏览器证据只对应仓库外验证宿主，不代表本实现已通过。
+
+私有诊断证据已移至仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/browser-open-fixes/`，不提交产品仓库。
+
+独立构建使用独立 `-DistPath`、`-WorkPath` 和 `-BuildOnly`；不覆盖、退出或重启日常 MC，不修改生产库/凭据，不关闭共享 Chrome。profile、Cookie、认证及私有日志不入包。旧单文件 spec 不在本功能支持范围。
+
+## 历史计划快照：2026-10-18 实施前状态
 
 用户已确认实施范围：另一台 Windows 电脑已有 Codex、Chrome 和 MC；希望拉取代码并重新打包后，直接向 MC 下达“打开某网址并显示到前台”的指令即可使用，无需额外插件、仓库外脚本或手动选择审批模式。本会话只完成分析、计划和本机验证，**下列集成尚未实现**。
 

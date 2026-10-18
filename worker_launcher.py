@@ -1,6 +1,6 @@
 import sys
 
-from codex_worker_process import main
+import browser_open
 
 
 def configure_utf8_stdio() -> None:
@@ -12,4 +12,7 @@ def configure_utf8_stdio() -> None:
 
 if __name__ == "__main__":
     configure_utf8_stdio()
+    if sys.argv[1:2] == ["--browser-open"]:
+        raise SystemExit(browser_open.main(sys.argv[2:]))
+    from codex_worker_process import main
     raise SystemExit(main())

@@ -14,6 +14,7 @@ import tempfile
 from datetime import datetime
 
 from context_usage import normalize_context_usage
+from browser_open import browser_open_argv, bundled_skill_root
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -35,8 +36,10 @@ CODEX_MODEL_BY_CONTEXT_WINDOW = {
 DEFAULT_INITIALIZE_TIMEOUT = 45
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_CODEX_TURN_TIMEOUT = 300
-DEFAULT_CODEX_APPROVAL_POLICY = "never"
-DEFAULT_CODEX_SANDBOX = "danger-full-access"
+DEFAULT_CODEX_APPROVAL_MODE = "auto-review"
+DEFAULT_CODEX_APPROVAL_POLICY = "on-request"
+DEFAULT_CODEX_SANDBOX = "workspace-write"
+DEFAULT_CODEX_APPROVALS_REVIEWER = "auto_review"
 CODEX_SERVICE_TIER_FAST = "fast"
 CODEX_SERVICE_TIER_STANDARD = ""
 
@@ -45,7 +48,18 @@ CODEX_APPROVAL_MODES = ("never", "on-request", "auto-review")
 
 
 def normalize_codex_approval_mode(value: str | None) -> str:
-    return value if value in CODEX_APPROVAL_MODES else "never"
+    return value if value in CODEX_APPROVAL_MODES else DEFAULT_CODEX_APPROVAL_MODE
+
+
+def resolve_native_approval_parameters(approval_policy=None, sandbox=None, approvals_reviewer=None):
+    if approval_policy == "auto-review":
+        raise ValueError("auto-review is a UI mode, not a native approval policy")
+    manual = approval_policy is not None
+    return {
+        "approvalPolicy": approval_policy if manual else DEFAULT_CODEX_APPROVAL_POLICY,
+        "sandbox": sandbox if sandbox is not None else ("danger-full-access" if manual else DEFAULT_CODEX_SANDBOX),
+        "approvalsReviewer": approvals_reviewer if approvals_reviewer is not None else ("user" if manual else DEFAULT_CODEX_APPROVALS_REVIEWER),
+    }
 
 
 def codex_approval_parameters(value: str | None) -> dict[str, str]:
@@ -645,25 +659,30 @@ class CodexAppServerClient:
             self._stop_process()
             self._global_plugin_settings = settings
         self._ensure_started()
-        skill_root = (_user_home() / ".agents" / "skills").resolve()
-        self.request("skills/extraRoots/set", {"extraRoots": [str(skill_root)] if skill_root.is_dir() else []})
+        roots = []
+        seen = set()
+        for root in (_user_home() / ".agents" / "skills", bundled_skill_root()):
+            root = root.resolve()
+            key = os.path.normcase(str(root))
+            if root.is_dir() and key not in seen:
+                roots.append(str(root))
+                seen.add(key)
+        self.request("skills/extraRoots/set", {"extraRoots": roots})
         self.request("skills/list", {"cwds": [str(Path(cwd or Path.cwd()).resolve())], "forceReload": True})
 
     def start_thread(
         self,
         cwd: str,
-        approval_policy: str = DEFAULT_CODEX_APPROVAL_POLICY,
-        sandbox: str = DEFAULT_CODEX_SANDBOX,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
         personality: str = "pragmatic",
         ephemeral: bool = False,
         service_tier: str | None = None,
-        approvals_reviewer: str = "user",
+        approvals_reviewer: str | None = None,
     ) -> dict:
         params = {
             "cwd": str(cwd or "").strip() or str(Path.cwd()),
-            "approvalPolicy": approval_policy,
-            "approvalsReviewer": approvals_reviewer,
-            "sandbox": sandbox,
+            **resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
             "personality": personality,
             "ephemeral": bool(ephemeral),
             "serviceTier": normalize_codex_service_tier(service_tier) or None,
@@ -673,18 +692,16 @@ class CodexAppServerClient:
     def resume_thread(
         self,
         thread_id: str,
-        approval_policy: str = DEFAULT_CODEX_APPROVAL_POLICY,
-        sandbox: str = DEFAULT_CODEX_SANDBOX,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
         personality: str = "pragmatic",
         cwd: str | None = None,
         service_tier: str | None = None,
-        approvals_reviewer: str = "user",
+        approvals_reviewer: str | None = None,
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
-            "approvalPolicy": approval_policy,
-            "approvalsReviewer": approvals_reviewer,
-            "sandbox": sandbox,
+            **resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
             "personality": personality,
             "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
@@ -899,6 +916,7 @@ class CodexAppServerClient:
         else:
             env = os.environ.copy()
             env["CODEX_HOME"] = str(self._codex_home_dir)
+        env["MC_BROWSER_OPEN_ARGV"] = json.dumps(browser_open_argv(), ensure_ascii=False)
         return env
 
     def _initialize(self) -> None:
