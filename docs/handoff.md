@@ -1,5 +1,33 @@
 # 当前交接
 
+## 2026-10-18 下一会话优先任务：可携带的网页打开与前台显示
+
+用户已确认实施范围：另一台 Windows 电脑已有 Codex、Chrome 和 MC；希望拉取代码并重新打包后，直接向 MC 下达“打开某网址并显示到前台”的指令即可使用，无需额外插件、仓库外脚本或手动选择审批模式。本会话只完成分析、计划和本机验证，**下列集成尚未实现**。
+
+实施依据为 dog 已更新的[实施计划](../../_bmad-output/implementation-artifacts/plan-portable-browser-open.md)，绝对路径 `D:/code/sj/_bmad-output/implementation-artifacts/plan-portable-browser-open.md`。计划位于 MC 仓库外，当前电脑的新会话可直接读取，不能假定另一台电脑仅拉取产品仓库就有该文件。已有方案明确，下一会话直接按计划实现，不重复广泛调研。沿用此前 `bmad-build-auto` 工作方式及项目派遣规则，director 实现、engineer 独立验证；本轮没有启动新的实施流程。
+
+### 已完成及证据边界
+
+- MC 源码已提交 `8bf51069fe69eaf410664badebe56338c590581b`（支持三种审批模式），此功能提交尚未推送，远端状态接续时再核对。本次交接另作本地文档提交，保持接续工作区干净。它只接入自动审查，**没有随包浏览器 helper/技能，也没有更改默认 never**。用户随后自行重新打包并启动 MC，agent 未操作其退出/重启；当前进程信息接续时重新读取，不复用历史 PID。
+- 本机真实自动审查曾返回 `approved`，无需人工点击，已验证网页完整加载、专用 Chrome 窗口可见/非最小化、真实前台 HWND 与归属一致，并打开了腾讯云登录页。证据在工作区 `D:/code/sj/_bmad-output/implementation-artifacts/verify-visible-browser-e2e-final.md`、`open-tencent-console-result.json`。验证使用仓库外脚本及独立 Codex 会话，不等于跨机产品能力已交付；验证宿主还使用过进程级 `windows.sandbox="elevated"`，不能直接照搬为跨机默认配置。
+- 成功验证代码可作为参考：工作区同目录的 `visible-browser-cdp-helper.py`、`open-tencent-console.ps1`；它们包含本机路径、PID、时间戳、固定 URL，必须提炼，不可直接当产品依赖。`run-open-tencent-console.py` 等独立模型验证宿主也不能移入正式功能。全局 `web-access` 目录此前为空，不依赖 legacy 副本、不改写全局技能。
+
+### 下一步实施顺序
+
+1. **默认官方自动审查及一次迁移。** 用户最新明确要求默认启用，取代旧计划的“保留默认 never”。新安装、缺失/未知配置以及旧配置首次升级均采用 `auto-review`，原生实际三元组为 `on-request / workspace-write / auto_review`；不能向 API 发送无效原生策略 `auto-review`。用 `codex_approval_defaults_version: 1` 做最小一次迁移，旧标记缺失时应用新默认；之后用户主动选择 never/on-request 必须持久保留，不每次启动覆盖。覆盖初始化、load/save、getattr fallback、菜单、IPC 缺值及直接 start/resume；加载恢复完整状态后再保存迁移，不能覆盖尚未恢复的数据。只影响后续新建/恢复，不改变活动回合。
+2. **新增正式浏览器入口。** 按计划新增 `browser_open.py` 和 `assets/codex-skills/mc-browser-open/SKILL.md`，让 Codex 从自然语言发现并调用。源码/安装包运行态生成准确 argv，安装包复用 `mc_worker.exe --browser-open --url …`；`worker_launcher.py` 提前分派，不启动模型 worker 协议。helper 本身不启动新的 Codex 子会话、不代答 accept。
+3. **接入发现和打包。** `codex_client.py` 合并用户技能根与随包技能根并刷新，启动环境提供 `MC_BROWSER_OPEN_ARGV`，不覆盖原用户根；资源按源码目录/`sys._MEIPASS` 定位。`zgwd.spec` 收录技能与已有 websocket-client 依赖，`package_mc.ps1` 补必要产物检查。所有路径、Chrome 安装位置、PID/StartTime、targetId/HWND 动态解析，不依赖本机盘符、外部 Python 或 `_bmad-output`。
+4. **定向验证后交付。** 验证旧配置迁移及用户后来手选模式保留、真实原生技能发现和自然语言调用；覆盖源码换目录、隔离打包版、专用 Chrome 首次启动与后续复用、网页及真实前台状态。另一台电脑的首启和焦点效果必须在该机实际验收，不能用本机结果代替。必要产品代码/技能/打包配置/测试/短说明提交并推送，包含现有未推送的自动审查提交；浏览器 profile、Cookie、认证文件和私有诊断日志不上传。
+
+### 实现中必须保留的已验证要点
+
+- 独立 profile `%LOCALAPPDATA%/ChromeAutomationProfile`，调试仅 `127.0.0.1:9222`；启动带 `--no-first-run`、`--no-default-browser-check`。欢迎/账号窗口不是普通标签窗口，统一用 CDP `Target.createTarget(newWindow:true)` 创建本任务普通窗口。保留日常 Chrome 和全部既有标签，只操作自己创建的 target。
+- 成熟 Python websocket-client 传输优先于临时 PowerShell WebSocket 拼装；原始 CDP 错误完整保留。PowerShell JSON 集合包装和错误编码曾造成误判，不能照搬失败实现。创建成功先返回自有 targetId，后续失败只续验该目标，不盲目重复建页；根进程排除 `--type=` 子进程。最终必须验证实际前台 HWND/PID、可见和非最小化，不凭 SetForegroundWindow 返回值或进程 exit 0 报成功；不写死 h1/测试站内容。
+- WMI `HRESULT 0x80041003` 等普通沙箱失败不等于审核拒绝；只有当前真实工具及权限允许时，走正式升级请求交给 auto_review。实际审核 deny/policy blocked 后停止，不换工具、线程或编码绕过，不降级成 MC 无条件放行。新机 Windows 原生沙箱是否就绪需检查，不自动改全局配置或承诺所有系统焦点条件均能置前。
+- **不退出、重启或覆盖日常 MC，不修改生产聊天库/配置/凭据。** 实施验证使用隔离数据和独立测试实例；若构建隔离包，使用独立 `-DistPath` 与 `-BuildOnly`，不更新当前运行目标。实际运行包的替换和重启仍由用户本人安排；不在本任务顺带修改 Cloudflare、frp、云安全组或 DNS。
+
+以下为此前远程控制功能的历史交接，其部署与测试边界仍有效。
+
 截至 2026-10-18 整理，最近实体验证为 2026-10-17；主分支为 `main`。远程数据精简已实现独立临时 RPC、有限通知流、权威通知快照和按需分页，生产 broker 使用独立 `mc`/`mobile` 用户及角色权限，见 [协议](remote-slim-protocol.md)。手机的新 `mobile/password` 认证与旧运行包的 `auth_token` 模式不兼容，必须配套升级；同 token 的两种认证实测已确认该根因，不能只延长手机超时或更换 token。
 
 2026-10-17 用户已自行重新打包并启动 `D:/code/cx/mc`。手机此前仍使用 CZ 临时公网地址，CZ MC 已退出，导致无法连接。已使用正式私有参数保数据覆盖安装实体 ARM64 RC，恢复 `wss://laptop.tingyou.cc/nats`；两来源 token、台式机地址和两来源 backup 均未变，最终选择笔记本。CX 直连 18081、桥接 18080、正式公网三处认证/PONG 的 server_id 一致，实际手机显示笔记本已连接和 CX 聊天列表；手机应用退出重开后自动恢复。此次未重启 CX 或改隧道，未发送模型请求。CZ 的独立数据副本保留为历史测试，不代表当前连接目标。
