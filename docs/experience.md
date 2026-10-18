@@ -4,6 +4,9 @@
 
 - 可携带网页入口使用运行态 `MC_BROWSER_OPEN_ARGV` JSON 数组，PowerShell call operator 展开参数；源码/frozen 路径与 cwd 分离。用户技能根与随包根合并去重、forceReload；安装包由 console worker 提前分派 helper，不输出 worker ready。自有 target 创建后立即 flush ID，后续失败只续验该目标；最终以同一 HWND 可见、非最小化及真实 foreground 判断。跨机首启和焦点效果须在目标机实际验收。
 
+- PowerShell 5.1 接收 argv JSON 时直接赋值 `ConvertFrom-Json` 的结果，避免外层 `@(...)` 把数组包装为单个元素；按技能示例实际展开参数检查。CLI 的 JSON 错误输出使用 ASCII 转义，避免 GBK 无法编码字符再次抛异常、遮蔽原始失败。
+- Windows 非管理员打包检查保持有效；当前工具宿主为管理员时，可经现有桌面 Explorer 的 ShellExecute 启动同用户隐藏普通权限宿主，并核实实际 isAdmin=false 和最终退出码。ShellExecute 返回或新建 Shell.Application 本身不证明降权成功。
+
 - 临时入口切回正式安装时，同时核对手机实际 endpoint、编译期 StartupOverride、电脑运行身份及隧道指向。电脑重打包不会修改手机目标；完整 RC 启动参数优先于持久偏好。用同 token 的直连/桥接/公网 PONG 与相同 server_id 核准电脑，再以实体列表和应用重开验证手机。
 
 - 认证诊断要在同一入口、同一 token 下比较实际 CONNECT 字段并收到 PONG。HTTP101/INFO 只证明到达 broker；旧 `auth_token` 与新 `mobile/password` 不兼容时，不能把认证拒绝归为网络超时。运行配置和安装包必须独立于 Git 源码核对。
