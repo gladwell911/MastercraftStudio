@@ -1,0 +1,17 @@
+serverAddr = "<FINAL_FRP_DOMAIN>"
+serverPort = 7000
+loginFailExit = false
+auth.method = "token"
+auth.token = "<PRIVATE_FRP_TOKEN>"
+transport.tls.enable = true
+transport.tls.serverName = "<FINAL_FRP_DOMAIN>"
+transport.tls.trustedCaFile = "<ABSOLUTE_WINDOWS_CA_PATH_WITH_FORWARD_SLASHES>"
+log.to = "<ABSOLUTE_WINDOWS_LOG_PATH_WITH_FORWARD_SLASHES>"
+log.level = "info"
+log.maxDays = 3
+[[proxies]]
+name = "mc-<FIRST_PAIR>"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 18080
+remotePort = <FIRST_MC_REMOTE_PORT>

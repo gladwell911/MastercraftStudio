@@ -1,0 +1,12 @@
+{
+    admin 127.0.0.1:2019
+    auto_https off
+    https_port 8443
+    servers {
+        protocols h1 h2
+    }
+}
+https://<FINAL_FIRST_MC_DOMAIN>:8443 {
+    tls /etc/mc-relay/tls/fullchain.pem /etc/mc-relay/tls/privkey.pem
+    reverse_proxy 127.0.0.1:<FIRST_MC_REMOTE_PORT>
+}

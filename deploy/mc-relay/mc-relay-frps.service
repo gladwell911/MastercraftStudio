@@ -1,0 +1,13 @@
+[Unit]
+Description=MC relay frps
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=mc-relay
+Group=mc-relay
+WorkingDirectory=/var/lib/mc-relay
+ExecStart=/opt/mc-relay/frps -c /etc/mc-relay/frps.toml
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+[Unit]
+Description=Renew certificates for MC relay only
+[Service]
+Type=oneshot
+ExecStart=/opt/mc-relay/acme-venv/bin/certbot renew --quiet --cert-name mc-relay --config-dir /etc/mc-relay/acme --work-dir /var/lib/mc-relay/acme-work --logs-dir /var/lib/mc-relay/acme-logs --deploy-hook /opt/mc-relay/deploy-cert.sh

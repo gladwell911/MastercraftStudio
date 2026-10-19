@@ -1,0 +1,12 @@
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "127.0.0.1"
+# Replace FIRST_MC_REMOTE_PORT: default=19080, laptop=19081 (only one).
+allowPorts = [{ single = <FIRST_MC_REMOTE_PORT> }]
+auth.method = "token"
+auth.token = "<PRIVATE_FRP_TOKEN>"
+transport.tls.force = true
+transport.tls.certFile = "/etc/mc-relay/tls/fullchain.pem"
+transport.tls.keyFile = "/etc/mc-relay/tls/privkey.pem"
+log.to = "console"
+log.level = "info"

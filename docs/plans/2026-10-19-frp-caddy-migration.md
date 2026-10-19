@@ -1,6 +1,6 @@
 # frp / Caddy 迁移实施计划
 
-日期：2026-10-19。状态：仅计划，未修改产品实现、DNS、安全组、服务器或手机，未部署或重启。
+日期：2026-10-19。状态：第一批独立relay已实施验收完成（含新增DNS、目标Lighthouse防火墙规则、独立证书/服务与首台临时frpc），详见[执行记录](../../_bmad-output/implementation-artifacts/plan-frp-caddy-01-server.md)。第二、三批未执行；未修改MC产品实现、旧论坛、RC地址或WSL。
 源码基线：MC `main@bae577a66d98248272e7e257589cc7601b047335`，已由父代理确认与 GitHub `origin/main` 一致。
 目标：手机 RC 经新入口连接两台 MC；论坛 Android 经独立新入口访问本机 WSL Discourse；现有云服务器论坛保持运行。
 
