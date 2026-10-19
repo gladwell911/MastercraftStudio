@@ -1,5 +1,10 @@
 # 可复用经验
 
+## 2026-10-19 外部入口与跨端排障
+
+- 核实际MC模式/domain、frpc目标、同token三处PONG身份及手机日常列表。持久domain写入后当前MC不动态重读，由用户重开；用户环境不自动刷新已开VSCode/MC。
+- 回复延迟按同answer_seq对齐outbox和手机接收，后台收到不等于详情显示；通知等待或别次RPC超时不能替代同事件证据。探针和历史快照只证明对应版本/路径。
+
 - Codex 执行审批沿用 `codex_approval_policy` 保存三种模式：`never` → `never / danger-full-access / user`，`on-request` → `on-request / danger-full-access / user`，`auto-review` → `on-request / workspace-write / auto_review`，依次对应 approvalPolicy、sandbox、approvalsReviewer。缺失或未知值回退 `auto-review`；旧无版本配置一次迁移并保存 `codex_approval_defaults_version: 1`，以后保留手选。只影响后续创建/恢复，切回旧模式显式发送 `user`。自动审查由 app-server 内置审核决定，不保证批准。隔离 wx 菜单与 IPC 至 JSON-RPC 请求验证不代表可见浏览器端到端通过。
 
 - 可携带网页入口使用运行态 `MC_BROWSER_OPEN_ARGV` JSON 数组，PowerShell call operator 展开参数；源码/frozen 路径与 cwd 分离。用户技能根与随包根合并去重、forceReload；安装包由 console worker 提前分派 helper，不输出 worker ready。自有 target 创建后立即 flush ID，后续失败只续验该目标；最终以同一 HWND 可见、非最小化及真实 foreground 判断。跨机首启和焦点效果须在目标机实际验收。

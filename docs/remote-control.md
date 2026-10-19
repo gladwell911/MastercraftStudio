@@ -1,5 +1,7 @@
 # 双电脑远程身份配置
 
+2026-10-19：台式机default已用external接入wss://mc-desktop-test.tingyou.cc:8443/nats，frpc转日常18080，旧CF保留；实体RC无编译覆盖、按私有持久配置接入。TLS/恢复期发送错误及前台延迟待修，见[交接](handoff.md)。下方双CF部署/私有编译方式是历史或可选方案，不代表当前台式机。
+
 ## 当前认证与升级要求（2026-10-17）
 
 新协议 broker 使用独立 mc/mobile 用户，手机以 mobile 为用户名、该机器原 token 为密码；不再使用旧 auth_token。身份、域名与 token 的持久化规则保持不变。电脑源码更新不代表运行中的 broker 已升级，必须在用户退出旧 MC 后重新打包启动，再核对认证、hello/readiness 与列表读取。手机私有编译参数也须与正式入口配套，不能只修改持久偏好。

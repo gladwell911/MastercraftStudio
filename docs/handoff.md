@@ -1,5 +1,15 @@
 # 当前交接
 
+## 2026-10-19 当前快照：日常台式机与实体RC已接入，稳定性待修
+
+用户自行重包/重启D:/code/cx/mc，default实际external，新入口wss://mc-desktop-test.tingyou.cc:8443/nats；history/remote_machine.json仅domain改变，pair/token保持。frpc desktop从隔离28080切到日常18080/服务器19080，forum-wsl/19420、旧Cloudflare保持。日常包SHA256为093134a6c5f9d67fa79a47f81cc7054abe507702a41c2096ca88c57f443ab94b。三处PONG同身份，公网hello/readiness/list正常，17聊天ID与本地一致。
+
+实体RC用户自行卸载后新安装，无startup override，恢复偏好仅改default地址；APK SHA256为8e0ced21846db322bddbb4880533b9880e2c147e38cf09e1f2a204646617fc5e。实际已连接、日常聊天可读、重开通过；旧签名阻塞解除，笔记本本轮未迁移。第三批论坛按用户收窄后的首页要求验收，不要求登录；WSL正常重启恢复/长期观察未验。
+
+未修问题：前台回复显示晚7–8秒；RPC发布前PING5秒超时导致前台退役；19:07真实IOException/TLS握手失败窗口点击发送暴露No authorized connection round。该次发送PUB前失败，不是token拒绝。TLS底层原因未知，不能套其他时间的PING超时。后台通知快到不等于详情快显示；提前history tail方案也未证适用于共享投影页面。
+
+下一步主入口为RC [连接问题交接](https://github.com/gladwell911/remoteControl/blob/master/docs/current/2026-10-19-connection-issues.md)，本机D:/code/sj/rc/docs/current/2026-10-19-connection-issues.md。证据在仓库外D:/code/sj/_bmad-output/implementation-artifacts/frp-caddy-desktop-production/。先修恢复期发送状态/提示，再窄计时定位TLS/PING与下行投影更新，不额外调用模型/重发问题、不停日常MC/CF/论坛、不改数据库。以下10月18日及以前部署记录均为历史。
+
 ## 2026-10-18 可携带网页入口实现
 
 已集成 `browser_open.py`、随包 `mc-browser-open` 技能、技能根合并刷新与 `MC_BROWSER_OPEN_ARGV`。源码调用 `.venv/Scripts/python.exe browser_open.py --url <HTTP(S) URL>`；默认 onedir 包使用 `mc_worker.exe --browser-open --url <URL>`，不依赖系统 Python。helper 保留专用实例与已有标签，只创建/续验自己的 target；失败返回 targetId 后只用同 URL 加 `--target-id` 续验，不能盲目重建。

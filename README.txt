@@ -1,5 +1,7 @@
 神匠工坊（mc）是面向读屏用户的 wxPython Windows 桌面客户端，整合 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，以及聊天历史、远程控制和笔记。
 
+2026-10-19：日常台式机external/frp/Caddy与实体RC基本连通通过，TLS握手失败、恢复期发送错误和前台回复延迟未修，下一步入口见 docs/handoff.md。
+
 ## 快速开始
 
 需要 Windows 10/11 与 Python 3.11。
