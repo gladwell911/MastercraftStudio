@@ -372,6 +372,15 @@ class DesktopFileLibrary:
         }
 
 
+class _ExclusiveFileHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class CopypartyFileService:
     def __init__(
         self,
@@ -562,7 +571,7 @@ class CopypartyFileService:
         candidates = (self.port, *FILE_SERVICE_FALLBACK_PORTS)
         for candidate in dict.fromkeys(candidates):
             try:
-                server = ThreadingHTTPServer((self.host, int(candidate)), Handler)
+                server = _ExclusiveFileHTTPServer((self.host, int(candidate)), Handler)
             except OSError as exc:
                 last_error = exc
                 continue

@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import main
+import pytest
 
 
 def test_recent_collection_pages_search_and_stale_cursor_preserve_canonical_chats(frame):
@@ -930,3 +931,171 @@ def test_registered_history_handler_bounds_escaped_long_content_and_preserves_ol
     assert response["body"]["has_more"] and response["body"]["oldest_cursor"]
     turns = response["body"]["chat"]["turns"]
     assert len(turns) <= 10 and all(turn["answer_continuation"] and turn["answer_seq"] == 0 for turn in turns)
+
+
+@pytest.mark.parametrize("primary,legacy,expected", [
+    (None, None, "cloudflared"), (None, "external", "external"),
+    ("cloudflared", "external", "cloudflared"), ("external", None, "external"),
+])
+def test_remote_tunnel_mode_precedence(frame, monkeypatch, primary, legacy, expected):
+    for key, value in [("REMOTE_CONTROL_TUNNEL_MODE", primary),
+                       ("CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE", legacy)]:
+        monkeypatch.delenv(key, raising=False)
+        if value is not None:
+            monkeypatch.setenv(key, value)
+    assert frame._remote_tunnel_mode() == expected
+
+
+def test_remote_tunnel_unknown_mode_is_configuration_error(frame, monkeypatch):
+    monkeypatch.setenv("REMOTE_CONTROL_TUNNEL_MODE", "invalid")
+    with pytest.raises(ValueError, match="REMOTE_CONTROL_TUNNEL_MODE"):
+        frame._remote_runtime_config()
+
+
+@pytest.mark.parametrize("url,port", [
+    ("wss://fixture:8443/nats", 8443), ("wss://fixture/nats", 443),
+    ("https://fixture", 443), ("ws://fixture/nats", 80),
+    ("http://fixture:8080", 8080),
+    ("wss://fixture:0/nats", None), ("wss://fixture:invalid/nats", None), ("wss://fixture:70000/nats", None),
+    ("ftp://fixture", None),
+])
+def test_remote_route_probe_uses_actual_url_port(frame, monkeypatch, url, port):
+    from contextlib import nullcontext
+    calls = []
+    monkeypatch.setattr(main.socket, "create_connection", lambda target, **_: calls.append(target) or nullcontext())
+    assert frame._remote_external_route_ready(url) is (port is not None)
+    assert calls == ([] if port is None else [("fixture", port)])
+
+
+@pytest.mark.parametrize("pair", ["default", "laptop"])
+def test_external_ignores_stale_cloudflared_urls(frame, monkeypatch, pair):
+    monkeypatch.setenv("REMOTE_CONTROL_TUNNEL_MODE", "external")
+    monkeypatch.setenv("REMOTE_CONTROL_PAIR_ID", pair)
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", f"wss://{pair}.example:8443/nats")
+    monkeypatch.setattr(frame, "_read_remote_control_token", lambda: pair + "-token")
+    frame.remote_nats_runtime_status = {"enabled": True, "cloudflared_url": "wss://old.example/nats"}
+    assert frame._cloudflare_file_public_base_url() == f"https://{pair}.example:8443"
+    assert frame._build_remote_nats_url() == f"wss://{pair}.example:8443/nats?token={pair}-token"
+
+
+@pytest.mark.parametrize("public_ok", [True, False])
+def test_external_startup_and_files_probe_public_without_cloudflared(frame, monkeypatch, public_ok):
+    monkeypatch.setenv("REMOTE_CONTROL_TUNNEL_MODE", "external")
+    monkeypatch.setenv("REMOTE_CONTROL_DOMAIN", "wss://fixture:8443/nats")
+    for name in ("_query_cloudflared_service", "_start_managed_cloudflared_process",
+                 "_stop_managed_cloudflared_process", "_owned_cloudflared_channel_count",
+                 "_restart_cloudflared_service"):
+        monkeypatch.setattr(frame, name, lambda *_, **__: pytest.fail("external touched cloudflared"))
+    frame._remote_nats_transport = SimpleNamespace(stop=lambda: None)
+    frame.remote_nats_runtime_status = {"enabled": True, "websocket_url": "ws://127.0.0.1:18082/nats"}
+    frame.file_service = SimpleNamespace(public_base_url="https://fixture:8443")
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda *_: True)
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda *_: (True, ""))
+    monkeypatch.setattr(frame, "_start_cloudflared_origin_proxy", lambda: True)
+    monkeypatch.setattr(frame, "_verify_remote_public_ws_with_retries", lambda *_: (public_ok, "public failed"))
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda *_: (public_ok, "public failed"))
+    monkeypatch.setattr(frame, "_set_status_text_safe", lambda *_: None)
+    if public_ok:
+        frame._ensure_remote_nats_startup_connectivity(token="fixture", published_url="wss://fixture:8443/nats")
+    else:
+        with pytest.raises(RuntimeError, match="public failed"):
+            frame._ensure_remote_nats_startup_connectivity(token="fixture", published_url="wss://fixture:8443/nats")
+    assert frame.remote_control_runtime_status["public_ws_ready"] is public_ok
+    assert frame._ensure_public_file_route_ready() is public_ok
+    frame._stop_remote_servers()
+
+
+@pytest.mark.parametrize("port_text", ["0", "65536", "invalid"])
+def test_explicit_nats_port_rejects_invalid_config(frame, monkeypatch, port_text):
+    monkeypatch.setenv("REMOTE_CONTROL_NATS_PORT", port_text)
+    monkeypatch.setattr(main, "NatsServerProcess", lambda *_: pytest.fail("invalid port started runtime"))
+    with pytest.raises(ValueError, match="REMOTE_CONTROL_NATS_PORT"):
+        frame._start_remote_nats_server_if_configured(token="fixture", host="127.0.0.1")
+
+
+@pytest.mark.parametrize("failure", [None, "already in use", "unavailable for binding"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_nats_port_is_exclusive(frame, monkeypatch, failure, legacy):
+    monkeypatch.delenv("REMOTE_CONTROL_NATS_PORT", raising=False)
+    monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_NATS_PORT", raising=False)
+    monkeypatch.setenv("CLAUDECODE_REMOTE_CONTROL_NATS_PORT" if legacy else "REMOTE_CONTROL_NATS_PORT", "24622")
+    ports, urls = [], []
+    class Process:
+        def __init__(self, config):
+            ports.append(config.port)
+        def start(self):
+            if failure:
+                raise RuntimeError(failure)
+        def stop(self):
+            pass
+    class Transport:
+        def __init__(self, **kwargs):
+            pass
+        def start_threaded(self, url):
+            urls.append(url)
+        def stop(self):
+            pass
+    monkeypatch.setattr(main, "NatsServerProcess", Process)
+    monkeypatch.setattr(main, "RemoteNatsTransport", Transport)
+    monkeypatch.setattr(frame, "_probe_existing_remote_nats_websocket_port", lambda *_: pytest.fail("explicit port reused broker"))
+    monkeypatch.setattr(frame, "_ensure_cloudflared_origin_bridge", lambda: None)
+    frame._start_remote_nats_server_if_configured(token="fixture", host="127.0.0.1")
+    assert ports == [24622]
+    assert urls == ([] if failure else ["nats://127.0.0.1:24622"])
+    assert frame.remote_nats_runtime_status["enabled"] is (failure is None)
+    if failure:
+        assert frame.remote_nats_runtime_status["last_error"] == failure
+        assert frame.remote_nats_runtime_status["tcp_url"] == "nats://127.0.0.1:24622"
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_file_storage_root_override_preserves_default(monkeypatch, tmp_path, request, override):
+    from file_transfer import DEFAULT_DESKTOP_FILE_STORAGE_DIR
+    isolated_root = tmp_path / "isolated-files"
+    monkeypatch.delenv("DESKTOP_FILE_STORAGE_DIR", raising=False)
+    if override:
+        monkeypatch.setenv("DESKTOP_FILE_STORAGE_DIR", str(isolated_root))
+    storage_frame = request.getfixturevalue("frame")
+    assert storage_frame.file_library.storage_dir == (isolated_root if override else DEFAULT_DESKTOP_FILE_STORAGE_DIR)
+
+
+@pytest.mark.parametrize("event_type", ["file_offer", "file_progress"])
+def test_file_broadcast_outbox_hint_has_direct_file_fields(frame, monkeypatch, event_type):
+    import asyncio
+    from remote_nats import RemoteNatsTransport
+    from remote_nats_protocol import build_file_command_event
+
+    file_body = {"file_id": "marker-id", "name": "marker report (1).txt", "size_bytes": 27,
+                 "download_url": "https://fixture:8443/marker%20report%20%281%29.txt?t=synthetic"}
+    frame.active_chat_id = "file-owner"
+    monkeypatch.setattr(frame, "_ensure_public_file_route_ready", lambda: True)
+    frame.file_service = SimpleNamespace(download_url_for=lambda _: file_body["download_url"])
+    if event_type == "file_offer":
+        payload = frame._file_offer_for_record(SimpleNamespace(
+            id=file_body["file_id"], name=file_body["name"], size_bytes=file_body["size_bytes"]))
+    else:
+        payload = build_file_command_event(request_id="progress-request", event_type=event_type,
+            device_id="desktop-fixture", body=file_body, chat_id="file-owner")
+    original = json.loads(json.dumps(payload))
+    published = []
+    class Client:
+        async def publish(self, subject, raw):
+            published.append((subject, json.loads(raw)))
+    transport = RemoteNatsTransport(pair_id="default", token="fixture", jetstream=object(), durable_store=frame.chat_store)
+    transport.protocol_version = 2
+    transport._nats_client = Client()
+    frame._remote_nats_transport = transport
+    assert frame._broadcast_remote_event(payload) is True
+    rows = frame.chat_store.pending_outbox(pair_id="default", domain="files")
+    assert len(rows) == 1
+    envelope = json.loads(bytes(rows[0]["payload"]))
+    expected_body = dict(file_body, **{key: payload[key] for key in ("request_id", "device_id", "ts")})
+    assert envelope["body"] == expected_body
+    assert "body" not in envelope["body"]
+    assert envelope["chat_id"] == "file-owner"
+    assert payload == original
+    count, retry, _ = asyncio.run(transport._drain_outbox_lane("other"))
+    assert count == 1 and retry is False
+    assert published == [(transport.subjects.hints, envelope)]
+    assert frame.chat_store.pending_outbox(pair_id="default", domain="files") == []
+    frame._remote_nats_transport = None

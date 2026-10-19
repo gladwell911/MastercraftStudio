@@ -3,6 +3,8 @@ from urllib import error, request
 import importlib.util
 import socket
 
+import pytest
+
 import file_transfer
 from file_transfer import CopypartyFileService, DesktopFileLibrary, file_transfer_token_for
 
@@ -153,7 +155,7 @@ def test_embedded_file_service_retries_after_actual_bind_race(tmp_path, monkeypa
         return _FakeServer()
 
     monkeypatch.setattr(file_transfer, "FILE_SERVICE_FALLBACK_PORTS", (49300,))
-    monkeypatch.setattr(file_transfer, "ThreadingHTTPServer", server_factory)
+    monkeypatch.setattr(file_transfer, "_ExclusiveFileHTTPServer", server_factory)
     service = CopypartyFileService(DesktopFileLibrary(tmp_path / "storage"), port=3923)
 
     service.start()
@@ -340,3 +342,47 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
+def test_embedded_file_services_exclusively_bind_and_serve_their_own_root(tmp_path, monkeypatch, host):
+    fallback_port = _free_port()
+    monkeypatch.setattr(file_transfer, "FILE_SERVICE_FALLBACK_PORTS", (fallback_port,))
+    services = []
+    records = []
+    try:
+        for index in range(2):
+            root = tmp_path / f"root-{index}"
+            root.mkdir()
+            # Same name in both roots makes a misplaced request detectably wrong.
+            source = root / "marker report (1).txt"
+            source.write_bytes(f"instance-{index}".encode())
+            library = DesktopFileLibrary(root)
+            library.sync_storage_dir()
+            record = library.list_records()[0]
+            service = CopypartyFileService(
+                library, host=host, advertised_host="127.0.0.1",
+                port=services[0].port if services else _free_port(),
+                use_copyparty_process=False,
+            )
+            services.append(service)
+            records.append(record)
+            service.start()
+        assert services[0].port != services[1].port
+        assert services[1].port == fallback_port
+        for index, (service, record) in enumerate(zip(services, records)):
+            for _ in range(3):
+                with request.urlopen(service.download_url_for(record), timeout=5) as response:
+                    assert response.status == 200
+                    assert response.read() == f"instance-{index}".encode()
+            unsigned_url = service.download_url_for(record).split("?", 1)[0]
+            with pytest.raises(error.HTTPError) as denied:
+                request.urlopen(unsigned_url, timeout=5)
+            assert denied.value.code == 403
+            wrong_token_url = unsigned_url + "?t=" + file_transfer_token_for(records[1 - index])
+            with pytest.raises(error.HTTPError) as wrong_owner:
+                request.urlopen(wrong_token_url, timeout=5)
+            assert wrong_owner.value.code == 403
+    finally:
+        for service in reversed(services):
+            service.stop()

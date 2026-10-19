@@ -1940,7 +1940,8 @@ class ChatFrame(wx.Frame):
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
         self.chat_uploads_dir = self.app_data_dir / "chat_uploads"
         self.chat_uploads_dir.mkdir(parents=True, exist_ok=True)
-        self.file_library = DesktopFileLibrary()
+        file_storage_dir = os.environ.get("DESKTOP_FILE_STORAGE_DIR", "").strip()
+        self.file_library = DesktopFileLibrary(storage_dir=file_storage_dir) if file_storage_dir else DesktopFileLibrary()
         self.file_service = CopypartyFileService(self.file_library)
         self.file_http_base_url = self.file_service.base_url
         self._cloudflared_origin_proxy = None
@@ -3493,7 +3494,7 @@ class ChatFrame(wx.Frame):
                 download_url = file_service.download_url_for(record)
             else:
                 download_url = ""
-                error = "公网文件通道不可用，未向手机下发本地下载地址。请确认 cloudflared 已将文件服务代理到 rc.tingyou.cc 后重试。"
+                error = "公网文件通道不可用，未向手机下发本地下载地址。请确认已配置的公网入口可访问文件服务后重试。"
         else:
             base_url = str(getattr(self, "file_http_base_url", "") or "").rstrip("/")
             download_url = f"{base_url}/files/{record.id}" if base_url else ""
@@ -3521,6 +3522,11 @@ class ChatFrame(wx.Frame):
         if not self._start_cloudflared_origin_proxy():
             return False
         origin_port = self._cloudflared_origin_port()
+        if self._remote_tunnel_mode() == "external":
+            runtime = self._remote_runtime_config()
+            token = self._read_remote_control_token() or self.remote_control_token
+            ready, _detail = self._verify_remote_public_ws(f"{runtime['published_base']}?token={quote(token)}")
+            return ready
         ready, _mode, _detail = self._ensure_cloudflared_tunnel(origin_port)
         return ready
 
@@ -4782,7 +4788,17 @@ class ChatFrame(wx.Frame):
         if changed:
             self._defer_chat_state_save()
 
+    def _remote_tunnel_mode(self) -> str:
+        mode = self._read_remote_control_setting(
+            "REMOTE_CONTROL_TUNNEL_MODE", "CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE",
+            default="cloudflared",
+        ).strip().lower()
+        if mode not in {"cloudflared", "external"}:
+            raise ValueError(f"Invalid REMOTE_CONTROL_TUNNEL_MODE: {mode!r}")
+        return mode
+
     def _remote_runtime_config(self) -> dict:
+        self._remote_tunnel_mode()
         has_domain_env = self._has_remote_control_env(
             "REMOTE_CONTROL_DOMAIN",
             "CLAUDECODE_REMOTE_CONTROL_DOMAIN",
@@ -11656,6 +11672,11 @@ class ChatFrame(wx.Frame):
             kind = str(payload.get("type") or payload.get("kind") or "event").strip() or "event"
             body = {key: copy.deepcopy(value) for key, value in payload.items()
                     if key not in {"type", "kind", "event_id", "chat_id", "origin_client"}}
+            if kind.startswith("file_") and isinstance(payload.get("body"), dict):
+                body = copy.deepcopy(payload["body"])
+                for key in ("request_id", "device_id", "ts"):
+                    if key in payload:
+                        body[key] = copy.deepcopy(payload[key])
             if kind == "execution_entry":
                 body["kind"] = str(payload.get("kind") or "info").strip() or "info"
             try:
@@ -16998,7 +17019,9 @@ class ChatFrame(wx.Frame):
         status = getattr(self, "remote_nats_runtime_status", {}) or {}
         if not status.get("enabled"):
             return ""
-        remote_url = str(status.get("cloudflared_url") or self._remote_runtime_config()["domain"] or "").strip()
+        configured_url = self._remote_runtime_config()["domain"]
+        remote_url = str(configured_url if self._remote_tunnel_mode() == "external" else
+                         status.get("cloudflared_url") or configured_url or "").strip()
         if not remote_url:
             return ""
         try:
@@ -17047,7 +17070,8 @@ class ChatFrame(wx.Frame):
         self._remote_health_stop.set()
         with self._remote_health_lock:
             self._remote_health_generation += 1
-        self._stop_managed_cloudflared_process()
+        if self._remote_tunnel_mode() != "external":
+            self._stop_managed_cloudflared_process()
         self._stop_cloudflared_origin_proxy()
         transport = getattr(self, "_remote_nats_transport", None)
         if transport is not None:
@@ -17122,30 +17146,31 @@ class ChatFrame(wx.Frame):
                 if not self._remote_health_current(stop, generation):
                     return
                 failures = 0 if public_ok else failures + 1
-                channels = self._owned_cloudflared_channel_count()
-                network_available = public_ok or self._remote_external_route_ready(published_url)
-                if restart_budget.allow(time.monotonic(), origin_healthy=local_ok,
-                        network_available=network_available, channels_healthy=public_ok or channels is None or channels > 0):
-                    with self._remote_health_lock:
+                if self._remote_tunnel_mode() != "external":
+                    channels = self._owned_cloudflared_channel_count()
+                    network_available = public_ok or self._remote_external_route_ready(published_url)
+                    if restart_budget.allow(time.monotonic(), origin_healthy=local_ok,
+                            network_available=network_available, channels_healthy=public_ok or channels is None or channels > 0):
+                        with self._remote_health_lock:
+                            if not self._remote_health_current(stop, generation):
+                                return
+                            last_restart = time.monotonic()
+                        owned = getattr(self, "_managed_cloudflared_process", None)
+                        if owned is not None or getattr(self, "_managed_cloudflared_start_failed", False):
+                            self._stop_managed_cloudflared_process()
+                            restarted = self._start_managed_cloudflared_process(self._cloudflared_origin_port())
+                        elif os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") == "service":
+                            restarted = self._restart_cloudflared_service(stop_event=stop)
+                        else:
+                            restarted = False
                         if not self._remote_health_current(stop, generation):
                             return
-                        last_restart = time.monotonic()
-                    owned = getattr(self, "_managed_cloudflared_process", None)
-                    if owned is not None or getattr(self, "_managed_cloudflared_start_failed", False):
-                        self._stop_managed_cloudflared_process()
-                        restarted = self._start_managed_cloudflared_process(self._cloudflared_origin_port())
-                    elif os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") == "service":
-                        restarted = self._restart_cloudflared_service(stop_event=stop)
-                    else:
-                        restarted = False
-                    if not self._remote_health_current(stop, generation):
-                        return
-                    if restarted:
-                        public_ok, detail = self._verify_remote_public_ws(published_url)
-                        if public_ok:
-                            failures = 0
-                    else:
-                        detail = f"cloudflared 服务重启失败；{detail}"
+                        if restarted:
+                            public_ok, detail = self._verify_remote_public_ws(published_url)
+                            if public_ok:
+                                failures = 0
+                        else:
+                            detail = f"cloudflared 服务重启失败；{detail}"
             detail = str(detail or "").replace(token, "<redacted>") if token else str(detail or "")
             with self._remote_health_lock:
                 if not self._remote_health_current(stop, generation):
@@ -17167,13 +17192,16 @@ class ChatFrame(wx.Frame):
 
     def _remote_external_route_ready(self, published_url: str) -> bool:
         """A DNS/TCP route probe gates restart; it never asserts UDP health."""
-        host = urlsplit(published_url).hostname
-        if not host:
-            return False
         try:
-            with socket.create_connection((host, 443), timeout=2):
+            parsed = urlsplit(published_url)
+            if parsed.scheme not in {"wss", "https", "ws", "http"} or not parsed.hostname:
+                return False
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme in {"wss", "https"} else 80)
+            if port <= 0:
+                return False
+            with socket.create_connection((parsed.hostname, port), timeout=2):
                 return True
-        except OSError:
+        except (OSError, ValueError):
             return False
 
     def _owned_cloudflared_channel_count(self) -> int | None:
@@ -17295,7 +17323,9 @@ class ChatFrame(wx.Frame):
         token = self._read_remote_control_token()
         if not token:
             return ""
-        base = getattr(self, "remote_nats_runtime_status", {}).get("cloudflared_url") or self._remote_runtime_config()["domain"]
+        configured_url = self._remote_runtime_config()["domain"]
+        base = (configured_url if self._remote_tunnel_mode() == "external" else
+                getattr(self, "remote_nats_runtime_status", {}).get("cloudflared_url") or configured_url)
         if not base:
             return ""
         return f"{base}?token={token}"
@@ -17315,6 +17345,17 @@ class ChatFrame(wx.Frame):
     def _start_remote_nats_server_if_configured(self, *, token: str, host: str) -> None:
         if getattr(self, "_remote_nats_transport", None) is not None:
             return
+        explicit_port_text = self._read_remote_control_setting(
+            "REMOTE_CONTROL_NATS_PORT", "CLAUDECODE_REMOTE_CONTROL_NATS_PORT", default="",
+        ).strip()
+        explicit_port = None
+        if explicit_port_text:
+            try:
+                explicit_port = int(explicit_port_text)
+            except ValueError:
+                raise ValueError("REMOTE_CONTROL_NATS_PORT must be an integer between 1 and 65535") from None
+            if not 1 <= explicit_port <= 65535:
+                raise ValueError("REMOTE_CONTROL_NATS_PORT must be an integer between 1 and 65535")
         preferred_websocket_port = self._resolve_remote_nats_websocket_port(
             DEFAULT_REMOTE_NATS_WEBSOCKET_PORT
         )
@@ -17324,7 +17365,7 @@ class ChatFrame(wx.Frame):
             )
         websocket_port = preferred_websocket_port
         self._remote_nats_websocket_port = websocket_port
-        preferred_ports = [DEFAULT_REMOTE_NATS_PORT, *REMOTE_NATS_PORT_FALLBACKS]
+        preferred_ports = [explicit_port] if explicit_port is not None else [DEFAULT_REMOTE_NATS_PORT, *REMOTE_NATS_PORT_FALLBACKS]
         seen_ports = set()
         last_error = ""
         for attempt_idx, tcp_port in enumerate(preferred_ports):
@@ -17350,6 +17391,8 @@ class ChatFrame(wx.Frame):
                 try:
                     process.start()
                 except Exception as exc:
+                    if explicit_port is not None:
+                        raise
                     message = str(exc or "").lower()
                     port_in_use = "already in use" in message
                     port_unavailable = (
@@ -17412,7 +17455,7 @@ class ChatFrame(wx.Frame):
                     except Exception:
                         pass
                 message = str(exc or "").lower()
-                if (
+                if explicit_port is None and (
                     reused_existing_runtime
                     or "already in use" in message
                     or "access permissions" in message
@@ -17905,6 +17948,9 @@ class ChatFrame(wx.Frame):
         502 path.  If the service exists, make it authoritative; use a child
         process only when no service is installed.
         """
+        if self._remote_tunnel_mode() == "external":
+            ready = self._remote_local_listener_ready(origin_port)
+            return ready, "external", "" if ready else "external origin 未监听。"
         state = self._query_cloudflared_service()
         if state.get("exists"):
             if os.environ.get("REMOTE_CONTROL_CLOUDFLARED_OWNER_MODE") != "service":
@@ -18121,10 +18167,10 @@ class ChatFrame(wx.Frame):
                 last_remote_error="",
                 published_url=published_url,
             )
-            connector = "桌面托管进程" if tunnel_mode == "managed" else "系统服务"
+            connector = ("external 公网入口" if tunnel_mode == "external" else
+                         "cloudflared 桌面托管进程" if tunnel_mode == "managed" else "cloudflared 系统服务")
             self._set_status_text_safe(
-                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；"
-                f"cloudflared {connector}与 rc.tingyou.cc 已验证"
+                f"远程 NATS 已启动：监听 {self.remote_control_runtime_bind}；发布 {published_url}；{connector}已验证"
             )
             return
         detail = public_detail

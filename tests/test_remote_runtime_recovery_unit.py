@@ -320,3 +320,23 @@ def test_managed_cloudflared_diagnostic_retains_bounded_log_tail(frame, monkeypa
     assert synthetic_token not in detail
     assert "<redacted>" in detail
     assert detail.count("old line") <= 18
+
+
+@pytest.mark.parametrize("responses,ready", [([False] * 6, False), ([False, True], True)])
+def test_external_health_degrades_and_recovers_without_cf(frame, monkeypatch, responses, ready):
+    monkeypatch.setenv("REMOTE_CONTROL_TUNNEL_MODE", "external")
+    clock = _ProbeClock(len(responses))
+    frame._remote_nats_transport = object()
+    frame.remote_nats_runtime_status = {"websocket_url": "ws://127.0.0.1:18082/nats"}
+    monkeypatch.setattr(frame, "_remote_runtime_config", lambda: {"fixed_domain_mode": True, "published_base": "wss://fixture:8443/nats"})
+    monkeypatch.setattr(frame, "_read_remote_control_token", lambda: "fixture")
+    monkeypatch.setattr(frame, "_verify_remote_local_health", lambda *_: (True, ""))
+    monkeypatch.setattr(frame, "_remote_local_listener_ready", lambda *_: True)
+    results = iter(responses)
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", lambda *_: (next(results), "public failure"))
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda *_: None)
+    for name in ("_owned_cloudflared_channel_count", "_restart_cloudflared_service", "_start_managed_cloudflared_process"):
+        monkeypatch.setattr(frame, name, lambda *_, **__: pytest.fail("external health touched CF"))
+    frame._remote_health_worker(clock, frame._remote_health_generation)
+    assert frame.remote_control_runtime_status["public_ws_ready"] is ready
+    frame._remote_nats_transport = None
