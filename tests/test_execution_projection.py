@@ -1,3 +1,5 @@
+import pytest
+
 from execution_projection import (
     collapse_kimi_execution_lifecycle,
     execution_command_list_text,
@@ -52,3 +54,57 @@ def test_projected_kimi_update_keeps_id_and_duplicate_legacy_text_stays_distinct
     duplicates = rows([duplicate, dict(duplicate)])
     assert len({row["row_id"] for row in duplicates}) == 2
     assert execution_row_id("owner", 2, started) == execution_row_id("owner", 2, completed)
+
+
+def _context_rows(turns, steps=(), mode="history", active_index=-1):
+    return project_execution_rows(
+        chat_id="history-owner", revision=2, steps=list(steps), turns=turns,
+        view_mode=mode, active_turn_index=active_index, selected_model="fallback",
+        requesting_text="requesting", answer_to_plain=lambda answer, model: answer,
+    )
+
+
+def test_history_context_uses_latest_turn_without_visible_steps():
+    turns = [
+        {"question": "old q", "answer_md": "old a"},
+        {"question": "new q", "answer_md": "new a", "created_at": 10, "answer_at": 12},
+    ]
+    steps = [
+        {"turn_idx": 0, "display_kind": "commentary", "list_text": "visible"},
+        {"turn_idx": 1, "display_kind": "command", "list_text": "hidden"},
+        {"turn_idx": 1, "event_type": "item_completed", "phase": "final_answer",
+         "detail_text": "hidden final"},
+    ]
+    rows = _context_rows(turns, steps)
+    assert [row["list_text"] for row in rows] == ["我：new q", "visible", "小诸葛：new a"]
+    assert [rows[0]["created_at"], rows[-1]["created_at"]] == [10, 12]
+    assert [rows[0]["row_id"], rows[-1]["row_id"]] == [
+        "execution:history-owner:turn:1:question", "execution:history-owner:turn:1:answer",
+    ]
+
+
+@pytest.mark.parametrize("tail,expected", [
+    ({"question": "last q", "answer_md": "last a"}, ["我：last q", "小诸葛：last a"]),
+    ({"question": "", "answer_md": ""}, []),
+    ({"question": "pending", "answer_md": "requesting"}, ["我：pending"]),
+])
+def test_history_consecutive_plain_turns_never_fall_back_to_old_answer(tail, expected):
+    turns = [{"question": "old q", "answer_md": "old a"},
+             {"question": "middle q", "answer_md": "middle a"}, tail, None]
+    assert [row["list_text"] for row in _context_rows(turns)] == expected
+
+
+@pytest.mark.parametrize("turns", [[], [None, "invalid"], [None, {}]])
+def test_history_empty_or_invalid_turns_keep_hidden_steps_hidden(turns):
+    assert _context_rows(turns, [{"display_kind": "command", "list_text": "hidden"}]) == []
+
+
+def test_active_context_keeps_selected_turn_and_existing_step_fallback():
+    turns = [{"question": "first", "answer_md": "a"}, {"question": "last", "answer_md": "b"}]
+    assert [row["list_text"] for row in _context_rows(turns, mode="active", active_index=0)] == [
+        "我：first", "小诸葛：a",
+    ]
+    steps = [{"turn_idx": 0, "display_kind": "command", "list_text": "hidden"}]
+    assert [row["list_text"] for row in _context_rows(turns, steps, mode="active")] == [
+        "我：first", "小诸葛：a",
+    ]

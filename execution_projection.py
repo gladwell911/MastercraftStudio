@@ -188,6 +188,10 @@ def execution_turn_context_steps(
     if not turns:
         return list(steps or [])
     indices = []
+    if view_mode == "history":
+        indices = [index for index, turn in enumerate(turns) if isinstance(turn, dict)][-1:]
+        if not indices:
+            return list(steps or [])
     if view_mode == "active" and 0 <= active_turn_index < len(turns):
         indices = [active_turn_index]
     if not indices:

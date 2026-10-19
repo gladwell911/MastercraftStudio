@@ -1279,6 +1279,10 @@ def test_ui_automation_history_execution_list_excludes_active_chat_turn_context(
         }
     ]
 
+    frame.archived_chats[0]["turns"].append(
+        {"question": "latest history q", "answer_md": "latest history a", "created_at": 3.0}
+    )
+
     frame._on_new_chat_clicked(None)
     frame.active_session_turns.append(
         {
@@ -1293,7 +1297,9 @@ def test_ui_automation_history_execution_list_excludes_active_chat_turn_context(
     assert frame._show_history_chat("chat-a")
     frame._apply_detail_panel_mode("execution", refresh_execution=True)
     history_rows = list(frame.execution_list.GetStrings())
-    assert any("A 的提问" in row for row in history_rows)
+    assert not any("A 的提问" in row for row in history_rows)
+    assert sum("latest history q" in row for row in history_rows) == 1
+    assert sum("latest history a" in row for row in history_rows) == 1
     assert not any("B 的提问" in row or "B 的回答" in row for row in history_rows)
 
     assert frame._show_history_chat(frame.active_chat_id)

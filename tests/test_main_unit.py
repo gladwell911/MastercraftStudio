@@ -21958,7 +21958,7 @@ def test_execution_history_duplicate_legacy_rows_keep_identity_when_page_expands
     assert len(set(_execution_content_ids(frame))) == 201
 
 
-def test_execution_history_memory_overrides_hidden_rows_before_more_decision(frame, tmp_path):
+def test_execution_history_memory_overrides_hidden_rows_before_more_decision(frame, tmp_path, wx_app):
     store = main.ChatStore(tmp_path / "overrides.db", max_execution_steps_per_turn=1000)
     store.initialize()
     store.upsert_chat({"id": "history", "detail_panel_mode": "execution"})
@@ -21973,6 +21973,10 @@ def test_execution_history_memory_overrides_hidden_rows_before_more_decision(fra
     frame.archived_chats = [{"id": "history", "turns": store.load_chat("history")["turns"],
                              "detail_panel_mode": "execution", "execution_steps": memory}]
     frame.view_mode, frame.view_history_id = "history", "history"
+    frame._render_execution_list(force=True)
+    deadline = time.monotonic() + 2
+    while getattr(frame, "_execution_scan_pending", None) and time.monotonic() < deadline:
+        wx_app.Yield()
     frame._render_execution_list(force=True)
     labels = _execution_content_labels(frame)
     assert labels == ["更多"] + [f"step {i}" for i in range(81, 180)] + ["小诸葛：new a"]
@@ -23303,3 +23307,42 @@ def test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lea
     assert frame._start_managed_cloudflared_process(18080) is False
     assert len([value for value in calls if value != "terminate"]) == 1
     assert all("private-test-secret" not in value and str(token_file) not in value for value in statuses)
+
+
+def test_remote_execution_projection_history_latest_plain_answer_owner(frame, tmp_path):
+    store = main.ChatStore(tmp_path / "history-latest-answer.db")
+    store.initialize()
+    turns = [
+        {"question": "old q", "answer_md": "old a", "created_at": 1.0},
+        {"question": "latest q", "answer_md": "latest a", "created_at": 2.0, "answer_at": 3.0},
+    ]
+    store.upsert_chat({"id": "history-owner", "title": "history", "turns": turns})
+    store.replace_turns("history-owner", turns)
+    store.replace_execution_steps("history-owner", [
+        {"turn_idx": 0, "display_kind": "commentary", "list_text": "old visible"},
+        {"turn_idx": 1, "display_kind": "command", "list_text": "hidden command"},
+        {"turn_idx": 1, "event_type": "item_completed", "phase": "final_answer",
+         "detail_text": "hidden final"},
+    ])
+    frame.chat_store = store
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "active-owner"
+    frame.active_turn_idx = 0
+    frame.active_session_turns = [{"question": "active q", "answer_md": "active a"}]
+    frame._current_chat_state = {"id": "active-owner", "turns": frame.active_session_turns,
+                                 "execution_steps": []}
+    frame.archived_chats = [{"id": "history-owner", "turns": turns,
+                             "detail_panel_mode": "execution",
+                             "execution_steps": store.load_execution_steps("history-owner")}]
+    frame.view_mode, frame.view_history_id = "history", "history-owner"
+
+    status, page = frame._remote_api_execution_page_ui(
+        {"chat_id": "history-owner", "body": {"limit": 2}}, secret="secret"
+    )
+    assert status == 200, page
+    assert [row["list_text"] for row in page["rows"]] == ["old visible", "小诸葛：latest a"]
+    assert page["rows"][-1]["created_at"] == 3.0
+    assert page["rows"][-1]["row_id"] == "execution:history-owner:turn:1:answer"
+    assert all(row["row_id"].startswith("execution:history-owner:") for row in page["rows"])
+    frame._render_execution_list(force=True)
+    assert _execution_content_labels(frame) == ["我：latest q", "old visible", "小诸葛：latest a"]
