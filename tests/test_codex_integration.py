@@ -69,6 +69,65 @@ def test_codex_steer_completed_items_accumulate_and_reload(frame, monkeypatch, a
     assert [turn.get("answer_at") for turn in loaded] == [turn.get("answer_at") for turn in turns]
 
 
+def test_codex_completed_append_then_read_keeps_identity_and_rejects_late_text(frame, monkeypatch):
+    owner = "codex-read-finalize"
+    turn = {"question": "question", "answer_md": main.REQUESTING_TEXT,
+            "request_status": "pending", "model": main.DEFAULT_CODEX_MODEL,
+            "codex_turn_id": TEST_TURN_ID, "codex_thread_id": TEST_THREAD_ID,
+            "codex_start_generation": 2, "codex_context_generation": 2}
+    chat = {"id": owner, "title": "read finalize", "model": main.DEFAULT_CODEX_MODEL,
+            "turns": [turn], "codex_thread_id": TEST_THREAD_ID,
+            "codex_turn_id": TEST_TURN_ID, "codex_context_generation": 2}
+    frame.active_chat_id = frame.current_chat_id = owner
+    frame.active_session_turns = chat["turns"]
+    frame._current_chat_state = chat
+    frame.chat_store.upsert_chat(chat)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_: None)
+    monkeypatch.setattr(frame, "_refresh_context_usage_after_done", lambda *_: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    # Drive explicit flushes, keeping deferred scheduling out of this test.
+    monkeypatch.setattr(frame, "_call_later_if_alive", lambda *_args, **_kwargs: object())
+
+    def deliver(kind, text, item_id=""):
+        frame._on_codex_event_for_chat(owner, CodexEvent(type=kind, text=text,
+            item_id=item_id, thread_id=TEST_THREAD_ID, turn_id=TEST_TURN_ID,
+            status="completed", phase="final_answer", subtype="agentMessage",
+            data={"turn_idx": 0, "context_generation": 2, "model": main.DEFAULT_CODEX_MODEL}))
+
+    deliver("item_completed", "persisted item text", "item")
+    frame._persist_chat_history_to_store()
+    assert frame.chat_store.load_turns(owner)[0]["answer_md"] == "persisted item text"
+    assert frame.chat_store.readable_answer(owner, turn_index=0) is None
+
+    deliver("turn_completed", "completion adds final text", "final")
+    assert turn["request_status"] == "done"
+    expected = "persisted item text\n\ncompletion adds final text"
+    assert turn["answer_md"] == expected
+    frame._render_answer_list(refresh_execution=False)
+    frame.answer_list.SetSelection(frame._find_answer_row_index(0))
+    target = frame._selected_read_target()
+    assert target is not None
+    frame._confirm_answer_read(target)
+    frame._flush_chat_state_save()
+    identity = frame.chat_store.readable_answer(owner, turn_index=0)
+    state = frame.chat_store.get_chat_read_state(owner, pair_id=frame._read_pair_id())
+    assert identity is not None
+    assert state["read_seq"] == identity["answer_seq"] == state["latest_readable_seq"]
+
+    frame._flush_chat_state_save()
+    frame._flush_codex_background_updates()
+    assert frame.chat_store.readable_answer(owner, turn_index=0) == identity
+    assert frame.chat_store.get_chat_read_state(owner, pair_id=frame._read_pair_id())["read_seq"] == state["read_seq"]
+    deliver("turn_completed", "late different text must be rejected", "late")
+    frame._flush_chat_state_save()
+    frame._flush_codex_background_updates()
+    assert turn["answer_md"] == expected
+    assert frame.chat_store.load_turns(owner)[0]["answer_md"] == expected
+    assert frame.chat_store.readable_answer(owner, turn_index=0) == identity
+    final_state = frame.chat_store.get_chat_read_state(owner, pair_id=frame._read_pair_id())
+    assert final_state["read_seq"] == final_state["latest_readable_seq"] == state["read_seq"]
+
+
 def test_codex_legacy_completed_text_deduplicates_without_item_id_and_kimi_keeps_first_answer(frame):
     turn = {"answer_md": main.REQUESTING_TEXT, "request_status": "pending"}
     for text in ("question", "question", "final", "final"):

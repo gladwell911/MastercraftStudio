@@ -1239,6 +1239,25 @@ class ChatStore:
             row = conn.execute("SELECT a.message_id,a.answer_seq,a.generation FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id,int(turn_index))).fetchone()
         return dict(row) if row else None
 
+    def readable_answer_for_turn(self, chat_id: str, *, turn_index: int, turn: dict,
+                                 generation: str) -> dict | None:
+        """Resolve the frozen visible turn and its identity in one snapshot."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT a.message_id,a.answer_seq,a.generation,t.payload_json "
+                "FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id "
+                "JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation "
+                "JOIN turns t ON t.chat_id=m.chat_id AND t.turn_index=m.legacy_turn_index "
+                "WHERE a.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant' AND g.generation=?",
+                (chat_id, int(turn_index), generation)).fetchone()
+            if row is None:
+                return None
+            persisted = self._json_dict(row["payload_json"])
+            if (persisted.get("request_status") != "done" or turn.get("request_status") != "done"
+                    or not self._same_canonical_turn(persisted, turn)):
+                return None
+            return {key: row[key] for key in ("message_id", "answer_seq", "generation")}
+
     def mark_chat_read(self, *, pair_id: str, chat_id: str, generation: str,
                        message_id: str, answer_seq: int, operation_id: str, domain: str = "events") -> dict:
         owner = self.normalize_chat_id(chat_id)
@@ -1847,9 +1866,16 @@ class ChatStore:
 
     @staticmethod
     def _same_canonical_turn(old: dict[str, Any], new: dict[str, Any]) -> bool:
-        return all(str(old.get(key) or "") == str(new.get(key) or "") for key in (
-            "question", "model", "provider", "provider_kind", "provider_user_message_id"
-        ))
+        if str(old.get("question") or "") != str(new.get("question") or ""):
+            return False
+        if (old.get("request_status") == new.get("request_status") == "done"
+                and str(old.get("answer_md") or "") != str(new.get("answer_md") or "")):
+            return False
+        # Missing provider identity is commonly filled after the first save.
+        # Only conflicting established identities denote a different turn.
+        return all(not old.get(key) or not new.get(key) or str(old[key]) == str(new[key])
+                   for key in ("model", "provider", "provider_kind", "provider_user_message_id",
+                               "session_id", "thread_id", "turn_id", "provider_message_id"))
 
     def _backfill_canonical_turns_conn(self, conn: sqlite3.Connection, chat_id: str,
                                        turns: list[dict[str, Any]], start: int) -> None:

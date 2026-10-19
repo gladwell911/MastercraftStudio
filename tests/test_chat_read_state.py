@@ -112,3 +112,48 @@ def test_initialization_cutoff_excludes_completion_waiting_on_transaction(store,
     new = store.readable_answer("a", turn_index=1)
     state = store.get_chat_read_state("a", pair_id="p")
     assert state["read_seq"] == old["answer_seq"] < new["answer_seq"]
+
+
+@pytest.mark.parametrize("suffix", [False, True])
+def test_provider_enrichment_keeps_read_identity(store, suffix):
+    original = turn("one")
+    store.replace_turns("a", [original])
+    target = store.readable_answer("a", turn_index=0)
+    mark(store, 0)
+    enriched = {**original, "provider": "codex", "provider_kind": "codex",
+                "provider_user_message_id": "user-one", "thread_id": "thread-one"}
+    save = store.replace_turns_from if suffix else store.replace_turns
+    save("a", [enriched, {"question": "next", "request_status": "pending"}])
+    assert store.readable_answer("a", turn_index=0) == target
+    assert store.get_chat_read_state("a", pair_id="p")["read_seq"] == target["answer_seq"]
+    save("a", [enriched, turn("next")])
+    assert store.readable_answer("a", turn_index=1)["answer_seq"] > target["answer_seq"]
+    save("a", [{**enriched, "provider_user_message_id": "replacement"}, turn("next")])
+    assert store.readable_answer("a", turn_index=0)["message_id"] != target["message_id"]
+
+
+def test_frozen_turn_resolution_is_read_only_and_rejects_replacement(store):
+    store.replace_turns("a", [turn("one", "pending")])
+    generation = store.get_chat_read_state("a")["generation"]
+    resolve = lambda: store.readable_answer_for_turn("a", turn_index=0,
+        turn=turn("one"), generation=generation)
+    assert resolve() is None
+    assert store.load_turns("a")[0]["request_status"] == "pending"
+    store.replace_turns("a", [turn("one"), turn("future")])
+    target = resolve()
+    assert target == store.readable_answer("a", turn_index=0)
+    store.replace_turns("a", [{**turn("one"), "answer_md": "replacement"}])
+    assert resolve() is None
+    store.begin_clear_operation("a", idempotency_key="clear", pair_id="p")
+    assert resolve() is None
+
+
+def test_completed_answer_replacement_gets_new_identity(store):
+    original = turn("one")
+    store.replace_turns("a", [original])
+    target = store.readable_answer("a", turn_index=0)
+    mark(store, 0)
+    store.replace_turns("a", [{**original, "answer_md": "genuine replacement"}])
+    replacement = store.readable_answer("a", turn_index=0)
+    assert replacement["message_id"] != target["message_id"]
+    assert replacement["answer_seq"] > target["answer_seq"]

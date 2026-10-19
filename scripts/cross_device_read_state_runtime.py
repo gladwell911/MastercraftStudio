@@ -129,6 +129,8 @@ def run():
             prompt = super().submit_prompt(session_id, content_blocks)
             question = content_blocks[0].get("text", "")
             answer = "READ E2E answer " + question
+            if question.startswith("long read regression"):
+                answer += " long answer continuation body" * 300
             def finish():
                 self.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id=prompt))
                 self.push_event(KimiEvent(type="agent_message_delta", thread_id=session_id, turn_id=prompt, text=answer, display_kind="assistant"))
@@ -141,11 +143,25 @@ def run():
     tcp = _choose_available_port(4522, (4523, 4524))
     websocket = _choose_available_port(18082, (18083, 18084))
     server = NatsServerProcess(NatsRuntimeConfig(app_data_dir=folder / "nats", token=token,
-        host="127.0.0.1", port=tcp, websocket_host="127.0.0.1", websocket_port=websocket))
+        host="127.0.0.1", port=tcp, websocket_host="127.0.0.1", websocket_port=websocket,
+        role_permissions=True, pair_id="default"))
     server.start(timeout=20)
     route = lambda name: lambda payload: frame._run_remote_ui_route(getattr(frame, name), payload)
-    history_delay = {"seconds": 0, "started": 0, "finished": 0}
+    history_delay = {"seconds": 0, "started": 0, "finished": 0, "held": False}
+    history_release = threading.Event()
+    history_release.set()
     read_race = {"armed": False, "started": False, "finished": False}
+    # Hold only this isolated instance's normal persistence. Product timers and
+    # keyboard/read handling remain untouched, including the indexed identity
+    # write required when the user reads a visibly completed unsaved answer.
+    save_window = {"held": False, "attempts": 0}
+    real_save_state = frame._save_state
+    def save_with_window(*args, **kwargs):
+        if save_window["held"]:
+            save_window["attempts"] += 1
+            return
+        return real_save_state(*args, **kwargs)
+    frame._save_state = save_with_window
     real_confirm = frame._confirm_answer_read
     def confirm_during_completion(target):
         if target and read_race["armed"]:
@@ -160,18 +176,27 @@ def run():
             read_race["finished"] = True
         real_confirm(target)
     frame._confirm_answer_read = confirm_during_completion
-    def history_read(payload):
-        result = route("_remote_api_history_read_ui")(payload)
+    def hold_detail_result(result):
         seconds = history_delay["seconds"]
-        if seconds:
+        if seconds or history_delay["held"]:
             history_delay["started"] += 1
-            time.sleep(seconds)
+            if history_delay["held"]:
+                if not history_release.wait(20):
+                    raise RuntimeError("Owned detail response was not released")
+            else:
+                time.sleep(seconds)
             history_delay["finished"] += 1
         return result
+    def history_read(payload):
+        return hold_detail_result(route("_remote_api_history_read_ui")(payload))
+    def state_read(payload):
+        return hold_detail_result(route("_remote_api_state_ui")(payload))
     transport = RemoteNatsTransport(pair_id="default", token=token, durable_store=frame.chat_store,
+        desktop_password=server.config.desktop_password,
         on_message=route("_remote_api_message_ui"), on_new_chat=route("_remote_api_new_chat_ui"),
-        on_state=route("_remote_api_state_ui"), on_history_read=history_read,
+        on_state=state_read, on_history_read=history_read,
         on_history_list=lambda: frame._run_remote_ui_route(frame._remote_api_history_list_ui),
+        on_history_page=route("_remote_api_history_list_ui"),
         on_model_list=lambda: frame._run_remote_ui_route(frame._remote_api_model_list_ui),
         on_rename_chat=route("_remote_api_rename_chat_ui"),
         on_chat_read_changed=lambda state: wx.CallAfter(frame._on_chat_read_changed, state))
@@ -217,6 +242,8 @@ def run():
             "answer_hwnd": int(frame.answer_list.GetHandle()), "owner": frame._visible_answer_owner_chat_id(),
             "input_hwnd": int(frame.input_edit.GetHandle()), "running": bool(frame.is_running),
             "viewer_open": bool(getattr(frame, "_answer_viewer_open", False)),
+            "save_window": dict(save_window),
+            "pending_read_count": len(getattr(frame, "_pending_answer_reads", {})),
             "history_delay": dict(history_delay),
             "read_race": dict(read_race),
             "selection": frame.answer_list.GetSelection(), "count": frame.answer_list.GetCount(),
@@ -243,7 +270,29 @@ def run():
 
     def control(body):
         action = body.get("action")
-        if action == "send":
+        if action == "save_window":
+            if body.get("held") and not save_window["held"]:
+                # Keep both requests on the same active owner. The archived
+                # remote-send path intentionally reloads its durable history.
+                frame._switch_current_chat(chat_a)
+            save_window["held"] = bool(body.get("held"))
+            if save_window["held"]:
+                save_window["attempts"] = 0
+            else:
+                real_save_state()
+                frame._flush_pending_remote_finals()
+        elif action == "prepare_window_key":
+            # Prepare selection/focus only. The next actual native Shift+Tab
+            # must cross the user keyboard handler before anything is read.
+            index = int(body["selection"])
+            target = frame._selected_read_target(index)
+            if not target or "frozen_turn" not in target:
+                raise RuntimeError("Expected visible completed answer without persisted identity")
+            activate_owned_frame(frame)
+            app.Yield()
+            frame.answer_list.SetSelection(index)
+            frame.input_edit.SetFocusFromKbd()
+        elif action == "send":
             status, result = frame._remote_api_message_ui({"chat_id": body["chat_id"], "text": body["text"], "model": "kimi/main"})
             return {"status": status, "result": result}
         if action == "show":
@@ -309,6 +358,14 @@ def run():
             server.stop()
         elif action == "nats_on":
             server.start(timeout=20)
+        elif action == "history_hold":
+            held = bool(body.get("held"))
+            history_delay["held"] = held
+            if held:
+                history_delay.update(seconds=0, started=0, finished=0)
+                history_release.clear()
+            else:
+                history_release.set()
         elif action == "history_delay":
             history_delay.update(seconds=int(body.get("seconds", 0)), started=0, finished=0)
         elif action == "read_race":

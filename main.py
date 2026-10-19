@@ -4313,6 +4313,8 @@ class ChatFrame(wx.Frame):
                 except Exception:
                     dirty_from = None
         if dirty_from is None:
+            if getattr(self, "_pending_answer_reads", None):
+                self._flush_pending_answer_reads(normalized)
             return
         start_index = max(0, min(int(dirty_from), len(turns or [])))
         replace_from = getattr(store, "replace_turns_from", None)
@@ -4320,6 +4322,8 @@ class ChatFrame(wx.Frame):
             replace_from(normalized, list(turns or [])[start_index:], start_index=start_index)
         else:
             store.replace_turns(normalized, turns or [])
+        if getattr(self, "_pending_answer_reads", None):
+            self._flush_pending_answer_reads(normalized)
         # Canonical message rows now exist. Deterministic event IDs make this safe
         # across repeated saves and ensure every provider path projects exactly once.
         transport = getattr(self, "_remote_nats_transport", None)
@@ -12148,7 +12152,7 @@ class ChatFrame(wx.Frame):
                     turn[field], turn[field + "_continuation"] = prefix, cursor
                     if field == "answer":
                         turn["complete_answer_seq"] = turn.get("answer_seq", 0)
-                        turn["answer_seq"] = 0
+                        # Content pagination does not change the readable identity.
 
     def _remote_chat_snapshot_page_from_store(self, chat: dict, payload: dict | None = None) -> tuple[dict, bool, str]:
         payload = dict(payload or {})
@@ -20969,7 +20973,18 @@ class ChatFrame(wx.Frame):
         if store is None or not hasattr(store, "readable_answer"):
             return None
         target = store.readable_answer(owner, turn_index=self.answer_meta[index][1])
-        return {**target, "chat_id": owner} if target else None
+        if target:
+            return {**target, "chat_id": owner}
+        turn_index = self.answer_meta[index][1]
+        turns = self._get_view_turns()
+        if 0 <= turn_index < len(turns):
+            turn = turns[turn_index]
+            if turn.get("request_status") == "done" and str(turn.get("answer_md") or "").strip():
+                state = self._chat_read_state(owner)
+                if state:
+                    return {"chat_id": owner, "generation": state["generation"],
+                            "turn_index": turn_index, "frozen_turn": copy.deepcopy(turn)}
+        return None
 
     def _on_chat_read_changed(self, state):
         if getattr(self, "_closing", False):
@@ -20983,7 +20998,21 @@ class ChatFrame(wx.Frame):
         if not target:
             return
         try:
-            state = self.chat_store.mark_chat_read(pair_id=self._read_pair_id(), chat_id=target["chat_id"],
+            if "frozen_turn" in target:
+                identity = self.chat_store.readable_answer_for_turn(target["chat_id"],
+                    turn_index=target["turn_index"], turn=target["frozen_turn"], generation=target["generation"])
+                if identity:
+                    target = {**identity, "chat_id": target["chat_id"],
+                              "pair_id": target.get("pair_id") or self._read_pair_id()}
+                else:
+                    pending = getattr(self, "_pending_answer_reads", None)
+                    if pending is None:
+                        pending = self._pending_answer_reads = {}
+                    pending[(target["chat_id"], target["generation"], target["turn_index"])] = {
+                        **copy.deepcopy(target), "pair_id": self._read_pair_id()}
+                    self._defer_chat_state_save()
+                    return
+            state = self.chat_store.mark_chat_read(pair_id=target.get("pair_id") or self._read_pair_id(), chat_id=target["chat_id"],
                 generation=target["generation"], message_id=target["message_id"],
                 answer_seq=target["answer_seq"], operation_id=uuid.uuid4().hex)
             self._on_chat_read_changed(state)
@@ -20993,6 +21022,21 @@ class ChatFrame(wx.Frame):
                 asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
         except (ValueError, RuntimeError) as exc:
             self.SetStatusText(f"已读确认失败：{exc}")
+
+    def _flush_pending_answer_reads(self, chat_id):
+        pending = getattr(self, "_pending_answer_reads", {})
+        for key, frozen in list(pending.items()):
+            if frozen["chat_id"] != chat_id:
+                continue
+            identity = self.chat_store.readable_answer_for_turn(chat_id,
+                turn_index=frozen["turn_index"], turn=frozen["frozen_turn"],
+                generation=frozen["generation"])
+            # Persistence completed. A missing/mismatched target is stale, not
+            # permission to read a replacement or a later answer.
+            pending.pop(key, None)
+            if identity:
+                self._confirm_answer_read({**identity, "chat_id": chat_id,
+                                           "pair_id": frozen["pair_id"]})
 
     def _on_answer_mouse_read(self, event):
         index = self.answer_list.HitTest(event.GetPosition())
@@ -21035,7 +21079,7 @@ class ChatFrame(wx.Frame):
                     return
             targets = [self._selected_read_target(index) for index in range(count)]
             readable = [target for target in targets if target and target["generation"] == chosen["generation"]
-                        and target["answer_seq"] <= chosen["latest_readable_seq"]]
+                        and 0 < target.get("answer_seq", 0) <= chosen["latest_readable_seq"]]
             if readable:
                 self._confirm_answer_read(max(readable, key=lambda target: target["answer_seq"]))
                 return
@@ -22210,6 +22254,8 @@ class ChatFrame(wx.Frame):
             if focus is self.input_edit:
                 if detail_target is not None:
                     detail_target.SetFocus()
+                    if detail_target is getattr(self, "answer_list", None):
+                        self._confirm_answer_read(self._selected_read_target())
                 return True
             if focus is detail_target or focus in detail_controls:
                 self.history_list.SetFocus()
@@ -22225,6 +22271,8 @@ class ChatFrame(wx.Frame):
         if focus is self.history_list:
             if detail_target is not None:
                 detail_target.SetFocus()
+                if detail_target is getattr(self, "answer_list", None):
+                    self._confirm_answer_read(self._selected_read_target())
             skip = getattr(event, "Skip", None)
             if callable(skip):
                 skip()
