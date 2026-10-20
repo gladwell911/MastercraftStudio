@@ -1,5 +1,11 @@
 # 当前交接
 
+## 2026-10-20 笔记本 FRP 部署接续
+
+笔记本 FRP 脚本与私有配置交接准备已就绪；服务器已配置独立 19081 和 `mc-laptop-test.tingyou.cc:8443` 路由。
+笔记本尚未执行本机部署，手机 laptop 仍使用原地址；先完成笔记本认证与列表验证，再修改手机，台式机 default 不变。
+笔记本 Codex 按 [部署说明](../deploy/mc-relay/LAPTOP.md) 使用仓库外私有 bundle 运行 setup-laptop.ps1；用户先退出旧 MC，保留原 history/token，后续升级也使用该入口
+
 ## 2026-10-19 当前快照：日常台式机与实体RC已接入，稳定性待修
 
 用户自行重包/重启D:/code/cx/mc，default实际external，新入口wss://mc-desktop-test.tingyou.cc:8443/nats；history/remote_machine.json仅domain改变，pair/token保持。frpc desktop从隔离28080切到日常18080/服务器19080，forum-wsl/19420、旧Cloudflare保持。日常包SHA256为093134a6c5f9d67fa79a47f81cc7054abe507702a41c2096ca88c57f443ab94b。三处PONG同身份，公网hello/readiness/list正常，17聊天ID与本地一致。

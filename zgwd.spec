@@ -5,7 +5,9 @@ from PyInstaller.utils.hooks import collect_submodules
 
 
 nats_server = Path("tools/nats-server/nats-server.exe")
-nats_datas = [(str(nats_server), "nats-server")] if nats_server.exists() else []
+if not nats_server.is_file() or nats_server.stat().st_size == 0:
+    raise FileNotFoundError(f"Required NATS server not found: {nats_server.resolve()}")
+nats_datas = [(str(nats_server), "nats-server")]
 nats_hiddenimports = collect_submodules("nats")
 chat_title_rules = Path("assets/chat_title_rules.json")
 if not chat_title_rules.is_file():

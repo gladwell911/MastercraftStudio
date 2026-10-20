@@ -90,3 +90,5 @@ frps 重启会短暂断开新隧道，必须实测 frpc 自动恢复。复查旧
 准备阶段本地检查：`bash -n deploy-cert.sh`、替换示例值后用 Python `tomllib` 解析两份 TOML、`git diff --check`。这些不代表服务器配置或端到端已通过。
 
 Upload deploy-cert.sh with LF line endings; .gitattributes pins LF for this script.
+
+2026-10-20 笔记本 FRP 部署入口见 [LAPTOP.md](LAPTOP.md)。私有 bundle 在仓库外；普通权限运行 setup-laptop.ps1，原目录保留 history，先由用户退出旧 MC。以后升级也使用 setup 入口；原 package 默认启动不保证 external 模式。手机待笔记本验证成功再改 laptop 地址，default 不变。

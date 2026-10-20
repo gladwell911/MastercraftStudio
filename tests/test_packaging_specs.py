@@ -115,6 +115,9 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     guard = 'return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
     assert text.count(guard) == 1
     script.write_text(text.replace(guard, 'return $false'), encoding="utf-8-sig")
+    nats_source = tmp_path / "tools" / "nats-server" / "nats-server.exe"
+    nats_source.parent.mkdir(parents=True)
+    nats_source.write_bytes(b"fake-nats-source")
     spec = tmp_path / "fake.spec"
     spec.write_text("fake only", encoding="utf-8")
     builder = tmp_path / "fake-builder.py"
@@ -128,6 +131,9 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         "if mode == 'build_fail': sys.exit(7)\n"
         "package = dist / 'mc'\n"
         "(package / '_internal' / 'assets').mkdir(parents=True)\n"
+        "nats = package / '_internal' / 'nats-server' / 'nats-server.exe'\n"
+        "nats.parent.mkdir()\n"
+        "nats.write_bytes(b'fake-nats-package')\n"
         "(package / 'mc.exe').write_bytes(b'new-gui')\n"
         "if mode != 'missing_worker': (package / 'mc_worker.exe').write_bytes(b'' if mode == 'empty_worker' else b'new-worker')\n"
         "(package / '_internal' / 'assets' / 'chat_title_rules.json').write_text('{}')\n"

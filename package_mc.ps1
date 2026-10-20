@@ -49,7 +49,7 @@ function Remove-PackageNode {
 
 function Assert-PackageArtifacts {
     param([string]$PackagePath)
-    foreach ($relativePath in @('mc.exe', 'mc_worker.exe', '_internal\assets\chat_title_rules.json', '_internal\assets\codex-skills\mc-browser-open\SKILL.md')) {
+    foreach ($relativePath in @('mc.exe', 'mc_worker.exe', '_internal\nats-server\nats-server.exe', '_internal\assets\chat_title_rules.json', '_internal\assets\codex-skills\mc-browser-open\SKILL.md')) {
         $artifact = Join-Path $PackagePath $relativePath
         $item = Get-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
         if ($null -eq $item -or $item.PSIsContainer -or $item.Length -eq 0 -or
@@ -130,6 +130,10 @@ try {
         if ($process.Path -and ([IO.Path]::GetFullPath($process.Path)).StartsWith($finalPackage + '\', [StringComparison]::OrdinalIgnoreCase)) {
             throw 'mc.exe is still running. Close it before packaging.'
         }
+    }
+    $natsSource = Join-Path $repoRoot "tools\nats-server\nats-server.exe"
+    if (-not (Test-Path -LiteralPath $natsSource -PathType Leaf) -or (Get-Item -LiteralPath $natsSource).Length -eq 0) {
+        throw "Required NATS server missing: $natsSource"
     }
     New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
     & $resolvedPythonExe -m PyInstaller -y --clean --distpath $stagingPath --workpath $resolvedWorkPath $resolvedSpecPath
