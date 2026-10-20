@@ -15,4 +15,4 @@
 配置副本与日志默认保存在 `%LOCALAPPDATA%\MC-Laptop-FRP`；当前用户普通权限登录任务 `MC-Laptop-FRP` 隐藏启动 FRPC 与 external 模式 MC。FRPC 子进程不继承 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY，其它应用的代理不变。以后升级仍使用上面的 setup 命令；仅启动已有包时使用登录任务或 `start-laptop.ps1`。直接运行原 `package_mc.ps1` 默认自动启动不能保证 external 模式。
 
 4. Codex 核实 MC 本地 18080、FRPC 日志注册成功，公网 `/nats` 使用该 laptop token 完成 mobile/password 的认证 PING/PONG，与本地 server_id 相同，再核 hello/readiness 和列表。无客户端注册时公网 502 是尚未接通，不能宣布部署成功。再试授权文件下载。不要为验证发送模型请求或修改数据。
-5. 笔记本验证成功后，在手机 RC 设置只修改笔记本地址为上方地址，保留 laptop 原 token，台式机地址/token 不动。现手机无 startup override，保存设置即可，无需重装。确认两个来源连接、列表正确、重开仍保留。笔记本未上线前不要改手机。
+5. 当前手机已于 2026-10-20 覆盖安装内置双来源 FRP 地址与原 token 的 RC，无需手填笔记本地址或再次安装。笔记本上线后确认两个来源连接、列表正确、重开仍保留；尚未上线时笔记本来源离线符合预期。此包完整 startup override 优先于保存设置，未来更换地址应更新私有编译参数后重新构建，不要仅改偏好。
