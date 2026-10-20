@@ -150,27 +150,48 @@ def guard(profile, expected):
         raise RuntimeError("Dedicated Chrome identity changed")
 
 
+def is_administrator():
+    if os.name != "nt":
+        return False
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    shell.IsUserAnAdmin.restype = wintypes.BOOL
+    return bool(shell.IsUserAnAdmin())
+
+
 def ensure_instance(profile, timeout):
     snapshot = process_snapshot()
     identity = inspect_instance(snapshot, profile)
     if identity is not None:
         return identity
     chrome = find_chrome()
-    process = subprocess.Popen([str(chrome), "--user-data-dir=" + str(profile),
+    argv = [str(chrome), "--user-data-dir=" + str(profile),
         "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=9222",
-        "--no-first-run", "--no-default-browser-check", "about:blank"])
+        "--no-first-run", "--no-default-browser-check", "about:blank"]
+    if is_administrator():
+        argv.insert(-1, "--do-not-de-elevate")
+    process = subprocess.Popen(argv)
+
+    def startup_failure(message, observed=None):
+        root = next((item for item in snapshot["processes"]
+                     if observed and item["pid"] == observed["pid"]), {})
+        diagnostics = {"spawnPid": process.pid, "observedRootPid": (observed or {}).get("pid"),
+                       "observedRootParent": root.get("parent"), "observedRootStartTime": root.get("startTime"),
+                       "spawnExitCode": process.poll()}
+        error = RuntimeError(message)
+        error.diagnostics = diagnostics
+        return error
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         snapshot = process_snapshot()
         if snapshot["listeners"]:
             identity = inspect_instance(snapshot, profile)
             if identity is None or identity["pid"] != process.pid:
-                raise RuntimeError("Started Chrome root ownership mismatch")
+                raise startup_failure("Started Chrome root ownership mismatch", identity)
             return identity
         if process.poll() is not None:
-            raise RuntimeError("Chrome exited before the debugging listener became available")
+            raise startup_failure("Chrome exited before the debugging listener became available")
         time.sleep(.2)
-    raise RuntimeError("Chrome startup timed out; instance preserved")
+    raise startup_failure("Chrome startup timed out; instance preserved")
 
 
 def http_json(path):
@@ -421,6 +442,7 @@ def main(argv=None):
         result = open_page(args.url, args.target_id)
     except Exception as exc:
         result = {"status": "error", "requestedUrl": args.url, "error": type(exc).__name__, "message": str(exc)}
+        result.update(getattr(exc, "diagnostics", {}))
         if args.target_id:
             result["targetId"] = args.target_id
     emit(result)

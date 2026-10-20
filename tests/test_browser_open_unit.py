@@ -118,7 +118,9 @@ def test_only_specific_transient_cdp_errors_retry_and_preserve_raw(monkeypatch, 
     assert (connection.calls > 1) == retry
 
 
-def test_startup_waits_for_listener_without_relaunch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("admin", [False, True])
+def test_startup_waits_for_listener_without_relaunch(tmp_path, monkeypatch, admin):
+    monkeypatch.setattr(browser, "is_administrator", lambda: admin)
     snapshots = [metadata(tmp_path) for _ in range(3)]
     snapshots[0] = {"processes": [], "listeners": []}
     snapshots[1]["listeners"] = []
@@ -136,6 +138,7 @@ def test_startup_waits_for_listener_without_relaunch(tmp_path, monkeypatch):
     assert browser.ensure_instance(tmp_path, 2) == {"pid": 51, "startTime": "start-1"}
     assert len(launches) == 1
     assert "--no-first-run" in launches[0]
+    assert ("--do-not-de-elevate" in launches[0]) == admin
 
 
 @pytest.mark.parametrize("stage", ["metadata", "connect"])
@@ -284,3 +287,31 @@ def test_launch_env_both_home_paths_and_roots_dedup(tmp_path, monkeypatch):
     client.prepare_task(str(tmp_path))
     assert calls[0] == ("skills/extraRoots/set", {"extraRoots": [str(agents.resolve())]})
     assert calls[1][1]["forceReload"] is True
+
+
+def test_startup_pid_mismatch_remains_error_with_json_diagnostics(tmp_path, monkeypatch, capsys):
+    snapshot = metadata(tmp_path)
+    snapshot["processes"][0]["parent"] = 99
+    snapshot["processes"][0]["command"] = subprocess.list2cmdline(snapshot["processes"][0]["command"])
+    snapshots = iter([{"processes": [], "listeners": []}, snapshot])
+    monkeypatch.setattr(browser, "process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(browser, "automation_profile", lambda: tmp_path)
+    monkeypatch.setattr(browser, "find_chrome", lambda: tmp_path / "chrome.exe")
+    monkeypatch.setattr(browser, "is_administrator", lambda: True)
+    class Process:
+        pid = 50
+        def poll(self): return 0
+    monkeypatch.setattr(browser.subprocess, "Popen", lambda argv: Process())
+    assert browser.main(["--url", "https://example.com/"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "error"
+    assert result["message"] == "Started Chrome root ownership mismatch"
+    assert result["spawnPid"] == 50 and result["observedRootPid"] == 51
+    assert result["observedRootParent"] == 99 and result["observedRootStartTime"] == "start-1"
+    assert result["spawnExitCode"] == 0
+
+
+def test_admin_detection_skips_windows_api_on_other_platforms(monkeypatch):
+    monkeypatch.setattr(browser.os, "name", "posix")
+    monkeypatch.setattr(browser.ctypes, "WinDLL", lambda *args, **kwargs: pytest.fail("Windows API called"))
+    assert browser.is_administrator() is False
