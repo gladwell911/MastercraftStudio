@@ -53,7 +53,7 @@ def test_reused_start_ack_routes_nb_final_to_actual_answer_list_and_canonical(re
         client.on_event(_event_from_item("item/completed", {"threadId":thread,"turnId":native,
             "item":{"id":"accepted-user","type":"userMessage","content":[{"type":"text","text":"accepted append QA"}]}}))
     class Provider(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             if self.started_turns and before_ack: boundary(self)
             self.started_turns.append(items)
             return {"turn":{"id":native}}

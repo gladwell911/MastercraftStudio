@@ -63,6 +63,9 @@ from codex_client import (
     CodexEvent,
     CODEX_APPROVAL_MODES,
     normalize_codex_approval_mode,
+    normalize_codex_sandbox,
+    CODEX_SANDBOX_MODES,
+    DEFAULT_CODEX_SANDBOX,
     DEFAULT_CODEX_APPROVAL_MODE,
     codex_approval_parameters,
     DEFAULT_CODEX_MODEL,
@@ -1991,6 +1994,7 @@ class ChatFrame(wx.Frame):
         self.active_openclaw_last_event_id = ""
         self.active_openclaw_last_synced_at = 0.0
         self.codex_answer_english_filter_enabled = False
+        self.codex_sandbox = DEFAULT_CODEX_SANDBOX
         self.codex_approval_policy = DEFAULT_CODEX_APPROVAL_MODE
         self.codex_approval_defaults_version = 1
         self.active_codex_thread_id = ""
@@ -2184,6 +2188,7 @@ class ChatFrame(wx.Frame):
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
         self._codex_answer_filter_menu_id = wx.NewIdRef()
+        self._codex_sandbox_menu_id = wx.NewIdRef()
         self._codex_approval_policy_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
         self._notes_move_entry_down_id = wx.NewIdRef()
@@ -2247,6 +2252,7 @@ class ChatFrame(wx.Frame):
         app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
         filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
         filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
+        app_menu.Append(int(self._codex_sandbox_menu_id), "Codex 访问权限")
         app_menu.Append(int(self._codex_approval_policy_menu_id), "Codex 执行审批")
         menu_bar = wx.MenuBar()
         menu_bar.Append(app_menu, "应用(&A)")
@@ -2451,6 +2457,7 @@ class ChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_sandbox(), id=int(self._codex_sandbox_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_approval_policy(), id=int(self._codex_approval_policy_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_down(), id=int(self._notes_move_entry_down_id))
@@ -4455,6 +4462,8 @@ class ChatFrame(wx.Frame):
         self.codex_approval_defaults_version = max(1, version)
         self.codex_approval_policy = normalize_codex_approval_mode(data.get("codex_approval_policy")) if version else DEFAULT_CODEX_APPROVAL_MODE
         approval_changed = not version or data.get("codex_approval_policy") != self.codex_approval_policy
+        self.codex_sandbox = normalize_codex_sandbox(data["codex_sandbox"]) if "codex_sandbox" in data else codex_approval_parameters(self.codex_approval_policy)["sandbox"]
+        approval_changed = approval_changed or data.get("codex_sandbox") != self.codex_sandbox
 
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and getattr(self, "chat_store", None) is not None:
@@ -4647,6 +4656,7 @@ class ChatFrame(wx.Frame):
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
+            "codex_sandbox": normalize_codex_sandbox(getattr(self, "codex_sandbox", DEFAULT_CODEX_SANDBOX)),
             "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
             "codex_approval_defaults_version": max(1, getattr(self, "codex_approval_defaults_version", 1)),
             "active_session_started_at": self.active_session_started_at,
@@ -5839,8 +5849,9 @@ class ChatFrame(wx.Frame):
             "",
             f"- 模型：{model_display_name(model) or model or DEFAULT_CODEX_MODEL}",
             f"- 工作目录：{self._workspace_dir_for_codex()}",
-            "- 审批策略：never",
-            "- 沙箱：danger-full-access",
+            f"- 请求审批方式：{normalize_codex_approval_mode(getattr(self, 'codex_approval_policy', None))}",
+            f"- 请求沙箱：{normalize_codex_sandbox(getattr(self, 'codex_sandbox', None))}",
+            f"- 最近确认线程配置：{((chat or {}).get('codex_thread_configuration') if (chat or {}).get('codex_thread_configuration_thread_id') == thread_id else None) or '未确认（未取得原生响应）'}",
             f"- 线程：{thread_id or '未创建'}",
             f"- 当前轮次：{turn_id or '无'}",
             f"- 运行状态：{thread_status or '未知'}",
@@ -10382,16 +10393,20 @@ class ChatFrame(wx.Frame):
         if not isinstance(resumed, set):
             resumed = set()
             setattr(client, "_zgwd_resumed_thread_ids", resumed)
-        if thread_value in resumed:
+        configuration = (getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE), getattr(self, "codex_sandbox", None), service_tier)
+        configurations = getattr(client, "_zgwd_resumed_configurations", {})
+        if thread_value in resumed and configurations.get(thread_value) == configuration:
             return
         client.resume_thread(
             thread_value,
-            **codex_approval_parameters(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
+            **codex_approval_parameters(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE), getattr(self, "codex_sandbox", None)),
             personality="pragmatic",
             cwd=self._workspace_dir_for_codex(),
             service_tier=service_tier,
         )
         resumed.add(thread_value)
+        configurations[thread_value] = configuration
+        client._zgwd_resumed_configurations = configurations
 
     @staticmethod
     def _remember_codex_thread_resumed(client, thread_id: str) -> None:
@@ -10509,6 +10524,7 @@ class ChatFrame(wx.Frame):
                 service_tier=service_tier,
                 should_steer=should_steer,
                 approval_policy=getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE),
+                sandbox=getattr(self, "codex_sandbox", DEFAULT_CODEX_SANDBOX),
                 history_turns=history_turns,
             )
             self._call_after_if_alive(
@@ -12230,10 +12246,26 @@ class ChatFrame(wx.Frame):
     def _codex_answer_filter_menu_label(self) -> str:
         return "取消过滤英文内容" if self.codex_answer_english_filter_enabled else "在回答中过滤英文内容"
 
+    def _show_codex_sandbox(self) -> None:
+        questions = [{"id": "sandbox", "header": "Codex 访问权限",
+            "question": "选择后续线程启动或恢复的访问权限。当前正在执行的回合保持原设置，审批方式独立保存。",
+            "options": [{"label": "只读", "value": "read-only"}, {"label": "工作区写入", "value": "workspace-write"}, {"label": "完全访问", "value": "danger-full-access"}]}]
+        dlg = CodexUserInputDialog(self, questions)
+        dlg._controls[0]["radio"].SetSelection(CODEX_SANDBOX_MODES.index(normalize_codex_sandbox(getattr(self, "codex_sandbox", None))))
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            values = dlg.get_answers().get("sandbox", [])
+            self.codex_sandbox = normalize_codex_sandbox(values[0] if len(values) == 1 else None)
+        finally:
+            dlg.Destroy()
+        self._save_state()
+        self.SetStatusText("Codex 访问权限已保存，将用于后续线程启动或恢复。")
+
     def _show_codex_approval_policy(self) -> None:
         questions = [{"id": "policy", "header": "Codex 执行审批",
-            "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。自动审查使用工作区沙箱，由 Codex 审核请求，不保证全部批准。",
-            "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}, {"label": "自动审查（工作区沙箱）", "value": "auto-review"}]}]
+            "question": "选择适用于后续线程启动或恢复的审批方式。当前正在执行的回合保持原设置。访问权限独立设置。自动审查由 Codex 审核请求，不保证全部批准。",
+            "options": [{"label": "不询问", "value": "never"}, {"label": "需要时询问", "value": "on-request"}, {"label": "自动审查", "value": "auto-review"}]}]
         dlg = CodexUserInputDialog(self, questions)
         dlg._controls[0]["radio"].SetSelection(CODEX_APPROVAL_MODES.index(normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE))))
         try:
@@ -16708,6 +16740,10 @@ class ChatFrame(wx.Frame):
                     key = self._context_usage_pending_key_from_chat(target_chat, turn_idx)
                     self._codex_early_context_usage_owner.pop(key, None)
             target_chat["codex_thread_id"] = thread_id
+            if "thread_configuration" in payload:
+                configuration = payload.get("thread_configuration")
+                target_chat["codex_thread_configuration"] = dict(configuration) if isinstance(configuration, dict) else {}
+                target_chat["codex_thread_configuration_thread_id"] = thread_id
             if is_current_target:
                 self.active_codex_thread_id = thread_id
             if thread_changed:

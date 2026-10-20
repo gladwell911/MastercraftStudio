@@ -1368,3 +1368,52 @@ def test_thread_requests_default_to_auto_reviewer(monkeypatch):
         assert message['params']['approvalsReviewer'] == 'auto_review'
         assert message['params']['approvalPolicy'] == 'on-request'
         assert message['params']['sandbox'] == 'workspace-write'
+
+
+@pytest.mark.parametrize("reuse_home", [False, True])
+@pytest.mark.parametrize("layers,expected", [
+    ("rUnAsAdMiN DetectorsAdminProtection", None),
+    ("WIN8RTM RunAsAdmin HIGHDPIAWARE detectorsadminprotection", "WIN8RTM HIGHDPIAWARE"),
+    ("WIN8RTM", "WIN8RTM"),
+])
+def test_launch_env_only_removes_proven_compatibility_tokens(tmp_path, monkeypatch, reuse_home, layers, expected):
+    monkeypatch.setenv("__COMPAT_LAYER", layers)
+    monkeypatch.setattr(codex_client, "build_codex_app_server_env",
+        lambda: (dict(codex_client.os.environ), tmp_path))
+    client = codex_client.CodexAppServerClient()
+    if reuse_home:
+        client._codex_home_dir = tmp_path
+    env = client._build_launch_env()
+    assert env.get("__COMPAT_LAYER") == expected
+    assert codex_client.os.environ["__COMPAT_LAYER"] == layers
+
+
+@pytest.mark.parametrize("sandbox,policy_type", [("danger-full-access", "dangerFullAccess"), ("read-only", "readOnly"), ("workspace-write", "workspaceWrite")])
+def test_turn_start_explicit_policy_overrides_hot_thread_without_claiming_confirmation(monkeypatch, sandbox, policy_type):
+    client = codex_client.CodexAppServerClient()
+    confirmed = {"type": policy_type, "networkAccess": False}
+    client.thread_configurations = {"thread": {"sandbox": confirmed}}
+    calls = []
+    monkeypatch.setattr(client, "_request_clearing_context_usage", lambda method, params, **kwargs: calls.append((method, params)) or {"turn": {"id": "turn"}})
+    client.start_turn_items("thread", [], approval_policy="on-request", sandbox=sandbox, approvals_reviewer="auto_review")
+    assert calls[0][1]["sandboxPolicy"] == confirmed
+    assert calls[0][1]["approvalPolicy"] == "on-request"
+    assert calls[0][1]["approvalsReviewer"] == "auto_review"
+    assert "thread" not in client.thread_configurations
+    client.start_turn_items("thread", [])
+    assert not {"sandboxPolicy", "approvalPolicy", "approvalsReviewer"}.intersection(calls[1][1])
+
+
+def test_turn_start_preserves_matching_confirmed_policy(monkeypatch):
+    client = codex_client.CodexAppServerClient()
+    configuration = {"sandbox": {"type": "workspaceWrite", "writableRoots": ["D:/project"], "networkAccess": False},
+                     "approvalPolicy": "on-request", "approvalsReviewer": "auto_review"}
+    client.thread_configurations = {"thread": configuration}
+    calls = []
+    monkeypatch.setattr(client, "_request_clearing_context_usage", lambda method, params, **kwargs: calls.append(params) or {})
+    client.start_turn_items("thread", [], approval_policy="on-request", sandbox="workspace-write", approvals_reviewer="auto_review")
+    assert client.thread_configurations["thread"] == configuration
+    assert calls[0]["sandboxPolicy"] == configuration["sandbox"]
+    client.start_turn_items("thread", [], sandbox="danger-full-access")
+    assert calls[1]["sandboxPolicy"] == {"type": "dangerFullAccess"}
+    assert "thread" not in client.thread_configurations

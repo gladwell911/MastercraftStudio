@@ -35,7 +35,7 @@ class FakeCodexClient:
         self.resumed_threads.append((thread_id, kwargs))
         return {"thread": {"id": thread_id}}
 
-    def start_turn_items(self, thread_id, items, service_tier=None):
+    def start_turn_items(self, thread_id, items, service_tier=None, **policy):
         self.operations.append(("start_turn", thread_id))
         self.started_turns.append((thread_id, items, service_tier))
         return {"turn": {"id": "turn-1"}}
@@ -88,7 +88,7 @@ def test_reused_start_completed_only_items_and_late_tool_keep_each_accepted_owne
 
 def test_failed_reused_start_preserves_unseen_old_final_without_registering_append():
     class Provider(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             if self.started_turns:
                 self.on_event(_event_from_item("item/completed", {"threadId":thread_id,"turnId":"turn-1",
                     "item":{"id":"prior-final","type":"agentMessage","phase":"final_answer","text":"prior final"}}))
@@ -109,7 +109,7 @@ def test_failed_reused_start_preserves_unseen_old_final_without_registering_appe
 @pytest.mark.parametrize("content", [None, "not a list", {"text":"q1"}])
 def test_reused_ack_normalizes_nonlist_user_content_consistently(content):
     class Provider(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             if self.started_turns:
                 self.on_event(CodexEvent(type="item_completed",subtype="userMessage",item_id="accepted",
                     thread_id=thread_id,turn_id="turn-1",text="q1",data={"content":content}))
@@ -163,7 +163,7 @@ def test_rejected_ack_keeps_original_command_and_thread_routing(conflict):
 @pytest.mark.parametrize("failure", ["exception", "overflow"])
 def test_prior_preservation_overflow_isolates_unknown_and_keeps_known_terminal(failure):
     class Provider(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             if self.started_turns:
                 self.on_event(CodexEvent(type="item_completed",thread_id=thread_id,turn_id="turn-1",item_id="unknown",
                     subtype="agentMessage",phase="final_answer",text="ambiguous" * 300))
@@ -192,7 +192,7 @@ def test_prior_preservation_overflow_isolates_unknown_and_keeps_known_terminal(f
 
 
 class RaisingTurnCodexClient(FakeCodexClient):
-    def start_turn_items(self, thread_id, items, service_tier=None):
+    def start_turn_items(self, thread_id, items, service_tier=None, **policy):
         raise RuntimeError("turn failed")
 
 
@@ -229,13 +229,13 @@ def test_failed_task_preparation_does_not_resume_or_start_turn():
 
 
 class EarlyUsageCodexClient(FakeCodexClient):
-    def start_turn_items(self, thread_id, items, service_tier=None):
+    def start_turn_items(self, thread_id, items, service_tier=None, **policy):
         self.on_event(CodexEvent(type="token_count", thread_id=thread_id, turn_id="turn-early"))
         return {"turn": {"id": "turn-early"}}
 
 
 class UniqueTurnCodexClient(FakeCodexClient):
-    def start_turn_items(self, thread_id, items, service_tier=None):
+    def start_turn_items(self, thread_id, items, service_tier=None, **policy):
         self.started_turns.append((thread_id, items, service_tier))
         return {"turn": {"id": f"turn-{len(self.started_turns)}"}}
 
@@ -346,7 +346,7 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
 
 def test_worker_events_keep_thread_scope_when_new_turn_or_model_starts():
     class ScopedClient(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             super().start_turn_items(thread_id, items, service_tier)
             return {"turn": {"id": f"turn-{thread_id}"}}
     output = io.StringIO()
@@ -1233,7 +1233,7 @@ def test_context_only_information_does_not_query_account_or_quota():
 
 def test_immediate_terminal_events_are_emitted_after_owner_ack_in_order():
     class ImmediateClient(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             for event in [
                 CodexEvent(type="turn_started", thread_id=thread_id, turn_id="immediate"),
                 CodexEvent(type="item_completed", thread_id=thread_id, turn_id="immediate", phase="final_answer", text="answer"),
@@ -1253,7 +1253,7 @@ def test_immediate_terminal_events_are_emitted_after_owner_ack_in_order():
 
 def test_startup_event_overflow_is_explicit_failure_without_cached_final():
     class OverflowClient(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             for _ in range(3):
                 self.on_event(CodexEvent(type="item_completed", phase="final_answer", thread_id=thread_id, turn_id="overflow", text="not accepted"))
             return {"turn":{"id":"overflow"}}
@@ -1270,7 +1270,7 @@ def test_startup_event_overflow_is_explicit_failure_without_cached_final():
 
 def test_startup_exception_drops_unowned_events_and_preserves_error_generation():
     class ErrorClient(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             self.on_event(CodexEvent(type="item_completed", phase="final_answer", thread_id=thread_id, turn_id="unowned", text="not accepted"))
             raise RuntimeError("failed before owner acknowledgement")
     output = io.StringIO()
@@ -1285,7 +1285,7 @@ def test_startup_exception_drops_unowned_events_and_preserves_error_generation()
 @pytest.mark.parametrize("failure_mode", ["exception", "overflow"])
 def test_second_start_failure_preserves_prior_turn_completion(failure_mode):
     class PriorClient(FakeCodexClient):
-        def start_turn_items(self, thread_id, items, service_tier=None):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
             if not self.started_turns:
                 self.started_turns.append((thread_id, items, service_tier))
                 return {"turn":{"id":"prior"}}
@@ -1461,3 +1461,39 @@ def test_item_ownership_limit_preserves_known_owner_and_rejects_unknown():
     assert [event.get("turn_idx") for event in events] == [0, 0, None, 0]
     assert len(runtime._item_owners) == 2
     assert any(message["type"] == "error" and "ownership limit" in message["payload"]["message"] for message in messages)
+
+
+def test_worker_thread_ack_only_transmits_native_response_configuration():
+    output = io.StringIO()
+    configuration = {"sandbox": {"type": "dangerFullAccess"}, "approvalPolicy": "on-request"}
+    client = FakeCodexClient()
+    client.thread_configurations = {"thread-1": configuration}
+    runtime = CodexWorkerRuntime(lambda callback, model: client, output)
+    runtime.handle_message(make_ui_request("start", "start_turn", {
+        "chat_id": "configuration-chat", "turn_idx": 0, "question": "hello",
+        "model": "codex/main", "sandbox": "workspace-write"}))
+    messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+    acks = [item for item in messages if item["type"] in ("thread_state", "turn_started_ack")]
+    assert len(acks) == 2
+    assert all(item["payload"]["thread_configuration"] == configuration for item in acks)
+    runtime.close()
+
+
+def test_worker_hot_steer_does_not_override_turn_policy():
+    output = io.StringIO()
+    class Client(FakeCodexClient):
+        def start_turn_items(self, thread_id, items, service_tier=None, **policy):
+            self.policy = policy
+            return super().start_turn_items(thread_id, items, service_tier)
+    client = Client()
+    runtime = CodexWorkerRuntime(lambda callback, model: client, output)
+    payload = {"chat_id": "chat", "turn_idx": 0, "question": "hello", "model": "codex/main",
+               "approval_policy": "auto-review", "sandbox": "workspace-write"}
+    runtime.handle_message(make_ui_request("first", "start_turn", payload))
+    assert client.policy["sandbox"] == "workspace-write"
+    runtime.handle_message(make_ui_request("steer", "start_turn", {**payload,
+        "thread_id": "thread-1", "turn_id": "turn-1", "should_steer": True, "sandbox": "danger-full-access"}))
+    assert len(client.started_turns) == 1
+    assert client.policy["sandbox"] == "workspace-write"
+    assert len(client.steered_turns) == 1
+    runtime.close()

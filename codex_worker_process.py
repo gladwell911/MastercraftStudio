@@ -342,7 +342,7 @@ class CodexWorkerRuntime:
                 try:
                     client.resume_thread(
                         thread_id,
-                        **codex_approval_parameters(payload.get("approval_policy")),
+                        **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")),
                         personality="pragmatic",
                         cwd=payload.get("cwd") or "",
                         service_tier=service_tier_arg,
@@ -379,7 +379,7 @@ class CodexWorkerRuntime:
                     try:
                         client.resume_thread(
                             thread_id,
-                            **codex_approval_parameters(payload.get("approval_policy")),
+                            **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")),
                             personality="pragmatic",
                             cwd=payload.get("cwd") or "",
                             service_tier=service_tier_arg,
@@ -389,7 +389,8 @@ class CodexWorkerRuntime:
                             raise
                         thread_id = self._start_thread(client, payload, service_tier_arg)
                         items = self._recovery_input_items(payload, items)
-                turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg)
+                turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg,
+                    **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")))
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
             if steered and not turn_id:
                 turn_id = str(payload.get("turn_id") or "").strip()
@@ -424,6 +425,7 @@ class CodexWorkerRuntime:
                     "turn_idx": turn_idx,
                     "model": model,
                     "thread_id": thread_id,
+                    "thread_configuration": dict(getattr(client, "thread_configurations", {}).get(thread_id, {})),
                     "turn_id": turn_id,
                     "context_generation": context_generation,
                     "active": True,
@@ -437,6 +439,7 @@ class CodexWorkerRuntime:
                     "turn_idx": turn_idx,
                     "model": model,
                     "thread_id": thread_id,
+                    "thread_configuration": dict(getattr(client, "thread_configurations", {}).get(thread_id, {})),
                     "turn_id": turn_id,
                     "context_generation": context_generation,
                     "active": True,
@@ -480,7 +483,7 @@ class CodexWorkerRuntime:
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(
             cwd=payload.get("cwd") or "",
-            **codex_approval_parameters(payload.get("approval_policy")),
+            **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")),
             personality="pragmatic",
             service_tier=service_tier_arg,
         )

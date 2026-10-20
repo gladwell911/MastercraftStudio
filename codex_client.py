@@ -62,11 +62,18 @@ def resolve_native_approval_parameters(approval_policy=None, sandbox=None, appro
     }
 
 
-def codex_approval_parameters(value: str | None) -> dict[str, str]:
+CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+
+
+def normalize_codex_sandbox(value: str | None) -> str:
+    return value if value in CODEX_SANDBOX_MODES else DEFAULT_CODEX_SANDBOX
+
+
+def codex_approval_parameters(value: str | None, sandbox: str | None = None) -> dict[str, str]:
     mode = normalize_codex_approval_mode(value)
     return {
         "approval_policy": "on-request" if mode == "auto-review" else mode,
-        "sandbox": "workspace-write" if mode == "auto-review" else "danger-full-access",
+        "sandbox": normalize_codex_sandbox(sandbox) if sandbox is not None else ("workspace-write" if mode == "auto-review" else "danger-full-access"),
         "approvals_reviewer": "auto_review" if mode == "auto-review" else "user",
     }
 
@@ -687,7 +694,7 @@ class CodexAppServerClient:
             "ephemeral": bool(ephemeral),
             "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
-        return self._request_clearing_context_usage("thread/start", params)
+        return self._request_thread_configuration("thread/start", params)
 
     def resume_thread(
         self,
@@ -707,7 +714,19 @@ class CodexAppServerClient:
         }
         if cwd:
             params["cwd"] = str(cwd).strip()
-        return self._request_clearing_context_usage("thread/resume", params)
+        return self._request_thread_configuration("thread/resume", params)
+
+    def _request_thread_configuration(self, method: str, params: dict) -> dict:
+        result = self._request_clearing_context_usage(method, params)
+        thread = result.get("thread") if isinstance(result, dict) else None
+        thread_id = str((thread or {}).get("id") or params.get("threadId") or "")
+        if not hasattr(self, "thread_configurations"):
+            self.thread_configurations = {}
+        self.thread_configurations[thread_id] = {
+            key: result[key] for key in ("approvalPolicy", "sandbox", "approvalsReviewer")
+            if isinstance(result, dict) and key in result
+        }
+        return result
 
     def read_thread(self, thread_id: str, include_turns: bool = True) -> dict:
         return self.request(
@@ -802,16 +821,36 @@ class CodexAppServerClient:
         items: list[dict],
         timeout: int | None = None,
         service_tier: str | None = None,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+        approvals_reviewer: str | None = None,
     ) -> dict:
-        return self._request_clearing_context_usage(
-            "turn/start",
-            {
-                "threadId": str(thread_id or "").strip(),
-                "input": list(items or []),
-                "serviceTier": normalize_codex_service_tier(service_tier) or None,
-            },
-            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT,
-        )
+        params = {
+            "threadId": str(thread_id or "").strip(),
+            "input": list(items or []),
+            "serviceTier": normalize_codex_service_tier(service_tier) or None,
+        }
+        configuration = getattr(self, "thread_configurations", {}).get(params["threadId"], {})
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if approvals_reviewer is not None:
+            params["approvalsReviewer"] = approvals_reviewer
+        if sandbox is not None:
+            policy_type = {"danger-full-access": "dangerFullAccess", "read-only": "readOnly",
+                           "workspace-write": "workspaceWrite"}[normalize_codex_sandbox(sandbox)]
+            confirmed = getattr(self, "thread_configurations", {}).get(params["threadId"], {}).get("sandbox")
+            params["sandboxPolicy"] = dict(confirmed) if isinstance(confirmed, dict) and confirmed.get("type") == policy_type else {"type": policy_type}
+        result = self._request_clearing_context_usage("turn/start", params,
+            timeout=timeout or DEFAULT_CODEX_TURN_TIMEOUT)
+        changed = any(key in params and params[key] != configuration.get(key)
+                      for key in ("approvalPolicy", "approvalsReviewer"))
+        if "sandboxPolicy" in params:
+            confirmed_sandbox = configuration.get("sandbox")
+            changed = changed or not isinstance(confirmed_sandbox, dict) or confirmed_sandbox.get("type") != params["sandboxPolicy"]["type"]
+        if changed:
+            # turn/start does not confirm effective policy; the old response is stale.
+            getattr(self, "thread_configurations", {}).pop(params["threadId"], None)
+        return result
 
     def steer_turn(self, thread_id: str, expected_turn_id: str, text: str, timeout: int | None = None) -> dict:
         return self.steer_turn_items(
@@ -916,6 +955,16 @@ class CodexAppServerClient:
         else:
             env = os.environ.copy()
             env["CODEX_HOME"] = str(self._codex_home_dir)
+        # These inherited compatibility flags break restricted Windows process
+        # creation together even with an elevated Codex token (native A/B).
+        for key in list(env):
+            if key.upper() == "__COMPAT_LAYER":
+                layers = [token for token in env[key].split()
+                          if token.casefold() not in {"runasadmin", "detectorsadminprotection"}]
+                if layers:
+                    env[key] = " ".join(layers)
+                else:
+                    env.pop(key)
         env["MC_BROWSER_OPEN_ARGV"] = json.dumps(browser_open_argv(), ensure_ascii=False)
         return env
 

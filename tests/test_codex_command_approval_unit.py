@@ -97,9 +97,10 @@ def test_command_decision_serialization_preserves_native_id_and_owner(monkeypatc
     assert native == [{'id': 7, 'result': {'decision': 'accept'}}]
 
 
+@pytest.mark.parametrize('sandbox', ['workspace-write', 'danger-full-access'])
 @pytest.mark.parametrize('manual', ['never', 'on-request'])
 @pytest.mark.parametrize('resume,active,missing', [(False, False, False), (True, False, False), (True, True, False), (True, False, True), (True, True, True)])
-def test_ipc_to_native_thread_messages_reset_reviewer(monkeypatch, manual, resume, active, missing):
+def test_ipc_to_native_thread_messages_reset_reviewer(monkeypatch, manual, resume, active, missing, sandbox):
     from codex_client import CodexAppServerClient
     from codex_worker_client import CodexWorkerClient
     from codex_worker_protocol import encode_worker_message, decode_worker_line
@@ -118,7 +119,7 @@ def test_ipc_to_native_thread_messages_reset_reviewer(monkeypatch, manual, resum
     worker = CodexWorkerClient()
     monkeypatch.setattr(worker, '_send_message', lambda message: runtime.handle_message(decode_worker_line(encode_worker_message(message))))
     for index, mode in enumerate(['auto-review', manual]):
-        payload = {'chat_id': 'chat', 'model': 'codex/main', 'turn_idx': index, 'question': 'hello', 'approval_policy': mode}
+        payload = {'chat_id': 'chat', 'model': 'codex/main', 'turn_idx': index, 'question': 'hello', 'approval_policy': mode, 'sandbox': sandbox}
         if resume:
             payload['thread_id'] = 'existing'
         if active:
@@ -133,6 +134,25 @@ def test_ipc_to_native_thread_messages_reset_reviewer(monkeypatch, manual, resum
         params = message['params']
         auto = index < split
         assert params['approvalPolicy'] == ('on-request' if auto else manual)
-        assert params['sandbox'] == ('workspace-write' if auto else 'danger-full-access')
+        assert params['sandbox'] == sandbox
         assert params['approvalsReviewer'] == ('auto_review' if auto else 'user')
+    runtime.close()
+
+
+@pytest.mark.parametrize("mode", ["never", "on-request", "auto-review"])
+@pytest.mark.parametrize("sandbox", ["read-only", "workspace-write", "danger-full-access"])
+@pytest.mark.parametrize("resume", [False, True])
+def test_explicit_sandbox_is_independent_for_worker_start_and_resume(mode, sandbox, resume):
+    created = []
+    runtime = CodexWorkerRuntime(lambda callback, model: created.append(FakeCodexClient(callback, model)) or created[-1], io.StringIO())
+    payload = {"chat_id": "chat", "model": "codex/main", "turn_idx": 0,
+               "question": "hello", "approval_policy": mode, "sandbox": sandbox}
+    if resume:
+        payload["thread_id"] = "old-workspace-thread"
+    runtime.handle_message(make_ui_request("start", "start_turn", payload))
+    client = created[0]
+    args = client.resumed_threads[0][1] if resume else client.started_threads[0]
+    assert args["sandbox"] == sandbox
+    assert args["approval_policy"] == ("on-request" if mode == "auto-review" else mode)
+    assert args["approvals_reviewer"] == ("auto_review" if mode == "auto-review" else "user")
     runtime.close()

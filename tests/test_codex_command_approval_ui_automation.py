@@ -79,7 +79,7 @@ def test_menu_policy_is_saved_for_future_threads_without_touching_live_turn(appr
     frame.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, int(frame._codex_approval_policy_menu_id)))
     assert frame.codex_approval_policy == policy
     assert json.loads(frame.state_path.read_text(encoding='utf-8'))['codex_approval_policy'] == policy
-    assert '工作区沙箱' in observed[0]['question']
+    assert '访问权限独立设置' in observed[0]['question']
     assert [item['value'] for item in observed[0]['options']] == ['never', 'on-request', 'auto-review']
     assert frame.active_codex_turn_active and frame.active_codex_turn_id == 'live-never-turn'
     frame.codex_approval_policy = 'never'
@@ -178,3 +178,73 @@ def test_command_server_request_entry_rejects_retired_client_then_prompts_curren
     assert replies[0]['request_id'] == 19
     assert 'codex_pending_request' not in frame._current_chat_state
     assert not frame._current_chat_state.get('execution_steps')
+
+
+@pytest.mark.parametrize("mode,expected", [("never", "danger-full-access"), ("on-request", "danger-full-access"), ("auto-review", "workspace-write")])
+def test_missing_sandbox_migrates_once_and_persists_independently(approval_frame, mode, expected):
+    frame = approval_frame
+    frame._save_state()
+    state = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    state.update(codex_approval_policy=mode, codex_approval_defaults_version=1)
+    state.pop("codex_sandbox", None)
+    frame.state_path.write_text(json.dumps(state), encoding="utf-8")
+    frame._load_state()
+    assert frame.codex_sandbox == expected
+    frame.codex_sandbox = "danger-full-access"
+    frame.codex_approval_policy = "auto-review"
+    frame._save_state()
+    frame.codex_sandbox = "read-only"
+    frame._load_state()
+    assert frame.codex_sandbox == "danger-full-access"
+    assert frame.codex_approval_policy == "auto-review"
+
+
+def test_sandbox_menu_and_resume_cache_apply_new_selection(approval_frame, monkeypatch):
+    frame = approval_frame
+    frame.codex_approval_policy = "auto-review"
+    frame.active_codex_turn_active = True
+    frame.active_codex_turn_id = "live-turn"
+    modal_selection(monkeypatch, "danger-full-access")
+    frame.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, int(frame._codex_sandbox_menu_id)))
+    assert frame.codex_sandbox == "danger-full-access"
+    assert frame.codex_approval_policy == "auto-review"
+    assert frame.active_codex_turn_id == "live-turn"
+    calls = []
+    class Client:
+        def resume_thread(self, thread_id, **kwargs):
+            calls.append(kwargs)
+    client = Client()
+    frame._ensure_codex_thread_resumed(client, "old-thread")
+    frame._ensure_codex_thread_resumed(client, "old-thread")
+    frame.codex_sandbox = "workspace-write"
+    frame._ensure_codex_thread_resumed(client, "old-thread")
+    assert [call["sandbox"] for call in calls] == ["danger-full-access", "workspace-write"]
+    state = json.loads(frame.state_path.read_text(encoding="utf-8"))
+    state["codex_sandbox"] = "unknown"
+    frame.state_path.write_text(json.dumps(state), encoding="utf-8")
+    frame._load_state()
+    assert frame.codex_sandbox == "workspace-write"
+    frame._save_state()
+    assert json.loads(frame.state_path.read_text(encoding="utf-8"))["codex_sandbox"] == "workspace-write"
+
+
+def test_thread_configuration_ack_is_bound_to_thread_and_rejects_stale_generation(approval_frame):
+    frame = approval_frame
+    frame.active_chat_id = frame.current_chat_id = "configuration-chat"
+    frame.active_session_turns = [{"model": main.DEFAULT_CODEX_MODEL, "codex_context_generation": 3}]
+    chat = {"id": "configuration-chat", "codex_thread_id": "thread", "codex_context_generation": 3,
+            "turns": frame.active_session_turns}
+    frame._current_chat_state = chat
+    configuration = {"sandbox": {"type": "dangerFullAccess"}, "approvalPolicy": "on-request"}
+    payload = {"thread_id": "thread", "turn_id": "turn", "turn_idx": 0,
+               "context_generation": 3, "thread_configuration": configuration}
+    frame._apply_codex_worker_turn_started_ack("configuration-chat", payload)
+    assert chat["codex_thread_configuration"] == configuration
+    assert chat["codex_thread_configuration_thread_id"] == "thread"
+    status = frame._build_codex_status_markdown(None, chat, main.DEFAULT_CODEX_MODEL)
+    assert "dangerFullAccess" in status and "最近确认线程配置" in status
+    frame._apply_codex_worker_turn_started_ack("configuration-chat", {**payload,
+        "context_generation": 2, "thread_configuration": {"sandbox": "stale"}})
+    assert chat["codex_thread_configuration"] == configuration
+    chat["codex_thread_id"] = "different-thread"
+    assert "未确认（未取得原生响应）" in frame._build_codex_status_markdown(None, chat, main.DEFAULT_CODEX_MODEL)
