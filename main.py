@@ -3600,12 +3600,25 @@ class ChatFrame(wx.Frame):
             self._refresh_file_manager_if_visible(selected_id=file_id)
             return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
         if command_type == "file_progress":
+            record = self.file_library.get_record(file_id)
+            if record is None:
+                return 404, {"accepted": False, "file_id": file_id}
+            if record.status in {
+                FileTransferStatus.COMPLETED,
+                FileTransferStatus.CANCELED,
+                FileTransferStatus.REJECTED,
+                FileTransferStatus.FAILED,
+                FileTransferStatus.PAUSED,
+            }:
+                # Delayed progress acknowledges the existing record without
+                # reviving a terminal/paused transfer or refreshing its UI.
+                return 200, {"accepted": True, "file_id": file_id}
             record = self.file_library.update_record_status(
                 file_id,
                 FileTransferStatus.TRANSFERRING,
                 transferred_bytes=int(body.get("transferred_bytes") or 0),
                 speed_bytes_per_second=int(body.get("speed_bytes_per_second") or 0),
-                size_bytes=int(body.get("size_bytes") or 0) or (self.file_library.get_record(file_id).size_bytes if self.file_library.get_record(file_id) else 0),
+                size_bytes=int(body.get("size_bytes") or 0) or record.size_bytes,
             )
             self._refresh_file_manager_if_visible(selected_id=file_id)
             return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}

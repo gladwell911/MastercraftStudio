@@ -2,6 +2,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import wx
+import pytest
 
 from file_transfer import FileDirection, FileTransferStatus
 
@@ -268,7 +269,7 @@ def test_remote_file_progress_updates_desktop_record(frame, tmp_path, monkeypatc
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "progress.txt"
     source.write_text("payload", encoding="utf-8")
-    record = frame.file_library.add_local_file(source)
+    record = frame.file_library.add_local_file(source, status=FileTransferStatus.ACCEPTED)
 
     status, body = frame._remote_api_file_command_ui({
         "type": "file_progress",
@@ -285,6 +286,42 @@ def test_remote_file_progress_updates_desktop_record(frame, tmp_path, monkeypatc
     assert updated.status == FileTransferStatus.TRANSFERRING
     assert updated.transferred_bytes == 3
     assert updated.speed_bytes_per_second == 42
+
+
+@pytest.mark.parametrize("status", [
+    FileTransferStatus.COMPLETED, FileTransferStatus.CANCELED,
+    FileTransferStatus.REJECTED, FileTransferStatus.FAILED, FileTransferStatus.PAUSED,
+])
+def test_remote_late_progress_preserves_nonactive_record(frame, tmp_path, monkeypatch, status):
+    monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
+    source = tmp_path / "late.txt"
+    source.write_text("payload", encoding="utf-8")
+    record = frame.file_library.add_local_file(source, status=FileTransferStatus.TRANSFERRING)
+    # Exercise completion through the same command consumer as the mobile peer.
+    if status == FileTransferStatus.COMPLETED:
+        code, _ = frame._remote_api_file_command_ui({"type": "file_complete", "body": {
+            "file_id": record.id, "size_bytes": 7, "transferred_bytes": 7}})
+        assert code == 200
+    else:
+        frame.file_library.update_record_status(record.id, status,
+            transferred_bytes=3, speed_bytes_per_second=5, size_bytes=7)
+    before = frame.file_library.get_record(record.id)
+    refreshes = []
+    monkeypatch.setattr(frame, "_refresh_file_manager_if_visible", lambda **kwargs: refreshes.append(kwargs))
+    code, body = frame._remote_api_file_command_ui({"type": "file_progress", "body": {
+        "file_id": record.id, "transferred_bytes": 99, "speed_bytes_per_second": 999, "size_bytes": 9999}})
+    assert code == 200 and body["accepted"] is True
+    assert frame.file_library.get_record(record.id) == before
+    assert not refreshes
+    if status == FileTransferStatus.COMPLETED:
+        code, body = frame._remote_api_file_command_ui({"type": "file_accept", "body": {"file_id": record.id}})
+        assert code == 200 and body["accepted"] is True
+        assert frame.file_library.get_record(record.id).status == FileTransferStatus.ACCEPTED
+
+
+def test_remote_progress_unknown_record_returns_404(frame):
+    code, body = frame._remote_api_file_command_ui({"type": "file_progress", "body": {"file_id": "missing"}})
+    assert code == 404 and body["accepted"] is False
 
 
 def test_remote_file_controls_broadcast_state_and_cancel_is_terminal(frame, tmp_path, monkeypatch):
