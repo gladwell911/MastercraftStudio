@@ -17266,6 +17266,9 @@ class ChatFrame(wx.Frame):
             return None if self._query_cloudflared_service().get("running") else 0
         if process.poll() is not None:
             return 0
+        log_reader = getattr(self, "_managed_cloudflared_log_handle", None)
+        if hasattr(log_reader, "channel_count"):
+            return log_reader.channel_count
         # A positive registration is never negated by a generic HTTP failure.
         # Missing channel evidence is unknown and cannot authorize restart.
         process_id = getattr(process, "pid", None)
@@ -17937,17 +17940,16 @@ class ChatFrame(wx.Frame):
             log_path = self._managed_cloudflared_log_path()
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._close_managed_cloudflared_log()
-            if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
-                log_path.replace(log_path.with_suffix(".log.1"))
-            self._managed_cloudflared_log_handle = log_path.open("ab", buffering=0)
+            from owned_logs import RotatingLog
+            self._managed_cloudflared_log_handle = RotatingLog(log_path, track_channels=True)
         except OSError:
             lease.close()
             self._managed_cloudflared_lease = None
             return False
         popen_kwargs = {
             "stdin": subprocess.DEVNULL,
-            "stdout": self._managed_cloudflared_log_handle,
-            "stderr": self._managed_cloudflared_log_handle,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
         }
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -17958,9 +17960,11 @@ class ChatFrame(wx.Frame):
         try:
             self._managed_cloudflared_start_failed = True
             self._managed_cloudflared_process = subprocess.Popen(command_line, **popen_kwargs)
+            self._managed_cloudflared_log_handle.attach(self._managed_cloudflared_process.stdout)
             deadline = time.monotonic() + 0.5
             while time.monotonic() < deadline:
                 if self._managed_cloudflared_process.poll() is not None:
+                    self._managed_cloudflared_log_handle.wait()
                     detail = self._managed_cloudflared_diagnostic()
                     self._set_status_text_safe(f"cloudflared process exited during startup; {detail}")
                     self._managed_cloudflared_process = None
@@ -17971,11 +17975,9 @@ class ChatFrame(wx.Frame):
             self._managed_cloudflared_start_failed = False
             return True
         except Exception as exc:
-            lease.close()
-            self._managed_cloudflared_process = None
             detail = self._managed_cloudflared_diagnostic()
+            self._stop_managed_cloudflared_process()
             self._set_status_text_safe(f"cloudflared process failed to start: {exc}; {detail}")
-            self._close_managed_cloudflared_log()
             return False
 
     def _verify_managed_cloudflared_process(self, origin_port: int) -> tuple[bool, str]:
@@ -18029,6 +18031,7 @@ class ChatFrame(wx.Frame):
 
     def _managed_cloudflared_log_tail(self, max_bytes: int = 4096) -> str:
         handle = getattr(self, "_managed_cloudflared_log_handle", None)
+        failure_note = getattr(handle, "failure_note", "")
         if handle is not None:
             try:
                 handle.flush()
@@ -18042,12 +18045,13 @@ class ChatFrame(wx.Frame):
                 stream.seek(max(0, size - max_bytes), os.SEEK_SET)
                 text = stream.read().decode("utf-8", errors="replace")
         except OSError:
-            return "<unavailable>"
+            return ("<unavailable> " + failure_note).strip()
         token = str(self._read_remote_control_token() or "")
         if token:
             text = text.replace(token, "<redacted>")
         text = re.sub(r"(?i)(--token\s+|[?&]token=|token\s*[:=]\s*)\S+", r"\1<redacted>", text)
-        return " | ".join(text.splitlines()[-20:]).strip() or "<empty>"
+        tail = " | ".join(text.splitlines()[-20:]).strip() or "<empty>"
+        return (tail + " | " + failure_note) if failure_note else tail
 
     def _managed_cloudflared_diagnostic(self) -> str:
         process = getattr(self, "_managed_cloudflared_process", None)
@@ -18743,6 +18747,8 @@ class ChatFrame(wx.Frame):
         return (frame_hwnd > 0 and fg_hwnd > 0 and root_hwnd == frame_hwnd), details
 
     def _log_ctrl_navigation_debug(self, direction: str, *, reason: str = "", result: str = "", details: dict | None = None) -> None:
+        if os.environ.get("MC_CTRL_NAVIGATION_DEBUG", "").strip().lower() not in {"1", "true", "on", "yes"}:
+            return
         path = self.app_data_dir / "ctrl_navigation_debug.log"
         detail_text = ""
         if details:
@@ -18756,8 +18762,8 @@ class ChatFrame(wx.Frame):
             parts.append(detail_text)
         line = " ".join(parts).strip()
         try:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            from owned_logs import append_diagnostic
+            append_diagnostic(path, line + "\n")
         except Exception:
             return
 

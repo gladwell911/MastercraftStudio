@@ -209,3 +209,23 @@ def test_main_imports_kimi_server_client_module():
     main_text = (root / "main.py").read_text(encoding="utf-8")
 
     assert "from kimi_server_client import" in main_text
+
+
+def test_package_collected_inputs_exclude_development_and_user_data(tmp_path):
+    from package_inputs import filter_package_toc
+    required = ["ZDSRAPI.dll", "ZDSRAPI_x64.dll", "nats-server/nats-server.exe",
+                "assets/chat_title_rules.json", "assets/codex-skills/mc-browser-open/SKILL.md",
+                "sound/done.wav", "python311.dll", "wx/msw/core.pyd"]
+    excluded = ["new.apk", "screenshots/screen.png", "tests/fixture.json",
+                "reverse-engineering/decompiled.txt", "jadx/sources/Main.java",
+                "history/chat_history.db", ".codex-home/session.json", ".dev/run/out.txt"]
+    entries = []
+    for name in required + excluded:
+        source = tmp_path / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"fixture")
+        entries.append((name, str(source), "DATA"))
+    assert [entry[0] for entry in filter_package_toc(entries)] == required
+    spec = (Path(__file__).resolve().parents[1] / "zgwd.spec").read_text(encoding="utf-8")
+    assert "a.datas = filter_package_toc(a.datas)" in spec
+    assert "b.datas = filter_package_toc(b.datas)" in spec

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 import asyncio
 from collections.abc import Callable
 import contextlib
@@ -109,6 +111,8 @@ class RemoteNatsTransport:
         self._sessions: dict[tuple[str, str], tuple[int, str]] = {}
         self._outbox_locks = {lane: asyncio.Lock() for lane in ("notification", "other")}
         self._outbox_tasks: dict[str, asyncio.Task] = {}
+        self._outbox_maintenance_after = 0.0
+        self._outbox_maintenance_domain = 0
         self._outbox_delays = {lane: 0.25 for lane in self._outbox_locks}
         self._nats_client: Any | None = None
         self._command_subscription: Any | None = None
@@ -379,6 +383,7 @@ class RemoteNatsTransport:
     async def _outbox_worker(self, lane: str, report: asyncio.Future) -> None:
         try:
             while not self._stop_requested:
+                await self._maintain_outbox()
                 async with self._outbox_locks[lane]:
                     count, retry, more = await self._drain_outbox_lane(lane)
                 if not report.done():
@@ -395,6 +400,29 @@ class RemoteNatsTransport:
         finally:
             if not report.done():
                 report.set_result(0)
+
+    async def _maintain_outbox(self) -> None:
+        """Piggyback one bounded batch on existing workers, never on the GUI."""
+        if os.environ.get("REMOTE_CONTROL_OUTBOX_RETENTION", "1").strip().lower() in {"0", "false", "off", "no"}:
+            return
+        now = time.monotonic()
+        if now < self._outbox_maintenance_after:
+            return
+        self._outbox_maintenance_after = now + 300
+        store = self.durable_store
+        if not callable(getattr(store, "publication_domains", None)):
+            return
+        def batch():
+            domains = store.publication_domains(pair_id=self.subjects.pair_id)
+            if domains:
+                domain = domains[self._outbox_maintenance_domain % len(domains)]
+                self._outbox_maintenance_domain += 1
+                store.retain_publication_outbox(pair_id=self.subjects.pair_id, domain=domain, dry_run=False)
+        try:
+            await asyncio.to_thread(batch)
+        except Exception:
+            # Maintenance cannot retire publication; retry on a later worker run.
+            pass
 
     async def _drain_outbox_lane(self, lane: str) -> tuple[int, bool, bool]:
         published = 0

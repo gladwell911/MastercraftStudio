@@ -1,6 +1,6 @@
 param(
     [string]$DistPath = "D:\code\cx",
-    [string]$WorkPath = "build_pyinstaller",
+    [string]$WorkPath = ".dev\build\pyinstaller",
     [string]$SpecPath = "zgwd.spec",
     [string]$PythonExe = ".venv\Scripts\python.exe",
     [switch]$BuildOnly
@@ -62,7 +62,8 @@ function Assert-PackageArtifacts {
 function Copy-PackageTree {
     param([string]$Source, [string]$Target, [string]$PackageRoot)
     foreach ($entry in Get-ChildItem -LiteralPath $Source -Force) {
-        if ($entry.Name -in @('.codex-home', 'history')) { continue }
+        if ($entry.Name -in @('.codex-home', 'history', '.dev', 'tests', 'test', 'screenshots', 'screenshot', 'reverse-engineering', 'reverse_engineering', 'apktool', 'jadx', 'app_state.json', 'remote_machine.json') -or
+            $entry.Extension -in @('.apk', '.aab', '.log', '.db', '.sqlite', '.sqlite3')) { continue }
         if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "Unexpected link in built package: $($entry.FullName)"
         }
@@ -111,7 +112,7 @@ $resolvedPythonExe = if ([IO.Path]::IsPathRooted($PythonExe)) { $PythonExe } els
 $resolvedSpecPath = if ([IO.Path]::IsPathRooted($SpecPath)) { $SpecPath } else { Join-Path $repoRoot $SpecPath }
 $resolvedWorkPath = if ([IO.Path]::IsPathRooted($WorkPath)) { $WorkPath } else { Join-Path $repoRoot $WorkPath }
 $resolvedDistPath = [IO.Path]::GetFullPath($DistPath)
-$stagingPath = Join-Path $resolvedDistPath ('.mc-build-' + [Guid]::NewGuid().ToString('N'))
+$stagingPath = Join-Path $resolvedWorkPath ('.mc-build-' + [Guid]::NewGuid().ToString('N'))
 $finalPackage = Join-Path $resolvedDistPath 'mc'
 $exitCode = 1
 
@@ -141,7 +142,7 @@ try {
     $builtPackage = Join-Path $stagingPath 'mc'
     Assert-PackageArtifacts -PackagePath $builtPackage
     Update-PackageOutput -BuiltPackage $builtPackage -Target $finalPackage -DistRoot $resolvedDistPath
-    Remove-PackageNode -Root $resolvedDistPath -Path $stagingPath
+    Remove-PackageNode -Root $resolvedWorkPath -Path $stagingPath
     Assert-PackageArtifacts -PackagePath $finalPackage
     # Launch once from the final directory, without waiting for the GUI to exit.
     if (-not $BuildOnly) {
@@ -151,7 +152,7 @@ try {
 } catch {
     Write-Error -Message $_ -ErrorAction Continue
 } finally {
-    try { Remove-PackageNode -Root $resolvedDistPath -Path $stagingPath }
+    try { Remove-PackageNode -Root $resolvedWorkPath -Path $stagingPath }
     catch { Write-Error -Message $_ -ErrorAction Continue; $exitCode = 1 }
     Pop-Location
 }

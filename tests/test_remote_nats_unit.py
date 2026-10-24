@@ -910,3 +910,88 @@ def test_start_returns_without_waiting_for_hanging_outbox(tmp_path, monkeypatch)
         assert not blocked.is_set() and len(store.pending_outbox()) == 1
         await transport._close_async()
     asyncio.run(run())
+
+
+def test_outbox_maintenance_is_bounded_scoped_disabled_and_off_event_thread(tmp_path, monkeypatch):
+    import threading
+    store = ChatStore(tmp_path / "maintenance.db")
+    store.initialize()
+    fact = store.commit_durable_fact(pair_id="pair", domain="events",
+        envelope={"event_id": "old", "kind": "state_changed", "chat_id": "chat", "body": {}})
+    store.mark_outbox_acked(fact["sync_sequence"], pair_id="pair", domain="events")
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1")
+    transport = RemoteNatsTransport(pair_id="pair", token="secret", durable_store=store)
+    calls = []
+    original = store.retain_publication_outbox
+    def tracked(**kwargs):
+        calls.append((threading.get_ident(), kwargs))
+        return original(**kwargs)
+    monkeypatch.setattr(store, "retain_publication_outbox", tracked)
+    async def run():
+        owner = threading.get_ident()
+        monkeypatch.setenv("REMOTE_CONTROL_OUTBOX_RETENTION", "0")
+        await transport._maintain_outbox()
+        assert not calls
+        monkeypatch.setenv("REMOTE_CONTROL_OUTBOX_RETENTION", "1")
+        await transport._maintain_outbox()
+        await transport._maintain_outbox()
+        assert len(calls) == 1 and calls[0][0] != owner
+        assert calls[0][1] == {"pair_id": "pair", "domain": "events", "dry_run": False}
+    asyncio.run(run())
+    assert store.retain_publication_outbox(pair_id="pair", domain="events")["eligible"] == 0
+
+
+def test_automatic_retention_runs_through_real_outbox_workers(tmp_path, monkeypatch):
+    store = ChatStore(tmp_path / "automatic-retention.db")
+    store.initialize()
+    old = store.commit_durable_fact(pair_id="default", domain="events",
+        envelope={"event_id": "old-confirmed", "kind": "status", "chat_id": "chat", "body": {}})
+    store.mark_outbox_acked(old["sync_sequence"], pair_id="default", domain="events")
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1")
+    monkeypatch.setenv("REMOTE_CONTROL_OUTBOX_RETENTION", "1")
+    transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=FakeJetStream(), durable_store=store)
+    async def run():
+        await asyncio.wait_for(transport.drain_outbox(), 5)
+        await asyncio.gather(*transport._outbox_tasks.values())
+    asyncio.run(run())
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM publication_outbox").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM durable_facts").fetchone()[0] == 1
+
+
+def test_notification_arriving_during_maintenance_is_drained_before_workers_exit(tmp_path, monkeypatch):
+    import threading
+    store = ChatStore(tmp_path / "maintenance-race.db")
+    store.initialize()
+    old = store.commit_durable_fact(pair_id="default", domain="events",
+        envelope={"event_id": "old", "kind": "status", "chat_id": "chat", "body": {}})
+    store.mark_outbox_acked(old["sync_sequence"], pair_id="default", domain="events")
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1")
+    entered, release = threading.Event(), threading.Event()
+    original = store.retain_publication_outbox
+    def paused(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(**kwargs)
+    monkeypatch.setattr(store, "retain_publication_outbox", paused)
+    monkeypatch.setenv("REMOTE_CONTROL_OUTBOX_RETENTION", "1")
+    broker = FakeJetStream()
+    transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=broker, durable_store=store)
+    async def run():
+        first = asyncio.create_task(transport.drain_outbox())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            store.commit_durable_fact(pair_id="default", domain="events", envelope={
+                "event_id": "new-final", "kind": "assistant_final", "chat_id": "chat", "body": {}})
+            await asyncio.wait_for(transport.drain_outbox(), 5)
+        finally:
+            release.set()
+        await asyncio.wait_for(first, 5)
+        await asyncio.wait_for(asyncio.gather(*transport._outbox_tasks.values()), 5)
+        assert store.pending_outbox(pair_id="default", lane="notification") == []
+    asyncio.run(run())
+    import json
+    assert [json.loads(payload)["event_id"] for _, payload in broker.published] == ["new-final"]

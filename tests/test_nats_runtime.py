@@ -157,3 +157,133 @@ def test_process_exit_reports_log_tail_without_token(
     assert "useful diagnostic" in message
     assert token not in message
     assert "<redacted>" in message
+
+
+def test_owned_child_continuously_rotates_over_ten_limits_and_drains(tmp_path, monkeypatch):
+    import sys
+    from owned_logs import LOG_LIMIT
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token="secret"))
+    code = ("import sys; out=sys.stdout.buffer; "
+            "out.write(b'x' * (55 * 1024 * 1024)); out.write(b'\\nLATEST OUTPUT\\n'); out.flush()")
+    monkeypatch.setattr(process, "build_command", lambda: [sys.executable, "-c", code])
+    monkeypatch.setattr(process, "_port_accepts_connections", lambda: False)
+    monkeypatch.setattr(process, "_port_can_bind", lambda: True)
+    monkeypatch.setattr(process, "wait_until_ready", lambda **_: None)
+    try:
+        child = process.start()
+        reader = process._log_handle
+        child.wait(timeout=30)
+        reader.wait()
+        assert "LATEST OUTPUT" in process._log_tail()
+        logs = list(process.log_path.parent.glob("nats-server.log*"))
+        assert len(logs) == 4
+        assert all(path.stat().st_size <= LOG_LIMIT for path in logs)
+        assert sum(path.stat().st_size for path in logs) <= 4 * LOG_LIMIT
+    finally:
+        process.stop()
+    assert not reader._thread.is_alive()
+    assert reader._pipe.closed
+    assert reader._handle.closed
+    assert process._log_handle is None
+
+
+def test_owned_child_failed_spawn_closes_logger(tmp_path, monkeypatch):
+    from owned_logs import RotatingLog
+    created = []
+    def logger(path):
+        result = RotatingLog(path)
+        created.append(result)
+        return result
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token="secret"))
+    monkeypatch.setattr("nats_runtime.RotatingLog", logger)
+    monkeypatch.setattr(process, "_port_accepts_connections", lambda: False)
+    monkeypatch.setattr(process, "_port_can_bind", lambda: True)
+    monkeypatch.setattr(process, "build_command", lambda: [str(tmp_path / "missing.exe")])
+    with pytest.raises(OSError):
+        process.start()
+    assert created[0]._handle.closed and created[0]._thread is None
+
+
+@pytest.mark.parametrize("failure", ["rename", "reopen"])
+def test_transient_rotation_failure_restores_writable_handle_and_recovers(tmp_path, monkeypatch, failure):
+    from owned_logs import RotatingLog
+    path = tmp_path / "recover.log"
+    log = RotatingLog(path, max_bytes=8)
+    log.write(b"12345678")
+    failed = [False]
+    original_replace, original_open = Path.replace, Path.open
+    def replace(source, target):
+        if failure == "rename" and source == path and not failed[0]:
+            failed[0] = True
+            raise OSError("secret-must-not-be-reported")
+        return original_replace(source, target)
+    def opened(source, *args, **kwargs):
+        if failure == "reopen" and source == path and args and args[0] == "ab" and not failed[0]:
+            failed[0] = True
+            raise OSError("secret-must-not-be-reported")
+        return original_open(source, *args, **kwargs)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(Path, "open", opened)
+    try:
+        with pytest.raises(OSError):
+            log.write(b"lost")
+        if failure == "rename":
+            assert not log._handle.closed
+        log.write(b"LATEST")
+        assert not log._handle.closed
+        assert path.read_bytes() == b"LATEST"
+        assert log.failure_note == "log_write_failures=1"
+    finally:
+        log.close()
+    assert log._handle.closed
+
+
+@pytest.mark.parametrize("failure_mode", ["write", "rotation"])
+def test_real_child_drains_after_rotation_write_error_and_reports_safe_failure(tmp_path, monkeypatch, failure_mode):
+    import sys
+    from owned_logs import RotatingLog
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token="private-token"))
+    created = []
+    def logger(path):
+        log = RotatingLog(path, max_bytes=65536, track_channels=True)
+        original = log._rotate
+        failed = [False]
+        def rotate():
+            if not failed[0]:
+                failed[0] = True
+                raise OSError("private-token secret credential path")
+            return original()
+        if failure_mode == "rotation":
+            log._rotate = rotate
+        else:
+            original_handle = log._handle
+            class FailOnceWriter:
+                def __getattr__(self, name):
+                    return getattr(original_handle, name)
+                def write(self, data):
+                    if not failed[0]:
+                        failed[0] = True
+                        raise OSError("private-token secret credential path")
+                    return original_handle.write(data)
+            log._handle = FailOnceWriter()
+        created.append(log)
+        return log
+    monkeypatch.setattr("nats_runtime.RotatingLog", logger)
+    monkeypatch.setattr(process, "_port_accepts_connections", lambda: False)
+    monkeypatch.setattr(process, "_port_can_bind", lambda: True)
+    monkeypatch.setattr(process, "wait_until_ready", lambda **_: None)
+    code = ("import sys,time; o=sys.stdout.buffer; o.write(b'x'*(2*1024*1024)); o.flush(); "
+            "time.sleep(.1); o.write(b'\\nRegistered tunnel connection connIndex=0\\nRECOVERED LATEST\\n'); o.flush()")
+    monkeypatch.setattr(process, "build_command", lambda: [sys.executable, "-c", code])
+    try:
+        child = process.start()
+        child.wait(timeout=15)
+        log = created[0]
+        log.wait()
+        tail = process._log_tail()
+        assert "RECOVERED LATEST" in tail and "log_write_failures=1" in tail
+        assert "private-token" not in tail and "secret credential path" not in tail
+        assert log.channel_count == 1
+    finally:
+        process.stop()
+    assert not log._thread.is_alive() and log._pipe.closed and log._handle.closed

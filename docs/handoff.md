@@ -1,3 +1,21 @@
+## 2026-10-24 长期运行性能与有界生成数据（源码实现）
+
+源码增加 pending outbox 部分索引（pair/sequence、pair/domain/sequence），独立的 pair/domain publication_progress，以及单调发布 checkpoint。首次迁移在事务内仅从首个未确认行之前实际已确认的 domain 前缀播种，不把 pair 序列间隙当成丢失事件；后续 ACK 与进度同事务更新，剪枝后重复 ACK 不回退。durable_facts 和 canonical history 不清理。
+
+`ChatStore.retain_publication_outbox(pair_id=..., domain=...)` 默认仅 dry-run，返回这一批 eligible/deleted/busy；显式 `dry_run=False` 才删除。默认500、硬上限1000，只处理 published_at 早于7天且不超过持久安全前沿、无 blocker 的单一 pair/domain。争锁立即 yield，不执行 VACUUM；释放的是 SQLite 内部页，不承诺文件缩小。现有后台 outbox worker 在每轮读取发布批次之前检查维护，最多每300秒轮到一个 domain 执行一批，无新增永久轮询线程。设置 `REMOTE_CONTROL_OUTBOX_RETENTION=0` 后续维护关闭；没有发布worker活动时不会主动清理。
+
+NATS 与 MC 自有 Cloudflared 子进程 stdout/stderr 由固定64KiB以内读取的 reader 持续排空，单日志5MiB加3备份，关闭时回收 pipe/thread/file。轮转rename/reopen或写盘瞬态失败后重新取得可写current handle，持续排空pipe，后续chunk可恢复；现有NATS/Cloudflared tail附加固定文本与饱和计数 `log_write_failures=N`，不包含异常正文/路径/凭据。Cloudflared channel 状态在 reader 中增量维护，跨文件轮转保留。`ctrl_navigation_debug.log` 默认不写；显式 `MC_CTRL_NAVIGATION_DEBUG=1` 使用相同大小策略。只管理 MC 拥有的日志与子进程，不更改 Codex 上游日志配置。
+
+未来默认构建 work 为 `.dev/build/pyinstaller`，临时 staging 在选定 WorkPath 下，自定义 WorkPath/DistPath 仍有效；只改变未来输出，不扫描/删除旧构建树。默认 spec 的 collected inputs 及复制边界排除 APK、screenshots、reverse/test trees 和运行用户数据；DLL、NATS、声音与随包技能保留。`package_mc_current_temp.ps1` 未触碰，没有执行真实打包或部署。
+
+隔离验证：规定六文件串行回归 208 passed / 2 failed（53.68秒）。两个失败为 `test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals`（chat-a缺失）与 `test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor`（既有 answer_seq=0 预期）；将 main/chat_store/remote_nats/nats_runtime 全部替换为基线 `5ec25009114c4b38d9d23f38e6442329c3a1197a` 临时模块副本后，两项以同一断言再次失败，未改这些无关UI行为。初版日志/打包29项通过；最终日志表面4项通过，最终打包fixture/static19项通过。新增测试经 store/transport/frame 入口覆盖迁移、domain gap、乱序/重复ACK、restart、永久blocker、年龄/批量边界、争锁和剪枝后 history/notification/execution/read 等值。真实本地 Python 子进程连续55MiB输出，保留4文件各≤5MiB、latest tail，并核对关闭后 reader/pipe/file 已释放。没有运行日常 MC/手机/真实隧道验收。
+
+基准命令：`.venv/Scripts/python.exe scripts/benchmark_outbox.py`；默认临时生成数据，`--source <db> --pair <id>` 仅用 mode=ro 打开指定源，并经 SQLite backup API 复制到临时数据库后测量，绝不向源库写入。脚本输出 revision、counts、首轮/暖态 p95/median、实际 query plan、索引升级锁持有与整体迁移时间。首轮只是新连接首读，不代表清空操作系统缓存。
+
+20个暖态样本的合成数据结果（ms；不是现场归档库155–334ms的复测）：196167行 notification p95 21.02→1.21，other 24.36→1.05；1961670行分别238.87→2.48、255.58→9.34。director这一轮两lane均≤10ms且同fixture加索引前后至少10倍；engineer独立生成数据复测的196167行other为20.73→2.40ms（8.65倍），未达到十倍目标，不能据单轮宣布性能验收全部通过；增长后的 median 为0.99/1.72ms（原1.00/0.97ms），空查询计划始终使用 pending 部分索引，无历史扫描/临时排序，p95有调度波动。当时两项pending索引升级锁分别24.50/273.23ms，整体升级48.02/415.32ms（以下新增retention索引之前的测量，不涵盖该索引的迁移成本）。合成fixture通过ChatStore连接事务批量插入最小payload，不能冒充真实业务payload或归档性能。完整JSON与基线失败证据在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/mc-outbox-benchmark.json`、`mc-performance-baseline-failures.txt`。
+
+通知流仍为7天/32MiB/20000条并回读校验；legacy COMMAND/EVENT 没有证明所有支持旧客户端具有权威恢复能力，因此没有新增过期策略。源码与正在运行EXE是两份证据，本轮没有更新EXE。未测量证明 `_save_history`/文件列表为瓶颈，未改这些UI路径。24–72小时资源观察、72小时弱网/长运行和月级稳定性仍未验证；短测不能证明不存在泄漏或保证数月顺滑。独立 engineer 最终结果见本节末尾，当前已完成受影响面验证。
+
 # 当前交接
 
 ## 2026-10-20 笔记本 FRP 部署接续
@@ -92,3 +110,23 @@
 - MC `main` 跟踪 `origin/main`；RC `master` 跟踪 `origin/master`。本次 neat-freak 将功能及文档提交正常推送既有 GitHub 上游；推送结果按实际命令与 `git log -1` 核对，不代表安装完成。
 
 旧阶段的精确命令、现场 owner 与失败证据见 [2026-10-08 前交接归档](archive/handoff-before-dual-control-2026-10-08.md)；长期规则见 [经验](experience.md)、[反思](reflection.md)与 [文档索引](README.md)。
+
+### 2026-10-24 独立验证后的 retention 最终局部修复
+
+engineer先后发现按sequence筛age、按age筛安全水位都存在双range残余线性扫描。最终改为 `idx_outbox_retention_prefix(pair_id,domain,sync_sequence,published_at) WHERE published_at IS NOT NULL AND blocked_reason IS NULL`；先在安全水位内按sequence取至多batch_size个published且无blocker的候选，再在不可flatten的LIMIT窗口外过滤7天年龄。实际EXPLAIN为CO-ROUTINE候选窗及pair/domain/sequence range lookup；外层SCAN只读取有界窗，不是历史全扫。窗口内近期记录可使本批少删/零删，后续自然老化后再前进，不承诺每批找到全库所有旧记录。默认500/最大1000同时限制检查行数和删除量。
+
+新增dry-run/实际写入口×近期大历史/旧记录低水位四组合VM回归，一万→十万行步骤不随历史增长（上限10000步、两规模差≤50）。定向retention/progress **9 passed**。复用独立probe：196167/1961670近期行0.73/3.19ms、均约6000VM步，competing busy0/1；旧记录frontier0为0.87/0.68ms、均不足1000VM步、busy1/0。微小固定事务仍可能与独立writer竞争，但不再随历史线性增长。最终证据 `director-window-retention-probe.json`、`director-window-retention-lowfrontier-probe.json`；先前age索引测量已被本次实现取代，仍保留历史问题证据。
+
+engineer只读打开归档备份并SQLite backup到临时库，196167行default两lane均零pending，20暖样本notification p95 259.03→3.80ms（68.2倍）、other295.45→1.27ms（232.5倍），满足此源的目标；生成fixture的8.65倍未达仍保留。证据 `mc-outbox-benchmark-archive-engineer.json`。该次整体升级712.52ms包含现已替换的age索引，pending两索引独立锁356.14ms；不能把它冒充最终prefix索引完整升级锁时长，后者尚未单独测量。该局部修复当时等待engineer复验；现已完成，最终结果见本节末尾。
+
+### 2026-10-24 review 后维护竞态、日志故障恢复与基准测量修补
+
+维护await移到现有worker每轮drain之前：持续backlog也会检查300秒节流，最后空批决策后不再await，避免维护暂停时新通知被既有worker退出遗漏。新增真实ChatStore+fake broker的drain_outbox集成，证明旧确认行自动剪枝；暂停retain期间新增final并第二次drain，释放维护后所有worker结束前final已发布。没有新增轮询或公共唤醒状态。
+
+日志rotation失败的finally尝试恢复current append handle；若reopen也失败，后续write再次尝试打开。固定安全失败计数与子进程内容分离，channel先观察后写盘保留；真实隐藏child分别注入write和rotation OSError后仍输出超过pipe容量、正常退出，later tail恢复且包含安全失败标识，敏感异常内容未外泄，pipe/thread/file关闭。另测一次rename/reopen失败后继续write恢复。
+
+benchmark现在对生成fixture和新schema副本均先在临时库剥除本次全部pending/retention索引、publication_progress表及seed marker，再直接计时实际initialize()完整迁移。`upgrade_ms`表示整个schema/index/progress初始化elapsed，`migration_timing_scope`明确写锁时间未单独仪表化；不再输出只覆盖pending索引的lock字段。此前大小数据时长均为对应旧实现的历史证据，不能当作本最终迁移成本。本轮通过生成/只读复制小fixture断言升级前缺少全部新增schema，未重新宣称大库完整迁移性能。--rows必须>0、--samples>=1、--growth>1，在创建fixture之前拒绝非法参数。
+
+本次仅跑受修改面：tests/test_remote_nats_unit.py、tests/test_nats_runtime.py、tests/test_benchmark_outbox.py共52 passed；main远程测试只选channel rollover/navigation diagnostics，2 passed。git diff --check通过。先前两项无关UI基线失败未修改。未做源码/EXE部署、真实隧道/手机或长运行验证。
+
+最终 engineer 受影响八文件验证：242 passed、2 deselected，精确排除前述两项已复现的基线旧失败；public worker维护竞态及真实child故障恢复均通过。最终默认20样本基准中，196167/1961670行完整initialize迁移elapsed分别149.40/1770.22ms，包含全部新增索引及进度schema创建，不是写锁持有时长；优化后空pending两lane p95为1.10–1.29ms，本轮前后均超过10倍。历史生成fixture的8.65倍未达，以及真实归档约68/233倍结果仍按原轮次保留，不以本轮覆盖历史差异。源码验证不代表运行EXE已更新，也不代表长运行稳定性验收。

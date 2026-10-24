@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from package_inputs import filter_package_toc
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -46,6 +47,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+a.datas = filter_package_toc(a.datas)
+a.binaries = filter_package_toc(a.binaries)
 pyz = PYZ(a.pure)
 
 b = Analysis(
@@ -61,6 +64,8 @@ b = Analysis(
     noarchive=False,
     optimize=0,
 )
+b.datas = filter_package_toc(b.datas)
+b.binaries = filter_package_toc(b.binaries)
 worker_pyz = PYZ(b.pure)
 
 exe = EXE(

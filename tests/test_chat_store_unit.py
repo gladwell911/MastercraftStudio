@@ -1420,3 +1420,160 @@ def test_execution_visibility_fragment_seed_replay_and_existing_projection(tmp_p
     store.apply_execution_fragment("owner", key, scope, fragment_id="last", offset=2, text="c",
         projection_seed={"list_text": "real again", "text": "real again", "display_kind": "commentary"})
     assert visible() == 1
+
+
+def test_publication_retention_preserves_progress_replay_and_scope(tmp_path):
+    store = ChatStore(tmp_path / "retention.db")
+    store.initialize()
+    def commit(event, domain="events", pair="pair"):
+        return store.commit_durable_fact(pair_id=pair, domain=domain,
+            envelope={"event_id": event, "kind": "state_changed", "chat_id": "chat", "body": {}})
+    first = commit("first")
+    gap = commit("gap", "files")
+    blocked = commit("blocked")
+    last = commit("last")
+    other = commit("other", pair="other")
+    for fact in (first, last, gap, other):
+        store.mark_outbox_acked(fact["sync_sequence"], pair_id=fact.get("pair_id", "other" if fact == other else "pair"),
+                                domain=fact["domain"], consumer_id="publisher")
+    store.record_outbox_failure(blocked["sync_sequence"], "bad", pair_id="pair", domain="events", permanent=True)
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1 WHERE published_at IS NOT NULL")
+        before = conn.execute("SELECT COUNT(*) FROM durable_facts").fetchone()[0]
+    replay = store.replay_after(pair_id="pair", domain="events", sync_sequence=0)
+    assert store.retain_publication_outbox(pair_id="pair", domain="events")["eligible"] == 1
+    assert len(store.replay_after(pair_id="pair", domain="events", sync_sequence=0)) == 3
+    assert store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=False)["deleted"] == 1
+    store = ChatStore(store.db_path)
+    store.initialize()
+    store.mark_outbox_acked(first["sync_sequence"], pair_id="pair", domain="events", consumer_id="publisher")
+    assert store.get_checkpoint("publisher", "events", pair_id="pair") == first["sync_sequence"]
+    assert store.commit_durable_fact(pair_id="pair", domain="events",
+        envelope={"event_id": "first", "kind": "state_changed", "chat_id": "chat", "body": {}}) == first
+    assert store.replay_after(pair_id="pair", domain="events", sync_sequence=0) == replay
+    assert [r["event_id"] for r in store.pending_outbox(pair_id="pair")] == ["blocked"]
+    store.mark_outbox_acked(blocked["sync_sequence"], pair_id="pair", domain="events", consumer_id="publisher")
+    assert store.get_checkpoint("publisher", "events", pair_id="pair") == last["sync_sequence"]
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_facts").fetchone()[0] == before
+        conn.execute("BEGIN IMMEDIATE")
+        assert store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=False)["busy"]
+
+
+def test_publication_progress_migration_uses_confirmed_domain_prefix(tmp_path):
+    store = ChatStore(tmp_path / "migration.db")
+    store.initialize()
+    for i in range(3):
+        store.commit_durable_fact(pair_id="pair", domain="events",
+            envelope={"event_id": str(i), "kind": "state_changed", "chat_id": "chat", "body": {}})
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1 WHERE sync_sequence IN (1,3)")
+        conn.execute("DELETE FROM publication_progress")
+        conn.execute("DELETE FROM meta WHERE key='publication_progress_initialized'")
+    store.initialize()
+    assert store.retain_publication_outbox(pair_id="pair", domain="events")["eligible"] == 1
+    assert store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=False)["deleted"] == 1
+    store.mark_outbox_acked(2, pair_id="pair", domain="events", consumer_id="publisher")
+    assert store.get_checkpoint("publisher", "events", pair_id="pair") == 3
+
+
+def test_retention_preserves_canonical_outer_read_apis(tmp_path):
+    store = ChatStore(tmp_path / "outer-retention.db")
+    store.initialize()
+    store.upsert_chat({"id": "chat", "title": "Title"})
+    store.replace_turns("chat", [{"question": "q", "answer_md": "answer", "request_status": "done"}])
+    snapshot_args = dict(pair_id="pair", device_id="device", baseline=0, incarnation="stream", secret="secret")
+    notifications = store.notification_sync(**snapshot_args)["records"]
+    execution = store.commit_durable_fact(pair_id="pair", domain="events", execution=True,
+        envelope={"event_id": "execution", "kind": "execution_entry", "chat_id": "chat", "body": {"text": "step"}})
+    answer = store.readable_answer("chat", turn_index=0)
+    store.mark_chat_read(pair_id="pair", chat_id="chat", generation=answer["generation"],
+                        message_id=answer["message_id"], answer_seq=answer["answer_seq"], operation_id="read")
+    history = store.load_chat("chat")
+    read = store.get_chat_read_state("chat", pair_id="pair")
+    execution_args = dict(pair_id="pair", domain="events", chat_id="chat", secret="secret")
+    page = store.load_execution_page(**execution_args)
+    for row in store.pending_outbox(pair_id="pair"):
+        store.mark_outbox_acked(row["sync_sequence"], pair_id="pair", domain=row["domain"], consumer_id="publisher")
+    with store._connect() as conn:
+        conn.execute("UPDATE publication_outbox SET published_at=1")
+        count = conn.execute("SELECT COUNT(*) FROM durable_facts").fetchone()[0]
+    # Capture authority after the read operation, before pruning.
+    notifications = store.notification_sync(**snapshot_args)["records"]
+    result = store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=False)
+    assert result["deleted"] == count
+    store = ChatStore(store.db_path)
+    store.initialize()
+    assert store.load_chat("chat") == history
+    assert store.get_chat_read_state("chat", pair_id="pair") == read
+    assert store.load_execution_page(**execution_args) == page
+    assert store.notification_sync(**snapshot_args)["records"] == notifications
+    assert store.pending_outbox(pair_id="pair") == []
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_facts").fetchone()[0] == count
+
+
+def test_retention_batch_cap_age_blocked_and_pair_boundaries(tmp_path):
+    store = ChatStore(tmp_path / "batch.db")
+    store.initialize()
+    # Populate a large fixture inside the store transaction boundary.
+    with store._connect() as conn:
+        conn.executemany("INSERT INTO publication_outbox VALUES('pair','events',?,?, 'events',?,0,1,NULL)",
+                         [(i, f"row-{i}", b"{}") for i in range(1, 1006)])
+        conn.execute("INSERT INTO publication_progress VALUES('pair','events',1005)")
+        conn.execute("UPDATE publication_outbox SET blocked_reason='permanent:blocked' WHERE sync_sequence=1")
+        conn.execute("UPDATE publication_outbox SET published_at=unixepoch() WHERE sync_sequence=2")
+        conn.execute("UPDATE publication_outbox SET published_at=NULL WHERE sync_sequence=3")
+    assert store.retain_publication_outbox(pair_id="other", domain="events")["eligible"] == 0
+    assert store.retain_publication_outbox(pair_id="pair", domain="events")["eligible"] == 499
+    assert store.retain_publication_outbox(pair_id="pair", domain="events", batch_size=9999, dry_run=False)["deleted"] == 999
+    assert store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=False)["deleted"] == 3
+    with store._connect() as conn:
+        assert [r[0] for r in conn.execute("SELECT sync_sequence FROM publication_outbox ORDER BY sync_sequence")] == [1,2,3]
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("scenario", ["recent", "low_frontier"])
+def test_retention_candidate_window_bounds_recent_and_low_frontier_history(tmp_path, dry_run, scenario):
+    from contextlib import contextmanager
+    store = ChatStore(tmp_path / "recent-retention.db")
+    store.initialize()
+    original = store._connect
+    counts = []
+    plans = []
+    for size in (10000, 100000):
+        with original() as conn:
+            conn.executemany("INSERT INTO publication_outbox VALUES('pair','events',?,?, 'events',?,0,unixepoch(),NULL)",
+                             [(i, f"recent-{i}", b"{}") for i in range(1 if size == 10000 else 10001, size + 1)])
+            conn.execute("INSERT INTO publication_progress VALUES('pair','events',?) ON CONFLICT(pair_id,domain) DO UPDATE SET sync_sequence=excluded.sync_sequence", (size,))
+        if scenario == "low_frontier":
+            with original() as conn:
+                conn.execute("UPDATE publication_outbox SET published_at=1")
+                conn.execute("UPDATE publication_progress SET sync_sequence=0")
+        statements = []
+        steps = [0]
+        @contextmanager
+        def measured():
+            with original() as conn:
+                conn.set_trace_callback(statements.append)
+                def progress():
+                    steps[0] += 1
+                    return 0
+                conn.set_progress_handler(progress, 1)
+                yield conn
+        store._connect = measured
+        try:
+            assert store.retain_publication_outbox(pair_id="pair", domain="events", dry_run=dry_run) == {
+                "eligible": 0, "deleted": 0, "busy": False}
+        finally:
+            store._connect = original
+        counts.append(steps[0])
+        query = next(sql for sql in statements if sql.startswith("SELECT o.sync_sequence"))
+        with original() as conn:
+            plan = " ".join(str(tuple(row)) for row in conn.execute("EXPLAIN QUERY PLAN " + query))
+        plans.append(plan)
+    assert all("idx_outbox_retention_prefix" in plan and "sync_sequence<?" in plan for plan in plans)
+    assert all("CO-ROUTINE o" in plan for plan in plans)
+    assert all("TEMP B-TREE" not in plan for plan in plans)
+    assert max(counts) < 10000
+    assert counts[1] <= counts[0] + 50

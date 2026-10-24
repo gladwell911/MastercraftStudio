@@ -1099,3 +1099,45 @@ def test_file_broadcast_outbox_hint_has_direct_file_fields(frame, monkeypatch, e
     assert published == [(transport.subjects.hints, envelope)]
     assert frame.chat_store.pending_outbox(pair_id="default", domain="files") == []
     frame._remote_nats_transport = None
+
+
+def test_cloudflared_channels_survive_continuous_rotation(frame, monkeypatch, tmp_path):
+    import sys
+    import subprocess
+    from owned_logs import RotatingLog
+    path = tmp_path / "cloudflared.log"
+    log = RotatingLog(path, max_bytes=1024, track_channels=True)
+    code = ("import sys,time; out=sys.stdout.buffer; "
+            "out.write(b'Registered tunnel connection connIndex=0\\n'); "
+            "out.write(b'x'*12000+b'\\n'); out.flush(); time.sleep(.3); "
+            "out.write(b'Unregistered tunnel connection connIndex=0\\nRegistered tunnel connection connIndex=1\\nLATEST\\n'); out.flush(); time.sleep(5)")
+    child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    frame._managed_cloudflared_process = child
+    frame._managed_cloudflared_log_handle = log
+    monkeypatch.setattr(frame, "_managed_cloudflared_log_path", lambda: path)
+    try:
+        log.attach(child.stdout)
+        import time
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "LATEST" not in frame._managed_cloudflared_log_tail():
+            time.sleep(.02)
+        assert "LATEST" in frame._managed_cloudflared_log_tail()
+        assert frame._owned_cloudflared_channel_count() == 1
+        assert log._channels == {"0": False, "1": True}
+        assert sum(p.stat().st_size for p in tmp_path.glob("cloudflared.log*")) <= 4096
+    finally:
+        frame._stop_managed_cloudflared_process()
+    assert not log._thread.is_alive() and log._pipe.closed and log._handle.closed
+
+
+def test_navigation_diagnostics_default_off_and_bounded_when_enabled(frame, monkeypatch, tmp_path):
+    path = tmp_path / "ctrl_navigation_debug.log"
+    frame.app_data_dir = tmp_path
+    monkeypatch.delenv("MC_CTRL_NAVIGATION_DEBUG", raising=False)
+    frame._log_ctrl_navigation_debug("left", reason="fixture")
+    assert not path.exists()
+    monkeypatch.setenv("MC_CTRL_NAVIGATION_DEBUG", "1")
+    frame._log_ctrl_navigation_debug("right", details={"payload": "x" * (6 * 1024 * 1024)})
+    assert path.stat().st_size <= 5 * 1024 * 1024
+    assert path.with_name(path.name + ".1").exists()

@@ -164,6 +164,18 @@ class ChatStore:
                     subject_domain TEXT NOT NULL, payload BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                     published_at REAL, blocked_reason TEXT, PRIMARY KEY(pair_id, domain, sync_sequence)
                 );
+                CREATE INDEX IF NOT EXISTS idx_outbox_pending_pair
+                    ON publication_outbox(pair_id,sync_sequence) WHERE published_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_outbox_pending_domain
+                    ON publication_outbox(pair_id,domain,sync_sequence) WHERE published_at IS NULL;
+                DROP INDEX IF EXISTS idx_outbox_retention_age;
+                CREATE INDEX IF NOT EXISTS idx_outbox_retention_prefix
+                    ON publication_outbox(pair_id,domain,sync_sequence,published_at)
+                    WHERE published_at IS NOT NULL AND blocked_reason IS NULL;
+                CREATE TABLE IF NOT EXISTS publication_progress (
+                    pair_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(pair_id,domain)
+                );
                 CREATE TABLE IF NOT EXISTS v2_checkpoints (
                     pair_id TEXT NOT NULL, consumer_id TEXT NOT NULL, domain TEXT NOT NULL, sync_sequence INTEGER NOT NULL,
                     PRIMARY KEY(pair_id, consumer_id, domain)
@@ -235,6 +247,10 @@ class ChatStore:
                 """
             )
             conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM meta WHERE key='publication_progress_initialized'").fetchone() is None:
+                for scope in conn.execute("SELECT DISTINCT pair_id,domain FROM publication_outbox").fetchall():
+                    self._advance_publication_progress(conn, scope["pair_id"], scope["domain"])
+                conn.execute("INSERT INTO meta(key,value) VALUES('publication_progress_initialized','1')")
             execution_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_steps)")}
             if "logical_key" not in execution_columns:
                 conn.execute("ALTER TABLE execution_steps ADD COLUMN logical_key TEXT NOT NULL DEFAULT ''")
@@ -1322,31 +1338,87 @@ class ChatStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def _advance_publication_progress(conn: sqlite3.Connection, pair: str, domain: str) -> int:
+        # Pair-wide sequences have legal gaps in each domain. Only an actual
+        # confirmed row below the first pending row can advance this frontier.
+        pending = conn.execute(
+            "SELECT sync_sequence FROM publication_outbox WHERE pair_id=? AND domain=? "
+            "AND published_at IS NULL ORDER BY sync_sequence LIMIT 1", (pair, domain)).fetchone()
+        sql = ("SELECT sync_sequence FROM publication_outbox WHERE pair_id=? AND domain=? "
+               "AND published_at IS NOT NULL")
+        args = [pair, domain]
+        if pending is not None:
+            sql += " AND sync_sequence<?"
+            args.append(int(pending[0]))
+        row = conn.execute(sql + " ORDER BY sync_sequence DESC LIMIT 1", args).fetchone()
+        prefix = int(row[0]) if row else 0
+        conn.execute(
+            "INSERT INTO publication_progress VALUES(?,?,?) ON CONFLICT(pair_id,domain) "
+            "DO UPDATE SET sync_sequence=MAX(sync_sequence,excluded.sync_sequence)", (pair, domain, prefix))
+        return int(conn.execute("SELECT sync_sequence FROM publication_progress WHERE pair_id=? AND domain=?",
+                                (pair, domain)).fetchone()[0])
+
     def mark_outbox_acked(self, sync_sequence: int, *, pair_id: str | None = None,
                           domain: str | None = None, consumer_id: str | None = None) -> None:
         where, args = "sync_sequence=?", [int(sync_sequence)]
         if pair_id is not None: where += " AND pair_id=?"; args.append(str(pair_id))
         if domain is not None: where += " AND domain=?"; args.append(str(domain))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            scopes = {(r[0], r[1]) for r in conn.execute(
+                f"SELECT pair_id,domain FROM publication_outbox WHERE {where}", args)}
+            # Duplicate ACK after pruning must still preserve the saved frontier.
+            if domain is not None:
+                scopes.add((str(pair_id or "default"), str(domain)))
             conn.execute(f"UPDATE publication_outbox SET published_at=unixepoch(),blocked_reason=NULL WHERE {where} AND published_at IS NULL", tuple(args))
-            if consumer_id is not None and domain is not None:
-                pair = str(pair_id or "default")
-                earliest_pending = conn.execute(
-                    "SELECT MIN(sync_sequence) n FROM publication_outbox "
-                    "WHERE pair_id=? AND domain=? AND published_at IS NULL",
-                    (pair, domain),
-                ).fetchone()["n"]
-                prefix = conn.execute(
-                    "SELECT COALESCE(MAX(sync_sequence),0) n FROM publication_outbox "
-                    "WHERE pair_id=? AND domain=? AND published_at IS NOT NULL "
-                    "AND (? IS NULL OR sync_sequence<?)",
-                    (pair, domain, earliest_pending, earliest_pending),
-                ).fetchone()["n"]
-                conn.execute(
-                    "INSERT INTO v2_checkpoints(pair_id,consumer_id,domain,sync_sequence) VALUES(?,?,?,?) "
-                    "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=excluded.sync_sequence",
-                    (pair, str(consumer_id), str(domain), int(prefix)),
-                )
+            for pair, sequence_domain in scopes:
+                prefix = self._advance_publication_progress(conn, pair, sequence_domain)
+                if consumer_id is not None and domain is not None:
+                    conn.execute(
+                        "INSERT INTO v2_checkpoints(pair_id,consumer_id,domain,sync_sequence) VALUES(?,?,?,?) "
+                        "ON CONFLICT(pair_id,consumer_id,domain) DO UPDATE SET sync_sequence=MAX(sync_sequence,excluded.sync_sequence)",
+                        (pair, str(consumer_id), sequence_domain, prefix))
+
+    def publication_domains(self, *, pair_id: str) -> list[str]:
+        with self._connect() as conn:
+            return [str(row[0]) for row in conn.execute(
+                "SELECT domain FROM publication_progress WHERE pair_id=? ORDER BY domain", (str(pair_id),))]
+
+    def retain_publication_outbox(self, *, pair_id: str, domain: str, dry_run: bool = True,
+                                   batch_size: int = 500, now: float | None = None) -> dict[str, Any]:
+        """Count/delete one old confirmed batch; busy writers yield immediately.
+
+        Inspect at most batch_size safe published rows, then apply age. A
+        recent prefix may defer older later rows; eligible counts this window.
+        Only publication copies are disposable. Canonical facts, device cursors
+        and broker/consumer policies are deliberately independent of this method.
+        """
+        limit = min(1000, max(1, int(batch_size)))
+        cutoff = (time.time() if now is None else float(now)) - 7 * 86400
+        try:
+            with self._connect() as conn:
+                conn.execute("PRAGMA busy_timeout=0")
+                conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
+                # LIMIT belongs inside this non-flattenable candidate window:
+                # inspect at most one safe prefix batch before applying age.
+                # A recent prefix may conservatively defer older later rows.
+                rows = conn.execute(
+                    "SELECT o.sync_sequence FROM ("
+                    "SELECT sync_sequence,published_at FROM publication_outbox "
+                    "WHERE pair_id=? AND domain=? AND published_at IS NOT NULL AND blocked_reason IS NULL "
+                    "AND sync_sequence<=COALESCE((SELECT sync_sequence FROM publication_progress "
+                    "WHERE pair_id=? AND domain=?),0) "
+                    "ORDER BY sync_sequence LIMIT ?) o WHERE o.published_at<?",
+                    (str(pair_id), str(domain), str(pair_id), str(domain), limit, cutoff)).fetchall()
+                if not dry_run:
+                    conn.executemany("DELETE FROM publication_outbox WHERE pair_id=? AND domain=? AND sync_sequence=?",
+                                     [(str(pair_id), str(domain), int(r[0])) for r in rows])
+                return {"eligible": len(rows), "deleted": 0 if dry_run else len(rows), "busy": False}
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            return {"eligible": 0, "deleted": 0, "busy": True}
 
     def record_outbox_failure(self, sync_sequence: int, reason: str, *, pair_id: str | None = None,
                               domain: str | None = None, permanent: bool = False) -> None:

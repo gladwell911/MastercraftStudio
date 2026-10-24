@@ -42,3 +42,8 @@ app_state.json
 tmp/
 .worktrees/
 docs/multi_agent/__pycache__/
+
+# Isolated future build, validation and diagnostic output
+/.dev/
+*.apk
+*.log.[123]

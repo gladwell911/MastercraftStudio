@@ -9,6 +9,7 @@ import sys
 import time
 import json
 import secrets
+from owned_logs import RotatingLog
 
 
 NATS_SERVER_ENV = "ZGWD_NATS_SERVER_PATH"
@@ -141,11 +142,11 @@ class NatsServerProcess:
 
         self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._close_log_handle()
-        self._log_handle = self.log_path.open("ab", buffering=0)
+        self._log_handle = RotatingLog(self.log_path)
         popen_kwargs: dict[str, object] = {
             "stdin": subprocess.DEVNULL,
-            "stdout": self._log_handle,
-            "stderr": self._log_handle,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
         }
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -156,6 +157,7 @@ class NatsServerProcess:
 
         try:
             self._process = subprocess.Popen(self.build_command(), **popen_kwargs)
+            self._log_handle.attach(self._process.stdout)
             self.wait_until_ready(timeout=timeout)
             self._raise_if_process_exited()
         except Exception:
@@ -199,6 +201,8 @@ class NatsServerProcess:
 
     def _raise_if_process_exited(self) -> None:
         if self._process and self._process.poll() is not None:
+            if self._log_handle is not None:
+                self._log_handle.wait()
             raise RuntimeError(
                 f"NATS server exited with code {self._process.returncode}; "
                 f"log: {self.log_path}; tail: {self._log_tail()}"
@@ -206,6 +210,7 @@ class NatsServerProcess:
 
     def _log_tail(self, max_bytes: int = 4096) -> str:
         handle = self._log_handle
+        failure_note = getattr(handle, "failure_note", "")
         if handle is not None:
             try:
                 handle.flush()
@@ -218,11 +223,12 @@ class NatsServerProcess:
                 stream.seek(max(0, size - max_bytes), os.SEEK_SET)
                 text = stream.read().decode("utf-8", errors="replace")
         except OSError:
-            return "<unavailable>"
+            return ("<unavailable> " + failure_note).strip()
         token = str(self.config.token or "")
         if token:
             text = text.replace(token, "<redacted>")
-        return " | ".join(text.splitlines()[-20:]).strip() or "<empty>"
+        tail = " | ".join(text.splitlines()[-20:]).strip() or "<empty>"
+        return (tail + " | " + failure_note) if failure_note else tail
 
     def _close_log_handle(self) -> None:
         handle = self._log_handle
