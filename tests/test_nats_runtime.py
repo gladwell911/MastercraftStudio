@@ -287,3 +287,110 @@ def test_real_child_drains_after_rotation_write_error_and_reports_safe_failure(t
     finally:
         process.stop()
     assert not log._thread.is_alive() and log._pipe.closed and log._handle.closed
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Win32 inherited pipe cancellation")
+def test_stop_closes_owned_reader_while_fixture_descendant_holds_stdout(tmp_path, monkeypatch):
+    import sys
+    import time
+    import _winapi
+    process = NatsServerProcess(NatsRuntimeConfig(app_data_dir=tmp_path, token="fixture"))
+    pid_path = tmp_path / "owned-descendant.pid"
+    descendant_code = "import time; print('DESCENDANT_READY', flush=True); time.sleep(60)"
+    parent_code = ("import subprocess,sys,time,pathlib; "
+        f"child=subprocess.Popen([sys.executable,'-c',{descendant_code!r}],stdout=sys.stdout,stderr=sys.stderr,creationflags=subprocess.CREATE_NO_WINDOW); "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid)); "
+        "print('PARENT_READY',flush=True); time.sleep(.3)")
+    monkeypatch.setattr(process, "build_command", lambda: [sys.executable, "-c", parent_code])
+    monkeypatch.setattr(process, "_port_accepts_connections", lambda: False)
+    monkeypatch.setattr(process, "_port_can_bind", lambda: True)
+    monkeypatch.setattr(process, "wait_until_ready", lambda **_: None)
+    descendant_handle = None
+    log = None
+    try:
+        parent = process.start()
+        log = process._log_handle
+        deadline = time.monotonic() + 5
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert pid_path.exists()
+        # Pin only this fixture-created PID by handle; never terminate by name.
+        descendant_handle = _winapi.OpenProcess(0x100001, False, int(pid_path.read_text()))
+        parent.wait(timeout=5)
+        assert _winapi.WaitForSingleObject(descendant_handle, 0) == 258
+        deadline = time.monotonic() + 5
+        while 'DESCENDANT_READY' not in process._log_tail() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert 'DESCENDANT_READY' in process._log_tail()
+        assert log._thread.is_alive()
+        process.stop()
+        assert not log._thread.is_alive()
+        assert log._pipe.closed and log._handle.closed
+        assert process._log_handle is None
+        assert _winapi.WaitForSingleObject(descendant_handle, 0) == 258
+    finally:
+        process.stop()
+        if descendant_handle is None and pid_path.exists():
+            descendant_handle = _winapi.OpenProcess(0x100001, False, int(pid_path.read_text()))
+        if descendant_handle is not None:
+            try:
+                if _winapi.WaitForSingleObject(descendant_handle, 0) == 258:
+                    _winapi.TerminateProcess(descendant_handle, 1)
+                assert _winapi.WaitForSingleObject(descendant_handle, 5000) == 0
+            finally:
+                _winapi.CloseHandle(descendant_handle)
+        pid_path.unlink(missing_ok=True)
+
+
+
+def test_owned_log_short_writes_preserve_every_byte_across_rotation(tmp_path):
+    from owned_logs import RotatingLog
+    path = tmp_path / "short.log"
+    log = RotatingLog(path, max_bytes=6)
+    original = log._handle
+    class ShortWriter:
+        def __getattr__(self, name):
+            return getattr(original, name)
+        def write(self, data):
+            return original.write(data[:2])
+    log._handle = ShortWriter()
+    try:
+        log.write(b"ABCDEFGH")
+        assert path.with_name(path.name + ".1").read_bytes() + path.read_bytes() == b"ABCDEFGH"
+        assert log.failure_note == ""
+    finally:
+        log.close()
+
+
+@pytest.mark.parametrize("result", [0, None])
+def test_owned_log_zero_progress_is_detected_and_later_pipe_output_drains(tmp_path, result):
+    import io
+    from owned_logs import RotatingLog
+    log = RotatingLog(tmp_path / "no-progress.log")
+    original = log._handle
+    class NoProgressWriter:
+        failed = False
+        def __getattr__(self, name):
+            return getattr(original, name)
+        def write(self, data):
+            if not self.failed:
+                self.failed = True
+                return result
+            return original.write(data)
+    log._handle = NoProgressWriter()
+    class Chunks(io.BytesIO):
+        def __init__(self):
+            super().__init__()
+            self.chunks = [b"failed chunk", b"RECOVERED", b""]
+        def read1(self, size):
+            return self.chunks.pop(0)
+    pipe = Chunks()
+    try:
+        log.attach(pipe)
+        log.wait()
+        assert not log._thread.is_alive()
+        assert log.failure_note == "log_write_failures=1"
+        assert log.path.read_bytes() == b"RECOVERED"
+    finally:
+        log.close()
+    assert pipe.closed and log._handle.closed

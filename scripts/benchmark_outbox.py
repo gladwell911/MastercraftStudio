@@ -101,7 +101,15 @@ def main():
                     pair = args.pair or (str(row[0]) if row else "bench")
             else:
                 store = fixture(path, args.rows * multiplier)
-                pair = "bench"
+                pair = args.pair or "bench"
+            with store._connect() as conn:
+                selected_counts = {
+                    "outbox": conn.execute("SELECT COUNT(*) FROM publication_outbox WHERE pair_id=?", (pair,)).fetchone()[0],
+                    "facts": conn.execute("SELECT COUNT(*) FROM durable_facts WHERE pair_id=?", (pair,)).fetchone()[0],
+                    "pending": conn.execute("SELECT COUNT(*) FROM publication_outbox WHERE pair_id=? AND published_at IS NULL", (pair,)).fetchone()[0],
+                }
+                if not selected_counts["outbox"] and not selected_counts["facts"]:
+                    parser.error(f"Selected pair {pair!r} has no outbox or durable facts")
             with store._connect() as conn:
                 conn.execute("DROP INDEX IF EXISTS idx_outbox_pending_pair")
                 conn.execute("DROP INDEX IF EXISTS idx_outbox_pending_domain")
@@ -115,7 +123,7 @@ def main():
             store.initialize()
             upgrade = (time.perf_counter() - start) * 1000
             after = measure(store, args.samples, pair)
-            result["runs"].append({"multiplier": multiplier, "pair": pair, "counts": counts, "upgrade_ms": upgrade,
+            result["runs"].append({"multiplier": multiplier, "pair": pair, "counts": counts, "selected_pair_counts": selected_counts, "upgrade_ms": upgrade,
                                    "migration_timing_scope": "full initialize; write-lock duration not separately instrumented",
                                    "before": before, "after": after})
     print(json.dumps(result, indent=2))

@@ -120,6 +120,14 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     nats_source.write_bytes(b"fake-nats-source")
     spec = tmp_path / "fake.spec"
     spec.write_text("fake only", encoding="utf-8")
+    excluded_dirs = [".dev", "tests", "test", "screenshots", "screenshot", "reverse-engineering",
+        "reverse_engineering", "apktool", "jadx", "android-reverse", "jetstream", ".git", ".pytest_cache",
+        "_bmad-output", ".codex-home", ".codex-home-other", "history"]
+    excluded_files = ["new.apk", "new.aab", "app_state.json", "remote_machine.json", "output.log",
+        "notes.db", "cache.sqlite", "cache.sqlite3"]
+    artifact_paths = [base + name + "/unwanted-build-artifact" for base in ("", "_internal/nested/") for name in excluded_dirs]
+    artifact_paths += [base + name for base in ("", "_internal/nested/") for name in excluded_files]
+    runtime_paths = ["ZDSRAPI.dll", "ZDSRAPI_x64.dll", "_internal/python311.dll", "_internal/sound/done.wav"]
     builder = tmp_path / "fake-builder.py"
     builder.write_text(
         "import pathlib, sys\n"
@@ -140,6 +148,10 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         "skill = package / '_internal' / 'assets' / 'codex-skills' / 'mc-browser-open' / 'SKILL.md'\n"
         "skill.parent.mkdir(parents=True)\n"
         "if mode != 'missing_skill': skill.write_bytes(b'' if mode == 'empty_skill' else b'skill')\n"
+        f"for relative in {artifact_paths + runtime_paths!r}:\n"
+        "    artifact = package / relative\n"
+        "    artifact.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    artifact.write_bytes(b'fixture-artifact')\n"
         "for name in ['history', '.codex-home']:\n"
         "    folder = package / '_internal' / name\n"
         "    folder.mkdir()\n"
@@ -193,6 +205,12 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         assert (package / "mc.exe").read_bytes() == b"new-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"new-worker"
         assert not cache.exists()
+        for base in ("", "_internal/nested/"):
+            for name in excluded_dirs + excluded_files:
+                assert not (package / base / name).exists(), base + name
+        for relative in runtime_paths:
+            assert (package / relative).read_bytes() == b"fixture-artifact"
+
 
 
 def test_pyinstaller_specs_bundle_websocket_client_for_kimi_server_client():
@@ -229,3 +247,16 @@ def test_package_collected_inputs_exclude_development_and_user_data(tmp_path):
     spec = (Path(__file__).resolve().parents[1] / "zgwd.spec").read_text(encoding="utf-8")
     assert "a.datas = filter_package_toc(a.datas)" in spec
     assert "b.datas = filter_package_toc(b.datas)" in spec
+
+
+@pytest.mark.parametrize("ancestor", ["test", "tests"])
+def test_package_source_filter_uses_collection_relative_boundary(tmp_path, monkeypatch, ancestor):
+    import package_inputs
+    collection = tmp_path / ancestor / "mc"
+    monkeypatch.setattr(package_inputs, "__file__", str(collection / "package_inputs.py"))
+    required = [("python311.dll", str(collection / ".venv/Lib/python311.dll"), "BINARY"),
+                ("assets/chat_title_rules.json", str(collection / "assets/chat_title_rules.json"), "DATA"),
+                ("wx/core.pyd", str(tmp_path / ancestor / "external-python/wx/core.pyd"), "BINARY")]
+    test_artifacts = [("assets/renamed-fixture.json", str(collection / "tests/fixture.json"), "DATA"),
+                      ("assets/other-fixture.json", str(collection / "test/fixture.json"), "DATA")]
+    assert package_inputs.filter_package_toc(required + test_artifacts) == required

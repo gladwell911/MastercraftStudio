@@ -90,8 +90,11 @@ class RotatingLog:
                     if remaining <= 0:
                         self._rotate()
                         remaining = self.max_bytes
-                    self._handle.write(view[:remaining])
-                    view = view[remaining:]
+                    chunk = view[:remaining]
+                    written = self._handle.write(chunk)
+                    if not isinstance(written, int) or written <= 0 or written > len(chunk):
+                        raise OSError("Owned log write made no valid progress")
+                    view = view[written:]
             except (OSError, ValueError):
                 self._write_failures = min(9999, self._write_failures + 1)
                 raise

@@ -23274,6 +23274,7 @@ def test_switched_chat_final_rejects_stale_generation(frame, monkeypatch, clear_
 
 def test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lease(frame, monkeypatch, tmp_path):
     import base64
+    import io
     from tunnel_policy import ConnectorLease, split_command_line
     token_file = tmp_path / "cloudflared-laptop" / "token.txt"
     token_file.parent.mkdir()
@@ -23288,7 +23289,7 @@ def test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lea
     monkeypatch.setattr(frame, "_managed_cloudflared_log_path", lambda: tmp_path / "connector.log")
     monkeypatch.setattr(frame, "_query_cloudflared_service", lambda: {"exists": False})
     calls, statuses = [], []
-    process = SimpleNamespace(pid=4242, poll=lambda: None, terminate=lambda: calls.append("terminate"),
+    process = SimpleNamespace(pid=4242, stdout=io.BytesIO(b""), poll=lambda: None, terminate=lambda: calls.append("terminate"),
         wait=lambda timeout: None)
     monkeypatch.setattr(main.subprocess, "Popen", lambda argv, **kwargs: calls.append(argv) or process)
     monkeypatch.setattr(frame, "_set_status_text_safe", statuses.append)

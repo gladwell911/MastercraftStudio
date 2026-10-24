@@ -1,132 +1,50 @@
-## 2026-10-24 长期运行性能与有界生成数据（源码实现）
-
-源码增加 pending outbox 部分索引（pair/sequence、pair/domain/sequence），独立的 pair/domain publication_progress，以及单调发布 checkpoint。首次迁移在事务内仅从首个未确认行之前实际已确认的 domain 前缀播种，不把 pair 序列间隙当成丢失事件；后续 ACK 与进度同事务更新，剪枝后重复 ACK 不回退。durable_facts 和 canonical history 不清理。
-
-`ChatStore.retain_publication_outbox(pair_id=..., domain=...)` 默认仅 dry-run，返回这一批 eligible/deleted/busy；显式 `dry_run=False` 才删除。默认500、硬上限1000，只处理 published_at 早于7天且不超过持久安全前沿、无 blocker 的单一 pair/domain。争锁立即 yield，不执行 VACUUM；释放的是 SQLite 内部页，不承诺文件缩小。现有后台 outbox worker 在每轮读取发布批次之前检查维护，最多每300秒轮到一个 domain 执行一批，无新增永久轮询线程。设置 `REMOTE_CONTROL_OUTBOX_RETENTION=0` 后续维护关闭；没有发布worker活动时不会主动清理。
-
-NATS 与 MC 自有 Cloudflared 子进程 stdout/stderr 由固定64KiB以内读取的 reader 持续排空，单日志5MiB加3备份，关闭时回收 pipe/thread/file。轮转rename/reopen或写盘瞬态失败后重新取得可写current handle，持续排空pipe，后续chunk可恢复；现有NATS/Cloudflared tail附加固定文本与饱和计数 `log_write_failures=N`，不包含异常正文/路径/凭据。Cloudflared channel 状态在 reader 中增量维护，跨文件轮转保留。`ctrl_navigation_debug.log` 默认不写；显式 `MC_CTRL_NAVIGATION_DEBUG=1` 使用相同大小策略。只管理 MC 拥有的日志与子进程，不更改 Codex 上游日志配置。
-
-未来默认构建 work 为 `.dev/build/pyinstaller`，临时 staging 在选定 WorkPath 下，自定义 WorkPath/DistPath 仍有效；只改变未来输出，不扫描/删除旧构建树。默认 spec 的 collected inputs 及复制边界排除 APK、screenshots、reverse/test trees 和运行用户数据；DLL、NATS、声音与随包技能保留。`package_mc_current_temp.ps1` 未触碰，没有执行真实打包或部署。
-
-隔离验证：规定六文件串行回归 208 passed / 2 failed（53.68秒）。两个失败为 `test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals`（chat-a缺失）与 `test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor`（既有 answer_seq=0 预期）；将 main/chat_store/remote_nats/nats_runtime 全部替换为基线 `5ec25009114c4b38d9d23f38e6442329c3a1197a` 临时模块副本后，两项以同一断言再次失败，未改这些无关UI行为。初版日志/打包29项通过；最终日志表面4项通过，最终打包fixture/static19项通过。新增测试经 store/transport/frame 入口覆盖迁移、domain gap、乱序/重复ACK、restart、永久blocker、年龄/批量边界、争锁和剪枝后 history/notification/execution/read 等值。真实本地 Python 子进程连续55MiB输出，保留4文件各≤5MiB、latest tail，并核对关闭后 reader/pipe/file 已释放。没有运行日常 MC/手机/真实隧道验收。
-
-基准命令：`.venv/Scripts/python.exe scripts/benchmark_outbox.py`；默认临时生成数据，`--source <db> --pair <id>` 仅用 mode=ro 打开指定源，并经 SQLite backup API 复制到临时数据库后测量，绝不向源库写入。脚本输出 revision、counts、首轮/暖态 p95/median、实际 query plan、索引升级锁持有与整体迁移时间。首轮只是新连接首读，不代表清空操作系统缓存。
-
-20个暖态样本的合成数据结果（ms；不是现场归档库155–334ms的复测）：196167行 notification p95 21.02→1.21，other 24.36→1.05；1961670行分别238.87→2.48、255.58→9.34。director这一轮两lane均≤10ms且同fixture加索引前后至少10倍；engineer独立生成数据复测的196167行other为20.73→2.40ms（8.65倍），未达到十倍目标，不能据单轮宣布性能验收全部通过；增长后的 median 为0.99/1.72ms（原1.00/0.97ms），空查询计划始终使用 pending 部分索引，无历史扫描/临时排序，p95有调度波动。当时两项pending索引升级锁分别24.50/273.23ms，整体升级48.02/415.32ms（以下新增retention索引之前的测量，不涵盖该索引的迁移成本）。合成fixture通过ChatStore连接事务批量插入最小payload，不能冒充真实业务payload或归档性能。完整JSON与基线失败证据在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/mc-outbox-benchmark.json`、`mc-performance-baseline-failures.txt`。
-
-通知流仍为7天/32MiB/20000条并回读校验；legacy COMMAND/EVENT 没有证明所有支持旧客户端具有权威恢复能力，因此没有新增过期策略。源码与正在运行EXE是两份证据，本轮没有更新EXE。未测量证明 `_save_history`/文件列表为瓶颈，未改这些UI路径。24–72小时资源观察、72小时弱网/长运行和月级稳定性仍未验证；短测不能证明不存在泄漏或保证数月顺滑。独立 engineer 最终结果见本节末尾，当前已完成受影响面验证。
-
 # 当前交接
 
-## 2026-10-20 笔记本 FRP 部署接续
+更新日期：2026-10-24。源码仓库 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本阶段完成长期运行性能与产物治理，以及新dog审查提出的7项补丁。此前提交为 `5ec2500`（笔记初始化）和 `21fa568`（性能治理）；本次neat-freak收尾范围包含剩余补丁与文档；最终哈希和推送结果以Git实测为准。
 
-笔记本 FRP 脚本与私有配置交接准备已就绪；服务器已配置独立 19081 和 `mc-laptop-test.tingyou.cc:8443` 路由。
-笔记本尚未执行本机部署。手机 RC 已于 2026-10-20 按用户要求覆盖安装内置双 FRP 配置的版本，laptop 使用新入口，无需手填地址；台式机 default 地址和两来源 token 保持。笔记本上线后再完成认证与列表验证。
-笔记本 Codex 按 [部署说明](../deploy/mc-relay/LAPTOP.md) 使用仓库外私有 bundle 运行 setup-laptop.ps1；用户先退出旧 MC，保留原 history/token，后续升级也使用该入口
+本轮没有重新打包、清理日常数据或退出/重启 `D:/code/cx/mc/mc.exe`。源码、GitHub和运行中EXE是不同状态。
 
-## 2026-10-19 当前快照：日常台式机与实体RC已接入，稳定性待修
+## 已完成
 
-用户自行重包/重启D:/code/cx/mc，default实际external，新入口wss://mc-desktop-test.tingyou.cc:8443/nats；history/remote_machine.json仅domain改变，pair/token保持。frpc desktop从隔离28080切到日常18080/服务器19080，forum-wsl/19420、旧Cloudflare保持。日常包SHA256为093134a6c5f9d67fa79a47f81cc7054abe507702a41c2096ca88c57f443ab94b。三处PONG同身份，公网hello/readiness/list正常，17聊天ID与本地一致。
+- 聊天状态缺失、损坏或有效时，笔记控制器均在 `_load_state()` 后恢复并刷新初始列表；对应计时器夹具负责完整回收。
+- pending outbox部分索引消除空查询扫描已发布历史；独立 `publication_progress` 使确认水位在清理、重复ACK和重启后保持单调，不跨过未确认前序。权威事实、用户历史、会话和笔记不清理。
+- 清理先取安全前沿内的有界候选，再筛七天年龄。自动维护在既有worker取批次前执行，修复维护等待期间新通知的交接遗漏；无新轮询。规则、开关和操作命令见[长期运行维护](runtime-maintenance.md)。
+- NATS/Cloudflared自有日志持续轮转、故障后恢复写入并继续排空管道；正确处理短写及零进展，导航诊断默认关闭。正常Windows后代持有stdout时，reader/pipe/file关闭已由真实fixture验证。
+- 构建work/staging进入开发目录，收集和最终复制边界排除开发/运行数据；修复tests祖先误筛必要资源，保留自定义构建路径、必要资产及已有用户数据。benchmark拒绝不存在pair，明确区分全库与所选pair计数；修复Cloudflared PIPE测试替身。
+- 新dog四个独立视角审查完成，7项行动已修复并独立验证；1项未验证风险保留。代理子树额度受限时，本轮由主线程逐个创建fresh审查员完成，未复用上下文充数或修改配置/历史。
 
-实体RC用户自行卸载后新安装，无startup override，恢复偏好仅改default地址；APK SHA256为8e0ced21846db322bddbb4880533b9880e2c147e38cf09e1f2a204646617fc5e。实际已连接、日常聊天可读、重开通过；旧签名阻塞解除，笔记本本轮未迁移。第三批论坛按用户收窄后的首页要求验收，不要求登录；WSL正常重启恢复/长期观察未验。
+## 验证与性能证据
 
-未修问题：前台回复显示晚7–8秒；RPC发布前PING5秒超时导致前台退役；19:07真实IOException/TLS握手失败窗口点击发送暴露No authorized connection round。该次发送PUB前失败，不是token拒绝。TLS底层原因未知，不能套其他时间的PING超时。后台通知快到不等于详情快显示；提前history tail方案也未证适用于共享投影页面。
+- 性能治理最终八文件串行 **242 passed、2 deselected**；只排除下列两个精确父版本亦失败的用例，不把它们计为通过。
+- 最新7项补丁独立验证 **51 passed**：三个完整受改文件48项，Cloudflared精确启动及两个日志消费者3项；无skip/xfail。Windows真实后代测试实际执行，复制矩阵使用临时假构建器，未真实部署。
+- 本次收尾补跑笔记启动恢复对应的 `tests/test_notes_ui_automation.py`，**7 passed**；文档一致性检查覆盖14份知识文件、62个本地链接，断链为0。上述51项沿用源码未变时的独立验证结果。
+- 真实备份只读复制后，196167条已发布记录的两个lane空查询p95从259.03/295.45 ms降至3.80/1.27 ms。最终合成196167/1961670行分别约1.10–1.29 ms；完整迁移elapsed149.40/1770.22 ms，不是写锁时长。历史一轮合成样本仅8.65倍改善仍保留，不以其他轮次覆盖它。
+- 大量近期记录和旧记录高于低安全水位两种场景，清理VM步数不随总历史线性增加；同时限制检查量与删除量，而不只检查LIMIT返回条数。
 
-下一步主入口为RC [连接问题交接](https://github.com/gladwell911/remoteControl/blob/master/docs/current/2026-10-19-connection-issues.md)，本机D:/code/sj/rc/docs/current/2026-10-19-connection-issues.md。证据在仓库外D:/code/sj/_bmad-output/implementation-artifacts/frp-caddy-desktop-production/。先修恢复期发送状态/提示，再窄计时定位TLS/PING与下行投影更新，不额外调用模型/重发问题、不停日常MC/CF/论坛、不改数据库。以下10月18日及以前部署记录均为历史。
-
-## 2026-10-18 可携带网页入口实现
-
-已集成 `browser_open.py`、随包 `mc-browser-open` 技能、技能根合并刷新与 `MC_BROWSER_OPEN_ARGV`。源码调用 `.venv/Scripts/python.exe browser_open.py --url <HTTP(S) URL>`；默认 onedir 包使用 `mc_worker.exe --browser-open --url <URL>`，不依赖系统 Python。helper 保留专用实例与已有标签，只创建/续验自己的 target；失败返回 targetId 后只用同 URL 加 `--target-id` 续验，不能盲目重建。
-
-新配置和旧无版本配置默认 `auto-review`，原生三元组为 `on-request / workspace-write / auto_review`。状态标记 `codex_approval_defaults_version: 1` 只迁移一次，此后菜单手选保留，不重启活动 turn。真实审核拒绝立即停止，不降级审批或代答 accept。
-
-定向验证：核心 helper/client/worker/packaging 原 164 项分段通过（163 项通过、1 项旧预期修正后精确复验通过）；审批迁移、菜单、IPC 串行 50 项通过。helper 真实执行问题修复后曾有 27 项通过，审查局部补丁完成后 director 与 engineer 最终均复验 46 项通过。engineer 已完成最终非管理员隔离重构建（exit 0）及打包 worker `--browser-open --help`。
-
-含空格源码目录的原生技能发现、自然语言读取随包技能并调用 helper、真实 `auto_review approved` 已实测；源码首次网页 complete、可见且非最小化，但 `foreground=false`，helper 正确报错，该次不记为置前成功。首个隔离包模型回合确认随包技能与用户技能并存，同 target 续验命令 exit 0，并有真实自动审查 approved。审查补丁后的最终重构建包由 engineer 直接调用同一自有 target 续验，exit 0，返回 `status=ok / complete / visible=true / minimized=false / foreground=true`、`HWND == foregroundHwnd` 且 `preexistingTargetsPreserved=true`；这次没有新的模型审核，不将此前批准冒充本次触发。证据见仓库外最终报告 `D:/code/sj/_bmad-output/implementation-artifacts/verify-portable-browser-open-engineer.md`。首次全新 profile 启动、另一台电脑的 sandbox 前置状态及焦点行为、正式 MC GUI 自然语言链仍待实际验收，本机隔离验证不能替代。
-
-私有诊断证据已移至仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/browser-open-fixes/`，不提交产品仓库。
-
-独立构建使用独立 `-DistPath`、`-WorkPath` 和 `-BuildOnly`；不覆盖、退出或重启日常 MC，不修改生产库/凭据，不关闭共享 Chrome。profile、Cookie、认证及私有日志不入包。旧单文件 spec 不在本功能支持范围。
-
-### 下一步与接续
-
-1. 已完成实现以提交 `57206cfe18134ee8e2e649905047ea1b09443b5e` 及[仓库内实施记录](../_bmad-output/implementation-artifacts/plan-portable-browser-open.md)为准，不再重复实施旧计划。2026-10-18 neat-freak 收尾同步 README、交接、反思和经验；推送结果以实际远端 SHA 为准。
-2. 在另一台电脑拉取后，使用该机实际目录重新打包；退出和重启日常 MC 仍由用户本人完成。依次检查有效审批模式、技能发现、首次专用 profile 启动及真实前台，不能仅凭命令 exit 0 通过。
-3. 本机尚未覆盖正式 MC GUI 自然语言全链。若续验失败，保留 targetId，仅续验原目标；`continuationAvailable=false` 时停止，不新建目标。首次 HWND 绑定要求唯一，已确认目标允许无关窗口共存，但原 HWND 和 CDP windowId 必须保持一致。
-4. 本轮只改文档并复用对应版本的已有验证，未重新打包、操作手机、启动模型或修改远程协议。RC 本轮无功能改动，其远程验收待办继续以下文和 RC 交接为准。
-
-## 远程控制当前状态
-
-截至 2026-10-18 整理，最近实体验证为 2026-10-17；主分支为 `main`。远程数据精简已实现独立临时 RPC、有限通知流、权威通知快照和按需分页，生产 broker 使用独立 `mc`/`mobile` 用户及角色权限，见 [协议](remote-slim-protocol.md)。手机的新 `mobile/password` 认证与旧运行包的 `auth_token` 模式不兼容，必须配套升级；同 token 的两种认证实测已确认该根因，不能只延长手机超时或更换 token。
-
-2026-10-17 用户已自行重新打包并启动 `D:/code/cx/mc`。手机此前仍使用 CZ 临时公网地址，CZ MC 已退出，导致无法连接。已使用正式私有参数保数据覆盖安装实体 ARM64 RC，恢复 `wss://laptop.tingyou.cc/nats`；两来源 token、台式机地址和两来源 backup 均未变，最终选择笔记本。CX 直连 18081、桥接 18080、正式公网三处认证/PONG 的 server_id 一致，实际手机显示笔记本已连接和 CX 聊天列表；手机应用退出重开后自动恢复。此次未重启 CX 或改隧道，未发送模型请求。CZ 的独立数据副本保留为历史测试，不代表当前连接目标。
-
-`package_mc.ps1 -BuildOnly -DistPath <独立父目录>` 构建并更新该目录下的 `mc`，不自动启动；它不是仅生成归档的开关，仍拒绝更新正在运行的目标。默认不传 `-BuildOnly` 时保留成功后自动启动一次的行为。原目录更新保留 `history/remote_machine.json` 中同身份配置；新目录不自动继承凭据。切回正式 `cx` 时，用户本人先退出旧 MC，再打包；手机现已恢复正式私有构建；后续升级继续使用正式参数，不能仅依赖持久偏好，因为完整启动构建参数优先。跨目录部署须迁移同身份配置并核对隧道实际指向，不能同时让两个同身份实例争用正式入口。
-
-本轮验证：MC 认证/打包定向 25 项、实例键及启动数据预检 6 项；RC 原生 13 项、Flutter 107 项、分析通过；最终双来源隔离 Local UI 39 秒通过，实体 ARM64 使用 `adb install -r -t` 升级且设备 hash 匹配。`cz` 本地 WS 与临时公网 WSS 的 server_id 一致，hello/readiness/列表/详情均通过。完整证据在工作区 `_bmad-output`，含私有配置及日志的材料不进入 Git。
-
-待办：台式机部署状态复核、当前版本真实模型问答、锁屏通知/文件/TalkBack 听验及长时弱网观察。2026-10-17 曾有一次瞬态传输/已读协调超时，重开后恢复；短时通过不证明长期稳定。不要退出日常 MC、清历史或回退到旧认证掩盖故障。以下 2026-10-09/12 记录仅保留为历史背景。
-
-截至 2026-10-09。双电脑远程控制已部署到笔记本 MC 和实体 ARM64 手机：笔记本独立隧道、自动机器名识别、手机到两台电脑的公网连接及各一次真实模型问答通过。实体通知点击、文件下载、单机断连恢复和 TalkBack 听验尚未验收。实测细节见工作区 `D:/code/sj/_bmad-output/implementation-artifacts/dual-physical-deployment-20261009.md`。
-
-## 目标与当前实现
-
-- 手机同时连接两台 MC：`emperorComputer` 自动识别 `default`，`emperorLaptop` 自动识别 `laptop`；显式 pair 环境变量优先，未知计算机名沿用持久值或 `default`。每台电脑保留自己的地址与固定 token，跨身份不继承凭据。MC 将身份保存到 `app_data_dir/remote_machine.json`。操作、执行游标、已读与文件 URL 使用所属机器身份，详见 [远程配置](remote-control.md)。
-- RC 的笔记本、台式机、全部标签严格过滤电脑聊天；全部显示设备后缀。无障碍标签包含成功收到 Android 通知后尚未阅读的消息数。正确详情成功显示回答及电脑端阅读清除相应范围；加载失败、仅划掉通知、切走或锁屏不算已读。本地 Doubao 保留独立入口。
-- 原有已读协议仍以 pair/chat/generation 隔离，稳定 message_id 与首次成功完成的 answer_seq 关联。read_seq 单调，清空才换 generation；自动定位不确认阅读，主动导航、全文或成功网页打开确认冻结范围。Ctrl+Shift+X 的原生 MOD_NOREPEAT 与真实末项焦点保留。
-- Kimi 系统注入边界修复、生成中公开思考与 commentary、REST 同 owner 补齐保留。边界仅按结构化 origin 判定；`metadata.origin` 存在时优先使用，未知值保守作为真实问题。完整旧验证记录已归档。
-- F1 使用 owner/view/turn/revision 的真实可视尾页，visible 部分索引与后台补齐保留。发送受理和首次成功回复推进活动排序；读取、标题、失败和重放不置顶。
-- Codex 私有 home 通过整目录链接复用全局 skills/plugins，新任务刷新原生清单，活动 turn 的追加输入不重启。打包脚本先临时构建和校验，再更新并自动启动最终产物；用户已自行重包并手动重启日常 MC。当前日常 MC 的后续退出/重启必须由用户本人操作，不能由 agent 自动进行。`package_mc_current_temp.ps1` 是本地未跟踪临时脚本，本轮不提交或删除。
-
-## 本阶段验证
-
-2026-10-12 分支收尾定向回归：`.venv/Scripts/python.exe -m pytest tests/test_remote_machine_config.py tests/test_remote_readiness.py tests/test_remote_readiness_qa.py -q`，24 项通过；仅纯配置与协议测试，没有恢复已停止的完整桌面验收。
-
-四个审查层按用户要求逐个运行，23 条意见逐项核对，10 组修复完成；父代理复验另外发现并补齐缓存详情的已读确认。MC 最终 83 passed，1 个已在精确旧基线复现的无关用例排除。RC 定向 Flutter 118、文件/通知回归 104、实际详情/设置/删除 widget 14 项通过；Android 单元 56、专用模拟器 instrumentation 16 项通过；静态分析与空白检查通过。
-
-两套私有 broker 的真实 Android UI Local 流程通过：同 chat ID 归属隔离、分别发送与显示答案、实际通知产生、非零设备及全部数字、对应缓存回答显示后清零、仅笔记本关闭/重启/重连。其后 2026-10-09 实体手机经双公网真实发送各一次：笔记本 canonical `LAPTOP_OK_10`（UI 当时显示空格形式）、台式机 UI `DESKTOP OK 10`；两来源 owner 独立，重新打开笔记本详情后未读由 1/1 变为 0/1。笔记本自动识别的定向测试 director 31 pass/1 deselected、startup 3 pass，engineer 再核 31 pass。未恢复 Windows 原生按键完整验收。
+在源码目录复验最新补丁：
 
 ```powershell
-# MC 源码目录；使用已配置的 Python 3.11 环境
-.venv/Scripts/python.exe -m pytest tests/test_remote_machine_config.py tests/test_dual_local_harness.py tests/test_main_remote_nats_unit.py tests/test_remote_nats_protocol.py tests/test_remote_nats_unit.py tests/test_chat_read_state.py tests/test_execution_projection.py -q -k 'not archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals'
+.venv/Scripts/python.exe -m pytest tests/test_nats_runtime.py tests/test_packaging_specs.py tests/test_benchmark_outbox.py --noconftest -o pythonpath=. -q -ra
+.venv/Scripts/python.exe -m pytest tests/test_main_unit.py::test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lease tests/test_main_remote_nats_unit.py::test_cloudflared_channels_survive_continuous_rotation tests/test_main_remote_nats_unit.py::test_navigation_diagnostics_default_off_and_bounded_when_enabled -q
 ```
 
-跨端命令及专用模拟器准备见 RC 的 `docs/current/testing.md`。上述 2026-10-08 Local 验证复用当时证据；2026-10-09 新增机器名识别定向测试和实体实测另如前述，本次文档整理未重复启动 GUI 或设备测试。工作区完整报告为 `D:/code/sj/_bmad-output/implementation-artifacts/dual-computer-control-verification.md`，最终 Local 证据目录为 `dual-local-root-read-final/`；这些含私有日志的工作区文件不进入产品 Git。
+完整先前回归与性能命令见[协议](remote-slim-protocol.md)及[维护说明](runtime-maintenance.md)。wx套件串行，frame测试注入临时笔记路径；不为文档收尾重复无改动的宽回归。
 
-## 剩余事项与下一步
+本机原始证据在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/`：`plan-mc-long-run-performance.md`、`review-mc-long-run-performance-new-dog.md`、`verify-mc-new-dog-seven-patches-engineer.md`、`verify-mc-long-run-performance-engineer.md`、`mc-outbox-benchmark-archive-engineer.json`、`mc-outbox-benchmark-final-patch-engineer.json`。私有诊断、备份、临时辅助脚本不进产品Git。逐轮细节和原部署背景见[收尾前快照](archive/handoff-before-runtime-maintenance-wrapup-2026-10-24.md)。
 
-1. 笔记本独立 named tunnel `laptop.tingyou.cc` 已配置；手机两套私有地址与 token 已部署。笔记本新 MC 使用 18080 桥接到新 NATS 18082（旧进程当时占 18081）；直连、桥接、公网三处 `INFO`/`PING/PONG` 的 server ID 一致。PID、端口占用、手机 serial 是 2026-10-09 快照，接续时重新读取。
-2. 实体通知点击、文件授权下载、单机断连恢复、TalkBack 数字朗读与焦点，以及完整同版本 Live 验收仍未完成；已通过的两条真实模型问答不覆盖这些项目。用户已自行卸载旧手机包后才安装新 ARM64 包，因此本轮不能宣称完成保数据升级验收。
-3. 不自动重启日常 MC；涉及配置生效由用户自己重启。真实隧道下更换笔记本凭据时的在途命令/文件归属仍可专项复核。
-4. 用户已停止完整桌面验收，未经后续授权不得恢复。旧整轮已读验收没有通过；实际解锁夹具和中文声音听验未完成，不能拼接不同失败轮形成成功结论。
-5. Kimi 旧失败记录未改动；安装包曾只读确认缺少新注入边界函数。部署后的安全恢复须先核对原始 owner，不能重发问题或直接改库冒充验证。
+## 剩余问题与下一步
 
-## 数据、环境与避坑
+1. **延期风险，未证实泄漏**：`owned_logs.py` 中reader若正在写盘，单次 `CancelSynchronousIo` 可能错过随后阻塞读取。需要真实Windows后代持stdout、受控读/写/关闭交错才能裁决；本轮7项补丁未扩修该风险。正常后代关闭通过不能代替这一调度测试。
+2. 两个已有基线失败仍在：`test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals` 缺chat-a；`test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor` 的answer_seq旧预期。不得因只跑排除后的集合而宣称全套通过。
+3. 需要安装验证时，先核对实际EXE版本、数据路径及私有启动入口，由用户退出日常MC，再按[远程配置](remote-control.md)对应机器部署；不因本次源码完成而自动打包/启动。
+4. 需要定位剩余卡顿时，测同一操作的UI延迟、数据库等待及24–72小时资源曲线，再决定是否修改历史保存/文件列表。尚无证据证明文件数量是唯一原因，也未建立月级流畅度结论。
+5. 当前通知流上限保留；legacy流TTL和Codex上游存储未获充分恢复证据，不手删或虚构关闭配置。
 
-- 本次不修改 OneDrive 笔记或常用命令同步。两台 MC 可以保持连接；用户保证不同时写入共享数据。换机写入前等待同步，不能用旧库直接覆盖新数据。
-- 源码笔记为 `D:/code/note/notes.db`；打包版需要个人 OneDrive 的 `code/data/sj/notes.db` 已存在且通过完整性与表结构校验。2026-09-29 的云端快照不含之后所有变化；切包前核对实际路径及后续数据，测试注入临时路径。
-- 2026-10-08 专用 AVD 为 `Codex_Dual_Control_API_35`，当次 serial 为 `emulator-5570`。复跑先核对设备归属；只可重置专用 QA 包。真实系统权限弹窗会让 Flutter inactive，不能绕过生产阅读守卫。
-- Local harness 的 history/state 必须含真实 ChatStore 的 canonical 回答及 read_state 元数据；通知 ACK 不代表详情可确认已读。私有 Flutter 日志含凭据，不能原样发布。
-- MC `main` 跟踪 `origin/main`；RC `master` 跟踪 `origin/master`。本次 neat-freak 将功能及文档提交正常推送既有 GitHub 上游；推送结果按实际命令与 `git log -1` 核对，不代表安装完成。
+## 其他有效背景与约束
 
-旧阶段的精确命令、现场 owner 与失败证据见 [2026-10-08 前交接归档](archive/handoff-before-dual-control-2026-10-08.md)；长期规则见 [经验](experience.md)、[反思](reflection.md)与 [文档索引](README.md)。
-
-### 2026-10-24 独立验证后的 retention 最终局部修复
-
-engineer先后发现按sequence筛age、按age筛安全水位都存在双range残余线性扫描。最终改为 `idx_outbox_retention_prefix(pair_id,domain,sync_sequence,published_at) WHERE published_at IS NOT NULL AND blocked_reason IS NULL`；先在安全水位内按sequence取至多batch_size个published且无blocker的候选，再在不可flatten的LIMIT窗口外过滤7天年龄。实际EXPLAIN为CO-ROUTINE候选窗及pair/domain/sequence range lookup；外层SCAN只读取有界窗，不是历史全扫。窗口内近期记录可使本批少删/零删，后续自然老化后再前进，不承诺每批找到全库所有旧记录。默认500/最大1000同时限制检查行数和删除量。
-
-新增dry-run/实际写入口×近期大历史/旧记录低水位四组合VM回归，一万→十万行步骤不随历史增长（上限10000步、两规模差≤50）。定向retention/progress **9 passed**。复用独立probe：196167/1961670近期行0.73/3.19ms、均约6000VM步，competing busy0/1；旧记录frontier0为0.87/0.68ms、均不足1000VM步、busy1/0。微小固定事务仍可能与独立writer竞争，但不再随历史线性增长。最终证据 `director-window-retention-probe.json`、`director-window-retention-lowfrontier-probe.json`；先前age索引测量已被本次实现取代，仍保留历史问题证据。
-
-engineer只读打开归档备份并SQLite backup到临时库，196167行default两lane均零pending，20暖样本notification p95 259.03→3.80ms（68.2倍）、other295.45→1.27ms（232.5倍），满足此源的目标；生成fixture的8.65倍未达仍保留。证据 `mc-outbox-benchmark-archive-engineer.json`。该次整体升级712.52ms包含现已替换的age索引，pending两索引独立锁356.14ms；不能把它冒充最终prefix索引完整升级锁时长，后者尚未单独测量。该局部修复当时等待engineer复验；现已完成，最终结果见本节末尾。
-
-### 2026-10-24 review 后维护竞态、日志故障恢复与基准测量修补
-
-维护await移到现有worker每轮drain之前：持续backlog也会检查300秒节流，最后空批决策后不再await，避免维护暂停时新通知被既有worker退出遗漏。新增真实ChatStore+fake broker的drain_outbox集成，证明旧确认行自动剪枝；暂停retain期间新增final并第二次drain，释放维护后所有worker结束前final已发布。没有新增轮询或公共唤醒状态。
-
-日志rotation失败的finally尝试恢复current append handle；若reopen也失败，后续write再次尝试打开。固定安全失败计数与子进程内容分离，channel先观察后写盘保留；真实隐藏child分别注入write和rotation OSError后仍输出超过pipe容量、正常退出，later tail恢复且包含安全失败标识，敏感异常内容未外泄，pipe/thread/file关闭。另测一次rename/reopen失败后继续write恢复。
-
-benchmark现在对生成fixture和新schema副本均先在临时库剥除本次全部pending/retention索引、publication_progress表及seed marker，再直接计时实际initialize()完整迁移。`upgrade_ms`表示整个schema/index/progress初始化elapsed，`migration_timing_scope`明确写锁时间未单独仪表化；不再输出只覆盖pending索引的lock字段。此前大小数据时长均为对应旧实现的历史证据，不能当作本最终迁移成本。本轮通过生成/只读复制小fixture断言升级前缺少全部新增schema，未重新宣称大库完整迁移性能。--rows必须>0、--samples>=1、--growth>1，在创建fixture之前拒绝非法参数。
-
-本次仅跑受修改面：tests/test_remote_nats_unit.py、tests/test_nats_runtime.py、tests/test_benchmark_outbox.py共52 passed；main远程测试只选channel rollover/navigation diagnostics，2 passed。git diff --check通过。先前两项无关UI基线失败未修改。未做源码/EXE部署、真实隧道/手机或长运行验证。
-
-最终 engineer 受影响八文件验证：242 passed、2 deselected，精确排除前述两项已复现的基线旧失败；public worker维护竞态及真实child故障恢复均通过。最终默认20样本基准中，196167/1961670行完整initialize迁移elapsed分别149.40/1770.22ms，包含全部新增索引及进度schema创建，不是写锁持有时长；优化后空pending两lane p95为1.10–1.29ms，本轮前后均超过10倍。历史生成fixture的8.65倍未达，以及真实归档约68/233倍结果仍按原轮次保留，不以本轮覆盖历史差异。源码验证不代表运行EXE已更新，也不代表长运行稳定性验收。
+- 2026-10-19日常台式机default通过external/frp/Caddy与实体RC连通；TLS握手、恢复期发送错误和前台回复延迟仍待修。RC接续文档为本机 `D:/code/sj/rc/docs/current/2026-10-19-connection-issues.md`；不要把通知快等同于详情快或拼接不同事件解释根因。
+- 2026-10-20笔记本FRP私有bundle准备完成、服务器独立端口/路由已配置，本机部署及认证/列表仍待验证。手机已安装内置双FRP配置的版本不证明笔记本已上线；保留default来源，下一步按[笔记本部署](../deploy/mc-relay/LAPTOP.md)现场核实。
+- 双来源固定台式机default、笔记本laptop，已知计算机名自动识别、显式pair优先；不互相继承凭据。笔记、OneDrive和已读隔离规则未改，两台MC不并发写共享笔记。
+- 源码笔记 `D:/code/note/notes.db`；打包版要求现存、完整且表结构正确的个人OneDrive `code/data/sj/notes.db`。2026-09-29快照不能覆盖之后改动，切包前核对与补齐；测试只写注入路径。
+- 可携带浏览器入口、默认自动审查、全局skills/plugins整目录链接和原生发现刷新已实现；首次专用profile、正式GUI全链、另一台电脑仍待验。目标续验保持原target/window，真实审核拒绝后停止。
+- Kimi结构化注入边界、owner/generation隔离、canonical执行投影和已读语义保留；详见[文档索引](README.md)。用户此前停止的完整桌面验收不在本次恢复范围。

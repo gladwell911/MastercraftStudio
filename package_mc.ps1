@@ -62,7 +62,8 @@ function Assert-PackageArtifacts {
 function Copy-PackageTree {
     param([string]$Source, [string]$Target, [string]$PackageRoot)
     foreach ($entry in Get-ChildItem -LiteralPath $Source -Force) {
-        if ($entry.Name -in @('.codex-home', 'history', '.dev', 'tests', 'test', 'screenshots', 'screenshot', 'reverse-engineering', 'reverse_engineering', 'apktool', 'jadx', 'app_state.json', 'remote_machine.json') -or
+        if ($entry.Name -in @('.codex-home', 'history', '.dev', 'tests', 'test', 'screenshots', 'screenshot', 'reverse-engineering', 'reverse_engineering', 'apktool', 'jadx', 'android-reverse', 'jetstream', '.git', '.pytest_cache', '_bmad-output', 'app_state.json', 'remote_machine.json') -or
+            $entry.Name -like '.codex-home-*' -or
             $entry.Extension -in @('.apk', '.aab', '.log', '.db', '.sqlite', '.sqlite3')) { continue }
         if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "Unexpected link in built package: $($entry.FullName)"

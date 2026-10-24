@@ -48,4 +48,4 @@ RC 以正式私有参数构建，再覆盖安装；打包方法和换手机边�
 
 MC 配置与真实 ChatFrame 启动、pair 主题及 URL 有定向回归；私有双 broker 的 Android 通知与读清零链路已通过。用户自行重包并手动重启笔记本 MC 后，实体 ARM64 手机对两台电脑各完成一次真实问答，来源过滤与已读隔离通过。实体文件下载、单机断连、锁屏通知点击和 TalkBack 听验仍待验。当前结论与接续见 [交接](handoff.md)。
 
-2026-10-20 笔记本 FRP 部署入口见 [笔记本部署](../deploy/mc-relay/LAPTOP.md)。私有 bundle 在仓库外；普通权限运行 setup-laptop.ps1，原目录保留 history，先由用户退出旧 MC。以后升级也使用 setup 入口；原 package 默认启动不保证 external 模式。手机待笔记本验证成功再改 laptop 地址，default 不变。
+2026-10-20 笔记本 FRP 部署入口见 [笔记本部署](../deploy/mc-relay/LAPTOP.md)。私有 bundle 在仓库外；普通权限运行 setup-laptop.ps1，原目录保留 history，先由用户退出旧 MC。以后升级也使用 setup 入口；原 package 默认启动不保证 external 模式。2026-10-20记录中手机已覆盖安装内置双FRP配置的版本，但这不证明笔记本已完成本机部署；后续按现场认证/列表核验及RC当前交接继续，default来源保持不变。

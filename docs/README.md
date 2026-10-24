@@ -1,6 +1,6 @@
 # 文档索引
 
-2026-10-19：日常台式机frp/Caddy与实体RC已接入，论坛首页按收窄要求验收；TLS/连接恢复/发送错误及前台延迟未修，接续见[交接](handoff.md)。
+2026-10-24：长期运行性能与产物治理、7项新dog审查补丁已验证；源码完成不等于运行EXE已更新。最新状态见[交接](handoff.md)，数据/日志/构建规则和基准命令见[长期运行维护](runtime-maintenance.md)。台式机TLS、恢复期发送错误及前台延迟仍待修。
 
 这个目录只保留当前仍有维护价值、并且适合在日常开发时直接阅读的文档。
 
@@ -25,6 +25,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
 - Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
 - [`../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md`](../_bmad-output/specs/spec-codex-kimi-chat-information/SPEC.md)：Codex/Kimi 聊天信息规格；同目录 `data-contract.md` 是必读数据契约
@@ -62,6 +63,7 @@ Codex 通过整目录链接复用全局技能，在新任务前刷新原生清�
 
 ## 历史归档
 
+- [2026-10-24收尾前交接快照](archive/handoff-before-runtime-maintenance-wrapup-2026-10-24.md)：原部署背景和逐轮性能/验证记录，当前结论以handoff为准。
 - `superpowers/specs/`、`superpowers/plans/`：仍保留原路径的带日期设计与计划；其中全量重建、直接重放 quiet 队列等旧执行方案已由当前执行规格取代，不据未勾选任务判定现状。
 - `archive/superpowers/specs/`：历史设计文档
 - `archive/superpowers/plans/`：历史实施计划

@@ -4,6 +4,7 @@
 
 - 明确要求打开 HTTP(S) 网页并显示前台时，使用随源码/onedir 包提供的 `mc-browser-open` 技能；源码入口 `.venv/Scripts/python.exe browser_open.py --url <URL>`，随包入口 `mc_worker.exe --browser-open --url <URL>`，运行时准确 argv 见 `MC_BROWSER_OPEN_ARGV`。普通搜索不启 Chrome；冲突/headless/真实审核拒绝立即停止。默认审批为 auto-review（on-request / workspace-write / auto_review），旧无版本配置仅迁移一次，之后保留手选。跨机首启及焦点效果须在目标机验收。
 
+- 长期维护以 docs/runtime-maintenance.md 为准：保持发布水位/权威facts、用户历史和Codex会话；修改维护时通过真实worker/管道/复制边界验证，不将每批有界或源码验证宣称为存储总上限、月级稳定或安装完成。
 - 本项目是面向读屏用户的 wxPython 桌面应用。没有可见状态变化时，不在后台轮询中触发 UI 重绘、选中变化或状态写入；保持键盘焦点稳定。
 - 双电脑远程身份固定为台式机 default、笔记本 laptop；已知计算机名 emperorComputer、emperorLaptop 分别自动识别这两个身份，显式 pair 环境变量优先。配置、命令、文件与已读保持来源归属，笔记本不继承台式机凭据。配置入口见 docs/remote-control.md；本功能不修改 OneDrive 同步。当前日常 MC 由用户本人退出/重启，agent 不主动操作；打包脚本的既有最终自动启动行为仍保留。
 - 本阶段审查按用户要求逐个派遣，上一位完成后再派下一位，最后汇总；面向用户使用中文。

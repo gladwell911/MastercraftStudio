@@ -1,6 +1,6 @@
 神匠工坊（mc）是面向读屏用户的 wxPython Windows 桌面客户端，整合 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，以及聊天历史、远程控制和笔记。
 
-2026-10-19：日常台式机external/frp/Caddy与实体RC基本连通通过，TLS握手失败、恢复期发送错误和前台回复延迟未修，下一步入口见 docs/handoff.md。
+2026-10-24：长期运行性能治理与7项独立审查补丁已完成源码验证，包含有界队列清理、日志轮转/短写恢复和构建产物隔离。尚未更新正在运行的MC；操作、限制与基准见 docs/runtime-maintenance.md，当前交接见 docs/handoff.md。
 
 ## 快速开始
 
@@ -29,7 +29,7 @@ F1 即时可视尾页与索引、消息活动即时排序、Kimi 本机安全 GE
 
 Codex 隔离 home 通过整目录 symlink/Junction 复用当前用户的 `.codex/skills` 和 `.codex/plugins`；用户 `.agents/skills` 与源码/随包 `assets/codex-skills` 在每个新任务前合并去重，向原生发现注册并刷新。同名技能优先级及插件身份由 Codex 处理。旧普通目录保存在同 home 的 `skills.legacy-*` / `plugins.legacy-*`，源缺失时保留旧内容；链接失败明确报错，不退回复制，不改全局文件（包括 BOM）。插件或 marketplaces 配置变化在新任务前更新对应配置并重启 app-server，通过原 thread 恢复；执行中追加输入保持当前任务。
 
-`package_mc.ps1` 先在临时目录构建和校验，再更新最终目录；保留包内 Codex 会话与 history、包外 history 和 OneDrive 数据，清理外链只移除链接节点。默认在最终产物校验后自动启动 MC 一次；传 `-BuildOnly` 则不启动，但仍会更新 `-DistPath` 下的 mc 目录。失败返回非零。不同聊天数据目录的安装副本可以并行运行，同目录仍共用单实例锁。
+`package_mc.ps1` 默认在源码 `.dev/build/pyinstaller` 下完成临时构建和校验，再更新最终目录；保留包内 Codex 会话与 history、包外 history 和 OneDrive 数据，清理外链只移除链接节点。默认在最终产物校验后自动启动 MC 一次；传 `-BuildOnly` 则不启动，但仍会更新 `-DistPath` 下的 mc 目录。失败返回非零。不同聊天数据目录的安装副本可以并行运行，同目录仍共用单实例锁。
 
 以后需要实际打包时，先关闭安装版 MC 及其 worker，再在源码目录的普通非管理员 PowerShell 执行以下命令；默认更新 `D:\code\cx\mc` 并在成功后自动运行：
 
@@ -39,6 +39,7 @@ Codex 隔离 home 通过整目录 symlink/Junction 复用当前用户的 `.codex
 
 聊天信息 Story 1.1–1.5 已提交；跨端 v3 执行投影、Kimi/Codex 聊天信息与 OneDrive 数据路径已有实现。2026-09-29 的云端文件只是快照；切包前核对实际安装包的数据路径，并按 docs/handoff.md 补齐之后的改动及验证。宽回归有已知基线失败，不能把定向通过称作全量通过。
 
+- 长期运行维护：docs/runtime-maintenance.md
 - 当前交接：docs/handoff.md
 - 项目文档：docs/README.md
 - 工程指令：AGENTS.md

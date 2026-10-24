@@ -48,3 +48,38 @@ def test_benchmark_upgrade_starts_without_new_indexes_or_progress(tmp_path, monk
     assert len(upgrades) == len(output["runs"]) == (1 if copied else 2)
     assert all(run["upgrade_ms"] > 0 and "not separately instrumented" in run["migration_timing_scope"] for run in output["runs"])
     assert all("pending_index_upgrade_lock_ms" not in run for run in output["runs"])
+
+
+
+@pytest.mark.parametrize("copied", [False, True])
+def test_nonexistent_pair_is_rejected_without_source_changes(tmp_path, monkeypatch, copied):
+    source = benchmark.fixture(tmp_path / "source.db", 10)
+    before = source.db_path.read_bytes()
+    args = ["benchmark_outbox.py", "--rows", "10", "--pair", "does-not-exist", "--samples", "1"]
+    if copied:
+        args += ["--source", str(source.db_path)]
+    monkeypatch.setattr(sys, "argv", args)
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+    assert source.db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("pruned", [False, True])
+def test_selected_pair_counts_are_distinct_from_whole_database_counts(tmp_path, monkeypatch, capsys, pruned):
+    source = benchmark.fixture(tmp_path / "multi-pair.db", 10)
+    source.commit_durable_fact(pair_id="other", domain="events", envelope={
+        "event_id": "other-pending", "kind": "state_changed", "chat_id": "chat", "body": {}})
+    if pruned:
+        with source._connect() as conn:
+            conn.execute("DELETE FROM publication_outbox WHERE pair_id='other'")
+    monkeypatch.setattr(sys, "argv", ["benchmark_outbox.py", "--source", str(source.db_path),
+        "--pair", "other", "--samples", "1"])
+    benchmark.main()
+    import json
+    run = json.loads(capsys.readouterr().out)["runs"][0]
+    assert run["pair"] == "other"
+    assert run["counts"] == {"outbox": 10 if pruned else 11, "facts": 11}
+    assert run["selected_pair_counts"] == {"outbox": 0 if pruned else 1, "facts": 1, "pending": 0 if pruned else 1}
+    assert run["before"]["other"]["returned_rows"] == (0 if pruned else 1)
+    assert run["after"]["other"]["returned_rows"] == (0 if pruned else 1)
