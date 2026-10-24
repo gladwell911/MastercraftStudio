@@ -13,6 +13,7 @@ def package_input_allowed(destination: str) -> bool:
     return (path.name not in {"app_state.json", "remote_machine.json"}
             and not any(part in _EXCLUDED_PARTS for part in path.parts)
             and not any(part.startswith(".codex-home-") for part in path.parts)
+            and not path.name.endswith((".db-wal", ".db-shm", ".sqlite-wal", ".sqlite-shm", ".sqlite3-wal", ".sqlite3-shm"))
             and path.suffix not in {".apk", ".aab", ".log", ".db", ".sqlite", ".sqlite3"})
 
 

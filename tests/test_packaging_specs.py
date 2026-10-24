@@ -93,7 +93,16 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     (package / "user-data.txt").write_bytes(b"keep-local")
     history = dist / "history"
     history.mkdir()
-    (history / "chat_history.db").write_bytes(b"outside-history")
+    from chat_store import ChatStore
+    preserved_store = ChatStore(history / "chat_history.db")
+    preserved_store.initialize()
+    preserved_store.upsert_chat({"id": "preserved", "title": "User history"})
+    feed_before = preserved_store.get_meta("notification_feed_id")
+    database_before = (history / "chat_history.db").read_bytes()
+    (history / "remote_machine.json").write_bytes(b'identity-and-token')
+    nats_data = history / "nats" / "jetstream" / "stream.blk"
+    nats_data.parent.mkdir(parents=True)
+    nats_data.write_bytes(b'broker-data')
     onedrive = tmp_path / "OneDrive"
     onedrive.mkdir()
     (onedrive / "notes.db").write_bytes(b"outside-notes")
@@ -124,7 +133,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         "reverse_engineering", "apktool", "jadx", "android-reverse", "jetstream", ".git", ".pytest_cache",
         "_bmad-output", ".codex-home", ".codex-home-other", "history"]
     excluded_files = ["new.apk", "new.aab", "app_state.json", "remote_machine.json", "output.log",
-        "notes.db", "cache.sqlite", "cache.sqlite3"]
+        "notes.db", "cache.sqlite", "cache.sqlite3", "chat_history.db", "chat_history.db-wal", "chat_history.db-shm"]
     artifact_paths = [base + name + "/unwanted-build-artifact" for base in ("", "_internal/nested/") for name in excluded_dirs]
     artifact_paths += [base + name for base in ("", "_internal/nested/") for name in excluded_files]
     runtime_paths = ["ZDSRAPI.dll", "ZDSRAPI_x64.dll", "_internal/python311.dll", "_internal/sound/done.wav"]
@@ -191,7 +200,11 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     assert (home / "rollout.db").read_bytes() == b"keep-session"
     assert (home / "skills" / "SKILL.md").read_bytes() == b"\xef\xbb\xbfglobal-unchanged"
     assert (bundled_history / "keep.db").read_bytes() == b"keep-old-history"
-    assert (history / "chat_history.db").read_bytes() == b"outside-history"
+    assert (history / "chat_history.db").read_bytes() == database_before
+    assert ChatStore(history / "chat_history.db").get_meta("notification_feed_id") == feed_before
+    assert ChatStore(history / "chat_history.db").load_chat("preserved")["title"] == "User history"
+    assert (history / "remote_machine.json").read_bytes() == b'identity-and-token'
+    assert nats_data.read_bytes() == b'broker-data'
     assert (onedrive / "notes.db").read_bytes() == b"outside-notes"
     assert (package / "user-data.txt").read_bytes() == b"keep-local"
     assert sentinel.read_bytes() == b"\xef\xbb\xbfglobal-unchanged"

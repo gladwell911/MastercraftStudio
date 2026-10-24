@@ -24,8 +24,10 @@ from remote_nats_protocol import (
     rpc_reply_subject,
     RPC_CAPABILITY,
     NOTIFY_CAPABILITY,
+    NOTIFY_FEED_CAPABILITY,
     NOTIFY_KINDS,
     compact_notification,
+    feed_bound_fact,
 )
 
 
@@ -282,7 +284,7 @@ class RemoteNatsTransport:
                 )
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
-                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness", RPC_CAPABILITY, NOTIFY_CAPABILITY],
+                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness", RPC_CAPABILITY, NOTIFY_CAPABILITY] + ([NOTIFY_FEED_CAPABILITY] if self.durable_store is not None else []),
                     "notification_incarnation": self.notification_incarnation,
                     "epoch": negotiated_epoch,
                     **watermark,
@@ -329,13 +331,15 @@ class RemoteNatsTransport:
         self.durable_store.reconcile_notification_finals(self.subjects.pair_id)
 
     async def _publish_response(self, event: dict, reply_subject: str) -> None:
+        if self.durable_store is not None:
+            event = {**event, "notification_feed_id": self.durable_store.get_meta("notification_feed_id")}
         if reply_subject:
             # Core publish deliberately bypasses JetStream even for large pages.
             if self._nats_client is not None:
                 encoded = encode_payload(event)
                 if len(encoded) > 128 * 1024:
                     error = build_error_response(str(event.get("request_id") or ""), 413, "RESPONSE_BUDGET_EXCEEDED")
-                    for field in ("protocol_version", "epoch", "chat_id"):
+                    for field in ("protocol_version", "epoch", "chat_id", "notification_feed_id"):
                         if field in event:
                             error[field] = event[field]
                     encoded = encode_payload(error)
@@ -348,6 +352,12 @@ class RemoteNatsTransport:
             return
 
         event = dict(payload)
+        if self.durable_store is not None:
+            if "canonical_hash" in event:
+                event = feed_bound_fact(event, pair_id=self.subjects.pair_id,
+                    notification_feed_id=self.durable_store.get_meta("notification_feed_id"))
+            else:
+                event["notification_feed_id"] = self.durable_store.get_meta("notification_feed_id")
         event_type = str(event.get("type") or "event")
         if not event.get("event_id"):
             event["event_id"] = make_event_id(event_type)
@@ -461,25 +471,29 @@ class RemoteNatsTransport:
                                 eligible = False
                         if eligible:
                             ack = await self.jetstream.publish(self.subjects.notifications,
-                                encode_payload(compact_notification(envelope, pair_id=self.subjects.pair_id)))
+                                encode_payload(compact_notification(envelope, pair_id=self.subjects.pair_id, notification_feed_id=self.durable_store.get_meta("notification_feed_id"))))
                         else:
                             ack = True
                         if envelope["kind"] == "execution_entry":
-                            hint = {"type": "execution_changed", "chat_id": envelope["chat_id"],
+                            hint = {"notification_feed_id": self.durable_store.get_meta("notification_feed_id"), "type": "execution_changed", "chat_id": envelope["chat_id"],
                                     "revision": envelope["revision"], "sync_sequence": envelope["sync_sequence"]}
                             owner_hints[envelope["chat_id"]] = hint
                         elif envelope["kind"] in {"assistant_final", "user_message"}:
                             await self._nats_client.publish(self.subjects.hints, encode_payload({
-                                "type": "history_changed", "chat_id": envelope["chat_id"],
+                                "notification_feed_id": self.durable_store.get_meta("notification_feed_id"), "type": "history_changed", "chat_id": envelope["chat_id"],
                                 "event_id": envelope["event_id"] + ":hint", "revision": envelope["revision"]}))
                         elif envelope["kind"] in {"state", "state_changed"}:
                             await self._nats_client.publish(f"zgwd.{self.subjects.pair_id}.owner-hints." + hashlib.sha256(envelope["chat_id"].encode()).hexdigest(), encode_payload({
-                                "type": "state_hint", "chat_id": envelope["chat_id"],
+                                "notification_feed_id": self.durable_store.get_meta("notification_feed_id"), "type": "state_hint", "chat_id": envelope["chat_id"],
                                 "revision": envelope["revision"], "sync_sequence": envelope["sync_sequence"]}))
                         else:
-                            await self._nats_client.publish(self.subjects.hints, raw)
+                            await self._nats_client.publish(self.subjects.hints, encode_payload(feed_bound_fact(
+                                envelope, pair_id=self.subjects.pair_id,
+                                notification_feed_id=self.durable_store.get_meta("notification_feed_id"))))
                     else:
-                        ack = await self.jetstream.publish(subject, raw)
+                        ack = await self.jetstream.publish(subject, encode_payload(feed_bound_fact(
+                            envelope, pair_id=self.subjects.pair_id,
+                            notification_feed_id=self.durable_store.get_meta("notification_feed_id"))))
                     if ack is None and type(self.jetstream).__module__.startswith("nats"):
                         raise RuntimeError("missing_publish_ack")
                     self.durable_store.mark_outbox_acked(row["sync_sequence"], consumer_id=f"publisher:{row['pair_id']}", **identity)
@@ -600,7 +614,8 @@ class RemoteNatsTransport:
                         "has_more": not snapshot["done"], "next_cursor": snapshot["cursor"],
                         "chats": [{"chat_id": state["chat_id"], "read_state": state} for state in snapshot["records"]]}
                 scope = dict(pair_id=self.subjects.pair_id, device_id=str(payload.get("device_id") or ""),
-                             incarnation=str(body.get("incarnation") or ""), secret=self.token)
+                             incarnation=str(body.get("incarnation") or ""), secret=self.token,
+                             notification_feed_id=str(body.get("notification_feed_id") or ""))
                 if scope["incarnation"] != self.notification_incarnation:
                     raise ValueError("STALE_NOTIFICATION_INCARNATION")
                 if command_type == "notification_sync_complete":
@@ -619,6 +634,8 @@ class RemoteNatsTransport:
                 if command_type == "chat_read_state":
                     state = self.durable_store.get_chat_read_state(owner, pair_id=self.subjects.pair_id)
                 else:
+                    if "notification_feed_id" in body and body["notification_feed_id"] != self.durable_store.get_meta("notification_feed_id"):
+                        raise ValueError("STALE_NOTIFICATION_FEED")
                     state = self.durable_store.mark_chat_read(pair_id=self.subjects.pair_id, chat_id=owner,
                         generation=body.get("generation"), message_id=body.get("message_id"),
                         answer_seq=body.get("answer_seq"), operation_id=body.get("operation_id"))

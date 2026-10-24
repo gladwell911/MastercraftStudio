@@ -247,6 +247,10 @@ class ChatStore:
                 """
             )
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('notification_feed_id',?)", (uuid.uuid4().hex,))
+            conn.execute("CREATE TABLE IF NOT EXISTS notification_feed_devices (pair_id TEXT NOT NULL, device_id TEXT NOT NULL, feed_id TEXT NOT NULL, baseline INTEGER NOT NULL, processed_sequence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(pair_id,device_id,feed_id))")
+            if "feed_id" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
+                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN feed_id TEXT NOT NULL DEFAULT ''")
             if conn.execute("SELECT 1 FROM meta WHERE key='publication_progress_initialized'").fetchone() is None:
                 for scope in conn.execute("SELECT DISTINCT pair_id,domain FROM publication_outbox").fetchall():
                     self._advance_publication_progress(conn, scope["pair_id"], scope["domain"])
@@ -881,6 +885,7 @@ class ChatStore:
             ).fetchone()
             authority = int(conn.execute("SELECT revision FROM authority_cache_revision WHERE singleton=1").fetchone()[0])
         return {
+            "notification_feed_id": self.get_meta("notification_feed_id"),
             "authority_high_sync_sequence": authority,
             "sequence_domain": normalized_domain,
             "high_sync_sequence": int(row["sync_sequence"]) if row else 0,
@@ -1035,7 +1040,7 @@ class ChatStore:
 
     def notification_sync(
         self, *, pair_id: str, device_id: str, baseline: int, incarnation: str,
-        secret: str, cursor: str = "", limit: int = 100, read_only: bool = False,
+        secret: str, cursor: str = "", limit: int = 100, read_only: bool = False, notification_feed_id: str = "",
     ) -> dict[str, Any]:
         """Materialize authority at business H; delivery is never a read receipt.
 
@@ -1047,6 +1052,9 @@ class ChatStore:
         pair, device = str(pair_id).strip(), str(device_id).strip()
         if not pair or not device or not incarnation or isinstance(baseline, bool) or not 0 <= int(baseline) <= MAX_INT64:
             raise ValueError("INVALID_NOTIFICATION_SCOPE")
+        feed = str(notification_feed_id)
+        if feed and feed != self.get_meta("notification_feed_id"):
+            raise ValueError("STALE_NOTIFICATION_FEED")
         page_limit = max(1, min(100, int(limit)))
         with self._connect() as conn:
             if "authority_high" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
@@ -1060,8 +1068,14 @@ class ChatStore:
             expired = "SELECT snapshot_id FROM notification_snapshots WHERE created_at<? OR snapshot_id NOT IN (SELECT snapshot_id FROM notification_snapshots ORDER BY created_at DESC,rowid DESC LIMIT 32)"
             conn.execute("DELETE FROM notification_snapshot_rows WHERE snapshot_id IN (" + expired + ")", (time.time() - 86400,))
             conn.execute("DELETE FROM notification_snapshots WHERE snapshot_id IN (" + expired + ")", (time.time() - 86400,))
-            fresh = conn.execute("INSERT OR IGNORE INTO notification_devices(pair_id,device_id,baseline) VALUES(?,?,?)", (pair, device, int(baseline))).rowcount > 0
-            installation = conn.execute("SELECT * FROM notification_devices WHERE pair_id=? AND device_id=?", (pair, device)).fetchone()
+            if feed:
+                # The authoritative hello baseline replaces unscoped legacy progress.
+                # Never infer a reset from a smaller sequence on the same feed.
+                conn.execute("INSERT OR IGNORE INTO notification_feed_devices(pair_id,device_id,feed_id,baseline) VALUES(?,?,?,?)", (pair, device, feed, int(baseline)))
+                installation = conn.execute("SELECT * FROM notification_feed_devices WHERE pair_id=? AND device_id=? AND feed_id=?", (pair, device, feed)).fetchone()
+            else:
+                conn.execute("INSERT OR IGNORE INTO notification_devices(pair_id,device_id,baseline) VALUES(?,?,?)", (pair, device, int(baseline)))
+                installation = conn.execute("SELECT * FROM notification_devices WHERE pair_id=? AND device_id=?", (pair, device)).fetchone()
             original_baseline = int(installation["baseline"])
             processed_floor = max(original_baseline, int(installation["processed_sequence"]))
             conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) SELECT id,lower(hex(randomblob(16))) FROM chats")
@@ -1077,11 +1091,11 @@ class ChatStore:
                 source.execute("BEGIN")
                 high_water = int(source.execute("SELECT COALESCE(MAX(sync_sequence),0) FROM durable_facts WHERE pair_id=?", (pair,)).fetchone()[0])
                 authority_high = int(source.execute("SELECT revision FROM authority_cache_revision WHERE singleton=1").fetchone()[0])
-                reusable = source.execute("SELECT * FROM notification_snapshots WHERE pair_id=? AND device_id=? AND incarnation=? AND ((?=1 AND authority_high=?) OR (?=0 AND high_water=?)) AND read_only=? AND row_count>=0 AND (?=1 OR (completed=0 AND processed_floor=?)) ORDER BY created_at DESC LIMIT 1", (pair, device, incarnation, int(read_only), authority_high, int(read_only), high_water, int(read_only), int(read_only), processed_floor)).fetchone()
+                reusable = source.execute("SELECT * FROM notification_snapshots WHERE pair_id=? AND device_id=? AND incarnation=? AND feed_id=? AND ((?=1 AND authority_high=?) OR (?=0 AND high_water=?)) AND read_only=? AND row_count>=0 AND (?=1 OR (completed=0 AND processed_floor=?)) ORDER BY created_at DESC LIMIT 1", (pair, device, incarnation, feed, int(read_only), authority_high, int(read_only), high_water, int(read_only), int(read_only), processed_floor)).fetchone()
                 snapshot_id, offset = (str(reusable["snapshot_id"]) if reusable else uuid.uuid4().hex), 0
                 if reusable is None:
                     with self._connect() as writer:
-                        writer.execute("INSERT INTO notification_snapshots(snapshot_id,pair_id,device_id,high_water,incarnation,row_count,read_only,processed_floor,authority_high) VALUES(?,?,?,?,?,-1,?,?,?)", (snapshot_id, pair, device, high_water, incarnation, int(read_only), processed_floor, authority_high))
+                        writer.execute("INSERT INTO notification_snapshots(snapshot_id,pair_id,device_id,high_water,incarnation,row_count,read_only,processed_floor,authority_high,feed_id) VALUES(?,?,?,?,?,-1,?,?,?,?)", (snapshot_id, pair, device, high_water, incarnation, int(read_only), processed_floor, authority_high, feed))
                     def records():
                         placeholders = ",".join("?" for _ in NOTIFY_KINDS)
                         if not read_only:
@@ -1092,7 +1106,7 @@ class ChatStore:
                                 if not exists or (fact["kind"] in {"assistant_final", "action_required", "failed"} and (current is None or fact["body"].get("generation") != current[0])):
                                     yield {"type": "notification_tombstone", "event_id": fact["event_id"], "chat_id": fact["chat_id"], "sync_sequence": fact["sync_sequence"]}
                                 else:
-                                    yield compact_notification(fact, pair_id=pair)
+                                    yield compact_notification(fact, pair_id=pair, notification_feed_id=feed)
                         for row in source.execute("SELECT id FROM chats ORDER BY id"):
                             yield {"type": "read_state", **self._read_state_conn(source, row[0], pair)}
                     batch, count = [], 0
@@ -1108,10 +1122,12 @@ class ChatStore:
                         writer.execute("UPDATE notification_snapshots SET row_count=? WHERE snapshot_id=?", (count, snapshot_id))
         with self._connect() as conn:
             snapshot = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=?", (snapshot_id, pair, device)).fetchone()
-            if (snapshot is None or snapshot["incarnation"] != incarnation or isinstance(offset, bool)
+            if (snapshot is None or snapshot["incarnation"] != incarnation or snapshot["feed_id"] != feed or isinstance(offset, bool)
                     or not isinstance(offset, int) or not 0 <= offset <= snapshot["row_count"]):
                 raise ValueError("INVALID_NOTIFICATION_CURSOR")
             result = {"snapshot_id": snapshot_id, "high_water": int(snapshot["high_water"]), "incarnation": incarnation, "baseline": original_baseline, "records": []}
+            if feed:
+                result["notification_feed_id"] = feed
             # Reserve continuation/envelope overhead; UTF-8 byte accounting is the
             # actual serialized payload, not a character estimate.
             budget = 60 * 1024
@@ -1133,14 +1149,19 @@ class ChatStore:
                 conn.execute("UPDATE notification_snapshots SET completed=1 WHERE snapshot_id=?", (snapshot_id,))
             return result
 
-    def complete_notification_sync(self, *, pair_id: str, device_id: str, incarnation: str, completion_token: str, secret: str) -> int:
+    def complete_notification_sync(self, *, pair_id: str, device_id: str, incarnation: str, completion_token: str, secret: str, notification_feed_id: str = "") -> int:
+        if notification_feed_id and notification_feed_id != self.get_meta("notification_feed_id"):
+            raise ValueError("STALE_NOTIFICATION_FEED")
         receipt = self._decode_execution_cursor(completion_token, secret)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=? AND incarnation=?", (receipt.get("snapshot_id"), pair_id, device_id, incarnation)).fetchone()
-            if row is None or receipt.get("offset") != row["row_count"] or row["delivered_count"] != row["row_count"]:
+            if row is None or row["feed_id"] != notification_feed_id or receipt.get("offset") != row["row_count"] or row["delivered_count"] != row["row_count"]:
                 raise ValueError("INCOMPLETE_NOTIFICATION_SNAPSHOT")
-            conn.execute("UPDATE notification_devices SET processed_sequence=MAX(processed_sequence,?) WHERE pair_id=? AND device_id=?", (row["high_water"], pair_id, device_id))
+            if notification_feed_id:
+                conn.execute("UPDATE notification_feed_devices SET processed_sequence=MAX(processed_sequence,?) WHERE pair_id=? AND device_id=? AND feed_id=?", (row["high_water"], pair_id, device_id, notification_feed_id))
+            else:
+                conn.execute("UPDATE notification_devices SET processed_sequence=MAX(processed_sequence,?) WHERE pair_id=? AND device_id=?", (row["high_water"], pair_id, device_id))
             conn.execute("UPDATE notification_snapshots SET completed=1 WHERE snapshot_id=?", (row["snapshot_id"],))
             return int(row["high_water"])
 
@@ -1877,7 +1898,7 @@ class ChatStore:
             return
         row = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
         revision = int(row[0]) + 1 if row else 1
-        pairs = conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM v2_feed_state WHERE domain='__pair__'").fetchall()
+        pairs = conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM notification_feed_devices UNION SELECT pair_id FROM v2_feed_state WHERE domain='__pair__'").fetchall()
         for pair in pairs:
             self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
                 revision, "deleted", kind="chat_deleted")
@@ -1981,7 +2002,7 @@ class ChatStore:
                 conn.execute("INSERT OR IGNORE INTO read_generations(chat_id,generation) VALUES(?,?)", (chat_id, uuid.uuid4().hex))
                 conn.execute("INSERT OR IGNORE INTO readable_answers(message_id,chat_id,generation) SELECT m.message_id,m.chat_id,g.generation FROM canonical_messages m JOIN read_generations g ON g.chat_id=m.chat_id WHERE m.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id, start + offset))
 
-        for pair in conn.execute("SELECT DISTINCT pair_id FROM notification_devices").fetchall():
+        for pair in conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM notification_feed_devices").fetchall():
             self._reconcile_notification_finals_conn(conn, pair[0], chat_id)
 
     def count_turns(self, chat_id: str) -> int:

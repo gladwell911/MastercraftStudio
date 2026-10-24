@@ -268,3 +268,62 @@ def test_wal_snapshot_materialization_allows_writer_and_preserves_original_autho
     states = {row["chat_id"]: row for row in following["records"]}
     assert "created-after-H" in states
     assert states["chat"]["read_seq"] == target["answer_seq"]
+
+
+def test_database_feed_is_persistent_and_new_database_gets_distinct_scope(store, tmp_path):
+    feed = store.get_meta("notification_feed_id")
+    assert feed
+    store.initialize()
+    reopened = ChatStore(store.db_path)
+    reopened.initialize()
+    assert reopened.paired_feed_high_water(pair_id="pair")["notification_feed_id"] == feed
+    other = ChatStore(tmp_path / "other.db")
+    other.initialize()
+    assert other.get_meta("notification_feed_id") != feed
+
+
+def test_feed_upgrade_preserves_legacy_progress_and_recovers_next_final_once(store):
+    legacy = store.notification_sync(pair_id="pair", device_id="install", baseline=186475,
+                                     incarnation="broker", secret="secret")
+    feed = store.get_meta("notification_feed_id")
+    scoped = dict(pair_id="pair", device_id="install", incarnation="broker", secret="secret", notification_feed_id=feed)
+    current = store.notification_sync(**scoped, baseline=8)
+    assert current["baseline"] == 8
+    assert not any(r.get("kind") == "assistant_final" for r in current["records"])
+    turns = store.load_turns("chat")
+    turns.append({"question": "new", "answer_md": "new final", "request_status": "done"})
+    store.replace_turns("chat", turns)
+    recovered = store.notification_sync(**scoped, baseline=999999)
+    notifications = [r for r in recovered["records"] if r.get("kind") == "assistant_final"]
+    assert len(notifications) == 1
+    assert notifications[0]["notification_feed_id"] == feed
+    validate_v2_durable(notifications[0])
+    store.complete_notification_sync(**scoped, completion_token=recovered["completion_token"])
+    assert not any(r.get("kind") == "assistant_final" for r in store.notification_sync(**scoped, baseline=0)["records"])
+    assert store.notification_sync(pair_id="pair", device_id="install", baseline=0,
+                                  incarnation="new-broker", secret="secret")["baseline"] == 186475
+    # A broker rebuild restarts paging, never the database baseline.
+    assert store.notification_sync(**{**scoped, "incarnation": "new-broker"}, baseline=20)["baseline"] == 8
+    with pytest.raises(ValueError, match="INCOMPLETE_NOTIFICATION_SNAPSHOT"):
+        store.complete_notification_sync(pair_id="pair", device_id="install", incarnation="broker",
+            secret="secret", completion_token=recovered["completion_token"])
+    with pytest.raises(ValueError, match="STALE_NOTIFICATION_FEED"):
+        store.notification_sync(**{**scoped, "notification_feed_id": "retired"}, baseline=0)
+    with pytest.raises(ValueError, match="STALE_NOTIFICATION_FEED"):
+        store.complete_notification_sync(**{**scoped, "notification_feed_id": "retired"}, completion_token=recovered["completion_token"])
+    assert store.notification_sync(pair_id="laptop", device_id="install", baseline=42,
+        incarnation="broker", secret="secret", notification_feed_id=feed)["baseline"] == 42
+
+
+def test_feed_only_installation_final_is_durable_before_next_recovery_pull(store):
+    feed = store.get_meta("notification_feed_id")
+    store.notification_sync(pair_id="pair", device_id="scoped-only", baseline=8,
+                            incarnation="broker", secret="secret", notification_feed_id=feed)
+    before = {row["event_id"]: row["payload"] for row in store.pending_outbox(pair_id="pair")}
+    turns = store.load_turns("chat")
+    turns.append({"question": "live", "answer_md": "new final", "request_status": "done"})
+    store.replace_turns("chat", turns)
+    after = store.pending_outbox(pair_id="pair")
+    assert len(after) == len(before) + 1
+    assert all(row["payload"] == before[row["event_id"]] for row in after if row["event_id"] in before)
+    assert all("notification_feed_id" not in json.loads(row["payload"]) for row in after)

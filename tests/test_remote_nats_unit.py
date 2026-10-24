@@ -674,6 +674,8 @@ def test_mobile_shaped_hello_negotiates_per_session_and_v2_errors_echo_epoch(tmp
         hello = __import__("json").loads(jetstream.published[-1][1])
         assert hello["body"]["protocol_version"] == 2
         assert "lightweight-readiness" in hello["body"]["capabilities"]
+        assert "notification-feed-v1" in hello["body"]["capabilities"]
+        assert hello["notification_feed_id"] == hello["body"]["notification_feed_id"] == store.get_meta("notification_feed_id")
         assert hello["body"]["sequence_domain"] == "events"
         assert hello["body"]["high_sync_sequence"] == 0
         epoch = hello["body"]["epoch"]
@@ -995,3 +997,97 @@ def test_notification_arriving_during_maintenance_is_drained_before_workers_exit
     asyncio.run(run())
     import json
     assert [json.loads(payload)["event_id"] for _, payload in broker.published] == ["new-final"]
+
+
+def test_full_canonical_delivery_is_feed_hashed_without_changing_stored_fact(tmp_path):
+    import json
+    from remote_nats_protocol import canonical_durable_hash, validate_v2_durable
+
+    async def run():
+        for live in (False, True):
+            store = ChatStore(tmp_path / f"wire-{live}.db")
+            store.initialize()
+            fact = store.commit_durable_fact(pair_id="default", domain="events", envelope={
+                "event_id": "retained-clear", "kind": "clear_context", "chat_id": "chat", "body": {"generation": "g"}})
+            original = store.pending_outbox()[0]["payload"]
+            broker = FakeJetStream()
+            transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=broker, durable_store=store)
+            if live:
+                transport._nats_client = broker
+            await transport.drain_outbox()
+            await asyncio.gather(*transport._outbox_tasks.values())
+            subject, raw = next((subject, raw) for subject, raw in broker.published
+                                if subject == (transport.subjects.hints if live else transport.subjects.events))
+            wire = json.loads(raw)
+            assert wire["notification_feed_id"] == store.get_meta("notification_feed_id")
+            assert wire["fact_hash"] == fact["canonical_hash"]
+            assert wire["canonical_hash"] == canonical_durable_hash(wire)
+            assert wire["body"] == fact["body"]
+            validate_v2_durable(wire)
+            import pytest
+            with pytest.raises(ValueError, match="CANONICAL_HASH_MISMATCH"):
+                validate_v2_durable({**wire, "notification_feed_id": "retired-feed"})
+            with store._connect() as conn:
+                assert conn.execute("SELECT payload FROM publication_outbox WHERE event_id='retained-clear'").fetchone()[0] == original
+            assert "notification_feed_id" not in json.loads(original)
+    asyncio.run(run())
+
+
+def test_actual_transport_feed_sync_and_read_write_authority(tmp_path):
+    async def run():
+        import json
+        store = ChatStore(tmp_path / "feed-wire.db")
+        store.initialize()
+        store.upsert_chat({"id": "chat", "title": "Feed"})
+        store.replace_turns("chat", [{"question": "old", "answer_md": "old answer", "request_status": "done"}])
+        store.notification_sync(pair_id="default", device_id="mobile", baseline=186475,
+                                incarnation="old", secret="secret")
+        with store._connect() as conn:
+            conn.execute("UPDATE v2_feed_state SET sync_sequence=8140 WHERE pair_id='default' AND domain='__pair__'")
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
+        transport.notification_incarnation = "broker-created"
+        await transport.handle_command({"id": "hello", "type": "hello", "device_id": "mobile",
+            "session_id": "session", "protocol_versions": [2, 1],
+            "body": {"session_id": "session", "protocol_versions": [2, 1]}})
+        hello = json.loads(jetstream.published[-1][1])["body"]
+        feed, epoch = hello["notification_feed_id"], hello["epoch"]
+        assert "notification-feed-v1" in hello["capabilities"]
+        assert hello["high_sync_sequence"] == 8140
+        async def rpc(kind, body):
+            await transport.handle_command({"id": kind, "request_id": kind, "type": kind,
+                "device_id": "mobile", "session_id": "session", "protocol_version": 2,
+                "epoch": epoch, "chat_id": "chat", "body": body})
+            return json.loads(jetstream.published[-1][1])["body"]
+        scope = {"incarnation": transport.notification_incarnation, "notification_feed_id": feed}
+        first = await rpc("notification_sync", {**scope, "baseline": 8140})
+        assert first.get("notification_feed_id") == feed and first["baseline"] == 8140, first
+        assert not any(r.get("kind") == "assistant_final" for r in first["records"])
+        store.replace_turns("chat", [{"question": "old", "answer_md": "old answer", "request_status": "done"},
+                                     {"question": "new", "answer_md": "new answer", "request_status": "done"}])
+        recovered = await rpc("notification_sync", {**scope, "baseline": 186475})
+        finals = [r for r in recovered["records"] if r.get("kind") == "assistant_final"]
+        assert len(finals) == 1 and finals[0]["notification_feed_id"] == feed
+        receipt = recovered["completion_token"]
+        stale = await rpc("notification_sync_complete", {**scope, "notification_feed_id": "retired", "completion_token": receipt})
+        assert stale["error"] == "STALE_NOTIFICATION_FEED"
+        completed = await rpc("notification_sync_complete", {**scope, "completion_token": receipt})
+        assert completed["processed_sequence"] == recovered["high_water"]
+        with store._connect() as conn:
+            row = conn.execute("SELECT baseline,processed_sequence FROM notification_feed_devices WHERE pair_id='default' AND device_id='mobile' AND feed_id=?", (feed,)).fetchone()
+            assert tuple(row) == (8140, recovered["high_water"])
+        replay = await rpc("notification_sync", {**scope, "baseline": 0})
+        assert not any(r.get("kind") == "assistant_final" for r in replay["records"])
+        bad_receipt = await rpc("notification_sync_complete", {**scope, "completion_token": receipt + "tampered"})
+        assert "error" in bad_receipt
+        target = store.readable_answer("chat", turn_index=1)
+        before = store.get_chat_read_state("chat", pair_id="default")
+        rejected = await rpc("mark_chat_read", {**target, "notification_feed_id": "retired", "operation_id": "stale"})
+        assert rejected["error"] == "STALE_NOTIFICATION_FEED"
+        assert store.get_chat_read_state("chat", pair_id="default") == before
+        accepted = await rpc("mark_chat_read", {**target, "notification_feed_id": feed, "operation_id": "current"})
+        assert accepted["accepted"] and accepted["read_state"]["read_seq"] == target["answer_seq"]
+        legacy = await rpc("mark_chat_read", {**target, "operation_id": "legacy"})
+        assert legacy["accepted"]
+        await transport._close_async()
+    asyncio.run(run())

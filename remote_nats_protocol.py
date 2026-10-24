@@ -13,10 +13,11 @@ PROTOCOL_V2 = 2
 MAX_SIGNED_64 = (1 << 63) - 1
 RPC_CAPABILITY = "rpc-inbox-v1"
 NOTIFY_CAPABILITY = "notification-sync-v1"
+NOTIFY_FEED_CAPABILITY = "notification-feed-v1"
 NOTIFY_KINDS = frozenset({"assistant_final", "chat_read_changed", "clear_context", "chat_deleted", "action_required", "failed"})
 
 
-def compact_notification(fact: dict, *, pair_id: str) -> dict:
+def compact_notification(fact: dict, *, pair_id: str, notification_feed_id: str = "") -> dict:
     """A wire projection has its own hash; never alter an immutable fact."""
     validate_v2_durable(fact)
     if fact["kind"] not in NOTIFY_KINDS:
@@ -36,9 +37,23 @@ def compact_notification(fact: dict, *, pair_id: str) -> dict:
     )}
     wire.update({"pair_id": normalize_pair_id(pair_id), "projection_version": 1,
                  "fact_hash": fact["canonical_hash"], "body": projected})
+    if notification_feed_id:
+        wire["notification_feed_id"] = notification_feed_id
     wire["canonical_hash"] = canonical_durable_hash(wire)
     if len(encode_payload(wire)) > 2048:
         raise ValueError("NOTIFICATION_METADATA_TOO_LARGE")
+    return wire
+
+
+def feed_bound_fact(fact: dict, *, pair_id: str, notification_feed_id: str) -> dict:
+    """Bind a full transport projection without changing the canonical stored fact."""
+    validate_v2_durable(fact)
+    if not isinstance(notification_feed_id, str) or not notification_feed_id.strip():
+        raise ValueError("INVALID_NOTIFICATION_FEED")
+    wire = dict(fact)
+    wire.update(pair_id=normalize_pair_id(pair_id), projection_version=1,
+                fact_hash=fact["canonical_hash"], notification_feed_id=notification_feed_id)
+    wire["canonical_hash"] = canonical_durable_hash(wire)
     return wire
 
 
