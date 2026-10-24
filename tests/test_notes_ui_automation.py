@@ -1,8 +1,83 @@
 import ctypes
+import json
 import time
 
 import main
+import pytest
 import wx
+
+
+@pytest.fixture(autouse=True)
+def notes_timer_registry(monkeypatch):
+    handles = []
+    actual_call_later = main.wx_call_later_if_alive
+
+    def registered_call_later(*args, **kwargs):
+        handle = actual_call_later(*args, **kwargs)
+        if isinstance(handle, wx.CallLater):
+            handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(main, "wx_call_later_if_alive", registered_call_later)
+    yield handles
+    for handle in handles:
+        handle.Stop()
+
+
+@pytest.fixture(autouse=True)
+def stop_notes_frame_timers(notes_timer_registry, existing_notes_state, frame):
+    yield
+    frame._closing = True
+    for handle in notes_timer_registry:
+        handle.Stop()
+    for value in vars(frame).values():
+        if isinstance(value, wx.Timer):
+            value.Stop()
+
+
+@pytest.fixture
+def existing_notes_state(request, tmp_path):
+    if not hasattr(request, "param"):
+        return None
+    store = main.NotesStore(tmp_path / "notes" / "notes.db", device_id="startup-test")
+    store.initialize()
+    store.create_notebook("other startup notebook")
+    notebook = store.create_notebook("saved startup notebook")
+    store.create_entry(notebook.id, "other startup entry", source="manual")
+    entry = store.create_entry(notebook.id, "saved startup entry", source="manual")
+    state_path = tmp_path / main.APP_STATE_FILE
+    if request.param == "corrupt":
+        state_path.write_text("{broken json", encoding="utf-8")
+    elif request.param == "valid":
+        state_path.write_text(json.dumps({
+            "codex_approval_defaults_version": 1,
+            "notes_ui_state": {
+                "active_root_tab": "notes",
+                "notes_view": "note_detail",
+                "active_notebook_id": notebook.id,
+                "active_entry_id": entry.id,
+            },
+        }), encoding="utf-8")
+    return request.param, notebook, entry
+
+
+@pytest.mark.parametrize("existing_notes_state", ["missing", "corrupt", "valid"], indirect=True)
+def test_notes_ui_automation_initial_population(existing_notes_state, frame):
+    state_kind, notebook, entry = existing_notes_state
+    assert notebook.id in frame._notes_notebook_ids
+    assert any("saved startup notebook" in label for label in frame.notes_notebook_list.GetStrings())
+    if state_kind == "valid":
+        assert frame.notes_controller.notes_view == "note_detail"
+        assert frame.notes_controller.active_notebook_id == notebook.id
+        assert frame.notes_controller.active_entry_id == entry.id
+        assert frame._notes_notebook_ids[frame.notes_notebook_list.GetSelection()] == notebook.id
+        assert frame._notes_entry_ids[frame.notes_entry_list.GetSelection()] == entry.id
+        assert any("saved startup entry" in label for label in frame.notes_entry_list.GetStrings())
+        assert frame.notes_detail_panel.IsShown()
+        assert not frame.notes_list_panel.IsShown()
+    else:
+        assert frame.notes_controller.notes_view == "notes_list"
+        assert frame.notes_list_panel.IsShown()
 
 
 def _send_listbox_key(window, key_code):

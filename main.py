@@ -2210,6 +2210,8 @@ class ChatFrame(wx.Frame):
         self._migrate_legacy_state_if_needed()
         self._migrate_legacy_chat_json_if_needed()
         self._load_state()
+        self.notes_controller.restore_state(self._current_notes_state)
+        self._notes_refresh_ui()
         self._pending_clear_recoveries = self.chat_store.recoverable_clear_operations()
         self._realtime_call.update_settings(
             RealtimeCallSettings(role=self.realtime_call_role, speech_rate=self.realtime_call_speech_rate)
@@ -4610,9 +4612,6 @@ class ChatFrame(wx.Frame):
         self._rebuild_kimi_runtime_state()
         if self._kimi_pending_owners() and self._kimi_client is None:
             self._recover_kimi_pending_owners()
-        if hasattr(self, "notes_controller"):
-            self.notes_controller.restore_state(self._current_notes_state)
-            self._notes_refresh_ui()
         self._sort_archived_chats()
         if changed:
             self._defer_chat_state_save()
