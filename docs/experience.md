@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 通知流部署核实
+
+- 源码、构建文件、安装进程和数据库身份分别核对。可从实际 PyInstaller PYZ 检查 capability/表实现；再比对手机协商的 feed 与运行库 meta。更晚的构建时间不证明包含某提交，较低序列也不证明应重置身份。
+- 诊断按同一事件拆分 durable/outbox、received/ACK、gate、NotificationManager posted 与系统可见；terminal 在 gate 前 ACK，不能把它报告为已经通知。正常已读取消也不应当作投递失败。
+- 独立 frozen MC 的父目录决定 history 和单实例键；测试 OneDrive、token、显式 NATS TCP 端口均隔离，并启动后核 WebSocket 实际监听 owner。清理只按自有 PID 与完整路径，不按进程名。
+
 ## 有界维护与验证
 
 - 双范围过滤可能在任一索引上留下线性残余扫描。先在安全前沿内按索引取有界候选，再筛年龄，并用实际入口的VM步数验证十倍数据增长；同时测近期零候选和旧记录低前沿，不把LIMIT本身当证明。

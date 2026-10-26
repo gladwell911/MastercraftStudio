@@ -1,26 +1,8 @@
 # 文档索引
 
-2026-10-24：长期运行性能与产物治理、7项新dog审查补丁已验证；源码完成不等于运行EXE已更新。最新状态见[交接](handoff.md)，数据/日志/构建规则和基准命令见[长期运行维护](runtime-maintenance.md)。台式机TLS、恢复期发送错误及前台延迟仍待修。
+2026-10-26：日常 MC 与 RC 的通知流部署及握手已核实；旧基线拦截修复已进入安装包。后台/锁屏独立实体测试与日常日志证据分别记录在 [交接](handoff.md)。长期维护、旧 TLS/发送/详情延迟及完整验收的限制保持。
 
-这个目录只保留当前仍有维护价值、并且适合在日常开发时直接阅读的文档。
-
-## 当前有效
-
-2026-10-18：可携带浏览器入口和默认自动审查迁移已实现，用户技能根与随包技能根共同发现。最终隔离包同 target 续验已验证真实前台；全新 profile 首启、正式 MC GUI 与另一台电脑仍待验。使用方法见[项目入口](../README.txt)，实现与验证边界见[当前交接](handoff.md)和[仓库内实施记录](../_bmad-output/implementation-artifacts/plan-portable-browser-open.md)。
-
-2026-10-17：CX 正式笔记本入口与实体手机已恢复，认证、列表和重开自动连接通过；CZ 临时入口仅为历史测试。升级和跨目录配置边界见[远程配置](remote-control.md)，当前验证范围见[交接](handoff.md)。以下日期均为历史版本证据。
-
-2026-10-12：主分支已包含轻量 readiness 协议、机器配置端口校验和并发原子持久化。辅助分支提交均已整合；本轮仅验证和同步源码，未打包或重启日常 MC。最新状态见[交接](handoff.md)。
-
-2026-10-09：双电脑远程身份及手机三标签已部署，笔记本独立隧道和实体手机双公网各一次真实问答通过；来源过滤和单侧已读清零实测通过。此前 MC 83 项、RC 定向和原生测试及双 broker Local 的结果仍对应各自版本。文件下载、单机断连、锁屏通知点击及 TalkBack 尚待验。详见[双电脑配置](remote-control.md)和[当前交接](handoff.md)。旧完整桌面验收停止状态保持。
-
-2026-10-07：Kimi 系统注入不再截断当前 prompt 的回答、思考及恢复范围；统一按结构化 origin 判断边界，272 项定向测试通过。BMAD 旧模板兼容修复另有 5 项通过。源码修复与现场安装版分开核对：本轮未重新打包，也未恢复旧失败记录。详情见[当前交接](handoff.md)与[注入边界修复规格](../_bmad-output/implementation-artifacts/spec-fix-kimi-injected-message-boundaries.md)。
-
-2026-10-06 当前状态见[交接](handoff.md)：Kimi 无消息 ID 的公开思考流已适配真实 step 生命周期，执行页及时显示原文摘录与全文；REST 补齐同一条目，工具前普通说明作为 commentary 保留。当前实施记录为 `D:/code/sj/_bmad-output/implementation-artifacts/plan-kimi-thinking-progress.md`。跨设备已读、通知范围清理及 Ctrl+Shift+X 已实现；完整矩阵与中文听验未完成，用户已停止完整桌面验收。2026-10-04 F1、Kimi 恢复与活动排序成果仍保留，对应历史报告只证明当时版本。
-
-Codex 通过整目录链接复用全局技能，在新任务前刷新原生清单；打包成功并校验最终产物后自动启动一次。三个定向文件独立验证 122 项通过，原生非模型探针确认技能/插件发现与刷新；此次未实际打包或更新安装版。方案及阶段验证见[全局技能与打包后启动实施记录](../_bmad-output/implementation-artifacts/plan-global-skills-package-start.md)，使用方法见[项目入口](../README.txt)。
-
-既有通知、回答时间与执行语义的[独立报告](../_bmad-output/implementation-artifacts/verify-notification-routing-answer-time-accessibility.md)、Codex 审批[实施记录](../_bmad-output/implementation-artifacts/plan-codex-command-approval.md)保留，仅证明相应版本。
+## 当前入口
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明

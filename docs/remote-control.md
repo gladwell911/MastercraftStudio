@@ -1,6 +1,6 @@
 # 双电脑远程身份配置
 
-2026-10-19：台式机default已用external接入wss://mc-desktop-test.tingyou.cc:8443/nats，frpc转日常18080，旧CF保留；实体RC无编译覆盖、按私有持久配置接入。TLS/恢复期发送错误及前台延迟待修，见[交接](handoff.md)。下方双CF部署/私有编译方式是历史或可选方案，不代表当前台式机。
+2026-10-26：日常台式机 default 已由用户重包，实体 RC 使用正式双来源编译配置并保数据覆盖安装；双方 notification-feed-v1 身份与日常数据库一致。旧的“RC 无 startup override”是 2026-10-19 版本状态，不能用于当前包。台式机继续使用既有 external/frp/Caddy 入口；笔记本未在本轮重部署。当前验收和限制见 [交接](handoff.md)。
 
 ## 当前认证与升级要求（2026-10-17）
 

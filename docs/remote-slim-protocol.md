@@ -14,6 +14,8 @@ Production uses separate `mc` and `mobile` users. The mobile password is the pai
 
 ## Recovery and migration
 
+Capable peers negotiate `notification-feed-v1` and the database UUID `notification_feed_id`. Baselines and recovery checkpoints are scoped to pair/feed/domain/connection scope. A changed database UUID establishes a new authority baseline without clearing canonical posted/terminal/read deduplication. Broker incarnation changes only paging; a lower sequence on the same feed never proves replacement. A restored backup with the same UUID cannot be identified automatically. Previously terminal events do not become new notifications after upgrade. See [the current deployment](handoff.md) for installed evidence and remaining acceptance.
+
 Android retains its installation baseline and posted ledger. It establishes current read/delete authority, then processes authoritative notification snapshots through the existing actor and ledger before pulling the new live consumer. Deliver-new is only an overlap mechanism; it does not replace offline recovery.
 
 SQLite snapshots bind installation, pair, stream incarnation and business high-water H. Pages contain at most 100 metadata records and stay within the response budget. Background recovery throttles pages. Canonical final/outbox gaps are reconciled, and clear/delete authority suppresses stale generations. Each page persists migration phase and cursor. Only an explicit receipt after all records are processed advances the device checkpoint. Device processing and shared read cursors remain separate.

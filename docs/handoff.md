@@ -1,50 +1,36 @@
 # 当前交接
 
-更新日期：2026-10-24。源码仓库 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本阶段完成长期运行性能与产物治理，以及新dog审查提出的7项补丁。此前提交为 `5ec2500`（笔记初始化）和 `21fa568`（性能治理）；本次neat-freak收尾范围包含剩余补丁与文档；最终哈希和推送结果以Git实测为准。
+更新日期：2026-10-26。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。本阶段目标是恢复手机系统通知，并核实此前源码修复是否进入日常安装包；本次收尾只同步文档，不再改产品代码或打包。
 
-本轮没有重新打包、清理日常数据或退出/重启 `D:/code/cx/mc/mc.exe`。源码、GitHub和运行中EXE是不同状态。
+## 当前部署
 
-## 已完成
+- 通知流修复提交为 `cd07002`。此前源码已有修复，但旧日常 MC 与手机 APK 均未包含该实现；旧手机基线 186475 高于实际新事件序列，事件在系统通知 gate 前即被标 terminal 并 ACK。
+- 用户于 2026-10-26 重新打包并启动 `D:/code/cx/mc/mc.exe`。已检查实际 EXE 的 PYZ 包含 `notification-feed-v1`、`notification_feed_id` 和 feed devices 实现；EXE SHA256 为 `beb2f09617d82106af355eaedb8d2bb46bdf980ba0b80528b827c1e60b1fdee0`。
+- 日常聊天库仍为 `D:/code/cx/history/chat_history.db`。手机 default 的 feed 与该库 meta 中的 UUID 一致，首次新流基线为 24725；未因数字下降清库、轮换 UUID 或清理通知账本。
+- RC 已用正式双来源配置保数据覆盖安装。日常日志在 18:38:11、18:50:57（北京时间）分别出现 `gate=eligible → notification_posted`，对应 answer_seq 14386、14397；前一条随后因 `read_cursor` 取消。这证明日常实际发布路径生效，不代表本轮已完成日常通知栏、锁屏和点击的完整矩阵。
+- 临时测试应用 `com.example.zhuge_qa.notificationprobe` 已卸载，独立测试 MC/broker 已停止，自有 ADB reverse 已移除。最终打开的是日常 `com.example.zhuge_qa`，不是同名测试入口。台式机部署已核实，笔记本未在本轮重新部署或验收。
 
-- 聊天状态缺失、损坏或有效时，笔记控制器均在 `_load_state()` 后恢复并刷新初始列表；对应计时器夹具负责完整回收。
-- pending outbox部分索引消除空查询扫描已发布历史；独立 `publication_progress` 使确认水位在清理、重复ACK和重启后保持单调，不跨过未确认前序。权威事实、用户历史、会话和笔记不清理。
-- 清理先取安全前沿内的有界候选，再筛七天年龄。自动维护在既有worker取批次前执行，修复维护等待期间新通知的交接遗漏；无新轮询。规则、开关和操作命令见[长期运行维护](runtime-maintenance.md)。
-- NATS/Cloudflared自有日志持续轮转、故障后恢复写入并继续排空管道；正确处理短写及零进展，导航诊断默认关闭。正常Windows后代持有stdout时，reader/pipe/file关闭已由真实fixture验证。
-- 构建work/staging进入开发目录，收集和最终复制边界排除开发/运行数据；修复tests祖先误筛必要资源，保留自定义构建路径、必要资产及已有用户数据。benchmark拒绝不存在pair，明确区分全库与所选pair计数；修复Cloudflared PIPE测试替身。
-- 新dog四个独立视角审查完成，7项行动已修复并独立验证；1项未验证风险保留。代理子树额度受限时，本轮由主线程逐个创建fresh审查员完成，未复用上下文充数或修改配置/历史。
+## 验证范围
 
-## 验证与性能证据
+- RC 本轮四文件 Dart 定向测试 148 项、Android 原生单元测试 128 项通过。独立完整新 MC 的真实握手成功，包内 ChatStore/RemoteNatsTransport 生成并投递测试终答；这不是实际模型生成验收。
+- 实体手机独立 QA 应用验证：186475 旧基线迁移到新流基线 3，桌面后台通知中心实际出现标题和正文；同一次锁屏操作发送前后均 `deviceLocked=true`，系统通知 active；同事件收到两次，仅发布一次。该证据不可替代日常锁屏验收。
+- 最初执行 `pytest tests/test_notification_sync.py tests/test_notification_contract_unit.py --noconftest -o pythonpath=. -p no:cacheprovider -q` 得到 22 passed、6 failed。失败均在旧 contract fixture 未设置完成状态时触发 `INCOMPLETE_CANONICAL_NOTIFICATION`；本轮未修改它们，不宣称该组合全绿。
+- 本次仅文档更新，复用上述对应源码的测试与构建结果；收尾另做文档路径、差异及敏感信息检查。
 
-- 性能治理最终八文件串行 **242 passed、2 deselected**；只排除下列两个精确父版本亦失败的用例，不把它们计为通过。
-- 最新7项补丁独立验证 **51 passed**：三个完整受改文件48项，Cloudflared精确启动及两个日志消费者3项；无skip/xfail。Windows真实后代测试实际执行，复制矩阵使用临时假构建器，未真实部署。
-- 本次收尾补跑笔记启动恢复对应的 `tests/test_notes_ui_automation.py`，**7 passed**；文档一致性检查覆盖14份知识文件、62个本地链接，断链为0。上述51项沿用源码未变时的独立验证结果。
-- 真实备份只读复制后，196167条已发布记录的两个lane空查询p95从259.03/295.45 ms降至3.80/1.27 ms。最终合成196167/1961670行分别约1.10–1.29 ms；完整迁移elapsed149.40/1770.22 ms，不是写锁时长。历史一轮合成样本仅8.65倍改善仍保留，不以其他轮次覆盖它。
-- 大量近期记录和旧记录高于低安全水位两种场景，清理VM步数不随总历史线性增加；同时限制检查量与删除量，而不只检查LIMIT返回条数。
+## 下一步与限制
 
-在源码目录复验最新补丁：
+1. 日常新消息验收应固定同一 pair/event/answer_seq，分别核收包、gate、posted、系统通知中心及读后取消。保持手机在桌面或锁屏，不能用 ACK 或补拉历史代替可见通知。
+2. 手机 2026-10-26 多次被 MIUI `OneKeyClean` 强停，18:28:33 的强停发生在新 broker 启动前；重新打开后才完成新 feed 协商。强停是独立运行条件，不能仅靠本次 feed 修复保证继续接收。
+3. 旧事件已被 terminal 去重，升级不自动补弹；不得批量清 posted/terminal/read 账本。数据库备份恢复且沿用同 UUID 的自动识别仍不支持。
+4. 2026-10-19 的 TLS、恢复期发送及详情延迟未在本轮统一修复或长期验收；成功的新连接不能据此关闭历史问题。停止的完整 Windows/TalkBack 验收不自动恢复。
+5. 既有长期运行风险保持：日志 reader 的受控读写/关闭交错尚未裁决；两个旧基线失败 `test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals`、`test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor` 不计通过。24–72 小时性能和月级稳定性没有结论。
 
-```powershell
-.venv/Scripts/python.exe -m pytest tests/test_nats_runtime.py tests/test_packaging_specs.py tests/test_benchmark_outbox.py --noconftest -o pythonpath=. -q -ra
-.venv/Scripts/python.exe -m pytest tests/test_main_unit.py::test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lease tests/test_main_remote_nats_unit.py::test_cloudflared_channels_survive_continuous_rotation tests/test_main_remote_nats_unit.py::test_navigation_diagnostics_default_off_and_bounded_when_enabled -q
-```
+## 保留的实现与运维约定
 
-完整先前回归与性能命令见[协议](remote-slim-protocol.md)及[维护说明](runtime-maintenance.md)。wx套件串行，frame测试注入临时笔记路径；不为文档收尾重复无改动的宽回归。
+- 长期维护的部分索引、独立 publication_progress、安全前沿内有界清理、自有日志轮转/短写恢复、构建产物过滤及笔记启动恢复均保留。历史 242 passed/2 deselected、7 项补丁 51 passed、笔记 UI 7 passed 只对应各自版本；规则及复现见 [维护说明](runtime-maintenance.md)、[协议](remote-slim-protocol.md)和[历史验证](remote-slim-validation.md)。
+- 用户本人退出、重包和启动日常 MC。需要隔离运行时使用不同 EXE 父目录/聊天库、随机 token、独立端口和测试 OneDrive；不能接管日常隧道或按进程名批量停止服务。
+- default/laptop 的配置、文件与读状态按来源隔离。打包版笔记/常用命令使用既有个人 OneDrive 数据，源码笔记为 `D:/code/note/notes.db`；本轮未更换或合并这些数据。
 
-本机原始证据在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/`：`plan-mc-long-run-performance.md`、`review-mc-long-run-performance-new-dog.md`、`verify-mc-new-dog-seven-patches-engineer.md`、`verify-mc-long-run-performance-engineer.md`、`mc-outbox-benchmark-archive-engineer.json`、`mc-outbox-benchmark-final-patch-engineer.json`。私有诊断、备份、临时辅助脚本不进产品Git。逐轮细节和原部署背景见[收尾前快照](archive/handoff-before-runtime-maintenance-wrapup-2026-10-24.md)。
+## 接续证据
 
-## 剩余问题与下一步
-
-1. **延期风险，未证实泄漏**：`owned_logs.py` 中reader若正在写盘，单次 `CancelSynchronousIo` 可能错过随后阻塞读取。需要真实Windows后代持stdout、受控读/写/关闭交错才能裁决；本轮7项补丁未扩修该风险。正常后代关闭通过不能代替这一调度测试。
-2. 两个已有基线失败仍在：`test_archived_mobile_result_v2_outbox_keeps_interleaved_owners_and_unique_finals` 缺chat-a；`test_registered_history_handler_bounds_escaped_long_content_and_preserves_older_cursor` 的answer_seq旧预期。不得因只跑排除后的集合而宣称全套通过。
-3. 需要安装验证时，先核对实际EXE版本、数据路径及私有启动入口，由用户退出日常MC，再按[远程配置](remote-control.md)对应机器部署；不因本次源码完成而自动打包/启动。
-4. 需要定位剩余卡顿时，测同一操作的UI延迟、数据库等待及24–72小时资源曲线，再决定是否修改历史保存/文件列表。尚无证据证明文件数量是唯一原因，也未建立月级流畅度结论。
-5. 当前通知流上限保留；legacy流TTL和Codex上游存储未获充分恢复证据，不手删或虚构关闭配置。
-
-## 其他有效背景与约束
-
-- 2026-10-19日常台式机default通过external/frp/Caddy与实体RC连通；TLS握手、恢复期发送错误和前台回复延迟仍待修。RC接续文档为本机 `D:/code/sj/rc/docs/current/2026-10-19-connection-issues.md`；不要把通知快等同于详情快或拼接不同事件解释根因。
-- 2026-10-20笔记本FRP私有bundle准备完成、服务器独立端口/路由已配置，本机部署及认证/列表仍待验证。手机已安装内置双FRP配置的版本不证明笔记本已上线；保留default来源，下一步按[笔记本部署](../deploy/mc-relay/LAPTOP.md)现场核实。
-- 双来源固定台式机default、笔记本laptop，已知计算机名自动识别、显式pair优先；不互相继承凭据。笔记、OneDrive和已读隔离规则未改，两台MC不并发写共享笔记。
-- 源码笔记 `D:/code/note/notes.db`；打包版要求现存、完整且表结构正确的个人OneDrive `code/data/sj/notes.db`。2026-09-29快照不能覆盖之后改动，切包前核对与补齐；测试只写注入路径。
-- 可携带浏览器入口、默认自动审查、全局skills/plugins整目录链接和原生发现刷新已实现；首次专用profile、正式GUI全链、另一台电脑仍待验。目标续验保持原target/window，真实审核拒绝后停止。
-- Kimi结构化注入边界、owner/generation隔离、canonical执行投影和已读语义保留；详见[文档索引](README.md)。用户此前停止的完整桌面验收不在本次恢复范围。
+私有诊断和验收 JSON 归档在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/notification-deployment-20261026/`，不提交日志、凭据或 APK。长期入口为 [远程配置](remote-control.md)、[文档索引](README.md)、[经验](experience.md)、[反思](reflection.md)。
