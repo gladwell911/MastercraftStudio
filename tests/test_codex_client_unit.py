@@ -1367,7 +1367,7 @@ def test_thread_requests_default_to_auto_reviewer(monkeypatch):
     for message in sent[1:]:
         assert message['params']['approvalsReviewer'] == 'auto_review'
         assert message['params']['approvalPolicy'] == 'on-request'
-        assert message['params']['sandbox'] == 'workspace-write'
+        assert message['params']['sandbox'] == 'danger-full-access'
 
 
 @pytest.mark.parametrize("reuse_home", [False, True])

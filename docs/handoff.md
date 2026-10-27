@@ -1,6 +1,12 @@
 # 当前交接
 
-更新日期：2026-10-26。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。本阶段目标是恢复手机系统通知，并核实此前源码修复是否进入日常安装包；本次收尾只同步文档，不再改产品代码或打包。
+更新日期：2026-10-27。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。当前完成 Codex 默认访问权限改动的源码验证，准备提交推送；未重新打包或重启日常 MC。以下通知部署结论仍对应 2026-10-26。
+
+## Codex 默认访问权限
+
+- 默认沙箱为 `danger-full-access`，审批仍为 `on-request / auto_review`。访问权限与审批模式独立保存；缺失或无效权限回退新默认，已有 `read-only`、`workspace-write`、`danger-full-access` 均保留。
+- 验证命令：`.venv/Scripts/python.exe -m pytest tests/test_codex_client_unit.py tests/test_codex_command_approval_unit.py tests/test_codex_worker_process.py tests/test_codex_command_approval_ui_automation.py -q`，221 passed。覆盖客户端请求、worker、审批流程与串行 wx 配置迁移测试；不代表真实模型或安装包验收。
+- 下一步如需部署，按既有打包流程执行；本次只验证、提交和推送源码。
 
 ## 当前部署
 
@@ -15,7 +21,7 @@
 - RC 本轮四文件 Dart 定向测试 148 项、Android 原生单元测试 128 项通过。独立完整新 MC 的真实握手成功，包内 ChatStore/RemoteNatsTransport 生成并投递测试终答；这不是实际模型生成验收。
 - 实体手机独立 QA 应用验证：186475 旧基线迁移到新流基线 3，桌面后台通知中心实际出现标题和正文；同一次锁屏操作发送前后均 `deviceLocked=true`，系统通知 active；同事件收到两次，仅发布一次。该证据不可替代日常锁屏验收。
 - 最初执行 `pytest tests/test_notification_sync.py tests/test_notification_contract_unit.py --noconftest -o pythonpath=. -p no:cacheprovider -q` 得到 22 passed、6 failed。失败均在旧 contract fixture 未设置完成状态时触发 `INCOMPLETE_CANONICAL_NOTIFICATION`；本轮未修改它们，不宣称该组合全绿。
-- 本次仅文档更新，复用上述对应源码的测试与构建结果；收尾另做文档路径、差异及敏感信息检查。
+- 2026-10-26 通知文档更新复用上述对应源码的测试与构建结果；2026-10-27 Codex 验证范围见上节。
 
 ## 下一步与限制
 

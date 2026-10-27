@@ -21,7 +21,7 @@ def test_command_policy_applies_only_to_future_thread_start_or_resume(policy, ex
     client = created[0]
     args = client.resumed_threads[0][1] if resume else client.started_threads[0]
     assert args['approval_policy'] == expected
-    assert args['sandbox'] == ('workspace-write' if policy in (None, 'invalid', 'auto-review') else 'danger-full-access')
+    assert args['sandbox'] == 'danger-full-access'
     assert args['approvals_reviewer'] == ('auto_review' if policy in (None, 'invalid', 'auto-review') else 'user')
     assert client.replies == []
     runtime.close()

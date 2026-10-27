@@ -38,7 +38,7 @@ DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_CODEX_TURN_TIMEOUT = 300
 DEFAULT_CODEX_APPROVAL_MODE = "auto-review"
 DEFAULT_CODEX_APPROVAL_POLICY = "on-request"
-DEFAULT_CODEX_SANDBOX = "workspace-write"
+DEFAULT_CODEX_SANDBOX = "danger-full-access"
 DEFAULT_CODEX_APPROVALS_REVIEWER = "auto_review"
 CODEX_SERVICE_TIER_FAST = "fast"
 CODEX_SERVICE_TIER_STANDARD = ""
@@ -73,7 +73,7 @@ def codex_approval_parameters(value: str | None, sandbox: str | None = None) -> 
     mode = normalize_codex_approval_mode(value)
     return {
         "approval_policy": "on-request" if mode == "auto-review" else mode,
-        "sandbox": normalize_codex_sandbox(sandbox) if sandbox is not None else ("workspace-write" if mode == "auto-review" else "danger-full-access"),
+        "sandbox": normalize_codex_sandbox(sandbox),
         "approvals_reviewer": "auto_review" if mode == "auto-review" else "user",
     }
 

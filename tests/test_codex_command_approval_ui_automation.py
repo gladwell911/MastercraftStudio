@@ -180,8 +180,9 @@ def test_command_server_request_entry_rejects_retired_client_then_prompts_curren
     assert not frame._current_chat_state.get('execution_steps')
 
 
-@pytest.mark.parametrize("mode,expected", [("never", "danger-full-access"), ("on-request", "danger-full-access"), ("auto-review", "workspace-write")])
-def test_missing_sandbox_migrates_once_and_persists_independently(approval_frame, mode, expected):
+@pytest.mark.parametrize("mode,expected", [("never", "danger-full-access"), ("on-request", "danger-full-access"), ("auto-review", "danger-full-access")])
+@pytest.mark.parametrize("saved_sandbox", ["read-only", "workspace-write", "danger-full-access"])
+def test_missing_sandbox_migrates_once_and_persists_independently(approval_frame, mode, expected, saved_sandbox):
     frame = approval_frame
     frame._save_state()
     state = json.loads(frame.state_path.read_text(encoding="utf-8"))
@@ -190,12 +191,12 @@ def test_missing_sandbox_migrates_once_and_persists_independently(approval_frame
     frame.state_path.write_text(json.dumps(state), encoding="utf-8")
     frame._load_state()
     assert frame.codex_sandbox == expected
-    frame.codex_sandbox = "danger-full-access"
+    frame.codex_sandbox = saved_sandbox
     frame.codex_approval_policy = "auto-review"
     frame._save_state()
     frame.codex_sandbox = "read-only"
     frame._load_state()
-    assert frame.codex_sandbox == "danger-full-access"
+    assert frame.codex_sandbox == saved_sandbox
     assert frame.codex_approval_policy == "auto-review"
 
 
@@ -223,9 +224,9 @@ def test_sandbox_menu_and_resume_cache_apply_new_selection(approval_frame, monke
     state["codex_sandbox"] = "unknown"
     frame.state_path.write_text(json.dumps(state), encoding="utf-8")
     frame._load_state()
-    assert frame.codex_sandbox == "workspace-write"
+    assert frame.codex_sandbox == "danger-full-access"
     frame._save_state()
-    assert json.loads(frame.state_path.read_text(encoding="utf-8"))["codex_sandbox"] == "workspace-write"
+    assert json.loads(frame.state_path.read_text(encoding="utf-8"))["codex_sandbox"] == "danger-full-access"
 
 
 def test_thread_configuration_ack_is_bound_to_thread_and_rejects_stale_generation(approval_frame):

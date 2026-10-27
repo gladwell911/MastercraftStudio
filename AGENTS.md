@@ -2,7 +2,7 @@
 
 每次开始新的 Codex 项目会话，先读取 docs/handoff.md、docs/experience.md 和 docs/reflection.md；再按任务读取 docs/README.md。历史快照与冻结基线只证明对应版本。
 
-- 明确要求打开 HTTP(S) 网页并显示前台时，使用随源码/onedir 包提供的 `mc-browser-open` 技能；源码入口 `.venv/Scripts/python.exe browser_open.py --url <URL>`，随包入口 `mc_worker.exe --browser-open --url <URL>`，运行时准确 argv 见 `MC_BROWSER_OPEN_ARGV`。普通搜索不启 Chrome；冲突/headless/真实审核拒绝立即停止。默认审批为 auto-review（on-request / workspace-write / auto_review），旧无版本配置仅迁移一次，之后保留手选。跨机首启及焦点效果须在目标机验收。
+- 明确要求打开 HTTP(S) 网页并显示前台时，使用随源码/onedir 包提供的 `mc-browser-open` 技能；源码入口 `.venv/Scripts/python.exe browser_open.py --url <URL>`，随包入口 `mc_worker.exe --browser-open --url <URL>`，运行时准确 argv 见 `MC_BROWSER_OPEN_ARGV`。普通搜索不启 Chrome；冲突/headless/真实审核拒绝立即停止。默认审批为 auto-review（on-request / danger-full-access / auto_review），访问权限独立保存，缺失或无效时默认完全访问，已有有效手选保持不变。旧无版本审批配置仅迁移一次。跨机首启及焦点效果须在目标机验收。
 
 - 长期维护以 docs/runtime-maintenance.md 为准：保持发布水位/权威facts、用户历史和Codex会话；修改维护时通过真实worker/管道/复制边界验证，不将每批有界或源码验证宣称为存储总上限、月级稳定或安装完成。
 - 跨端通知排查先核实际前台 Android 包名、前后台端点及运行 MC；独立 QA 应用可能与主应用同名。测试结束清理自建测试包、进程和转发，并打开日常主包；不清日常数据，不仅凭图标或 ACK 判定验收。
