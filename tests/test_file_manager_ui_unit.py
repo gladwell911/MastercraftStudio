@@ -536,3 +536,344 @@ def test_remote_file_delete_removes_record_and_file(frame, tmp_path, monkeypatch
     assert body["accepted"] is True
     assert frame.file_library.get_record(record.id) is None
     assert not record.stored_path.exists()
+
+
+@pytest.mark.parametrize("failure", ["copy_expired", "closed", "runtime_changed", "service_changed", "probe_failed", "probe_expired", "copy_error", "missing", "queued_commit", "service_start"])
+def test_file_worker_failures_never_publish_late_record(frame, tmp_path, monkeypatch, failure):
+    import threading
+    import time
+    from types import SimpleNamespace
+    from file_transfer import DesktopFileLibrary
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"complete payload")
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    frame.file_service = SimpleNamespace(public_base_url="https://files.example", download_url_for=lambda r: "https://files.example/" + r.name)
+    monkeypatch.setattr(frame, "_build_remote_nats_url", lambda: "wss://files.example/nats?token=synthetic")
+    frame._file_preparation_budget_seconds = .15 if failure in {"copy_expired", "probe_expired", "queued_commit"} else 2
+    if failure == "service_start":
+        def fail_start():
+            assert threading.current_thread() is not threading.main_thread()
+            raise OSError("controlled service startup failure")
+        frame.file_service.start = fail_start
+    entered, release = threading.Event(), threading.Event()
+    original = frame.file_library.prepare_local_file
+    def prepare(*args, **kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        if failure in {"copy_expired", "closed", "runtime_changed", "service_changed"}:
+            entered.set()
+            assert release.wait(3)
+        if failure == "copy_error":
+            raise OSError("controlled copy failure")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", prepare)
+    def verify(_url, *, timeout_seconds):
+        assert threading.current_thread() is not threading.main_thread()
+        assert 0 < timeout_seconds <= min(5, frame._file_preparation_budget_seconds) + 1e-8
+        if failure == "probe_expired":
+            entered.set()
+            assert release.wait(3)
+        return failure != "probe_failed", "controlled"
+    monkeypatch.setattr(frame, "_verify_remote_public_ws", verify)
+    offers = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda event, **kwargs: offers.append(event))
+    queued = []
+    original_call_after = frame._call_after_if_alive
+    calls = []
+    def call_after(callback, *args, **kwargs):
+        if threading.current_thread() is thread:
+            calls.append(callback)
+        if failure == "queued_commit" and threading.current_thread() is thread and len(calls) == 2:
+            queued.append(callback)
+            entered.set()
+            return True
+        return original_call_after(callback, *args, **kwargs)
+    monkeypatch.setattr(frame, "_call_after_if_alive", call_after)
+    result = []
+    path = source if failure != "missing" else source.with_name("absent.txt")
+    thread = threading.Thread(target=lambda: result.append(frame._remote_api_file_command_worker({
+        "type": "file_probe", "id": failure, "body": {"path": str(path)}})))
+    try:
+        thread.start()
+        limit = time.monotonic() + 3
+        changed = False
+        while thread.is_alive() and time.monotonic() < limit:
+            wx.Yield()
+            if entered.is_set() and not changed:
+                changed = True
+                if failure == "closed":
+                    frame._closing = True
+                if failure == "runtime_changed":
+                    frame._remote_nats_transport = object()
+                if failure == "service_changed":
+                    frame.file_service = object()
+                if failure in {"copy_expired", "probe_expired"}:
+                    threading.Event().wait(.17)
+                release.set()
+            time.sleep(.002)
+        assert not thread.is_alive()
+        for callback in queued:
+            callback()
+        assert result[0][0] == (404 if failure == "missing" else 500 if failure == "copy_error" else 503), result[0]
+        assert offers == []
+        assert frame.file_library.list_records() == []
+        assert list(tmp_path.glob(".mc-file-*")) == []
+        assert not (tmp_path / "storage").exists() or list((tmp_path / "storage").iterdir()) == []
+    finally:
+        release.set()
+        thread.join(1)
+
+
+@pytest.mark.parametrize("failure", ["offer_build", "durable_publish", "after_publish_refresh"])
+def test_file_worker_rolls_back_only_unpublished_own_file(frame, tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    from file_transfer import DesktopFileLibrary
+    import main
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"payload")
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    existing = frame.file_library.add_local_file(source)
+    frame.file_service = None
+    frame.file_http_base_url = "https://files.example"
+    frame._remote_nats_transport = SimpleNamespace(protocol_version=2, subjects=SimpleNamespace(pair_id="default"), _loop=None)
+    frame.active_chat_id = "file-owner"
+    def fail(*args, **kwargs):
+        raise RuntimeError("controlled failure")
+    if failure == "offer_build":
+        monkeypatch.setattr(frame, "_file_offer_for_record", fail)
+    elif failure == "durable_publish":
+        monkeypatch.setattr(frame.chat_store, "commit_durable_fact", fail)
+        # The regression must not leave a delayed retry task behind.
+        monkeypatch.setattr(main.threading, "Timer", lambda *args: SimpleNamespace(start=lambda: None))
+    else:
+        monkeypatch.setattr(frame, "_refresh_file_manager_if_visible", fail)
+    status, body = frame._remote_api_file_command_worker({"type": "file_probe", "id": failure,
+        "chat_id": "file-owner", "body": {"path": str(source)}})
+    assert status == 500, body
+    records = frame.file_library.list_records()
+    assert existing in records and existing.stored_path.read_bytes() == b"payload"
+    assert len(records) == (2 if failure == "after_publish_refresh" else 1)
+    assert len(list((tmp_path / "storage").iterdir())) == len(records)
+    assert list(tmp_path.glob(".mc-file-*")) == []
+    assert not getattr(frame, "_pending_v2_remote_facts", [])
+    assert len(frame.chat_store.pending_outbox(pair_id="default", domain="files")) == (1 if failure == "after_publish_refresh" else 0)
+
+
+@pytest.mark.parametrize("invalidate", ["closing", "service_replaced"])
+def test_file_worker_does_not_revive_service_after_context_invalidated(frame, tmp_path, monkeypatch, invalidate):
+    import socket
+    import threading
+    import time
+    from file_transfer import DesktopFileHttpService, DesktopFileLibrary
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"payload")
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    service = DesktopFileHttpService(frame.file_library, host="127.0.0.1", port=0)
+    frame.file_service = service
+    replacement = DesktopFileHttpService(frame.file_library, host="127.0.0.1", port=0)
+    entered, release = threading.Event(), threading.Event()
+    original = service.start
+    started = []
+    def blocked_start():
+        entered.set()
+        assert release.wait(3)
+        result = original()
+        started.append((service._thread, service._server.server_address))
+        return result
+    monkeypatch.setattr(service, "start", blocked_start)
+    offers = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda event, **kwargs: offers.append(event))
+    result = []
+    thread = threading.Thread(target=lambda: result.append(frame._remote_api_file_command_worker({
+        "type": "file_probe", "id": invalidate, "body": {"path": str(source)}})))
+    try:
+        thread.start()
+        limit = time.monotonic() + 3
+        while not entered.is_set() and time.monotonic() < limit:
+            wx.Yield()
+            time.sleep(.002)
+        assert entered.is_set()
+        if invalidate == "closing":
+            frame._closing = True
+        else:
+            replacement.start()
+            frame.file_service = replacement
+        service.stop()
+        assert service._server is None
+        release.set()
+        limit = time.monotonic() + 3
+        while thread.is_alive() and time.monotonic() < limit:
+            wx.Yield()
+            time.sleep(.002)
+        assert not thread.is_alive()
+        assert result[0][0] == 503
+        assert offers == [] and frame.file_library.list_records() == []
+        assert service._server is None
+        assert started and not started[0][0].is_alive()
+        with socket.socket() as client:
+            assert client.connect_ex(started[0][1]) != 0
+        if invalidate == "service_replaced":
+            assert replacement._server is not None and replacement._thread.is_alive()
+    finally:
+        release.set()
+        thread.join(3)
+        service.stop()
+        replacement.stop()
+
+
+@pytest.mark.parametrize("failure", ["config_exception", "running_capture_timeout"])
+def test_file_capture_failure_same_id_retry_has_no_phantom_owner(frame, tmp_path, monkeypatch, failure):
+    import threading
+    import time
+    from types import SimpleNamespace
+    from file_transfer import DesktopFileLibrary
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    frame.file_service = SimpleNamespace(public_base_url="https://files.example")
+    frame._file_preparation_budget_seconds = 35 if failure == "running_capture_timeout" else .12
+    entered, expired = threading.Event(), threading.Event()
+    calls = []
+    def build_url():
+        calls.append(True)
+        if len(calls) == 1:
+            if failure == "config_exception":
+                raise RuntimeError("controlled config failure")
+            entered.set()
+            assert expired.wait(7)
+        return "wss://files.example/nats?token=synthetic"
+    monkeypatch.setattr(frame, "_build_remote_nats_url", build_url)
+    result = []
+    payload = {"type": "file_probe", "id": "retry-same-id", "body": {"path": str(tmp_path / "missing.txt")}}
+    def run():
+        try:
+            result.append(frame._remote_api_file_command_worker(payload))
+        except Exception as exc:
+            result.append(exc)
+        finally:
+            expired.set()
+    thread = threading.Thread(target=run)
+    try:
+        thread.start()
+        limit = time.monotonic() + 7
+        while thread.is_alive() and time.monotonic() < limit:
+            wx.Yield()
+            time.sleep(.002)
+        assert not thread.is_alive()
+        assert isinstance(result[0], tuple) and result[0][0] == (503 if failure == "running_capture_timeout" else 500)
+        if failure == "running_capture_timeout":
+            assert entered.is_set()
+        assert not any(not entry["done"].is_set() for entry in getattr(frame, "_file_preparation_requests", {}).values())
+        # The corrected configuration and same identity must execute a producer.
+        status, body = frame._remote_api_file_command_worker(payload)
+        assert status == 404 and body["exists"] is False
+    finally:
+        expired.set()
+        thread.join(7)
+
+
+def test_file_capture_capacity_keeps_inflight_and_evicts_completed_only(frame, tmp_path, monkeypatch):
+    import threading
+    import time
+    from file_transfer import DesktopFileLibrary
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    frame.file_service = None
+    frame._remote_nats_transport = None
+    entries = {}
+    for index in range(128):
+        entries[(id(None), "", "", "", "", f"existing-{index}")] = {"done": threading.Event(), "result": None}
+    frame._file_preparation_requests = entries
+    original = dict(entries)
+    payload = {"type": "file_probe", "id": "new-id", "body": {"path": str(tmp_path / "missing.txt")}}
+    assert frame._remote_api_file_command_worker(payload)[0] == 503
+    assert len(entries) == 128 and all(entries[key] is value for key, value in original.items())
+    def never_prepare(*args, **kwargs):
+        raise AssertionError("same RPC must share the in-flight producer")
+    real_prepare = frame.file_library.prepare_local_file
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", never_prepare)
+    shared = entries[(id(None), "", "", "", "", "existing-0")]
+    result = []
+    thread = threading.Thread(target=lambda: result.append(frame._remote_api_file_command_worker(dict(payload, id="existing-0"))))
+    try:
+        thread.start()
+        wx.Yield()
+        shared["result"] = (200, {"accepted": True, "file_id": "shared-existing"})
+        shared["done"].set()
+        limit = time.monotonic() + 2
+        while thread.is_alive() and time.monotonic() < limit:
+            wx.Yield()
+            time.sleep(.002)
+        assert result == [shared["result"]]
+        assert len(entries) == 128
+        # Keep existing-0 in flight; only the separately completed entry may leave.
+        shared["done"].clear()
+        evicted_key = (id(None), "", "", "", "", "existing-127")
+        entries[evicted_key]["done"].set()
+        entries[evicted_key]["result"] = (404, {"accepted": False})
+        monkeypatch.setattr(frame.file_library, "prepare_local_file", real_prepare)
+        assert frame._remote_api_file_command_worker(payload)[0] == 404
+        assert len(entries) == 128 and evicted_key not in entries
+        assert entries[(id(None), "", "", "", "", "existing-0")] is shared
+    finally:
+        shared["done"].set()
+        thread.join(2)
+
+
+def test_file_offer_sqlite_writer_lock_cannot_commit_after_worker_timeout(frame, tmp_path, monkeypatch):
+    import sqlite3
+    import threading
+    import time
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from file_transfer import DesktopFileLibrary
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"payload")
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    frame.file_service = None
+    frame.file_http_base_url = "https://files.example"
+    frame.active_chat_id = "file-owner"
+    frame._remote_nats_transport = SimpleNamespace(protocol_version=2, subjects=SimpleNamespace(pair_id="default"), _loop=None)
+    frame._file_preparation_budget_seconds = .3
+    entered, worker_finished, released = threading.Event(), threading.Event(), threading.Event()
+    original_connect = frame.chat_store._connect
+    @contextmanager
+    def traced_connect():
+        with original_connect() as connection:
+            connection.set_trace_callback(lambda sql: entered.set() if sql == "BEGIN IMMEDIATE" else None)
+            yield connection
+    monkeypatch.setattr(frame.chat_store, "_connect", traced_connect)
+    writer = sqlite3.connect(frame.chat_store.db_path, check_same_thread=False)
+    writer.execute("BEGIN IMMEDIATE")
+    result = []
+    def run():
+        try:
+            result.append(frame._remote_api_file_command_worker({"type": "file_probe", "id": "writer-lock",
+                "chat_id": "file-owner", "body": {"path": str(source)}}))
+        finally:
+            worker_finished.set()
+    def unlock_after_timeout():
+        try:
+            assert entered.wait(2)
+            assert worker_finished.wait(2)
+        finally:
+            writer.rollback()
+            writer.close()
+            released.set()
+    worker = threading.Thread(target=run)
+    unlocker = threading.Thread(target=unlock_after_timeout)
+    try:
+        unlocker.start()
+        worker.start()
+        limit = time.monotonic() + 3
+        while (worker.is_alive() or not released.is_set()) and time.monotonic() < limit:
+            wx.Yield()
+            time.sleep(.002)
+        assert entered.is_set() and released.is_set() and not worker.is_alive()
+        assert result[0][0] == 503
+        assert frame.file_library.list_records() == []
+        assert list((tmp_path / "storage").iterdir()) == []
+        assert frame.chat_store.pending_outbox(pair_id="default", domain="files") == []
+        with original_connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM durable_facts WHERE domain='files'").fetchone()[0] == 0
+        assert not getattr(frame, "_pending_v2_remote_facts", [])
+    finally:
+        worker_finished.set()
+        worker.join(3)
+        unlocker.join(3)

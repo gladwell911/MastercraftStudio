@@ -80,9 +80,32 @@ def main() -> None:
     tcp_port = _choose_available_port(preferred_port, NATS_E2E_PORT_FALLBACKS)
     websocket_port = _choose_available_port(preferred_ws_port, NATS_E2E_WS_PORT_FALLBACKS)
 
+    # Use the real wx capture/worker/commit path with entirely isolated data.
+    os.environ["REMOTE_CONTROL_AUTOSTART"] = "0"
+    os.environ["DESKTOP_FILE_SERVICE_AUTOSTART"] = "0"
+    os.environ["AUTO_START_QUICK_TUNNEL"] = "0"
+    import wx
+    import main as mc_main
+    mc_main.resolve_app_data_dir = lambda: work_dir
+    mc_main.resolve_notes_data_dir = lambda: work_dir / "notes"
+    mc_main.ChatFrame._legacy_state_paths = lambda self: [self.state_path]
+    mc_main.GlobalCtrlTapHook.start = lambda self: None
+    mc_main.GlobalCtrlTapHook.stop = lambda self: None
+    app = wx.App(False)
+    frame = mc_main.ChatFrame()
+    frame.Hide()
+    frame.active_chat_id = CHAT_ID
     library = DesktopFileLibrary(storage_dir)
+    frame.file_library = library
+    original_prepare = library.prepare_local_file
+    def prepare(*args, **kwargs):
+        if file_probe_delay_seconds > 0:
+            time.sleep(file_probe_delay_seconds)
+        return original_prepare(*args, **kwargs)
+    library.prepare_local_file = prepare
     desktop_record = library.add_local_file(desktop_source)
     http_service = DesktopFileHttpService(library, host="127.0.0.1", port=0)
+    frame.file_service = http_service
     server = NatsServerProcess(
         NatsRuntimeConfig(
             app_data_dir=work_dir,
@@ -102,6 +125,8 @@ def main() -> None:
     phone_upload_completed = threading.Event()
     phone_upload_record_id = ""
     offer_accepted = threading.Event()
+    desktop_download_record_ids = {desktop_record.id}
+    publisher = None
     seen: dict[str, object] = {
         "desktop_file_id": desktop_record.id,
         "desktop_download_completed": False,
@@ -125,15 +150,15 @@ def main() -> None:
         command_type = str(payload.get("type") or "")
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
         if command_type == "file_accept":
-            if str(body.get("file_id") or "") == desktop_record.id:
+            if str(body.get("file_id") or "") in desktop_download_record_ids:
                 offer_accepted.set()
             return 200, {"ok": True}
         if command_type == "file_progress":
-            if str(body.get("file_id") or "") == desktop_record.id:
+            if str(body.get("file_id") or "") in desktop_download_record_ids:
                 seen["desktop_download_progress_events"] = int(seen["desktop_download_progress_events"]) + 1
             return 200, {"ok": True}
         if command_type == "file_complete":
-            if str(body.get("file_id") or "") == desktop_record.id:
+            if str(body.get("file_id") or "") in desktop_download_record_ids:
                 seen["desktop_download_completed"] = True
                 desktop_download_completed.set()
             if str(body.get("file_id") or "") == phone_upload_record_id:
@@ -144,24 +169,15 @@ def main() -> None:
             seen["errors"].append(dict(body))
             return 200, {"ok": True}
         if command_type in {"file_pause", "file_resume", "file_cancel"}:
-            if str(body.get("file_id") or "") == desktop_record.id:
+            if str(body.get("file_id") or "") in desktop_download_record_ids:
                 seen["transfer_controls"].append(command_type)
             return 200, {"ok": True}
         if command_type in {"file_probe", "file_download_request"}:
-            if file_probe_delay_seconds > 0:
-                time.sleep(file_probe_delay_seconds)
-            path = str(body.get("path") or "")
-            exists = Path(path) == desktop_source or Path(path).is_file()
-            if not exists:
-                return 404, {"accepted": False, "exists": False, "path": path}
-            return 200, {
-                "accepted": True,
-                "exists": True,
-                "file_id": desktop_record.id,
-                "name": desktop_record.name,
-                "size_bytes": desktop_record.size_bytes,
-                "download_url": http_service.download_url_for(desktop_record),
-            }
+            status, response = frame._remote_api_file_command_worker(payload)
+            if status == 200:
+                desktop_download_record_ids.add(response["file_id"])
+                seen["production_file_worker"] = True
+            return status, response
         if command_type == "file_upload_request":
             name = Path(str(body.get("name") or phone_upload_name)).name or phone_upload_name
             upload_record = library.prepare_incoming_upload(name, size_bytes=int(body.get("size_bytes") or 0))
@@ -181,7 +197,9 @@ def main() -> None:
             token=token,
             desktop_password=server.config.desktop_password,
             on_file_command=on_file_command,
+            durable_store=frame.chat_store,
         )
+        frame._remote_nats_transport = transport
         transport.start_threaded(f"nats://127.0.0.1:{tcp_port}", timeout=15)
 
         ready_payload = {
@@ -220,10 +238,12 @@ def main() -> None:
                 transport.publish_event_threadsafe(offer)
                 stop.wait(1.0)
 
-        threading.Thread(target=_publish_offer_until_seen, name="file-offer-publisher", daemon=True).start()
+        publisher = threading.Thread(target=_publish_offer_until_seen, name="file-offer-publisher", daemon=True)
+        publisher.start()
 
         deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline and not stop.wait(0.2):
+        while time.monotonic() < deadline and not stop.wait(0.01):
+            app.Yield()
             matches = sorted(storage_dir.glob(phone_upload_name))
             matches.extend(sorted(storage_dir.glob(f"{Path(phone_upload_name).stem} (*{Path(phone_upload_name).suffix}")))
             for candidate in matches:
@@ -252,10 +272,18 @@ def main() -> None:
         )
         result_file.write_text(json.dumps(seen, ensure_ascii=False), encoding="utf-8")
     finally:
+        stop.set()
+        if publisher is not None:
+            publisher.join(timeout=2)
+        frame._closing = True
         if transport is not None:
             transport.stop()
         server.stop()
         http_service.stop()
+        frame._flush_execution_step_persists_sync()
+        frame.Destroy()
+        app.Yield()
+        app.Destroy()
 
 
 if __name__ == "__main__":

@@ -89,6 +89,10 @@ def test_laptop_machine_settings_reach_actual_transport_startup(frame, monkeypat
     assert frame.remote_nats_runtime_status['cloudflared_url'] == 'wss://laptop.example/nats'
     assert frame._build_remote_nats_url() == 'wss://laptop.example/nats?token=laptop-secret'
     assert frame._cloudflare_file_public_base_url() == 'https://laptop.example'
+    old_callback = getattr(frame._remote_nats_transport, "on_file_command", captured["on_file_command"])
+    frame._remote_nats_transport = object()
+    status, body = old_callback({"type": "file_probe", "id": "stale-source", "body": {"path": "absent"}})
+    assert (status, body["error"]) == (503, "file_preparation_unavailable")
 
 
 def test_v2_broadcast_commits_owner_fact_to_outbox_instead_of_direct_publish(frame, monkeypatch):
@@ -1141,3 +1145,88 @@ def test_navigation_diagnostics_default_off_and_bounded_when_enabled(frame, monk
     frame._log_ctrl_navigation_debug("right", details={"payload": "x" * (6 * 1024 * 1024)})
     assert path.stat().st_size <= 5 * 1024 * 1024
     assert path.with_name(path.name + ".1").exists()
+
+
+def test_file_worker_keeps_ui_responsive_and_commits_original_chat(frame, tmp_path, monkeypatch):
+    import threading
+    import time
+    from file_transfer import DesktopFileLibrary
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"complete bytes")
+    frame.file_library = DesktopFileLibrary(tmp_path / "storage")
+    from file_transfer import DesktopFileHttpService
+    from urllib.request import urlopen
+    http_service = DesktopFileHttpService(frame.file_library, host="127.0.0.1", port=0)
+    http_service.start()
+    http_service.stop()  # File service died while the NATS transport remains usable.
+    recovered = []
+    original_start = http_service.start
+    def recover():
+        assert threading.current_thread() is not threading.main_thread()
+        recovered.append(True)
+        original_start()
+    monkeypatch.setattr(http_service, "start", recover)
+    frame.file_service = http_service
+    entered, release = threading.Event(), threading.Event()
+    original = frame.file_library.prepare_local_file
+    def prepare(*args, **kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        entered.set()
+        assert release.wait(8)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", prepare)
+    original_commit = frame.file_library.commit_prepared_file
+    def commit(*args, **kwargs):
+        assert threading.current_thread() is threading.main_thread()
+        return original_commit(*args, **kwargs)
+    monkeypatch.setattr(frame.file_library, "commit_prepared_file", commit)
+    events = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", lambda event, **kwargs: events.append(event))
+    import asyncio
+    from remote_nats import RemoteNatsTransport
+    transport = RemoteNatsTransport(pair_id="file-fixture", token="synthetic", on_file_command=frame._remote_api_file_command_worker)
+    frame._remote_nats_transport = transport
+    result = []
+    async def capture_response(event, reply_subject=""):
+        result.append((event["status"], event["body"]))
+    transport._publish_response = capture_response
+    payload = {"type": "file_download_request", "id": "same-rpc", "chat_id": "original-chat",
+               "device_id": "phone", "session_id": "session", "epoch": "epoch", "body": {"path": str(source)}}
+    threads = [threading.Thread(target=lambda: asyncio.run(transport.handle_command(payload))) for _ in range(2)]
+    try:
+        threads[0].start()
+        limit = time.monotonic() + 3
+        while not entered.is_set() and time.monotonic() < limit:
+            main.wx.Yield()
+            time.sleep(.005)
+        assert entered.is_set()
+        threads[1].start()
+        sentinel = []
+        main.wx.CallAfter(lambda: sentinel.append(True))
+        frame.active_chat_id = "different-chat"
+        # Hold beyond the old UI-route deadline while continuing to pump wx.
+        limit = time.monotonic() + 5.05
+        while time.monotonic() < limit:
+            main.wx.Yield()
+            time.sleep(.005)
+        assert sentinel == [True]
+        assert not frame.file_library.list_records()
+        release.set()
+        limit = time.monotonic() + 3
+        while any(t.is_alive() for t in threads) and time.monotonic() < limit:
+            main.wx.Yield()
+            time.sleep(.005)
+        assert recovered == [True]
+        assert len(result) == 2 and result[0] == result[1]
+        assert result[0][0] == 200
+        assert len(events) == 1 and events[0]["chat_id"] == "original-chat"
+        assert len(frame.file_library.list_records()) == 1
+        assert frame.file_library.list_records()[0].stored_path.read_bytes() == source.read_bytes()
+        with urlopen(result[0][1]["download_url"], timeout=2) as response:
+            assert response.read() == source.read_bytes()
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident:
+                thread.join(1)
+        http_service.stop()

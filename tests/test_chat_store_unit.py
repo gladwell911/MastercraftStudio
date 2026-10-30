@@ -1577,3 +1577,41 @@ def test_retention_candidate_window_bounds_recent_and_low_frontier_history(tmp_p
     assert all("TEMP B-TREE" not in plan for plan in plans)
     assert max(counts) < 10000
     assert counts[1] <= counts[0] + 50
+
+
+def test_file_publication_deadline_rolls_back_written_fact_before_commit(tmp_path, monkeypatch):
+    import chat_store
+    store = ChatStore(tmp_path / "file-deadline.db")
+    store.initialize()
+    original_connect = store._connect
+    original_time = chat_store.time
+    expired = []
+    statements = []
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(original_time, name)
+        def monotonic(self):
+            return float("inf") if expired else original_time.monotonic()
+    monkeypatch.setattr(chat_store, "time", Clock())
+    @contextmanager
+    def traced_connect():
+        with original_connect() as conn:
+            def trace(sql):
+                statements.append(sql)
+                if sql.startswith("INSERT INTO publication_outbox"):
+                    expired.append(True)
+            conn.set_trace_callback(trace)
+            yield conn
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    envelope = {"event_id": "file-deadline", "kind": "file_offer", "chat_id": "owner", "body": {"file_id": "owned"}}
+    with pytest.raises(TimeoutError, match="file_preparation_timeout"):
+        store.commit_durable_fact(pair_id="pair", domain="files", envelope=envelope,
+                                  publication_deadline=original_time.monotonic() + 10)
+    assert "ROLLBACK" in statements
+    with original_connect() as conn:
+        for table in ("durable_facts", "publication_outbox", "v2_feed_state"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    # Non-file/default callers continue to commit without a deadline.
+    stored = store.commit_durable_fact(pair_id="pair", domain="files", envelope=envelope)
+    assert stored["event_id"] == "file-deadline"
+    assert len(store.pending_outbox(pair_id="pair", domain="files")) == 1

@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
@@ -284,6 +285,58 @@ class DesktopFileLibrary:
         self._records.append(record)
         return record
 
+    def prepare_local_file(self, source_path: Path | str, *, deadline: float) -> tuple[Path, str, int]:
+        """Copy privately on the worker; never touch the shared record list."""
+        def check_deadline():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("file_preparation_timeout")
+        check_deadline()
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(str(source))
+        check_deadline()
+        self.storage_dir.parent.mkdir(parents=True, exist_ok=True)
+        # A sibling is on the destination volume but outside sync_storage_dir.
+        descriptor, name = tempfile.mkstemp(prefix=".mc-file-", dir=self.storage_dir.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
+                while True:
+                    check_deadline()
+                    chunk = reader.read(FILE_TRANSFER_CHUNK_SIZE)
+                    check_deadline()
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    check_deadline()
+            check_deadline()
+            shutil.copystat(source, temporary)
+            size = temporary.stat().st_size
+            check_deadline()
+            return temporary, source.name, size
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def commit_prepared_file(self, prepared: tuple[Path, str, int], *, deadline: float) -> FileTransferRecord:
+        """Publish a complete worker copy and register it on the UI thread."""
+        temporary, name, size = prepared
+        if time.monotonic() >= deadline:
+            raise TimeoutError("file_preparation_timeout")
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        target = unique_destination_path(self.storage_dir, name)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("file_preparation_timeout")
+        os.replace(temporary, target)
+        if time.monotonic() >= deadline:
+            target.unlink(missing_ok=True)
+            raise TimeoutError("file_preparation_timeout")
+        return self.add_record(FileTransferRecord(
+            id=f"file-{uuid.uuid4().hex}", name=target.name, stored_path=target,
+            size_bytes=size, direction=FileDirection.DESKTOP_TO_PHONE,
+            status=FileTransferStatus.COMPLETED, created_at=time.time(), transferred_bytes=size,
+        ))
+
     def add_record(self, record: FileTransferRecord) -> FileTransferRecord:
         self._records = [item for item in self._records if item.id != record.id]
         self._records.append(record)
@@ -395,6 +448,7 @@ class CopypartyFileService:
         wait_for_ready: bool = False,
         use_copyparty_process: bool | None = None,
     ):
+        self._start_lock = threading.Lock()
         self.library = library
         self.host = host or "0.0.0.0"
         self.advertised_host = advertised_host or (detect_lan_ip() if host is None else self.host)
@@ -453,14 +507,19 @@ class CopypartyFileService:
             "--no-mv",
         ]
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        # Recovery can be requested concurrently by independent file RPCs.
+        with self._start_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         if self._process is not None and self._process.poll() is None:
-            return
+            return False
         if self._embedded_server is not None:
-            return
+            return False
         if not self.use_copyparty_process:
             self._start_embedded_http_server()
-            return
+            return True
         self._select_bindable_port()
         self.library.storage_dir.mkdir(parents=True, exist_ok=True)
         kwargs = {
@@ -485,6 +544,7 @@ class CopypartyFileService:
                         process.kill()
                         process.wait(timeout=3.0)
                 self._start_embedded_http_server()
+        return True
 
     def _can_bind_port(self, port: int) -> bool:
         try:
@@ -663,6 +723,7 @@ class CopypartyFileService:
 
 class DesktopFileHttpService:
     def __init__(self, library: DesktopFileLibrary, *, host: str = "127.0.0.1", port: int = 0):
+        self._start_lock = threading.Lock()
         self.library = library
         self.host = host
         self.port = int(port)
@@ -676,9 +737,14 @@ class DesktopFileHttpService:
         host, port = self._server.server_address
         return f"http://{host}:{port}"
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        # Recovery can be requested concurrently by independent file RPCs.
+        with self._start_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         if self._server is not None:
-            return
+            return False
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -694,6 +760,7 @@ class DesktopFileHttpService:
         self._server = ThreadingHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        return True
 
     def stop(self) -> None:
         server = self._server

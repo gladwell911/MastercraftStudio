@@ -3494,8 +3494,9 @@ class ChatFrame(wx.Frame):
         if record is not None:
             self._refresh_file_manager_if_visible(selected_id=record.id)
 
-    def _file_offer_for_record(self, record) -> dict:
-        public_route_ready = self._ensure_public_file_route_ready()
+    def _file_offer_for_record(self, record, *, public_route_ready=None, chat_id=None) -> dict:
+        if public_route_ready is None:
+            public_route_ready = self._ensure_public_file_route_ready()
         file_service = getattr(self, "file_service", None)
         error = ""
         if file_service is not None and hasattr(file_service, "download_url_for"):
@@ -3517,7 +3518,7 @@ class ChatFrame(wx.Frame):
                 "size_bytes": record.size_bytes,
                 "download_url": download_url,
             },
-            chat_id=str(getattr(self, "active_chat_id", "") or ""),
+            chat_id=str(getattr(self, "active_chat_id", "") or "") if chat_id is None else chat_id,
         )
         if error:
             event["body"]["error"] = error
@@ -3551,6 +3552,155 @@ class ChatFrame(wx.Frame):
                 self._refresh_file_manager_list(selected_id=selected_id)
         except Exception:
             pass
+
+    def _remote_api_file_command_worker(self, payload: dict, *, source_transport=None) -> tuple[int, dict]:
+        if str(payload.get("type") or "") not in ("file_probe", "file_download_request"):
+            return self._run_remote_ui_route(self._remote_api_file_command_ui, payload)
+        deadline = time.monotonic() + float(getattr(self, "_file_preparation_budget_seconds", 35.0))
+        context = {}
+        unavailable = (503, {"accepted": False, "error": "file_preparation_unavailable"})
+        timed_out = (503, {"accepted": False, "error": "file_preparation_timeout"})
+        capture_deadline = min(deadline, time.monotonic() + 5.0)
+
+        def capture():
+            if getattr(self, "_closing", False):
+                return unavailable
+            transport = getattr(self, "_remote_nats_transport", None)
+            if source_transport is not None and transport is not source_transport:
+                return unavailable
+            library = self.file_library
+            service = getattr(self, "file_service", None)
+            runtime = dict(getattr(self, "remote_nats_runtime_status", {}) or {})
+            body = self._file_command_body(payload)
+            identity = tuple(str(payload.get(k) or body.get(k) or "") for k in ("device_id", "session_id", "epoch", "id"))
+            pair = str(getattr(getattr(transport, "subjects", None), "pair_id", ""))
+            key = (id(transport), pair, *identity)
+            # Finish configuration reads before publishing an in-flight owner.
+            public_base = str(getattr(service, "public_base_url", "") or "").strip()
+            public_url = self._build_remote_nats_url() if public_base else ""
+            captured = dict(library=library, service=service, transport=transport, runtime=runtime,
+                            chat_id=str(payload.get("chat_id") or getattr(self, "active_chat_id", "") or ""),
+                            path=str(body.get("path") or "").strip(), public_base=public_base,
+                            public_url=public_url)
+            if time.monotonic() >= capture_deadline:
+                return timed_out
+            cache = getattr(self, "_file_preparation_requests", None)
+            if cache is None:
+                cache = self._file_preparation_requests = {}
+            entry = cache.get(key) if identity[-1] else None
+            owner = entry is None
+            if owner:
+                if len(cache) >= 128:
+                    for old_key, old_entry in list(cache.items()):
+                        if old_entry["done"].is_set():
+                            del cache[old_key]
+                            break
+                    else:
+                        return unavailable
+                entry = {"done": threading.Event(), "result": None}
+            context.update(captured, entry=entry, owner=owner)
+            if time.monotonic() >= capture_deadline:
+                return timed_out
+            if owner and identity[-1]:
+                cache[key] = entry
+            return 200, {"accepted": True}
+
+        try:
+            status, response = self._run_remote_ui_route(capture, deadline=capture_deadline)
+        except Exception as exc:
+            status, response = 500, {"accepted": False, "error": str(exc)}
+        if status != 200:
+            # Covers the tiny gap between publishing the entry and signaling UI completion.
+            if context.get("owner"):
+                context["entry"]["result"] = status, response
+                context["entry"]["done"].set()
+            return status, response
+        entry = context["entry"]
+        if not context["owner"]:
+            if not entry["done"].wait(max(0.0, deadline - time.monotonic())):
+                return timed_out
+            return entry["result"]
+        def context_available():
+            # Plain captured identities only; no wx calls on the worker.
+            return (not getattr(self, "_closing", False)
+                    and self.file_library is context["library"]
+                    and getattr(self, "file_service", None) is context["service"]
+                    and getattr(self, "_remote_nats_transport", None) is context["transport"]
+                    and (source_transport is None or source_transport is context["transport"])
+                    and dict(getattr(self, "remote_nats_runtime_status", {}) or {}) == context["runtime"])
+
+        prepared = None
+        result = unavailable
+        try:
+            library = context["library"]
+            service = context["service"]
+            if not context_available():
+                return result
+            if service is not None and callable(getattr(service, "start", None)):
+                try:
+                    restored = service.start()
+                except Exception:
+                    result = (503, {"accepted": False, "error": "file_service_unavailable"})
+                    return result
+                if not context_available():
+                    # Close may have stopped this service while start was queued.
+                    # Only undo the instance this worker actually restored.
+                    if restored:
+                        service.stop()
+                    return result
+            if time.monotonic() >= deadline:
+                raise TimeoutError("file_preparation_timeout")
+            prepared = library.prepare_local_file(context["path"], deadline=deadline)
+            ready = True
+            if context["public_base"]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("file_preparation_timeout")
+                ready = bool(context["public_url"]) and self._verify_remote_public_ws(
+                    context["public_url"], timeout_seconds=min(5.0, remaining))[0]
+            if time.monotonic() >= deadline:
+                raise TimeoutError("file_preparation_timeout")
+            if not ready:
+                result = (503, {"accepted": False, "exists": True, "error": "public_file_route_unavailable"})
+            else:
+                commit_deadline = min(deadline, time.monotonic() + 5.0)
+                def commit():
+                    if time.monotonic() >= commit_deadline:
+                        return timed_out
+                    if not context_available():
+                        return unavailable
+                    record = library.commit_prepared_file(prepared, deadline=commit_deadline)
+                    published = False
+                    try:
+                        offer = self._file_offer_for_record(record, public_route_ready=True, chat_id=context["chat_id"])
+                        download_url = str(offer.get("body", {}).get("download_url") or "")
+                        if time.monotonic() >= commit_deadline or not download_url:
+                            return timed_out if time.monotonic() >= commit_deadline else unavailable
+                        if self._broadcast_remote_event(offer, retry_on_failure=False, publication_deadline=commit_deadline) is False:
+                            raise RuntimeError("file_offer_unavailable")
+                        published = True
+                        self._last_file_offer_event = offer
+                    finally:
+                        if not published:
+                            library.delete_record(record.id)
+                    self._refresh_file_manager_if_visible(selected_id=record.id)
+                    return 200, {"accepted": True, "exists": True, "file_id": record.id,
+                                 "name": record.name, "size_bytes": record.size_bytes, "download_url": download_url}
+                result = self._run_remote_ui_route(commit, deadline=commit_deadline)
+        except FileNotFoundError:
+            result = (404, {"accepted": False, "exists": False, "path": context["path"]})
+        except TimeoutError:
+            result = timed_out
+        except Exception as exc:
+            result = (500, {"accepted": False, "error": str(exc)})
+        finally:
+            try:
+                if prepared is not None:
+                    prepared[0].unlink(missing_ok=True)
+            finally:
+                entry["result"] = result
+                entry["done"].set()
+        return result
 
     def _remote_api_file_command_ui(self, payload: dict) -> tuple[int, dict]:
         command_type = str((payload or {}).get("type") or "").strip()
@@ -11684,7 +11834,8 @@ class ChatFrame(wx.Frame):
         except Exception:
             pass
 
-    def _broadcast_remote_event(self, payload: dict) -> None:
+    def _broadcast_remote_event(self, payload: dict, *, retry_on_failure: bool = True,
+                                publication_deadline: float | None = None) -> bool | None:
         transport = getattr(self, "_remote_nats_transport", None)
         store = getattr(self, "chat_store", None)
         if (
@@ -11699,7 +11850,7 @@ class ChatFrame(wx.Frame):
                     store.quarantine("MISSING_OWNER", payload, str(payload.get("event_id") or ""))
                 except Exception:
                     pass
-                return
+                return False if not retry_on_failure else None
             event_id = str(payload.get("event_id") or "").strip() or f"event-{uuid.uuid4().hex}"
             kind = str(payload.get("type") or payload.get("kind") or "event").strip() or "event"
             body = {key: copy.deepcopy(value) for key, value in payload.items()
@@ -11711,6 +11862,7 @@ class ChatFrame(wx.Frame):
                         body[key] = copy.deepcopy(payload[key])
             if kind == "execution_entry":
                 body["kind"] = str(payload.get("kind") or "info").strip() or "info"
+            committed = False
             try:
                 store.commit_durable_fact(
                     pair_id=transport.subjects.pair_id,
@@ -11723,15 +11875,25 @@ class ChatFrame(wx.Frame):
                         "body": body,
                     },
                     execution=kind == "execution_entry",
+                    **({"publication_deadline": publication_deadline} if publication_deadline is not None else {}),
                 )
+                committed = True
                 loop = getattr(transport, "_loop", None)
                 if loop is not None and loop.is_running():
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
                 return True
             except ValueError as exc:
+                if not retry_on_failure:
+                    if committed:
+                        return True
+                    raise
                 if str(exc) in {"EVENT_ID_CONFLICT", "STALE_REVISION"}:
                     return
             except Exception:
+                if not retry_on_failure:
+                    if committed:
+                        return True
+                    raise
                 pending = getattr(self, "_pending_v2_remote_facts", None)
                 if not isinstance(pending, list):
                     pending = []
@@ -11916,7 +12078,7 @@ class ChatFrame(wx.Frame):
         payload.update({"type": "notes_sync_status", "event_id": f"evt-{uuid.uuid4().hex[:8]}", "ts": time.time()})
         self._broadcast_remote_event(payload)
 
-    def _run_remote_ui_route(self, callback, payload: dict | None = None) -> tuple[int, dict]:
+    def _run_remote_ui_route(self, callback, payload: dict | None = None, *, deadline: float | None = None) -> tuple[int, dict]:
         if threading.current_thread() is threading.main_thread():
             return callback(payload) if payload is not None else callback()
         done = threading.Event()
@@ -11925,7 +12087,9 @@ class ChatFrame(wx.Frame):
         cancelled = threading.Event()
 
         def _invoke() -> None:
-            if cancelled.is_set():
+            if cancelled.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                result["value"] = (503, {"accepted": False, "error": "file_preparation_timeout"})
+                done.set()
                 return
             try:
                 result["value"] = callback(payload) if payload is not None else callback()
@@ -11936,7 +12100,7 @@ class ChatFrame(wx.Frame):
 
         if not self._call_after_if_alive(_invoke):
             return 503, {"accepted": False, "error": "ui_unavailable"}
-        if not done.wait(5.0):
+        if not done.wait(5.0 if deadline is None else max(0.0, min(5.0, deadline - time.monotonic()))):
             cancelled.set()
             return 503, {"accepted": False, "error": "ui_timeout"}
         if "error" in result:
@@ -17498,9 +17662,11 @@ class ChatFrame(wx.Frame):
                     on_chat_information=lambda payload: self._run_remote_ui_route(self._remote_api_chat_information_ui, payload),
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
-                    on_file_command=lambda payload: self._run_remote_ui_route(self._remote_api_file_command_ui, payload),
+                    on_file_command=None,
                     durable_store=getattr(self, "chat_store", None),
                 )
+                transport.on_file_command = lambda payload, source_transport=transport: self._remote_api_file_command_worker(
+                    payload, source_transport=source_transport)
                 transport.start_threaded(tcp_url)
             except Exception as exc:
                 last_error = str(exc)
@@ -18120,16 +18286,17 @@ class ChatFrame(wx.Frame):
         )
         return self._verify_remote_public_ws(probe_url)
 
-    async def _verify_remote_public_ws_async(self, url: str) -> tuple[bool, str]:
-        timeout = ClientTimeout(total=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+    async def _verify_remote_public_ws_async(self, url: str, *, timeout_seconds=None) -> tuple[bool, str]:
+        timeout_seconds = REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        timeout = ClientTimeout(total=timeout_seconds)
         parsed_url = urlsplit(str(url or ""))
         path = (parsed_url.path or "").strip().lower()
         nats_token = str((parse_qs(parsed_url.query).get("token") or [""])[0] or "")
         try:
             async with ClientSession(timeout=timeout) as session:
-                async with session.ws_connect(url, heartbeat=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS) as ws:
+                async with session.ws_connect(url, heartbeat=timeout_seconds) as ws:
                     if path.endswith("/nats"):
-                        message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+                        message = await ws.receive(timeout=timeout_seconds)
                         info_text = ""
                         if message.type == WSMsgType.TEXT:
                             info_text = str(message.data or "")
@@ -18146,7 +18313,7 @@ class ChatFrame(wx.Frame):
                             f"CONNECT {json.dumps({'user': 'mobile', 'pass': nats_token, 'verbose': False}, separators=(',', ':'))}\r\nPING\r\n"
                         )
                         while True:
-                            message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+                            message = await ws.receive(timeout=timeout_seconds)
                             if message.type == WSMsgType.TEXT:
                                 response = str(message.data or "")
                             elif message.type == WSMsgType.BINARY:
@@ -18161,7 +18328,7 @@ class ChatFrame(wx.Frame):
                                     await ws.send_str("PONG\r\n")
                                 elif protocol_line.startswith("-ERR"):
                                     return False, f"公网 NATS 隧道认证失败：{protocol_line}"
-                    message = await ws.receive(timeout=REMOTE_CONTROL_HEALTH_TIMEOUT_SECONDS)
+                    message = await ws.receive(timeout=timeout_seconds)
         except Exception as exc:
             return False, f"公网隧道握手失败：{exc}"
         if message.type != WSMsgType.TEXT:
@@ -18173,8 +18340,15 @@ class ChatFrame(wx.Frame):
         ok = payload.get("type") == "connected" and bool(payload.get("ok")) and bool((payload.get("body") or {}).get("accepted"))
         return ok, ("" if ok else f"公网隧道响应异常：{payload}")
 
-    def _verify_remote_public_ws(self, url: str) -> tuple[bool, str]:
-        return asyncio.run(self._verify_remote_public_ws_async(url))
+    def _verify_remote_public_ws(self, url: str, *, timeout_seconds=None) -> tuple[bool, str]:
+        async def verify():
+            if timeout_seconds is None:
+                return await self._verify_remote_public_ws_async(url)
+            return await asyncio.wait_for(self._verify_remote_public_ws_async(url, timeout_seconds=timeout_seconds), timeout_seconds)
+        try:
+            return asyncio.run(verify())
+        except TimeoutError:
+            return False, "public_route_timeout"
 
     def _verify_remote_public_ws_with_retries(self, url: str) -> tuple[bool, str]:
         last_detail = ""

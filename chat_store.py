@@ -766,7 +766,7 @@ class ChatStore:
             return turn_id
 
     def commit_durable_fact(self, *, pair_id: str, domain: str, envelope: dict[str, Any],
-                            execution: bool = False) -> dict[str, Any]:
+                            execution: bool = False, publication_deadline: float | None = None) -> dict[str, Any]:
         """Atomically store an immutable fact and its byte-stable publication row."""
         if not self.v2_writes_enabled:
             raise RuntimeError("V2_READ_ONLY_RECOVERY")
@@ -797,6 +797,11 @@ class ChatStore:
             raise ValueError("INVALID_CANONICAL_VALUE") from exc
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            def check_publication_deadline():
+                if publication_deadline is not None and time.monotonic() >= publication_deadline:
+                    conn.rollback()
+                    raise TimeoutError("file_preparation_timeout")
+            check_publication_deadline()
             if event_id.startswith("projection:"):
                 message_id = str((envelope.get("body") or {}).get("message_id") or "").strip()
                 projection_kind = str((envelope.get("body") or {}).get("kind") or "").strip()
@@ -815,6 +820,7 @@ class ChatStore:
                 comparable = {k: v for k, v in envelope.items() if k != "canonical_hash"}
                 if existing["pair_id"] != normalized_pair or existing["domain"] != normalized_domain or any(original.get(k) != v for k, v in comparable.items()):
                     self._quarantine_conn(conn, "EVENT_ID_CONFLICT", envelope, event_id)
+                    check_publication_deadline()
                     conn.commit()
                     raise ValueError("EVENT_ID_CONFLICT")
                 return original
@@ -847,6 +853,10 @@ class ChatStore:
             conn.execute("INSERT INTO durable_facts(event_id,canonical_hash,kind,pair_id,domain,chat_id,turn_id,revision,sync_sequence,execution_sequence,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (event_id,digest,kind,str(pair_id),str(domain),owner,normalized.get("turn_id"),revision,sync,execution_seq,canonical))
             conn.execute("INSERT INTO publication_outbox(pair_id,domain,sync_sequence,event_id,subject_domain,payload) VALUES(?,?,?,?,?,?)", (str(pair_id),str(domain),sync,event_id,str(domain),payload))
+            check_publication_deadline()
+            if publication_deadline is not None:
+                # The SQLite/OS commit itself cannot be forcibly interrupted.
+                conn.commit()
             return normalized
 
     def commit_attention_notification(self, *, pair_id: str, chat_id: str, kind: str,

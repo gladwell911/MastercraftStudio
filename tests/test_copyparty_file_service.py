@@ -386,3 +386,40 @@ def test_embedded_file_services_exclusively_bind_and_serve_their_own_root(tmp_pa
     finally:
         for service in reversed(services):
             service.stop()
+
+
+def test_concurrent_service_recovery_starts_only_one_process(tmp_path):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    processes = []
+    def factory(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        process = FakeProcess()
+        processes.append(process)
+        return process
+    service = CopypartyFileService(DesktopFileLibrary(tmp_path / "storage"), host="127.0.0.1",
+        port=0, process_factory=factory, use_copyparty_process=True)
+    service._process = ExitedProcess()
+    errors = []
+    def start():
+        try:
+            service.start()
+        except Exception as exc:
+            errors.append(exc)
+    first, second = threading.Thread(target=start), threading.Thread(target=start)
+    try:
+        first.start()
+        assert entered.wait(1)
+        second.start()
+        release.set()
+        first.join(2)
+        second.join(2)
+        assert not first.is_alive() and not second.is_alive()
+        assert errors == [] and len(processes) == 1
+    finally:
+        release.set()
+        first.join(2)
+        if second.ident:
+            second.join(2)
+        service.stop()

@@ -216,3 +216,32 @@ def test_probe_path_reports_missing_file(tmp_path):
         "name": "missing.txt",
         "size_bytes": 0,
     }
+
+
+def test_prepared_copy_is_hidden_until_ui_commit(tmp_path):
+    import time
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"complete payload")
+    library = DesktopFileLibrary(tmp_path / "storage")
+    prepared = library.prepare_local_file(source, deadline=time.monotonic() + 5)
+    try:
+        assert library.sync_storage_dir() == []
+        assert library.list_records() == []
+        record = library.commit_prepared_file(prepared, deadline=time.monotonic() + 5)
+        assert record.stored_path.read_bytes() == source.read_bytes()
+        assert library.list_records() == [record]
+        assert not prepared[0].exists()
+    finally:
+        prepared[0].unlink(missing_ok=True)
+
+
+def test_prepared_copy_expiry_leaves_no_record_or_partial_file(tmp_path):
+    import time
+    import pytest
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"payload")
+    library = DesktopFileLibrary(tmp_path / "storage")
+    with pytest.raises(TimeoutError):
+        library.prepare_local_file(source, deadline=time.monotonic() - 1)
+    assert library.list_records() == []
+    assert list(tmp_path.glob(".mc-file-*")) == []
