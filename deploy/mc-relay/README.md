@@ -1,4 +1,4 @@
-# 第一批 MC relay 准备产物
+﻿# 第一批 MC relay 准备产物
 
 模板已用于第一批真实部署：四域DNS-only A、目标Lighthouse实例两端口规则、独立证书和frps/Caddy/renew.timer已落地；仅首台default路由配置。Windows临时frpc已通过官方校验并运行，三处认证PONG、错误CA拒绝和正式deploy后自动恢复已实测。实体手机默认CELLULAR条件下系统信任TLS与真实HTTPS请求也已通过（手机存在ClashMeta VPN，未改）；第一批已由engineer独立验收通过，并完成一次限范围审查；第二、三批未开始。用户不以恢复Windows防火墙作为本批门槛；最新状态以 `_bmad-output/implementation-artifacts/plan-frp-caddy-01-server.md` 为准。以下保留安装/检查模板，所有占位符仍须按实际值填写。
 
@@ -92,3 +92,40 @@ frps 重启会短暂断开新隧道，必须实测 frpc 自动恢复。复查旧
 Upload deploy-cert.sh with LF line endings; .gitattributes pins LF for this script.
 
 2026-10-20 笔记本 FRP 部署入口见 [LAPTOP.md](LAPTOP.md)。私有 bundle 在仓库外；普通权限运行 setup-laptop.ps1，原目录保留 history，先由用户退出旧 MC。以后升级也使用 setup 入口；原 package 默认启动不保证 external 模式。手机待笔记本验证成功再改 laptop 地址，default 不变。
+
+## Desktop independent FRP supervisors (2026-10-30)
+
+The source of truth for both desktop runtime wrappers is `install-frpc-supervisor.ps1` in this directory. ControlTower's historical setup instructions can recreate an obsolete wrapper: use this installer for all future relay setup. The dirty ControlTower repository is deliberately not changed. Laptop installation remains separate and is outside this desktop rollout.
+
+`MCRelay-frpc` owns only `%LOCALAPPDATA%\MCRelay\frpc.toml`; `ControlTower-frpc` owns only `%LOCALAPPDATA%\controlTower\relay\frpc.toml`. Both reuse the existing MCRelay `frpc.exe`. Ownership uses normalized absolute config paths parsed from Windows argv, never an executable-only test. A per-user/config Global mutex spans the supervisor lifetime; a replacement supervisor adopts one exact orphan and refuses multiple matches. Every child exit is recovered with bounded backoff. Proxy variables are removed only from the child's environment. Logs contain fixed state labels, not command lines or exceptions that might expose credentials.
+
+Run from the source directory after inspecting the existing wrappers:
+
+```powershell
+.\install-frpc-supervisor.ps1 -Profile All -AdoptExisting # first adoption only
+.\install-frpc-supervisor.ps1 -Profile MCRelay           # repeat installation/update
+```
+
+The installer verifies both unchanged configs before mutation, checks deployed script hashes and refuses external drift, then backs up each affected task XML and scripts under `%LOCALAPPDATA%\MCRelay-supervisor-backups`. It updates one profile at a time and rolls back only that profile on failure. It preserves configs, CA, shared executable and current-user interactive login. Both tasks retain one-minute failure retry, IgnoreNew, no duration limit and battery operation; login plus a one-minute supplemental trigger and StartWhenAvailable recover a lost wrapper. This requires a logged-in user; unattended boot availability is not promised.
+
+For precise maintenance, select the profile explicitly (ControlTower uses its own runtime directory and task name):
+
+```powershell
+$runtime = Join-Path $env:LOCALAPPDATA 'MCRelay'
+$arguments = @{
+    Executable = (Join-Path $env:LOCALAPPDATA 'MCRelay\frpc.exe')
+    Config = (Join-Path $runtime 'frpc.toml')
+    RuntimeDirectory = $runtime
+    TaskName = 'MCRelay-frpc'
+}
+& (Join-Path $runtime 'frpc-supervisor.ps1') -Mode Status @arguments
+& (Join-Path $runtime 'frpc-supervisor.ps1') -Mode Stop @arguments
+# Maintain this profile while its task is disabled and maintenance marker is present.
+& (Join-Path $runtime 'frpc-supervisor.ps1') -Mode Resume @arguments
+```
+
+Stop validates the task action, sets a persistent maintenance marker, disables/stops that exact task, obtains the same lifetime lock and revalidates each matching child's PID, creation time and config before stopping. Stopping PowerShell alone does not stop its FRP child. Resume removes the marker and enables/starts the task. Status reports exact owned PIDs, supervisor/maintenance state and hash drift without secrets. Do not bypass a drift refusal: inspect the runtime changes and preserve a private backup before reconciling source ownership. Never upgrade the shared binary while either profile runs; stop both precisely first, then verify both configs and resume both.
+
+Verification: run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test_frpc_supervisor.ps1` from the repository. It creates a unique temporary fake executable/config directory and never uses daily tasks or applications. Deployment evidence and the current acceptance limits are in `docs/handoff.md` and the implementation plan.
+
+Maintenance and installation now share a separate per-identity operation lock, held through preflight and success/rollback; nested Stop/Resume uses recursive mutex acquisition. Resume does not enable a task when marker removal fails. The managed manifest must include both script hashes and matching profile/config/executable/task identity. Successful installation waits up to20seconds for an active supervisor and exactly one child; failure restores original script/manifest bytes, maintenance marker bytes/existence and task state. Run the additional isolated installer suite with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test_frpc_installer.ps1`; it uses temporary files and mocked tasks, never daily tasks.

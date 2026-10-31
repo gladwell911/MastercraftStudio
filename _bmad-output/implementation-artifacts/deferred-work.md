@@ -19,3 +19,10 @@
 ## Deferred from: code review of plan-fix-codex-steer-answer-ownership (2026-10-02)
 
 - [resolved 2026-10-02] main.py:13351 最新owner失效阻断completion_owners的候选已由相关item容量错误的真实写入链证实并修复。逐owner收尾保留原身份及generation守卫；有效较早owner完成，failed/stale owner不复活。独立integration回归通过。原审查：review-codex-steer-98a0d34-dog-20261002.md；修复：plan-fix-codex-steer-review-findings.md。
+
+- source_plan: plan-frpc-independent-supervision.md
+  summary: Restore the pre-existing ControlTower API origin on host18679 separately from FRP supervision.
+  evidence: FRP login/proxy registration succeeded, while localhost18679 refused connection and existing API container had no host port mapping; this change does not restart or reconfigure that application.
+- source_plan: plan-frpc-independent-supervision.md
+  summary: Confirm real phone main-package connection when USB ADB device is online.
+  evidence: MC direct/bridge/public authentication returned matching server IDs, but existing SDK ADB server5037 listed no device during final acceptance.

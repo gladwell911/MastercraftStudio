@@ -1,4 +1,4 @@
-# 当前交接
+﻿# 当前交接
 
 更新日期：2026-10-27。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。当前完成 Codex 默认访问权限改动的源码验证，准备提交推送；未重新打包或重启日常 MC。以下通知部署结论仍对应 2026-10-26。
 
@@ -40,3 +40,22 @@
 ## 接续证据
 
 私有诊断和验收 JSON 归档在仓库外 `D:/code/sj/_bmad-output/implementation-artifacts/notification-deployment-20261026/`，不提交日志、凭据或 APK。长期入口为 [远程配置](remote-control.md)、[文档索引](README.md)、[经验](experience.md)、[反思](reflection.md)。
+
+## 2026-10-30 desktop FRP independent supervision
+
+Source tooling: `deploy/mc-relay/frpc-supervisor.ps1` and `install-frpc-supervisor.ps1`; runtime copies and minimal wrappers are installed for `MCRelay-frpc` and `ControlTower-frpc`. Both use exact normalized config/Windows argv ownership with a per-user/config Global lifetime mutex, orphan adoption, bounded child recovery, maintenance stop/resume and deployed hash drift detection. Future desktop relay setup must use this installer; historical ControlTower instructions can replace the wrapper incorrectly. ControlTower source remains untouched; laptop rollout is excluded. No commit/push or package rebuild performed.
+
+Both unchanged configs passed `frpc verify`. Actual tasks have current-user interactive logon plus one-minute supplemental trigger, IgnoreNew, StartWhenAvailable, unlimited duration, battery operation and existing one-minute/999 failure retry. Runtime script/task backups are outside Git under `%LOCALAPPDATA%/MCRelay-supervisor-backups/20261030-230838-820` (original) and `20261030-230932-097` (successful task-trigger update). The first attempted hand-built trigger XML was rejected; the system task-trigger API replaced that implementation, and both tasks were successfully registered and inspected afterward.
+
+Windows PowerShell 5.1 isolated fake-child matrix passed in full, including spaces/case/slashes, quoted config, same-EXE independent configs, concurrent wrapper, child-only proxy cleanup, orphan adoption/abandoned lock, duplicate refusal, zero/nonzero exits, precise stop/maintenance suppression, missing config/access denial and safe Status. Actual controlled recovery: MC child 30100→14776 with ControlTower 17404 unchanged; ControlTower 17404→15888 with MC 14776 unchanged; MC wrapper 29284 was terminated and the scheduled supplement adopted surviving child 14776. Each config finished with one child and a running task.
+
+Authenticated direct18081/bridge18080/new-public `wss://mc-desktop-test.tingyou.cc:8443/nats` all returned PONG with identical server ID; `https://forum-dev-test.tingyou.cc:8443/` returned HTTP200 with normal certificate verification after recovery. Earlier probes against historical rc/tingyou endpoints included transient timeouts and are not evidence for the new FRP path. Daily MC PID7480 and creation time remained unchanged, and both config SHA256 values were identical before/after. Tokens were read only into probe memory; no model request, business write, phone setting change, CA/token/config rewrite or shared service restart occurred.
+
+Remaining acceptance limits: ControlTower FRP successfully logs in/registers `controltower-api`, but public HTTPS returns502 because unchanged `127.0.0.1:18679` refuses connection; existing `ctkeepall_498eae7dc5-api-1` container is present without a host port mapping. API restoration/port publishing needs separate authorized service work; this repair did not restart it. Existing SDK ADB server5037 is alive but reports no devices, so actual phone main-package/connection acceptance remains unverified. Login startup is configured, not unattended boot availability or a reboot test.
+Private actual outputs: `C:\Users\gladwell\AppData\Local\MCRelay-supervisor-evidence\20261030-230836` (`isolated-tests.txt`, `before.json`, `after.json`, `recovery.json`, `probes-frp-final.json`). Probe scripts there read existing credentials at runtime; no secrets/configs/raw response bodies enter Git.
+
+### 2026-10-30 review fixes and redeployment
+
+Added operation locking across Stop/Resume and installer preflight/success/rollback, strict managed-manifest identity/hash validation, fail-closed Resume marker removal, -c= ownership, exact maintenance/task-state rollback and bounded installation readiness. Both targeted Windows PowerShell5.1 suites passed (`tests/test_frpc_supervisor.ps1` and `tests/test_frpc_installer.ps1`), covering concurrency, normal/maintenance/managed rollback, startup failure, drift refusal and marker-removal failure. No production test parameters were added.
+
+Redeployed both profiles via installer; private backup `%LOCALAPPDATA%/MCRelay-supervisor-backups/20261030-232704-694`. Final source/helper runtime bytes match exactly; both manifests clean, tasks enabled/running, exactly one child per config (MC20932, ControlTower20904). Both config hashes and daily MC PID7480/creation time stayed unchanged. Final direct/bridge/FRP-public PONG server IDs match and FRP forum HTTPS200/TLS verified. Existing ControlTower API/phone acceptance limits above remain; neither was restarted or changed. Actual output directory: `C:\Users\gladwell\AppData\Local\MCRelay-supervisor-evidence\review-fixes-20261030-232443` (`supervisor-tests.txt`, `installer-tests.txt`, `deployment.txt`, `status.json`, `before.json`, `after.json`, `probes-frp-final.json`).
