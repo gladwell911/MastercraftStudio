@@ -12,6 +12,8 @@
 
 ## MC 配置
 
+2026-11-02 源码新增台式机旧 external 入口的启动迁移：当身份为 `default`、隧道模式为 `external`，且没有显式 DOMAIN/HOST/PORT 环境覆盖时，旧默认 `wss://rc.tingyou.cc/nats` 会迁移为 `wss://mc-desktop-test.tingyou.cc:8443/nats`。机器配置原子保存，app_state 沿现有保存流程同步，原 token 保留；文件公网来源为 `https://mc-desktop-test.tingyou.cc:8443`。笔记本、自定义域、显式环境地址及 cloudflared 模式不迁移。此逻辑只在新源码/新包启动时生效，不改变已运行实例；日常包部署和实体 APK 下载仍需另行验收。
+
 首次启动笔记本前，在其运行环境中设置：
 
 ```powershell

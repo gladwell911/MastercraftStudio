@@ -4865,10 +4865,10 @@ class ChatFrame(wx.Frame):
         machine = load_machine_config(machine_path,
                                       default_domain=self.remote_control_domain or DEFAULT_REMOTE_CONTROL_DOMAIN,
                                       default_token=self.remote_control_token or DEFAULT_REMOTE_CONTROL_TOKEN)
+        changed = self.remote_control_domain != machine["domain"]
         self.remote_control_pair_id = machine["pair_id"]
         self.remote_control_domain = machine["domain"]
         self.remote_control_token = machine["token"]
-        changed = False
         has_domain_env = self._has_remote_control_env(
             "REMOTE_CONTROL_DOMAIN",
             "CLAUDECODE_REMOTE_CONTROL_DOMAIN",

@@ -46,6 +46,16 @@ def load_machine_config(path: Path, *, default_domain: str, default_token: str,
         # Parsing the authority alone does not validate numeric/ranged ports.
         uri.port
         domain = urlunsplit((scheme, uri.netloc, "" if scheme == "nats" else "/nats", "", ""))
+    # The desktop external relay moved independently of the old Cloudflare
+    # endpoint. Upgrade only its inherited default; explicit routing still wins.
+    explicit_route = any(str(env.get(key) or "").strip() for name in ("DOMAIN", "HOST", "PORT")
+                         for key in (f"REMOTE_CONTROL_{name}", f"CLAUDECODE_REMOTE_CONTROL_{name}"))
+    tunnel_mode = next((str(env[key]).strip().lower() for key in (
+        "REMOTE_CONTROL_TUNNEL_MODE", "CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE")
+        if str(env.get(key) or "").strip()), "cloudflared")
+    if (pair == "default" and tunnel_mode == "external" and not explicit_route
+            and domain == "wss://rc.tingyou.cc/nats"):
+        domain = "wss://mc-desktop-test.tingyou.cc:8443/nats"
     token = "".join(setting("TOKEN", default_token if pair == "default" else "").split())
     config = {"pair_id": pair, "domain": domain, "token": token}
     if config != persisted:

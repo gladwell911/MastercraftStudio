@@ -28,6 +28,8 @@ def disable_system_hooks(monkeypatch):
     monkeypatch.setenv("AUTO_START_QUICK_TUNNEL", "0")
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "0")
     monkeypatch.setenv("DESKTOP_FILE_SERVICE_AUTOSTART", "0")
+    monkeypatch.delenv("REMOTE_CONTROL_TUNNEL_MODE", raising=False)
+    monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_HOST", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_PORT", raising=False)

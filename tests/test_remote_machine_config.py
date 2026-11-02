@@ -6,6 +6,39 @@ from pathlib import Path
 from remote_machine_config import load_machine_config
 
 
+@pytest.mark.parametrize('pair,domain,overrides,expected', [
+    ('default', 'wss://rc.tingyou.cc/nats', {}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'https://rc.tingyou.cc/old', {}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://custom.example/nats', {}, 'wss://custom.example/nats'),
+    ('laptop', 'wss://rc.tingyou.cc/nats', {}, 'wss://rc.tingyou.cc/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_TUNNEL_MODE': 'cloudflared'}, 'wss://rc.tingyou.cc/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': 'wss://rc.tingyou.cc/nats'}, 'wss://rc.tingyou.cc/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_DOMAIN': 'wss://rc.tingyou.cc/nats'}, 'wss://rc.tingyou.cc/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_PORT': '18080'}, 'wss://rc.tingyou.cc/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_HOST': ''}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_HOST': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_PORT': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_PORT': ''}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+])
+def test_external_desktop_legacy_route_migration(tmp_path, pair, domain, overrides, expected):
+    path = tmp_path / 'machine.json'
+    path.write_text(json.dumps(dict(pair_id=pair, domain=domain, token='original-secret')), encoding='utf-8')
+    env = {'REMOTE_CONTROL_TUNNEL_MODE': 'external', **overrides}
+    loaded = load_machine_config(path, default_domain='', default_token='', environ=env)
+    assert loaded == dict(pair_id=pair, domain=expected, token='original-secret')
+    assert json.loads(path.read_text(encoding='utf-8')) == loaded
+    before = path.stat().st_mtime_ns
+    assert load_machine_config(path, default_domain='', default_token='', environ=env) == loaded
+    assert path.stat().st_mtime_ns == before
+
+
+def test_external_desktop_without_machine_file_migrates_legacy_app_state(tmp_path):
+    loaded = load_machine_config(tmp_path / 'machine.json',
+        default_domain='wss://rc.tingyou.cc/nats', default_token='app-state-secret',
+        environ={'CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE': 'external'})
+    assert loaded == dict(pair_id='default', domain='wss://mc-desktop-test.tingyou.cc:8443/nats', token='app-state-secret')
+
+
 @pytest.mark.parametrize("domain", [
     "ftp://host.example", "wss://user:secret@host.example", "wss://host.example:not-a-port",
     "wss://host.example:65536", "wss://host.example:-1", "nats://host.example:invalid",

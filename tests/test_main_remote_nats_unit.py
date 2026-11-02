@@ -5,6 +5,27 @@ import main
 import pytest
 
 
+def test_external_desktop_startup_migrates_machine_and_file_origin(frame, tmp_path, monkeypatch):
+    monkeypatch.setenv('REMOTE_CONTROL_TUNNEL_MODE', 'external')
+    machine_path = tmp_path / 'remote_machine.json'
+    machine_path.write_text(json.dumps(dict(pair_id='default', domain='wss://rc.tingyou.cc/nats', token='kept-secret')), encoding='utf-8')
+    frame.remote_control_domain = 'wss://rc.tingyou.cc/nats'
+    saved = []
+    def save():
+        saved.append(frame.remote_control_domain)
+        frame._save_state(persist_chat_history=False)
+    monkeypatch.setattr(frame, '_defer_chat_state_save', save)
+    frame._initialize_remote_control_settings()
+    assert saved and saved[-1] == 'wss://mc-desktop-test.tingyou.cc:8443/nats'
+    assert frame._build_remote_nats_url() == 'wss://mc-desktop-test.tingyou.cc:8443/nats?token=kept-secret'
+    frame.remote_nats_runtime_status = {'enabled': True}
+    assert frame._cloudflare_file_public_base_url() == 'https://mc-desktop-test.tingyou.cc:8443'
+    assert json.loads(machine_path.read_text(encoding='utf-8'))['token'] == 'kept-secret'
+    state = json.loads(frame.state_path.read_text(encoding='utf-8'))
+    assert state['remote_control_domain'] == 'wss://mc-desktop-test.tingyou.cc:8443/nats'
+    assert state['remote_control_token'] == 'kept-secret'
+
+
 def test_recent_collection_pages_search_and_stale_cursor_preserve_canonical_chats(frame):
     frame.active_chat_id = frame.current_chat_id = ""
     frame.active_session_turns = []
