@@ -27,7 +27,12 @@ def load_machine_config(path: Path, *, default_domain: str, default_token: str,
     def setting(name, fallback):
         for key in (f"REMOTE_CONTROL_{name}", f"CLAUDECODE_REMOTE_CONTROL_{name}"):
             if key in env:
-                return str(env[key]).strip()
+                value = str(env[key]).strip()
+                # Runtime ignores blank address overrides; TOKEN still allows
+                # an explicit empty value to clear the saved credential.
+                if name == "DOMAIN" and not value:
+                    continue
+                return value
         return str(persisted.get(name.lower(), fallback) or "").strip()
     explicit_pair = next((str(env[key]).strip() for key in (
         "REMOTE_CONTROL_PAIR_ID", "CLAUDECODE_REMOTE_CONTROL_PAIR_ID") if key in env), None)

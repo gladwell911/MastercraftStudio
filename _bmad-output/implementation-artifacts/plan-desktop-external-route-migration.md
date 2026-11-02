@@ -48,3 +48,8 @@ context:
 ## Review Triage Log
 
 - quick独立审查1项：medium / patch。环境变量存在但HOST/PORT为空白时，主运行配置忽略该值，迁移也应忽略。已改为非空白判断，新增REMOTE_CONTROL及CLAUDECODE两类别名的HOST/PORT共4例。最终同一完整定向选择45 passed / 1050 deselected（4.91s）。无defer项。
+
+### 新Dog四视角审查后续
+
+- P1 / medium / patch：空白DOMAIN在setting按键存在取值，导致旧域迁移失效；两个别名已用隔离fixture复现。由bmad-build-auto计划plan-fix-blank-domain-migration.md处理。
+- D1 token-only app_state保存、D2 Windows并发replace WinError5为既有行为，留在审查报告，未扩大本次迁移修复。

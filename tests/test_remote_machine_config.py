@@ -19,6 +19,13 @@ from remote_machine_config import load_machine_config
     ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_HOST': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
     ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_PORT': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
     ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_PORT': ''}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': ''}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_DOMAIN': ''}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'CLAUDECODE_REMOTE_CONTROL_DOMAIN': '  '}, 'wss://mc-desktop-test.tingyou.cc:8443/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': ' ', 'CLAUDECODE_REMOTE_CONTROL_DOMAIN': 'https://alias.example'}, 'wss://alias.example/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': 'https://primary.example', 'CLAUDECODE_REMOTE_CONTROL_DOMAIN': 'https://alias.example'}, 'wss://primary.example/nats'),
+    ('default', 'wss://rc.tingyou.cc/nats', {'REMOTE_CONTROL_DOMAIN': '', 'CLAUDECODE_REMOTE_CONTROL_DOMAIN': 'wss://rc.tingyou.cc/nats'}, 'wss://rc.tingyou.cc/nats'),
 ])
 def test_external_desktop_legacy_route_migration(tmp_path, pair, domain, overrides, expected):
     path = tmp_path / 'machine.json'
@@ -30,6 +37,15 @@ def test_external_desktop_legacy_route_migration(tmp_path, pair, domain, overrid
     before = path.stat().st_mtime_ns
     assert load_machine_config(path, default_domain='', default_token='', environ=env) == loaded
     assert path.stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize('token_key', ['REMOTE_CONTROL_TOKEN', 'CLAUDECODE_REMOTE_CONTROL_TOKEN'])
+def test_external_desktop_blank_domain_preserves_explicit_token_clear(tmp_path, token_key):
+    path = tmp_path / 'machine.json'
+    path.write_text(json.dumps(dict(pair_id='default', domain='wss://rc.tingyou.cc/nats', token='old-secret')), encoding='utf-8')
+    loaded = load_machine_config(path, default_domain='', default_token='', environ={
+        'REMOTE_CONTROL_TUNNEL_MODE': 'external', 'REMOTE_CONTROL_DOMAIN': ' ', token_key: ''})
+    assert loaded == dict(pair_id='default', domain='wss://mc-desktop-test.tingyou.cc:8443/nats', token='')
 
 
 def test_external_desktop_without_machine_file_migrates_legacy_app_state(tmp_path):

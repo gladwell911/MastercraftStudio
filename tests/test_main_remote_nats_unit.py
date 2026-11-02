@@ -5,8 +5,13 @@ import main
 import pytest
 
 
-def test_external_desktop_startup_migrates_machine_and_file_origin(frame, tmp_path, monkeypatch):
+@pytest.mark.parametrize('domain_env', [{}, {'REMOTE_CONTROL_DOMAIN': ''},
+    {'REMOTE_CONTROL_DOMAIN': '  '}, {'CLAUDECODE_REMOTE_CONTROL_DOMAIN': ''},
+    {'CLAUDECODE_REMOTE_CONTROL_DOMAIN': '  '}])
+def test_external_desktop_startup_migrates_machine_and_file_origin(frame, tmp_path, monkeypatch, domain_env):
     monkeypatch.setenv('REMOTE_CONTROL_TUNNEL_MODE', 'external')
+    for key, value in domain_env.items():
+        monkeypatch.setenv(key, value)
     machine_path = tmp_path / 'remote_machine.json'
     machine_path.write_text(json.dumps(dict(pair_id='default', domain='wss://rc.tingyou.cc/nats', token='kept-secret')), encoding='utf-8')
     frame.remote_control_domain = 'wss://rc.tingyou.cc/nats'
