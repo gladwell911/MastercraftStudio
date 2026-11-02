@@ -12,7 +12,7 @@
 
 ## MC 配置
 
-2026-11-02 源码新增台式机旧 external 入口的启动迁移：当身份为 `default`、隧道模式为 `external`，且没有显式 DOMAIN/HOST/PORT 环境覆盖时，旧默认 `wss://rc.tingyou.cc/nats` 会迁移为 `wss://mc-desktop-test.tingyou.cc:8443/nats`。机器配置原子保存，app_state 沿现有保存流程同步，原 token 保留；文件公网来源为 `https://mc-desktop-test.tingyou.cc:8443`。笔记本、自定义域、显式环境地址及 cloudflared 模式不迁移。此逻辑只在新源码/新包启动时生效，不改变已运行实例；日常包部署和实体 APK 下载仍需另行验收。
+2026-11-02 源码新增台式机旧 external 入口的启动迁移：当身份为 `default`、隧道模式为 `external`，且没有非空白的显式 DOMAIN/HOST/PORT 环境覆盖时，旧默认 `wss://rc.tingyou.cc/nats` 会迁移为 `wss://mc-desktop-test.tingyou.cc:8443/nats`。机器配置原子保存，app_state 沿现有保存流程同步，原 token 保留；文件公网来源为 `https://mc-desktop-test.tingyou.cc:8443`。笔记本、自定义域、显式环境地址及 cloudflared 模式不迁移。此逻辑只在新源码/新包启动时生效，不改变已运行实例；2026-11-02日常新入口及实体97MB完整下载已验证；稍后空白DOMAIN补丁部署仍待核实，速度瓶颈未知，见[交接](handoff.md)。
 
 首次启动笔记本前，在其运行环境中设置：
 
@@ -22,7 +22,7 @@ $env:REMOTE_CONTROL_DOMAIN = 'wss://your-laptop.example/nats'
 $env:REMOTE_CONTROL_TOKEN = '<private-laptop-token>'
 ```
 
-这些值只是配置示例。`CLAUDECODE_REMOTE_CONTROL_*` 同名变量仍兼容，`REMOTE_CONTROL_*` 优先。机器身份的优先级为显式 `PAIR_ID` 环境变量、计算机名、持久值、`default`：`emperorComputer` 自动识别为 `default`，`emperorLaptop` 自动识别为 `laptop`，名称忽略大小写和首尾空格；其他名称沿用持久身份或旧默认。`DOMAIN` 和 `TOKEN` 的显式环境变量仍优先，否则沿用同身份持久值。身份切换会丢弃另一身份的持久地址和 token，笔记本不会继承台式凭据；改名后若识别为新身份，需要单独配置该机器的地址和 token。配置保存到 `app_data_dir/remote_machine.json`，不要把该文件或真实 token 提交到 Git。
+这些值只是配置示例。`CLAUDECODE_REMOTE_CONTROL_*` 同名变量仍兼容，`REMOTE_CONTROL_*` 优先。机器身份的优先级为显式 `PAIR_ID` 环境变量、计算机名、持久值、`default`：`emperorComputer` 自动识别为 `default`，`emperorLaptop` 自动识别为 `laptop`，名称忽略大小写和首尾空格；其他名称沿用持久身份或旧默认。`DOMAIN`跳过空白主变量、继续兼容别名，再沿用同身份持久值；`TOKEN`显式空值仍清除凭据。身份切换会丢弃另一身份的持久地址和 token，笔记本不会继承台式凭据；改名后若识别为新身份，需要单独配置该机器的地址和 token。配置保存到 `app_data_dir/remote_machine.json`，不要把该文件或真实 token 提交到 Git。
 
 `DOMAIN` 可输入域名或 ws/wss/http/https/nats URL；HTTP 转为对应 WebSocket，WebSocket 路径规范为 `/nats`。传输主题、执行游标、已读事件、复制连接 URL 与公开文件 URL 均采用该机器配置。公开文件 base URL 使用其对应 HTTP(S) 来源。
 

@@ -1,5 +1,15 @@
 # 纠错反思
 
+## 2026-11-03 文档收尾
+
+本次无实质性纠正。仅依据实现和已有报告同步过期快照。
+
+## 2026-11-02 启动迁移审查纠正
+
+| 修改内容 | 错误归因 | 下次指令建议 |
+|---|---|---|
+| 审查复现空白DOMAIN按键存在遮盖持久域，导致迁移失效；18221e2修正有效值优先级 | 判断逻辑有问题 | 配置迁移先比较真实运行时的有效值规则；DOMAIN空值回退与TOKEN空值清除分别测试，并核真实初始化后的状态和文件origin。 |
+
 ## 2026-10-27 默认访问权限验证
 
 本次无实质性纠正。
@@ -113,7 +123,6 @@
 
 完整纠错记录见 [归档原文](archive/entry-context-2026-09-29/reflection.md)。
 - Recovery QA needs the complete authoritative final-answer protocol; a delta is insufficient. Native Alt+A automatically resends the first question, so a cleared empty-turn expectation is wrong. Activate the native GUI event loop and await visible answer rows after the existing navigation quiet interval; done status alone is not visible-answer evidence. Record the configured startup attempt budget, actual child exit and final request state.
-
 
 The final combined review found two asynchronous identity gaps missed by the initial recovery scenarios. Exception/overflow prior-owner regressions and paired retired/current client UI tests now cover both; the focused dog follow-up checks the repaired boundaries without restarting the entire review.
 
