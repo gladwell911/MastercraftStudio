@@ -53,15 +53,29 @@ def test_local_ready_precedes_connection_and_early_stop_preserves_all_pcm(contro
 
 
 @pytest.mark.parametrize('mode', [MODE_DIRECT, MODE_OPTIMIZE])
-def test_latest_text_and_identical_utterances_in_distinct_generations(controller, rig, mode):
+def test_latest_text_and_identical_utterances_in_distinct_generations(controller, rig, mode, monkeypatch):
     c, seen = controller
+    rig.interim_texts = ['opening', 'opening phrase']
+    updates = []
+    stream_text = c._stream_text
+    def observe(session, text):
+        stream_text(session, text)
+        updates.append((session.generation, text))
+    monkeypatch.setattr(c, '_stream_text', observe)
     rig.connect.set()
-    for _ in range(2):
+    for index in range(2):
         c.start_recording(mode)
         wait_until(lambda: c.state == 'recording')
+        generation = c.generation
+        wait_until(lambda: len(updates) == index * 3 + 2)
+        assert updates[-2:] == [(generation, text) for text in rig.interim_texts]
+        assert seen['results'] == [(rig.text, mode)] * index
         c.stop_and_transcribe()
         wait_until(lambda: c.state == 'idle')
+        assert updates[-1] == (generation, rig.text)
+        assert seen['results'] == [(rig.text, mode)] * (index + 1)
     assert seen['results'] == [(rig.text, mode), (rig.text, mode)]
+    assert not seen['errors']
 
 
 @pytest.mark.parametrize('phase', ['starting', 'recording', 'finishing'])

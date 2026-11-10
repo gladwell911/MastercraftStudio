@@ -31,6 +31,7 @@ class VoiceRig:
         self.first = b'A' * 6400
         self.tail = b''
         self.text = 'opening phrase opening phrase'
+        self.interim_texts = []
         self.streams = []
         self.sockets = []
         self.sessions = []
@@ -85,9 +86,10 @@ class VoiceRig:
                     # Driver reports an error after releasing its handle.
                     raise OSError('controlled device close failure')
 
-        def final():
-            body = gzip.compress(json.dumps({'result': {'text': rig.text}}).encode())
-            return types.SimpleNamespace(type='binary', data=b'\x11\x93\x11\x00' + struct.pack('>iI', -1, len(body)) + body)
+        def response(text, is_final=True):
+            body = gzip.compress(json.dumps({'result': {'text': text}}).encode())
+            header = b'\x11\x93\x11\x00' if is_final else b'\x11\x91\x11\x00'
+            return types.SimpleNamespace(type='binary', data=header + struct.pack('>iI', -1 if is_final else 1, len(body)) + body)
 
         class WebSocket:
             def __init__(self):
@@ -104,16 +106,19 @@ class VoiceRig:
                         raise OSError('controlled send failure')
                     rig.packets.append((sequence, gzip.decompress(data[12:])))
                     if sequence < 0:
-                        await self.messages.put(final())
+                        await self.messages.put(response(rig.text))
                         rig.terminal_received.set()
                         while not rig.terminal_return_gate.is_set():
                             await asyncio.sleep(.001)
                         if rig.fail_terminal:
                             raise OSError('controlled terminal send failure')
                 elif rig.early_final:
-                    await self.messages.put(final())
+                    await self.messages.put(response(rig.text))
                 elif rig.receive_fault:
                     await self.messages.put(rig.receive_fault)
+                else:
+                    for text in rig.interim_texts:
+                        await self.messages.put(response(text, is_final=False))
 
             def __aiter__(self):
                 return self
