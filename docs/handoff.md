@@ -1,20 +1,23 @@
 # 当前交接
 
-更新日期：2026-11-10。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。本阶段已完成语音本地先录、收尾竞态修复及累计文本回归补强；这是源码与软件验证完成状态，未打包、替换或重启日常 MC。稳定使用/实现说明见 [语音输入](voice-input.md)，其他项目入口见 [文档索引](README.md)。
+更新日期：2026-11-10。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。本阶段已完成语音本地先录、收尾竞态修复、累计文本回归补强及默认豆包流式识别 2.0 升级；源码软件回归与固定样本真实云端识别通过，未打包、替换或重启日常 MC。稳定使用/实现说明见 [语音输入](voice-input.md)，其他项目入口见 [文档索引](README.md)。
+
+本次 neat-freak 已同步交接、索引、反思与经验，定向回归 42 项及文档链接/diff 检查通过。用户已明确授权保留 `realtime_asr.py` 的既有硬编码配置并继续提交、推送，因此本轮不改动该配置；该授权解除此次 Git 收尾的凭据门禁。RC 工作区干净，无需新提交。未生成构建包、录音或临时交付产物。
 
 ## 语音输入：已完成与证据
 
+- 2.0 升级 `8f16036`：默认资源为 `volc.seedasr.sauc.duration`，默认 WebSocket 路径为 `/api/v3/sauc/bigmodel_async`，`model_name=bigmodel` 不变；显式环境覆盖保留，资源与接口须配套。现有凭据配合 `rc/rtjava/whoareyou.wav` 经真实 `RealtimeAsrClient` 返回“你是谁？你叫什么名字？”，`terminal_sent/final_received=true`，`cleanup_error` 为空。旧 `/bigmodel` 路径配 2.0 资源实测 HTTP 400，不应只换资源而保留旧默认路径。独立 quick 审查无发现；固定样本成功不能替代麦克风、物理双 Ctrl 与焦点插入验收。RC 未修改或重新部署。
 - 实现 `2a089f22f459b4ed465f4d83195c98645e57977c`：设备启动且首帧入队后提示就绪，ASR 后台并行连接；单一有界 FIFO 保留并顺序发送连接前后音频。GUI 不等待设备或网络；会话代次隔离旧音频、结果和排队提示。已修终包发送返回前 final 到达的竞争，以及重复失败取消导致清理尚未结束就收敛的竞争；诊断记录保留后续 GUI 投递时间。
 - 新 dog 审查 `71e05f5d83ae27bf6166914f58421c352beafec5`：四名全新 reviewer 逐个执行，未确认新产品缺陷；1 个 medium 回归缺口 V1 已补完。审查仍有局限：edge 空数组按 workflow 记 failed layer，blind 数量未达 floor，不能称完整 clean review。原裁决保存在 [审查报告](../_bmad-output/implementation-artifacts/review-voice-local-first-new-dog-20261110.md)。
 - V1 补强 `22284df21b428800384d32de74450a4980c93ad4`：真实 receiver→controller→converge 每代处理两个不同累计 interim 和不同 final，仅提交完整 final 一次；direct/optimize 及两代相同 final 均覆盖。拼接/仅保留首版两类纯内存变异各触发 2 项预期失败；原实现通过。president quick 审查 0 项问题，engineer 独立定向复验 2 passed（0.06s），并核对变异设计和默认 fixture 未改变。
 
-可复用的软件验证（2026-11-10，产品代码未再变化，详见 [独立验证](../_bmad-output/implementation-artifacts/verify-voice-input-local-first.md) 与 [V1 局部计划](../_bmad-output/implementation-artifacts/plan-v1-voice-cumulative-transcript-regression.md)）：
+可复用的软件验证（2026-11-10；2.0 升级后 ASR/controller/integration 与 main voice 已重新通过，其余本地先录阶段证据详见 [独立验证](../_bmad-output/implementation-artifacts/verify-voice-input-local-first.md) 与 [V1 局部计划](../_bmad-output/implementation-artifacts/plan-v1-voice-cumulative-transcript-regression.md)）：
 
 ```powershell
 .venv/Scripts/python.exe -m pytest tests/test_voice_controller_unit.py tests/test_realtime_asr_unit.py tests/test_voice_input_integration.py -q
-# 41 passed；V1 补强后仍为41项。
+# 42 passed；2.0 默认资源与接口回归新增1项。
 .venv/Scripts/python.exe -m pytest tests/test_main_unit.py -k voice -q
-# 17 passed, 982 deselected；V1 未改产品逻辑，复用已核对结果。
+# 17 passed, 982 deselected；2.0 升级后重新通过。
 .venv/Scripts/python.exe -m pytest tests/test_voice_input_ui_automation.py tests/test_voice_input_e2e.py -k "local_ready or queued_ready or optimize_worker or software_ready or actual_capture" -q
 # 串行：9 passed, 37 deselected。
 ```
@@ -28,7 +31,7 @@
 1. 实际设备 stop/close 报错后的未释放可达性；现有 fake 模拟已释放后抛错，不能保证任意驱动都及时回收。
 2. 真实 transport 的取消硬截止；只有取消抵抗 fake 曾超预算，实际 aiohttp 等效问题未复现，不新增推测性隔离机制。
 3. 物理全局按键到声学出声 P95；先前隔离真实设备 ready 回调 P95=250ms、最小 wx 消息响应 P95=15ms 只是元数据，不能当作音效 API 或声学验收。
-4. 真实云端慢连接下句首识别；固定文本/编号 PCM 替身只证明字节顺序与 GUI 边界。
+4. 真实云端慢连接下句首识别；2.0 固定音频已通过正常连接的真实云端识别，但未制造慢连接并验证真实麦克风句首，固定文本/编号 PCM 替身仍只证明字节顺序与 GUI 边界。
 5. 4–8 小时后的同组复测及原小时级变慢机制；短硬件样本和100周期测试不代表长稳。
 
 下一步若继续现场验收，按 [原实施计划](../_bmad-output/implementation-artifacts/plan-voice-input-local-first.md) 的隔离输入承接、对齐回环声学证据和长期复测执行。不要用提前播提示、重置启动缓存、丢帧或文本内容去重替代会话完整性。部署须另按既有流程授权，日常 MC 的退出/重启由用户操作。
