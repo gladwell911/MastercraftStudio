@@ -19,8 +19,9 @@ except Exception:  # pragma: no cover - handled at runtime
 
 DEFAULT_APP_ID = "5685852259"
 DEFAULT_ACCESS_TOKEN = "tCNf26V6T1NYLoauifmAB46QPKv1rs_0"
-DEFAULT_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
-DEFAULT_RESOURCE_ID = "volc.bigasr.sauc.duration"
+DEFAULT_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+# Model generation is selected by resource ID; model_name remains "bigmodel".
+DEFAULT_RESOURCE_ID = "volc.seedasr.sauc.duration"
 
 SAMPLE_RATE = 16000
 CHANNELS = 1

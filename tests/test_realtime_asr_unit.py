@@ -5,6 +5,18 @@ from realtime_asr import AsrResponse, RealtimeAsrClient, extract_text
 from realtime_asr import PcmBuffer
 
 
+def test_default_resource_selects_asr_2_and_explicit_override_is_preserved(monkeypatch):
+    from realtime_asr import Protocol
+
+    monkeypatch.delenv("DOUBAO_ASR_RESOURCE_ID", raising=False)
+    monkeypatch.delenv("DOUBAO_ASR_WS_URL", raising=False)
+    client = RealtimeAsrClient(lambda text: None, lambda message: None)
+    assert client._ws_url == "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+    assert Protocol.build_auth_headers()["X-Api-Resource-Id"] == "volc.seedasr.sauc.duration"
+    monkeypatch.setenv("DOUBAO_ASR_RESOURCE_ID", "volc.seedasr.sauc.concurrent")
+    assert Protocol.build_auth_headers()["X-Api-Resource-Id"] == "volc.seedasr.sauc.concurrent"
+
+
 def test_fifo_exact_byte_boundary_and_irreversible_failure():
     buffer = PcmBuffer()
     for _ in range(100):
