@@ -13086,16 +13086,19 @@ def test_voice_stop_recording_plays_end_sound(frame):
     assert called["end"] == 1
 
 
-def test_voice_error_no_modal_beep_only(frame, monkeypatch):
+def test_voice_error_uses_accessible_status_and_sound_without_modal(frame, monkeypatch):
     called = {"wrong_sound": 0, "msgbox": 0}
     statuses = []
+    spoken = []
+    monkeypatch.setattr(frame, "_speak_text_via_screen_reader", spoken.append)
     frame._play_voice_wrong_sound = lambda: called.__setitem__("wrong_sound", called["wrong_sound"] + 1)
     frame.SetStatusText = lambda text: statuses.append(text)
     monkeypatch.setattr(main.wx, "MessageBox", lambda *_a, **_k: called.__setitem__("msgbox", called["msgbox"] + 1))
     frame._on_voice_error("err")
     assert called["wrong_sound"] == 1
     assert called["msgbox"] == 0
-    assert statuses == []
+    assert statuses == ["err"]
+    assert spoken == ["err"]
 
 
 def test_voice_state_recording_plays_begin_sound(frame):

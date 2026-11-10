@@ -2172,10 +2172,11 @@ class ChatFrame(wx.Frame):
         self.realtime_call_role = DEFAULT_REALTIME_CALL_ROLE
         self.realtime_call_speech_rate = DEFAULT_REALTIME_CALL_SPEECH_RATE
         self._voice_input = VoiceInputController(
-            on_state_change=lambda text: wx_call_after_if_alive(self._on_voice_state, text),
-            on_result=lambda text, mode: wx_call_after_if_alive(self._on_voice_result, text, mode),
-            on_error=lambda msg: wx_call_after_if_alive(self._on_voice_error, msg),
-            on_stop_recording=lambda: wx_call_after_if_alive(self._on_voice_stop_recording),
+            on_state_change=self._on_voice_state,
+            on_result=self._on_voice_result,
+            on_error=self._on_voice_error,
+            on_stop_recording=self._on_voice_stop_recording,
+            dispatch=lambda deliver: wx_call_after_if_alive(self._deliver_voice_event, deliver),
         )
         self._chat_navigation_left_id = wx.NewIdRef()
         self._chat_navigation_right_id = wx.NewIdRef()
@@ -20099,11 +20100,17 @@ class ChatFrame(wx.Frame):
         self._record_chat_activity(self._current_chat_state, turn["created_at"])
         return True, ""
 
+    def _deliver_voice_event(self, deliver):
+        if not getattr(self, "_closing", False):
+            deliver()
+
     def _on_voice_state(self, text: str):
-        if getattr(self._voice_input, "state", "") == "recording":
+        if text == "开始录音":
             self._play_voice_begin_sound()
 
     def _on_voice_error(self, msg: str):
+        self.SetStatusText(msg)
+        self._speak_text_via_screen_reader(msg)
         self._play_voice_wrong_sound()
 
     def _on_realtime_call_status(self, message: str):
@@ -20382,9 +20389,13 @@ class ChatFrame(wx.Frame):
 
     def _on_voice_result(self, text: str, mode: str = MODE_DIRECT):
         if mode == MODE_OPTIMIZE:
+            generation = self._voice_input.generation
             def _worker():
                 optimized = self._optimize_voice_text(text)
-                wx_call_after_if_alive(self._on_voice_optimized_result, optimized)
+                def deliver():
+                    if self._voice_input.is_generation_current(generation):
+                        self._on_voice_optimized_result(optimized)
+                wx_call_after_if_alive(self._deliver_voice_event, deliver)
 
             threading.Thread(target=_worker, daemon=True).start()
             return
@@ -24033,6 +24044,7 @@ class ChatFrame(wx.Frame):
     def _on_close(self, event: wx.CloseEvent):
         # Always allow close (e.g. Alt+F4) even during active reply.
         self._closing = True
+        self._voice_input.shutdown()
         self._stop_answer_refresh_deadline()
         self._release_execution_focus_lease()
         self._invalidate_execution_scan()
@@ -24044,7 +24056,6 @@ class ChatFrame(wx.Frame):
                 pass
             self._defer_close_for_persistence_worker()
             return
-        self._voice_input.cancel()
         self._realtime_call.shutdown()
         if self._answer_redirect_timer:
             try:

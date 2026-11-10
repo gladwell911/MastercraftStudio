@@ -6,6 +6,9 @@ import json
 import os
 import struct
 import uuid
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -246,121 +249,322 @@ def extract_text(payload: Any) -> str:
     return "\n".join(out).strip()
 
 
-class RealtimeAsrClient:
-    def __init__(
-        self,
-        on_text: Callable[[str], None],
-        on_error: Callable[[str], None],
-        ws_url: str | None = None,
-    ):
-        self.on_text = on_text
-        self.on_error = on_error
-        self._ws_url = ws_url or os.getenv("DOUBAO_ASR_WS_URL", DEFAULT_WS_URL)
+class PcmBuffer:
+    """The sole PCM queue. Callback-side work never takes the coordinator lock."""
+    MAX_BYTES = 640000
+    MAX_FRAME_BYTES = 6400
 
-        self._session: aiohttp.ClientSession | None = None
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frames = deque()
+        self.size = 0
+        self.peak = 0
+        self.sealed = False
+        self.failure = ""
+        self.cancelled = False
+        self.committed = False
+        self.first_frame = threading.Event()
+        self.changed = threading.Event()
+        self._loop = None
+        self._event = None
+        self._wake_pending = False
+        self._failure_callback = None
+        self.first_frame_at = None
+
+    def bind(self, loop, event, failure_callback):
+        with self.lock:
+            self._loop, self._event = loop, event
+            self._failure_callback = failure_callback
+            self._wake_locked()
+
+    def _wake_locked(self):
+        self.changed.set()
+        if self._loop is not None and not self._wake_pending:
+            self._wake_pending = True
+            self._loop.call_soon_threadsafe(self._deliver_wake)
+
+    def _deliver_wake(self):
+        with self.lock:
+            self._wake_pending = False
+            event, failure, callback = self._event, self.failure, self._failure_callback
+        if event:
+            event.set()
+        if failure and callback:
+            callback(failure)
+
+    def append(self, data):
+        with self.lock:
+            if self.cancelled or self.failure or self.sealed or self.committed:
+                return False
+            if not data:
+                return False
+            if len(data) > self.MAX_FRAME_BYTES or self.size + len(data) > self.MAX_BYTES:
+                self.failure = "语音缓存已满，本次未写入，请重试"
+                self._wake_locked()
+                return False
+            self.frames.append(data)
+            self.size += len(data)
+            self.peak = max(self.peak, self.size)
+            if self.first_frame_at is None:
+                self.first_frame_at = time.monotonic()
+            self.first_frame.set()
+            self._wake_locked()
+            return True
+
+    def fail(self, message):
+        with self.lock:
+            if not self.committed and not self.cancelled and not self.failure:
+                self.failure = message
+                self._wake_locked()
+
+    def seal(self):
+        with self.lock:
+            self.sealed = True
+            self._wake_locked()
+
+    def discard(self):
+        with self.lock:
+            self.cancelled = True
+            self.frames.clear()
+            self.size = 0
+            self._wake_locked()
+
+
+class RealtimeAsrClient:
+    CONNECT_TIMEOUT = 10.0
+    DRAIN_TIMEOUT = 12.0
+    FINAL_TIMEOUT = 12.0
+    CLEANUP_TIMEOUT = 3.0
+
+    def __init__(self, on_text, on_error, ws_url=None, buffer=None, started_at=None):
+        self.on_text, self.on_error = on_text, on_error
+        self.buffer = buffer if buffer is not None else PcmBuffer()
+        self.started_at = started_at if started_at is not None else time.monotonic()
+        self._ws_url = ws_url or os.getenv("DOUBAO_ASR_WS_URL", DEFAULT_WS_URL)
+        self._session = self._ws = None
         self._seq = 1
         self._running = False
-        self._sender_task: asyncio.Task | None = None
-        self._receiver_task: asyncio.Task | None = None
+        self._sender_task = self._receiver_task = self._connect_task = None
+        self._run_task = None
         self._sent_wav_header = False
+        self.terminal_sent = False
+        self._terminal_send_task = None
+        self.final_received = False
+        self._terminal_time = None
+        self._event = None
+        self._aborted = False
+        self._cleanup_task = None
+        self._failure_cancel_requested = False
+        self.cleanup_error = ""
+        self.milestones = {}
 
     @property
-    def running(self) -> bool:
+    def running(self):
         return self._running
 
-    async def start(self) -> None:
-        if self._running:
-            return
+    async def _connect(self):
         if aiohttp is None:
-            raise RuntimeError("缺少依赖 aiohttp，请先安装 requirements.txt")
-        self._running = True
-        self._seq = 1
-        self._sent_wav_header = False
-        self._queue = asyncio.Queue(maxsize=200)
-
+            raise RuntimeError("缺少依赖 aiohttp")
         self._session = aiohttp.ClientSession()
         self._ws = await self._session.ws_connect(self._ws_url, headers=Protocol.build_auth_headers())
-
         await self._ws.send_bytes(Protocol.build_full_request(self._seq))
         self._seq += 1
 
-        self._sender_task = asyncio.create_task(self._sender(), name="doubao_asr_sender")
-        self._receiver_task = asyncio.create_task(self._receiver(), name="doubao_asr_receiver")
-
-    async def stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-
-        if self._sender_task:
-            await self._sender_task
-        if self._receiver_task:
-            await self._receiver_task
-
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-        self._ws = None
-        self._session = None
-        self._sender_task = None
-        self._receiver_task = None
-
-    def push_audio(self, pcm_bytes: bytes) -> None:
-        if (not self._running) or (not pcm_bytes):
-            return
+    async def start(self):
+        if self._aborted:
+            raise asyncio.CancelledError()
+        if self._connect_task is None:
+            self._event = asyncio.Event()
+            self.buffer.bind(asyncio.get_running_loop(), self._event, self._buffer_failed)
+            self._connect_task = asyncio.create_task(self._connect())
         try:
-            self._queue.put_nowait(pcm_bytes)
-        except asyncio.QueueFull:
-            return
+            remaining = self.CONNECT_TIMEOUT - (time.monotonic() - self.started_at)
+            await asyncio.wait_for(asyncio.shield(self._connect_task), max(0, remaining))
+            self.milestones["connected"] = time.monotonic()
+            if self._aborted:
+                raise asyncio.CancelledError()
+            if self._sender_task is None:
+                self._running = True
+                self._sender_task = asyncio.create_task(self._sender(), name="voice-asr-sender")
+                self._receiver_task = asyncio.create_task(self._receiver(), name="voice-asr-receiver")
+        except BaseException:
+            await self.abort()
+            raise
 
-    async def _sender(self) -> None:
-        if not self._ws:
-            return
+    def _buffer_failed(self, message):
+        # Failure is already irreversible under the FIFO lock.
+        if (not self._failure_cancel_requested and self._cleanup_task is None
+                and self._run_task and not self._run_task.done()):
+            self._failure_cancel_requested = True
+            self._run_task.cancel()
 
-        while True:
-            if (not self._running) and self._queue.empty():
-                await self._ws.send_bytes(Protocol.build_audio_request(self._seq, b"", is_last=True))
-                break
-
+    async def run(self):
+        self._run_task = asyncio.current_task()
+        try:
             try:
-                chunk = await asyncio.wait_for(self._queue.get(), timeout=0.1)
-            except asyncio.TimeoutError:
-                continue
+                await self.start()
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("识别服务连接超时，本次未写入") from exc
+            except Exception as exc:
+                raise RuntimeError(f"识别服务连接失败：{exc}") from exc
+            # Receiver rejects early final/EOF. A sender error must interrupt it immediately.
+            pending = {self._sender_task, self._receiver_task}
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            if not self.final_received:
+                raise RuntimeError("识别服务提前结束，本次未写入")
+        except OSError as exc:
+            raise RuntimeError("识别服务网络失败，本次未写入") from exc
+        finally:
+            await self._cleanup()
 
-            is_last = (not self._running) and self._queue.empty()
-            if (not self._sent_wav_header) and chunk:
-                chunk = build_stream_wav_header(SAMPLE_RATE, CHANNELS, 16) + chunk
-                self._sent_wav_header = True
+    def push_audio(self, pcm_bytes):
+        return self.buffer.append(bytes(pcm_bytes))
 
-            await self._ws.send_bytes(Protocol.build_audio_request(self._seq, chunk, is_last=is_last))
-            if is_last:
-                break
-            self._seq += 1
+    async def stop(self):
+        self.buffer.seal()
+        if self._run_task:
+            await asyncio.shield(self._run_task)
+        else:
+            try:
+                await self.start()
+                await asyncio.gather(self._sender_task, self._receiver_task)
+            finally:
+                await self._cleanup()
 
-    async def _receiver(self) -> None:
-        if not self._ws:
-            return
+    async def abort(self):
+        self._aborted = True
+        self.buffer.discard()
         try:
-            async for msg in self._ws:
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    response = Protocol.parse_response(msg.data)
-                    if response.code != 0:
-                        detail = f", detail: {response.payload_msg}" if response.payload_msg is not None else ""
-                        self.on_error(f"ASR error code: {response.code}{detail}")
-                        break
+            await self._cleanup()
+        except RuntimeError:
+            # Cancellation has no user error. The bounded cleanup failure remains
+            # observable through cleanup_error, and run() cannot commit success.
+            return
 
-                    text = extract_text(response.payload_msg)
-                    if text:
-                        self.on_text(text)
+    async def _cleanup(self):
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._close_resources())
+        await asyncio.shield(self._cleanup_task)
 
-                    if response.is_last_package:
-                        break
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    self.on_error("WebSocket error")
-                    break
+    async def _close_resources(self):
+        current = asyncio.current_task()
+        tasks = [t for t in (self._connect_task, self._sender_task, self._receiver_task)
+                 if t and t is not current]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        async def close():
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                if self._ws is not None and not self._ws.closed:
+                    await self._ws.close()
+            finally:
+                if self._session is not None and not self._session.closed:
+                    await self._session.close()
+        try:
+            await asyncio.wait_for(close(), self.CLEANUP_TIMEOUT)
         except Exception as exc:
-            self.on_error(f"Receive failed: {exc}")
+            self.cleanup_error = f"识别服务资源清理失败：{type(exc).__name__}"
+            raise RuntimeError(self.cleanup_error) from exc
+        finally:
+            self._running = False
+
+    async def _sender(self):
+        drain_deadline = None
+        while True:
+            self._event.clear()
+            with self.buffer.lock:
+                if self.buffer.failure:
+                    raise RuntimeError(self.buffer.failure)
+                if self.buffer.cancelled:
+                    raise asyncio.CancelledError()
+                if self.buffer.sealed and drain_deadline is None:
+                    drain_deadline = time.monotonic() + self.DRAIN_TIMEOUT
+                chunk = self.buffer.frames.popleft() if self.buffer.frames else None
+                if chunk is not None:
+                    self.buffer.size -= len(chunk)
+                sealed = self.buffer.sealed
+            if chunk is None and not sealed:
+                await self._event.wait()
+                continue
+            if chunk is None:
+                packet = Protocol.build_audio_request(self._seq, b"", True)
+            else:
+                if not self._sent_wav_header:
+                    chunk = build_stream_wav_header(SAMPLE_RATE, CHANNELS, 16) + chunk
+                    self._sent_wav_header = True
+                packet = Protocol.build_audio_request(self._seq, chunk, False)
+            # A seal must also bound a send that was already blocked before seal.
+            async def send_packet():
+                await self._ws.send_bytes(packet)
+                if chunk is None:
+                    self.terminal_sent = True
+                    self._terminal_time = time.monotonic()
+                    self.milestones["terminal"] = self._terminal_time
+            send = asyncio.create_task(send_packet())
+            if chunk is None:
+                self._terminal_send_task = send
+            try:
+                while not send.done():
+                    with self.buffer.lock:
+                        if self.buffer.sealed and drain_deadline is None:
+                            drain_deadline = time.monotonic() + self.DRAIN_TIMEOUT
+                    budget = None if drain_deadline is None else drain_deadline - time.monotonic()
+                    if budget is not None and budget <= 0:
+                        raise RuntimeError("识别服务发送超时，本次未写入")
+                    await asyncio.wait({send}, timeout=min(.05, budget) if budget is not None else .05)
+                send.result()
+            finally:
+                if not send.done():
+                    send.cancel()
+                    await asyncio.gather(send, return_exceptions=True)
+            self._seq += 1
+            if chunk is None:
+                return
+
+    async def _receiver(self):
+        iterator = self._ws.__aiter__()
+        while True:
+            receive = asyncio.create_task(iterator.__anext__())
+            try:
+                while not receive.done():
+                    if self._terminal_time is not None and time.monotonic() - self._terminal_time >= self.FINAL_TIMEOUT:
+                        raise RuntimeError("识别结果超时，本次未写入")
+                    await asyncio.wait({receive}, timeout=.05)
+                try:
+                    msg = receive.result()
+                except StopAsyncIteration as exc:
+                    raise RuntimeError("识别服务提前关闭，本次未写入") from exc
+            finally:
+                if not receive.done():
+                    receive.cancel()
+                    await asyncio.gather(receive, return_exceptions=True)
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                response = Protocol.parse_response(msg.data)
+                if response.code:
+                    raise RuntimeError(f"识别服务错误：{response.code}")
+                if response.is_last_package:
+                    if not self.terminal_sent and self._terminal_send_task is not None:
+                        # The server may receive EOF before the transport's send
+                        # await returns. Hold final until that exact send succeeds.
+                        await asyncio.wait({self._terminal_send_task})
+                        if self._terminal_send_task.cancelled():
+                            raise RuntimeError("识别服务终包发送未完成，本次未写入")
+                        self._terminal_send_task.result()
+                    with self.buffer.lock:
+                        if (not self.terminal_sent or not self.buffer.sealed or self.buffer.size
+                                or self.buffer.failure or self.buffer.cancelled):
+                            raise RuntimeError("识别服务提前结束，本次未写入")
+                    self.final_received = True
+                    self.milestones["final"] = time.monotonic()
+                text = extract_text(response.payload_msg)
+                if text:
+                    self.on_text(text)
+                if self.final_received:
+                    return
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                raise RuntimeError("识别服务网络错误，本次未写入")

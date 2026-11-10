@@ -1,6 +1,47 @@
 import pytest
 
 import main
+from voice_fakes import VoiceRig, wait_until
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_double_ctrl_actual_capture_and_protocol_retains_opening_words(frame, wx_app, monkeypatch, side):
+    """Controlled device/transport end-to-end; physical/acoustic checks remain field work."""
+    import time
+    rig = VoiceRig(monkeypatch)
+    cues = []
+    monkeypatch.setattr(frame, '_play_voice_begin_sound', lambda: cues.append('ready'))
+    monkeypatch.setattr(frame, '_play_voice_end_sound', lambda: cues.append('stop'))
+    monkeypatch.setattr(frame, '_speak_text_via_screen_reader', lambda _t: None)
+    monkeypatch.setattr(frame, '_call_later_if_alive', lambda *_a: object())
+    monkeypatch.setattr(main.wx.Window, 'FindFocus', lambda: frame.input_edit)
+    c = frame._voice_input
+    def pump(predicate):
+        deadline = time.monotonic() + 2
+        while not predicate():
+            wx_app.Yield()
+            assert time.monotonic() < deadline
+            time.sleep(.002)
+    try:
+        for _ in range(2):
+            frame._on_global_ctrl_keyup(False, side)
+        pump(lambda: cues == ['ready'])
+        assert not rig.sockets
+        rig.frame(b'B' * 6400)
+        frame._on_global_ctrl_keyup(False, side)
+        frame._on_global_ctrl_keyup(False, side)  # fourth release cannot create a second stream
+        rig.connect.set()
+        pump(lambda: frame.input_edit.GetValue() == rig.text)
+        assert cues == ['ready', 'stop']
+        assert len(rig.streams) == len(rig.sockets) == 1
+        assert rig.packets[0][1][44:] == rig.first
+        assert rig.packets[1][1] == b'B' * 6400
+        assert sum(seq < 0 for seq, _ in rig.packets) == 1
+    finally:
+        c.shutdown()
+        assert c._shutdown_done.wait(3)
+        c._audio_thread.join(2)
+        rig.assert_closed()
 
 
 def test_voice_input_controller_callback_inserts_verbatim_into_editor(frame, monkeypatch):

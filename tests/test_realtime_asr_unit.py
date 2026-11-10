@@ -2,6 +2,45 @@ import asyncio
 import types
 
 from realtime_asr import AsrResponse, RealtimeAsrClient, extract_text
+from realtime_asr import PcmBuffer
+
+
+def test_fifo_exact_byte_boundary_and_irreversible_failure():
+    buffer = PcmBuffer()
+    for _ in range(100):
+        assert buffer.append(b'x' * 6400)
+    assert buffer.size == buffer.MAX_BYTES
+    assert not buffer.append(b'x')
+    assert buffer.failure
+    assert buffer.size == buffer.MAX_BYTES  # no silent drop or extra byte
+    assert not buffer.append(b'y')
+    buffer.discard()
+    assert buffer.size == 0 and buffer.failure
+
+
+def test_fifo_rejects_oversized_frame_and_seal_is_final():
+    buffer = PcmBuffer()
+    assert not buffer.append(b'x' * 6401)
+    assert buffer.failure
+    buffer = PcmBuffer()
+    assert buffer.append(b'x')
+    buffer.seal()
+    assert not buffer.append(b'y')
+    assert list(buffer.frames) == [b'x']
+
+
+def test_fifo_wakeups_are_coalesced_even_when_loop_is_blocked():
+    callbacks = []
+    loop = types.SimpleNamespace(call_soon_threadsafe=callbacks.append)
+    buffer = PcmBuffer()
+    buffer.bind(loop, None, None)
+    for _ in range(1000):
+        buffer.append(b'x')
+    buffer.fail('overflow')
+    assert len(callbacks) == 1
+    callbacks.pop()()
+    buffer.seal()
+    assert len(callbacks) == 1
 
 
 def test_extract_text_prefers_full_sentence_over_fragments():
@@ -67,6 +106,8 @@ def test_receiver_emits_each_text_packet_without_client_side_dedupe(monkeypatch)
     )
     messages = [types.SimpleNamespace(type="binary", data=b"x") for _ in range(4)]
     client._ws = _FakeWs(messages)
+    client.buffer.seal()
+    client.terminal_sent = True
 
     import realtime_asr
 

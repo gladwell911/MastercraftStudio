@@ -47,6 +47,7 @@ def test_single_right_ctrl_tap_does_not_start(monkeypatch):
 def test_recording_stops_on_any_ctrl_tap(monkeypatch):
     c = VoiceInputController(on_state_change=_noop, on_result=lambda *_a, **_k: None, on_error=_noop)
     c.state = "recording"
+    c._session = speech_input._Session(1, MODE_DIRECT)
     called = {"stop": 0}
     monkeypatch.setattr(c, "stop_and_transcribe", lambda: called.__setitem__("stop", called["stop"] + 1))
     c.on_ctrl_keyup(combo_used=False, side="left")
@@ -75,6 +76,7 @@ def test_stop_and_transcribe_emits_stop_callback_immediately(monkeypatch):
         on_stop_recording=lambda: called.__setitem__("stop", called["stop"] + 1),
     )
     c.state = "recording"
+    c._session = speech_input._Session(1, MODE_DIRECT)
 
     class _DummyThread:
         def __init__(self, target=None, daemon=None):
