@@ -26,3 +26,13 @@
 - source_plan: plan-frpc-independent-supervision.md
   summary: Confirm real phone main-package connection when USB ADB device is online.
   evidence: MC direct/bridge/public authentication returned matching server IDs, but existing SDK ADB server5037 listed no device during final acceptance.
+
+## Deferred from: code review of plan-voice-input-local-first (2026-11-10)
+
+- B1/I2：设备stop/close失败但真实未释放是否可达尚未证实（medium unverified）。需实际driver失败和未释放证据，再决定是否隔离为不可用；不能将先释放再抛错fake当现场缺陷。
+- B3/I2：实际aiohttp合作取消是否可能越过3秒清理预算尚未证实（medium unverified）。仅取消抵抗fake复现，需真实transport结算及资源状态。
+- B4/I3：20次物理双Ctrl到声学出声P95未验收（medium unverified）；需对齐声学证据。
+- B5/I3：真实云端慢连接保句首未验收（medium unverified）；固定文本fake不可替代。
+- B6/I3：4–8小时后同组启动/停止测量未执行（medium unverified）；不据短测断言历史小时级问题已解决。
+
+逐项证据见 [新dog审查报告](review-voice-local-first-new-dog-20261110.md)。

@@ -178,3 +178,22 @@ Final independent verification:
 Residual limits: no physical global-keyboard-to-acoustic-onset measurement, real cloud transcription/opening phrase, or 4-8h acceptance. Native device calls cannot be forcibly killed. Cancellation-resistant synthetic close exceeded its budget, but the equivalent actual-aiohttp failure is unverified and no speculative isolation was added. Daily MC was not stopped/restarted/replaced; no packaging, deployment or push.
 
 Cleanup: all owned tests, devices, wx fixtures and worker/loop resources were closed. Retain the small baseline/current failure evidence directory under system Temp for the known 26 failures; it contains baseline source and failure lists, not user data. Generated review diff/cache may be removed after local commit because Git can reproduce them.
+
+## Code Review
+
+### 2026-11-10 — 新 dog 独立复审
+
+Code review complete: 0 decision-needed, 1 patch, 5 defer, 2 rejected. 四名新context-free reviewer逐个执行；edge返回空数组，按workflow记为failed layer，因此不宣称完整clean review。完整逐项证据见 [新审查报告](review-voice-local-first-new-dog-20261110.md)。未改产品代码或计划状态。
+
+- [ ] [Review][Patch] V1：补控制器累计识别文本回归 [tests/test_voice_input_integration.py:56] — fake同代发送多个interim再final，断言controller仅提交最终完整文本一次；保留direct/optimize、两代同文各一次。现有每代单final不能检出拼接或仅保留首版的变异。
+- [x] [Review][Defer] B1/I2：设备错误后真实未释放可达性 [speech_input.py:265] — deferred: medium unverified；需实际driver失败及未释放证据。现有fake先释放再抛错不能证明该问题，sounddevice默认忽略错误码。
+- [x] [Review][Defer] B3/I2：真实transport硬清理上限 [realtime_asr.py:_close_resources] — deferred: medium unverified；仅取消抵抗fake曾超预算，需实际aiohttp等效复现。
+- [x] [Review][Defer] B4/I3：物理键到声学出声P95 — deferred: medium unverified；需20次对齐声学测量，ready回调不能替代。
+- [x] [Review][Defer] B5/I3：真实云端慢连接句首 — deferred: medium unverified；固定文本fixture只证明字节与GUI边界，需真实识别。
+- [x] [Review][Defer] B6/I3：4–8小时验收 — deferred: medium unverified；100周期/短硬件数据不能替代长稳。
+
+Rejected:
+- B2 false：规范规定已连接且seal后才开始12秒drain预算，现实现符合。
+- I1 false：规范明确starting取消、recording未连接时stop保留，未发现意图偏离。
+
+本轮重新执行：核心41 passed；main voice 17 passed/982 deselected；wx定向9 passed/37 deselected；git diff --check通过。V1仍待下游修复验证。
