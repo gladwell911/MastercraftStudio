@@ -2,7 +2,7 @@
 
 2026-11-10。审查范围 `98016ccdb47f629888d8226900bbcc8272b0df1b..2a089f22f459b4ed465f4d83195c98645e57977c`；启动时 HEAD 为后者、工作树干净。12 文件，+1580/-297。读取全局/项目 AGENTS、handoff、experience、reflection、docs/README、实施计划及其两个 context、独立验证报告。bmad-code-review renderer 在原工作目录调用一次成功，按生成 workflow 执行；已有明确审查授权，不重复请求范围确认。只审查，不修改产品、不打包、不重启日常 MC、不写用户数据。
 
-结论：**0 decision-needed，1 patch，5 defer，2 rejected**。未确认新的产品代码缺陷；确认一项中等优先级回归验证缺口。不能称完整 clean review：edge-case-hunter 返回空数组，按 workflow 记为 failed layer。其余三层均返回有效非空结果。
+审查时结论：**0 decision-needed，1 patch，5 defer，2 rejected**。未确认新的产品代码缺陷；确认一项中等优先级回归验证缺口。不能称完整 clean review：edge-case-hunter 返回空数组，按 workflow 记为 failed layer。其余三层均返回有效非空结果。V1后续已补强并独立验证，见末尾完成状态；以下保留原审查裁决与当时证据。
 
 ## 独立性与执行
 
@@ -39,3 +39,9 @@
 - `git diff --check`：通过。测试进程均退出；fixture完成自身shutdown/资源检查。
 
 这些结果证明本轮指定软件边界，不证明声学出声、真实识别或4–8小时。没有新增后台服务、工作树、数据库或录音；本轮仅创建可复现diff/claims临时目录及渲染缓存，最终审查结论保存在本文件和计划中。
+
+## V1后续完成状态（2026-11-10）
+
+`22284df21b428800384d32de74450a4980c93ad4` 仅补测试，产品逻辑未变。默认fake仍只发final；opt-in每代两个不同累计interim后接不同final，经真实receiver/controller/converge只输出完整final一次，direct/optimize与两代相同final各一次均覆盖。隔离进程内拼接/仅存首版变异各使两个模式在最终结果断言处失败，未在主树留变异；原实现定向2 passed。president quick审查0项问题，核心41 passed、共享fixture串行wx选择9 passed/37 deselected。
+
+engineer独立运行 `.venv/Scripts/python.exe -m pytest tests/test_voice_input_integration.py::test_latest_text_and_identical_utterances_in_distinct_generations -q`：2 passed（0.06s），并核对diff、变异设计与默认fixture不变，复用未变产品代码的核心41/main voice17/wx9证据。V1已修复；原5个defer和审查层执行局限未改变。详见 [局部built计划](plan-v1-voice-cumulative-transcript-regression.md)。

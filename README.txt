@@ -1,8 +1,6 @@
 神匠工坊（mc）是面向读屏用户的 wxPython Windows 桌面客户端，整合 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，以及聊天历史、远程控制和笔记。
 
-2026-11-03：台式机旧external入口启动迁移和空白DOMAIN修复已进入源码。11月2日日常新入口与实体97MB文件完整下载通过；安装未确认，约61.6 KB/s瓶颈未知，最后空白DOMAIN补丁部署待核实。当前状态见 docs/handoff.md。
-
-2026-10-26：通知流修复已由用户重包到日常 MC，实体 RC 已配套保数据升级，双方 feed 与日常聊天库一致；日常新回复已有系统通知发布记录。隔离实体测试通过后台/锁屏与去重，日常完整锁屏验收仍待完成。当前状态见 docs/handoff.md；维护规则见 docs/runtime-maintenance.md。
+2026-11-10：语音本地先录及收尾竞态修复已进入源码，累计interim到最终完整文本的回归补强已通过独立验证；尚未部署到日常 MC。当前状态、未完成的现场验收及下载/通知/远程维护接续统一见 [当前交接](docs/handoff.md)，工程说明见 [文档索引](docs/README.md)。
 
 ## 快速开始
 
@@ -12,6 +10,10 @@
     python main.py
 
 开发依赖：python -m pip install -r requirements-dev.txt。详细运行与配置说明见[归档的原入口](docs/archive/entry-context-2026-09-29/README.txt)。
+
+## 语音输入
+
+同侧左/右 Ctrl 双击开始；麦克风启动并缓冲首帧后提示就绪，ASR 后台连接。录音时单击任一 Ctrl 停止，完整识别结果按现有焦点插入并读屏反馈。详细行为、错误提示和实现约定见 [语音输入](docs/voice-input.md)。软件验证通过不代表物理按键到声学出声、真实云端句首或4–8小时验收通过。
 
 ## 既有能力与历史验证
 

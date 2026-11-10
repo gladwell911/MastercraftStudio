@@ -185,7 +185,7 @@ Cleanup: all owned tests, devices, wx fixtures and worker/loop resources were cl
 
 Code review complete: 0 decision-needed, 1 patch, 5 defer, 2 rejected. 四名新context-free reviewer逐个执行；edge返回空数组，按workflow记为failed layer，因此不宣称完整clean review。完整逐项证据见 [新审查报告](review-voice-local-first-new-dog-20261110.md)。未改产品代码或计划状态。
 
-- [ ] [Review][Patch] V1：补控制器累计识别文本回归 [tests/test_voice_input_integration.py:56] — fake同代发送多个interim再final，断言controller仅提交最终完整文本一次；保留direct/optimize、两代同文各一次。现有每代单final不能检出拼接或仅保留首版的变异。
+- [x] [Review][Patch] V1：补控制器累计识别文本回归 [tests/test_voice_input_integration.py:56] — 原审查时每代单final不能检出拼接/首版保留；已由 `22284df21b428800384d32de74450a4980c93ad4` 补强，多interim再final、direct/optimize及两代同文各一次均覆盖，两类内存变异均被捕获。见 [V1局部计划](plan-v1-voice-cumulative-transcript-regression.md)。
 - [x] [Review][Defer] B1/I2：设备错误后真实未释放可达性 [speech_input.py:265] — deferred: medium unverified；需实际driver失败及未释放证据。现有fake先释放再抛错不能证明该问题，sounddevice默认忽略错误码。
 - [x] [Review][Defer] B3/I2：真实transport硬清理上限 [realtime_asr.py:_close_resources] — deferred: medium unverified；仅取消抵抗fake曾超预算，需实际aiohttp等效复现。
 - [x] [Review][Defer] B4/I3：物理键到声学出声P95 — deferred: medium unverified；需20次对齐声学测量，ready回调不能替代。
@@ -196,4 +196,8 @@ Rejected:
 - B2 false：规范规定已连接且seal后才开始12秒drain预算，现实现符合。
 - I1 false：规范明确starting取消、recording未连接时stop保留，未发现意图偏离。
 
-本轮重新执行：核心41 passed；main voice 17 passed/982 deselected；wx定向9 passed/37 deselected；git diff --check通过。V1仍待下游修复验证。
+该次审查重新执行：核心41 passed；main voice 17 passed/982 deselected；wx定向9 passed/37 deselected；git diff --check通过。当时V1待下游修复，现已完成下述复验。
+
+### 2026-11-10 — V1补强完成状态
+
+新dog独立复审已落实原follow-up建议，其edge failed layer与blind数量不足局限保留，不宣称完整clean review。V1只改测试，president quick审查0项问题；engineer独立运行累计文本定向两模式2 passed（0.06s），核对默认fixture行为、真实receiver/controller链路和两类变异设计，并复用未变化代码的核心41/main17/wx9证据。原审查的5项未证实现场边界保持，原逐项历史裁决不覆盖。当前可接续快照见 [handoff](../../docs/handoff.md)。

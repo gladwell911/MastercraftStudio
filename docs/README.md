@@ -1,14 +1,13 @@
 # 文档索引
 
-2026-11-03：台式机旧external入口启动迁移和空白DOMAIN修复已进入源码。11月2日日常新入口与实体97MB文件完整下载通过；安装未确认，约61.6 KB/s瓶颈未知，最后空白DOMAIN补丁部署待核实。当前状态见 handoff.md。
-
-2026-10-26：日常 MC 与 RC 的通知流部署及握手已核实；旧基线拦截修复已进入安装包。后台/锁屏独立实体测试与日常日志证据分别记录在 [交接](handoff.md)。长期维护、旧 TLS/发送/详情延迟及完整验收的限制保持。
+2026-11-10：语音本地先录、收尾竞争修复和累计文本回归补强已完成软件验证；当前快照、现场边界及下载/通知/远程维护待办统一见 [交接](handoff.md)。各历史报告只证明其对应阶段，不代表安装包或完整现场验收。
 
 ## 当前入口
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`voice-input.md`](./voice-input.md)：双 Ctrl 使用反馈、设备/ASR会话所有权、FIFO与停止/取消约定；验收状态由handoff维护
 - [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
 - Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
@@ -46,6 +45,8 @@
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。
 
 ## 历史归档
+
+- [语音收尾前交接快照](archive/handoff-before-voice-local-first-2026-11-10.md)：保留原下载/通知/FRP细节与私有证据路径，归档链接已按新位置调整。
 
 - [2026-10-24收尾前交接快照](archive/handoff-before-runtime-maintenance-wrapup-2026-10-24.md)：原部署背景和逐轮性能/验证记录，当前结论以handoff为准。
 - `superpowers/specs/`、`superpowers/plans/`：仍保留原路径的带日期设计与计划；其中全量重建、直接重放 quiet 队列等旧执行方案已由当前执行规格取代，不据未勾选任务判定现状。

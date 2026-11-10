@@ -63,3 +63,9 @@
 - 优化 worker 的正常/new_session/cancel/close 四种 GUI 投递实际通过；软件 ready<500ms 用例通过，仅是受控设备的调度防回归阈值，不能替代原计划 50ms 现场目标或声学指标。
 
 本轮结论：上述局部修复通过独立复验，无新增可复现缺陷。三个测试进程均正常退出，相关 fixture 完成 controller shutdown、音频 worker join 与 fake 资源关闭；无新增临时文件/后台进程，无用户数据操作。最终 `git diff --check` 通过（Git 的 LF→CRLF 提示属于工作树换行提示）。
+
+## 新dog V1测试补强后的独立复验
+
+2026-11-10，engineer在 `22284df21b428800384d32de74450a4980c93ad4` 核对测试增量：每代至少两个不同累计interim、一个不同完整final通过真实receiver/controller/converge；direct/optimize及两代同文各一次均覆盖，默认fake仍不发送interim，产品逻辑未变。
+
+独立执行 `.venv/Scripts/python.exe -m pytest tests/test_voice_input_integration.py::test_latest_text_and_identical_utterances_in_distinct_generations -q`：**2 passed（0.06s）**。核对director的隔离纯内存拼接/只保留首版变异设计与两模式预期失败证据，复用同一未变代码的核心41、main voice17和串行wx9结果。没有重做硬件22次、真实云端、声学/长稳或26项无关旧失败。测试进程退出，工作树干净，无遗留测试资源。此补强关闭新审查V1验证缺口，不改变原审查defer边界。
