@@ -1822,7 +1822,8 @@ def test_prompt_during_active_turn_steers(frame, monkeypatch):
     )
     assert frame.active_session_turns[0]["request_status"] == "done"
     assert frame.active_session_turns[1]["request_status"] == "done"
-    assert frame.active_session_turns[1]["answer_md"] == "合并答案"
+    assert frame.active_session_turns[1]["answer_md"] == ""
+    assert frame.active_session_turns[1]["answer_alias_of"] == frame.active_session_turns[0]["answer_identity"]
     assert frame.is_running is False
 
 
@@ -1893,6 +1894,141 @@ def test_completed_active_owner_plays_sound_once_while_queue_remains(frame, monk
     assert len(frame._current_chat_state.get("kimi_request_queue") or []) == 1
     assert frame.is_running is True
     assert played["n"] == 1
+
+
+def test_kimi_accepted_answer_notifies_and_saves_before_ui_failure(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "synthetic question")
+    sid = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=sid, turn_id="10"))
+    fake.push_event(KimiEvent(type="agent_message_delta", thread_id=sid, turn_id="10", text="synthetic answer", display_kind="assistant"))
+    played, saved = [], []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: saved.append(True))
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic UI failure")
+    monkeypatch.setattr(frame, "_request_kimi_chat_information", fail)
+    completion = main.CodexEvent(type="turn_completed", thread_id=sid, turn_id="10", status="completed")
+    with pytest.raises(RuntimeError, match="synthetic UI"):
+        frame._on_kimi_event(completion)
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert played == [True]
+    assert saved
+    frame._on_kimi_event(completion)
+    assert played == [True]
+
+
+def test_v2_real_client_transcript_to_mc_final_and_rest_replay(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "synthetic question")
+    sid, prompt = fake.created_sessions[0]["session_id"], fake.submitted[0]["prompt_id"]
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    transport = KimiServerClient(start_reader_thread=False)
+    transport._handle_ws_message({"type": "server_hello", "payload": {"protocol_version": 2}})
+    turn = {"kind": "turn", "turnId": "v2-turn", "triggerPromptId": prompt, "ordinal": 0,
+            "origin": {"kind": "user"}, "state": "completed", "steps": [
+                {"kind": "step", "stepId": "st", "turnId": "v2-turn", "ordinal": 0,
+                 "state": "completed", "frames": [{"kind": "text", "role": "assistant", "frameId": "f", "text": "synthetic final"}]}]}
+    message = {"type": "transcript.reset", "session_id": sid, "payload": {
+        "agent_id": "main", "seq": 5, "snapshot": {"items": [turn]}}}
+    for _ in range(2):
+        transport._handle_ws_message(message)
+        for row in transport.drain_pending_messages(100):
+            if row["type"] == "event":
+                fake.push_event(KimiEvent(**row["payload"]["event"]))
+    assert frame.active_session_turns[0]["answer_md"] == "synthetic final"
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    # A REST recovery result uses the same authoritative prompt identity.
+    fake.push_event(transport._v2_final_event(sid, turn, "synthetic final"))
+    assert played == [True]
+
+
+@pytest.mark.parametrize("state", ["running", "queued", "blocked"])
+def test_v2_recovery_live_prompt_remains_pending_beyond_short_budget(frame, monkeypatch, state):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "synthetic long task")
+    sid, prompt = fake.created_sessions[0]["session_id"], fake.submitted[0]["prompt_id"]
+    fake.protocol_version = 2
+    transport = KimiServerClient()
+    page = {"items": [], "prompts": [{"promptId": prompt, "status": state}], "has_more": False}
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: page)
+    fake.reconcile_v2 = transport.reconcile_v2
+    owner = frame._find_kimi_prompt_owner(prompt, session_id=sid)
+    clock = [10.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    for _ in range(3):
+        assert frame._reconcile_kimi_owner_worker({**owner, "_recovery_deadline": clock[0] + .01}) == "monitor"
+        clock[0] += 10
+        assert frame.active_session_turns[0]["request_status"] == "pending"
+    page["items"] = [{"kind": "turn", "turnId": "t", "triggerPromptId": prompt, "state": "completed",
+        "steps": [{"stepId": "st", "state": "completed", "frames": [
+            {"kind": "text", "role": "assistant", "frameId": "f", "text": "long final"}]}]}]
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    assert frame._reconcile_kimi_owner_worker(owner) == "done"
+    assert frame._reconcile_kimi_owner_worker(owner) == "done"
+    assert frame.active_session_turns[0]["answer_md"] == "long final"
+    assert played == [True]
+    assert len(fake.submitted) == 1
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_v2_lost_post_response_recovers_only_unique_prompt_without_reposting(frame, monkeypatch, ambiguous):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **kwargs: None)
+    posts = []
+    def lost_post(*args):
+        posts.append(True)
+        raise KimiServerError("synthetic accepted response lost", result_unknown=True)
+    fake.submit_prompt = lost_post
+    _submit(frame, "synthetic lost request")
+    sid = fake.created_sessions[0]["session_id"]
+    owner = frame._kimi_pending_owners()[0]
+    assert owner["prompt_id"].startswith("__unresolved__:")
+    transport = KimiServerClient()
+    def turn(prompt):
+        return {"kind": "turn", "turnId": prompt, "triggerPromptId": prompt, "state": "completed",
+            "prompt": "synthetic lost request", "origin": {"kind": "user"}, "steps": [
+                {"stepId": "st", "state": "completed", "frames": [{"kind": "text", "role": "assistant", "text": "recovered unique final", "frameId": "f"}]}]}
+    page = {"items": [turn("actual-prompt")], "has_more": False}
+    if ambiguous:
+        page["items"].append(turn("other-prompt"))
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: page)
+    fake.protocol_version = 2
+    fake.reconcile_v2 = transport.reconcile_v2
+    fake.recovery_messages_v2 = transport.recovery_messages_v2
+    assert frame._reconcile_kimi_owner_worker(owner) == "done"
+    result = frame.active_session_turns[0]
+    if ambiguous:
+        assert result["request_status"] == "failed"
+        assert "ambiguous" in result["request_error"]
+        assert result["kimi_prompt_id"].startswith("__unresolved__:")
+        assert result["answer_md"] != "recovered unique final"
+    else:
+        assert result["kimi_prompt_id"] == "actual-prompt"
+        assert result["request_status"] == "done"
+        assert result["answer_md"] == "recovered unique final"
+    assert posts == [True]
+
+
+def test_v2_terminal_without_body_exhausts_only_finite_recovery_budget(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "synthetic terminal")
+    sid, prompt = fake.created_sessions[0]["session_id"], fake.submitted[0]["prompt_id"]
+    fake.protocol_version = 2
+    transport = KimiServerClient()
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: {"items": [
+        {"kind": "turn", "turnId": "t", "triggerPromptId": prompt, "state": "completed", "steps": []}], "has_more": False})
+    fake.reconcile_v2 = transport.reconcile_v2
+    owner = frame._find_kimi_prompt_owner(prompt, session_id=sid)
+    clock = [10.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(main.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    assert frame._reconcile_kimi_owner_worker({**owner, "_recovery_deadline": 10.1}) == "done"
+    assert clock[0] <= 10.1
+    assert frame.active_session_turns[0]["request_status"] == "failed"
+    assert len(fake.submitted) == 1
 
 
 def test_ambiguous_submit_preserves_unresolved_owner_for_rest_reconciliation(frame, monkeypatch):

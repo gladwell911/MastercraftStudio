@@ -291,7 +291,8 @@ def test_resolve_launch_command_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("KIMI_BIN", str(kimi_bin))
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: r"C:\elsewhere\kimi.exe")
 
-    assert resolve_kimi_launch_command() == [str(kimi_bin)]
+    with pytest.raises(KimiServerError, match="SHA256"):
+        resolve_kimi_launch_command()
 
 
 def test_resolve_launch_command_env_override_missing_file(monkeypatch, tmp_path):
@@ -302,14 +303,15 @@ def test_resolve_launch_command_env_override_missing_file(monkeypatch, tmp_path)
         resolve_kimi_launch_command()
 
 
-def test_resolve_launch_command_path_fallback(monkeypatch):
+def test_resolve_launch_command_does_not_use_shared_path(monkeypatch):
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "/usr/bin/kimi")
 
-    assert resolve_kimi_launch_command() == ["/usr/bin/kimi"]
+    with pytest.raises(KimiServerError, match="runtime missing"):
+        resolve_kimi_launch_command()
 
 
-def test_resolve_launch_command_user_install_fallback(monkeypatch, tmp_path):
+def test_resolve_launch_command_does_not_use_shared_user_install(monkeypatch, tmp_path):
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: None)
     monkeypatch.setattr(kimi_server_client.os, "name", "nt")
@@ -318,7 +320,8 @@ def test_resolve_launch_command_user_install_fallback(monkeypatch, tmp_path):
     candidate.write_text("", encoding="utf-8")
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
-    assert resolve_kimi_launch_command() == [str(candidate)]
+    with pytest.raises(KimiServerError, match="runtime missing"):
+        resolve_kimi_launch_command()
 
 
 def test_resolve_launch_command_not_found(monkeypatch, tmp_path):
@@ -1389,6 +1392,289 @@ def test_module_does_not_import_wx():
 
     assert "import wx" not in source
     assert "from wx" not in source
+
+
+def test_v2_subscription_uses_per_session_grade_and_requires_matching_ack():
+    client, _, _, ws, _ = started_client()
+    client._handle_ws_message({"type": "server_hello", "payload": {"protocol_version": 2}})
+    client.subscribe(["s"])
+    request = sent_ws_messages(ws)[-1]
+    assert request["type"] == "subscribe_v2"
+    assert request["payload"] == {"session_id": "s", "transcript": {"main": "delta"}}
+    with pytest.raises(KimiServerError, match="accepted"):
+        client._handle_ack({"type": "ack", "id": request["id"], "code": 0, "payload": {}})
+
+
+def test_v2_completed_transcript_maps_once_without_legacy_rest():
+    client, _, _, _, _ = started_client()
+    client._handle_ws_message({"type": "server_hello", "payload": {"protocol_version": 2}})
+    # Kimi Code 2.5.3 packages/transcript schema; synthetic, no user content.
+    frame = {"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 4, "has_more_older": False,
+        "snapshot": {"items": [{"kind": "turn", "turnId": "t", "triggerPromptId": "p",
+            "ordinal": 0, "origin": {"kind": "user"}, "state": "completed",
+            "steps": [{"kind": "step", "stepId": "st", "turnId": "t", "ordinal": 0,
+                "state": "completed", "frames": [{"kind": "text", "role": "assistant",
+                    "frameId": "f", "text": "synthetic answer"}]}]}]}}}
+    client._handle_ws_message(frame)
+    client._handle_ws_message(frame)
+    events = [row["payload"]["event"] for row in client.drain_pending_messages(100) if row["type"] == "event"]
+    finals = [event for event in events if event["type"] == "turn_completed"]
+    assert len(finals) == 1
+    assert finals[0]["text"] == "synthetic answer"
+    assert finals[0]["data"]["prompt_id"] == "p"
+    assert finals[0]["data"]["stream_complete"] is True
+
+
+def test_v2_unknown_protocol_and_missing_subscription_ack_fail_before_post():
+    client, _, http, _, _ = started_client()
+    with pytest.raises(KimiServerError, match="protocol 7"):
+        client._handle_ws_message({"type": "server_hello", "payload": {"protocol_version": 7}})
+    client.protocol_version = 2
+    client.ws_connect_timeout = .001
+    with pytest.raises(KimiServerError, match="ACK timed out"):
+        client.submit_prompt("s", [{"type": "text", "text": "synthetic"}])
+    assert not any(call["method"] == "POST" for call in http.calls)
+
+
+def test_v2_recovery_reads_exact_prompt_and_ignores_later_assistant():
+    client, _, http, _, _ = started_client()
+    client.protocol_version = 2
+    def turn(prompt, text, state="completed"):
+        return {"kind": "turn", "turnId": prompt, "triggerPromptId": prompt,
+                "state": state, "steps": [{"stepId": "st", "ordinal": 0, "state": "completed",
+                    "frames": [{"kind": "text", "role": "assistant", "frameId": "f", "text": text}]}]}
+    http.routes[("GET", "/api/v1/sessions/s/transcript")] = FakeResponse(200, {
+        "code": 0, "data": {"agent_id": "main", "items": [turn("p", "correct"), turn("later", "wrong")], "has_more": False}})
+    event = client.reconcile_v2("s", "p")
+    assert event.text == "correct"
+    assert event.data["prompt_id"] == "p"
+    assert client.reconcile_v2("s", "missing") is None
+    assert not any(call["url"].endswith(("/status", "/snapshot", "/messages")) for call in http.calls)
+
+
+def test_v2_transcript_gap_and_tool_step_never_publish_partial():
+    from kimi_transcript import Transcript
+    transcript = Transcript()
+    transcript.reset({"items": [{"kind": "turn", "turnId": "t", "triggerPromptId": "p", "state": "completed",
+        "steps": [{"stepId": "st", "state": "completed", "frames": [
+            {"frameId": "f", "kind": "text", "role": "assistant", "text": "intermediate"},
+            {"frameId": "tool", "kind": "tool", "state": "done"}]}]}]}, 1)
+    assert transcript.results() == []
+    assert not transcript.apply([], 3)
+    assert transcript.incomplete
+    assert transcript.results() == []
+
+
+def test_v2_client_gap_uses_journal_before_publishing_final():
+    client, _, http, _, _ = started_client()
+    client.protocol_version = 2
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 1, "snapshot": {"items": []}}})
+    batches = [
+        {"seq": 2, "ops": [{"op": "turn.upsert", "turn": {
+            "kind": "turn", "turnId": "t", "triggerPromptId": "p", "state": "completed"}}]},
+        {"seq": 3, "ops": [{"op": "step.upsert", "turnId": "t", "step": {
+            "kind": "step", "stepId": "st", "turnId": "t", "ordinal": 0, "state": "completed"}}]},
+        {"seq": 4, "ops": [{"op": "frame.upsert", "turnId": "t", "stepId": "st", "frame": {
+            "kind": "text", "role": "assistant", "frameId": "f", "text": "journal final"}}]},
+    ]
+    http.routes[("GET", "/api/v1/sessions/s/transcript/ops")] = FakeResponse(200, {
+        "code": 0, "data": {"agent_id": "main", "complete": True, "latest_seq": 4, "batches": batches}})
+    client._handle_ws_message({"type": "transcript.ops", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 4, "ops": batches[-1]["ops"]}})
+    finals = [row["payload"]["event"] for row in client.drain_pending_messages(100) if row["type"] == "event"]
+    assert len(finals) == 1
+    assert finals[0]["text"] == "journal final"
+    assert http.calls[-1]["params"] == {"agent_id": "main", "since_seq": 1}
+
+
+def _v2_snapshot(text="", state="running", prompt="p", turn="t"):
+    return {"items": [{"kind": "turn", "turnId": turn, "triggerPromptId": prompt, "state": state,
+        "steps": [{"stepId": "st", "ordinal": 0, "state": "completed", "frames": [
+            {"kind": "text", "role": "assistant", "frameId": "f", "text": text}]}]}]}
+
+
+@pytest.mark.parametrize("prefix,fragment,overlap,expected", [
+    ("hello", " world", 5, "hello world"),
+    ("中文", "回复", 2, "中文回复"),
+    ("😀", "x", 2, "😀x"),
+    ("a😀", "😀x", 1, "a😀x"),
+    ("\ud83d", "\ude00x", 1, "😀x"),
+])
+def test_v2_append_utf16_overlap_to_one_complete_answer(prefix, fragment, overlap, expected):
+    client, *_ = started_client()
+    client.protocol_version = 2
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 1, "snapshot": _v2_snapshot(prefix)}})
+    client.drain_pending_messages(100)
+    append = {"op": "append", "target": {"type": "frame", "turnId": "t", "stepId": "st", "frameId": "f"},
+              "offset": overlap, "text": fragment}
+    for seq, ops in [(2, [append]), (3, [append]), (4, [{"op": "turn.upsert", "turn": {
+            "kind": "turn", "turnId": "t", "triggerPromptId": "p", "state": "completed"}}])]:
+        client._handle_ws_message({"type": "transcript.ops", "session_id": "s", "payload": {
+            "agent_id": "main", "seq": seq, "ops": ops}})
+    finals = [row["payload"]["event"] for row in client.drain_pending_messages(100)
+              if row["type"] == "event" and row["payload"]["event"]["type"] == "turn_completed"]
+    assert [event["text"] for event in finals] == [expected]
+    assert not client._v2_frame_texts and not client._v2_started
+    assert not client._v2_transcripts["s"].items
+
+
+@pytest.mark.parametrize("frame_id,fragment", [("missing", "x"), ("f", "conflict")])
+def test_v2_failed_append_is_atomic_and_client_repairs_from_previous_seq(frame_id, fragment):
+    from kimi_transcript import Transcript
+    snapshot = _v2_snapshot("😀", state="completed")
+    op = {"op": "append", "target": {"type": "frame", "turnId": "t", "stepId": "st", "frameId": frame_id},
+          "offset": 0, "text": fragment}
+    transcript = Transcript()
+    transcript.reset(snapshot, 1)
+    assert not transcript.apply([{"op": "turn.upsert", "turn": {"turnId": "t", "state": "running"}}, op], 2)
+    assert transcript.seq == 1 and transcript.items["t"]["state"] == "completed"
+    client, _, http, _, _ = started_client()
+    client.protocol_version = 2
+    client._v2_transcripts["s"] = transcript
+    http.routes[("GET", "/api/v1/sessions/s/transcript/ops")] = FakeResponse(200, {"code": 0, "data": {"complete": False}})
+    http.routes[("GET", "/api/v1/sessions/s/transcript")] = FakeResponse(200, {"code": 0, "data": {
+        **_v2_snapshot("😀 repaired", state="completed"), "seq": 2}})
+    client._handle_ws_message({"type": "transcript.ops", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 2, "ops": [op]}})
+    assert http.calls[-2]["params"]["since_seq"] == 1
+    events = [row["payload"]["event"] for row in client.drain_pending_messages(100) if row["type"] == "event"]
+    assert [event["text"] for event in events if event["type"] == "turn_completed"] == ["😀 repaired"]
+
+
+def test_v2_completed_retention_is_bounded_while_pending_text_survives():
+    client, *_ = started_client()
+    client.protocol_version = 2
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "pending", "payload": {
+        "agent_id": "main", "seq": 1, "snapshot": _v2_snapshot("keep pending")}})
+    latest = None
+    for index in range(530):
+        latest = {"type": "transcript.reset", "session_id": f"s{index}", "payload": {
+            "agent_id": "main", "seq": 1, "snapshot": _v2_snapshot(f"completed {index}", "completed")}}
+        client._handle_ws_message(latest)
+        client.drain_pending_messages(100)
+    assert len(client._v2_completed) == len(client._v2_completed_order) == 512
+    assert len(client._v2_transcripts) <= 33
+    assert list(client._v2_frame_texts.values()) == ["keep pending"]
+    client._handle_ws_message(latest)
+    assert client.drain_pending_messages(100) == []
+    client.close()
+    assert not any((client._v2_transcripts, client._v2_completed, client._v2_started, client._v2_frame_texts))
+
+
+def test_v2_rest_completion_releases_stream_text_and_keeps_replay_dedup(monkeypatch):
+    client, *_ = started_client()
+    client.protocol_version = 2
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 1, "snapshot": _v2_snapshot("pending")}})
+    client.drain_pending_messages(100)
+    final = _v2_snapshot("authoritative final", "completed")
+    monkeypatch.setattr(client, "get_transcript", lambda *a, **k: {**final, "has_more": False})
+    assert client.reconcile_v2("s", "p").text == "authoritative final"
+    assert not client._v2_frame_texts and not client._v2_started and not client._v2_transcripts["s"].items
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 2, "snapshot": final}})
+    assert client.drain_pending_messages(100) == []
+
+
+def test_v2_real_connection_greeting_ack_invalidation_and_new_generation(monkeypatch):
+    import websocket
+    class Socket(BlockingWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.subscription_sent = threading.Event()
+            self.feed(json.dumps({"type": "server_hello", "payload": {"protocol_version": 2}}))
+        def send(self, line):
+            super().send(line)
+            message = json.loads(line)
+            if message["type"] == "client_hello":
+                self.feed(json.dumps({"type": "ack", "id": message["id"], "code": 0, "payload": {}}))
+            if message["type"] == "subscribe_v2":
+                self.subscription_sent.set()
+    old, new = Socket(), Socket()
+    sockets = iter((old, new))
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: next(sockets))
+    http = FakeHttpSession()
+    http.routes[("POST", "/api/v1/sessions/s/prompts")] = FakeResponse(200, {"code": 0, "data": {"prompt_id": "p"}})
+    client = KimiServerClient(process_factory=lambda args: FakeProcess(), http_session_factory=lambda: http,
+                              launch_command=["/fake/kimi"], token="test-token", ws_connect_timeout=.2)
+    def post_count():
+        return sum(call["method"] == "POST" and call["url"].endswith("/prompts") for call in http.calls)
+    def submit_after_ack(ws):
+        ws.subscription_sent.clear()
+        results = []
+        worker = threading.Thread(target=lambda: results.append(client.submit_prompt("s", [])))
+        worker.start()
+        assert ws.subscription_sent.wait(1)
+        count = post_count()
+        request = [m for m in sent_ws_messages(ws) if m["type"] == "subscribe_v2"][-1]
+        ws.feed(json.dumps({"type": "ack", "id": request["id"], "code": 0, "payload": {"accepted": ["s"], "not_found": []}}))
+        worker.join(2)
+        assert not worker.is_alive() and results == ["p"]
+        assert post_count() == count + 1
+        return request
+    try:
+        client.start()
+        assert client.protocol_version == 2
+        request = submit_after_ack(old)
+        generation = client._ws_generation
+        monkeypatch.setattr(client, "_request_recovery", lambda error: None)
+        assert client._invalidate_ws(old, "controlled disconnect", recover=True)
+        assert not client._v2_ready_sessions
+        assert not client._v2_subscription_events["s"].is_set()
+        client._handle_ack({"type": "ack", "id": request["id"], "payload": {"accepted": ["s"]}}, generation=generation)
+        assert not client._v2_ready_sessions
+        with monkeypatch.context() as paused:
+            paused.setattr(client, "_connect_ws_locked", lambda **k: (_ for _ in ()).throw(KimiServerError("reconnect paused")))
+            with pytest.raises(KimiServerError):
+                client.submit_prompt("s", [])
+        assert post_count() == 1
+        client.start()
+        client._handle_ack({"type": "ack", "id": request["id"], "payload": {"accepted": ["s"]}})
+        assert not client._v2_ready_sessions
+        submit_after_ack(new)
+        assert post_count() == 2
+    finally:
+        client.close()
+
+
+def test_v2_live_smoke_terminal_check_is_exact_prompt_and_offline():
+    from test_kimi_live_smoke import _assert_successful_prompt
+    client = KimiServerClient()
+    client.protocol_version = 2
+    calls = []
+    def reconcile(session, prompt):
+        calls.append((session, prompt))
+        return client._v2_final_event(session, {"turnId": "t", "triggerPromptId": prompt, "state": "completed"}, "pong")
+    client.reconcile_v2 = reconcile
+    client.get_status = lambda *a, **k: pytest.fail("legacy status called")
+    assert _assert_successful_prompt(client, "s", "p") == "pong"
+    assert calls == [("s", "p")]
+    client.reconcile_v2 = lambda *a, **k: KimiEvent(type="thread_status_changed", status="running")
+    with pytest.raises(AssertionError):
+        _assert_successful_prompt(client, "s", "p")
+
+
+def test_runtime_preparation_hash_version_and_environment_are_isolated(tmp_path, monkeypatch):
+    import kimi_runtime
+    source = tmp_path / "candidate.exe"
+    source.write_bytes(b"synthetic runtime")
+    monkeypatch.setattr(kimi_runtime, "SUPPORTED_SHA256", kimi_server_client.hashlib.sha256(source.read_bytes()).hexdigest())
+    monkeypatch.setattr(kimi_runtime.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"2.5.3\n"))
+    target = kimi_runtime.prepare_runtime(source, tmp_path / "private/2.5.3")
+    monkeypatch.setattr(kimi_runtime, "runtime_path", lambda: target)
+    monkeypatch.delenv("KIMI_BIN", raising=False)
+    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "changed-shared-version")
+    assert resolve_kimi_launch_command() == [str(target)]
+    assert kimi_runtime.child_environment({"KIMI_CODE_NO_AUTO_UPDATE": "0"})["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+    target.write_bytes(b"changed")
+    with pytest.raises(KimiServerError, match="SHA256"):
+        resolve_kimi_launch_command()
+    target.unlink()
+    with pytest.raises(KimiServerError, match="runtime missing"):
+        resolve_kimi_launch_command()
 
 
 def test_sequenced_frame_without_epoch_inherits_confirmed_epoch():

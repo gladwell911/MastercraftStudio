@@ -18,6 +18,54 @@ def _make_turn(question, answer, created_at, model="openai/gpt-5.2"):
     }
 
 
+def test_late_answer_follows_subsequent_question_after_rebuild(frame):
+    base = time.time() - 3600
+    first = _make_turn("Q0", "A0", base)
+    first["answer_at"] = base + 20
+    second = _make_turn("Q1", main.REQUESTING_TEXT, base + 10)
+    frame.active_session_turns = [first, second]
+    frame._render_answer_list(refresh_execution=False)
+    assert [meta[2] for meta in frame.answer_meta if meta[0] in {"question", "answer"}] == ["Q0", "Q1", "A0"]
+
+
+def test_explicit_sequence_wins_over_timestamps_through_paging_storage_and_replay(frame):
+    base = time.time() - 3600
+    first = {**_make_turn("Q0", "A0", base), "answer_at": base + 10,
+             "question_order": 1001, "answer_order": 1003, "request_status": "done"}
+    second = {**_make_turn("Q1", main.REQUESTING_TEXT, base + 20), "question_order": 1002}
+    history = [{**_make_turn(f"old{i}", main.REQUESTING_TEXT, base - 100), "question_order": i} for i in range(120)]
+    turns = history + [first, second]
+    chat_id = "explicit-message-order"
+    frame.chat_store.upsert_chat({"id": chat_id, "title": "synthetic"})
+    frame.chat_store.replace_turns(chat_id, turns)
+    frame.active_session_turns = frame.chat_store.load_turns(chat_id)
+    for limit in (100, 400):
+        frame.answer_visible_row_limit = limit
+        frame._render_answer_list(refresh_execution=False)
+        assert [meta[2] for meta in frame.answer_meta if meta[0] in {"question", "answer"} and meta[2] in {"Q0", "Q1", "A0"}] == ["Q0", "Q1", "A0"]
+    loaded = frame.active_session_turns[-2]
+    frame._mark_turn_request_done(loaded)
+    assert loaded["answer_order"] == 1003
+    frame.chat_store.replace_turns(chat_id, frame.active_session_turns)
+    assert frame.chat_store.load_turns(chat_id)[-2]["answer_order"] == 1003
+
+
+def test_lightweight_tail_keeps_old_turn_late_answer_without_formatting_history(frame, monkeypatch):
+    turns = [{**_make_turn(f"Q{i}", main.REQUESTING_TEXT, time.time()), "question_order": i} for i in range(500)]
+    turns[0].update(answer_md="late A0", answer_order=10000, answer_at=time.time())
+    frame.active_session_turns = turns
+    formatted = []
+    original = frame._turn_answer_markdown
+    def format_answer(turn):
+        formatted.append(turn["question"])
+        return original(turn)
+    monkeypatch.setattr(frame, "_turn_answer_markdown", format_answer)
+    frame._render_answer_list(refresh_execution=False)
+    assert len(formatted) <= frame.answer_visible_row_limit
+    assert "Q0" in formatted
+    assert [meta[2] for meta in frame.answer_meta if meta[0] == "answer"] == ["late A0"]
+
+
 @pytest.mark.parametrize("gap,shown", [(299, False), (300, True), (1800, True)])
 def test_answer_time_is_independent_and_incremental_matches_rebuild(frame, gap, shown):
     base = time.time() - 3600

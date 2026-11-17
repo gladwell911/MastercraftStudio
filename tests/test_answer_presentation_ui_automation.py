@@ -158,6 +158,36 @@ def test_answer_text_viewer_plain_scratch_reopens_authoritative_markdown(frame):
         stop_timers(frame, drain=lambda: run_native_for(50))
 
 
+def test_late_answer_rebuild_preserves_native_question_selection(frame):
+    try:
+        base = time.time() - 600
+        frame.active_session_turns = [
+            {"question": "Q0", "answer_md": main.REQUESTING_TEXT, "created_at": base},
+            {"question": "Q1", "answer_md": main.REQUESTING_TEXT, "created_at": base + 10},
+        ]
+        frame._current_chat_state["turns"] = frame.active_session_turns
+        frame.view_mode = "active"
+        frame._render_answer_list(refresh_execution=False)
+        wx.GetApp().SetTopWindow(frame)
+        frame.Show()
+        frame.Raise()
+        pump()
+        frame.answer_list.SetFocus()
+        pump()
+        assert wx.Window.FindFocus() is frame.answer_list
+        question = next(i for i, meta in enumerate(frame.answer_meta) if meta[0] == "question" and meta[1] == 1)
+        frame.answer_list.SetSelection(question)
+        selected = frame._answer_row_id(frame.answer_meta[question])
+        turn = frame.active_session_turns[0]
+        turn.update(answer_md="A0", answer_at=base + 20)
+        frame._refresh_answer_list_preserving_selection(refresh_execution=False)
+        assert [meta[2] for meta in frame.answer_meta if meta[0] in {"question", "answer"}] == ["Q0", "Q1", "A0"]
+        assert frame._answer_row_id(frame.answer_meta[frame.answer_list.GetSelection()]) == selected
+        assert wx.Window.FindFocus() is frame.answer_list
+    finally:
+        stop_timers(frame)
+
+
 def test_final_visible_with_continuous_native_navigation_preserves_identity(frame, monkeypatch):
     try:
         for name in ("_play_finish_sound", "_push_remote_state", "_push_remote_history_changed",

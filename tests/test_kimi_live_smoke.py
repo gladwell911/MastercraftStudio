@@ -75,6 +75,23 @@ def _is_authoritative_terminal(event):
     )
 
 
+def _assert_successful_prompt(client, session_id, prompt_id):
+    if client.protocol_version == 2:
+        event = client.reconcile_v2(session_id, prompt_id)
+        assert event is not None and event.type == "turn_completed"
+        assert event.status == "completed"
+        assert event.data.get("prompt_id") == prompt_id
+        assert event.data.get("terminal_verified") is True
+        assert event.data.get("stream_complete") is True
+        assert event.text.strip()
+        return event.text
+    status = client.get_status(session_id)
+    assert status.get("model")
+    messages = client.list_messages(session_id)
+    assert any(item.get("role") == "assistant" for item in messages)
+    return ""
+
+
 def test_live_prompt_roundtrip(live_client):
     session_id = live_client.create_session(
         cwd=os.getcwd(),
@@ -95,12 +112,10 @@ def test_live_prompt_roundtrip(live_client):
     )
     deltas = _events_of(messages, "agent_message_delta")
     answer_text = "".join(e.get("text") or "" for e in deltas if e.get("display_kind") == "assistant")
+    final_text = _assert_successful_prompt(live_client, session_id, prompt_id)
+    if live_client.protocol_version == 2:
+        answer_text = final_text
     assert "pong" in answer_text.lower()
-
-    status = live_client.get_status(session_id)
-    assert status.get("model")
-    messages_list = live_client.list_messages(session_id)
-    assert any(item.get("role") == "assistant" for item in messages_list)
 
 
 def test_live_abort(live_client):

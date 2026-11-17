@@ -6259,6 +6259,31 @@ class ChatFrame(wx.Frame):
             self.answer_list.Append(row_text)
             self.answer_meta.append(meta)
 
+    def _ordered_answer_message_keys(self, turns: list[dict]) -> list[tuple]:
+        """Order lightweight identities before formatting any answer bodies."""
+        entries, previous = [], 0
+        for index, turn in enumerate(turns):
+            raw = str(turn.get("answer_md") or "")
+            roles = []
+            if str(turn.get("question") or "").strip() or turn.get("attachments"):
+                roles.append("user")
+            if (raw != REQUESTING_TEXT and not (turn.get("suppress_empty_answer_row") and not raw.strip())) or turn.get("received_attachments"):
+                roles.append("assistant")
+            for role in roles:
+                sequence = turn.get("answer_order" if role == "assistant" else "question_order")
+                timestamp = _finite_timestamp(turn.get("answer_at" if role == "assistant" else "created_at"))
+                if isinstance(sequence, int) and not isinstance(sequence, bool):
+                    order = sequence
+                elif timestamp is not None:
+                    order = int(timestamp * 1_000_000_000)
+                else:
+                    order = previous
+                previous = order
+                entries.append((order, len(entries), (index, role)))
+        if any(t.get("answer_at") is not None or t.get("answer_order") is not None for t in turns):
+            entries.sort(key=lambda entry: (entry[0], entry[1]))
+        return [entry[2] for entry in entries]
+
     def _answer_rows_with_limit(
         self,
         rows: list[str],
@@ -6273,6 +6298,28 @@ class ChatFrame(wx.Frame):
         header_metas = metas[:header_count]
         content_rows = rows[header_count:]
         content_metas = metas[header_count:]
+        turns = self._get_view_turns()
+        groups = []
+        current = None
+        for row, meta in zip(content_rows, content_metas):
+            if meta[0] == "time":
+                continue
+            role = "assistant" if meta[0] in {"ai", "answer"} else "user" if meta[0] in {"user", "question"} else (current[1] if current else "user")
+            key = (meta[1], role)
+            if current != key:
+                groups.append([key, []])
+                current = key
+            groups[-1][1].append((row, meta))
+        positions = {key: position for position, key in enumerate(self._ordered_answer_message_keys(turns))}
+        ordered = []
+        for ordinal, (key, entries) in enumerate(groups):
+            ordered.append((positions.get(key, ordinal), ordinal, entries))
+        ordered.sort(key=lambda entry: (entry[0], entry[1]))
+        content_rows, content_metas = [], []
+        for _, _, entries in ordered:
+            for row, meta in entries:
+                content_rows.append(row)
+                content_metas.append(meta)
         self.answer_total_content_rows = len(content_rows)
         limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0))
         self.answer_visible_row_limit = limit
@@ -6434,17 +6481,13 @@ class ChatFrame(wx.Frame):
             ANSWER_LIST_DEFAULT_VISIBLE_ROWS,
             int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0),
         )
-        turn_offset = 0
-        force_has_more = False
-        visible_turns = turns
-        if len(turns) > limit:
-            turn_offset = len(turns) - limit
-            visible_turns = turns[turn_offset:]
-            force_has_more = True
+        message_keys = self._ordered_answer_message_keys(turns)
+        visible_indexes = {index for index, _role in message_keys[-limit:]}
+        force_has_more = len(message_keys) > limit
+        visible_turns = [(index, turns[index]) for index in sorted(visible_indexes)]
         now_ts = time.time()
         time_anchor = None
-        for local_i, t in enumerate(visible_turns):
-            i = turn_offset + local_i
+        for i, t in visible_turns:
             q = str(t.get("question") or "")
             a_md, a = self._turn_answer_markdown(t)
             attachments = t.get("attachments") if isinstance(t.get("attachments"), list) else []
@@ -10170,6 +10213,8 @@ class ChatFrame(wx.Frame):
         )
 
     def _mark_turn_request_pending(self, turn: dict, model: str, question: str) -> None:
+        if "question_order" not in turn:
+            turn["question_order"] = self._next_answer_message_order()
         now = time.time()
         turn["request_status"] = "pending"
         turn["request_model"] = str(model or "")
@@ -10337,7 +10382,16 @@ class ChatFrame(wx.Frame):
             is_current_target and bool(self.active_codex_turn_active)
         )
 
+    def _next_answer_message_order(self) -> int:
+        known = [int(t.get(field) or 0) for t in getattr(self, "active_session_turns", [])
+                 if isinstance(t, dict) for field in ("question_order", "answer_order")]
+        value = max(time.time_ns(), int(getattr(self, "_answer_message_order", 0)) + 1, max(known, default=0) + 1)
+        self._answer_message_order = value
+        return value
+
     def _mark_turn_request_done(self, turn: dict) -> None:
+        if str(turn.get("request_status") or "") != "done" and "answer_order" not in turn:
+            turn["answer_order"] = self._next_answer_message_order()
         if str(turn.get("request_status") or "") != "done" and _finite_timestamp(turn.get("answer_at")) is None:
             turn["answer_at"] = time.time()
         turn["request_status"] = "done"
@@ -12131,6 +12185,8 @@ class ChatFrame(wx.Frame):
             model,
             turn.get("created_at"),
             turn.get("answer_at"),
+            turn.get("question_order"), turn.get("answer_order"),
+            turn.get("answer_identity"), turn.get("answer_alias_of"),
             str(turn.get("request_status") or ""),
             str(turn.get("request_error") or ""),
             str(turn.get("client_send_id") or ""),
@@ -12160,6 +12216,9 @@ class ChatFrame(wx.Frame):
         answer_at = _finite_timestamp(turn.get("answer_at"))
         if answer_at is not None:
             payload["answer_at"] = answer_at
+        for field in ("question_order", "answer_order", "answer_identity", "answer_alias_of"):
+            if field in turn:
+                payload[field] = turn[field]
         cache[cache_key] = (signature, dict(payload))
         return payload
 
@@ -14987,6 +15046,40 @@ class ChatFrame(wx.Frame):
                         [session_id],
                         deadline=deadline,
                     )
+                    if getattr(client, "protocol_version", 1) == 2:
+                        if bool(owner.get("legacy")) or str(owner.get("role") or "") == "unresolved":
+                            messages = self._kimi_call_with_deadline(client.recovery_messages_v2, session_id, deadline=deadline)
+                            candidates = [row for row in messages if self._kimi_is_user_prompt(row)
+                                          and self._kimi_message_text(row) == str(owner.get("question") or "").strip()]
+                            known = [row for row in candidates if str(row.get("id") or "") == prompt_id]
+                            # V2 never uses a nearest-time guess when several
+                            # identical submissions have no stable identity.
+                            if not known and len(candidates) != 1:
+                                last_error = "Kimi V2 prompt attribution is missing or ambiguous"
+                                last_was_exception = False
+                                break
+                            migrated = self._migrate_legacy_kimi_owner(owner, messages if len(candidates) == 1 else known)
+                            if not isinstance(migrated, dict):
+                                last_error = "Kimi V2 prompt attribution is ambiguous"
+                                break
+                            owner = migrated
+                            prompt_id = str(owner.get("owner_prompt_id") if owner.get("role") == "alias" else owner.get("prompt_id") or "").strip()
+                        event = self._kimi_call_with_deadline(client.reconcile_v2, session_id, prompt_id, deadline=deadline)
+                        if event is not None and event.type == "thread_status_changed" and event.status in {"running", "queued", "blocked"}:
+                            return "monitor"
+                        if event is not None:
+                            event.data["owner_generation"] = int(owner.get("generation") or 0)
+                            self._call_after_if_alive(self._on_kimi_event, CodexEvent(**kimi_event_to_payload(event)))
+                            return "done"
+                        last_error = "Kimi V2 transcript has no complete authoritative answer for this prompt"
+                        last_was_exception = False
+                        if deadline is not None:
+                            terminal_wait = True
+                            continue
+                        attempt += 1
+                        if attempt >= max_attempts:
+                            break
+                        continue
                     status = self._kimi_call_with_deadline(
                         client.get_status,
                         session_id,
@@ -15835,9 +15928,11 @@ class ChatFrame(wx.Frame):
         event_generation = int(event_data.get("owner_generation") or 0)
         if event_generation and event_generation != int(owner.get("generation") or 0):
             return []
+        answer_identity = "kimi:" + hashlib.sha256((event_session_id + ":" + owner_prompt_id).encode()).hexdigest()
         identity = (owner_key[1], owner_key[2], event_turn_id, self._kimi_event_agent_id(event))
         with self._kimi_owner_lock:
             if owner_key in self._kimi_terminal_tombstones or identity in self._kimi_completed_identities:
+                self._record_kimi_completion_stage(answer_identity, "deduplicated")
                 return []
             stored_owner = self._kimi_prompt_owners.get(owner_key)
             if source_kind == "turn.ended" and isinstance(stored_owner, dict):
@@ -15910,6 +16005,9 @@ class ChatFrame(wx.Frame):
                 self.active_kimi_request_queue = queue
         finalized: list[int] = []
         accepted: list[int] = []
+        primary_idx = next((candidate.get("turn_idx") for candidate in owner_snapshot
+                            if isinstance(candidate, dict) and candidate.get("prompt_id") == owner_prompt_id
+                            and candidate.get("chat_id") == chat_id and candidate.get("session_id") == event_session_id), owner.get("turn_idx"))
         for idx in covered:
             if not isinstance(idx, int) or idx < 0 or idx >= len(target_turns):
                 continue
@@ -15925,7 +16023,13 @@ class ChatFrame(wx.Frame):
                     self._recover_kimi_pending_owners(session_ids={event_session_id} if event_session_id else None)
                     return []
                 was_done = str(turn.get("request_status") or "") == "done"
-                self._apply_kimi_final_answer_to_turn(turn, final_text)
+                turn["answer_identity"] = answer_identity
+                if idx == primary_idx:
+                    self._apply_kimi_final_answer_to_turn(turn, final_text)
+                else:
+                    turn["answer_md"] = ""
+                    turn["answer_alias_of"] = answer_identity
+                    turn["suppress_empty_answer_row"] = True
                 if not was_done:
                     self._record_chat_activity(target_chat, time.time())
                 self._mark_turn_request_done(turn)
@@ -15988,7 +16092,31 @@ class ChatFrame(wx.Frame):
                     key for key in self._kimi_incomplete_streams
                     if not (key[0] == str(chat_id or "") and key[1] == event_session_id and key[2] == owner_prompt_id)
                 }
+        # Accepted state and notification survive failures in either foreground
+        # or background presentation below this common boundary.
+        self._mark_chat_turns_dirty(chat_id, min(finalized))
+        self._defer_chat_state_save()
+        if status == "completed" and any(str(target_turns[i].get("answer_md") or "").strip() for i in finalized):
+            self._notify_kimi_answer_completed(answer_identity)
         return finalized
+
+    def _record_kimi_completion_stage(self, identity: str, stage: str) -> None:
+        if os.getenv("MC_KIMI_COMPLETION_DIAGNOSTICS", "").strip() != "1":
+            return
+        records = getattr(self, "_kimi_completion_diagnostics", None)
+        if records is None:
+            records = deque(maxlen=128)
+            self._kimi_completion_diagnostics = records
+        records.append({"answer": identity, "stage": stage})
+
+    def _notify_kimi_answer_completed(self, identity: str) -> None:
+        self._record_kimi_completion_stage(identity, "accepted")
+        try:
+            self._play_finish_sound()
+            self._record_kimi_completion_stage(identity, "sound_called")
+        except Exception:
+            # Audio device failures cannot undo or prevent answer persistence.
+            self._record_kimi_completion_stage(identity, "sound_failed")
 
     def _apply_kimi_error(
         self,
@@ -16518,7 +16646,6 @@ class ChatFrame(wx.Frame):
                             self._request_kimi_chat_information(target_chat, str(turn.get("model") or DEFAULT_KIMI_MODEL), visible_only=True)
                             self._request_kimi_quota(target_chat, str(turn.get("model") or DEFAULT_KIMI_MODEL))
                         if successful:
-                            self._play_finish_sound()
                             for finalized_idx in finalized:
                                 finalized_turn = target_turns[finalized_idx]
                                 if (
@@ -16628,8 +16755,6 @@ class ChatFrame(wx.Frame):
                 and str(self.active_session_turns[idx].get("request_status") or "").strip() == "done"
                 and bool(str(self.active_session_turns[idx].get("answer_md") or "").strip())
             ]
-            if successful:
-                self._play_finish_sound()
             if finalized and not still_active:
                 self.is_running = False
                 self._active_request_count = 0
