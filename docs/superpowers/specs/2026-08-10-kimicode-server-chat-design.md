@@ -1,5 +1,7 @@
 # Kimi Code Server Chat Design
 
+Historical design verified against the 2026-08-10 V1 runtime. Current fixed-runtime resolution and Kimi 2.5.3 V2 subscription/recovery behavior are documented in [Kimi runtime](../../kimi-runtime.md); the PATH and status/snapshot descriptions below are historical evidence.
+
 ## Problem
 
 The app already chats with the Codex CLI through a dedicated worker-process pipeline

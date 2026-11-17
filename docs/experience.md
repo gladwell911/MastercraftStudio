@@ -1,5 +1,12 @@
 # 可复用经验
 
+## Kimi V2 协议与恢复边界
+
+- 核对固定二进制的线上schema、producer和consumer，不把持久wire事件当WebSocket帧。2.5.3的append offset按UTF-16 code unit计数；批次失败保留旧游标，正常中文与非BMP都要经client消费和权威完成断言。
+- 订阅就绪属于socket generation和目标session；真实invalidate立即撤销ready，旧代迟到ACK不能解锁发送。回归覆盖真实连接分支的greeting、匹配ACK、POST及重连；直接注入完成snapshot不足以保护该链路。
+- “仍在运行”和“终态正文未落盘”使用不同恢复结果：前者保留owner和monitor，后者才有限补齐。结果不明的POST只读恢复唯一prompt，歧义明确报告，不能重发或挑最后assistant。
+- 消息顺序用独立稳定身份/序列，格式化前按轻量消息取尾页；用与时间相反的序列、旧turn晚到答案、分页重载和原生焦点共同验证，避免排序正确却让长历史重绘退化。
+
 ## 语音异步边界与回归验证
 
 - 豆包流式识别的模型代次由资源 ID 选择，不能从请求体 `model_name=bigmodel` 判断仍是旧版。升级时核对资源与 WebSocket 路径配套，并通过真实 client 检查最终文本、终包和清理；本次 2.0 资源配旧 `/bigmodel` 返回 HTTP 400，配 `/bigmodel_async` 成功。使用固定非私人音频验证云端，另做物理按键与麦克风验收。

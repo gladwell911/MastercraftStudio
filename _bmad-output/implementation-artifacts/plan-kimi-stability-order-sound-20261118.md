@@ -30,7 +30,7 @@ deferred:
 
 # Kimi 兼容性、消息顺序与完成音效实施计划
 
-日期：2026-11-18。规划者：dog。源码基线：`7ac8fca`，工作区 `D:/code/sj/mc`。状态：待实施；本文件不是修复或部署完成证明。
+日期：2026-11-18。规划者：dog。源码基线：`7ac8fca`，工作区 `D:/code/sj/mc`。状态：built，源码实施、审查patch及独立定向验证已完成；真实云端新请求、物理声音、日常部署及长稳未验收。
 
 ## 目标及边界
 
@@ -135,26 +135,26 @@ director 在现有 Kimi client/integration 测试中先加入失败回归，复�
 
 ## 完成交付清单
 
-- [ ] V2 client、恢复及明确兼容错误已实现；V1 定向回归无退化。
-- [ ] 固定运行时准备/检查入口及禁更新环境已实现，临时目录验收通过；日常未安装状态明确。
-- [ ] 消息出现顺序在增量/重建/分页/重启一致；alias 最终回答和通知唯一。
-- [ ] 已证实无声触发链修复，必要故障注入通过；未复现声学问题如实保留。
-- [ ] 定向测试、独立验证和新 dog 审查证据可追溯，无未解释失败。
-- [ ] 任务创建的临时目录/进程已登记并清理；失败必要证据保留。无日常数据修改，无打包/重启。
-- [ ] handoff/README/experience/reflection 按最终事实更新；明确源码、隔离验证、真实云端、日常部署各自完成状态。
+- [x] V2 client、恢复及明确兼容错误已实现；V1 定向回归无退化。
+- [x] 固定运行时准备/检查入口及禁更新环境已实现，临时目录验收通过；日常未安装状态明确。
+- [x] 消息出现顺序在增量/重建/分页/重启一致；alias 最终回答和通知唯一。
+- [x] 已证实无声触发链修复，必要故障注入通过；未复现声学问题如实保留。
+- [x] 定向测试、独立验证和新 dog 审查证据可追溯，无未解释失败。
+- [x] 任务创建的临时目录/进程已登记并清理；失败必要证据保留。无日常数据修改，无打包/重启。
+- [x] handoff/README/experience/reflection 按最终事实更新；明确源码、隔离验证、真实云端、日常部署各自完成状态。
 
 执行者在本文件末追加精简结果：修改文件、关键测试结果、未完成验收、审查及修复结论；无需为每一步再新建重复方案文档。
 
-## director 实施记录（2026-11-18，待独立验证及审查）
+## director 初次实施记录（2026-11-18，后续独立验证及审查修复见下文）
 
 - 修改 `kimi_server_client.py`、`main.py`；新增 `kimi_transcript.py`、`kimi_runtime.py` 和 `docs/kimi-runtime.md`。V1 保留；V2 从真实 server_hello 选择协议，采用目标 session 的 subscribe_v2 ACK 门禁、主代理 transcript reset/ops、triggerPromptId 完成关联、journal/full transcript 补齐及有界 prompt 分页恢复。旧 status/snapshot 对 V2 明确报告不支持。
 - 运行时固定为已核对的 2.5.3 Windows SHA256；准备入口先验来源再复制复验，不覆盖已有目标。KIMI_BIN 也必须校验，子进程禁自动更新。日常独立运行时未安装。
 - 问题和完成答案分别记录稳定顺序，完整消息组统一排序后取尾页；取消按 turn 预截断。旧数据有可信回答时间时合并，否则保持旧相对顺序。alias 保留问题和 done 状态，正文仅存原 owner，引用共享 answer_identity；远程 payload 同时携带顺序及引用字段。旧手机消费者若忽略新增顺序字段，其显示排序仍属于消费者契约边界，本轮没有修改手机代码。
 - 故障注入确认：答案接纳后 `_request_kimi_chat_information` 抛错会漏完成音。已将状态保存调度与提示移到前后台共用接纳边界，重复终态仍去重；声音失败不撤销答案。有界匿名诊断默认关闭，无持久音效队列。
-- 回归先失败：旧 subscribe、V2 未映射终答、Q0/A0/Q1 顺序及 UI 异常漏音均已复现。最终合并命令 `.venv/Scripts/python.exe -m pytest tests/test_kimi_server_client_unit.py tests/test_answer_list_time_rows_unit.py tests/test_kimi_integration.py -q`：**306 passed、3 failed**（61.95s）。剩余三项是执行步骤用例：`test_kimi_tool_completion_updates_started_item_with_result_and_failure`、`test_kimi_completion_does_not_overwrite_reused_item_id_from_another_turn`、`test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_steps`；尚未独立核对基线，不能计为通过。随后新增 journal 缺口回归，连同原缺口测试 **2 passed**。
+- 回归先失败：旧 subscribe、V2 未映射终答、Q0/A0/Q1 顺序及 UI 异常漏音均已复现。最终合并命令 `.venv/Scripts/python.exe -m pytest tests/test_kimi_server_client_unit.py tests/test_answer_list_time_rows_unit.py tests/test_kimi_integration.py -q`：**306 passed、3 failed**（61.95s）。剩余三项是执行步骤用例：`test_kimi_tool_completion_updates_started_item_with_result_and_failure`、`test_kimi_completion_does_not_overwrite_reused_item_id_from_another_turn`、`test_real_fixture_status_thinking_and_tool_result_produce_primary_chinese_steps`；初次运行时尚未核对基线；后续engineer已在原7ac8fca完整基线同断言复现，未计为通过。随后新增 journal 缺口回归，连同原缺口测试 **2 passed**。
 - 受影响 `tests/test_answer_presentation_ui_automation.py` 首次 **11 passed、1 failed**：新加用例没有等待初始焦点任务结束；补显式原生焦点前置条件后该用例单独 **1 passed**。首次运行打印 Windows COM `0x8001010d` 诊断，但测试进程正常完成；不能把该诊断称为产品缺陷。原有11项未受后续测试前置条件修改影响。`git diff --check` 与源码编译检查通过。
 - 真实无凭据隔离验证完成：准备到任务临时目录的独立二进制，独立 KIMI_CODE_HOME、空工作目录、随机端口；真实 client 得到 protocol=2、目标订阅 ACK、主代理空 transcript。没有发送云端 prompt。自有进程已退出，临时目录及154MB测试副本已清理，无日常数据库修改、无打包/重启。
-- 待验收：engineer 独立验证、指定新 dog 审查、真实云端新请求、物理声音、日常安装切换及长期运行。未知历史真实到达顺序不可保证重建。尚未复现 PlaySound 相互覆盖，不添加补偿机制。收尾文档和 Git 操作由父代理协调下一阶段。
+- 后续engineer独立验证与新dog审查及R1–R11修复已完成。待验收：真实云端新请求、物理声音、日常安装切换及长期运行。未知历史真实到达顺序不可保证重建。尚未复现 PlaySound 相互覆盖，不添加补偿机制。最终文档已同步；Git结果见收尾汇报。
 
 ## engineer 独立验证（2026-11-18）
 
@@ -192,7 +192,7 @@ director 在现有 Kimi client/integration 测试中先加入失败回归，复�
 
 完整原始透镜及R1–R11最小修复要求见 [审查报告](review-kimi-stability-order-sound-20261118.md)。已沿调用链核对，全部明确问题按patch进入本次build-auto同一实施代理修复，不重复全轮审查。
 
-### 审查修复 R1–R11（待 engineer 复验）
+### 审查修复 R1–R11（engineer 17+4项独立复验通过）
 
 本轮局部修复：V2 明确区分 running/queued/blocked 并返回既有 monitor；legacy/unresolved 先用只读 transcript 唯一归属，再按真实 prompt 恢复，歧义明确失败且不重POST。恢复事件统一转换为 MC 消费类型。append 批次原子应用，失败不推进游标，并按实际 UTF-16 code-unit 处理追加/重叠；真实 client 缺口或冲突触发现有修复。ACK 绑定当前 socket generation，实际 invalidate 立即撤销旧 ready/Event。WS/REST 完成后释放已完成正文、started/frame cache，完成身份最多512项、空闲transcript最多32个，保留pending文本，close清理自有状态。共享轻量消息顺序先选择尾页再格式化正文，保留旧turn晚到答案。opt-in smoke 对 V2 检查目标prompt权威终态，仅V1使用旧status。
 
@@ -208,4 +208,4 @@ Status: built. 本轮实施、独立验证、指定新 dog 四透镜审查及 R1
 - 审查：四透镜全部完成，24项逐项裁决见上文及报告；11个patch组已修复，其中high 4组、medium 7组（含测试补强）；2项未核实风险deferred，9项依记录理由驳回。未将被驳回/未证实场景扩成机制。
 - 修复后engineer独立复验：17项协议/恢复/运行时/append/缓存/ACK/smoke测试通过，4项显式顺序/迟到回答/有界渲染/UI焦点测试通过，无新增失败。此前三项执行步骤失败已在完整原基线上同断言复现；未计为通过。
 - followup_review_recommended: true。依据本轮修复4个high组；特定未验证风险是实际云端长任务在断连重连和未决发送后的整体行为，当前只有真实本地无凭据握手及隔离合成链路证据，不能宣称云端现场已验收。物理声音及长期运行亦待现场验收。
-- 全程无日常MC重启、无打包、无日常数据改写或运行时安装；下一阶段由director执行neat-freak同步文档及提交推送。
+- 全程无日常MC重启、无打包、无日常数据改写或运行时安装；director已按neat-freak同步最终文档，Git提交及推送结果见收尾汇报。

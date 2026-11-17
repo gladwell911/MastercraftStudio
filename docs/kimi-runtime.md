@@ -14,6 +14,12 @@ MC 使用独立运行时 `runtimes/kimi/2.5.3/kimi.exe`，不再从共享 PATH �
 
 客户端根据真实握手选择 V1 或 V2。V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
 
+ACK只属于当前socket generation，失效立即撤销就绪。running/queued/blocked继续既有monitor；POST结果不明时通过只读transcript定位唯一prompt，歧义明确失败，不自动重发。append按UTF-16 code unit应用，批次失败不跳游标；终态缺正文仍走有界补齐。完成后释放正文和流缓存，仅保留最多512项完成身份、32个空闲transcript，pending文本保留；这些是局部对象保留界限，不是存储总量或长期稳定性证明。
+
 首次完整成功回答在前后台共用接纳边界保存并请求完成音，alias 只保留问题和回答身份引用。`MC_KIMI_COMPLETION_DIAGNOSTICS=1` 开启当前进程最多 128 条匿名完成/音效结果记录（`_kimi_completion_diagnostics`）；默认关闭，不保存正文或凭据，无历史补播。
 
 固定版本不能保证云端 API 永远兼容。回退前必须验证升级后的会话格式可读，不能直接让旧程序写日常库。真实云端新请求、物理声音、安装后长期运行仍待验收；模拟调用次数与无凭据本地握手不能代替这些验收。
+
+2026-11-18：源码修复 `7852d06` 已完成审查patch及独立定向复验；真实无凭据隔离服务完成握手/订阅ACK/空transcript验证，临时运行时已清理。具体证据见 [交接](handoff.md)。整体云端断连/未决发送仍建议现场跟进，不能称clean review。完成身份被淘汰后的旧重放尚未验收；旧手机可能忽略新增消息顺序字段，未知历史真实到达次序无法保证重建。
+
+保留 [审查报告](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md) 的D1/D2：固定2.5.3的`complete:true`却journal覆盖不足，以及同一frame权威reset合法缩短/替换，都尚无真实可达证据，不为此新增防御。PlaySound相互覆盖未复现，不添加历史补播机制。

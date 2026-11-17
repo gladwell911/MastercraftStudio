@@ -1,12 +1,13 @@
 # 文档索引
 
-2026-11-10：语音本地先录、收尾竞争修复和累计文本回归补强已完成软件验证；默认豆包流式识别已升级 2.0，固定音频真实云端识别通过，尚未打包或重启日常 MC。当前快照、现场边界及下载/通知/远程维护待办统一见 [交接](handoff.md)。各历史报告只证明其对应阶段，不代表安装包或完整现场验收。
+2026-11-18：Kimi 2.5.3 协议、稳定消息顺序及完成音效源码修复已完成，审查后的R1–R11经独立定向复验通过。独立运行时仅有准备入口，日常MC仍旧包；真实云端新请求、物理声音、安装切换及长稳未验收。语音阶段成果与其他接续事项见 [交接](handoff.md)。各历史报告只证明对应阶段，不代表当前安装包或完整现场验收。
 
 ## 当前入口
 
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
+- [`kimi-runtime.md`](./kimi-runtime.md)：固定Kimi版本/哈希、显式准备、V2订阅/恢复及验证边界
 - [`voice-input.md`](./voice-input.md)：双 Ctrl 使用反馈、设备/ASR会话所有权、FIFO与停止/取消约定；验收状态由handoff维护
 - [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
@@ -39,8 +40,8 @@
 - 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
 - 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
 - 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
-- 回答使用独立的 created_at/answer_at，时间行同样累计 300 秒。终结重放保持答案时间，完成及 accepted 延迟刷新核对现有回答行；旧记录只恢复可信 final 时间，不填当前时间。
-- 聊天信息菜单与 Codex/Kimi 上下文、累计用量现已接入；Codex 主 `codex` 周额度和 Kimi OAuth 五小时/七日额度也已接入。信息行的数据来源、缺失状态和异步身份约束以聊天信息规格及 Story 1.1–1.5 计划为准。
+- 问题/答案按独立question_order/answer_order排序并在格式化前选择消息尾页；created_at/answer_at只用于时间标签，时间行累计300秒。终结重放保留顺序和时间；旧记录仅合并可信时间，不填当前时间。Kimi steer alias共用answer_identity，alias正文为空并引用answer_alias_of；旧手机忽略新增排序字段的显示边界保留。
+- 聊天信息菜单、Codex主 `codex` 周额度和Kimi OAuth五小时/七日额度已有接入。V2不支持的旧status/snapshot能力明确报告不可用，不伪造上下文数值；其余信息行来源与异步身份约束以聊天信息规格及Story 1.1–1.5计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。
 

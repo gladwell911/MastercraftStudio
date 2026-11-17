@@ -1,6 +1,6 @@
 神匠工坊（mc）是面向读屏用户的 wxPython Windows 桌面客户端，整合 Codex、Claude Code、Kimi Code、OpenClaw 等模型工作流，以及聊天历史、远程控制和笔记。
 
-2026-11-10：语音本地先录及收尾竞态修复已进入源码，累计interim到最终完整文本的回归补强已通过独立验证；尚未部署到日常 MC。当前状态、未完成的现场验收及下载/通知/远程维护接续统一见 [当前交接](docs/handoff.md)，工程说明见 [文档索引](docs/README.md)。
+2026-11-18：Kimi 2.5.3 协议、回答出现顺序与完成音效修复已进入源码，审查修复及独立定向验证完成。日常 MC 仍是旧包，独立 Kimi 运行时未安装；真实云端新请求、物理声音及长稳仍待验收。当前状态、语音阶段及下载/通知/远程维护接续统一见 [当前交接](docs/handoff.md)，工程说明见 [文档索引](docs/README.md)。
 
 ## 快速开始
 
@@ -10,6 +10,10 @@
     python main.py
 
 开发依赖：python -m pip install -r requirements-dev.txt。详细运行与配置说明见[归档的原入口](docs/archive/entry-context-2026-09-29/README.txt)。
+
+## Kimi Code
+
+源码为 MC 使用独立、固定版本的 Kimi 2.5.3 Windows 二进制，启动前核对版本和 SHA256，子进程禁自动更新；缺少运行时明确报错，不回退共享 PATH。先按 [Kimi 运行时](docs/kimi-runtime.md) 从已验证的本地候选显式准备。`KIMI_BIN` 覆盖也需相同校验。准备入口已在临时目录验证，日常安装和应用切换须另行安排；旧设计里的共享 PATH 和 V1 status/snapshot 说明不适用于当前 V2。
 
 ## 语音输入
 
