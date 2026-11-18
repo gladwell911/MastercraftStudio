@@ -1918,6 +1918,58 @@ def test_kimi_accepted_answer_notifies_and_saves_before_ui_failure(frame, monkey
     assert played == [True]
 
 
+@pytest.mark.parametrize("first_source", ["reset", "rest"])
+def test_v2_steered_rest_and_reset_complete_alias_once(frame, monkeypatch, first_source):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    played = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: played.append(True))
+    _submit(frame, "owner request")
+    sid, prompt = fake.created_sessions[0]["session_id"], fake.submitted[0]["prompt_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=sid, turn_id="steered-turn"))
+    _submit(frame, "follow-up request")
+    assert len(fake.steer_calls) == 1
+    transport = KimiServerClient(start_reader_thread=False)
+    transport.protocol_version = 2
+    snapshot = {"items": [{"kind": "turn", "turnId": "steered-turn", "triggerPromptId": prompt,
+        "state": "completed", "steps": [{"stepId": "st", "ordinal": 1,
+            "state": "interrupted", "endReason": "steered", "frames": [
+                {"kind": "text", "role": "assistant", "frameId": "old", "text": "pre-steer partial"},
+                {"kind": "text", "role": "user", "frameId": "user", "text": "follow-up request"},
+                {"kind": "thinking", "frameId": "thought", "text": "reasoning"},
+                {"kind": "text", "role": "assistant", "frameId": "final", "text": "public steered final"}]}]}]}
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: {**snapshot, "has_more": False})
+    reset = {"type": "transcript.reset", "session_id": sid, "payload": {
+        "agent_id": "main", "seq": 5, "snapshot": snapshot}}
+    try:
+        if first_source == "rest":
+            fake.push_event(transport.reconcile_v2(sid, prompt))
+        else:
+            transport._handle_ws_message(reset)
+            for row in transport.drain_pending_messages(100):
+                if row["type"] == "event":
+                    fake.push_event(KimiEvent(**row["payload"]["event"]))
+        frame._flush_chat_state_save()
+        chat_id = _active_chat_id(frame)
+        stored = frame.chat_store.load_chat(chat_id)["turns"]
+        assert [t["request_status"] for t in stored] == ["done", "done"]
+        assert [t["answer_md"] for t in stored] == ["public steered final", ""]
+        assert stored[1]["answer_alias_of"] == stored[0]["answer_identity"]
+        read_state = frame.chat_store.get_chat_read_state(chat_id)
+        for _ in range(2):
+            transport._handle_ws_message(reset)
+            for row in transport.drain_pending_messages(100):
+                if row["type"] == "event":
+                    fake.push_event(KimiEvent(**row["payload"]["event"]))
+            fake.push_event(transport.reconcile_v2(sid, prompt))
+        frame._flush_chat_state_save()
+        assert frame.chat_store.load_chat(chat_id)["turns"] == stored
+        assert frame.chat_store.get_chat_read_state(chat_id) == read_state
+        assert played == [True]
+        assert len(fake.submitted) == 2
+    finally:
+        transport.close()
+
+
 def test_v2_real_client_transcript_to_mc_final_and_rest_replay(frame, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
     _submit(frame, "synthetic question")

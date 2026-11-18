@@ -1495,6 +1495,97 @@ def _v2_snapshot(text="", state="running", prompt="p", turn="t"):
             {"kind": "text", "role": "assistant", "frameId": "f", "text": text}]}]}]}
 
 
+def _steered_rest_snapshot():
+    snapshot = _v2_snapshot("final public answer", "completed")
+    step = snapshot["items"][0]["steps"][0]
+    step.update(state="interrupted", endReason="steered")
+    step["frames"][:0] = [
+        {"kind": "text", "role": "assistant", "text": "old partial"},
+        {"kind": "text", "role": "user", "text": "follow-up"},
+        {"kind": "thinking", "text": "private reasoning"},
+    ]
+    return snapshot
+
+
+def test_v2_steered_rest_recovers_exact_owner_public_final():
+    client, _, http, _, _ = started_client()
+    client.protocol_version = 2
+    snapshot = _steered_rest_snapshot()
+    snapshot["items"] += _v2_snapshot("wrong later answer", "completed", "later", "later-turn")["items"]
+    http.routes[("GET", "/api/v1/sessions/s/transcript")] = FakeResponse(200, {
+        "code": 0, "data": {**snapshot, "has_more": False}})
+    event = client.reconcile_v2("s", "p")
+    assert event is not None
+    assert (event.type, event.status, event.text) == ("turn_completed", "completed", "final public answer")
+    assert event.data["prompt_id"] == "p"
+    assert all(event.data[key] is True for key in ("authoritative", "terminal_verified", "stream_complete"))
+    assert client.reconcile_v2("s", "missing") is None
+    transcript_calls = [call for call in http.calls if call["url"].endswith("/transcript")]
+    assert all(call["params"] == {"agent_id": "main", "page_size": 100} for call in transcript_calls)
+
+
+@pytest.mark.parametrize("case", ["aborted", "unknown", "missing_reason", "running_step", "failed_step",
+    "running_turn", "failed_turn", "cancelled_turn", "tool", "thinking", "blank", "private", "hidden",
+    "non_disclosable", "not_disclosable", "no_answer_after_user", "thinking_after_user", "gap"])
+def test_v2_steered_rest_rejects_unsafe_terminal_candidates(case):
+    from kimi_transcript import Transcript
+    client, *_ = started_client()
+    snapshot = _steered_rest_snapshot()
+    turn = snapshot["items"][0]
+    step = turn["steps"][0]
+    final = step["frames"][-1]
+    if case in {"aborted", "unknown"}:
+        step["endReason"] = case
+    elif case == "missing_reason":
+        del step["endReason"]
+    elif case.endswith("_step"):
+        step["state"] = case.removesuffix("_step")
+    elif case.endswith("_turn"):
+        turn["state"] = case.removesuffix("_turn")
+    elif case == "tool":
+        step["frames"].append({"kind": "tool"})
+    elif case == "thinking":
+        final["kind"] = "thinking"
+    elif case == "blank":
+        final["text"] = " \n"
+    elif case in {"private", "hidden", "non_disclosable"}:
+        final[case] = True
+    elif case == "not_disclosable":
+        final["disclosable"] = False
+    elif case in {"no_answer_after_user", "thinking_after_user"}:
+        step["frames"].append({"kind": "text", "role": "user", "text": "last follow-up"})
+        if case == "thinking_after_user":
+            step["frames"].append({"kind": "thinking", "text": "still thinking"})
+    # An earlier completed step must never rescue a rejected final step.
+    turn["steps"].insert(0, {"stepId": "earlier", "ordinal": -1, "state": "completed", "frames": [
+        {"kind": "text", "role": "assistant", "text": "earlier answer"}]})
+    transcript = Transcript()
+    transcript.reset(snapshot, 1)
+    if case == "gap":
+        assert not transcript.apply([], 3)
+    results = transcript.results()
+    monkey_page = {**snapshot, "has_more": False}
+    client.get_transcript = lambda *a, **k: monkey_page
+    event = client.reconcile_v2("s", "p")
+    if case in {"failed_turn", "cancelled_turn"}:
+        assert results == [(turn, "")]
+        assert event.status == "failed"
+    else:
+        assert results == []
+        # REST builds a fresh complete snapshot rather than inheriting a stream gap.
+        if case != "gap":
+            assert event is None or event.type == "thread_status_changed"
+
+
+def test_v2_steered_rest_without_user_frame_keeps_public_assistant_text():
+    client, *_ = started_client()
+    snapshot = _steered_rest_snapshot()
+    snapshot["items"][0]["steps"][0]["frames"] = [{
+        "kind": "text", "role": "assistant", "text": "whole final"}]
+    client.get_transcript = lambda *a, **k: {**snapshot, "has_more": False}
+    assert client.reconcile_v2("s", "p").text == "whole final"
+
+
 @pytest.mark.parametrize("prefix,fragment,overlap,expected", [
     ("hello", " world", 5, "hello world"),
     ("中文", "回复", 2, "中文回复"),

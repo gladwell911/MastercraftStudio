@@ -114,11 +114,18 @@ class Transcript:
             if not steps:
                 continue
             last = steps[-1]
-            if last.get('state') != 'completed':
+            steered = last.get('state') == 'interrupted' and last.get('endReason') == 'steered'
+            if last.get('state') != 'completed' and not steered:
                 continue
             frames = last.get('frames', [])
             if any(f.get('kind') == 'tool' for f in frames):
                 continue
+            if steered:
+                # A steer can retain pre-follow-up partial output in this step.
+                # Only structured user frames delimit the final response.
+                boundary = max((i for i, frame in enumerate(frames)
+                                if frame.get('kind') == 'text' and frame.get('role') == 'user'), default=-1)
+                frames = frames[boundary + 1:]
             texts = [f.get('text', '') for f in frames
                      if f.get('kind') == 'text' and f.get('role') == 'assistant'
                      and not any(f.get(k) for k in ('private', 'hidden', 'non_disclosable'))
