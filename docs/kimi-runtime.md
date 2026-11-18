@@ -22,6 +22,8 @@ ACK只属于当前socket generation，失效立即撤销就绪。running/queued/
 
 固定版本不能保证云端 API 永远兼容。回退前必须验证升级后的会话格式可读，不能直接让旧程序写日常库。物理声音、日常安装切换与长期运行仍待验收；隔离云端和音效替身调用不代替这些验收。
 
-2026-11-18：`7852d06` 的协议/顺序/音效修复后，`8858753` 补齐 steered REST 恢复；独立 client 146项及串行 integration 13项通过。真实隔离云端新请求、重连 ACK、同会话连续性、活动长任务追问、owner REST 正文相等与重放去重已通过，临时运行时和数据库已清理。证据及审查限制见 [交接](handoff.md)，不能称 clean review。真实活动长任务断连、未决 POST 整体恢复、完成身份淘汰后旧重放尚未验收；旧手机可能忽略新增顺序字段，未知历史真实到达次序无法保证重建。
+2026-11-18：`7852d06` 的协议/顺序/音效修复后，`8858753` 补齐 steered REST 恢复；独立 client 146项及串行 integration 13项通过，源码未变，后续审查复用该结果。真实隔离云端新请求、同会话连续性、活动长任务追问期间断连和新代目标 ACK、owner REST 正文相等与重放去重已通过，临时运行时和数据库已清理。65.39秒活动断连场景允许 WS 补终结，不代表“WS无终结仅靠自动REST调度”已验收；未决 POST 整体真实恢复、完成身份淘汰后旧重放也尚未验收。旧手机可能忽略新增顺序字段，未知历史真实到达次序无法保证重建。
+
+最新 [全新四透镜审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 为0 patch、1 defer、9 reject。defer 是 medium (unverified) 的协议边界疑问：无 user 但残留追问前正文，或同一最终 step 保留追问前 tool，是否在固定2.5.3真实可达，仍须脱敏 shape 与 producer 证据；当前按既定合同处理，不新增推测分支。edge空结果仍是 failed layer，不能称完整 clean review；本轮 blind 的代码 diff 不含计划，旧轮叙述污染限制不套用到该 blind，协调员读取原计划的影响见报告。其他证据与现场限制见 [交接](handoff.md)。
 
 保留 [审查报告](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md) 的D1/D2：固定2.5.3的`complete:true`却journal覆盖不足，以及同一frame权威reset合法缩短/替换，都尚无真实可达证据，不为此新增防御。PlaySound相互覆盖未复现，不添加历史补播机制。

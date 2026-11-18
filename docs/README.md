@@ -1,6 +1,6 @@
 # 文档索引
 
-2026-11-18：Kimi 2.5.3 协议、消息顺序及完成音效源码修复已完成；`8858753` 修复追问后的 steered REST 最终回答恢复，独立定向159项通过。真实隔离云端新请求、重连 ACK、长任务追问与 REST 重放已通过；物理声音、日常独立运行时安装、包切换及长稳未验收，日常MC仍旧包。当前证据与审查限制见 [交接](handoff.md)。各历史报告只证明对应阶段，不代表当前安装包或完整现场验收。
+2026-11-18：Kimi 2.5.3 协议、消息顺序及完成音效源码修复已完成；`8858753` 修复追问后的 steered REST 最终回答恢复，独立定向159项通过。真实隔离云端活动长任务追问期间断连、新代 ACK、最终正文和 REST 重放已通过；最新审查为0 patch、1 defer、9 reject。物理声音、日常独立运行时安装、包切换及长稳未验收，日常MC仍旧包。当前证据、协议边界留项与验收限制见 [交接](handoff.md)。各历史报告只证明对应阶段，不代表当前安装包或完整现场验收。
 
 ## 当前入口
 
@@ -9,6 +9,7 @@
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
 - [`kimi-runtime.md`](./kimi-runtime.md)：固定Kimi版本/哈希、显式准备、V2订阅/恢复及验证边界
 - [`../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md`](../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md)：steered REST恢复的实施、精确验证命令和真实隔离证据；[独立审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-recovery-20261118.md)的父裁决以计划为准
+- [`../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md`](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md)：最新全新四透镜审查、活动长任务断连证据及未验证协议边界 defer；原计划/审查保留为历史记录
 - [`voice-input.md`](./voice-input.md)：双 Ctrl 使用反馈、设备/ASR会话所有权、FIFO与停止/取消约定；验收状态由handoff维护
 - [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
