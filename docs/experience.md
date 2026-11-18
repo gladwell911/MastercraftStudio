@@ -5,6 +5,8 @@
 - 核对固定二进制的线上schema、producer和consumer，不把持久wire事件当WebSocket帧。2.5.3的append offset按UTF-16 code unit计数；批次失败保留旧游标，正常中文与非BMP都要经client消费和权威完成断言。
 - 订阅就绪属于socket generation和目标session；真实invalidate立即撤销ready，旧代迟到ACK不能解锁发送。回归覆盖真实连接分支的greeting、匹配ACK、POST及重连；直接注入完成snapshot不足以保护该链路。
 - “仍在运行”和“终态正文未落盘”使用不同恢复结果：前者保留owner和monitor，后者才有限补齐。结果不明的POST只读恢复唯一prompt，歧义明确报告，不能重发或挑最后assistant。
+- 真实 Kimi 2.5.3 的 completed turn 可保留 interrupted/steered 内容末步；先用隔离探针记录实际 endReason，再收窄例外，不能从 interrupted 或 prompts completed 推断成功。末步若含多次 user，只取最后结构化 user 之后的公开 assistant 正文，避免合入追问前 partial；由精确 owner REST 恢复及外层 reset/alias/保存/重放共同验证。
+- 真实云端验收在新私有 desktop 内使用独立 home、运行时和数据库，抑制声学输出；只保留枚举、身份及正文相等布尔值。完成方法到 winsound 替身的一次调用证明调用契约，不能据此宣称物理出声；finally 清自有资源并保留脱敏证据。
 - 消息顺序用独立稳定身份/序列，格式化前按轻量消息取尾页；用与时间相反的序列、旧turn晚到答案、分页重载和原生焦点共同验证，避免排序正确却让长历史重绘退化。
 
 ## 语音异步边界与回归验证

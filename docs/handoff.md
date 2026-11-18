@@ -1,16 +1,20 @@
 # 当前交接
 
-更新日期：2026-11-18。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。Kimi 2.5.3 协议、消息顺序和完成音效修复已提交为 `7852d06`；独立验证及新 dog 审查后的 R1–R11 修复已完成。日常 MC 仍是旧包，独立 Kimi 运行时未安装；本轮没有打包、替换或重启日常 MC，也没有改写日常聊天/笔记库。
+更新日期：2026-11-18。源码 `D:/code/sj/mc`，`main` 跟踪 `origin/main`。Kimi 2.5.3 协议、顺序和完成音效修复后，追问后的 steered REST 最终回答恢复已提交为 `8858753cd5a64903ef8c6b66af6e15299e4f9ab9`，独立定向159项通过；真实隔离云端验收通过。日常 MC 仍是旧包，独立 Kimi 运行时未安装；没有打包、替换或重启日常 MC，也没有改写日常聊天/笔记库。
 
 ## Kimi：当前完成状态与接续
 
-V2 按真实握手选择 `subscribe_v2`，只认可当前 socket generation 的目标 session ACK；权威完成绑定主代理 `triggerPromptId`。运行/排队/阻塞状态继续 monitor，POST 结果不明时只读定位唯一归属，不重发请求。UTF-16 append 原子应用，失败保留原游标并补齐；完成后释放正文缓存。消息投影先按问题/答案各自的稳定顺序选尾页，再格式化正文；steer alias 共用一个最终回答。首次成功提示位于前后台共用接纳边界，UI 后处理异常不会吞掉该调用。
+V2 按真实握手选择 `subscribe_v2`，只认可当前 socket generation 的目标 session ACK；权威完成绑定主代理 `triggerPromptId`。运行/排队/阻塞状态继续 monitor，POST 结果不明时只读定位唯一归属，不重发请求。UTF-16 append 原子应用，失败保留原游标并补齐；完成后释放正文缓存。消息投影先按问题/答案各自的稳定顺序选尾页，再格式化正文；steer alias 共用一个最终回答。首次成功提示位于前后台共用接纳边界，UI 后处理异常不会吞掉该调用。completed turn 的末步若为 interrupted/steered，仅提取最后结构化 user 之后的公开正文，保留 tool/隐私/空正文/缺口过滤，不回退早先步骤。
 
 运行准备、兼容能力、诊断开关及保留界限见 [Kimi 运行时](kimi-runtime.md)。源码不再自动回退共享 PATH；需要用户安排独立运行时安装和后续切换。固定版本不保证云端 API 永远兼容，回退前先验证会话格式可读，不让旧程序直接写日常库。
 
-证据及精确命令集中在 [实施计划](../_bmad-output/implementation-artifacts/plan-kimi-stability-order-sound-20261118.md) 和 [新 dog 审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)：四透镜完成，24 项裁决为11组 patch、2项 defer、9项 reject；R1–R11 已修复，最后 engineer 独立协议/恢复/append/缓存/ACK/smoke **17项**、顺序/UI/有界渲染 **4项**通过。早期 client/投影138项、合并306项通过只证明对应阶段；合并中的3项执行步骤失败已在原 `7ac8fca` 完整基线同断言复现，不计通过。无凭据真实隔离2.5.3的握手、订阅 ACK 和空 transcript 已验证，自有进程与临时运行时副本已清理。
+本次 [steered REST 计划](../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md) 已 built，含精确 node IDs、真实探针和实施证据。合成正例先失败复现，engineer 独立复验 **146 client + 13 integration = 159项**通过（1.77s / 4.13s，wx串行）；cwd 固定 `D:/code/sj`，client 命令为 `mc/.venv/Scripts/python.exe -m pytest mc/tests/test_kimi_server_client_unit.py -q`，integration 仅运行计划列出的13个恢复/alias/音效用例。`git diff --check` 通过，未扩大旧执行步骤失败或全系统回归。
 
-下一步待用户授权现场验收：真实云端新请求、长任务断连及未决发送的整体恢复、物理声音、日常安装/切换和长期运行。计划保留 `followup_review_recommended=true`，不能称 clean review 或已部署。D1/D2尚缺固定版本真实触发证据，不加推测性防御；旧手机可能忽略新增顺序字段，已淘汰完成身份的旧重放尚未验收，未知历史到达顺序不能保证重建。声学相互覆盖未复现，不新增音频队列或历史补播。原审查冻结 diff/claims 保留；本轮可再生成最终 diff 已核实归属并清理，未发现遗留自有测试进程。
+真实隔离云端新请求、真实 socket 重连新代 ACK、同会话历史连续性、活动长任务追问和 REST 重放已通过（39.53s）。实际 REST 为 completed turn + interrupted/steered 末步；原 owner REST 正文严格等于实时最终正文。owner/alias 均 done、共享一个答案身份、一次完成音调用；两次恢复事件重放后正文/身份不变，仍一个答案及一次调用。脱敏证据和脚本保留于 `C:/Users/gladwell/AppData/Local/Temp/mc-kimi-live-e2e-0d77cf0e71e74dc095dd06548fbae473/`，修复前真实失败保留于 `mc-kimi-live-e2e-10445551e49e4677b0b8cb3ff866459f/`，原始调查目录 `mc-kimi-live-e2e-fu_cj887/` 未修改。这些 Temp 路径当前可读，不保证永久保存；不得清理冻结审查 diff `C:/Users/gladwell/AppData/Local/Temp/mc-steer-reviewed-4a15c39824ee4a049d3eb978131e98b2.diff`。
+
+本次 [新 dog 四透镜报告](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-recovery-20261118.md) 没有确认新增产品缺陷；父裁决为11项 reject、0 patch、0 defer（low9/false2，#4由原表false更正为low，裁决以计划为准）。`followup_review_recommended=false` 只表明本次无待修项；edge空结果按workflow记failed layer，diff包含计划及叙述证据，不能称完整 clean review。此前 `7852d06` 的 R1–R11、历史验证和 D1/D2 仍见 [原稳定性计划](../_bmad-output/implementation-artifacts/plan-kimi-stability-order-sound-20261118.md) 与 [原审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)；早期138/306项只证明当时版本，3项执行步骤旧基线失败不计通过。
+
+下一步仍待真实活动长任务断连及未决 POST 整体恢复、物理声音、日常独立运行时安装/包切换和长期运行验收。当前只用 winsound 替身计数，未证明声学出声；声学覆盖未复现，不加音频队列或历史补播。D1/D2尚缺固定版本真实触发证据，不加推测性防御；完成身份淘汰后旧重放、旧手机顺序字段和未知历史到达顺序的边界保留。隔离运行的 home、runtime、workspace、app-data/chat/notes 数据库均已清理，自有服务退出、私有 desktop 释放；日常 MC PID18416/Kimi PID24596 保持原路径与06:12启动时间，未动。日常部署和退出/重启仍由用户安排。
 
 2026-11-10 的语音阶段成果及待现场验收仍有效，保留如下；与 Kimi 本轮软件验证分别核对。
 
