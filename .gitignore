@@ -45,5 +45,6 @@ docs/multi_agent/__pycache__/
 
 # Isolated future build, validation and diagnostic output
 /.dev/
+/runtimes/kimi/2.5.3/kimi.exe
 *.apk
 *.log.[123]

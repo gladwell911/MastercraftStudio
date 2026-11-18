@@ -303,7 +303,14 @@ def test_resolve_launch_command_env_override_missing_file(monkeypatch, tmp_path)
         resolve_kimi_launch_command()
 
 
-def test_resolve_launch_command_does_not_use_shared_path(monkeypatch):
+@pytest.fixture
+def missing_kimi_resource_root(monkeypatch, tmp_path):
+    import kimi_runtime
+
+    monkeypatch.setattr(kimi_runtime, "resource_root", lambda: tmp_path)
+
+
+def test_resolve_launch_command_does_not_use_shared_path(monkeypatch, missing_kimi_resource_root):
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "/usr/bin/kimi")
 
@@ -311,7 +318,7 @@ def test_resolve_launch_command_does_not_use_shared_path(monkeypatch):
         resolve_kimi_launch_command()
 
 
-def test_resolve_launch_command_does_not_use_shared_user_install(monkeypatch, tmp_path):
+def test_resolve_launch_command_does_not_use_shared_user_install(monkeypatch, tmp_path, missing_kimi_resource_root):
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: None)
     monkeypatch.setattr(kimi_server_client.os, "name", "nt")
@@ -324,7 +331,7 @@ def test_resolve_launch_command_does_not_use_shared_user_install(monkeypatch, tm
         resolve_kimi_launch_command()
 
 
-def test_resolve_launch_command_not_found(monkeypatch, tmp_path):
+def test_resolve_launch_command_not_found(monkeypatch, tmp_path, missing_kimi_resource_root):
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: None)
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -1755,6 +1762,10 @@ def test_runtime_preparation_hash_version_and_environment_are_isolated(tmp_path,
     monkeypatch.setattr(kimi_runtime, "SUPPORTED_SHA256", kimi_server_client.hashlib.sha256(source.read_bytes()).hexdigest())
     monkeypatch.setattr(kimi_runtime.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"2.5.3\n"))
     target = kimi_runtime.prepare_runtime(source, tmp_path / "private/2.5.3")
+    assert kimi_runtime.validate_runtime(target) == target
+    with pytest.raises(RuntimeError, match="destination already exists"):
+        kimi_runtime.prepare_runtime(source, target.parent)
+    assert target.read_bytes() == source.read_bytes()
     monkeypatch.setattr(kimi_runtime, "runtime_path", lambda: target)
     monkeypatch.delenv("KIMI_BIN", raising=False)
     monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "changed-shared-version")
@@ -1763,6 +1774,9 @@ def test_runtime_preparation_hash_version_and_environment_are_isolated(tmp_path,
     target.write_bytes(b"changed")
     with pytest.raises(KimiServerError, match="SHA256"):
         resolve_kimi_launch_command()
+    with pytest.raises(RuntimeError, match="destination already exists"):
+        kimi_runtime.prepare_runtime(source, target.parent)
+    assert target.read_bytes() == b"changed"
     target.unlink()
     with pytest.raises(KimiServerError, match="runtime missing"):
         resolve_kimi_launch_command()

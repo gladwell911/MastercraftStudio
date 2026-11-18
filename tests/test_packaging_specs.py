@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 import os
 import shutil
@@ -74,7 +75,11 @@ def test_package_script_builds_and_validates_before_updating_and_launching_final
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell packaging on Windows")
-@pytest.mark.parametrize("mode", ["success", "build_only", "build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill", "update_fail", "final_invalid", "start_fail"])
+@pytest.mark.parametrize("mode", [
+    "success", "build_only", "build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill",
+    "missing_kimi", "bad_kimi_hash", "bad_kimi_version", "linked_kimi",
+    "update_fail", "final_invalid", "final_kimi_corrupt", "start_fail",
+])
 def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     import codex_client
 
@@ -91,6 +96,10 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     (package / "mc.exe").write_bytes(b"old-gui")
     (package / "mc_worker.exe").write_bytes(b"old-worker")
     (package / "user-data.txt").write_bytes(b"keep-local")
+    kimi_relative = "_internal/runtimes/kimi/2.5.3/kimi.exe"
+    kimi_target = package / kimi_relative
+    kimi_target.parent.mkdir(parents=True)
+    kimi_target.write_bytes(b"old-kimi")
     history = dist / "history"
     history.mkdir()
     from chat_store import ChatStore
@@ -124,6 +133,30 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     guard = 'return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
     assert text.count(guard) == 1
     script.write_text(text.replace(guard, 'return $false'), encoding="utf-8-sig")
+    # Use the real validator CLI with a synthetic pinned file and a controlled
+    # version probe so its hash, path and exit-code checks all run.
+    kimi_bytes = b"fixture-pinned-kimi"
+    runtime_module = (root / "kimi_runtime.py").read_text(encoding="utf-8")
+    test_hash = hashlib.sha256(kimi_bytes).hexdigest()
+    from kimi_runtime import SUPPORTED_SHA256
+    assert runtime_module.count(SUPPORTED_SHA256) == 1
+    assert runtime_module.count("result = subprocess.run(") == 1
+    runtime_module = runtime_module.replace(SUPPORTED_SHA256, test_hash)
+    runtime_module = runtime_module.replace("result = subprocess.run(", "result = fixture_version_probe(")
+    version = b"9.9.9" if mode == "bad_kimi_version" else b"2.5.3"
+    version_fixture = (
+        "def fixture_version_probe(argv, **kwargs):\n"
+        "    assert argv[1:] == ['--version']\n"
+        "    assert kwargs['env']['KIMI_CODE_NO_AUTO_UPDATE'] == '1'\n"
+        "    with Path(__file__).with_name('probes.txt').open('a', encoding='utf-8') as probes:\n"
+        "        probes.write(argv[0] + '\\n')\n"
+        f"    return subprocess.CompletedProcess(argv, 0, {version!r})\n\n\n"
+    )
+    runtime_module = runtime_module.replace('if __name__ == "__main__":', version_fixture + 'if __name__ == "__main__":')
+    (tmp_path / "kimi_runtime.py").write_text(runtime_module, encoding="utf-8")
+    shutil.copyfile(root / "browser_open.py", tmp_path / "browser_open.py")
+    external_kimi = outside / "kimi.exe"
+    external_kimi.write_bytes(kimi_bytes)
     nats_source = tmp_path / "tools" / "nats-server" / "nats-server.exe"
     nats_source.parent.mkdir(parents=True)
     nats_source.write_bytes(b"fake-nats-source")
@@ -139,7 +172,9 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     runtime_paths = ["ZDSRAPI.dll", "ZDSRAPI_x64.dll", "_internal/python311.dll", "_internal/sound/done.wav"]
     builder = tmp_path / "fake-builder.py"
     builder.write_text(
-        "import pathlib, sys\n"
+        "import pathlib, subprocess, sys\n"
+        "if pathlib.Path(sys.argv[1]).name == 'kimi_runtime.py':\n"
+        "    sys.exit(subprocess.call([sys.executable, *sys.argv[1:]]))\n"
         "assert sys.argv[1:3] == ['-m', 'PyInstaller']\n"
         f"mode = {mode!r}\n"
         f"fixture = pathlib.Path({str(tmp_path)!r}).resolve()\n"
@@ -157,6 +192,13 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
         "skill = package / '_internal' / 'assets' / 'codex-skills' / 'mc-browser-open' / 'SKILL.md'\n"
         "skill.parent.mkdir(parents=True)\n"
         "if mode != 'missing_skill': skill.write_bytes(b'' if mode == 'empty_skill' else b'skill')\n"
+        f"kimi = package / {kimi_relative!r}\n"
+        "if mode == 'linked_kimi':\n"
+        "    kimi.parent.parent.mkdir(parents=True)\n"
+        "    subprocess.run(['cmd.exe', '/c', 'mklink', '/J', str(kimi.parent), str(fixture / 'outside')], check=True)\n"
+        "elif mode != 'missing_kimi':\n"
+        "    kimi.parent.mkdir(parents=True)\n"
+        f"    kimi.write_bytes(b'wrong-hash' if mode == 'bad_kimi_hash' else {kimi_bytes!r})\n"
         f"for relative in {artifact_paths + runtime_paths!r}:\n"
         "    artifact = package / relative\n"
         "    artifact.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -186,6 +228,10 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
            "Microsoft.PowerShell.Management\\Copy-Item @PSBoundParameters\n"
            "if ($Destination.EndsWith('mc_worker.exe')) { [IO.File]::WriteAllBytes($Destination, [byte[]]@()) }\n}\n"
            if mode == "final_invalid" else "")
+        + ("function Copy-Item { param($LiteralPath, $Destination, [switch]$Force)\n"
+           "Microsoft.PowerShell.Management\\Copy-Item @PSBoundParameters\n"
+           "if ($Destination.EndsWith('kimi.exe')) { [IO.File]::WriteAllText($Destination, 'corrupted-after-copy') }\n}\n"
+           if mode == "final_kimi_corrupt" else "")
         + f"& {quote(script)} -DistPath {quote(dist)} -WorkPath {quote(tmp_path / 'work')} -SpecPath {quote(spec)} -PythonExe {quote(fake_python)}{' -BuildOnly' if mode == 'build_only' else ''}\n"
         + "exit $LASTEXITCODE\n",
         encoding="utf-8-sig",
@@ -193,6 +239,7 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     result = subprocess.run(
         [shutil.which("powershell.exe"), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
         capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
+        env={**os.environ, "KIMI_BIN": str(external_kimi), "KIMI_CODE_NO_AUTO_UPDATE": "0"},
     )
     assert result.returncode == (0 if mode in {"success", "build_only"} else 1), result.stdout + result.stderr
     launch_rows = [json.loads(line) for line in launches.read_text(encoding="utf-8-sig").splitlines()] if launches.exists() else []
@@ -211,9 +258,32 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
     assert sentinel.stat().st_file_attributes == attributes
     assert not list(dist.glob(".mc-build-*"))
     assert not (home / "unwanted-build-state").exists()
-    if mode in {"build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill"}:
+    if mode in {"build_fail", "missing_worker", "empty_worker", "missing_skill", "empty_skill",
+                "missing_kimi", "bad_kimi_hash", "bad_kimi_version", "linked_kimi"}:
         assert (package / "mc.exe").read_bytes() == b"old-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"old-worker"
+        assert kimi_target.read_bytes() == b"old-kimi"
+        assert cache.exists()
+    probes_path = tmp_path / "probes.txt"
+    probes = probes_path.read_text(encoding="utf-8").splitlines() if probes_path.exists() else []
+    if mode == "missing_kimi":
+        assert "Kimi runtime missing" in result.stderr
+        assert not probes
+    if mode == "bad_kimi_hash":
+        assert "SHA256 mismatch" in result.stderr
+        assert not probes
+    if mode == "bad_kimi_version":
+        assert "version validation failed" in result.stderr and "9.9.9" in result.stderr
+        assert len(probes) == 1 and ".mc-build-" in probes[0]
+    if mode == "linked_kimi":
+        assert "Kimi packaged runtime path contains a link" in result.stderr
+        assert external_kimi.read_bytes() == kimi_bytes
+        assert not probes
+    if mode == "final_kimi_corrupt":
+        assert "SHA256 mismatch" in result.stderr
+        assert str(kimi_target) in result.stderr
+        assert len(probes) == 1 and ".mc-build-" in probes[0]
+        assert kimi_target.read_bytes() == b"corrupted-after-copy"
     if mode in {"success", "build_only"}:
         assert (package / "mc.exe").read_bytes() == b"new-gui"
         assert (package / "mc_worker.exe").read_bytes() == b"new-worker"
@@ -223,6 +293,9 @@ def test_package_script_isolated_fake_build_and_launch_matrix(tmp_path, mode):
                 assert not (package / base / name).exists(), base + name
         for relative in runtime_paths:
             assert (package / relative).read_bytes() == b"fixture-artifact"
+        assert kimi_target.read_bytes() == kimi_bytes
+        assert len(probes) == 2 and ".mc-build-" in probes[0]
+        assert Path(probes[1]) == kimi_target
 
 
 

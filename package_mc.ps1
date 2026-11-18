@@ -48,7 +48,7 @@ function Remove-PackageNode {
 }
 
 function Assert-PackageArtifacts {
-    param([string]$PackagePath)
+    param([string]$PackagePath, [string]$PythonPath, [string]$KimiValidator)
     foreach ($relativePath in @('mc.exe', 'mc_worker.exe', '_internal\nats-server\nats-server.exe', '_internal\assets\chat_title_rules.json', '_internal\assets\codex-skills\mc-browser-open\SKILL.md')) {
         $artifact = Join-Path $PackagePath $relativePath
         $item = Get-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
@@ -56,6 +56,10 @@ function Assert-PackageArtifacts {
             ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "Required package artifact missing or invalid: $artifact"
         }
+    }
+    & $PythonPath $KimiValidator --package-root $PackagePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Kimi runtime validation failed for package $PackagePath (exit code $LASTEXITCODE). Prepare the fixed source runtime and rebuild with a spec that collects it."
     }
 }
 
@@ -141,10 +145,11 @@ try {
     & $resolvedPythonExe -m PyInstaller -y --clean --distpath $stagingPath --workpath $resolvedWorkPath $resolvedSpecPath
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
     $builtPackage = Join-Path $stagingPath 'mc'
-    Assert-PackageArtifacts -PackagePath $builtPackage
+    $kimiValidator = Join-Path $repoRoot "kimi_runtime.py"
+    Assert-PackageArtifacts -PackagePath $builtPackage -PythonPath $resolvedPythonExe -KimiValidator $kimiValidator
     Update-PackageOutput -BuiltPackage $builtPackage -Target $finalPackage -DistRoot $resolvedDistPath
     Remove-PackageNode -Root $resolvedWorkPath -Path $stagingPath
-    Assert-PackageArtifacts -PackagePath $finalPackage
+    Assert-PackageArtifacts -PackagePath $finalPackage -PythonPath $resolvedPythonExe -KimiValidator $kimiValidator
     # Launch once from the final directory, without waiting for the GUI to exit.
     if (-not $BuildOnly) {
         Start-Process -FilePath (Join-Path $finalPackage 'mc.exe') -WorkingDirectory $finalPackage -ErrorAction Stop | Out-Null
