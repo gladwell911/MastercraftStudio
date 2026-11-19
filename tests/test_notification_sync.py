@@ -1,6 +1,9 @@
 import json
+import time
+from types import SimpleNamespace
 import pytest
 
+import chat_store
 from chat_store import ChatStore
 from remote_nats_protocol import compact_notification, validate_v2_durable
 
@@ -77,6 +80,11 @@ def test_scope_incarnation_and_original_baseline_are_immutable(store):
 
 def test_clear_and_delete_authority_prevent_old_final_resurrection(store):
     page(store)
+    future = time.time() + 86401
+    with monkeypatch.context() as patch:
+        patch.setattr(chat_store, "time", SimpleNamespace(time=lambda: future))
+        with pytest.raises(ValueError, match="STALE_CONTENT_CURSOR"):
+            store.read_content_page(chat_id="chat", cursor=cursor, secret="secret")
     store.begin_clear_operation("chat", idempotency_key="clear", pair_id="pair")
     result = page(store)
     assert not any(row.get("kind") == "assistant_final" for row in result["records"])
@@ -86,7 +94,7 @@ def test_clear_and_delete_authority_prevent_old_final_resurrection(store):
     assert all(row["type"] == "notification_tombstone" for row in result["records"])
 
 
-def test_long_content_utf8_continuation_rejects_wrong_owner_and_clear(store):
+def test_long_content_utf8_continuation_rejects_wrong_owner_and_clear(store, monkeypatch):
     text = "汉字🙂" * 40000
     prefix, cursor = store.content_continuation(chat_id="chat", text=text, secret="secret")
     assert len(prefix.encode()) <= 4096

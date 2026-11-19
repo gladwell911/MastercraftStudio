@@ -4,8 +4,10 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
+import chat_store
 from chat_store import ChatStore
 from chat_store import CLEAR_OPERATION_STATES, MAX_INT64, V2_MIGRATION_KEY
 
@@ -89,7 +91,7 @@ def test_execution_replace_is_atomic_and_source_read_has_one_owner(tmp_path, mon
     assert [step["list_text"] for step in store.read_execution_projection_source("other")["steps"]] == ["other"]
 
 
-def test_execution_projection_snapshot_freezes_pages_and_scopes_cursor(tmp_path):
+def test_execution_projection_snapshot_freezes_pages_and_scopes_cursor(tmp_path, monkeypatch):
     store = ChatStore(tmp_path / "projection-page.db")
     store.initialize()
     store.replace_execution_steps("owner", [{"list_text": str(i)} for i in range(5)])
@@ -130,6 +132,14 @@ def test_execution_projection_snapshot_freezes_pages_and_scopes_cursor(tmp_path)
             pair_id="pair", domain="events", chat_id="owner", secret="secret",
             snapshot_id=snapshot, cursor=tail["cursor"], now=time.time() + 901,
         )
+    expires = time.time() + 901
+    with monkeypatch.context() as patch:
+        patch.setattr(chat_store, "time", SimpleNamespace(time=lambda: expires))
+        with pytest.raises(ValueError, match="EXPIRED"):
+            store.load_execution_projection_page(
+                pair_id="pair", domain="events", chat_id="owner", secret="secret",
+                snapshot_id=snapshot, cursor=tail["cursor"],
+            )
     with store._connect() as conn:
         conn.execute("INSERT OR REPLACE INTO v2_chat_state(chat_id,revision,execution_sequence) VALUES(?,?,?)",
                      ("owner", source["revision"] + 1, 0))
