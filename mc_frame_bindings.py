@@ -12,18 +12,11 @@ def bind_entry(namespace: dict) -> None:
     if app is not None:
         return
     name = namespace["__name__"]
-    spec = namespace.get("__spec__")
     if name == "main":
         # A normal import sets this flag; runpy executes a secondary module.
-        if not getattr(spec, "_initializing", False):
+        if not getattr(namespace.get("__spec__"), "_initializing", False):
             return
-    elif name == "__main__":
-        if spec is None:
-            if namespace.get("__loader__") is None and not getattr(sys, "frozen", False):
-                return
-        elif spec.name != "main" or ("-m", "main") not in zip(sys.orig_argv, sys.orig_argv[1:]):
-            return
-    else:
+    elif name != "__main__":
         return
     module = sys.modules.get(name)
     if module is not None and vars(module) is namespace:

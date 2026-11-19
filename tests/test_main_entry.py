@@ -2,9 +2,68 @@ import json
 import main
 import pytest
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+
+
+@pytest.mark.parametrize(
+    "entry_args",
+    [
+        pytest.param(["main.py"], id="script"),
+        pytest.param(["-m", "main"], id="module"),
+        pytest.param(["-mmain"], id="compact-module"),
+        pytest.param(
+            ["-c", "import runpy; runpy.run_path('main.py', run_name='__main__')"],
+            id="debugger",
+        ),
+    ],
+)
+def test_worker_entry_responds_to_ping(entry_args):
+    request_id = "entry-ping"
+    completed = subprocess.run(
+        [sys.executable, *entry_args, "--codex-worker"],
+        cwd=Path(__file__).resolve().parents[1],
+        input=json.dumps({"type": "ping", "id": request_id}) + "\n",
+        capture_output=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    events = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [event["type"] for event in events] == ["ready", "pong"]
+    assert events[1]["id"] == request_id
+
+
+def test_secondary_entry_preserves_original_application_binding():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import runpy
+
+import main
+import mc_frame_bindings
+
+assert mc_frame_bindings.app is main
+runpy.run_path(main.__file__, run_name='__main__')
+assert mc_frame_bindings.app is main
+print('binding preserved')
+""",
+            "--codex-worker",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "binding preserved"
 
 
 def test_app_shows_missing_onedrive_error_before_creating_frame(monkeypatch):
