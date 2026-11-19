@@ -4209,20 +4209,6 @@ class ChatFrame(wx.Frame):
             "</body></html>"
         )
 
-    def _build_answer_detail_html(self, answer_md: str) -> str:
-        a_html = markdown.markdown(remove_emojis(answer_md), extensions=["extra", "fenced_code", "tables", "sane_lists"])
-        return (
-            "<!doctype html><html><head><meta charset='utf-8'><title>回答详情</title>"
-            "<style>"
-            "body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:12px;line-height:1.6;}"
-            "h2{margin:8px 0;}"
-            "pre{background:#f1f5f9;padding:10px;border-radius:6px;overflow:auto;}"
-            "</style></head><body>"
-            "<h2>回答详情</h2>"
-            f"{a_html}"
-            "</body></html>"
-        )
-
     def _ensure_question_detail_page(self, turn: dict, turn_idx: int) -> Path:
         created = int(float(turn.get("created_at") or time.time()))
         file_name = f"question_{created}_{turn_idx}_{uuid.uuid4().hex[:8]}.html"
