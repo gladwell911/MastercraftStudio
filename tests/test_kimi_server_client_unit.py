@@ -1395,10 +1395,11 @@ def test_public_methods_thread_safe():
 
 
 def test_module_does_not_import_wx():
-    source = Path(kimi_server_client.__file__).read_text(encoding="utf-8")
-
-    assert "import wx" not in source
-    assert "from wx" not in source
+    entry = Path(kimi_server_client.__file__)
+    for name in (entry.stem, "kimi_server_events", "kimi_server_queue", "kimi_server_v2", "kimi_server_websocket"):
+        source = entry.with_name(f"{name}.py").read_text(encoding="utf-8")
+        assert "import wx" not in source, name
+        assert "from wx" not in source, name
 
 
 def test_v2_subscription_uses_per_session_grade_and_requires_matching_ack():

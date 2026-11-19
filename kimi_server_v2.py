@@ -1,0 +1,286 @@
+"""Kimi V2 subscription readiness, transcript replay and reconciliation."""
+
+from __future__ import annotations
+
+import threading
+import time
+from kimi_server_events import (
+    KimiEvent,
+    KimiServerError,
+    _payload_of,
+    _provider_origin_timestamp,
+    _str,
+)
+from kimi_transcript import Transcript
+from typing import Any
+
+
+class KimiServerV2Mixin:
+    def _subscribe_v2(self, session_id: str, *, timeout: float | None = None) -> None:
+        request_id = self._next_id()
+        with self._lifecycle_lock:
+            self._subscribed_sessions.add(session_id)
+            if self._v2_ready_generations.get(session_id) == self._ws_generation and self._ws_is_usable_locked():
+                return
+            self._subscribe_requests[request_id] = {session_id}
+            self._v2_request_generations[request_id] = self._ws_generation
+            self._v2_subscription_events.setdefault(session_id, threading.Event()).clear()
+            transcript = self._v2_transcripts.get(session_id)
+            payload = {"session_id": session_id, "transcript": {"main": "delta"}}
+            if transcript is not None and transcript.seq is not None and not transcript.incomplete:
+                payload["transcript_since"] = {"main": transcript.seq}
+        self._send_ws({"type": "subscribe_v2", "id": request_id, "payload": payload}, send_timeout=timeout)
+
+    def _require_v2_ready(self, session_id: str, *, timeout: float | None = None) -> None:
+        self.subscribe([session_id], timeout=timeout)
+        ready = self._v2_subscription_events.setdefault(session_id, threading.Event())
+        if not ready.wait(min(self.ws_connect_timeout, timeout) if timeout is not None else self.ws_connect_timeout):
+            raise KimiServerError("Kimi compatibility failure at subscribe_v2: target session ACK timed out; request was not sent")
+        with self._lifecycle_lock:
+            if self._v2_ready_generations.get(session_id) != self._ws_generation or not self._ws_is_usable_locked():
+                raise KimiServerError("Kimi compatibility failure at subscribe_v2: target session not accepted on current socket; request was not sent")
+
+    def _clear_v2_readiness(self) -> None:
+        self._v2_ready_sessions.clear()
+        self._v2_ready_generations.clear()
+        for ready in self._v2_subscription_events.values():
+            ready.clear()
+        for request_id in self._v2_request_generations:
+            self._subscribe_requests.pop(request_id, None)
+        self._v2_request_generations.clear()
+
+    def get_transcript(self, session_id: str, *, before_turn: str | None = None,
+                       timeout: float | None = None, agent_id: str = "main") -> dict[str, Any]:
+        params = {"agent_id": agent_id, "page_size": 100}
+        if before_turn:
+            params["before_turn"] = before_turn
+        return self._request_data("GET", f"/api/v1/sessions/{session_id}/transcript", params=params, timeout=timeout)
+
+    def reconcile_v2(self, session_id: str, prompt_id: str, *, timeout: float | None = None) -> KimiEvent | None:
+        deadline = time.monotonic() + (timeout if timeout is not None else self.rest_timeout)
+        before = None
+        for _ in range(100):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KimiServerError("Kimi transcript recovery deadline exhausted")
+            page = self.get_transcript(session_id, before_turn=before, timeout=remaining)
+            transcript = Transcript()
+            transcript.reset(page)
+            matching = [turn for turn in transcript.items.values() if turn.get("triggerPromptId") == prompt_id]
+            if len(matching) > 1:
+                raise KimiServerError("Kimi transcript recovery has ambiguous prompt identity")
+            for turn, text in transcript.results():
+                if turn.get("triggerPromptId") == prompt_id:
+                    event = self._v2_final_event(session_id, turn, text)
+                    self._retire_v2_turn(session_id, turn)
+                    return event
+            ongoing = next((turn.get("state") for turn in matching if turn.get("state") in {"running", "queued", "blocked"}), None)
+            if ongoing is None and not matching:
+                ongoing = next((prompt.get("status") for prompt in page.get("prompts", [])
+                                if prompt.get("promptId") == prompt_id and prompt.get("status") in {"running", "queued", "blocked"}), None)
+            if ongoing:
+                return KimiEvent(type="thread_status_changed", thread_id=session_id, status=ongoing,
+                                 data={"prompt_id": prompt_id, "terminal": False})
+            if matching or not page.get("has_more"):
+                return None
+            turns = [item for item in page.get("items", []) if item.get("kind") == "turn"]
+            if not turns:
+                raise KimiServerError("Kimi transcript recovery pagination made no progress")
+            cursor = turns[0]["turnId"]
+            if cursor == before:
+                raise KimiServerError("Kimi transcript recovery repeated pagination cursor")
+            before = cursor
+        raise KimiServerError("Kimi transcript recovery page budget exhausted")
+
+    def recovery_messages_v2(self, session_id: str, *, timeout: float | None = None) -> list[dict]:
+        """Project read-only transcript identities into existing migration rules."""
+        deadline = time.monotonic() + (timeout if timeout is not None else self.rest_timeout)
+        before, rows, seen = None, [], set()
+        listed_prompts = {}
+        for _ in range(100):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KimiServerError("Kimi prompt attribution deadline exhausted")
+            page = self.get_transcript(session_id, before_turn=before, timeout=remaining)
+            page_rows = []
+            turns = [item for item in page.get("items", []) if item.get("kind") == "turn"]
+            for turn in turns:
+                pid = turn.get("triggerPromptId")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    page_rows.append({"id": pid, "role": "user", "content": str(turn.get("prompt") or ""),
+                                      "created_at": turn.get("startedAt"), "metadata": {"origin": turn.get("origin")},
+                                      "independent_turn": True, "prompt_status": turn.get("state")})
+                    for step in turn.get("steps", []):
+                        for frame in step.get("frames", []):
+                            if frame.get("kind") != "text" or frame.get("role") != "user":
+                                continue
+                            for child in frame.get("promptIds") or []:
+                                if child in seen:
+                                    continue
+                                seen.add(child)
+                                page_rows.append({"id": child, "role": "user", "content": frame.get("text", ""),
+                                                  "metadata": {"origin": frame.get("origin")},
+                                                  "owner_prompt_id": pid, "prompt_status": turn.get("state")})
+                    if turn.get("state") == "completed":
+                        page_rows.append({"role": "assistant", "content": "", "created_at": turn.get("endedAt")})
+            for prompt in page.get("prompts", []):
+                pid = prompt.get("promptId")
+                if pid and pid not in listed_prompts:
+                    listed_prompts[pid] = {"id": pid, "role": "user", "content": prompt.get("content", ""),
+                                           "created_at": prompt.get("createdAt"),
+                                           "prompt_status": None if prompt.get("steeredAt") else prompt.get("status")}
+            rows = page_rows + rows
+            if not page.get("has_more"):
+                return rows + [row for pid, row in listed_prompts.items() if pid not in seen]
+            cursor = turns[0]["turnId"] if turns else None
+            if not cursor or cursor == before:
+                raise KimiServerError("Kimi prompt attribution pagination made no progress")
+            before = cursor
+        raise KimiServerError("Kimi prompt attribution page budget exhausted")
+
+    def _v2_final_event(self, session_id: str, turn: dict, text: str,
+                        source_kind: str = "rest.reconciled") -> KimiEvent:
+        return KimiEvent(type="turn_completed", thread_id=session_id, session_id=session_id,
+                         turn_id=turn["turnId"], text=text if turn["state"] == "completed" else str(turn.get("error") or turn["state"]),
+                         status=turn["state"],
+                         origin_timestamp=_provider_origin_timestamp({"timestamp": turn.get("endedAt")}),
+                         data={"prompt_id": turn["triggerPromptId"], "agent_id": "main", "agent_scope": "main",
+                               "authoritative": True, "source_kind": source_kind, "terminal_verified": True,
+                               "stream_complete": True})
+
+    def _consume_v2(self, message: dict, *, ws: Any = None, generation: int | None = None) -> None:
+        body = _payload_of(message)
+        sid = _str(message.get("session_id"))
+        if body.get("agent_id") != "main" or not sid:
+            return
+
+        def current_socket():
+            return not self._closed and (ws is None or self._ws is ws) and (
+                generation is None or self._ws_generation == generation
+            )
+
+        with self._lifecycle_lock:
+            if not current_socket():
+                return
+            transcript = self._v2_transcripts.setdefault(sid, Transcript())
+            seq = body.get("seq")
+            if message["type"] == "transcript.reset":
+                # Reset is authoritative even when seq decreases after a restart.
+                transcript.reset(body.get("snapshot") or {}, seq)
+            else:
+                transcript.apply(body.get("ops") or [], seq)
+            needs_catchup = transcript.incomplete
+            since = transcript.seq or 0
+
+        transcript_source = "ws"
+        if needs_catchup:
+            timeout = min(3.0, self.rest_timeout)
+            catchup = page = None
+            try:
+                catchup = self._request_data("GET", f"/api/v1/sessions/{sid}/transcript/ops",
+                    params={"agent_id": "main", "since_seq": since}, timeout=timeout)
+                if not catchup.get("complete"):
+                    page = self.get_transcript(sid, timeout=timeout)
+            except KimiServerError:
+                # The owner worker reports the original transport/REST error.
+                pass
+            with self._lifecycle_lock:
+                if not current_socket() or self._v2_transcripts.get(sid) is not transcript:
+                    return
+                if transcript.incomplete and (transcript.seq or 0) == since:
+                    if catchup is not None and catchup.get("complete"):
+                        transcript_source = "rest"
+                        transcript.incomplete = False
+                        for batch in catchup.get("batches", []):
+                            transcript.apply(batch["ops"], batch["seq"])
+                    elif page is not None:
+                        transcript_source = "rest"
+                        transcript.reset(page, page.get("seq"))
+            self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
+
+        with self._lifecycle_lock:
+            if not current_socket() or self._v2_transcripts.get(sid) is not transcript or transcript.incomplete:
+                return
+            events = self._v2_execution_events(sid, transcript, transcript_source)
+            needs_recovery = transcript.incomplete
+        for event in events:
+            self._enqueue_event(event)
+        if needs_recovery:
+            self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
+
+        with self._lifecycle_lock:
+            if not current_socket() or self._v2_transcripts.get(sid) is not transcript:
+                return
+            finals = []
+            source_kind = "transcript.terminal" if transcript_source == "ws" else "rest.reconciled"
+            for turn, text in transcript.results():
+                key = (sid, turn["triggerPromptId"], turn["turnId"])
+                if key not in self._v2_completed:
+                    finals.append(self._v2_final_event(sid, turn, text, source_kind))
+                self._retire_v2_turn(sid, turn)
+        for event in finals:
+            self._enqueue_event(event)
+
+    def _retire_v2_turn(self, sid: str, turn: dict) -> None:
+        with self._lifecycle_lock:
+            key = (sid, turn["triggerPromptId"], turn["turnId"])
+            if key not in self._v2_completed:
+                self._v2_completed.add(key)
+                self._v2_completed_order.append(key)
+                while len(self._v2_completed_order) > 512:
+                    self._v2_completed.discard(self._v2_completed_order.popleft())
+            # Delivered finals live in the owning consumer. Keep only active and
+            # terminal-but-incomplete bodies for ongoing reconciliation.
+            transcript = self._v2_transcripts.get(sid)
+            if transcript is not None:
+                current = transcript.items.get(turn["turnId"])
+                if current is not None and current.get("triggerPromptId") == turn["triggerPromptId"]:
+                    transcript.items.pop(turn["turnId"], None)
+            self._v2_started.discard((sid, turn["turnId"], turn["triggerPromptId"]))
+            for frame_key in list(self._v2_frame_texts):
+                if frame_key[:3] == (sid, turn["turnId"], turn["triggerPromptId"]):
+                    self._v2_frame_texts.pop(frame_key, None)
+            idle_sessions = [session for session, state in self._v2_transcripts.items() if not state.items]
+            for session in idle_sessions[:-32]:
+                self._v2_transcripts.pop(session, None)
+
+    def _v2_execution_events(self, sid: str, transcript: Transcript, transcript_source: str) -> list[KimiEvent]:
+        events = []
+        for turn in transcript.items.values():
+            prompt = turn.get("triggerPromptId")
+            if not prompt or turn.get("state") != "running":
+                continue
+            key = (sid, turn["turnId"], prompt)
+            if (sid, prompt, turn["turnId"]) in self._v2_completed:
+                continue
+            base = {"agent_scope": "main", "agent_id": "main", "prompt_id": prompt, "authoritative": True,
+                    "transcript_source": transcript_source}
+            if key not in self._v2_started:
+                events.append(KimiEvent(type="turn_started", thread_id=sid, turn_id=turn["turnId"],
+                    text=str(turn.get("prompt") or ""), data={**base, "source_kind": "turn.started"}))
+                self._v2_started.add(key)
+            for step in turn.get("steps", []):
+                for frame in step.get("frames", []):
+                    if frame.get("kind") not in {"text", "thinking"}:
+                        continue
+                    if frame.get("kind") == "text" and frame.get("role") != "assistant":
+                        continue
+                    if any(frame.get(k) for k in ("private", "hidden", "non_disclosable")) or frame.get("disclosable", True) is False:
+                        continue
+                    frame_key = (*key, step["stepId"], frame["frameId"])
+                    text = str(frame.get("text") or "")
+                    old = self._v2_frame_texts.get(frame_key, "")
+                    text_units = text.encode("utf-16-le", errors="surrogatepass")
+                    old_units = old.encode("utf-16-le", errors="surrogatepass")
+                    if not text_units.startswith(old_units):
+                        transcript.incomplete = True
+                        continue
+                    if text != old:
+                        kind = "thinking" if frame["kind"] == "thinking" else "assistant"
+                        events.append(KimiEvent(type="agent_message_delta", thread_id=sid,
+                            turn_id=turn["turnId"], item_id=frame["frameId"], stream_id=frame["frameId"],
+                            text=text_units[len(old_units):].decode("utf-16-le", errors="surrogatepass"), offset=len(old), display_kind=kind,
+                            data={**base, "source_kind": kind + ".delta", "step_id": step["stepId"], "offset": len(old)}))
+                        self._v2_frame_texts[frame_key] = text
+        return events
