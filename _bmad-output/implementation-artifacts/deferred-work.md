@@ -36,3 +36,7 @@
 - B6/I3：4–8小时后同组启动/停止测量未执行（medium unverified）；不据短测断言历史小时级问题已解决。
 
 逐项证据见 [新dog审查报告](review-voice-local-first-new-dog-20261110.md)。
+
+## Deferred from: code review of plan-fix-kimicode-functional-20261119 (2026-11-19)
+
+- 904cda1 独立复审沿用既有 D2（medium，未证实）。kimi_server_client.py:936 缺 ID 成功响应需要固定 2.5.3 确已接纳的 HTTP 应答和同一 prompt 的 transcript 配对证据。见 [本轮裁决 1](review-kimicode-fresh-904cda1-20261119.md)。

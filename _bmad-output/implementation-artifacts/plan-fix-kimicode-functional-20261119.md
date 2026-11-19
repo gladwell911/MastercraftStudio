@@ -167,3 +167,29 @@ engineer 初次独立复验 223 client/mapping +15 定向 integration 通过。�
 - Follow-up review recommendation: false。清理竞态和其余修补已有确定性交错、受控HTTP/来源反例及独立验证，没有可指名的新风险需要另轮审查。既存硬退出窗口和两项未证实边界继续 defer，不表示已修复。
 - 仍有3项既有 integration 失败、2项已基线对照的原生 recovery fixture 超时。物理键盘/读屏、云端真实 pending interaction、新打包版验收未完成；本轮真实 wx 为源码运行。未打包、替换或重启日常 MC，未修改日常聊天/笔记。
 - 已清理本轮临时认证、测试数据与基线工作树；保留必要的脱敏日志、哈希和原有失败/冻结证据。本地提交，不推送。
+
+## Code Review
+
+### 2026-11-19 · 904cda1 独立复审
+
+0 decision-needed，10 patch，1 defer，5 rejected。详细触发条件、逐项裁决及原始证据见 [独立审查报告](review-kimicode-fresh-904cda1-20261119.md)。
+
+- [ ] [Review][Patch] R1 普通 /clear 后迟到回包重新挂回旧 session [main.py:11712]
+- [ ] [Review][Patch] R2 单选长选项在横向裁切 [main.py:1493]
+- [ ] [Review][Patch] R3 关闭失效/清理的重试请求时清掉原错误 [main.py:16622]
+- [ ] [Review][Patch] R4 HTTP 先确认的 ended 记录绕过保留上限 [main.py:16511]
+- [ ] [Review][Patch] R5 多项重试时后登记的请求无法操作 [main.py:16565]
+- [ ] [Review][Patch] R6 只读重查启动失败后恢复可操作状态 [main.py:16661]
+- [ ] [Review][Patch] R7 归档聊天重载时丢弃无法执行的历史重试提示 [main.py:22799]
+- [ ] [Review][Patch] R8 ended 后延迟错误回调仍发送远程提醒 [main.py:16695]
+- [ ] [Review][Patch] R9 检查 V2 原生审批正文 [tests/test_kimi_integration.py:3922]
+- [ ] [Review][Patch] R10 从聊天验证 /stop 遭拒的反馈 [tests/test_kimi_integration.py:4058]
+- [x] [Review][Defer] D2 沿用固定版本缺 ID 的成功响应待证项 [kimi_server_client.py:936]，需配对的服务端成功响应与 transcript 记录。
+
+**Rejected**
+
+- B2（false）固定 producer 从已提交的 decision 生成成功回执。
+- B3（false）首轮早到请求在提交落地回调后找到且可展示。
+- B10（low）在 wx 再强制 WS 先到会误判 REST 先正确结算；独立 live_abort 已强制核对 WS。
+- E6（low）同 B10，源码 wx 用例另验证了实际聊天与持久化终态。
+- I（false，作为缺陷）原验收对模拟和现场边界已有明确记录。
