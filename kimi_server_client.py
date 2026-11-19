@@ -34,6 +34,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 import requests
 
@@ -919,20 +920,27 @@ class KimiServerClient:
             pass
         return session_id
 
-    def submit_prompt(self, session_id: str, content_blocks: list[dict[str, Any]]) -> str:
+    def submit_prompt(self, session_id: str, content_blocks: list[dict[str, Any]], *,
+                      prompt_id: str = "") -> str:
+        body: dict[str, Any] = {"content": list(content_blocks)}
         if self.protocol_version == 2:
             self._require_v2_ready(session_id)
+            if prompt_id:
+                body["prompt_id"] = prompt_id
         data = self._request_data(
             "POST",
             f"/api/v1/sessions/{session_id}/prompts",
-            json_body={"content": list(content_blocks)},
+            json_body=body,
         )
-        prompt_id = _str(data.get("prompt_id") or data.get("user_message_id"))
-        if not prompt_id:
+        returned_id = _str(data.get("prompt_id") or data.get("user_message_id"))
+        if not returned_id:
             raise KimiServerError(
                 f"submit_prompt response missing prompt_id/user_message_id: {data!r}"
             )
-        return prompt_id
+        if self.protocol_version == 2 and prompt_id and returned_id != prompt_id:
+            raise KimiServerError("Kimi returned a different prompt ID; recovering the submitted identity",
+                                  result_unknown=True)
+        return returned_id
 
     def steer_prompts(self, session_id: str, prompt_ids: list[str]) -> bool | None:
         """Return accepted/rejected/unknown without guessing ambiguous POSTs."""
@@ -1010,11 +1018,31 @@ class KimiServerClient:
             body["feedback"] = feedback
         if selected_label:
             body["selected_label"] = selected_label
-        self._request_data(
-            "POST",
-            f"/api/v1/sessions/{session_id}/approvals/{approval_id}",
-            json_body=body,
-        )
+        if self.protocol_version == 2:
+            self.answer_interaction(session_id, approval_id, {"kind": "approval", **body})
+        else:
+            self._request_data(
+                "POST",
+                f"/api/v1/sessions/{session_id}/approvals/{approval_id}",
+                json_body=body,
+            )
+
+    def answer_interaction(self, session_id: str, interaction_id: str, response: dict[str, Any]) -> None:
+        sid = quote(session_id, safe="")
+        iid = quote(interaction_id, safe="")
+        try:
+            data = self._request_data("POST", f"/api/v1/sessions/{sid}/interactions/{iid}", json_body=response)
+        except KimiServerError as exc:
+            if exc.status_code is None:
+                exc.result_unknown = True
+            raise
+        if data.get("outcome") not in {"approved", "rejected", "cancelled", "answered", "dismissed"}:
+            raise KimiServerError("Kimi did not confirm the interaction response", result_unknown=True)
+
+    def interaction_state(self, session_id: str, interaction_id: str, agent_id: str = "main") -> str:
+        page = self.get_transcript(session_id, agent_id=agent_id, timeout=min(self.rest_timeout, 5.0))
+        return next((_str(row.get("state")) for row in page.get("interactions", [])
+                     if row.get("interactionId") == interaction_id), "")
 
     def list_approvals(self, session_id: str) -> list[dict[str, Any]]:
         data = self._request_data("GET", f"/api/v1/sessions/{session_id}/approvals")
@@ -1091,8 +1119,8 @@ class KimiServerClient:
         self._v2_request_generations.clear()
 
     def get_transcript(self, session_id: str, *, before_turn: str | None = None,
-                       timeout: float | None = None) -> dict[str, Any]:
-        params = {"agent_id": "main", "page_size": 100}
+                       timeout: float | None = None, agent_id: str = "main") -> dict[str, Any]:
+        params = {"agent_id": agent_id, "page_size": 100}
         if before_turn:
             params["before_turn"] = before_turn
         return self._request_data("GET", f"/api/v1/sessions/{session_id}/transcript", params=params, timeout=timeout)
@@ -1137,6 +1165,7 @@ class KimiServerClient:
         """Project read-only transcript identities into existing migration rules."""
         deadline = time.monotonic() + (timeout if timeout is not None else self.rest_timeout)
         before, rows, seen = None, [], set()
+        listed_prompts = {}
         for _ in range(100):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1149,104 +1178,156 @@ class KimiServerClient:
                 if pid and pid not in seen:
                     seen.add(pid)
                     page_rows.append({"id": pid, "role": "user", "content": str(turn.get("prompt") or ""),
-                                      "created_at": turn.get("startedAt"), "metadata": {"origin": turn.get("origin")}})
+                                      "created_at": turn.get("startedAt"), "metadata": {"origin": turn.get("origin")},
+                                      "independent_turn": True, "prompt_status": turn.get("state")})
+                    for step in turn.get("steps", []):
+                        for frame in step.get("frames", []):
+                            if frame.get("kind") != "text" or frame.get("role") != "user":
+                                continue
+                            for child in frame.get("promptIds") or []:
+                                if child in seen:
+                                    continue
+                                seen.add(child)
+                                page_rows.append({"id": child, "role": "user", "content": frame.get("text", ""),
+                                                  "metadata": {"origin": frame.get("origin")},
+                                                  "owner_prompt_id": pid, "prompt_status": turn.get("state")})
                     if turn.get("state") == "completed":
                         page_rows.append({"role": "assistant", "content": "", "created_at": turn.get("endedAt")})
             for prompt in page.get("prompts", []):
                 pid = prompt.get("promptId")
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    page_rows.append({"id": pid, "role": "user", "content": prompt.get("content", ""),
-                                      "created_at": prompt.get("createdAt")})
+                if pid and pid not in listed_prompts:
+                    listed_prompts[pid] = {"id": pid, "role": "user", "content": prompt.get("content", ""),
+                                           "created_at": prompt.get("createdAt"),
+                                           "prompt_status": None if prompt.get("steeredAt") else prompt.get("status")}
             rows = page_rows + rows
             if not page.get("has_more"):
-                return rows
+                return rows + [row for pid, row in listed_prompts.items() if pid not in seen]
             cursor = turns[0]["turnId"] if turns else None
             if not cursor or cursor == before:
                 raise KimiServerError("Kimi prompt attribution pagination made no progress")
             before = cursor
         raise KimiServerError("Kimi prompt attribution page budget exhausted")
 
-    def _v2_final_event(self, session_id: str, turn: dict, text: str) -> KimiEvent:
+    def _v2_final_event(self, session_id: str, turn: dict, text: str,
+                        source_kind: str = "rest.reconciled") -> KimiEvent:
         return KimiEvent(type="turn_completed", thread_id=session_id, session_id=session_id,
                          turn_id=turn["turnId"], text=text if turn["state"] == "completed" else str(turn.get("error") or turn["state"]),
-                         status="completed" if turn["state"] == "completed" else "failed",
+                         status=turn["state"],
                          origin_timestamp=_provider_origin_timestamp({"timestamp": turn.get("endedAt")}),
                          data={"prompt_id": turn["triggerPromptId"], "agent_id": "main", "agent_scope": "main",
-                               "authoritative": True, "source_kind": "rest.reconciled", "terminal_verified": True,
+                               "authoritative": True, "source_kind": source_kind, "terminal_verified": True,
                                "stream_complete": True})
 
-    def _consume_v2(self, message: dict) -> None:
+    def _consume_v2(self, message: dict, *, ws: Any = None, generation: int | None = None) -> None:
         body = _payload_of(message)
-        if body.get("agent_id") != "main":
-            return
         sid = _str(message.get("session_id"))
-        if not sid:
+        if body.get("agent_id") != "main" or not sid:
             return
-        transcript = self._v2_transcripts.setdefault(sid, Transcript())
-        seq = body.get("seq")
-        if message["type"] == "transcript.reset":
-            # Reset is authoritative even when seq decreases after a restart.
-            transcript.reset(body.get("snapshot") or {}, seq)
-        elif not transcript.apply(body.get("ops") or [], seq):
-            if transcript.incomplete:
-                # Ask the actual V2 journal first. A cold/restarted server or
-                # expired journal requires a full authoritative refresh.
-                try:
-                    catchup = self._request_data("GET", f"/api/v1/sessions/{sid}/transcript/ops",
-                        params={"agent_id": "main", "since_seq": transcript.seq or 0}, timeout=min(3.0, self.rest_timeout))
-                    if catchup.get("complete"):
+
+        def current_socket():
+            return not self._closed and (ws is None or self._ws is ws) and (
+                generation is None or self._ws_generation == generation
+            )
+
+        with self._lifecycle_lock:
+            if not current_socket():
+                return
+            transcript = self._v2_transcripts.setdefault(sid, Transcript())
+            seq = body.get("seq")
+            if message["type"] == "transcript.reset":
+                # Reset is authoritative even when seq decreases after a restart.
+                transcript.reset(body.get("snapshot") or {}, seq)
+            else:
+                transcript.apply(body.get("ops") or [], seq)
+            needs_catchup = transcript.incomplete
+            since = transcript.seq or 0
+
+        transcript_source = "ws"
+        if needs_catchup:
+            timeout = min(3.0, self.rest_timeout)
+            catchup = page = None
+            try:
+                catchup = self._request_data("GET", f"/api/v1/sessions/{sid}/transcript/ops",
+                    params={"agent_id": "main", "since_seq": since}, timeout=timeout)
+                if not catchup.get("complete"):
+                    page = self.get_transcript(sid, timeout=timeout)
+            except KimiServerError:
+                # The owner worker reports the original transport/REST error.
+                pass
+            with self._lifecycle_lock:
+                if not current_socket() or self._v2_transcripts.get(sid) is not transcript:
+                    return
+                if transcript.incomplete and (transcript.seq or 0) == since:
+                    if catchup is not None and catchup.get("complete"):
+                        transcript_source = "rest"
                         transcript.incomplete = False
                         for batch in catchup.get("batches", []):
                             transcript.apply(batch["ops"], batch["seq"])
-                    else:
-                        page = self.get_transcript(sid, timeout=min(3.0, self.rest_timeout))
+                    elif page is not None:
+                        transcript_source = "rest"
                         transcript.reset(page, page.get("seq"))
-                except KimiServerError:
-                    # The existing owner recovery worker retains its bounded
-                    # deadline and reports the original REST/transport error.
-                    pass
-                self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
-            if transcript.incomplete:
+            self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
+
+        with self._lifecycle_lock:
+            if not current_socket() or self._v2_transcripts.get(sid) is not transcript or transcript.incomplete:
                 return
-        self._v2_execution_events(sid, transcript)
-        for turn, text in transcript.results():
-            key = (sid, turn["triggerPromptId"], turn["turnId"])
-            if key not in self._v2_completed:
-                self._enqueue_event(self._v2_final_event(sid, turn, text))
-            self._retire_v2_turn(sid, turn)
+            events = self._v2_execution_events(sid, transcript, transcript_source)
+            needs_recovery = transcript.incomplete
+        for event in events:
+            self._enqueue_event(event)
+        if needs_recovery:
+            self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
+
+        with self._lifecycle_lock:
+            if not current_socket() or self._v2_transcripts.get(sid) is not transcript:
+                return
+            finals = []
+            source_kind = "transcript.terminal" if transcript_source == "ws" else "rest.reconciled"
+            for turn, text in transcript.results():
+                key = (sid, turn["triggerPromptId"], turn["turnId"])
+                if key not in self._v2_completed:
+                    finals.append(self._v2_final_event(sid, turn, text, source_kind))
+                self._retire_v2_turn(sid, turn)
+        for event in finals:
+            self._enqueue_event(event)
 
     def _retire_v2_turn(self, sid: str, turn: dict) -> None:
-        key = (sid, turn["triggerPromptId"], turn["turnId"])
-        if key not in self._v2_completed:
-            self._v2_completed.add(key)
-            self._v2_completed_order.append(key)
-            while len(self._v2_completed_order) > 512:
-                self._v2_completed.discard(self._v2_completed_order.popleft())
-        # Delivered finals live in the owning consumer. Keep only active and
-        # terminal-but-incomplete bodies for ongoing reconciliation.
-        transcript = self._v2_transcripts.get(sid)
-        if transcript is not None:
-            transcript.items.pop(turn["turnId"], None)
-        self._v2_started.discard((sid, turn["turnId"], turn["triggerPromptId"]))
-        for frame_key in list(self._v2_frame_texts):
-            if frame_key[:3] == (sid, turn["turnId"], turn["triggerPromptId"]):
-                self._v2_frame_texts.pop(frame_key, None)
-        idle_sessions = [session for session, state in self._v2_transcripts.items() if not state.items]
-        for session in idle_sessions[:-32]:
-            self._v2_transcripts.pop(session, None)
+        with self._lifecycle_lock:
+            key = (sid, turn["triggerPromptId"], turn["turnId"])
+            if key not in self._v2_completed:
+                self._v2_completed.add(key)
+                self._v2_completed_order.append(key)
+                while len(self._v2_completed_order) > 512:
+                    self._v2_completed.discard(self._v2_completed_order.popleft())
+            # Delivered finals live in the owning consumer. Keep only active and
+            # terminal-but-incomplete bodies for ongoing reconciliation.
+            transcript = self._v2_transcripts.get(sid)
+            if transcript is not None:
+                current = transcript.items.get(turn["turnId"])
+                if current is not None and current.get("triggerPromptId") == turn["triggerPromptId"]:
+                    transcript.items.pop(turn["turnId"], None)
+            self._v2_started.discard((sid, turn["turnId"], turn["triggerPromptId"]))
+            for frame_key in list(self._v2_frame_texts):
+                if frame_key[:3] == (sid, turn["turnId"], turn["triggerPromptId"]):
+                    self._v2_frame_texts.pop(frame_key, None)
+            idle_sessions = [session for session, state in self._v2_transcripts.items() if not state.items]
+            for session in idle_sessions[:-32]:
+                self._v2_transcripts.pop(session, None)
 
-    def _v2_execution_events(self, sid: str, transcript: Transcript) -> None:
-        if transcript.incomplete:
-            return
+
+    def _v2_execution_events(self, sid: str, transcript: Transcript, transcript_source: str) -> list[KimiEvent]:
+        events = []
         for turn in transcript.items.values():
             prompt = turn.get("triggerPromptId")
             if not prompt or turn.get("state") != "running":
                 continue
             key = (sid, turn["turnId"], prompt)
-            base = {"agent_scope": "main", "agent_id": "main", "prompt_id": prompt, "authoritative": True}
+            if (sid, prompt, turn["turnId"]) in self._v2_completed:
+                continue
+            base = {"agent_scope": "main", "agent_id": "main", "prompt_id": prompt, "authoritative": True,
+                    "transcript_source": transcript_source}
             if key not in self._v2_started:
-                self._enqueue_event(KimiEvent(type="turn_started", thread_id=sid, turn_id=turn["turnId"],
+                events.append(KimiEvent(type="turn_started", thread_id=sid, turn_id=turn["turnId"],
                     text=str(turn.get("prompt") or ""), data={**base, "source_kind": "turn.started"}))
                 self._v2_started.add(key)
             for step in turn.get("steps", []):
@@ -1264,17 +1345,26 @@ class KimiServerClient:
                     old_units = old.encode("utf-16-le", errors="surrogatepass")
                     if not text_units.startswith(old_units):
                         transcript.incomplete = True
-                        self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
                         continue
                     if text != old:
                         kind = "thinking" if frame["kind"] == "thinking" else "assistant"
-                        self._enqueue_event(KimiEvent(type="agent_message_delta", thread_id=sid,
+                        events.append(KimiEvent(type="agent_message_delta", thread_id=sid,
                             turn_id=turn["turnId"], item_id=frame["frameId"], stream_id=frame["frameId"],
                             text=text_units[len(old_units):].decode("utf-16-le", errors="surrogatepass"), offset=len(old), display_kind=kind,
                             data={**base, "source_kind": kind + ".delta", "step_id": step["stepId"], "offset": len(old)}))
                         self._v2_frame_texts[frame_key] = text
+        return events
 
     def abort(self, session_id: str, prompt_id: str = "") -> None:
+        if self.protocol_version == 2:
+            if not session_id or not prompt_id:
+                raise KimiServerError("Kimi cancellation requires an exact active prompt identity")
+            sid = quote(session_id, safe="")
+            pid = quote(prompt_id, safe="")
+            data = self._request_data("POST", f"/api/v1/sessions/{sid}/prompts/{pid}:abort")
+            if data.get("aborted") is not True:
+                raise KimiServerError("Kimi did not accept the prompt cancellation")
+            return
         payload: dict[str, Any] = {"session_id": str(session_id)}
         if prompt_id:
             payload["prompt_id"] = str(prompt_id)
@@ -1713,7 +1803,22 @@ class KimiServerClient:
                     self._subscribe_v2(sid)
             return True
         if self.protocol_version == 2 and isinstance(message, dict) and message.get("type") in {"transcript.reset", "transcript.ops"}:
-            self._consume_v2(message)
+            self._consume_v2(message, ws=ws, generation=generation)
+            return True
+        if self.protocol_version == 2 and isinstance(message, dict) and message.get("type") == "interaction":
+            session_id = _str(message.get("session_id"))
+            interaction_id = _str(message.get("interaction_id"))
+            kind, status = message.get("kind"), message.get("status")
+            if session_id and interaction_id and kind in {"approval", "question"} and status in {"pending", "ended"}:
+                request = message.get("request")
+                self._enqueue_event(KimiEvent(
+                    type="server_request" if status == "pending" else "server_request_ended",
+                    thread_id=session_id, session_id=session_id, request_id=interaction_id,
+                    method=kind, status=status, params=request if isinstance(request, dict) else {},
+                    origin_timestamp=_provider_origin_timestamp({"timestamp": message.get("event_created_at")}),
+                    data={"source_kind": "interaction", "agent_id": message.get("agent_id"),
+                          "outcome": message.get("outcome")},
+                ))
             return True
         if isinstance(message, dict) and _str(message.get("type")) == "ack":
             try:
@@ -2124,7 +2229,8 @@ class KimiServerClient:
                 event_data = event.data if isinstance(event.data, dict) else {}
                 agent_id = _str(event_data.get("agent_id") or event_data.get("agentId"))
                 source_kind = _str(event_data.get("source_kind")).split(".", 1)[0]
-                key = (event.thread_id, event.turn_id, event.item_id, event.display_kind, agent_id, source_kind)
+                key = (event.thread_id, event.turn_id, event.item_id, event.display_kind, agent_id, source_kind,
+                       event_data.get("transcript_source"))
                 last_entry = self._queue[-1] if self._queue else None
                 can_merge = bool(last_entry and last_entry.get("kind") == "delta" and last_entry.get("key") == key)
                 if can_merge:

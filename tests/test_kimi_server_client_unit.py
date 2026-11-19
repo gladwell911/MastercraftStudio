@@ -1493,6 +1493,7 @@ def test_v2_client_gap_uses_journal_before_publishing_final():
     finals = [row["payload"]["event"] for row in client.drain_pending_messages(100) if row["type"] == "event"]
     assert len(finals) == 1
     assert finals[0]["text"] == "journal final"
+    assert finals[0]["data"]["source_kind"] == "rest.reconciled"
     assert http.calls[-1]["params"] == {"agent_id": "main", "since_seq": 1}
 
 
@@ -1576,7 +1577,7 @@ def test_v2_steered_rest_rejects_unsafe_terminal_candidates(case):
     event = client.reconcile_v2("s", "p")
     if case in {"failed_turn", "cancelled_turn"}:
         assert results == [(turn, "")]
-        assert event.status == "failed"
+        assert event.status == turn["state"]
     else:
         assert results == []
         # REST builds a fresh complete snapshot rather than inheriting a stream gap.
@@ -2005,3 +2006,110 @@ def test_owned_local_rest_session_is_configured_before_other_owners_can_observe_
         release.set()
         worker.join(2)
         client.close()
+
+
+def test_v2_rest_retirement_during_ws_projection_keeps_other_streams(monkeypatch):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    running = _v2_snapshot("first", prompt="p0", turn="t0")["items"][0]
+    complete = _v2_snapshot("ready", state="completed", prompt="p1", turn="t1")["items"][0]
+    later = _v2_snapshot("second", prompt="p2", turn="t2")["items"][0]
+    projected = threading.Event()
+    retired = threading.Event()
+    enqueue = client._enqueue_event
+
+    def on_event(event):
+        enqueue(event)
+        if event.type == "turn_started" and event.data["prompt_id"] == "p0":
+            projected.set()
+            assert retired.wait(5)
+
+    monkeypatch.setattr(client, "_enqueue_event", on_event)
+    monkeypatch.setattr(client, "get_transcript", lambda *_args, **_kwargs: {"items": [complete]})
+
+    def rest():
+        try:
+            assert projected.wait(5)
+            assert client.reconcile_v2("S", "p1").text == "ready"
+        finally:
+            retired.set()
+
+    worker = threading.Thread(target=rest)
+    worker.start()
+    try:
+        client._handle_ws_message({"type": "transcript.reset", "session_id": "S",
+                                   "payload": {"agent_id": "main", "seq": 1,
+                                               "snapshot": {"items": [running, complete, later]}}})
+    finally:
+        worker.join(5)
+    assert not worker.is_alive()
+    events = [item["payload"]["event"] for item in client.drain_pending_messages()]
+    assert [event["text"] for event in events if event["type"] == "agent_message_delta"] == ["first", "second"]
+    assert not any(event["type"] == "turn_completed" for event in events)
+
+
+@pytest.mark.parametrize("invalid", ["session", "prompt", "natural_completion", "rest_only", "timeout"])
+def test_live_ws_assertions_reject_wrong_identity_or_missing_evidence(invalid):
+    from test_kimi_live_smoke import _assert_cancelled, _assert_started, _assert_streamed_answer
+
+    def message(event_type, **kwargs):
+        return {"type": "event", "payload": {"event": {"type": event_type, "thread_id": "S",
+                "data": {"prompt_id": "P", "agent_id": "main", "transcript_source": "ws"}, **kwargs}}}
+
+    terminal = message("turn_completed", status="completed", text="pong",
+                       data={"prompt_id": "P", "agent_id": "main", "source_kind": "transcript.terminal",
+                             "terminal_verified": True})
+    delta = message("agent_message_delta", display_kind="assistant", text="pong")
+    if invalid == "session":
+        delta["payload"]["event"]["thread_id"] = "OTHER"
+        assert_target = lambda: _assert_streamed_answer([delta, terminal], "S", "P")
+    elif invalid == "prompt":
+        terminal["payload"]["event"]["data"]["prompt_id"] = "OTHER"
+        assert_target = lambda: _assert_streamed_answer([delta, terminal], "S", "P")
+    elif invalid == "natural_completion":
+        assert_target = lambda: _assert_cancelled([terminal], "S", "P")
+    elif invalid == "rest_only":
+        terminal["payload"]["event"]["data"]["source_kind"] = "rest.reconciled"
+        assert_target = lambda: _assert_streamed_answer([delta, terminal], "S", "P")
+    else:
+        assert_target = lambda: _assert_started([], "S", "P")
+    with pytest.raises(AssertionError):
+        assert_target()
+
+
+@pytest.mark.parametrize("rest_terminal", [True, False])
+def test_v2_live_ws_assertions_reject_rest_snapshot_repaired_after_gap(rest_terminal):
+    from test_kimi_live_smoke import _assert_streamed_answer, _events_of, _ws_terminals
+
+    client, _, http, _, _ = started_client()
+    client.protocol_version = 2
+    initial = _v2_snapshot("WS prefix") if rest_terminal else {"items": []}
+    client._handle_ws_message({"type": "transcript.reset", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 1, "snapshot": initial}})
+    http.routes[("GET", "/api/v1/sessions/s/transcript/ops")] = FakeResponse(
+        200, {"code": 0, "data": {"complete": False}}
+    )
+    state = "completed" if rest_terminal else "running"
+    http.routes[("GET", "/api/v1/sessions/s/transcript")] = FakeResponse(
+        200, {"code": 0, "data": {"seq": 3, **_v2_snapshot("REST text", state)}}
+    )
+    client._handle_ws_message({"type": "transcript.ops", "session_id": "s", "payload": {
+        "agent_id": "main", "seq": 3, "ops": []}})
+    if not rest_terminal:
+        client._handle_ws_message({"type": "transcript.ops", "session_id": "s", "payload": {
+            "agent_id": "main", "seq": 4, "ops": [{"op": "turn.upsert", "turn": {
+                "kind": "turn", "turnId": "t", "triggerPromptId": "p", "state": "completed"}}]}})
+    messages = client.drain_pending_messages()
+    finals = _events_of(messages, "turn_completed")
+    assert len(finals) == 1 and finals[0]["text"] == "REST text"
+    if rest_terminal:
+        assert finals[0]["data"]["source_kind"] == "rest.reconciled"
+        assert not _ws_terminals(messages, "s", "p")
+        expected = "no matching WS terminal"
+    else:
+        deltas = _events_of(messages, "agent_message_delta")
+        assert deltas[0]["data"]["transcript_source"] == "rest"
+        assert len(_ws_terminals(messages, "s", "p")) == 1
+        expected = "no matching WS assistant delta"
+    with pytest.raises(AssertionError, match=expected):
+        _assert_streamed_answer(messages, "s", "p")

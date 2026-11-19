@@ -3624,3 +3624,576 @@ def test_rest_injection_no_final_reconciliation_persists_failure_without_complet
         assert "intermediate commentary" not in turn["answer_md"]
     assert played == []
     assert len(fake.submitted) == 1
+
+
+def test_overlapping_kimi_followup_uses_origin_chat_after_switch(frame, monkeypatch, tmp_path):
+    real_thread = main.threading.Thread
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    chat = {"id": "chat-a", "title": "A"}
+    a_file = tmp_path / "A-attachment.txt"
+    b_file = tmp_path / "B-attachment.txt"
+    a_file.write_text("A file", encoding="utf-8")
+    b_file.write_text("B file", encoding="utf-8")
+    turns = [
+        {"question": "A-history", "request_status": "pending", "model": "kimi/main"},
+        {"question": "A-followup", "request_status": "pending", "model": "kimi/main",
+         "attachments": [{"status": "success", "path": str(a_file)}]},
+    ]
+    frame._current_chat_state = chat
+    frame.active_chat_id = frame.current_chat_id = chat["id"]
+    frame.active_session_turns = turns
+    frame.active_kimi_session_id = ""
+    archived_chat = {**chat, "turns": list(turns)}
+    monkeypatch.setattr(frame, "_find_archived_chat", lambda chat_id: archived_chat if chat_id == chat["id"] else None)
+    frame.archived_chats.append(archived_chat)
+    callbacks = []
+    real_call_after = frame._call_after_if_alive
+
+    def marshal(fn, *args):
+        if main.threading.current_thread() is main.threading.main_thread():
+            return real_call_after(fn, *args)
+        callbacks.append((fn, args))
+        return True
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", marshal)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    first_started = main.threading.Event()
+    second_waiting = main.threading.Event()
+    release_first = main.threading.Event()
+    create_session = fake.create_session
+    submission_lock = frame._kimi_submission_lock
+
+    def create(**kwargs):
+        first_started.set()
+        assert release_first.wait(5)
+        return create_session(**kwargs)
+
+    class ObservedLock:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def acquire(self):
+            if main.threading.current_thread().name == "kimi-followup":
+                second_waiting.set()
+            return self.lock.acquire()
+
+        def release(self):
+            self.lock.release()
+
+    monkeypatch.setattr(fake, "create_session", create)
+    frame._kimi_submission_locks[chat["id"]] = ObservedLock(submission_lock(chat["id"]))
+    first = real_thread(target=frame._run_kimi_turn_worker, args=(chat["id"], 0, "A-history", "kimi/main"))
+    second = real_thread(name="kimi-followup", target=frame._run_kimi_turn_worker,
+                         args=(chat["id"], 1, "A-followup", "kimi/main"))
+    first.start()
+    try:
+        assert first_started.wait(5)
+        second.start()
+        assert second_waiting.wait(5)
+        frame._current_chat_state = {"id": "chat-b"}
+        frame.active_chat_id = frame.current_chat_id = "chat-b"
+        frame.active_session_turns = [
+            {"question": "B-history"},
+            {"attachments": [{"status": "success", "path": str(b_file)}]},
+        ]
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(fake.submitted) == 2
+    assert [post["session_id"] for post in fake.submitted] == ["session-fake-1", "session-fake-1"]
+    assert "A-followup" in str(fake.submitted[1]["blocks"])
+    assert "A-attachment" in str(fake.submitted[1]["blocks"])
+    assert "B-history" not in str(fake.submitted)
+    assert "B-attachment" not in str(fake.submitted)
+    assert fake.steer_calls == [("session-fake-1", ["prompt-2"])]
+    assert {key[0] for key in frame._kimi_prompt_owners} == {"chat-a"}
+    for callback, args in callbacks:
+        callback(*args)
+    fake.push_event(KimiEvent(type="turn_started", thread_id="session-fake-1", turn_id="turn-a",
+                              data={"prompt_id": "prompt-1"}))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id="session-fake-1", turn_id="turn-a",
+                              status="completed", text="A answer", data={"prompt_id": "prompt-1"}))
+    b_turns = frame.active_session_turns
+    assert all(not turn.get("answer_md") for turn in b_turns)
+    assert turns[0]["answer_md"] == "A answer"
+    assert turns[1]["answer_alias_of"] == turns[0]["answer_identity"]
+    frame._save_state()
+    assert frame.chat_store.load_turns(chat["id"])[0]["answer_md"] == "A answer"
+
+
+def test_distinct_kimi_recovery_owner_gets_own_deadline(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.protocol_version = 2
+    frame._kimi_reconcile_attempts = 1
+    now = [20.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(main.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    finished = []
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: finished.append(True))
+    chat_id, sid = "two-owners", "shared-session"
+    frame.active_chat_id = frame.current_chat_id = chat_id
+    frame.active_kimi_session_id = sid
+    frame.active_session_turns = [
+        {"question": prompt, "model": "kimi/main", "request_status": "pending",
+         "kimi_session_id": sid, "kimi_prompt_id": prompt}
+        for prompt in ("slow", "ready")
+    ]
+    frame._current_chat_state = {"id": chat_id, "kimi_session_id": sid, "turns": frame.active_session_turns}
+    for idx, prompt in enumerate(("slow", "ready")):
+        frame._register_kimi_prompt_owner({
+            "chat_id": chat_id, "session_id": sid, "prompt_id": prompt,
+            "turn_idx": idx, "role": "active" if idx == 0 else "queued", "landed": True,
+        })
+    queries = []
+
+    def reconcile(session, prompt, *, timeout):
+        assert session == sid
+        queries.append((prompt, now[0], timeout))
+        if prompt == "ready":
+            return KimiEvent(type="turn_completed", thread_id=sid, turn_id="ready-turn", text="ready answer",
+                             status="completed", data={"prompt_id": "ready", "source_kind": "rest.reconciled",
+                                                       "stream_complete": True})
+        return None
+
+    fake.reconcile_v2 = reconcile
+    frame._reconcile_kimi_session_worker(sid)
+    assert queries[0] == ("slow", 20.0, 5.0)
+    assert queries[-1] == ("ready", 25.0, 5.0)
+    assert frame.active_session_turns[0]["request_status"] == "failed"
+    assert frame.active_session_turns[1]["answer_md"] == "ready answer"
+    frame._on_kimi_event(main.CodexEvent(**event_to_payload(reconcile(sid, "ready", timeout=1))))
+    assert finished == [True]
+    frame._save_state()
+    assert frame.chat_store.load_turns(chat_id)[1]["answer_md"] == "ready answer"
+
+
+@pytest.fixture
+def running_kimi_control_server(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    import requests
+
+    requests_seen = []
+    interaction_reads = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, data, *, code=0, status=200):
+            payload = json.dumps({"code": code, "data": data, "msg": "synthetic rejection" if code else ""}).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            requests_seen.append((self.path, "GET"))
+            state = interaction_reads.pop(0)
+            if state is None:
+                self._reply({}, status=500)
+                return
+            post_path = next(path for path, body in reversed(requests_seen) if body != "GET")
+            self._reply({"interactions": [{"interactionId": post_path.rsplit("/", 1)[-1], "state": state}]})
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(size)) if size else None
+            requests_seen.append((self.path, body))
+            if "interaction-retry" in self.path and sum(path == self.path for path, _ in requests_seen) == 1:
+                if self.path.endswith(("interaction-retry", "retry_ended_wire")):
+                    self._reply({}, code=40001)
+                else:
+                    self._reply({}, status=500)
+                return
+            if self.path.endswith(":abort"):
+                data = {"aborted": "/refused:abort" not in self.path}
+            elif body["kind"] == "approval":
+                data = {"outcome": body["decision"], "ended_at": "2026-11-19T08:00:00Z"}
+            else:
+                data = {"outcome": "dismissed" if body.get("dismissed") else "answered",
+                        "ended_at": "2026-11-19T08:00:00Z"}
+            self._reply(data)
+
+        def log_message(self, _format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client.base_url = f"http://127.0.0.1:{server.server_port}"
+    client._http = requests.Session()
+    client._http.trust_env = False
+    monkeypatch.setattr(client, "start", lambda: None)
+    try:
+        yield client, requests_seen, interaction_reads
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+@pytest.mark.parametrize("action", [
+    "approve", "reject", "cancel", "question", "question_other", "dismiss", "ended", "switch", "expired",
+    "retry", "retry_unknown", "retry_approved", "retry_answered", "retry_ended_wire",
+    "retry_recheck_pending", "retry_recheck_ended", "retry_recheck_unknown",
+])
+def test_v2_wire_interaction_reaches_native_controls_and_exact_http(
+    frame, monkeypatch, running_kimi_control_server, action
+):
+    native_call_later = wx.CallLater
+    _setup_kimi_frame(frame, monkeypatch)
+    client, requests_seen, interaction_reads = running_kimi_control_server
+    frame._kimi_client = client
+    client.on_message = frame._on_kimi_client_message
+    frame.active_chat_id = frame.current_chat_id = "chat-wire"
+    frame.active_kimi_session_id = "session-wire"
+    frame._current_chat_state = {"id": "chat-wire", "kimi_session_id": "session-wire", "turns": []}
+    if action == "switch":
+        frame.archived_chats.append({"id": "chat-other", "kimi_session_id": "session-other", "turns": []})
+        assert frame._switch_current_chat("chat-other")
+    if action == "expired":
+        now = [100.0]
+        monkeypatch.setattr(main.time, "time", lambda: now[0])
+        monkeypatch.setattr(client, "start", lambda: now.__setitem__(0, 102.0))
+    interaction_reads.extend({
+        "retry_unknown": ["pending"],
+        "retry_approved": ["approved"],
+        "retry_answered": ["answered"],
+        "retry_recheck_pending": [None, "pending"],
+        "retry_recheck_ended": [None, "rejected"],
+        "retry_recheck_unknown": [None, None],
+    }.get(action, []))
+    questions = [
+        {"id": "single-provider", "question": "Select one", "allow_other": True,
+         "options": [{"id": "real-a", "label": "A"}, {"id": "real-b", "label": "B"}]},
+        {"id": "multi-provider", "question": "Select several", "multi_select": True, "allow_other": True,
+         "options": [{"id": "real-x", "label": "X"}, {"id": "real-y", "label": "Y"}]},
+        {"id": "other-provider", "question": "Add a detail", "allow_other": True, "options": []},
+    ]
+    kind = "question" if action in {"question", "question_other", "dismiss", "retry_answered"} else "approval"
+    interaction_id = f"interaction-{action}" if action.startswith("retry") else "interaction-wire"
+    pending = {
+        "type": "interaction", "session_id": "session-wire", "agent_id": "main",
+        "event_created_at": "2026-11-19T08:00:00Z", "status": "pending", "tool_call_id": "tool-wire",
+        "interaction_id": interaction_id, "kind": kind,
+        "request": {"questions": questions} if kind == "question" else
+                   {"tool_name": "Shell", "action": "Run the local checks",
+                    "tool_input_display": {"command": "pytest -q"}},
+    }
+    if action == "expired":
+        pending["request"]["expires_at"] = 101.0
+    shown = []
+    native_show_modal = main.CodexUserInputDialog.ShowModal
+
+    def show_modal(dialog):
+        shown.append(dialog.GetTitle())
+
+        def perform_action():
+            # Replay pending while the native modal is open. The same session
+            # and interaction must not display a second modal.
+            client._handle_ws_message(pending)
+            if action == "ended":
+                client._handle_ws_message({**pending, "status": "ended", "outcome": "cancelled"})
+                return
+            if action in {"cancel", "dismiss"}:
+                dialog.Close()
+                return
+            if action in {"question", "question_other", "retry_answered"}:
+                single, multi, other = dialog._controls
+                if action == "question_other":
+                    assert single["choices"].GetSelection() == 0
+                    single["other"].SetValue("instead of the first option")
+                    assert single["choices"].GetSelection() == 2
+                else:
+                    single["choices"].SetSelection(1)
+                multi["choices"].Check(0)
+                multi["choices"].Check(1)
+                multi["other"].SetValue("more")
+                other["other"].SetValue("extra detail")
+            elif action == "reject":
+                dialog._controls[0]["radio"].SetSelection(1)
+            button = dialog.FindWindow(wx.ID_OK)
+            assert button.GetLabel()
+            wx.PostEvent(button, wx.CommandEvent(wx.wxEVT_BUTTON, wx.ID_OK))
+
+        action_timer = native_call_later(1, perform_action)
+        timeout_timer = native_call_later(3000, dialog.EndModal, wx.ID_CANCEL)
+        try:
+            return native_show_modal(dialog)
+        finally:
+            action_timer.Stop()
+            timeout_timer.Stop()
+
+    monkeypatch.setattr(main.CodexUserInputDialog, "ShowModal", show_modal)
+    client._handle_ws_message(pending)
+    client._handle_ws_message(pending)
+    if action == "switch":
+        assert _active_chat_id(frame) == "chat-other"
+        assert shown == [] and requests_seen == []
+        assert frame._switch_current_chat("chat-wire")
+        assert _active_chat_id(frame) == "chat-wire"
+        client._handle_ws_message(pending)
+    assert len(shown) == 1
+    if action in {"ended", "expired"}:
+        assert requests_seen == []
+        return
+
+    expected_answers = {
+        "single-provider": ({"kind": "other", "text": "instead of the first option"} if action == "question_other"
+                            else {"kind": "single", "option_id": "real-b"}),
+        "multi-provider": {"kind": "multi_with_other", "option_ids": ["real-x", "real-y"], "other_text": "more"},
+        "other-provider": {"kind": "other", "text": "extra detail"},
+    }
+    if action.startswith("retry"):
+        key = ("session-wire", interaction_id)
+        request = frame._kimi_interactions[key]
+        response = {"kind": "approval", "decision": "approved"} if kind == "approval" else {
+            "kind": "question", "answers": expected_answers,
+        }
+        post = (f"/api/v1/sessions/session-wire/interactions/{interaction_id}", response)
+        get = ("/api/v1/sessions/session-wire/transcript?agent_id=main&page_size=100", "GET")
+        menu_id = int(frame._kimi_retry_interaction_menu_id)
+        menu = frame.GetMenuBar().FindItemById(menu_id)
+
+        def select_retry():
+            frame._on_chat_information_menu_open(wx.MenuEvent(wx.wxEVT_MENU_OPEN))
+            assert menu.IsEnabled()
+            frame.GetEventHandler().ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, menu_id))
+
+        if action in {"retry_approved", "retry_answered"}:
+            assert request["state"] == "ended"
+            assert frame.GetStatusBar().GetStatusText() == "已回复 Kimi Code 请求。"
+            assert requests_seen == [post, get]
+            frame._on_chat_information_menu_open(wx.MenuEvent(wx.wxEVT_MENU_OPEN))
+            assert not menu.IsEnabled()
+            return
+        if action == "retry_ended_wire":
+            assert request["state"] == "retryable"
+            other = (key[0], "other-interaction")
+            frame._kimi_interactions[other] = {"state": "retryable", "chat_id": "chat-wire"}
+            frame._report_kimi_interaction_error(other, "chat-wire", "another failure", True)
+            client._handle_ws_message({**pending, "status": "ended", "outcome": "cancelled"})
+            assert request["state"] == "ended"
+            assert list(frame._current_chat_state["kimi_interaction_errors"]) == ["/".join(other)]
+            assert "another failure" in frame.GetStatusBar().GetStatusText()
+            assert requests_seen == [post]
+            return
+        if action.startswith("retry_recheck"):
+            assert request["state"] == "uncertain"
+            assert requests_seen == [post, get]
+            select_retry()
+            assert len(shown) == 1
+            assert requests_seen == [post, get, get]
+            if action == "retry_recheck_ended":
+                assert request["state"] == "ended"
+                assert frame.GetStatusBar().GetStatusText() == "Kimi Code 请求已结束。"
+                assert not frame._current_chat_state.get("kimi_interaction_errors")
+                frame._on_chat_information_menu_open(wx.MenuEvent(wx.wxEVT_MENU_OPEN))
+                assert not menu.IsEnabled()
+                return
+            if action == "retry_recheck_unknown":
+                assert request["state"] == "uncertain"
+                frame._on_chat_information_menu_open(wx.MenuEvent(wx.wxEVT_MENU_OPEN))
+                assert menu.IsEnabled()
+                return
+        assert request["state"] == "retryable"
+        assert "重试 Kimi 请求" in frame.GetStatusBar().GetStatusText()
+        before_retry = {
+            "retry": [post], "retry_unknown": [post, get], "retry_recheck_pending": [post, get, get]
+        }[action]
+        assert requests_seen == before_retry
+        select_retry()
+        assert frame.GetStatusBar().GetStatusText() == "已回复 Kimi Code 请求。"
+        assert not frame._current_chat_state.get("kimi_interaction_errors")
+        assert requests_seen == [*before_retry, post]
+        client._handle_ws_message(pending)
+        assert len(shown) == 2
+        return
+    if kind == "approval":
+        expected = {"kind": "approval", "decision": {"approve": "approved", "switch": "approved", "reject": "rejected", "cancel": "cancelled"}[action]}
+    elif action == "dismiss":
+        expected = {"kind": "question", "dismissed": True}
+    else:
+        expected = {"kind": "question", "answers": expected_answers}
+    assert requests_seen == [("/api/v1/sessions/session-wire/interactions/interaction-wire", expected)]
+
+
+def test_v2_stop_exact_prompt_http_and_cancelled_terminal(frame, monkeypatch, running_kimi_control_server):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    client, requests_seen, _ = running_kimi_control_server
+    fake.protocol_version = 2
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    fake.abort = client.abort
+    posted = []
+
+    def submit(session, blocks, *, prompt_id):
+        posted.append((session, prompt_id))
+        return prompt_id
+
+    fake.submit_prompt = submit
+    _submit(frame, "task waiting to start")
+    sid, pid = posted[0]
+    _submit(frame, "/stop")
+    assert requests_seen == []
+    fake.push_event(KimiEvent(type="turn_started", thread_id=sid, turn_id="t1", data={"prompt_id": pid}))
+    _submit(frame, "/stop")
+    assert requests_seen == [(f"/api/v1/sessions/{sid}/prompts/{pid}:abort", None)]
+    assert "已受理" in frame.active_session_turns[-1]["answer_md"]
+    assert frame.active_session_turns[0]["request_status"] == "pending"
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=sid, turn_id="t1", status="cancelled",
+                              data={"prompt_id": pid, "source_kind": "transcript.terminal", "stream_complete": True}))
+    assert frame.active_session_turns[0]["answer_md"] == "Kimi Code 已中断。"
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=sid, turn_id="t1", status="completed",
+                              text="late duplicate", data={"prompt_id": pid}))
+    _submit(frame, "/stop")
+    assert frame.active_session_turns[0]["answer_md"] == "Kimi Code 已中断。"
+    assert len(requests_seen) == 1
+    with pytest.raises(KimiServerError, match="did not accept"):
+        client.abort(sid, "refused")
+
+
+def test_v2_lost_wrapped_post_recovers_preallocated_id_after_store_reload(frame, monkeypatch, tmp_path):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "history question")
+    old_session = fake.created_sessions[0]["session_id"]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=old_session, turn_id="t-old"))
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=old_session, turn_id="t-old",
+                              status="completed", text="history answer"))
+    fake.session_exists_result = False
+    fake.protocol_version = 2
+    posts = []
+    attachment = tmp_path / "recovery-attachment.txt"
+    attachment.write_text("test attachment", encoding="utf-8")
+    frame._pending_input_attachments = [{"status": "success", "kind": "file", "path": str(attachment)}]
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+
+    def lose_response(session_id, blocks, *, prompt_id):
+        posts.append((session_id, blocks, prompt_id))
+        fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="unrelated",
+                                  data={"prompt_id": "wrong-prompt"}))
+        raise KimiServerError("response lost", result_unknown=True)
+
+    fake.submit_prompt = lose_response
+    _submit(frame, "new request")
+    sid, blocks, pid = posts[0]
+    assert frame.active_session_turns[-1]["kimi_prompt_id"] == pid
+    assert frame.active_session_turns[-1]["kimi_prompt_exact"] is True
+    assert "history question" in blocks[0]["text"]
+    assert "recovery-attachment.txt" in blocks[0]["text"]
+    assert not frame._find_kimi_prompt_owner("wrong-prompt", session_id=sid, include_unlanded=True)
+    frame._save_state()
+    assert frame.chat_store.load_turns(_active_chat_id(frame))[-1]["kimi_prompt_id"] == pid
+    frame._kimi_prompt_owners.clear()
+    frame._kimi_active_turns.clear()
+    frame._load_state()
+    owner = frame._find_kimi_prompt_owner(pid, session_id=sid)
+    assert owner["exact_prompt_id"] is True
+    assert owner["role"] == "unresolved"
+    transport = KimiServerClient()
+    snapshot = {"items": [
+        {"kind": "turn", "turnId": "other", "triggerPromptId": "wrong-prompt", "state": "completed",
+         "prompt": "new request", "steps": [{"state": "completed", "frames": [
+             {"kind": "text", "role": "assistant", "text": "unrelated answer"}]}]},
+        {"kind": "turn", "turnId": "t-new", "triggerPromptId": pid, "state": "completed",
+         "prompt": blocks[0]["text"], "steps": [{"state": "completed", "frames": [
+             {"kind": "text", "role": "assistant", "text": "exact recovered answer"}]}]},
+    ]}
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: snapshot)
+    fake.reconcile_v2 = transport.reconcile_v2
+    fake.recovery_messages_v2 = transport.recovery_messages_v2
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: fake)
+    frame._reconcile_kimi_owner_worker(owner)
+    assert len(posts) == 1
+    assert frame.active_session_turns[-1]["answer_md"] == "exact recovered answer"
+
+
+@pytest.mark.parametrize("steered", [True, False])
+def test_v2_lost_same_text_steer_recovers_alias_or_distinct_prompt(frame, monkeypatch, steered):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    fake.protocol_version = 2
+    posts = []
+    sounds = []
+    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: sounds.append(True))
+
+    def submit(sid, _blocks, *, prompt_id):
+        posts.append((sid, prompt_id))
+        return prompt_id
+
+    fake.submit_prompt = submit
+    fake.steer_result = None
+    _submit(frame, "same text")
+    sid, parent = posts[0]
+    fake.push_event(KimiEvent(type="turn_started", thread_id=sid, turn_id="parent-turn", data={"prompt_id": parent}))
+    _submit(frame, "same text")
+    child = posts[1][1]
+    fake.push_event(KimiEvent(type="turn_completed", thread_id=sid, turn_id="parent-turn", status="completed",
+                              text="parent answer", data={"prompt_id": parent}))
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    assert frame.active_session_turns[1]["request_status"] == "pending"
+    transport = KimiServerClient()
+    parent_turn = {"kind": "turn", "turnId": "parent-turn", "triggerPromptId": parent, "state": "completed",
+                   "prompt": "same text", "steps": [{"state": "completed", "frames": [
+                       {"kind": "text", "role": "assistant", "text": "parent answer"}]}]}
+    snapshot = {"items": [parent_turn], "prompts": []}
+    if steered:
+        parent_turn["steps"][0]["frames"].insert(
+            0, {"kind": "text", "role": "user", "text": "same text", "promptIds": [child]}
+        )
+    else:
+        snapshot["prompts"].append({"promptId": child, "status": "queued", "content": "same text"})
+    monkeypatch.setattr(transport, "get_transcript", lambda *a, **k: snapshot)
+    fake.reconcile_v2 = transport.reconcile_v2
+    fake.recovery_messages_v2 = transport.recovery_messages_v2
+    owner = frame._find_kimi_prompt_owner(child, session_id=sid)
+    assert owner["role"] == "unresolved"
+    frame._reconcile_kimi_owner_worker(owner)
+    if steered:
+        assert frame.active_session_turns[1]["request_status"] == "done"
+        assert frame.active_session_turns[1]["answer_alias_of"] == frame.active_session_turns[0]["answer_identity"]
+        assert frame.active_session_turns[1]["answer_md"] == ""
+        assert sounds == [True]
+    else:
+        assert frame.active_session_turns[1]["request_status"] == "pending"
+        assert frame._find_kimi_prompt_owner(child, session_id=sid)["role"] == "queued"
+        fake.push_event(KimiEvent(type="turn_started", thread_id=sid, turn_id="child-turn", data={"prompt_id": child}))
+        fake.push_event(KimiEvent(type="turn_completed", thread_id=sid, turn_id="child-turn", status="completed",
+                                  text="independent answer", data={"prompt_id": child}))
+        assert frame.active_session_turns[1]["answer_md"] == "independent answer"
+        assert sounds == [True, True]
+    assert len(posts) == 2
+
+
+def test_legacy_known_kimi_prompt_id_takes_priority_over_closer_matching_text(frame):
+    owner = {"chat_id": "c", "session_id": "s", "prompt_id": "older",
+             "question": "same", "created_at": 104, "turn_idx": 0}
+    messages = [{"role": "user", "id": "older", "created_at": 100, "content": "same"},
+                {"role": "user", "id": "nearer", "created_at": 104, "content": "same"}]
+    assert frame._migrate_legacy_kimi_owner(owner, messages)["prompt_id"] == "older"
+
+
+def test_kimi_clear_between_generation_check_and_publish_cannot_leak_session(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    original_is_current = frame._model_startup_request_is_current
+    cleared = []
+
+    def interleave(chat_id, turn_idx, request):
+        is_current = original_is_current(chat_id, turn_idx, request)
+        if is_current and not cleared and fake.created_sessions:
+            frame.new_chat_button.Enable()
+            cleared.append(chat_id)
+            assert frame._clear_context_and_start_new_chat(auto_resend_first=True)
+        return is_current
+
+    monkeypatch.setattr(frame, "_model_startup_request_is_current", interleave)
+    _submit(frame, "old generation")
+    assert cleared == [_active_chat_id(frame)]
+    assert frame._kimi_submission_sessions[cleared[0]] == "session-fake-2"
+    assert [entry["session_id"] for entry in fake.created_sessions] == ["session-fake-1", "session-fake-2"]
+    assert [entry["session_id"] for entry in fake.submitted] == ["session-fake-2"]

@@ -8,7 +8,8 @@ and clean shutdown. Marked ``live`` so ``-m "not live"`` excludes it.
 from __future__ import annotations
 
 import os
-import threading
+import uuid
+from pathlib import Path
 import time
 
 import pytest
@@ -25,6 +26,27 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolated_kimi_live_environment(tmp_path_factory):
+    configured_home = os.getenv("KIMI_LIVE_HOME", "").strip()
+    if not configured_home:
+        pytest.skip("KIMI_LIVE_HOME must name a separately authenticated test home")
+    home = Path(configured_home).resolve()
+    config = (home / ".kimi-code").resolve()
+    daily = (Path.home() / ".kimi-code").resolve()
+    current_config = Path(os.getenv("KIMI_CODE_HOME") or daily).resolve()
+    if not config.is_dir() or any(config == root or root in config.parents for root in {daily, current_config}):
+        pytest.fail("KIMI_LIVE_HOME must be an independent test home with its own .kimi-code")
+    workspace = tmp_path_factory.mktemp("kimi-live-workspace")
+    with pytest.MonkeyPatch.context() as environment:
+        environment.setenv("HOME", str(home))
+        environment.setenv("USERPROFILE", str(home))
+        environment.setenv("KIMI_CODE_HOME", str(config))
+        environment.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+        environment.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
+        yield workspace
+
+
 @pytest.fixture(scope="module")
 def live_client():
     try:
@@ -32,9 +54,12 @@ def live_client():
     except KimiServerError as exc:
         pytest.skip(f"kimi binary unavailable: {exc}")
     client = KimiServerClient()
-    client.start()
-    yield client
-    client.close()
+    try:
+        client.start()
+        assert client.protocol_version == 2
+        yield client
+    finally:
+        client.close()
 
 
 def _drain_until(client: KimiServerClient, predicate, timeout: float = 180.0):
@@ -61,18 +86,43 @@ def _events_of(messages, event_type: str):
     return out
 
 
-def _is_authoritative_terminal(event):
-    data = event.get("data") if isinstance(event.get("data"), dict) else {}
-    if event.get("type") != "turn_completed" or str(data.get("agent_id") or "main") != "main":
-        return False
-    source_kind = str(data.get("source_kind") or "")
-    if source_kind == "turn.ended":
-        return True
-    return bool(
-        source_kind == "rest.reconciled"
-        and data.get("stream_complete") is True
-        and str(event.get("text") or "").strip()
+def _owns_prompt(event, session_id, prompt_id):
+    data = event.get("data") or {}
+    return event.get("thread_id") == session_id and data.get("prompt_id") == prompt_id and data.get("agent_id") == "main"
+
+
+def _ws_terminals(messages, session_id, prompt_id):
+    return [event for event in _events_of(messages, "turn_completed")
+            if _owns_prompt(event, session_id, prompt_id)
+            and event["data"].get("source_kind") == "transcript.terminal"
+            and event["data"].get("terminal_verified") is True]
+
+
+def _assert_streamed_answer(messages, session_id, prompt_id):
+    deltas = [event.get("text") or "" for event in _events_of(messages, "agent_message_delta")
+              if _owns_prompt(event, session_id, prompt_id) and event.get("display_kind") == "assistant"
+              and event["data"].get("transcript_source") == "ws"]
+    assert "".join(deltas).strip(), "no matching WS assistant delta before the deadline"
+    terminals = _ws_terminals(messages, session_id, prompt_id)
+    assert terminals, "no matching WS terminal before the deadline"
+    assert terminals[-1]["status"] == "completed", terminals[-1]
+    answer = terminals[-1]["text"]
+    assert answer.strip(), "WS terminal did not contain a complete answer"
+    return "".join(deltas), answer
+
+
+def _assert_cancelled(messages, session_id, prompt_id):
+    terminals = _ws_terminals(messages, session_id, prompt_id)
+    assert terminals, "no matching WS terminal before the cancellation deadline"
+    assert terminals[-1]["status"] == "cancelled", terminals[-1]
+
+
+def _assert_started(messages, session_id, prompt_id):
+    assert any(_owns_prompt(event, session_id, prompt_id) and event["data"].get("transcript_source") == "ws"
+               for event in _events_of(messages, "turn_started")), (
+        "prompt did not start before the deadline"
     )
+    assert not _ws_terminals(messages, session_id, prompt_id), "prompt already terminated before cancellation"
 
 
 def _assert_successful_prompt(client, session_id, prompt_id):
@@ -92,57 +142,46 @@ def _assert_successful_prompt(client, session_id, prompt_id):
     return ""
 
 
-def test_live_prompt_roundtrip(live_client):
-    session_id = live_client.create_session(
-        cwd=os.getcwd(),
-        model="kimi/main",
-        title="live smoke",
-    )
+def test_live_prompt_roundtrip(live_client, isolated_kimi_live_environment):
+    session_id = live_client.create_session(cwd=str(isolated_kimi_live_environment), model="kimi/main", title="live smoke")
     assert session_id.startswith("session_")
-
-    prompt_id = live_client.submit_prompt(
+    prompt_id = uuid.uuid4().hex
+    assert live_client.submit_prompt(
         session_id,
         [{"type": "text", "text": "Reply with exactly the single word: pong. Do not use any tools."}],
-    )
-    assert prompt_id
-
-    messages = _drain_until(
-        live_client,
-        lambda ms: any(e.get("status") == "completed" and _is_authoritative_terminal(e) for e in _events_of(ms, "turn_completed")),
-    )
-    deltas = _events_of(messages, "agent_message_delta")
-    answer_text = "".join(e.get("text") or "" for e in deltas if e.get("display_kind") == "assistant")
-    final_text = _assert_successful_prompt(live_client, session_id, prompt_id)
-    if live_client.protocol_version == 2:
-        answer_text = final_text
-    assert "pong" in answer_text.lower()
+        prompt_id=prompt_id,
+    ) == prompt_id
+    messages = _drain_until(live_client, lambda ms: bool(_ws_terminals(ms, session_id, prompt_id)))
+    streamed, ws_answer = _assert_streamed_answer(messages, session_id, prompt_id)
+    assert "pong" in streamed.lower()
+    assert "pong" in ws_answer.lower()
+    assert _assert_successful_prompt(live_client, session_id, prompt_id) == ws_answer
 
 
-def test_live_abort(live_client):
-    session_id = live_client.create_session(cwd=os.getcwd(), model="kimi/main", title="live abort")
-    prompt_id = live_client.submit_prompt(
+def test_live_abort(live_client, isolated_kimi_live_environment):
+    session_id = live_client.create_session(cwd=str(isolated_kimi_live_environment), model="kimi/main", title="live abort")
+    prompt_id = uuid.uuid4().hex
+    assert live_client.submit_prompt(
         session_id,
-        [{"type": "text", "text": "Count from 1 to 500, one number per line, no tools."}],
-    )
-    started = threading.Event()
-
-    def _wait_start():
-        _drain_until(live_client, lambda ms: bool(_events_of(ms, "turn_started")), timeout=60)
-        started.set()
-
-    waiter = threading.Thread(target=_wait_start, daemon=True)
-    waiter.start()
-    assert started.wait(timeout=70)
-    live_client.abort(session_id, prompt_id)
+        [{"type": "text", "text": "Count from 1 to 2000, one number per line, no tools."}],
+        prompt_id=prompt_id,
+    ) == prompt_id
     messages = _drain_until(
         live_client,
-        lambda ms: any(_is_authoritative_terminal(event) for event in _events_of(ms, "turn_completed")),
-        timeout=90,
+        lambda ms: any(_owns_prompt(e, session_id, prompt_id) for e in _events_of(ms, "turn_started"))
+                   or bool(_ws_terminals(ms, session_id, prompt_id)),
+        timeout=60,
     )
-    assert any(_is_authoritative_terminal(event) for event in _events_of(messages, "turn_completed")), "turn did not finish after abort"
+    _assert_started(messages, session_id, prompt_id)
+    live_client.abort(session_id, prompt_id)
+    messages = _drain_until(live_client, lambda ms: bool(_ws_terminals(ms, session_id, prompt_id)), timeout=90)
+    _assert_cancelled(messages, session_id, prompt_id)
+    event = live_client.reconcile_v2(session_id, prompt_id)
+    assert event is not None and event.thread_id == session_id and event.data.get("prompt_id") == prompt_id
+    assert event.status == "cancelled"
 
 
-def test_live_server_shutdown_restart_keeps_session():
+def test_live_server_shutdown_restart_keeps_session(isolated_kimi_live_environment):
     try:
         resolve_kimi_launch_command()
     except KimiServerError as exc:
@@ -150,7 +189,7 @@ def test_live_server_shutdown_restart_keeps_session():
     client = KimiServerClient()
     client.start()
     try:
-        session_id = client.create_session(cwd=os.getcwd(), model="kimi/main", title="live restart")
+        session_id = client.create_session(cwd=str(isolated_kimi_live_environment), model="kimi/main", title="live restart")
     finally:
         client.close()
     client2 = KimiServerClient()
@@ -166,7 +205,7 @@ def test_live_server_shutdown_restart_keeps_session():
         client2.close()
 
 
-def test_live_frame_three_consecutive_chat_rounds_across_idle_heartbeat(frame, monkeypatch):
+def test_live_frame_three_consecutive_chat_rounds_across_idle_heartbeat(frame, monkeypatch, isolated_kimi_live_environment):
     """真实端到端：真实 ChatFrame + 真实 kimi web server，连续三轮问答。
 
     不 mock KimiServerClient、不替换后台线程，走完整 UI 提交链路
@@ -185,6 +224,7 @@ def test_live_frame_three_consecutive_chat_rounds_across_idle_heartbeat(frame, m
     frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
     frame._play_send_sound = lambda: None
     frame._play_finish_sound = lambda: None
+    monkeypatch.setattr(frame, "_workspace_dir_for_kimi", lambda: str(isolated_kimi_live_environment))
     frame._schedule_first_question_auto_title = lambda *a, **k: None
     monkeypatch.setattr(main, "AUTO_START_QUICK_TUNNEL", "0", raising=False)
 
@@ -235,7 +275,7 @@ def test_live_frame_three_consecutive_chat_rounds_across_idle_heartbeat(frame, m
     session_ids = {t.get("kimi_session_id") for t in frame.active_session_turns[-3:]}
     assert len(session_ids) == 1, f"三轮未复用同一会话: {session_ids}"
 
-def test_live_frame_three_consecutive_chat_rounds_without_mainloop(frame, monkeypatch):
+def test_live_frame_three_consecutive_chat_rounds_without_mainloop(frame, monkeypatch, isolated_kimi_live_environment):
     """End-to-end 3-round Kimi chat while app.MainLoop is reported as not running."""
     try:
         resolve_kimi_launch_command()
@@ -249,6 +289,7 @@ def test_live_frame_three_consecutive_chat_rounds_without_mainloop(frame, monkey
     frame._refresh_openclaw_sync_lifecycle = lambda force_replay=False: None
     frame._play_send_sound = lambda: None
     frame._play_finish_sound = lambda: None
+    monkeypatch.setattr(frame, "_workspace_dir_for_kimi", lambda: str(isolated_kimi_live_environment))
     frame._schedule_first_question_auto_title = lambda *a, **k: None
     monkeypatch.setattr(main, "AUTO_START_QUICK_TUNNEL", "0", raising=False)
 
@@ -295,3 +336,79 @@ def test_live_frame_three_consecutive_chat_rounds_without_mainloop(frame, monkey
 
     session_ids = {t.get("kimi_session_id") for t in frame.active_session_turns[-3:]}
     assert len(session_ids) == 1, f"Expected one reused session: {session_ids}"
+
+
+def test_live_frame_sends_and_stops_exact_kimi_task(frame, monkeypatch, isolated_kimi_live_environment):
+    import main
+    import wx
+
+    monkeypatch.setattr(frame, "_workspace_dir_for_kimi", lambda: str(isolated_kimi_live_environment))
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda **_kwargs: None)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "AUTO_START_QUICK_TUNNEL", "0", raising=False)
+    frame.model_combo.SetValue("Kimi Code")
+    frame.selected_model = "kimi/main"
+    app = wx.GetApp()
+    captured = []
+    on_message = frame._on_kimi_client_message
+
+    def receive(message):
+        if message.get("type") == "event":
+            captured.append(message)
+        on_message(message)
+
+    monkeypatch.setattr(frame, "_on_kimi_client_message", receive)
+
+    def send(text):
+        frame.input_edit.SetValue(text)
+        frame._on_send_clicked(None)
+
+    def until(predicate, timeout=90):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            app.Yield()
+            if predicate():
+                return
+            time.sleep(0.02)
+        pytest.fail("isolated wx Kimi condition did not complete before its deadline")
+
+    try:
+        send("Reply with exactly the single word pong. Do not use any tools.")
+        until(lambda: frame.active_session_turns[0].get("request_status") in {"done", "failed"})
+        first = frame.active_session_turns[0]
+        assert first["request_status"] == "done", first.get("request_error")
+        sid, first_pid = first["kimi_session_id"], first["kimi_prompt_id"]
+        streamed, ws_answer = _assert_streamed_answer(captured, sid, first_pid)
+        assert "pong" in streamed.lower()
+        assert first["answer_md"] == ws_answer
+        assert _assert_successful_prompt(frame._kimi_client, sid, first_pid) == ws_answer
+
+        send("Count from 1 to 2000, one number per line, no tools.")
+        def active_prompt():
+            turn = frame.active_session_turns[1]
+            pid = turn.get("kimi_prompt_id")
+            return pid and any(_owns_prompt(event, sid, pid) for event in _events_of(captured, "turn_started"))
+
+        until(active_prompt)
+        target = frame.active_session_turns[1]
+        assert target["kimi_session_id"] == sid
+        pid = target["kimi_prompt_id"]
+        _assert_started(captured, sid, pid)
+        send("/stop")
+        until(lambda: len(frame.active_session_turns) == 3
+              and frame.active_session_turns[2].get("request_status") == "done"
+              and target.get("request_status") != "pending")
+        assert "已受理" in frame.active_session_turns[2]["answer_md"]
+        assert target["answer_md"] == "Kimi Code 已中断。"
+        event = frame._kimi_client.reconcile_v2(sid, pid)
+        assert event is not None and event.thread_id == sid and event.data.get("prompt_id") == pid
+        assert event.status == "cancelled"
+        frame._save_state()
+        stored = frame.chat_store.load_turns(frame.active_chat_id)
+        assert stored[0]["answer_md"] == ws_answer
+        assert stored[1]["answer_md"] == "Kimi Code 已中断。"
+    finally:
+        if frame._kimi_client is not None:
+            frame._kimi_client.close()
