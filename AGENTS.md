@@ -16,7 +16,7 @@
 - UI 变更至少运行相关 tests/test_*ui_automation.py 和受影响模型流程测试。wx GUI 套件串行运行；真实定时器从 frame 构造到销毁全程清理。
 - CLI 后续输入、异步状态及结果必须按 chat、turn、session、account 和 request generation 归属；按规范化 model id 分派 provider。执行页保持 owner、revision 与有界前台读取，重工作放后台。
 - Kimi REST 回答、思考、分页与旧 owner 恢复共用结构化 prompt 边界判定；仅明确标记的 injection 可跳过。metadata.origin 的优先级与未知值保守规则见 docs/README.md，不能按消息正文识别注入。
-- Kimi 独立固定运行时、V2 ACK代次门禁和只读恢复以 docs/kimi-runtime.md 为准；缺失时不回退共享 PATH，不自动准备日常运行时。源码验证、真实云端与日常部署状态分别核对 docs/handoff.md。
+- Kimi 固定运行时、V2 ACK 代次门禁和只读恢复以 docs/kimi-runtime.md 为准。运行时缺失时禁止回退共享 PATH 或自动准备日常运行时。普通 `/clear` 在发送入口退休旧会话，旧 POST、WS 认领和界面回调必须校验原提交锁身份。源码、云端、冻结包与日常部署证据见 docs/handoff.md。
 - 源码笔记路径为 D:\code\note\notes.db；打包版需要现存且经完整性校验的个人 OneDrive\code\data\sj\notes.db，缺失时在初始化前停止。测试须 monkeypatch resolve_notes_data_dir()。
 - 切包门禁：2026-09-29 的 OneDrive 数据库只是一次快照，早期安装包曾写本地源库。新包启用前核对实际运行包的数据路径，补齐之后的改动并安全替换或合并。两台 MC 可保持远程连接，用户保证不同时写入共享数据；换机写入前等同步。当前步骤见 docs/handoff.md。
 

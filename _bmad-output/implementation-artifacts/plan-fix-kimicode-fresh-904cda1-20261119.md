@@ -120,7 +120,11 @@ mc/.venv/Scripts/python.exe -m pytest mc/tests/test_kimi_integration.py mc/tests
 
 六组合并补丁已全部完成：界面接纳普通 `/clear` 时同步退休旧会话，后台只持久化和回报；启动回调原子发布内存后在锁外保存和更新界面；Kimi 长选项局部启用原生横向滚动；原生审批正文增加可用区几何断言；归档错误回归先核仍有效提示再核重载清理；终态保留按完成先后验证长期 pending 最后完成仍抑制重放。
 
-director 定向 40 passed（16.50s），engineer 独立复跑 40 passed、181 deselected（24.30s）。命令为 `tests/test_kimi_integration.py -q -k "v2_wire_interaction or clear_worker_start or startup_save or long_option or retry_expiry or archived_interaction_error or http_first_kimi or clear_resend or generation_check_and_publish or new_and_clear or clear_removes or slash_clear_retires or v2_stop_exact"`，具体执行节点以本轮代理验证记录为准。原生窗口及数据库均为隔离夹具，未运行云端或日常程序。最终 `git diff --check` 通过。
+director 在 `D:/code/sj` 执行下列定向命令，40 passed、181 deselected（24.22 秒）。engineer 独立复验同一范围，40 passed、181 deselected（24.30 秒）。原生窗口及数据库使用隔离夹具。最终 `git diff --check` 通过。
+
+```powershell
+mc/.venv/Scripts/python.exe -m pytest mc/tests/test_kimi_integration.py -q -k 'v2_wire_interaction or slash_clear or startup_save_does_not_hold or http_first_kimi or archived_interaction_error or clear_resend or generation_check_and_publish or new_and_clear or clear_removes or v2_stop_exact'
+```
 
 ## Auto Run Result
 

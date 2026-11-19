@@ -22,20 +22,20 @@ $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid(
 .venv/Scripts/python.exe kimi_runtime.py --package-root (Join-Path $isolated 'dist/mc')
 ```
 
-2026-11-18 已用准备入口补齐源码和日常包中的固定文件，回读 SHA256 均与上述固定记录相同，独立版本探针均返回 2.5.3。日常 MC 补齐前后均为 PID 36616，启动时间 11:10:04。非管理员隔离构建用默认 spec 完成，暂存包和最终包均通过门禁。日常包仅补齐运行时文件，本轮未触发日常云端问答或应用重启。
+2026-11-18 用准备入口补齐了源码和日常包的固定文件，两处版本探针均为 2.5.3。2026-11-19 再次回读，两处 SHA256 均匹配固定记录。非管理员隔离构建的默认 spec 暂存包和最终包均通过门禁。日常包当时只更新运行时文件，后续源码修复尚待打包切换。复制阶段失败可能留下部分程序文件，最终校验会阻止启动，回滚仍是维护留项。见 [打包修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimi-runtime-packaging-20261118.md) 与 [功能审查](../_bmad-output/implementation-artifacts/review-kimicode-functional-20261119.md)。
 
 客户端根据真实握手选择 V1 或 V2。V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
 
 最终回答要求整个 turn completed，并取最高 ordinal 末步。末步通常 completed；真实追问可能留下 interrupted 且 `endReason` 精确为 `steered`，此时只取该步最后一个结构化 text/user frame 之后的公开 assistant 正文，无 user 则取该步正文。其他/缺失原因、tool、thinking-only、隐藏/空正文和不完整 transcript 均不发布，也不回退早先步骤；失败/取消仍保留失败语义。REST 与 V2 reset/ops 共用该提取规则，不改写服务端状态。
 
-ACK只属于当前socket generation，失效立即撤销就绪。running/queued/blocked继续既有monitor；POST结果不明时通过只读transcript定位唯一prompt，歧义明确失败，不自动重发。append按UTF-16 code unit应用，批次失败不跳游标；终态缺正文仍走有界补齐。完成后释放正文和流缓存，仅保留最多512项完成身份、32个空闲transcript，pending文本保留；这些是局部对象保留界限，不是存储总量或长期稳定性证明。
+ACK 只属于当前 socket generation，失效立即撤销就绪。running、queued、blocked 继续既有 monitor。V2 发 POST 前分配精确 prompt ID，回包结果不明时通过只读 transcript 确认唯一归属，遇到歧义明确失败，禁止自动重发。append 按 UTF-16 code unit 应用，批次失败时保留游标。终态缺正文仍走有界补齐，完成后释放正文和流缓存，最多保留 512 项完成身份和 32 个空闲 transcript，pending 文本保留。
+
+普通 `/clear` 在发送入口退休当前聊天的会话关联，保留历史并结算此前未完成的 Kimi 提问。新问题分配新会话，迟到的回包、早到 WS 认领和延迟界面回调都校验提交时的锁身份。V2 `/stop` 按当前准确的 session 与 prompt 发送。服务端受理后等待权威终态，被拒后原提问仍可完成。
+
+V2 审批和提问按 session 与 interaction ID 归属。已知失败可经“应用 → 重试 Kimi 请求”再次答复，结果未知先只读查询。菜单轮流处理当前聊天的未决请求，历史归档仅在对应请求仍有效时显示重试提示。HTTP 响应、WS ended 和本地退休共用终态处理，最多保留 512 个近期终态用于抑制重放，活动请求保持可用。
 
 首次完整成功回答在前后台共用接纳边界保存并请求完成音，alias 只保留问题和回答身份引用。`MC_KIMI_COMPLETION_DIAGNOSTICS=1` 开启当前进程最多 128 条匿名完成/音效结果记录（`_kimi_completion_diagnostics`）；默认关闭，不保存正文或凭据，无历史补播。
 
 固定版本不能保证云端 API 永远兼容。回退前必须验证升级后的会话格式可读，不能直接让旧程序写日常库。物理声音、新版 MC 日常切换与长期运行仍待验收。
 
-2026-11-18：`7852d06` 的协议/顺序/音效修复后，`8858753` 补齐 steered REST 恢复；独立 client 146项及串行 integration 13项通过，源码未变，后续审查复用该结果。真实隔离云端新请求、同会话连续性、活动长任务追问期间断连和新代目标 ACK、owner REST 正文相等与重放去重已通过，临时运行时和数据库已清理。65.39秒活动断连场景允许 WS 补终结，不代表“WS无终结仅靠自动REST调度”已验收；未决 POST 整体真实恢复、完成身份淘汰后旧重放也尚未验收。旧手机可能忽略新增顺序字段，未知历史真实到达次序无法保证重建。
-
-最新 [全新四透镜审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 为0 patch、1 defer、9 reject。defer 是 medium (unverified) 的协议边界疑问：无 user 但残留追问前正文，或同一最终 step 保留追问前 tool，是否在固定2.5.3真实可达，仍须脱敏 shape 与 producer 证据；当前按既定合同处理，不新增推测分支。edge空结果仍是 failed layer，不能称完整 clean review；本轮 blind 的代码 diff 不含计划，旧轮叙述污染限制不套用到该 blind，协调员读取原计划的影响见报告。其他证据与现场限制见 [交接](handoff.md)。
-
-保留 [审查报告](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md) 的D1/D2：固定2.5.3的`complete:true`却journal覆盖不足，以及同一frame权威reset合法缩短/替换，都尚无真实可达证据，不为此新增防御。PlaySound相互覆盖未复现，不添加历史补播机制。
+源码、隔离云端、frozen GUI 和日常包的验证状态及延期项集中记录在 [当前交接](handoff.md)。原有 steered 末步、journal 覆盖和权威 reset 的待证场景分别保存在 [steered 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 与 [稳定性审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)。

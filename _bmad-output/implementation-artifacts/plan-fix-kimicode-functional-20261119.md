@@ -156,7 +156,7 @@ B、E、G、I 分别表示 blind-hunter、edge-case-hunter、verification-gap �
 
 engineer 初次独立复验 223 client/mapping +15 定向 integration 通过。最终补丁独立复验 client 16 passed（0.13s）、wx integration 22 passed（16.46s），后者使用 `tests/test_kimi_integration.py -q -k "v2_wire_interaction or clear_between_generation or overlapping_kimi or clear_resend_rejects_old_submit_return or v2_stop_exact" --tb=short`。clear 用例走真实 `auto_resend_first=True`；HTTP 测试覆盖显式重试、未知只读确认、过期禁提交及聊天切换。`git diff --check` 通过。
 
-最终来源补丁后，director 以独立环境 API 认证重跑真实 2.5.3：CLI 问答/取消 2 passed（9.03s），源码 wx 发送/精确取消 1 passed（10.83s）。脱敏日志和源码/runtime 哈希在 `%TEMP%/mc-kimi-functional-final-logs-06c7offn/`，engineer 独立读取并确认与最终文件一致，未重复运行云端。临时 HOME、工作区、数据库、服务已清理，无源码 runtime 残留，未复制或改写日常 OAuth。
+最终来源补丁后，director 以独立环境 API 认证重跑真实 2.5.3：CLI 问答/取消 2 passed（9.03s），源码 wx 发送/精确取消 1 passed（10.83s）。脱敏日志和源码/runtime 哈希在 `%TEMP%/mc-kimi-functional-final-logs-06c7offn/`，engineer 独立读取并确认与当次文件一致，未重复运行云端。临时 HOME、工作区、数据库和服务已清理，源码和日常包既有的固定运行时仍在，未复制或改写日常 OAuth。
 
 ## Auto Run Result
 
