@@ -1411,8 +1411,8 @@ class CodexUserInputDialog(wx.Dialog):
         scroll = wx.BoxSizer(wx.VERTICAL)
         question_parent = panel
         if kimi_question:
-            question_parent = wx.ScrolledWindow(panel, style=wx.TAB_TRAVERSAL | wx.VSCROLL)
-            question_parent.SetScrollRate(0, 16)
+            question_parent = wx.ScrolledWindow(panel, style=wx.TAB_TRAVERSAL | wx.HSCROLL | wx.VSCROLL)
+            question_parent.SetScrollRate(16, 16)
 
         for question in questions or []:
             if not isinstance(question, dict):
@@ -1491,7 +1491,7 @@ class CodexUserInputDialog(wx.Dialog):
             choices.SetName(question_text)
         elif labels:
             choices = wx.RadioBox(parent, label=question_text, choices=labels, majorDimension=1,
-                                  style=wx.RA_SPECIFY_ROWS)
+                                  style=wx.RA_SPECIFY_COLS)
         if choices:
             block.Add(choices, 0, wx.EXPAND | wx.ALL, 6)
         other = None
@@ -2105,7 +2105,6 @@ class ChatFrame(wx.Frame):
         self._kimi_active_turns: dict[str, dict] = {}
         self._kimi_prompt_owners: dict[tuple[str, str, str], dict] = {}
         self._kimi_owner_lock = threading.RLock()
-        self._kimi_submission_locks_lock = threading.Lock()
         self._kimi_submission_locks: dict[str, threading.Lock] = {}
         self._kimi_submission_sessions: dict[str, str] = {}
         self._kimi_early_events: dict[tuple[str, str], list[CodexEvent]] = {}
@@ -4707,6 +4706,7 @@ class ChatFrame(wx.Frame):
             chat.setdefault(key, value)
         if not isinstance(turns, list):
             chat["turns"] = loaded.get("turns", [])
+        self._prune_kimi_interaction_errors(chat)
         return chat
 
     def _load_state(self):
@@ -4857,6 +4857,10 @@ class ChatFrame(wx.Frame):
             self._current_chat_state["turns"] = self.active_session_turns
             if self._normalize_detail_panel_fields(self._current_chat_state):
                 changed = True
+            self._prune_kimi_interaction_errors(self._current_chat_state)
+        for chat in self.archived_chats:
+            if isinstance(chat, dict):
+                self._prune_kimi_interaction_errors(chat)
         self._rebuild_kimi_runtime_state()
         if self._kimi_pending_owners() and self._kimi_client is None:
             self._recover_kimi_pending_owners()
@@ -10766,9 +10770,11 @@ class ChatFrame(wx.Frame):
             self._clear_kimi_active_turn(chat_id, turn_idx)
         self._on_done(turn_idx, "", message, model, "", chat_id)
 
-    def _apply_kimi_startup_state(self, chat_id: str, turn_idx: int, request, payload: dict) -> None:
-        if self._model_startup_request_is_current(chat_id, turn_idx, request):
-            self._apply_kimi_thread_state(chat_id, payload)
+    def _finish_kimi_startup_failure(self, chat_id: str, turn_idx: int, request, submission_lock,
+                                     message: str, model: str) -> None:
+        with self._kimi_owner_lock:
+            if self._kimi_submission_locks.get(chat_id) is submission_lock:
+                self._finish_model_startup_failure(chat_id, turn_idx, request, message, model)
 
     def _apply_codex_request_started(self, chat_id: str, turn_idx: int, request, *args) -> None:
         if self._model_startup_request_is_current(chat_id, turn_idx, request):
@@ -11106,7 +11112,7 @@ class ChatFrame(wx.Frame):
 
     def _kimi_submission_lock(self, session_or_chat: str) -> threading.Lock:
         key = str(session_or_chat or "").strip()
-        with self._kimi_submission_locks_lock:
+        with self._kimi_owner_lock:
             lock = self._kimi_submission_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
@@ -11147,13 +11153,15 @@ class ChatFrame(wx.Frame):
             ]
         return dict(matches[0]) if len(matches) == 1 else None
 
-    def _register_kimi_prompt_owner(self, owner: dict) -> None:
+    def _register_kimi_prompt_owner(self, owner: dict, *, submission_lock=None) -> bool:
         prompt_id = str(owner.get("prompt_id") or "").strip()
         session_id = str(owner.get("session_id") or "").strip()
         chat_id = str(owner.get("chat_id") or "").strip()
         if not prompt_id or not session_id or not chat_id:
-            return
+            return False
         with self._kimi_owner_lock:
+            if submission_lock is not None and self._kimi_submission_locks.get(chat_id) is not submission_lock:
+                return False
             key = self._kimi_owner_key(chat_id, session_id, prompt_id)
             existing = self._kimi_prompt_owners.get(key)
             stored = dict(existing) if isinstance(existing, dict) else {}
@@ -11165,6 +11173,7 @@ class ChatFrame(wx.Frame):
             self._kimi_idle_proofs.pop(key, None)
             self._kimi_terminal_tombstones.discard(key)
             self._kimi_prompt_owners[key] = stored
+        return True
 
     def _replay_kimi_early_events(self, owner: dict) -> None:
         prompt_id = str(owner.get("prompt_id") or "").strip()
@@ -11259,6 +11268,9 @@ class ChatFrame(wx.Frame):
             if len(intents) != 1:
                 return None
             owner = dict(intents[0])
+            submission_lock = self._kimi_submission_locks.get(owner.get("chat_id"))
+            if submission_lock is None:
+                return None
             owner.update(
                 {
                     "session_id": session_id,
@@ -11268,8 +11280,7 @@ class ChatFrame(wx.Frame):
                     "landed": False,
                 }
             )
-        self._register_kimi_prompt_owner(owner)
-        return owner
+            return owner if self._register_kimi_prompt_owner(owner, submission_lock=submission_lock) else None
 
     def _kimi_owner_for_event(self, event: CodexEvent) -> dict | None:
         prompt_id = self._kimi_event_prompt_id(event)
@@ -11363,18 +11374,24 @@ class ChatFrame(wx.Frame):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _start_kimi_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
+        normalized_command = str(command or "").strip().lower()
+        clear_answer = ""
         stop_owner = None
-        if str(command or "").strip().lower() == "stop":
+        if normalized_command == "clear":
+            # Retire the old session before the send entry can accept another prompt.
+            target_chat, _turns, _is_current = self._chat_target_for_request(chat_id)
+            clear_answer = self._handle_kimi_clear_command(target_chat, turn_idx, persist=False)
+        elif normalized_command == "stop":
             with self._kimi_owner_lock:
                 stop_owner = dict(self._kimi_active_turns.get(chat_id) or {})
         threading.Thread(
             target=self._run_kimi_local_command_worker,
-            args=(chat_id, turn_idx, command, args, model, stop_owner),
+            args=(chat_id, turn_idx, command, args, model, stop_owner, clear_answer),
             daemon=True,
         ).start()
 
     def _run_kimi_local_command_worker(self, chat_id: str, turn_idx: int, command: str, args: str,
-                                       model: str, stop_owner: dict | None = None) -> None:
+                                       model: str, stop_owner: dict | None = None, clear_answer: str = "") -> None:
         try:
             chat_id = str(chat_id or "").strip()
             target_chat, _target_turns, is_current_target = self._chat_target_for_request(chat_id)
@@ -11393,7 +11410,8 @@ class ChatFrame(wx.Frame):
                 answer = "## Kimi Code 新聊天\n\n已请求开始新聊天。"
                 self._call_after_if_alive(self._on_new_chat_clicked, None)
             elif normalized_command == "clear":
-                answer = self._handle_kimi_clear_command(target_chat)
+                self._save_state()
+                answer = clear_answer
             elif normalized_command == "stop":
                 client = None
                 if self._kimi_session_id_for_chat(target_chat):
@@ -11406,17 +11424,25 @@ class ChatFrame(wx.Frame):
         except Exception as exc:
             self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
 
-    def _handle_kimi_clear_command(self, chat: dict) -> str:
-        cleared_session = str((chat or {}).get("kimi_session_id") or "").strip()
-        if isinstance(chat, dict):
-            self._clear_kimi_information_for_session_change(chat)
+    def _handle_kimi_clear_command(self, chat: dict, command_turn_idx: int | None = None, *, persist: bool = True) -> str:
+        with self._kimi_owner_lock:
+            cleared_session = self._kimi_session_id_for_chat(chat)
+            self._retire_kimi_chat_runtime(chat, cleared_session)
+            self._clear_kimi_information_for_session_change(chat, refresh=False)
             chat["kimi_session_id"] = ""
             chat["kimi_turn_id"] = ""
             chat["kimi_turn_active"] = False
             chat["kimi_pending_prompt"] = ""
             chat["kimi_request_queue"] = []
-            for turn in chat.get("turns") if isinstance(chat.get("turns"), list) else []:
+            turns = chat.get("turns")
+            earlier_turns = turns[:command_turn_idx] if isinstance(turns, list) else []
+            for turn in earlier_turns:
                 if isinstance(turn, dict):
+                    if (is_kimi_model(turn.get("model")) and not turn.get("local_command")
+                            and turn.get("request_status") in {"pending", "running"}):
+                        self._mark_turn_request_failed(turn, "Kimi Code 会话已清理。")
+                        if turn.get("answer_md") == REQUESTING_TEXT:
+                            turn["answer_md"] = turn["request_error"]
                     turn.pop("kimi_prompt_id", None)
                     turn.pop("kimi_owner_prompt_id", None)
                     turn.pop("kimi_prompt_role", None)
@@ -11425,29 +11451,33 @@ class ChatFrame(wx.Frame):
                     turn.pop("kimi_session_id", None)
                     turn.pop("kimi_unresolved_submission", None)
                     turn.pop("kimi_prompt_exact", None)
-                    turn.pop("request_resume_token", None)
-        if chat is self._current_chat_state:
-            self._reset_active_kimi_session_state()
-        if isinstance(chat, dict):
-            self._publish_kimi_information_session_change(chat)
-        self._retire_kimi_chat_runtime(chat, cleared_session)
-        self._save_state()
+                    if is_kimi_model(turn.get("model")):
+                        turn.pop("request_resume_token", None)
+            if earlier_turns:
+                self._mark_chat_turns_dirty(str(chat.get("id") or ""))
+            if chat is self._current_chat_state:
+                self._reset_active_kimi_session_state()
+        self._refresh_kimi_information_for_session_change(chat)
+        self._publish_kimi_information_session_change(chat)
+        if persist:
+            self._save_state()
         return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
 
     def _retire_kimi_chat_runtime(self, chat: dict, cleared_session: str) -> None:
         chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
         if chat_id:
-            with self._kimi_submission_locks_lock, self._kimi_owner_lock:
+            with self._kimi_owner_lock:
                 # Retire the lock and its session together before admitting
                 # the first send in the cleared conversation.
                 self._kimi_submission_locks.pop(chat_id, None)
-                self._kimi_submission_sessions.pop(chat_id, None)
+                submitting_session = self._kimi_submission_sessions.pop(chat_id, None)
                 self._kimi_active_turns.pop(chat_id, None)
-            with self._kimi_owner_lock:
-                for interaction_key, request in self._kimi_interactions.items():
-                    if request.get("chat_id") == chat_id:
-                        request["state"] = "ended"
+                retired_sessions = {session for session in (cleared_session, submitting_session) if session}
+                for interaction_key, request in list(self._kimi_interactions.items()):
+                    if request.get("chat_id") == chat_id and request["state"] != "ended":
+                        self._end_kimi_interaction(interaction_key, request)
                         self._call_after_if_alive(self._close_ended_kimi_dialog, interaction_key)
+                        self._call_after_if_alive(self._finish_kimi_interaction_feedback, interaction_key, chat_id, False)
                 doomed = [key for key in self._kimi_prompt_owners if key[0] == chat_id]
                 doomed_owner_records = [
                     self._kimi_prompt_owners.get(key) for key in doomed
@@ -11464,7 +11494,7 @@ class ChatFrame(wx.Frame):
                 }
                 for early_key in list(self._kimi_early_events):
                     early_session, early_identity = early_key
-                    if early_session == cleared_session or early_identity.removeprefix("__intent__:") in doomed_intents:
+                    if early_session in retired_sessions or early_identity.removeprefix("__intent__:") in doomed_intents:
                         self._kimi_early_events.pop(early_key, None)
                 for key in list(self._kimi_turn_answer_parts):
                     if key and key[0] == chat_id:
@@ -11472,16 +11502,17 @@ class ChatFrame(wx.Frame):
                 for key in list(self._kimi_turn_answer_segments):
                     if key and key[0] == chat_id:
                         self._kimi_turn_answer_segments.pop(key, None)
-                if cleared_session:
-                    self._kimi_pending_submissions.pop(cleared_session, None)
-                    self._kimi_recovery_intents.pop(cleared_session, None)
-                    self._kimi_recovery_requested_generation.pop(cleared_session, None)
-                    self._kimi_incomplete_sessions.discard(cleared_session)
+                for session in retired_sessions:
+                    self._kimi_pending_submissions.pop(session, None)
+                    self._kimi_recovery_intents.pop(session, None)
+                    self._kimi_recovery_requested_generation.pop(session, None)
+                    self._kimi_incomplete_sessions.discard(session)
+                if retired_sessions:
                     self._kimi_incomplete_streams = {
-                        key for key in self._kimi_incomplete_streams if key[1] != cleared_session
+                        key for key in self._kimi_incomplete_streams if key[1] not in retired_sessions
                     }
 
-    def _clear_kimi_information_for_session_change(self, chat: dict) -> None:
+    def _clear_kimi_information_for_session_change(self, chat: dict, *, refresh: bool = True) -> None:
         usage = context_usage_from_dict(chat.get("context_usage"))
         if usage is not None and usage.source == "kimi":
             chat["context_usage"] = None
@@ -11496,6 +11527,10 @@ class ChatFrame(wx.Frame):
         for key in list(self._pending_context_usage_by_turn):
             if key[0] == chat_id:
                 self._pending_context_usage_by_turn.pop(key, None)
+        if refresh:
+            self._refresh_kimi_information_for_session_change(chat)
+
+    def _refresh_kimi_information_for_session_change(self, chat: dict) -> None:
         if threading.current_thread() is threading.main_thread():
             self._refresh_chat_information(chat)
         else:
@@ -11587,10 +11622,12 @@ class ChatFrame(wx.Frame):
             client_chat_id = self._ensure_active_chat_id()
         session_id = ""
         submission_lock = None
+
         def discard_stale_submission(prompt_id="") -> bool:
-            if self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
-                return False
             with self._kimi_owner_lock:
+                if (self._model_startup_request_is_current(chat_id, turn_idx, startup_request)
+                        and self._kimi_submission_locks.get(client_chat_id) is submission_lock):
+                    return False
                 pending = self._kimi_pending_submissions.get(session_id, [])
                 pending[:] = [intent for intent in pending if intent is not submission_intent]
                 if not pending:
@@ -11602,7 +11639,7 @@ class ChatFrame(wx.Frame):
         try:
             submission_lock = self._kimi_submission_lock(client_chat_id)
             submission_lock.acquire()
-            if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
+            if discard_stale_submission():
                 return
             target_chat, target_turns, _ = self._chat_target_for_request(client_chat_id)
             if (not isinstance(target_chat, dict) or not 0 <= turn_idx < len(target_turns)
@@ -11623,7 +11660,7 @@ class ChatFrame(wx.Frame):
             history_turns = target_turns[:turn_idx]
             client = self._ensure_kimi_client()
             self._start_kimi_client_with_retry(client)
-            if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
+            if discard_stale_submission():
                 return
             if session_id:
                 exists_error: Exception | None = None
@@ -11657,7 +11694,7 @@ class ChatFrame(wx.Frame):
                 )
             if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
                 return
-            with self._kimi_submission_locks_lock, self._kimi_owner_lock:
+            with self._kimi_owner_lock:
                 if self._kimi_submission_locks.get(client_chat_id) is not submission_lock:
                     return
                 self._kimi_submission_sessions[client_chat_id] = session_id
@@ -11688,7 +11725,7 @@ class ChatFrame(wx.Frame):
                 "exact_prompt_id": bool(exact_prompt_id),
                 "created_at": time.time(),
             }
-            with self._kimi_submission_locks_lock, self._kimi_owner_lock:
+            with self._kimi_owner_lock:
                 if self._kimi_submission_locks.get(client_chat_id) is not submission_lock:
                     return
                 if not should_steer and not existing_queue:
@@ -11699,7 +11736,6 @@ class ChatFrame(wx.Frame):
                     if proof_key[1] == session_id:
                         self._kimi_idle_proofs.pop(proof_key, None)
                 self._kimi_pending_submissions.setdefault(session_id, []).append(submission_intent)
-            if isinstance(target_chat, dict):
                 target_chat["kimi_idle_verified"] = None
             try:
                 if exact_prompt_id:
@@ -11720,15 +11756,18 @@ class ChatFrame(wx.Frame):
                     "legacy": not bool(exact_prompt_id),
                     "unresolved_error": str(exc),
                 }
-                self._register_kimi_prompt_owner(unresolved_owner)
-                if not should_steer and not existing_queue:
-                    with self._kimi_owner_lock:
+                with self._kimi_owner_lock:
+                    if not self._register_kimi_prompt_owner(unresolved_owner, submission_lock=submission_lock):
+                        discard_stale_submission(exact_prompt_id)
+                        return
+                    if not should_steer and not existing_queue:
                         self._kimi_active_turns[client_chat_id] = dict(unresolved_owner)
                 self._call_after_if_alive(
                     self._apply_kimi_startup_state,
                     client_chat_id,
                     turn_idx,
                     startup_request,
+                    submission_lock,
                     {
                         **unresolved_owner,
                         "active": True,
@@ -11793,15 +11832,16 @@ class ChatFrame(wx.Frame):
             }
             if discard_stale_submission(prompt_id):
                 return
-            self._register_kimi_prompt_owner(owner)
             with self._kimi_owner_lock:
+                if not self._register_kimi_prompt_owner(owner, submission_lock=submission_lock):
+                    if discard_stale_submission(prompt_id):
+                        return
                 pending_submissions = self._kimi_pending_submissions.get(session_id, [])
                 if submission_intent in pending_submissions:
                     pending_submissions.remove(submission_intent)
                 if not pending_submissions:
                     self._kimi_pending_submissions.pop(session_id, None)
-            if prompt_role == "active":
-                with self._kimi_owner_lock:
+                if prompt_role == "active":
                     metadata = self._kimi_active_turns.get(client_chat_id)
                     if isinstance(metadata, dict):
                         metadata.update(owner)
@@ -11810,6 +11850,7 @@ class ChatFrame(wx.Frame):
                 client_chat_id,
                 turn_idx,
                 startup_request,
+                submission_lock,
                 {
                     "session_id": session_id,
                     "prompt_id": str(prompt_id or "").strip(),
@@ -11836,74 +11877,83 @@ class ChatFrame(wx.Frame):
                 ]
                 if not pending:
                     self._kimi_pending_submissions.pop(session_id, None)
-            self._call_after_if_alive(self._finish_model_startup_failure, chat_id, turn_idx, startup_request, str(exc), model)
+            self._call_after_if_alive(
+                self._finish_kimi_startup_failure, client_chat_id, turn_idx, startup_request, submission_lock, str(exc), model,
+            )
         finally:
             if submission_lock is not None:
                 submission_lock.release()
 
-    def _apply_kimi_thread_state(self, chat_id: str, payload: dict) -> None:
-        target_chat, is_current_target = self._kimi_target_chat(chat_id)
-        if not isinstance(target_chat, dict):
-            return
+    def _apply_kimi_startup_state(self, chat_id: str, turn_idx: int, request, submission_lock, payload: dict) -> None:
         session_id = str(payload.get("session_id") or "").strip()
         turn_id = str(payload.get("turn_id") or "").strip()
+        prompt_id = str(payload.get("prompt_id") or "").strip()
+        with self._kimi_owner_lock:
+            if (not self._model_startup_request_is_current(chat_id, turn_idx, request)
+                    or self._kimi_submission_locks.get(chat_id) is not submission_lock):
+                return
+            target_chat, is_current_target = self._kimi_target_chat(chat_id)
+            if not isinstance(target_chat, dict):
+                return
+            session_changed = "session_id" in payload and str(target_chat.get("kimi_session_id") or "").strip() != session_id
+            if "session_id" in payload:
+                if session_changed:
+                    self._clear_kimi_information_for_session_change(target_chat, refresh=False)
+                target_chat["kimi_session_id"] = session_id
+                if is_current_target:
+                    self.active_kimi_session_id = session_id
+            if "turn_id" in payload:
+                target_chat["kimi_turn_id"] = turn_id
+                if is_current_target:
+                    self.active_kimi_turn_id = turn_id
+            if "active" in payload:
+                active = bool(payload.get("active"))
+                target_chat["kimi_turn_active"] = active
+                if is_current_target:
+                    self.active_kimi_turn_active = active
+                if active and str(payload.get("prompt_role") or "active") == "active":
+                    self._remember_kimi_active_turn(chat_id, payload)
+                elif not active:
+                    self._clear_kimi_active_turn(chat_id)
+            queued_entry = payload.get("queued_entry")
+            if isinstance(queued_entry, dict) and queued_entry:
+                queue = target_chat.get("kimi_request_queue")
+                if not isinstance(queue, list):
+                    queue = []
+                    target_chat["kimi_request_queue"] = queue
+                queue.append(dict(queued_entry))
+                if is_current_target:
+                    self.active_kimi_request_queue = queue
+            target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
+            turn = request[0]
+            if session_id:
+                turn["kimi_session_id"] = session_id
+            if prompt_id:
+                turn["kimi_prompt_id"] = prompt_id
+                turn["kimi_prompt_question"] = str(payload.get("question") or turn.get("question") or "").strip()
+                turn["kimi_prompt_role"] = str(payload.get("prompt_role") or "active")
+                turn["kimi_owner_prompt_id"] = str(payload.get("owner_prompt_id") or prompt_id).strip()
+                turn["kimi_candidate_alias"] = bool(payload.get("candidate_alias"))
+                turn["kimi_unresolved_submission"] = bool(payload.get("unresolved"))
+                turn["kimi_prompt_exact"] = bool(payload.get("exact_prompt_id"))
+            if "turn_id" in payload:
+                turn["kimi_turn_id"] = turn_id
+            if session_id or turn_id:
+                turn["request_resume_token"] = {"session_id": session_id, "turn_id": turn_id}
+            self._mark_chat_turns_dirty(None if is_current_target else chat_id, turn_idx)
+
+        # Persistence and native UI updates can wait without holding up other chats.
+        if session_changed:
+            self._refresh_kimi_information_for_session_change(target_chat)
         if "session_id" in payload:
-            if str(target_chat.get("kimi_session_id") or "").strip() != session_id:
-                self._clear_kimi_information_for_session_change(target_chat)
-            target_chat["kimi_session_id"] = session_id
-            if is_current_target:
-                self.active_kimi_session_id = session_id
             self._publish_kimi_information_session_change(target_chat)
-        if "turn_id" in payload:
-            target_chat["kimi_turn_id"] = turn_id
-            if is_current_target:
-                self.active_kimi_turn_id = turn_id
-        if "active" in payload:
-            active = bool(payload.get("active"))
-            target_chat["kimi_turn_active"] = active
-            if is_current_target:
-                self.active_kimi_turn_active = active
-            if active and str(payload.get("prompt_role") or "active") == "active":
-                self._remember_kimi_active_turn(chat_id, payload)
-            elif not active:
-                self._clear_kimi_active_turn(chat_id)
-        queued_entry = payload.get("queued_entry") if isinstance(payload.get("queued_entry"), dict) else None
-        if queued_entry:
-            queue = target_chat.get("kimi_request_queue")
-            if not isinstance(queue, list):
-                queue = []
-                target_chat["kimi_request_queue"] = queue
-            queue.append(dict(queued_entry))
-            if is_current_target:
-                self.active_kimi_request_queue = queue
-        target_turns = self.active_session_turns if is_current_target else target_chat.get("turns")
-        turn_idx = payload.get("turn_idx")
-        if isinstance(target_turns, list) and isinstance(turn_idx, int) and 0 <= turn_idx < len(target_turns):
-            turn = target_turns[turn_idx]
-            if isinstance(turn, dict):
-                if session_id:
-                    turn["kimi_session_id"] = session_id
-                prompt_id = str(payload.get("prompt_id") or "").strip()
-                if prompt_id:
-                    turn["kimi_prompt_id"] = prompt_id
-                    turn["kimi_prompt_question"] = str(payload.get("question") or turn.get("question") or "").strip()
-                    turn["kimi_prompt_role"] = str(payload.get("prompt_role") or "active")
-                    turn["kimi_owner_prompt_id"] = str(payload.get("owner_prompt_id") or prompt_id).strip()
-                    turn["kimi_candidate_alias"] = bool(payload.get("candidate_alias"))
-                    turn["kimi_unresolved_submission"] = bool(payload.get("unresolved"))
-                    turn["kimi_prompt_exact"] = bool(payload.get("exact_prompt_id"))
-                if "turn_id" in payload:
-                    turn["kimi_turn_id"] = turn_id
-                if session_id or turn_id:
-                    turn["request_resume_token"] = {"session_id": session_id, "turn_id": turn_id}
-                self._mark_chat_turns_dirty(None if is_current_target else chat_id, turn_idx)
-                if prompt_id:
-                    if payload.get("prompt_role") == "alias":
-                        key = self._kimi_owner_key(chat_id, session_id, prompt_id)
-                        self._settle_kimi_alias_from_parent(turn, target_turns, key, payload["owner_prompt_id"])
-                    if payload.get("unresolved") and payload.get("exact_prompt_id"):
-                        self._save_state()
-                    self._replay_kimi_early_events({**payload, "chat_id": str(chat_id or "")})
+        if prompt_id:
+            if payload.get("prompt_role") == "alias":
+                key = self._kimi_owner_key(chat_id, session_id, prompt_id)
+                self._settle_kimi_alias_from_parent(turn, target_turns, key, payload["owner_prompt_id"])
+            if payload.get("unresolved") and payload.get("exact_prompt_id"):
+                self._save_state()
+            self._replay_kimi_early_events({**payload, "chat_id": str(chat_id or "")})
         if not is_current_target:
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
@@ -16507,14 +16557,10 @@ class ChatFrame(wx.Frame):
         key = (session_id, interaction_id)
         if event.type == "server_request_ended":
             with self._kimi_owner_lock:
-                request = self._kimi_interactions.setdefault(key, {})
+                request = self._kimi_interactions.get(key, {})
                 if request.get("state") == "ended":
                     return
-                request["state"] = "ended"
-                # Keep recent terminal identities to suppress WS reset/replay.
-                ended = [item for item, value in self._kimi_interactions.items() if value["state"] == "ended"]
-                for item in ended[:-self._kimi_replay_window]:
-                    self._kimi_interactions.pop(item, None)
+                self._end_kimi_interaction(key, request)
             self._call_after_if_alive(self._close_ended_kimi_dialog, key)
             chat_id = request.get("chat_id")
             if chat_id:
@@ -16523,10 +16569,10 @@ class ChatFrame(wx.Frame):
                 self._call_after_if_alive(self._finish_kimi_interaction_feedback, key, chat_id,
                                           bool(intended and outcome == intended))
             return
-        chat_id = self._resolve_kimi_event_chat_id(event)
-        if not chat_id:
-            return
         with self._kimi_owner_lock:
+            chat_id = self._resolve_kimi_event_chat_id(event)
+            if not chat_id:
+                return
             previous = self._kimi_interactions.get(key)
             if previous is None:
                 self._kimi_interactions[key] = {
@@ -16538,12 +16584,22 @@ class ChatFrame(wx.Frame):
                 # The server generated another pending frame after the lost
                 # response. This enables a manual retry without resending.
                 previous["state"] = "retryable"
+                error = previous["error"]
             else:
                 return
         if previous is None:
             self._call_after_if_alive(self._offer_kimi_interaction, key)
         else:
-            self._call_after_if_alive(self._report_kimi_interaction_error, key, chat_id, previous["error"], True)
+            self._call_after_if_alive(self._report_kimi_interaction_error, key, chat_id, error, True)
+
+    def _end_kimi_interaction(self, key: tuple[str, str], request: dict) -> None:
+        # The caller holds the owner lock. Keep terminal identities in completion order.
+        request["state"] = "ended"
+        self._kimi_interactions.pop(key, None)
+        self._kimi_interactions[key] = {"state": "ended"}
+        ended = [item for item, value in self._kimi_interactions.items() if value["state"] == "ended"]
+        for item in ended[:-self._kimi_replay_window]:
+            self._kimi_interactions.pop(item)
 
     def _offer_kimi_interaction(self, key: tuple[str, str]) -> None:
         with self._kimi_owner_lock:
@@ -16576,7 +16632,13 @@ class ChatFrame(wx.Frame):
             key, request = pending
             recheck = request["state"] == "uncertain"
             expired = self._kimi_interaction_expired(request)
-            request["state"] = "ended" if expired else ("rechecking" if recheck else "showing")
+            if expired:
+                self._end_kimi_interaction(key, request)
+            else:
+                request["state"] = "rechecking" if recheck else "showing"
+                if retry:
+                    # Let the next menu invocation reach another unresolved request.
+                    self._kimi_interactions[key] = self._kimi_interactions.pop(key)
         if expired:
             self._finish_kimi_interaction_feedback(key, request["chat_id"], False)
             self._call_after_if_alive(self._show_pending_kimi_interaction)
@@ -16619,18 +16681,24 @@ class ChatFrame(wx.Frame):
             self._kimi_interaction_dialog = None
             dialog.Destroy()
         with self._kimi_owner_lock:
-            should_send = request["state"] == "showing" and not self._kimi_interaction_expired(request)
-            if request["state"] == "showing":
-                request["state"] = "responding" if should_send else "ended"
+            showing = request["state"] == "showing"
+            expired = showing and self._kimi_interaction_expired(request)
+            should_send = showing and not expired
+            if expired:
+                self._end_kimi_interaction(key, request)
+            elif should_send:
+                request["state"] = "responding"
                 request["intended_outcome"] = (response.get("decision") if kind == "approval"
                                                else ("dismissed" if response.get("dismissed") else "answered"))
-        if should_send:
+        if expired:
+            self._finish_kimi_interaction_feedback(key, request["chat_id"], False)
+        elif should_send:
             threading.Thread(target=self._answer_kimi_interaction_worker, args=(key, request, response),
                              daemon=True).start()
         self._call_after_if_alive(self._show_pending_kimi_interaction)
 
     def _kimi_interaction_expired(self, request: dict) -> bool:
-        expires = self._kimi_timestamp_value(request["params"].get("expires_at"))
+        expires = self._kimi_timestamp_value((request.get("params") or {}).get("expires_at"))
         return expires is not None and expires <= time.time()
 
     def _answer_kimi_interaction_worker(self, key: tuple[str, str], request: dict, response: dict) -> None:
@@ -16661,8 +16729,14 @@ class ChatFrame(wx.Frame):
             if client is None:
                 client = self._ensure_kimi_client()
                 client.start()
+            with self._kimi_owner_lock:
+                if self._kimi_interactions.get(key) is not request or request["state"] != previous_state:
+                    return
+            if self._kimi_interaction_expired(request):
+                self._complete_kimi_interaction_attempt(key, request, previous_state, "ended")
+                return
             server_state = client.interaction_state(*key, request["agent_id"])
-        except KimiServerError as exc:
+        except (KimiServerError, OSError) as exc:
             server_state = ""
             error = error or str(exc)
         if server_state in {"approved", "rejected", "cancelled", "answered", "dismissed"}:
@@ -16680,7 +16754,12 @@ class ChatFrame(wx.Frame):
         with self._kimi_owner_lock:
             if self._kimi_interactions.get(key) is not request or request["state"] != previous_state:
                 return
-            request.update(state=state, error=error, uncertain_since=time.time())
+            if state != "ended" and self._kimi_interaction_expired(request):
+                state = "ended"
+            if state == "ended":
+                self._end_kimi_interaction(key, request)
+            else:
+                request.update(state=state, error=error, uncertain_since=time.time())
         if state == "ended":
             self._call_after_if_alive(self._finish_kimi_interaction_feedback, key, request["chat_id"], success)
         else:
@@ -16692,8 +16771,14 @@ class ChatFrame(wx.Frame):
         message = f"回复 Kimi Code 请求失败：{error}。可从应用菜单重试 Kimi 请求。"
         if not retryable:
             message = f"Kimi Code 回复结果待确认：{error}。可从应用菜单重试 Kimi 请求以查询状态。"
-        self._push_remote_attention(chat_id, "action_required", "/".join(key) + "/error", message)
-        self._set_kimi_interaction_feedback(key, chat_id, error=message)
+        with self._kimi_owner_lock:
+            request = self._kimi_interactions.get(key)
+            expected_state = "retryable" if retryable else "uncertain"
+            if (not request or request["state"] != expected_state or request["chat_id"] != chat_id
+                    or request.get("error") != error or self._kimi_interaction_expired(request)):
+                return
+            self._push_remote_attention(chat_id, "action_required", "/".join(key) + "/error", message)
+            self._set_kimi_interaction_feedback(key, chat_id, error=message)
 
     def _finish_kimi_interaction_feedback(self, key: tuple[str, str], chat_id: str, success: bool) -> None:
         self._set_kimi_interaction_feedback(key, chat_id, status="已回复 Kimi Code 请求。" if success else "Kimi Code 请求已结束。")
@@ -16703,10 +16788,6 @@ class ChatFrame(wx.Frame):
         target_chat, is_current = self._kimi_target_chat(chat_id)
         if target_chat is None:
             return
-        with self._kimi_owner_lock:
-            request = self._kimi_interactions.get(key)
-            if error and (not request or request["state"] == "ended"):
-                return
         errors = target_chat.setdefault("kimi_interaction_errors", {})
         previous = target_chat.get("kimi_interaction_error")
         errors.pop("/".join(key), None)
@@ -16716,10 +16797,31 @@ class ChatFrame(wx.Frame):
         if current:
             target_chat["kimi_interaction_error"] = current
         else:
+            target_chat.pop("kimi_interaction_errors", None)
             target_chat.pop("kimi_interaction_error", None)
         if is_current and (error or previous != current or not current):
             self.SetStatusText(current or status)
         self._defer_codex_state_save()
+
+    def _prune_kimi_interaction_errors(self, chat: dict) -> None:
+        errors = chat.get("kimi_interaction_errors")
+        if not errors and not chat.get("kimi_interaction_error"):
+            return
+        chat_id = str(chat.get("source_chat_id") or chat.get("id") or "").strip()
+        session_id = self._kimi_session_id_for_chat(chat)
+        with self._kimi_owner_lock:
+            live_keys = {
+                "/".join(key) for key, request in self._kimi_interactions.items()
+                if key[0] == session_id and request.get("chat_id") == chat_id
+                and request["state"] != "ended" and not self._kimi_interaction_expired(request)
+            }
+        remaining = {key: value for key, value in errors.items() if key in live_keys} if isinstance(errors, dict) else {}
+        if remaining:
+            chat["kimi_interaction_errors"] = remaining
+            chat["kimi_interaction_error"] = next(reversed(remaining.values()))
+        else:
+            chat.pop("kimi_interaction_errors", None)
+            chat.pop("kimi_interaction_error", None)
 
     def _handle_kimi_request_dialog(self, request: dict) -> None:
         self._push_remote_attention(str(request.get("chat_id") or ""), "action_required",
@@ -21529,6 +21631,9 @@ class ChatFrame(wx.Frame):
             ),
         }
         archived["turns"] = turns_snapshot
+        for field in ("kimi_interaction_errors", "kimi_interaction_error"):
+            if field in self._current_chat_state:
+                archived[field] = copy.deepcopy(self._current_chat_state[field])
         if "context_usage" in self._current_chat_state:
             archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
         existing_matches = [
@@ -22775,6 +22880,7 @@ class ChatFrame(wx.Frame):
                 self._current_chat_state["execution_steps"] = []
         else:
             self._current_chat_state = copy.deepcopy(chat)
+        self._prune_kimi_interaction_errors(self._current_chat_state)
         self._rebuild_kimi_runtime_state()
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
@@ -22796,8 +22902,8 @@ class ChatFrame(wx.Frame):
         self._refresh_openclaw_sync_lifecycle()
         self._refresh_history(chat_id)
         self._save_state()
-        if chat.get("kimi_interaction_error"):
-            self.SetStatusText(str(chat["kimi_interaction_error"]))
+        if self._current_chat_state.get("kimi_interaction_error"):
+            self.SetStatusText(str(self._current_chat_state["kimi_interaction_error"]))
         elif previous_interaction_error and self.GetStatusBar().GetStatusText() == previous_interaction_error:
             self.SetStatusText("就绪")
         if self._kimi_interactions:
