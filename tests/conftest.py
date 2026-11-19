@@ -6,8 +6,9 @@ import wx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for path in (ROOT, ROOT / "tests"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import main
 
@@ -40,10 +41,14 @@ def disable_system_hooks(monkeypatch):
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_DOMAIN", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def isolate_notes_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
+
+
 @pytest.fixture
 def frame(tmp_path, monkeypatch, wx_app, request):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(main, "resolve_notes_data_dir", lambda: tmp_path / "notes")
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     assert Path(main.resolve_notes_data_dir()).resolve() != Path(r"D:\code\note").resolve()
     f = main.ChatFrame()

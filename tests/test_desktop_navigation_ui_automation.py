@@ -8,7 +8,7 @@ import wx
 import main
 from codex_client import CodexAppServerClient, CodexEvent
 from kimi_server_client import KimiEvent
-from test_kimi_integration import _make_fake_client
+from kimi_test_support import _make_fake_client
 from test_model_session_recovery_ui_automation import (
     native_gui_loop, native_key_input_batch, native_modifier_state, native_user32, pump, run_native_for, wait_for,
 )

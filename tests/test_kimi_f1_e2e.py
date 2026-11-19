@@ -7,7 +7,7 @@ server only replaces the network (event push + REST transcripts).
 
 import time
 
-from test_kimi_integration import (
+from kimi_test_support import (
     TEST_TURN_ID,
     KimiEvent,
     _active_chat_id,

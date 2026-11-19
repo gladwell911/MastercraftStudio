@@ -34,7 +34,7 @@ from kimi_server_client import KimiEvent
 from nats_runtime import NatsRuntimeConfig, NatsServerProcess
 from remote_nats import RemoteNatsTransport
 from owned_window_qa import activate_owned_frame
-from test_kimi_integration import FakeKimiServerClient
+from kimi_test_support import FakeKimiServerClient
 from test_model_session_recovery_ui_automation import native_key_input_batch, native_modifier_state, native_user32
 from real_desktop_remote_e2e_runtime import _choose_available_port
 

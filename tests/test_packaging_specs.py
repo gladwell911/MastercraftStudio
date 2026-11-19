@@ -313,6 +313,26 @@ def test_main_imports_kimi_server_client_module():
     main_text = (root / "main.py").read_text(encoding="utf-8")
 
     assert "from kimi_server_client import" in main_text
+    import threading
+    from types import SimpleNamespace
+
+    import main
+    from kimi_server_client import KimiServerClient
+
+    owner = SimpleNamespace(
+        _kimi_client_lock=threading.Lock(),
+        _kimi_client=None,
+        _on_kimi_client_message=lambda _message: None,
+        _on_kimi_client_exit=lambda _code: None,
+    )
+    client = main.ChatFrame._ensure_kimi_client(owner)
+    try:
+        assert isinstance(client, KimiServerClient)
+        assert client.on_message is owner._on_kimi_client_message
+        assert client.on_exit is owner._on_kimi_client_exit
+        assert main.ChatFrame._ensure_kimi_client(owner) is client
+    finally:
+        client.close()
 
 
 def test_package_collected_inputs_exclude_development_and_user_data(tmp_path):

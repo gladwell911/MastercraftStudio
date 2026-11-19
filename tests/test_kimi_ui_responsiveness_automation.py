@@ -5,7 +5,7 @@ import pytest
 
 import main
 from kimi_server_client import KimiEvent, KimiServerClient, event_to_payload
-from test_kimi_integration import FakeKimiServerClient, _setup_kimi_frame, _sdk_push
+from kimi_test_support import FakeKimiServerClient, _setup_kimi_frame, _sdk_push
 from test_codex_ui_responsiveness_automation import _track_ui_timers_for_test
 
 
