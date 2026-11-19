@@ -3,7 +3,7 @@ title: '清理被覆盖的回答详情和旧笔记方法'
 type: 'refactor'
 ticket: ''
 created: '2026-11-19'
-status: 'built'
+status: 'done'
 baseline_revision: 'd5864ef1948965bd457394219f3e456ee2d823c6'
 route: 'full'
 route_source: 'auto'
@@ -35,9 +35,11 @@ deferred: []
 
 ## Code Map
 
+以下代码位置对应基线提交。
+
 - `main.py:4212` 是旧的 `_build_answer_detail_html(self, answer_md)`。`main.py:10301` 的同名定义接受 `model` 并负责现行过滤。
 - `notes_store.py:1107` 的 `apply_remote_op` 通过带 `_conn` 的私有方法在一个 SQLite 事务内执行。文件末尾 `notes_store.py:1390` 起的旧方法组没有现行入口。同名方法在 `notes_store_impl.py` 属于另一个类。
-- 两处删除合计约 265 行。自动选择 full，交给 director 实施，使用原有测试验证。
+- 两处删除合计 267 行。自动选择 full，交给 director 实施，使用原有测试验证。
 
 ## Tasks & Acceptance
 
@@ -77,9 +79,22 @@ deferred: []
 - `.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider tests/test_notes_desktop_unit.py tests/test_notes_remote_hardening_unit.py -k "legacy or migrat or remote or conflict or document_cache"`
 - `git diff --check`、`git diff --stat`，并用 Python AST 核对只删除指定定义。两组测试均先于源码改动运行，再按文件复测。
 
+## Code Review
+
+### 2026-11-19 · 独立复审
+
+**Code review complete.** 0 decision-needed, 0 patch, 0 defer, 0 rejected.
+
+- 新 dog 使用 `bmad-code-review` quick，唯一审查镜头通过，无需修复。
+- Python AST 对照基线确认只删除指定的 8 个方法定义，`git diff --check` 通过。
+- 串行复跑回答组 6 项和笔记组 31 项，另跑 `test_answer_char_hook_enter_opens_plain_text_viewer` 和 `test_notes_sync_old_document_preserves_existing_placement_v2`，全部通过。快捷键路由和 HTML 模型过滤由独立用例验证，笔记用例使用临时 SQLite 数据库。
+- 验证覆盖源码，实体读屏和打包未测试。
+
+Rejected: 无。
+
 ## Auto Run Result
 
 - `main.py` 和 `notes_store.py` 合计净删 267 行。AST 对照基线确认仅移除指定的八个定义。
 - 回答组 6 项和笔记组 31 项在基线、实施后和主会话复测均通过。额外两项既有用例通过。暂存差异检查通过。
-- 内置审查未确认本批引入的代码缺陷。已修复 0 项，延期 0 项。五项低级建议的裁决见上文。独立 dog 审查另行执行。
+- 内置审查的五项低级建议裁决见 Review Triage Log。独立审查也已完成，结果见 Code Review。
 - 验证覆盖源码和临时数据。独立冻结包、实体读屏和日常安装切换属于后续结构迁移的验收范围。
