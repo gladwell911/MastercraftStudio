@@ -1,12 +1,19 @@
 # 当前交接
 
-更新日期 2026-11-19。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。日常包于 2026-11-18 补齐了固定 Kimi 2.5.3 运行时。2026-11-19 的 Kimi 功能修复仍待打包和日常切换。
+更新日期 2026-11-20。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。日常包于 2026-11-18 补齐了固定 Kimi 2.5.3 运行时。后续源码修复与职责拆分已完成隔离构建，日常切换仍待安排。
+
+## 职责拆分与验收
+
+- `main.py` 从 24,850 行缩至 1,494 行。保留 `ChatFrame` 的 966 个原有方法，其中 937 个迁至 16 个职责类。`chat_store.py` 从 2,731 行缩至 919 行，`kimi_server_client.py` 从 2,348 行缩至 690 行。入口减量来自迁移，三个模块组最终净增 738 个物理行。查找入口和测试见 [文档索引](README.md#职责与测试入口)。
+- 两份原测试的 880 和 141 个定义、3,036 个非实时参数实例全部保留。最终补丁加 5 个入口实例，共收集 3,041 项。拆分前后定向对照 2,078 个原实例，1,941 通过，136 在相同节点失败，1 项两版均触发 Windows COM 阻塞。随后 34 项修复复验通过，包含原阻塞的忙碌发送用例。最终补丁单独复验通知 17 项和入口 5 项，均通过。全量非实时套件未完成。命令和边界见 [整轮拆分计划](../_bmad-output/implementation-artifacts/plan-mc-code-split.md)。
+- 已用实际 VS Code Python Debugger 运行源码 worker。正式 `-BuildOnly` 隔离构建的基线和最终版均验证了 `mc.exe` 和 `mc_worker.exe`。真实 Kimi 2.5.3 经回环服务完成连续两问，核对同一 chat/session、不同 prompt、原生界面与 SQLite/REST 正文一致，以及重启恢复。真实云端、物理键盘和实体读屏待现场验收。两项独立复审修复见 [修复计划](../_bmad-output/implementation-artifacts/plan-mc-code-split-review-fixes.md)。
+- 早期直接构造 frame 的测试可能初始化源码笔记库。其修改时间落在首轮测试期间，只读 `quick_check` 通过，具体内容变化无法确认。补上自动临时笔记路径夹具后，定向复跑前后文件元数据一致。具体纠正见 [反思](reflection.md)。
 
 ## 首批废弃代码清理
 
 - `beea5c1` 已完成。删除 `main.py` 中被覆盖的回答详情定义和 `notes_store.py` 末尾的 7 个旧远程操作方法，净减 267 行。回答详情键盘入口、模型过滤和笔记远程事务均通过源码核对。
 - 串行基线与复测中，回答组 6 项和笔记组 31 项均通过。独立 quick 审查复跑通过，另有普通 Enter 字符钩子和旧端笔记位置兼容 2 项通过。实体读屏、打包和部署留待后续验收。命令与审查记录见 [首批清理计划](../_bmad-output/implementation-artifacts/plan-remove-obsolete-answer-and-notes-methods.md)。
-- 下一批 `main.py` 拆分与相关测试迁移尚未开始，范围和验证计划待定。`notes_store_impl.py` 的去留留待独立核对。
+- `notes_store_impl.py` 的去留留待独立核对。
 
 ## Kimi 源码与运行时
 
@@ -27,7 +34,7 @@
 
 ## Kimi 接续
 
-1. 新包仍需隔离构建并验收真实 frozen GUI 连续问答。日常切换需先核对部署路径和聊天、笔记数据归属，应用退出和重启由用户安排。物理键盘、读屏、声学出声、真实云端审批/提问及长时运行仍待现场验收。
+1. 拆分后的冻结包已通过回环服务连续问答。日常切换需先核对部署路径和聊天、笔记数据归属，应用退出和重启由用户安排。物理键盘、读屏、声学出声、真实云端审批/提问及长时运行仍待现场验收。
 2. 继续保留纯 REST 自动调度、真实未决 POST 的整体恢复、完成身份淘汰后收到旧重放等验证边界。固定版本的 steered 末步、journal 覆盖和权威 reset 等待证形态见 [steered 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 和 [稳定性审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)。
 3. [功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md) 保留中途硬退出、有成功状态但缺失 prompt ID 或响应畸形，以及代次切换后旧队列项的三组延期项。[最终修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md) 另保留静置过期后重试菜单暂时可用和入站过期 pending 会触发远程提醒两项既有问题。安装复制中途失败时缺乏回滚独立留在 [原功能审查](../_bmad-output/implementation-artifacts/review-kimicode-functional-20261119.md)。
 
@@ -42,16 +49,18 @@
 - 新 dog 审查 `71e05f5d83ae27bf6166914f58421c352beafec5`：四名全新 reviewer 逐个执行，未确认新产品缺陷；1 个 medium 回归缺口 V1 已补完。审查仍有局限：edge 空数组按 workflow 记 failed layer，blind 数量未达 floor，不能称完整 clean review。原裁决保存在 [审查报告](../_bmad-output/implementation-artifacts/review-voice-local-first-new-dog-20261110.md)。
 - V1 补强 `22284df21b428800384d32de74450a4980c93ad4`：真实 receiver→controller→converge 每代处理两个不同累计 interim 和不同 final，仅提交完整 final 一次；direct/optimize 及两代相同 final 均覆盖。拼接/仅保留首版两类纯内存变异各触发 2 项预期失败；原实现通过。president quick 审查 0 项问题，engineer 独立定向复验 2 passed（0.06s），并核对变异设计和默认 fixture 未改变。
 
-可复用的软件验证（2026-11-10；2.0 升级后 ASR/controller/integration 与 main voice 已重新通过，其余本地先录阶段证据详见 [独立验证](../_bmad-output/implementation-artifacts/verify-voice-input-local-first.md) 与 [V1 局部计划](../_bmad-output/implementation-artifacts/plan-v1-voice-cumulative-transcript-regression.md)）：
+2026-11-10 的历史软件验证记录见 [独立验证](../_bmad-output/implementation-artifacts/verify-voice-input-local-first.md) 和 [V1 局部计划](../_bmad-output/implementation-artifacts/plan-v1-voice-cumulative-transcript-regression.md)。
 
 ```powershell
 .venv/Scripts/python.exe -m pytest tests/test_voice_controller_unit.py tests/test_realtime_asr_unit.py tests/test_voice_input_integration.py -q
 # 42 passed；2.0 默认资源与接口回归新增1项。
 .venv/Scripts/python.exe -m pytest tests/test_main_unit.py -k voice -q
-# 17 passed, 982 deselected；2.0 升级后重新通过。
+# 历史入口，拆分前 17 passed, 982 deselected。
 .venv/Scripts/python.exe -m pytest tests/test_voice_input_ui_automation.py tests/test_voice_input_e2e.py -k "local_ready or queued_ready or optimize_worker or software_ready or actual_capture" -q
 # 串行：9 passed, 37 deselected。
 ```
+
+当前桌面语音测试入口为 `.venv/Scripts/python.exe -m pytest -q tests/test_main_voice.py`。
 
 两个完整 wx 文件另有 26 项旧失败，已逐条核对与原 HEAD 基线相同（模型列表、聊天箭头、笔记 Alt-X）；不计为通过，也未借收尾扩修。必要失败证据仍保留在系统 Temp 的 `mc-voice-baseline-6is0yu3m/`，不提交原始日志、录音、数据库或凭据。
 

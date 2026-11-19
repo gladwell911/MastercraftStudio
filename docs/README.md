@@ -1,6 +1,6 @@
 # 文档索引
 
-2026-11-19 的 Kimi 归属、取消、交互与清理修复已进入源码。日常包已补齐固定 2.5.3 运行时，后续源码修复尚待打包切换。各版本的隔离云端、源码与 frozen 验证范围、已知基线失败和延期事项见 [交接](handoff.md)。
+Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完成职责拆分和隔离构建验收。日常包已补齐固定 2.5.3 运行时，后续源码变更尚待日常切换。各版本的隔离云端、源码与冻结包验证范围见 [交接](handoff.md)。
 
 ## 当前入口
 
@@ -26,6 +26,17 @@
 - Story 2.4 跨端执行时间线：旧工作区规格当前未找到，不保留失效链接；以现有协议实现、测试及归档审查记录核对。
 - 2026-09-21 Epics 1–4 最终规格位于工作区 `_bmad-output/implementation-artifacts/`：`spec-1-1-restart-the-current-text-context-once-with-truthful-audio.md`、`spec-2-1-preserve-each-chats-selected-model.md`、`spec-2-2-create-and-name-a-new-chat-immediately.md`、`spec-3-1-show-meaningful-kimi-execution-stages.md`、`spec-3-2-coalesce-one-logical-provider-event-into-one-item.md`、`spec-3-3-group-every-execution-timeline-by-accessible-time.md`、`spec-4-1-edit-answer-detail-temporarily-without-saving.md`。
 - [`non-live-regression-baseline-2026-09-06.md`](./non-live-regression-baseline-2026-09-06.md)：2026-09-06 全量非实时测试的历史失败基线与复现范围
+
+## 职责与测试入口
+
+| 职责 | 源码 | 测试 |
+|---|---|---|
+| 桌面装配、生命周期与启动 | `main.py`、`mc_frame_bindings.py` | `tests/test_main_entry.py` |
+| 桌面回答、执行、历史、模型与语音等功能 | `mc_frame_*.py` 中同领域模块 | `tests/test_main_*.py`，如 `tests/test_main_answers.py`、`tests/test_main_voice.py` |
+| 聊天存储、表结构、通知与执行分页 | `chat_store.py`、`chat_store_schema.py`、`chat_store_notifications.py`、`chat_store_execution.py` | `tests/test_chat_store_unit.py`、`tests/test_notification_sync.py` |
+| Kimi 客户端、事件、队列、V2 与 WebSocket | `kimi_server_client.py`、`kimi_server_events.py`、`kimi_server_queue.py`、`kimi_server_v2.py`、`kimi_server_websocket.py` | `tests/test_kimi_server_client_unit.py`、`tests/test_kimi_integration_*.py` |
+
+历史记录中的 `tests/test_main_unit.py` 和 `tests/test_kimi_integration.py` 对应拆分前的版本。迁移与验证记录见 [职责拆分计划](../_bmad-output/implementation-artifacts/plan-mc-code-split.md)。
 
 ## 关键当前事实
 

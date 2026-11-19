@@ -3,7 +3,7 @@ title: '按职责拆分 MC 入口、存储、Kimi 客户端与测试'
 type: 'refactor'
 ticket: ''
 created: '2026-11-19'
-status: 'built'
+status: 'done'
 baseline_revision: '4ea91777336e650603ea1e80e589f080566c9b72'
 route: 'full'
 route_source: 'auto'
@@ -11,17 +11,10 @@ review: 'thorough'
 review_source: 'auto'
 lenses_ran: [blind-hunter, edge-case-hunter, verification-gap, intent-alignment]
 review_loop_iteration: 0
-followup_review_recommended: true
+followup_review_recommended: false
 context: ['{project-root}/AGENTS.md', '{project-root}/docs/handoff.md', '{project-root}/docs/experience.md', '{project-root}/docs/reflection.md']
 warnings: [multiple-goals, oversized]
 deferred:
-  - summary: >-
-      交接文档中的实时语音验证命令仍引用移动前的文件名。
-    evidence: |-
-      当前文件按领域拆分。neat-freak 收尾更新可复跑的命令并标注历史结果。
-    location: >-
-      docs/handoff.md
-    severity: low
   - summary: >-
       实体键盘、读屏和独立云端仍待现场验证。
     evidence: |-
@@ -72,25 +65,27 @@ deferred:
 
 ## Implementation Notes
 
-- `main.py` 从 24,850 行拆至约 1,500 行，937 个方法迁入 16 个职责类。`ChatStore` 保持 97 个原有方法，schema 保持原连接，移出的运行时取同一时钟。`KimiServerClient` 保留 61 个原有方法。AST 对照确认主体相同，差异包括明确的原模块依赖绑定、时钟访问和 schema 提取。
-- 两份大测试的 880 和 141 个测试函数均保留。3,036 个非实时实例逐个对照，1,220 个实例迁移文件。三个测试方法的结构断言由原路径或原类名调整到当前实现，另有打包检查验证实际重构模块的依赖；业务断言保持。
-- 定向验证 2,078 个用例实例，1,941 项通过，136 项失败在相同旧版节点复现，1 项在两版都遇到相同 Windows COM 阻塞。全量单进程基线出现 Windows 原生故障，按文件串行对照。真实云端、实体键盘与读屏未实测。
+- `ChatFrame` 保留 966 个原有方法，其中 937 个迁入 16 个职责类。`ChatStore` 保持 97 个原有方法，schema 保持原连接，移出的运行时取同一时钟。`KimiServerClient` 保留 61 个原有方法。AST 对照确认主体相同，差异包括明确的原模块依赖绑定、时钟访问和 schema 提取。
+- 两份大测试的 880 和 141 个测试函数均保留。3,036 个非实时实例逐个对照，1,220 个实例迁移文件。三个测试方法的结构断言由原路径或原类名调整到当前实现，另有打包检查验证重构模块的实际依赖。最终修复另加 5 个入口实例，共收集 3,041 项。
+- 拆分前后定向对照 2,078 个原用例实例，1,941 项通过，136 项失败在相同节点复现，1 项在两版都遇到相同 Windows COM 阻塞。全量单进程基线出现 Windows 原生故障，定向对照按文件串行运行。全量非实时验证未完成。
 - 基线与候选包均从独立目录用正式打包脚本 `-BuildOnly` 成功构建。基线 SQLite 夹具、真实 2.5.3 和回环模型完成两问，确认同 chat/session、不同 prompt、原生列表和 SQLite 可见、REST 与正文一致、退出重启恢复。两版 `mc_worker.exe` 响应 ping 和 `--browser-open --help`，源码 `main.py --codex-worker` 响应 ping。冻结验证使用全套临时数据，测试子进程和临时数据已清理。
 - engineer 独立复核原方法体、逐用例收集、基线失败分布和两份冻结包证据。2,078 个实例属于定向验证范围，其余 958 个在这轮定向运行范围之外。
-- 内置审查修复后 34 个针对性用例通过，包括原先被 COM 对话框阻塞的忙碌发送断言。默认和 importlib 两种收集模式均保留全部 3,036 项。生产入口和 `runpy` 次级执行、独立呈现及退出重启以修复后的树复验。最终隔离包重新构建，Kimi 两轮回环和 worker 探针通过。
-- 定向复测前后，源码笔记库及 SQLite 辅助文件的存在、写入时间和大小记录一致。补丁统一把所有 pytest 窗口构造使用的笔记路径指向每个用例的临时目录。
+- 内置审查修复后 34 个针对性用例通过，包括原先被 COM 对话框阻塞的忙碌发送断言。该阶段默认和 importlib 两种收集模式均保留全部 3,036 项。独立复审修复后的通知 17 项和入口 5 项均通过。
+- 早期直接构造 frame 的回归可能初始化 `D:/code/note/notes.db`。该文件的修改时间落在首轮测试期间，只读 `quick_check` 通过，具体内容变化无法确认。修订后 autouse 夹具在每个用例中设置临时笔记路径，之后定向复跑前后源码笔记库与 SQLite 辅助文件的存在、写入时间和大小一致。
 
 ### 物理行数
 
 | 原文件 | 拆分前 | 入口现状 | 新职责文件总行数 | 模块组净变化 |
 |---|---:|---:|---:|---:|
-| `main.py` | 24,850 | 1,494 | 23,989 | +633 |
+| `main.py` | 24,850 | 1,494 | 23,982 | +626 |
 | `chat_store.py` | 2,731 | 919 | 1,859 | +47 |
 | `kimi_server_client.py` | 2,348 | 690 | 1,723 | +65 |
 
-这些是物理行数。入口减量来自迁移，拆分后的 Python 文件增加了各自的导入与模块声明。三个生产模块组总计增加 745 行。
+这些是截至 `947056c` 的物理行数。入口减量来自迁移，拆分后的 Python 文件增加了各自的导入与模块声明。三个生产模块组最终净增 738 行。
 
 ## Plan Change Log
+
+- 2026-11-20 收尾更新了交接中的语音测试入口，并标明拆分前测试结果适用的版本。
 
 ## Review Triage Log
 
@@ -122,9 +117,20 @@ deferred:
 - `.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider -m 'not live'` 或在相同环境按文件分组 serial 运行，明确原有失败和未覆盖条件。含回答、常用命令、笔记、语音、历史、Codex/Kimi、远程、聊天存储与打包测试。先建立定向基线并分批复测直至整轮范围可对比。
 - 对正常入口、常量解析、迁移方法和测试做 AST/符号对照、编译、`git diff --check`。用 `package_mc.ps1 -BuildOnly` 指向独立目录验证实际 frozen 产物，并使用临时笔记和历史、回环或可用独立认证验证关键调用链；保留实际结果的边界。
 
+## Code Review
+
+### 2026-11-20 · 独立复审
+
+**Code review complete.** 0 decision-needed, 2 patch, 0 defer, 0 rejected.
+
+- [x] 独立 dog 运行 `bmad-code-review` quick。修复 VS Code 调试入口和 CPython 紧凑 `-mmain` 的静默退出。
+- [x] 将通知游标 TTL 断言移至实际创建续页游标并替换时钟的测试。
+- 两项修复均由 `947056c8d329713c731a3211495bec27358c000b` 完成。通知 17 项、入口 5 项通过，内置 quick 复审 0 发现。真实 VS Code debugpy worker 与修复后的隔离包复验通过。复现命令与证据见 [独立复审修复计划](plan-mc-code-split-review-fixes.md)。
+
+Rejected: 无。
+
 ## Auto Run Result
 
 - 完成桌面入口、聊天存储、Kimi 客户端及两份大型测试的拆分。实现和物理行数见 Implementation Notes。
-- 内置审查合并重复项后修补 1 个 high、3 个 medium 和 7 个 low 条目。文档命令由收尾处理，真实云端和物理输入由对应环境另验。其余裁决已记录。
-- 修复后 34 项定向用例通过，默认和 `importlib` 收集均为 3,036 项。隔离打包复验覆盖 worker、两轮 Kimi 回环、SQLite 写入和重新打开。
-- 建议独立复审，重点检查两种真实入口和次级运行共用绑定时的隔离，以及通过共享夹具保护直接构造窗口的测试。首轮源码测试曾绕过笔记夹具，影响见审查记录。修复后的定向复跑期间笔记库元数据保持一致。
+- 内置审查合并重复项后修补 1 个 high、3 个 medium 和 7 个 low 条目，独立 quick 复审另确认并修复两项问题，详见 Code Review。交接已更新语音测试入口。
+- 正式 `-BuildOnly` 隔离构建后的基线与最终版通过 `mc.exe` 和 `mc_worker.exe` 验收。真实 Kimi 2.5.3 经回环服务完成两问，核对同 chat/session、不同 prompt、原生界面与 SQLite/REST 一致以及重启恢复。真实云端、物理键盘和实体读屏仍待验证。
