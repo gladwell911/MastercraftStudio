@@ -159,6 +159,9 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
         self._v2_ready_generations = {}
         self._v2_request_generations = {}
         self._v2_subscription_events = {}
+        self._v2_usage_windows = {}
+        self._v2_usage_events = {}
+        self._v2_usage_ledgers = {}
         self.on_message = on_message
         self.on_exit = on_exit
         self.process_factory = process_factory

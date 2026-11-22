@@ -59,8 +59,9 @@ class _ParagraphStripper(_Stripper):
     _blocks = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "ul", "ol", "table"}
     _text_blocks = {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th"}
 
-    def __init__(self):
+    def __init__(self, *, ordinary=False):
         super().__init__()
+        self._ordinary = ordinary
         self._lists = []
         self._pre = False
         self._text_depth = 0
@@ -122,7 +123,7 @@ class _ParagraphStripper(_Stripper):
     def handle_endtag(self, tag):
         if tag == "a" and self._links:
             target, start = self._links.pop()
-            if target and "".join(self.parts[start:]).strip() != target:
+            if target and not self._ordinary and "".join(self.parts[start:]).strip() != target:
                 self._append(f" ({target})")
         if tag in self._text_blocks:
             self._text_depth -= 1
@@ -136,10 +137,44 @@ class _ParagraphStripper(_Stripper):
             self._boundary(1)
 
 
-def answer_detail_plain_text(md_text: str) -> str:
-    parser = _ParagraphStripper()
+_PATH_PART = r"[^\s\\/<>\[\]()（）{}`'\"，。！？、；：,;!?|=*:]+"
+_SPACED_PART = rf"{_PATH_PART}(?:[ ]+{_PATH_PART})*"
+_FILE = rf"{_PATH_PART}?(?:[ ]+{_PATH_PART}?)*?\.[A-Za-z][A-Za-z0-9_+-]*(?::[0-9]+(?::[0-9]+)?|#[A-Za-z0-9_-]+)?"
+_PATH_END = r"(?![\\/A-Za-z0-9_+-]|\.[A-Za-z0-9])"
+_PATH_ANCHOR = r"(?:[A-Za-z]:[\\/]+|[\\/]{2}|\.{1,2}[\\/]+)"
+_PATH = (
+    rf"(?:{_PATH_ANCHOR}|/)(?:{_SPACED_PART}[\\/]+)*?{_FILE}{_PATH_END}"
+    rf"|{_PATH_ANCHOR}(?:{_PATH_PART}[\\/]+)*{_PATH_PART}{_PATH_END}"
+    rf"|/(?:{_PATH_PART}/)+{_PATH_PART}{_PATH_END}"
+    rf"|(?=[A-Za-z_\u0080-\uffff])(?:{_PATH_PART}[\\/]+)+{_FILE}"
+)
+_URL_PART = r"[^\s<>\[\]()（）{}`'\"，。！？、；：]"
+_DISPLAY_REFERENCES = re.compile(
+    rf"(?P<url>(?i:https?://|www\.){_URL_PART}+(?:\((?:{_URL_PART}|\({_URL_PART}*\))*\){_URL_PART}*)*)"
+    rf"|(?<![A-Za-z0-9_./\\:-])(?:\((?P<ascii_path>{_PATH})\)|（(?P<wide_path>{_PATH})）|(?P<path>{_PATH}))"
+)
+
+
+def filter_answer_display_text(text: str) -> str:
+    """Shorten references in rendered answer text without changing its source."""
+    def replacement(match):
+        token = match.group()
+        if match.group("url"):
+            trimmed = token.rstrip(".,;:!?")
+            return "（网址）" + token[len(trimmed):]
+        if match.group("ascii_path") or match.group("wide_path"):
+            return "（文件）"
+        trimmed = token.rstrip(".:")
+        return "（文件）" + token[len(trimmed):]
+
+    return _DISPLAY_REFERENCES.sub(replacement, text)
+
+
+def answer_detail_plain_text(md_text: str, *, ordinary=False) -> str:
+    parser = _ParagraphStripper(ordinary=ordinary)
     parser.feed(markdown.markdown(str(md_text or ""), extensions=["extra", "fenced_code", "tables", "sane_lists"]))
-    return parser.text().strip("\n")
+    text = parser.text().strip("\n")
+    return filter_answer_display_text(text) if ordinary else text
 
 
 def answer_time_projection(timestamps) -> list[bool]:

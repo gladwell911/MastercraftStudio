@@ -126,7 +126,7 @@ def test_global_ctrl_poller_release_disabled_when_hook_recent(monkeypatch):
     hook._last_hook_event_at = 100.0
     hook._hook_stale_seconds = 0.45
     monkeypatch.setattr(main.time, "monotonic", lambda: 100.2)
-    assert hook._should_use_poller_release()
+    assert not hook._should_use_poller_release()
 
 
 def test_global_ctrl_poller_release_enabled_when_hook_stale(monkeypatch):
@@ -140,16 +140,16 @@ def test_global_ctrl_poller_release_enabled_when_hook_stale(monkeypatch):
     assert hook._should_use_poller_release()
 
 
-def test_global_ctrl_poller_release_enabled_even_when_hook_is_recent():
+def test_global_ctrl_poller_release_disabled_with_healthy_hook():
     hook = main.GlobalCtrlTapHook(lambda *_a, **_k: None)
     hook._running = True
     hook._hook = object()
     hook._using_fallback = False
     hook._last_hook_event_at = time.monotonic()
-    assert hook._should_use_poller_release()
+    assert not hook._should_use_poller_release()
 
 
-def test_global_ctrl_poller_detects_left_release_without_waiting_for_hook_staleness(monkeypatch):
+def test_global_ctrl_poller_defers_to_recent_hook_release(monkeypatch):
     seen = []
     hook = main.GlobalCtrlTapHook(lambda combo_used, side: seen.append((combo_used, side)))
     monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
@@ -157,11 +157,45 @@ def test_global_ctrl_poller_detects_left_release_without_waiting_for_hook_stalen
     hook._running = True
     hook._hook = object()
     hook._using_fallback = False
+    hook._last_hook_event_at = time.monotonic()
 
     hook._process_poller_state(left_down=True, right_down=False)
     hook._process_poller_state(left_down=False, right_down=False)
 
+    assert seen == []
+
+    hook._emit_ctrl_keyup(False, "left", source="hook")
     assert seen == [(False, "left")]
+
+
+def test_global_ctrl_hook_marks_each_right_tap_while_left_remains_down(monkeypatch):
+    seen = []
+    hook = main.GlobalCtrlTapHook(lambda combo, side: seen.append((combo, side)))
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    for vk, event in [(main.VK_LCONTROL, main.WM_KEYDOWN),
+                      (main.VK_RCONTROL, main.WM_KEYDOWN), (main.VK_RCONTROL, main.WM_KEYUP),
+                      (main.VK_RCONTROL, main.WM_KEYDOWN), (main.VK_RCONTROL, main.WM_KEYUP),
+                      (main.VK_LCONTROL, main.WM_KEYUP), (main.VK_RCONTROL, main.WM_KEYDOWN),
+                      (main.VK_RCONTROL, main.WM_KEYUP)]:
+        hook._last_hook_event_at += 0.05
+        hook._process_hook_key(vk, event)
+    assert seen == [(True, "right"), (True, "right"), (True, "left"), (False, "right")]
+
+
+def test_external_voice_refuses_caret_drift_and_does_not_confirm_deletion(monkeypatch):
+    from contextlib import nullcontext
+    import windows_voice_target as target
+
+    hwnd = (101, 102)
+    completion = target.VoiceEditSnapshot((10, 11), "ab", ("a", "", "b"), None)
+    live = target.VoiceEditSnapshot((10, 11), "ab", ("ab", "", ""), None)
+    monkeypatch.setattr(target, "foreground_edit_target", lambda: hwnd)
+    monkeypatch.setattr(target, "_focused_automation", lambda: nullcontext((None, None)))
+    monkeypatch.setattr(target, "_sample_editor", lambda *_: (live, lambda: "ab"))
+    monkeypatch.setattr(target, "send_unicode_text", lambda _: pytest.fail("changed caret received keys"))
+    assert not target.insert_and_verify(hwnd, completion, "x", lambda: True)
+    assert target._changed_by_inserting("ab", "axb", "x")
+    assert not target._changed_by_inserting("aXbc", "aXb", "X")
 
 
 def test_large_legacy_app_state_migrates_to_chat_store_and_slims_json(tmp_path, monkeypatch):

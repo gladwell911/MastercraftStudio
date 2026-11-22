@@ -7,13 +7,13 @@ import uuid
 import wx
 from claudecode_client import is_claudecode_model
 from codex_client import is_codex_model
-from context_usage import format_context_usage_label
 from kimi_server_client import is_kimi_model
 from mc_frame_dialogs import AnswerViewerPayload
 from mc_frame_presentation import (
     _finite_timestamp,
     answer_time_projection,
     compact_markdown_summary,
+    filter_answer_display_text,
     md_to_plain_preserving_paragraphs,
     remove_emojis,
     wechat_time_label,
@@ -78,7 +78,7 @@ class AnswersMixin:
         created = int(float(turn.get("created_at") or bindings.app.time.time()))
         file_name = f"answer_{created}_{turn_idx}_{uuid.uuid4().hex[:8]}.html"
         page_path = self.detail_pages_dir / file_name
-        html = self._build_answer_detail_html(str(turn.get("answer_md") or ""), str(turn.get("model") or ""))
+        html = self._build_answer_detail_html(str(turn.get("answer_md") or ""))
         page_path.write_text(html, encoding="utf-8")
         turn["answer_detail_page_path"] = str(page_path)
         return page_path
@@ -347,7 +347,7 @@ class AnswersMixin:
             if self.view_mode == "history"
             else str(self.active_chat_id or self.current_chat_id or (self._current_chat_state or {}).get("id") or "").strip()
         )
-        context_usage_label = format_context_usage_label(self._active_chat_context_usage())
+        context_usage_label = self._answer_usage_header_label()
         if self._should_show_context_usage_row(context_usage_label, turns):
             self._append_context_usage_row(rows, metas)
         self._append_current_model_row(rows, metas)
@@ -672,8 +672,7 @@ class AnswersMixin:
             return False
         if not (0 <= turn_idx < len(self.active_session_turns)):
             return False
-        answer_md = str(self.active_session_turns[turn_idx].get("answer_md") or "")
-        text = REQUESTING_TEXT if answer_md == REQUESTING_TEXT else remove_emojis(bindings.app.md_to_plain(compact_markdown_summary(answer_md)))
+        answer_md, text = self._turn_answer_markdown(self.active_session_turns[turn_idx])
         item_type, idx, current_meta_text, current_meta_md = self.answer_meta[row]
         if current_meta_text == text and current_meta_md == answer_md:
             return True
@@ -718,11 +717,10 @@ class AnswersMixin:
                 return "", err or "上次未完成回答恢复失败，可手动继续"
             return "", ""
         compact = compact_markdown_summary(self._answer_markdown_for_output(answer_md, model))
-        return answer_md, remove_emojis(bindings.app.md_to_plain(compact))
+        return answer_md, filter_answer_display_text(remove_emojis(bindings.app.md_to_plain(compact)))
 
     def _build_answer_detail_html(self, answer_md: str, model: str = "") -> str:
-        filtered = self._answer_markdown_for_output(answer_md, model)
-        a_html = markdown.markdown(remove_emojis(filtered), extensions=["extra", "fenced_code", "tables", "sane_lists"])
+        a_html = markdown.markdown(answer_md, extensions=["extra", "fenced_code", "tables", "sane_lists"])
         return (
             "<!doctype html><html><head><meta charset='utf-8'><title>回答详情</title>"
             "<style>"

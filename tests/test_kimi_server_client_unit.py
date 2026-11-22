@@ -26,6 +26,60 @@ from kimi_server_client import (
 )
 
 
+def test_v2_idle_usage_before_ack_and_complete_paged_cache(monkeypatch):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    generation = client._ws_generation
+    client._v2_request_generations["sub"] = generation
+    client._subscribe_requests["sub"] = {"s"}
+    monkeypatch.setattr(client, "_record_v2_transcript_usage", lambda *a, **k: None)
+    frame = {"type": "usage", "session_id": "s", "agent_id": "main",
+             "context_tokens": 42, "max_context_tokens": 100}
+    client._handle_ws_message(frame, generation=generation)
+    assert not client.drain_pending_messages()
+    client._handle_ws_message({"type": "ack", "id": "sub", "payload": {"accepted": ["s"]}}, generation=generation)
+    assert client.drain_pending_messages()[0]["payload"]["event"]["data"]["usage"]["context_tokens"] == 42
+    client._handle_ws_message({**frame, "context_tokens": 999}, generation=generation - 1)
+    client._handle_ws_message({**frame, "session_id": "other"})
+    client._handle_ws_message({**frame, "agent_id": "sub-agent"})
+    assert not client.drain_pending_messages()
+    monkeypatch.setattr(client, "_require_v2_ready", lambda session: None)
+
+    def turn(turn_id, uncached, cached):
+        return {"kind": "turn", "turnId": turn_id, "state": "completed",
+                "usage": {"inputTokens": uncached, "cachedTokens": cached, "outputTokens": 10},
+                "steps": [{"state": "completed", "ordinal": 1,
+                           "usage": {"inputOther": 30, "inputCacheRead": 0, "inputCacheCreation": 10}}]}
+
+    t2 = turn("t2", 60, 40)
+    pages = {None: {"items": [t2, turn("t3", 100, 100)], "has_more": True},
+             "t2": {"items": [turn("t1", 5, 5), t2], "has_more": False}}
+    monkeypatch.setattr(client, "get_transcript", lambda session, before_turn, timeout: pages[before_turn])
+    snapshot = client.get_v2_usage_totals("s")
+    assert snapshot["session_total_tokens"] == 340
+    assert snapshot["cache_hits"] == {"last": {"input_tokens": 40, "cached_tokens": 0},
+                                       "total": {"input_tokens": 310, "cached_tokens": 145}}
+
+
+def test_v2_usage_rejects_scan_when_transcript_changes_mid_page(monkeypatch):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client._v2_ready_generations["s"] = client._ws_generation
+    monkeypatch.setattr(client, "_require_v2_ready", lambda _sid: None)
+    calls = []
+
+    def page(session, **_kwargs):
+        calls.append(session)
+        if len(calls) == 1:
+            client._invalidate_v2_usage_scan(session)
+        return {"items": [], "has_more": False}
+
+    monkeypatch.setattr(client, "get_transcript", page)
+    with pytest.raises(KimiServerError, match="changed during usage scan"):
+        client.get_v2_usage_totals("s")
+    assert client.get_v2_usage_totals("s")["scan_generation"] == 1
+
+
 @pytest.mark.parametrize("event_type", ["tool.call.started", "tool.result", "turn.step.started", "session.meta.updated"])
 def test_visible_and_lifecycle_events_retain_envelope_origin_timestamp(event_type):
     payload = {"type": event_type, "turnId": "turn-1", "toolCallId": "tool-1", "stepId": "step-1"}

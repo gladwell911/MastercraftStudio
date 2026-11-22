@@ -768,6 +768,7 @@ class CodexSessionsMixin:
         preserve_total = bool(preserve and chat_id and self._codex_early_context_usage_owner.get((chat_id, preserve[0])) == preserve[1:])
         if not preserve_total:
             chat["codex_session_total_tokens"] = None
+            chat.pop("codex_cache_hits", None)
             chat.pop("codex_total_observed_at", None)
             chat.pop("codex_usage_cache_owner", None)
         chat.pop("codex_context_error", None)
@@ -783,6 +784,10 @@ class CodexSessionsMixin:
                     self._codex_early_context_usage_owner.pop(key, None)
 
     def _publish_codex_context_thread_change(self, chat: dict) -> None:
+        if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
+            self._refresh_chat_information(chat)
+        else:
+            self._call_after_if_alive(self._refresh_chat_information, chat)
         if getattr(self, "_scoped_chat_information", None) is not None:
             if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
                 self._information_subscriptions().changed(chat)
@@ -1274,7 +1279,8 @@ class CodexSessionsMixin:
                 return
             early_codex_usage = bool(event_thread_id and not self._codex_thread_id_for_chat(identity_chat))
             event_data = event.data if isinstance(event.data, dict) else {}
-            if (event.usage or isinstance(event_data.get("session_total_tokens"), int)) and event_thread_id and not self._codex_thread_id_for_chat(identity_chat):
+            if (event.usage or isinstance(event_data.get("session_total_tokens"), int)
+                    or any((event_data.get("cache_hits") or {}).values())) and early_codex_usage:
                 turns = identity_chat.get("turns") if isinstance(identity_chat.get("turns"), list) else []
                 turn_idx = self._event_scoped_turn_index(turns, event)
                 if turn_idx >= 0:
@@ -1286,16 +1292,25 @@ class CodexSessionsMixin:
         if event_type == "token_count" and isinstance(identity_chat, dict):
             event_data = event.data if isinstance(event.data, dict) else {}
             identity_chat["codex_usage_revision"] = int(identity_chat.get("codex_usage_revision") or 0) + 1
+            cache_hits = event_data.get("cache_hits")
+            hits_changed = isinstance(cache_hits, dict) and cache_hits != identity_chat.get("codex_cache_hits")
+            if hits_changed:
+                identity_chat["codex_cache_hits"] = cache_hits
+                identity_chat["codex_usage_cache_owner"] = self._information_cache_owner(identity_chat, "codex")
             total = event_data.get("session_total_tokens")
+            total_changed = False
             if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
-                identity_chat["codex_total_observed_at"] = bindings.app.time.time()
+                total_changed = (identity_chat.get("codex_session_total_tokens") != total
+                                 or bool(identity_chat.get("codex_snapshot_error")))
+                if total_changed:
+                    identity_chat["codex_total_observed_at"] = bindings.app.time.time()
                 identity_chat["codex_snapshot_error"] = False
                 identity_chat["codex_usage_cache_owner"] = self._information_cache_owner(identity_chat, "codex")
-                total_changed = identity_chat.get("codex_session_total_tokens") != total
                 identity_chat["codex_session_total_tokens"] = total
-                self._refresh_chat_information(identity_chat)
-                if total_changed:
-                    self._defer_codex_state_save()
+            if hits_changed or total_changed:
+                if not early_codex_usage:
+                    self._refresh_chat_information(identity_chat)
+                self._defer_codex_state_save()
             if not event.usage:
                 return
         if event_type == "server_request" and event.method == "item/commandExecution/requestApproval":
@@ -1737,6 +1752,8 @@ class CodexSessionsMixin:
             if is_current_target:
                 self.active_codex_thread_id = thread_id
             if thread_changed:
+                if target_chat.get("codex_usage_cache_owner") is not None:
+                    target_chat["codex_usage_cache_owner"] = self._information_cache_owner(target_chat, "codex")
                 self._publish_codex_context_thread_change(target_chat)
         if "turn_id" in payload:
             target_chat["codex_turn_id"] = turn_id

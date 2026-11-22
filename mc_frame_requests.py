@@ -3,6 +3,7 @@
 import copy
 import uuid
 import wx
+from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from chat_store import ChatStore
 from claudecode_client import DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
 from codex_client import is_codex_model
@@ -848,13 +849,74 @@ class ChatRequestsMixin:
             self._schedule_first_question_auto_title(owner_id, text)
         return True, ""
 
-    def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "", *, client_send_id: str = "") -> tuple[bool, str]:
+    def _preflight_claude_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
+                                           attachments) -> tuple[bool, str]:
+        if getattr(self, "_claude_attachment_preflight", None) is not None:
+            return False, "正在检查附件，请稍候"
+        expected_state = self._current_chat_state
+        expected_owner = (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
+        expected_model = self._resolve_current_model()
+        expected_draft = self.input_edit.GetValue()
+        attachments = copy.deepcopy(attachments)
+        token = object()
+        self._claude_attachment_preflight = token
+
+        def finish(files, prepared, error):
+            if self._claude_attachment_preflight is not token:
+                return
+            self._claude_attachment_preflight = None
+            if (getattr(self, "_closing", False) or self._current_chat_state is not expected_state
+                    or expected_owner != (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
+                    or self._resolve_current_model() != expected_model or self.input_edit.GetValue() != expected_draft
+                    or list(self._pending_input_attachments) != attachments):
+                return
+            if not error:
+                ok, error = self._submit_question(
+                    raw_question, source, model, chat_id, client_send_id=client_send_id,
+                    _verified_attachments=(files, prepared),
+                )
+                if ok:
+                    return
+            if error:
+                wx.MessageBox(error, "附件发送失败", wx.OK | wx.ICON_WARNING)
+
+        def worker():
+            try:
+                files, failed = self._normalize_outgoing_attachments(attachments)
+                if failed:
+                    names = "、".join(item["name"] for item in failed)
+                    raise ValueError(f"以下附件无法读取，请移除或修复后重试：{names}")
+                prepared = read_openrouter_claude_attachments(model, files)
+            except Exception as exc:
+                self._call_after_if_alive(finish, [], [], str(exc) or "无法读取附件")
+                return
+            self._call_after_if_alive(finish, files, prepared, "")
+
+        try:
+            bindings.app.threading.Thread(target=worker, daemon=True, name="claude-attachment-preflight").start()
+        except Exception:
+            self._claude_attachment_preflight = None
+            return False, "无法开始检查附件"
+        return True, ""
+
+    def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "", *,
+                         client_send_id: str = "", _verified_attachments=None) -> tuple[bool, str]:
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
-        success_attachments, failed_attachments = self._normalize_outgoing_attachments(requested_attachments)
+        resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
+        if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:
+            return self._preflight_claude_attachment_draft(
+                raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
+            )
+        prepared_attachments = None
+        if _verified_attachments is not None:
+            success_attachments, prepared_attachments = _verified_attachments
+            failed_attachments = []
+        else:
+            success_attachments, failed_attachments = self._normalize_outgoing_attachments(requested_attachments)
         outgoing_attachments = success_attachments + failed_attachments
         display_question = q
         if failed_attachments:
@@ -870,7 +932,6 @@ class ChatRequestsMixin:
         self._answer_list_tail_notice = ""
         self._answer_list_tail_notice_chat_id = ""
 
-        resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
         selected_history_id = ""
         if (not chat_id) and self.view_mode == "history":
             selected_history_id = str(self.view_history_id or "").strip()
@@ -953,7 +1014,8 @@ class ChatRequestsMixin:
             self._current_chat_state["codex_service_tier"] = codex_service_tier
             self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         worker_question = q
-        if success_attachments and not is_codex_model(resolved_model) and not is_kimi_model(resolved_model):
+        if (success_attachments and prepared_attachments is None
+                and not is_codex_model(resolved_model) and not is_kimi_model(resolved_model)):
             attachment_context = self._build_cli_attachment_context(success_attachments)
             worker_question = f"{q}\n\n{attachment_context}".strip() if q else attachment_context
         codex_local_command = self._parse_codex_local_command(q) if is_codex_model(resolved_model) and not outgoing_attachments else None
@@ -1200,7 +1262,11 @@ class ChatRequestsMixin:
                     resolved_model,
                 )
             else:
-                t = bindings.app.threading.Thread(target=self._worker, args=(bindings.app.openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id or self.current_chat_id or ""), daemon=True)
+                args = (bindings.app.openrouter_api_key_for_app(), turn_idx, worker_question, resolved_model,
+                        False, chat_id or self.active_chat_id or self.current_chat_id or "")
+                if prepared_attachments:
+                    args += ("", prepared_attachments)
+                t = bindings.app.threading.Thread(target=self._worker, args=args, daemon=True)
                 started = t.start()
             if started is False:
                 raise RuntimeError("Provider rejected submission")
@@ -1281,6 +1347,7 @@ class ChatRequestsMixin:
         from_recovery: bool = False,
         chat_id: str = "",
         openclaw_session_id: str = "",
+        prepared_attachments=None,
     ):
         full = ""
         err = ""
@@ -1290,6 +1357,8 @@ class ChatRequestsMixin:
         if target_chat is None:
             return
         history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
+        outgoing = target_turns[turn_idx].get("attachments") if 0 <= turn_idx < len(target_turns) else None
+        has_claude_attachments = bool(is_openrouter_claude_model(model) and (prepared_attachments or outgoing))
         skip_done = False
         try:
             if is_openclaw_model(model):
@@ -1340,12 +1409,17 @@ class ChatRequestsMixin:
                     bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, d, chat_id)
 
                 c = bindings.app.ChatClient(api_key=api_key, model=model)
-                full = c.stream_chat(question, on_delta, history_turns=history_turns)
+                if has_claude_attachments:
+                    attachments = prepared_attachments or read_openrouter_claude_attachments(model, outgoing)
+                    full = c.stream_chat(question, on_delta, history_turns=history_turns, attachments=attachments)
+                else:
+                    full = c.stream_chat(question, on_delta, history_turns=history_turns)
                 if c.last_context_usage:
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
         except Exception as e:
             err = str(e)
-            if (not is_openclaw_model(model)) and (not is_codex_model(model)) and self._is_model_endpoint_unavailable_error(model, err):
+            if (not has_claude_attachments and not is_openclaw_model(model) and not is_codex_model(model)
+                    and self._is_model_endpoint_unavailable_error(model, err)):
                 for fb_model in self._candidate_fallback_models(model):
                     try:
                         c = bindings.app.ChatClient(api_key=api_key, model=fb_model)

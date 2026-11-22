@@ -1,3 +1,4 @@
+import base64
 import json
 
 import pytest
@@ -85,6 +86,43 @@ def test_stream_chat_records_provider_usage(monkeypatch):
     assert client.last_context_usage["context_window"] == 128000
     assert client.last_context_usage["exact"] is True
     assert client.last_context_usage["source"] == "api"
+
+
+def test_openrouter_claude_stream_sends_selected_file_contents(tmp_path, monkeypatch):
+    bodies = []
+    monkeypatch.setattr(chat_client.requests, "post", lambda *a, **kw: bodies.append(kw["json"]) or _StreamingResponse())
+    files = {"probe.pdf": b"%PDF-1.4\nPDF_MARKER", "probe.png": b"\x89PNG\r\n\x1a\nIMAGE_MARKER",
+             "probe.txt": "文本样本".encode()}
+    for name, data in files.items():
+        (tmp_path / name).write_bytes(data)
+    client = ChatClient(api_key="dummy", model="anthropic/claude-sonnet-4.6")
+    attachments = chat_client.read_openrouter_claude_attachments(
+        client.model, [{"name": name, "path": tmp_path / name} for name in files],
+    )
+    assert client.stream_chat("读取附件", lambda _: None, attachments=attachments) == "你好"
+    parts = next(body for body in bodies if body["stream"])["messages"][-1]["content"]
+    assert parts[0] == {"type": "text", "text": "读取附件"}
+    assert parts[1]["file"]["filename"] == "probe.pdf"
+    assert parts[1]["file"]["file_data"].startswith("data:application/pdf;base64,")
+    assert base64.b64decode(parts[1]["file"]["file_data"].split(",", 1)[1]) == files["probe.pdf"]
+    assert parts[2]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert base64.b64decode(parts[2]["image_url"]["url"].split(",", 1)[1]) == files["probe.png"]
+    assert parts[3] == {"type": "text", "text": "附件：probe.txt\n\n文本样本"}
+
+
+def test_openrouter_claude_history_replays_attachment_only_turn_and_names_unavailable_file(tmp_path):
+    doc = tmp_path / "original.txt"
+    doc.write_text("HISTORY_MARKER", encoding="utf-8")
+    client = ChatClient(api_key="dummy", model="anthropic/claude-sonnet-4.6")
+    turns = [{"question": "", "answer_md": "previous answer", "attachments": [
+        {"path": str(doc)}, {"path": str(tmp_path / "missing.txt")},
+    ]}]
+    messages = client._build_messages("follow-up", turns)
+    assert [item["role"] for item in messages] == ["system", "user", "assistant", "user"]
+    assert "HISTORY_MARKER" in messages[1]["content"][1]["text"]
+    assert "missing.txt 不可读取" in messages[1]["content"][2]["text"]
+    with pytest.raises(ValueError, match="容量"):
+        chat_client.read_openrouter_claude_attachments(client.model, [{"path": str(doc)}], byte_budget=1)
 
 
 def test_capture_usage_ignores_empty_usage():

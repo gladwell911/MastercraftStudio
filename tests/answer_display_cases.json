@@ -1,0 +1,42 @@
+[
+  [
+    "请访问 https://example.test/a?q=1。",
+    "请访问 （网址）。"
+  ],
+  [
+    "D:\\\\work\\\\app.py 或 lib/main.dart",
+    "（文件） 或 （文件）"
+  ],
+  [
+    "修复（D:\\\\work\\\\app.py:42）后及 (/tmp/src/app.py:9:2)，abc.exe",
+    "修复（文件）后及 （文件），abc.exe"
+  ],
+  [
+    "请读 [使用说明](https://example.test/docs) 和 [abc.exe](lib/abc.exe)。",
+    "请读 使用说明 和 abc.exe。"
+  ],
+  [
+    "参考 [https://example.test/docs](https://example.test/docs)、`../src/module.py` 和普通文字。",
+    "参考 （网址）、（文件） 和普通文字。"
+  ],
+  [
+    "See <https://example.test/guide> and `/a/b.txt`, then finish.",
+    "See （网址） and （文件）, then finish."
+  ],
+  [
+    "Version 1/2.5 and /quiet.",
+    "Version 1/2.5 and /quiet."
+  ],
+  [
+    "See https://example.test/a(b)c?q=1, then finish.",
+    "See （网址）, then finish."
+  ],
+  [
+    "See \"C:\\Program Files\\my notes.txt\" and /home/project files/log.txt.",
+    "See \"（文件）\" and （文件）."
+  ],
+  [
+    "See lib/**main**.dart and abc.exe.",
+    "See （文件） and abc.exe."
+  ]
+]

@@ -24,7 +24,7 @@ class CtrlTapDetector:
         now = time.monotonic()
         side_key = "right" if side == "right" else "left"
         last = self._last_tap_by_side.get(side_key, 0.0)
-        hit = (now - last) <= self.double_tap_s
+        hit = side_key == "right" or (now - last) <= self.double_tap_s
         self._last_tap_by_side[side_key] = now
         self._last_any_tap = now
         return hit
@@ -44,6 +44,7 @@ class CtrlTapDetector:
 class _Session:
     generation: int
     mode: str
+    side: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     buffer: PcmBuffer = field(default_factory=PcmBuffer)
     intent: threading.Event = field(default_factory=threading.Event)
@@ -116,14 +117,18 @@ class VoiceInputController:
                 self.on_error(payload[0])
             elif kind == "result":
                 self.on_result(*payload)
-                self.on_state_change("识别完成，已追加")
+                if session.side is None:
+                    self.on_state_change("识别完成，已追加")
         self._mark(session, kind + "_posted")
         self._dispatch(deliver)
 
     def on_ctrl_keyup(self, combo_used=False, side="left"):
         if self.state == "idle":
-            if self.detector.on_tap_idle(side):
-                self.start_recording(MODE_DIRECT)
+            side = "right" if side == "right" else "left"
+            if combo_used:
+                self.detector.reset()
+            elif self.detector.on_tap_idle(side):
+                self.start_recording(MODE_DIRECT, side=side)
         elif self.state == "starting":
             self.cancel()
         elif self.state == "recording" and self.detector.on_tap_recording():
@@ -145,13 +150,13 @@ class VoiceInputController:
             self._audio_thread = threading.Thread(target=self._audio_worker, name="voice-audio", daemon=True)
             self._audio_thread.start()
 
-    def start_recording(self, mode=MODE_DIRECT):
+    def start_recording(self, mode=MODE_DIRECT, *, side=None):
         with self._lock:
             if self.state != "idle" or self._closed:
                 return
             self._ensure_workers_locked()
             self._generation += 1
-            session = _Session(self._generation, mode if mode in (MODE_DIRECT, MODE_OPTIMIZE) else MODE_DIRECT)
+            session = _Session(self._generation, mode if mode in (MODE_DIRECT, MODE_OPTIMIZE) else MODE_DIRECT, side)
             self._session = session
             self.state = "starting"
             self.detector.reset()
@@ -322,7 +327,8 @@ class VoiceInputController:
             self.state = "closed" if self._closed else "idle"
             self.detector.reset()
         if result:
-            self._emit(session, "result", result, session.mode)
+            output = (result, session.mode, session.side) if session.side is not None else (result, session.mode)
+            self._emit(session, "result", *output)
         elif valid:
             self._emit(session, "error", "未识别到语音内容")
 

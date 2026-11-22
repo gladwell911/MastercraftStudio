@@ -1,6 +1,8 @@
 ﻿import json
+import base64
 import os
 import re
+from pathlib import Path
 from typing import Callable
 
 import requests
@@ -25,6 +27,75 @@ DOUBAO_MODEL_MAP = {
     "doubao-2.0-lite": "doubao-seed-2-0-lite-260215",
     "doubao-2.0-mini": "doubao-seed-2-0-mini-260215",
 }
+OPENROUTER_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
+}
+OPENROUTER_TEXT_EXTENSIONS = {".txt", ".text", ".md", ".markdown", ".csv", ".tsv",
+                             ".log", ".rst", ".json", ".yaml", ".yml", ".xml"}
+AttachmentContent = tuple[str, str, bytes | str]
+MAX_OPENROUTER_ATTACHMENT_BYTES = 32 * 1024 * 1024
+
+
+def is_openrouter_claude_model(model: str) -> bool:
+    return str(model or "").strip().casefold().startswith("anthropic/claude")
+
+
+def read_openrouter_claude_attachments(
+    model: str, attachments: list[dict], *, byte_budget: int = MAX_OPENROUTER_ATTACHMENT_BYTES,
+) -> list[AttachmentContent]:
+    """Check every selected file before the send commits the editor draft."""
+    prepared = []
+    model_id = model.partition(":")[0].casefold()
+    for attachment in attachments:
+        path = Path(str(attachment["path"]))
+        name = Path(str(attachment.get("name") or path.name)).name
+        extension = path.suffix.casefold()
+        mime = OPENROUTER_IMAGE_MIME.get(extension)
+        if mime is not None:
+            if re.match(r"anthropic/claude-(?:instant|[12](?:[.-]|$))", model_id):
+                raise ValueError(f"模型 {model} 不支持图片附件：{name}")
+        elif extension == ".pdf":
+            mime = "application/pdf"
+        elif extension in OPENROUTER_TEXT_EXTENSIONS:
+            mime = "text/plain"
+        else:
+            raise ValueError(f"附件 {name} 的扩展名 {extension or '缺失'} 不受支持")
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(byte_budget + 1)
+        except OSError as exc:
+            raise ValueError(f"无法读取附件 {name}：{exc.strerror or '读取失败'}") from exc
+        if len(data) > byte_budget:
+            raise ValueError(f"附件 {name} 超出本次请求可读取的附件容量")
+        byte_budget -= len(data)
+        if not data:
+            raise ValueError(f"附件 {name} 没有内容")
+        if mime == "text/plain":
+            try:
+                encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+                data = data.decode(encoding)
+                if "\x00" in data:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(f"文本附件 {name} 的编码无效，请保存为 UTF-8 或带 BOM 的 UTF-16") from exc
+        prepared.append((name, mime, data))
+    return prepared
+
+
+def _attachment_parts(attachments: list[AttachmentContent]) -> list[dict]:
+    parts = []
+    for name, mime, data in attachments:
+        if mime == "text/plain":
+            parts.append({"type": "text", "text": f"附件：{name}\n\n{data}"})
+            continue
+        uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        if mime == "application/pdf":
+            # OpenRouter chooses native parsing when available, then OCR.
+            parts.append({"type": "file", "file": {"filename": name, "file_data": uri}})
+        else:
+            parts.append({"type": "image_url", "image_url": {"url": uri}})
+    return parts
 
 
 def is_doubao_model(model: str | None) -> bool:
@@ -58,33 +129,63 @@ class ChatClient:
                 "content": "请使用 Markdown 格式回答，尽量使用标题、段落、列表等结构化格式。不要使用任何表情符号（emoji）。",
             },
         ]
+        history_budget = MAX_OPENROUTER_ATTACHMENT_BYTES
         for turn in history_turns or []:
             q = str(turn.get("question") or "").strip()
             a = str(turn.get("answer_md") or "").strip()
-            if q:
+            files = turn.get("attachments") if is_openrouter_claude_model(self.model) else None
+            if isinstance(files, list) and files:
+                parts = [{"type": "text", "text": q or "请读取并说明所附文件的内容。"}]
+                for file in files:
+                    if not isinstance(file, dict) or file.get("direction") == "incoming":
+                        continue
+                    name = Path(str(file.get("name") or file.get("path") or "附件")).name
+                    try:
+                        if not file.get("path") or file.get("status") == "failed":
+                            raise ValueError("附件不可读取")
+                        prepared = read_openrouter_claude_attachments(self.model, [file], byte_budget=history_budget)
+                    except ValueError as exc:
+                        parts.append({"type": "text", "text": f"历史附件 {name} 不可读取：{exc}"})
+                    else:
+                        data = prepared[0][2]
+                        history_budget = max(0, history_budget - (len(data) if isinstance(data, bytes) else len(data.encode("utf-8"))))
+                        parts.extend(_attachment_parts(prepared))
+                messages.append({"role": "user", "content": parts})
+            elif q:
                 messages.append({"role": "user", "content": q})
             if a:
                 messages.append({"role": "assistant", "content": a})
         messages.append({"role": "user", "content": user_text})
         return messages
 
-    def stream_chat(self, user_text: str, on_delta: Callable[[str], None], history_turns: list[dict] | None = None) -> str:
+    def stream_chat(self, user_text: str, on_delta: Callable[[str], None], history_turns: list[dict] | None = None,
+                    *, attachments: list[AttachmentContent] | None = None) -> str:
         self.last_context_usage = None
         messages = self._build_messages(user_text, history_turns=history_turns)
+        if attachments:
+            if not is_openrouter_claude_model(self.model):
+                raise ValueError(f"模型 {self.model} 的当前发送路径不支持这些附件")
+            parts = [{"type": "text", "text": user_text or "请读取并说明所附文件的内容。"}]
+            parts.extend(_attachment_parts(attachments))
+            messages[-1]["content"] = parts
         if is_doubao_model(self.model):
             return self._stream_doubao_request(messages, on_delta)
-        need_web = self._should_use_web(user_text)
+        need_web = (not attachments or bool(user_text.strip())) and self._should_use_web(user_text)
         if not need_web:
-            return self._stream_request(self.model, messages, on_delta)
-
-        # 本轮按需开启联网。优先 online 变体，失败则回退 plugins:web。
-        try:
-            return self._stream_request(f"{self.model}:online", messages, on_delta)
-        except RuntimeError as online_err:
+            answer = self._stream_request(self.model, messages, on_delta)
+        else:
+            # 本轮按需开启联网。优先 online 变体，失败则回退 plugins:web。
             try:
-                return self._stream_request(self.model, messages, on_delta, plugins=[{"id": "web"}])
-            except RuntimeError:
-                raise online_err
+                answer = self._stream_request(f"{self.model}:online", messages, on_delta)
+            except RuntimeError as online_err:
+                try:
+                    answer = self._stream_request(self.model, messages, on_delta, plugins=[{"id": "web"}])
+                except RuntimeError:
+                    raise online_err
+
+        if attachments and not answer.strip():
+            raise RuntimeError("附件请求未返回回答，请重试。")
+        return answer
 
     @staticmethod
     def is_no_endpoint_error(error_text: str, model: str | None = None) -> bool:

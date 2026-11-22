@@ -13,9 +13,6 @@ from mc_frame_keyboard import (
     HOTKEY_ID_REALTIME_CALL_ALT2,
     HOTKEY_ID_SHOW,
     HOTKEY_ID_UNREAD,
-    INPUT_KEYBOARD,
-    KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE,
     OBJID_CLIENT,
     VK_OEM_102,
     VK_OEM_5,
@@ -25,6 +22,7 @@ from mc_frame_presentation import remove_trailing_punctuation, sanitize_optimize
 from mc_frame_settings import VOICE_OPTIMIZE_MODEL, VOICE_OPTIMIZE_PROMPT
 from realtime_call import RealtimeCallSettings
 from speech_input import MODE_DIRECT, MODE_OPTIMIZE
+from windows_voice_target import capture_voice_editor, foreground_edit_target, insert_and_verify, send_unicode_text
 
 import mc_frame_bindings as bindings
 
@@ -300,67 +298,7 @@ class VoiceInputMixin:
             return False
 
     def _type_text_to_system_focus(self, text: str) -> bool:
-        if not text:
-            return False
-        try:
-            user32 = ctypes.windll.user32
-
-            class KEYBDINPUT(ctypes.Structure):
-                _fields_ = [
-                    ("wVk", wintypes.WORD),
-                    ("wScan", wintypes.WORD),
-                    ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-                ]
-
-            class _INPUTUNION(ctypes.Union):
-                _fields_ = [("ki", KEYBDINPUT)]
-
-            class INPUT(ctypes.Structure):
-                _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
-
-            events = []
-            for ch in text:
-                cp = ord(ch)
-                if cp > 0xFFFF:
-                    continue
-                down = INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUTUNION(
-                        ki=KEYBDINPUT(
-                            wVk=0,
-                            wScan=cp,
-                            dwFlags=KEYEVENTF_UNICODE,
-                            time=0,
-                            dwExtraInfo=None,
-                        )
-                    ),
-                )
-                up = INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUTUNION(
-                        ki=KEYBDINPUT(
-                            wVk=0,
-                            wScan=cp,
-                            dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                            time=0,
-                            dwExtraInfo=None,
-                        )
-                    ),
-                )
-                events.extend([down, up])
-            if not events:
-                return False
-
-            n_inputs = len(events)
-            arr_type = INPUT * n_inputs
-            sent = user32.SendInput(n_inputs, arr_type(*events), ctypes.sizeof(INPUT))
-            if sent != n_inputs:
-                return False
-            return True
-        except Exception:
-            return False
+        return bool(text) and send_unicode_text(text)
 
     def _insert_text_to_system_focus(self, text: str) -> bool:
         norm = remove_trailing_punctuation(text)
@@ -384,25 +322,100 @@ class VoiceInputMixin:
         except Exception:
             return sanitize_optimized_text(text)
 
-    def _on_voice_result(self, text: str, mode: str = MODE_DIRECT):
+    def _on_voice_result(self, text: str, mode: str = MODE_DIRECT, side: str | None = None):
         if mode == MODE_OPTIMIZE:
             generation = self._voice_input.generation
             def _worker():
                 optimized = self._optimize_voice_text(text)
                 def deliver():
                     if self._voice_input.is_generation_current(generation):
-                        self._on_voice_optimized_result(optimized)
+                        if side is None:
+                            self._on_voice_optimized_result(optimized)
+                        else:
+                            self._on_voice_optimized_result(optimized, side)
                 bindings.app.wx_call_after_if_alive(self._deliver_voice_event, deliver)
 
             bindings.app.threading.Thread(target=_worker, daemon=True).start()
             return
 
-        self._finalize_voice_input_with_feedback(text)
+        self._finalize_voice_input_with_feedback(text, side)
 
-    def _on_voice_optimized_result(self, text: str):
-        self._finalize_voice_input_with_feedback(text)
+    def _on_voice_optimized_result(self, text: str, side: str | None = None):
+        self._finalize_voice_input_with_feedback(text, side)
 
-    def _finalize_voice_input_with_feedback(self, text: str):
+    def _append_voice_question(self, text: str) -> None:
+        paragraph = text.strip().rstrip("；; \r\n")
+        if not paragraph:
+            self._on_voice_error("未识别到可追加的语音内容")
+            return
+        editor = self.input_edit
+        draft = editor.GetValue()
+        separator = "\n" if draft and not draft.endswith(("\r", "\n")) else ""
+        addition = f"{separator}{paragraph}；\n"
+        editor.SetInsertionPointEnd()
+        editor.WriteText(addition)
+        inserted = editor.GetValue() == draft + addition
+        if inserted:
+            self._notify_accessible_text_update(editor)
+        self._voice_insertion_feedback(text, inserted)
+
+    def _insert_voice_at_caret(self, text: str) -> None:
+        target = foreground_edit_target()
+        if target is None:
+            self._voice_insertion_feedback(text, False)
+            return
+        focused = wx.Window.FindFocus()
+        if (isinstance(focused, wx.TextCtrl) and focused.IsEditable()
+                and int(focused.GetHandle()) == target[1]):
+            begin, end = focused.GetSelection()
+            expected = focused.GetRange(0, begin) + text + focused.GetRange(end, focused.GetLastPosition())
+            focused.WriteText(text)
+            inserted = focused.GetValue() == expected
+            if inserted:
+                self._notify_accessible_text_update(focused)
+            self._voice_insertion_feedback(text, inserted)
+            return
+        generation = self._voice_input.generation
+        try:
+            snapshot = capture_voice_editor(target)
+        except Exception:
+            snapshot = None
+        if snapshot is None:
+            self._voice_insertion_feedback(text, False)
+            return
+
+        def current():
+            return not self._closing and self._voice_input.is_generation_current(generation)
+
+        def worker():
+            try:
+                inserted = insert_and_verify(target, snapshot, text, current)
+            except Exception:
+                inserted = False
+
+            def deliver():
+                if current():
+                    self._voice_insertion_feedback(text, inserted)
+
+            bindings.app.wx_call_after_if_alive(self._deliver_voice_event, deliver)
+
+        bindings.app.threading.Thread(target=worker, daemon=True, name="voice-caret-insert").start()
+
+    def _voice_insertion_feedback(self, text: str, inserted: bool) -> None:
+        if not inserted:
+            self._on_voice_error("当前编辑控件未确认语音输入，文本可能未写入。")
+            return
+        self.SetStatusText("识别完成，已写入")
+        if self._call_later_if_alive(200, self._speak_text_via_screen_reader, text) is None:
+            self._speak_text_via_screen_reader(text)
+
+    def _finalize_voice_input_with_feedback(self, text: str, side: str | None = None):
+        if side == "left":
+            self._append_voice_question(text)
+            return
+        if side == "right":
+            self._insert_voice_at_caret(text)
+            return
         # 顺序：写入焦点 -> 延迟朗读写入内容（结束音效在单击 Ctrl 停止录音时立即播放）
         focus = wx.Window.FindFocus()
         if isinstance(focus, wx.TextCtrl) and focus.IsEditable():

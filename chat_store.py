@@ -12,6 +12,7 @@ from typing import Any, Iterator
 from chat_store_execution import ChatStoreExecutionMixin
 from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
+from context_usage import NATIVE_USAGE_FIELDS
 from execution_projection import canonical_answer_timestamp, should_show_execution_step
 
 
@@ -171,6 +172,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("UPDATE v2_chat_state SET revision=?,execution_sequence=0 WHERE chat_id=?", (revision, owner))
             conn.execute("INSERT INTO read_generations(chat_id,generation) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET generation=excluded.generation", (owner, uuid.uuid4().hex))
             metadata = self._json_dict(chat["metadata_json"])
+            metadata.update(dict.fromkeys(NATIVE_USAGE_FIELDS))
             metadata.update({
                 "openclaw_session_key": "openclaw/main", "openclaw_session_id": "", "openclaw_session_file": "",
                 "openclaw_sync_offset": 0, "openclaw_last_event_id": "", "openclaw_last_synced_at": 0.0,

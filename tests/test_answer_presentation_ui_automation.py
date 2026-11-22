@@ -130,7 +130,8 @@ def test_answer_text_viewer_plain_scratch_reopens_authoritative_markdown(frame):
                 visible = dialog.text_ctrl.GetValue()
                 print(f"DETAIL attempt={attempt} get_value_complete", flush=True)
                 assert "Heading\n\nbold and *literal* and C# \U0001f600" in visible
-                assert "alpha beta link (https://example.test) code" in visible
+                assert "alpha beta link code" in visible
+                assert "https://example.test" not in visible
                 assert "diagram description" in visible
                 assert "- first\n- second" in visible
                 assert "1. one\n2. two" in visible
@@ -627,7 +628,8 @@ def test_review_detail_projection_native_and_cleanup(frame, monkeypatch):
             run_native_for(25)
             visible = dialog.text_ctrl.GetValue()
             assert '1. fallback' in visible
-            assert 'docs (https://example.com/docs)' in visible
+            assert 'docs' in visible
+            assert 'https://example.com/docs' not in visible
             assert 'first\n\nsecond' in visible
             assert '- outer\n  - inner\n- next' in visible
             assert 'a\tb\nc\td' in visible

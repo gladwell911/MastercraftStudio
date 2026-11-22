@@ -718,6 +718,8 @@ class KimiSessionsMixin:
         if usage is not None and usage.source == "kimi":
             chat["context_usage"] = None
         chat["kimi_session_total_tokens"] = None
+        chat.pop("kimi_cache_hits", None)
+        chat.pop("kimi_v2_usage_stamp", None)
         chat.pop("kimi_total_observed_at", None)
         chat.pop("kimi_usage_cache_owner", None)
         chat["kimi_context_error"] = False
@@ -1235,6 +1237,15 @@ class KimiSessionsMixin:
         except Exception:
             return
         event = CodexEvent(**kimi_event_to_payload(kimi_event))
+        if event.type == "kimi_v2_usage":
+            chat_id = self._known_kimi_event_chat_id(event)
+            target = self._chat_information_owner_for_id(chat_id) if chat_id else None
+            if target is not None and is_kimi_model(target[1]):
+                data = event.data
+                owner = self._information_cache_owner(target[0], "kimi")
+                self._call_after_if_alive(self._apply_live_kimi_usage, chat_id,
+                                          self._event_thread_id(event), data.get("kind"), data.get("usage"), owner)
+            return
         if (event.data or {}).get("source_kind") == "interaction":
             self._receive_kimi_interaction(event)
             return

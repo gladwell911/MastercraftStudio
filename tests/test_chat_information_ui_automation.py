@@ -62,7 +62,7 @@ def test_mobile_information_reads_archived_owner_without_switching_desktop(frame
     desktop, target, published, reads, ready = _scoped_information_fixture(frame, monkeypatch)
     status, snapshot = _information_command(frame)
     assert status == 200 and snapshot["rows"] == frame._chat_information_rows(target, "codex/main")
-    assert len(snapshot["rows"]) == 4 and ready.wait(2)
+    assert len(snapshot["rows"]) == 6 and ready.wait(2)
     read = reads[0]
     payload = dict(read, native_usage={"session_total_tokens": 700,
         "context_usage": {"source": "codex", "used_tokens": 100, "context_window": 1000},
@@ -153,7 +153,7 @@ def test_mobile_kimi_without_session_still_reads_quota(frame, wx_app, monkeypatc
         time.sleep(.01)
     assert calls == ["start", "auth"]
     assert not frame._information_subscriptions().requests
-    assert "此登录方式不适用" in published[-1]["rows"][2]
+    assert "此登录方式不适用" in published[-1]["rows"][4]
     assert frame._current_chat_state is desktop and frame._chat_information_dialog is None
 
 
@@ -215,7 +215,7 @@ def test_mobile_kimi_adopts_usage_and_quota_when_desktop_window_closes(frame, wx
         {"session": {"usage": {"input_tokens": 8, "output_tokens": 2}}}, False)
     frame._apply_kimi_quota(17, identity, {"kind": "not_applicable"}, False)
     assert target["kimi_session_total_tokens"] == 10
-    assert "此登录方式不适用" in published[-1]["rows"][2]
+    assert "此登录方式不适用" in published[-1]["rows"][4]
     assert not frame._information_subscriptions().requests
     assert not frame._scoped_kimi_quota_requests and frame._chat_information_dialog is None
 
@@ -558,7 +558,7 @@ def test_epic1_quota_error_or_first_identity_does_not_delete_usage(frame, wx_app
     assert chat["kimi_verified_account_id"] == "A"
     assert list(dialog.information_list.GetStrings())[:2] == before
     if not first_binding:
-        assert "查询失败" in dialog.information_list.GetString(2)
+        assert "查询失败" in dialog.information_list.GetString(4)
     dialog.Close()
     wx_app.Yield()
 
@@ -612,7 +612,7 @@ def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkey
     wx_app.Yield()
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
-    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetSelection(4)
     dialog.information_list.SetFocus()
     identity = dialog.identity
     frame._kimi_quota_request = (1, identity)
@@ -621,9 +621,9 @@ def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkey
             "limit5h": {"usedRatio": .25, "resetAt": "2026-09-27T12:00:00Z"},
             "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
     rows = list(dialog.information_list.GetStrings())
-    assert "已用 25.0%" in rows[2] and "本地重置" in rows[2]
-    assert "已用 50.0%" in rows[3] and "距重置" in rows[3]
-    assert dialog.information_list.GetSelection() == 2
+    assert "已用 25.0%" in rows[4] and "本地重置" in rows[4]
+    assert "已用 50.0%" in rows[5] and "距重置" in rows[5]
+    assert dialog.information_list.GetSelection() == 4
     assert main.wx.Window.FindFocus() is dialog.information_list
     chat["kimi_session_id"] = "session-new"
     frame._apply_kimi_quota(1, identity, None, True)
@@ -632,7 +632,7 @@ def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkey
     wx_app.Yield()
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
-    assert "上次更新于" in dialog.information_list.GetStrings()[2]
+    assert "上次更新于" in dialog.information_list.GetStrings()[4]
     dialog.Close()
     wx_app.Yield()
 
@@ -689,21 +689,21 @@ def test_kimi_quota_account_result_replaces_previous_account(frame, wx_app):
             "quota": {"usages": {"limit5h": {"usedRatio": ratio}}}}, False)
     assert chat["kimi_quota_owner"] == "user-2"
     assert chat["kimi_verified_account_id"] == "user-2"
-    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(2)
-    assert "上次更新于" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(4)
+    assert "上次更新于" in frame._chat_information_dialog.information_list.GetString(4)
     chat["kimi_verified_account_id"] = "user-3"
     frame._refresh_chat_information(chat)
-    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(4)
     frame._kimi_quota_request = (3, identity)
     frame._apply_kimi_quota(2, identity, {"kind": "ok", "_account_id": "user-2",
         "quota": {"usages": {"limit5h": {"usedRatio": .9}}}}, False)
     assert chat["kimi_verified_account_id"] == "user-3"
-    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(4)
     same_payload = chat["kimi_quota_payload"]
     frame._kimi_quota_request = (4, identity)
     frame._apply_kimi_quota(4, identity, same_payload, False)
     assert chat["kimi_verified_account_id"] == "user-2"
-    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "70.0%" in frame._chat_information_dialog.information_list.GetString(4)
     frame._chat_information_dialog.Close()
     wx_app.Yield()
 
@@ -742,12 +742,12 @@ def test_kimi_quota_http_401_is_unlogged_and_reopen_clears_cache(frame, wx_app, 
     monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: Client())
     frame._request_kimi_quota(chat, "kimi/main")
     wx_app.Yield()
-    assert "未登录" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "未登录" in frame._chat_information_dialog.information_list.GetString(4)
     frame._chat_information_dialog.Close()
     wx_app.Yield()
     monkeypatch.setattr(main.ChatFrame, "_request_kimi_quota", lambda *_a, **_k: None)
     assert frame._show_chat_information()
-    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(2)
+    assert "暂不可用" in frame._chat_information_dialog.information_list.GetString(4)
     frame._chat_information_dialog.Close()
     wx_app.Yield()
 
@@ -794,7 +794,7 @@ def test_kimi_quota_dialog_timer_account_switch_rejects_late_a_without_session(f
     wx_app.Yield()
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
-    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetSelection(4)
     dialog.information_list.SetFocus()
     assert len(jobs) == 1
     jobs.pop(0)()
@@ -810,8 +810,8 @@ def test_kimi_quota_dialog_timer_account_switch_rejects_late_a_without_session(f
     callback_a(*args_a)
     wx_app.Yield()
     assert frame._current_chat_state["kimi_quota_owner"] == "B"
-    assert "70.0%" in dialog.information_list.GetString(2)
-    assert dialog.information_list.GetSelection() == 2
+    assert "70.0%" in dialog.information_list.GetString(4)
+    assert dialog.information_list.GetSelection() == 4
     assert main.wx.Window.FindFocus() is dialog.information_list
     assert "status" not in calls and "snapshot" not in calls
     assert calls.count("usage") == 2
@@ -850,7 +850,7 @@ def test_kimi_quota_real_thread_delivers_to_wx_dialog(frame, wx_app, monkeypatch
     wx_app.Yield()
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
-    dialog.information_list.SetSelection(2)
+    dialog.information_list.SetSelection(4)
     dialog.information_list.SetFocus()
 
     def pump_until_owner(expected):
@@ -862,13 +862,13 @@ def test_kimi_quota_real_thread_delivers_to_wx_dialog(frame, wx_app, monkeypatch
         pytest.fail(f"quota callback for {expected} was not delivered")
 
     pump_until_owner("A")
-    assert "20.0%" in dialog.information_list.GetString(2)
+    assert "20.0%" in dialog.information_list.GetString(4)
     account[0] = "B"
     dialog._on_refresh_timer(None)
     pump_until_owner("B")
-    assert "70.0%" in dialog.information_list.GetString(2)
+    assert "70.0%" in dialog.information_list.GetString(4)
     assert calls == ["usage", "usage"]
-    assert dialog.information_list.GetSelection() == 2
+    assert dialog.information_list.GetSelection() == 4
     assert main.wx.Window.FindFocus() is dialog.information_list
     dialog.Close()
     wx_app.Yield()
@@ -893,21 +893,21 @@ def test_kimi_seven_day_countdown_timer_changes_only_visible_text(frame, wx_app,
     frame._current_chat_state = chat
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
-    dialog.information_list.SetSelection(3)
+    dialog.information_list.SetSelection(5)
     dialog.information_list.SetFocus()
     identity = dialog.identity
     frame._kimi_quota_request = (1, identity)
     frame._apply_kimi_quota(1, identity, {"kind": "ok", "_account_id": "A", "quota": {"usages": {
         "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
-    first = dialog.information_list.GetString(3)
+    first = dialog.information_list.GetString(5)
     calls = []
     monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a: calls.append("quota"))
     clock[0] = datetime(2029, 12, 31, 22, 1, tzinfo=timezone.utc)
     dialog._on_refresh_timer(None)
-    second = dialog.information_list.GetString(3)
+    second = dialog.information_list.GetString(5)
     assert first != second and "1 小时 59 分钟" in second
     assert calls == ["quota"]
-    assert dialog.information_list.GetSelection() == 3
+    assert dialog.information_list.GetSelection() == 5
     assert main.wx.Window.FindFocus() is dialog.information_list
     dialog.Close()
     wx_app.Yield()
@@ -939,7 +939,7 @@ def test_kimi_identical_quota_reply_updates_query_time_without_same_minute_repai
         now[0] += 60
         frame._kimi_quota_request = (3, identity)
         frame._apply_kimi_quota(3, identity, payload, False)
-        assert "上次更新于" in dialog.information_list.GetString(2)
+        assert "上次更新于" in dialog.information_list.GetString(4)
         assert list(dialog.information_list.GetStrings()) != first_rows
         now[0] += 60
         frame._kimi_quota_request = (4, identity)
@@ -1042,7 +1042,7 @@ def test_kimi_quota_dialog_auth_states_without_session(frame, wx_app, monkeypatc
     frame._current_chat_state = {"id": "chat-q", "model": "kimi/main"}
     assert frame._show_chat_information()
     wx_app.Yield()
-    assert expected in frame._chat_information_dialog.information_list.GetString(2)
+    assert expected in frame._chat_information_dialog.information_list.GetString(4)
     frame._chat_information_dialog.Close()
     wx_app.Yield()
 
@@ -1066,7 +1066,7 @@ def test_codex_chat_information_list_arrows_and_escape_restore_focus(frame, wx_a
     wx_app.Yield()
     assert main.wx.Window.FindFocus() is dialog.information_list
     assert dialog.information_list.GetStrings()[0] == "当前上下文：已用 4.6%（11,891 / 258,400 token）"
-    assert dialog.information_list.GetCount() == 4
+    assert dialog.information_list.GetCount() == 6
 
     _send_key(dialog.information_list, 0x28)
     wx_app.Yield()
@@ -1276,12 +1276,12 @@ def test_codex_total_and_weekly_quota_rows_ignore_stale_reply(frame, wx_app, mon
              "rate_limits": {"rateLimits": {"limitId": "codex", "secondary": {
                  "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}}}
     frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-old", "payload": stale})
-    assert dialog.information_list.GetString(3) == "Codex 周额度：暂不可用"
+    assert dialog.information_list.GetString(5) == "Codex 周额度：暂不可用"
 
     fresh = dict(stale, generation=2)
     frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-new", "payload": fresh})
-    assert "剩余 75.0%" in dialog.information_list.GetString(3)
-    assert "本地重置" in dialog.information_list.GetString(3)
+    assert "剩余 75.0%" in dialog.information_list.GetString(5)
+    assert "本地重置" in dialog.information_list.GetString(5)
     assert dialog.information_list.GetSelection() == 1
     assert main.wx.Window.FindFocus() is dialog.information_list
 
@@ -1327,13 +1327,13 @@ def test_codex_information_account_states_and_identity_switch(frame, wx_app, mon
                "account": {"account": {"type": "apiKey", "id": "account-1"}},
                "rate_limits_error": "not available"}
     frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-1", "payload": payload})
-    assert dialog.information_list.GetString(3) == "Codex 周额度：API key 账号不适用"
+    assert dialog.information_list.GetString(5) == "Codex 周额度：API key 账号不适用"
 
     frame._chat_information_request = ("req-2", 2, identity)
     payload = dict(payload, generation=2, account={"account": None}, rate_limits_error="")
     frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-2", "payload": payload})
-    assert dialog.information_list.GetString(2) == "Codex 账号：未登录"
-    assert dialog.information_list.GetString(3) == "Codex 周额度：未登录"
+    assert dialog.information_list.GetString(4) == "Codex 账号：未登录"
+    assert dialog.information_list.GetString(5) == "Codex 周额度：未登录"
 
     current_rows = list(dialog.information_list.GetStrings())
     frame._chat_information_request = ("req-3", 3, dialog.identity)
@@ -1391,13 +1391,13 @@ def test_first_codex_information_read_starts_worker_off_ui_thread(frame, wx_app,
     assert started.wait(1)
     assert calls[0] is not threading.main_thread()
     assert main.wx.Window.FindFocus() is dialog.information_list
-    assert dialog.information_list.GetString(3) == "Codex 周额度：暂不可用"
+    assert dialog.information_list.GetString(5) == "Codex 周额度：暂不可用"
     release.set()
     deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and "剩余 80.0%" not in dialog.information_list.GetString(3):
+    while time.monotonic() < deadline and "剩余 80.0%" not in dialog.information_list.GetString(5):
         wx_app.Yield()
         time.sleep(0.01)
-    assert "剩余 80.0%" in dialog.information_list.GetString(3)
+    assert "剩余 80.0%" in dialog.information_list.GetString(5)
     assert main.wx.Window.FindFocus() is dialog.information_list
     dialog.Close()
     wx_app.Yield()

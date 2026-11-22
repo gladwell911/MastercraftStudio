@@ -303,6 +303,9 @@ class KimiServerWebSocketMixin:
         if self.protocol_version == 2 and isinstance(message, dict) and message.get("type") in {"transcript.reset", "transcript.ops"}:
             self._consume_v2(message, ws=ws, generation=generation)
             return True
+        if self.protocol_version == 2 and isinstance(message, dict) and message.get("type") == "usage":
+            self._consume_v2_usage_window(message, ws=ws, generation=generation)
+            return True
         if self.protocol_version == 2 and isinstance(message, dict) and message.get("type") == "interaction":
             session_id = _str(message.get("session_id"))
             interaction_id = _str(message.get("interaction_id"))
@@ -472,10 +475,15 @@ class KimiServerWebSocketMixin:
         if self.protocol_version == 2 and requested_subscriptions and not isinstance(accepted_value, list):
             raise KimiServerError("Kimi subscribe_v2 ACK missing accepted sessions")
         if self.protocol_version == 2:
-            for sid in requested_subscriptions & accepted:
-                self._v2_ready_sessions.add(sid)
-                self._v2_ready_generations[sid] = self._ws_generation
-                self._v2_subscription_events.setdefault(sid, threading.Event()).set()
+            with self._lifecycle_lock:
+                if request_generation == self._ws_generation:
+                    for sid in requested_subscriptions & accepted:
+                        self._v2_ready_sessions.add(sid)
+                        self._v2_ready_generations[sid] = self._ws_generation
+                        self._v2_subscription_events.setdefault(sid, threading.Event()).set()
+                        if sid in self._v2_usage_windows:
+                            self._emit_v2_usage(sid, "status", self._v2_usage_windows[sid])
+                        self._record_v2_transcript_usage(sid, self._v2_transcripts.get(sid))
         rejected = requested_subscriptions & not_found
         if requested_subscriptions and isinstance(accepted_value, list):
             rejected.update(requested_subscriptions - accepted)

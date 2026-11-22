@@ -5,7 +5,10 @@ import wx
 from chat_information import ChatInformationSubscriptions
 from claudecode_client import is_claudecode_model
 from codex_client import codex_model_label_for_model, is_codex_model
-from context_usage import context_usage_from_dict, format_context_usage_label
+from context_usage import (
+    context_usage_from_dict, format_cache_hit, format_context_usage_label,
+    format_session_total_tokens, native_token_count,
+)
 from datetime import timezone
 from kimi_server_client import KimiServerError, is_kimi_model, kimi_snapshot_total_tokens
 from mc_frame_dialogs import ChatInformationDialog
@@ -20,7 +23,8 @@ class ChatInformationMixin:
         chat = self._current_chat_state if self.view_mode != "history" else self._find_archived_chat(self.view_history_id)
         if not isinstance(chat, dict):
             return None
-        model = bindings.app.normalize_model_id(str(chat.get("model") or self.selected_model or ""), default="")
+        turn_owner = chat if self.view_mode == "history" else {**chat, "turns": self.active_session_turns}
+        model = self._model_for_chat_selection(turn_owner) or bindings.app.normalize_model_id(self.selected_model, default="")
         if not (is_codex_model(model) or is_kimi_model(model)):
             return None
         return chat, model
@@ -31,7 +35,7 @@ class ChatInformationMixin:
             chat = self._find_archived_chat(chat_id)
         if not isinstance(chat, dict):
             return None
-        model = bindings.app.normalize_model_id(str(chat.get("model") or ""), default="")
+        model = self._model_for_chat_selection(chat)
         return (chat, model) if is_codex_model(model) or is_kimi_model(model) else None
 
     def _information_subscriptions(self) -> ChatInformationSubscriptions:
@@ -74,11 +78,11 @@ class ChatInformationMixin:
                 context_row = f"当前上下文：{usage.used_tokens:,} token，窗口未知"
         else:
             context_row = "当前上下文：查询失败" if is_kimi_model(model) and chat.get("kimi_context_error") else "当前上下文：暂不可用"
-        total = chat.get("codex_session_total_tokens") if is_codex_model(model) else chat.get("kimi_session_total_tokens")
+        provider = "codex" if is_codex_model(model) else "kimi"
+        total = native_token_count(chat.get(f"{provider}_session_total_tokens"))
         total_row = f"会话累计 token：{total:,}" if isinstance(total, int) and total >= 0 else (
             "会话累计 token：查询失败" if is_kimi_model(model) and chat.get("kimi_snapshot_error") else "会话累计 token：暂不可用")
         rows = [context_row, total_row]
-        provider = "codex" if is_codex_model(model) else "kimi"
         for index, stamp in ((0, usage.updated_at if usage else None),
                              (1, chat.get(f"{provider}_total_observed_at"))):
             error = chat.get(f"{provider}_context_error" if index == 0 else f"{provider}_snapshot_error")
@@ -89,6 +93,12 @@ class ChatInformationMixin:
                 rows[index] = ("当前上下文" if index == 0 else "会话累计 token") + "：查询失败"
         if isinstance(total, int) and f"{provider}_total_observed_at" in chat and not chat.get(f"{provider}_total_observed_at"):
             rows[1] += "（缓存，观测时间未知）"
+        hits = chat.get(f"{provider}_cache_hits")
+        hits = hits if isinstance(hits, dict) else {}
+        rows.extend([
+            f"缓存命中：{format_cache_hit(hits.get('last'))}",
+            f"累计缓存命中：{format_cache_hit(hits.get('total'))}",
+        ])
         if is_codex_model(model):
             owner_id = str(chat.get("codex_account_id") or "").strip()
             if str(chat.get("codex_chat_information_account_owner") or "").strip() == owner_id:
@@ -174,14 +184,16 @@ class ChatInformationMixin:
         scoped = getattr(self, "_scoped_chat_information", None)
         if scoped is not None:
             scoped.changed(chat)
-        dialog = getattr(self, "_chat_information_dialog", None)
-        if dialog is None or dialog.IsBeingDeleted():
-            return
         owner = self._visible_chat_information_owner()
         if owner is None:
             return
         visible_chat, model = owner
         if chat is not None and chat is not visible_chat:
+            return
+        if hasattr(self, "answer_meta"):
+            self._refresh_context_usage_header_rows()
+        dialog = getattr(self, "_chat_information_dialog", None)
+        if dialog is None or dialog.IsBeingDeleted():
             return
         if self._chat_information_identity(visible_chat, model) != dialog.identity:
             return
@@ -326,6 +338,10 @@ class ChatInformationMixin:
                 if observed_at is not None:
                     usage["updated_at"] = observed_at
                 self._set_chat_context_usage(chat, usage)
+            hits = native.get("cache_hits")
+            if isinstance(hits, dict):
+                chat["codex_cache_hits"] = hits
+                chat["codex_usage_cache_owner"] = self._information_cache_owner(chat, "codex")
             total = native.get("session_total_tokens")
             if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
                 chat["codex_session_total_tokens"] = total
@@ -333,6 +349,8 @@ class ChatInformationMixin:
                 chat["codex_usage_cache_owner"] = self._information_cache_owner(chat, "codex")
             chat["codex_context_error"] = bool(payload.get("usage_error"))
             chat["codex_snapshot_error"] = bool(payload.get("usage_error"))
+            if isinstance(hits, dict) or isinstance(total, int):
+                self._defer_codex_state_save()
         if payload.get("context_only"):
             self._refresh_chat_information(chat)
             if scoped is None:
@@ -424,7 +442,11 @@ class ChatInformationMixin:
                     self._call_after_if_alive(self._apply_kimi_chat_information_result,
                                               identity[0], generation, identity, kind, None, True)
                 return
-            for kind, getter in (("status", client.get_status), ("snapshot", client.get_snapshot)):
+            if getattr(client, "protocol_version", 1) == 2:
+                getters = (("status", client.get_v2_usage_context), ("snapshot", client.get_v2_usage_totals))
+            else:
+                getters = (("status", client.get_status), ("snapshot", client.get_snapshot))
+            for kind, getter in getters:
                 if kind not in kinds:
                     continue
                 try:
@@ -568,6 +590,9 @@ class ChatInformationMixin:
         request = self._kimi_information_requests.get(chat_id)
         if not isinstance(request, dict) or request.get("generation") != generation or request.get("identity") != identity:
             return
+        if (isinstance(payload, dict) and "socket_generation" in payload
+                and not self._current_kimi_usage_socket(identity[2], payload)):
+            failed, payload = True, None
         if (request.get("scoped") or request.get("scoped_observed")) and not self._information_subscriptions().interested(chat_id):
             self._kimi_information_requests.pop(chat_id, None)
             self._information_subscriptions().requests.pop(chat_id, None)
@@ -604,12 +629,18 @@ class ChatInformationMixin:
                 "max_context_tokens": (payload or {}).get("max_context_tokens", (payload or {}).get("maxContextTokens")),
             })
             if usage is not None:
+                if "socket_generation" in (payload or {}):
+                    usage["protocol"] = 2
                 changed = self._set_chat_context_usage(chat, usage)
             if bool(chat.get("kimi_context_error")) != bool(failed):
                 chat["kimi_context_error"] = bool(failed)
                 changed = True
         elif kind == "snapshot":
-            total = None if failed else kimi_snapshot_total_tokens(payload)
+            if not failed and isinstance(payload, dict) and "socket_generation" in payload:
+                changed = self._set_kimi_v2_usage_totals(chat, payload)
+                total = None
+            else:
+                total = None if failed else kimi_snapshot_total_tokens(payload)
             if total is not None and chat.get("kimi_session_total_tokens") != total:
                 chat["kimi_session_total_tokens"] = total
                 changed = True
@@ -637,6 +668,66 @@ class ChatInformationMixin:
                         pending["usage_done"] = True
                         if pending["context_only"] or pending.get("quota_done"):
                             subscriptions.finished(chat_id, pending)
+        if changed:
+            self._refresh_chat_information(chat)
+            self._defer_codex_state_save()
+
+    def _current_kimi_usage_socket(self, session_id: str, payload: dict) -> bool:
+        client = self._kimi_client
+        return bool(client and client.is_current_v2_usage(
+            session_id, payload.get("socket_generation"), payload.get("usage_client"),
+        ) and ("scan_generation" not in payload or client.is_current_v2_usage_scan(
+            session_id, payload["scan_generation"],
+        )))
+
+    def _set_kimi_v2_usage_totals(self, chat: dict, payload: dict) -> bool:
+        socket = (payload["usage_client"], payload["socket_generation"])
+        stamp = (socket, payload["serial"])
+        previous = chat.get("kimi_v2_usage_stamp")
+        if previous is not None and previous[0] == socket and previous[1] > stamp[1]:
+            return False
+        chat["kimi_v2_usage_stamp"] = stamp
+        total = native_token_count(payload.get("session_total_tokens"))
+        hits = payload.get("cache_hits")
+        owner = self._information_cache_owner(chat, "kimi")
+        changed = (total != chat.get("kimi_session_total_tokens")
+                   or hits != chat.get("kimi_cache_hits") or owner != chat.get("kimi_usage_cache_owner")
+                   or bool(chat.get("kimi_snapshot_error")))
+        if changed:
+            chat["kimi_session_total_tokens"] = total
+            chat["kimi_cache_hits"] = hits
+            chat["kimi_usage_cache_owner"] = owner
+            chat["kimi_total_observed_at"] = bindings.app.time.time()
+            chat["kimi_snapshot_error"] = False
+        return changed
+
+    def _apply_live_kimi_usage(self, chat_id: str, session_id: str, kind: str, payload: dict, owner: tuple) -> None:
+        if not isinstance(payload, dict) or not self._current_kimi_usage_socket(session_id, payload):
+            return
+        target = self._chat_information_owner_for_id(chat_id)
+        if target is None or not is_kimi_model(target[1]):
+            return
+        chat, model = target
+        if (self._chat_information_identity(chat, model)[2] != session_id
+                or self._information_cache_owner(chat, "kimi") != owner):
+            return
+        self._validate_information_cache_owner(chat, "kimi")
+        changed = False
+        if kind == "status":
+            usage = self._kimi_context_usage_from_values(payload)
+            if usage is not None:
+                usage["protocol"] = 2
+            previous = chat.get("context_usage")
+            if usage is not None and (not isinstance(previous, dict)
+                    or chat.get("kimi_context_error")
+                    or any(previous.get(key) != value for key, value in usage.items() if key != "updated_at")):
+                chat["kimi_context_revision"] = int(chat.get("kimi_context_revision") or 0) + 1
+                changed = self._set_chat_context_usage(chat, usage)
+        elif kind == "snapshot":
+            changed = self._set_kimi_v2_usage_totals(chat, payload)
+        elif kind == "snapshot_invalidated" and not chat.get("kimi_snapshot_error"):
+            chat["kimi_snapshot_error"] = True
+            changed = True
         if changed:
             self._refresh_chat_information(chat)
             self._defer_codex_state_save()
@@ -813,7 +904,7 @@ class ChatInformationMixin:
         return selected
 
     def _append_context_usage_row(self, rows: list[str] | None = None, metas: list[tuple] | None = None) -> None:
-        label = format_context_usage_label(self._active_chat_context_usage())
+        label = self._answer_usage_header_label()
         meta = ("context_usage", -1, label, "")
         if rows is not None and metas is not None:
             rows.append(label)
@@ -825,7 +916,20 @@ class ChatInformationMixin:
     def _append_current_model_row(self, rows: list[str] | None = None, metas: list[tuple] | None = None) -> None:
         return
 
+    def _answer_usage_header_label(self) -> str:
+        owner = self._visible_chat_information_owner()
+        if owner is None:
+            return format_context_usage_label(self._active_chat_context_usage())
+        chat, model = owner
+        provider = "codex" if is_codex_model(model) else "kimi"
+        cached_owner = chat.get(f"{provider}_usage_cache_owner")
+        if cached_owner is not None and tuple(cached_owner) != self._information_cache_owner(chat, provider):
+            return format_session_total_tokens(None)
+        return format_session_total_tokens(chat.get(f"{provider}_session_total_tokens"))
+
     def _should_show_context_usage_row(self, label: str | None = None, turns: list[dict] | None = None) -> bool:
+        if self._visible_chat_information_owner() is not None:
+            return True
         usage_label = str(label if label is not None else format_context_usage_label(self._active_chat_context_usage()) or "")
         if usage_label != "暂无":
             return True
@@ -849,7 +953,7 @@ class ChatInformationMixin:
             return False
         handled = False
         changed = False
-        context_label = format_context_usage_label(self._active_chat_context_usage())
+        context_label = self._answer_usage_header_label()
         labels = {
             "context_usage": context_label,
         }
@@ -868,8 +972,14 @@ class ChatInformationMixin:
                 current = ""
             if current == label and len(meta) >= 3 and meta[2] == label:
                 continue
+            selected_idx = self.answer_list.GetSelection()
             try:
-                self.answer_list.SetString(row, label)
+                if hasattr(self, "answer_list_model"):
+                    self.answer_list_model.update_label(self._answer_row_id(meta), label)
+                else:
+                    self.answer_list.SetString(row, label)
+                if selected_idx != wx.NOT_FOUND and self.answer_list.GetSelection() != selected_idx:
+                    self.answer_list.SetSelection(selected_idx)
             except Exception:
                 continue
             self.answer_meta[row] = (kind, -1, label, "")
@@ -882,9 +992,11 @@ class ChatInformationMixin:
             else:
                 self.answer_list.Insert(context_label, 0)
             self.answer_meta.insert(0, meta)
-            if selected_idx in {wx.NOT_FOUND, 0}:
+            if self._active_answer_row_index >= 0:
+                self._active_answer_row_index += 1
+            if selected_idx != wx.NOT_FOUND:
                 try:
-                    self.answer_list.SetSelection(0)
+                    self.answer_list.SetSelection(selected_idx + 1)
                 except Exception:
                     pass
             handled = True
@@ -928,7 +1040,10 @@ class ChatInformationMixin:
                 chat[f"{source}_usage_cache_owner"] = self._information_cache_owner(chat, source)
             if source in {"codex", "kimi"}:
                 chat[f"{source}_context_error"] = False
-            if not self._context_usage_payload_changed(chat.get("context_usage"), usage):
+            previous = chat.get("context_usage")
+            previous = previous if isinstance(previous, dict) else {}
+            if (not self._context_usage_payload_changed(previous, usage)
+                    and previous.get("protocol") == usage.get("protocol")):
                 return False
             chat["context_usage"] = usage
             self._invalidate_remote_state_cache()
@@ -945,7 +1060,14 @@ class ChatInformationMixin:
             self._pending_context_usage_by_turn[self._context_usage_pending_key_from_chat(target_chat, turn_idx)] = pending
         if self._is_authoritative_context_usage_model(used_model):
             if isinstance(target_chat, dict):
-                target_chat.pop("context_usage", None)
+                current = target_chat.get("context_usage")
+                current = current if isinstance(current, dict) else {}
+                owner = target_chat.get("kimi_usage_cache_owner")
+                keep_v2 = (is_kimi_model(used_model) and current.get("source") == "kimi"
+                           and current.get("protocol") == 2 and owner is not None
+                           and tuple(owner) == self._information_cache_owner(target_chat, "kimi"))
+                if not keep_v2:
+                    target_chat.pop("context_usage", None)
             return
         self._schedule_context_usage_estimate(target_chat, target_turns, turn_idx, used_model)
 

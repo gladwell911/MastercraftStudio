@@ -33,7 +33,7 @@ def test_local_ready_and_gui_messages_while_asr_connection_is_gated(frame, wx_ap
         frame._on_global_ctrl_keyup(False, 'left')
         _pump_until(wx_app, lambda: cues == ['ready', 'stop'])
         rig.connect.set()
-        _pump_until(wx_app, lambda: frame.input_edit.GetValue() == rig.text)
+        _pump_until(wx_app, lambda: frame.input_edit.GetValue() == f"{rig.text}；\n")
         assert spoken == [rig.text]
     finally:
         c.shutdown()
@@ -94,9 +94,9 @@ def test_optimize_worker_gui_delivery_respects_generation(frame, wx_app, monkeyp
     monkeypatch.setattr(main, 'wx_call_after_if_alive', dispatch)
     monkeypatch.setattr(frame, '_optimize_voice_text', optimize)
     original_insert = frame._finalize_voice_input_with_feedback
-    def insert(text):
+    def insert(text, side=None):
         insertions.append(text)
-        original_insert(text)
+        original_insert(text, side)
     monkeypatch.setattr(frame, '_finalize_voice_input_with_feedback', insert)
     monkeypatch.setattr(frame, '_speak_text_via_screen_reader', lambda *_: None)
     monkeypatch.setattr(frame, '_call_later_if_alive', lambda *_: object())

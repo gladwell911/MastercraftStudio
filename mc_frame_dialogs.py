@@ -148,7 +148,7 @@ class AnswerTextViewerDialog(wx.Dialog):
         self.continue_button.Enable(payload is not None and callable(on_continue))
 
     def _set_answer_display_text(self) -> None:
-        display_text = self._display_prefix + answer_detail_plain_text(self.canonical_text).lstrip("\r\n")
+        display_text = self._display_prefix + answer_detail_plain_text(self.canonical_text, ordinary=True).lstrip("\r\n")
         self.text_ctrl.ChangeValue(display_text)
         self._display_marker_offset = 0
         self._scratch_previous_text = display_text

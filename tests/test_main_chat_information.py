@@ -59,7 +59,7 @@ def test_remote_new_chat_from_history_clears_context_usage_for_model_variants(fr
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == ("累计暂无" if model == "codex/main" else "暂无")
 
 
 def test_on_done_uses_worker_context_usage_for_regular_model(frame):
@@ -93,6 +93,9 @@ def test_on_done_preserves_selected_context_usage_row_when_consuming_pending_usa
         {"question": "q", "answer_md": main.REQUESTING_TEXT, "model": "openai/gpt-5.2", "created_at": 1.0}
     ]
     frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns}
+    frame._current_chat_state["context_usage"] = {
+        "used_tokens": 1000, "context_window": 128000, "source": "api",
+    }
     frame._pending_context_usage_by_turn = {
         ("chat-current", 0): {
             "used_tokens": 1500,
@@ -241,6 +244,46 @@ def test_kimi_context_usage_keeps_used_tokens_when_window_missing(frame):
     )) is None
 
 
+def test_kimi_live_usage_fences_account_and_preserves_verified_idle_snapshot(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "kimi-context-owner"
+    chat = frame._current_chat_state
+    chat.update(id=frame.active_chat_id, model="kimi/main", kimi_session_id="session",
+                kimi_verified_account_id="A")
+    monkeypatch.setattr(frame, "_current_kimi_usage_socket", lambda *_: True)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    owner_a = frame._information_cache_owner(chat, "kimi")
+    chat["kimi_verified_account_id"] = "B"
+    usage = {"context_tokens": 400, "max_context_tokens": 1000}
+    frame._apply_live_kimi_usage(frame.active_chat_id, "session", "status", usage, owner_a)
+    assert not chat.get("context_usage")
+    owner_b = frame._information_cache_owner(chat, "kimi")
+    frame._apply_live_kimi_usage(frame.active_chat_id, "session", "status", usage, owner_b)
+    frame._refresh_context_usage_after_done(chat, [], 0, "kimi/main")
+    assert chat["context_usage"]["used_tokens"] == 400
+    chat["kimi_information_generation"] = 1
+    frame._refresh_context_usage_after_done(chat, [], 0, "kimi/main")
+    assert "context_usage" not in chat
+
+
+def test_codex_repeated_total_refreshes_once_when_snapshot_recovers(frame, monkeypatch):
+    frame.active_chat_id = frame.current_chat_id = "codex-total-owner"
+    chat = frame._current_chat_state
+    chat.update(id=frame.active_chat_id, model="codex/main", codex_thread_id="thread",
+                codex_turn_id="turn", codex_session_total_tokens=400, codex_snapshot_error=True)
+    frame.active_session_turns = chat["turns"] = [
+        {"model": "codex/main", "codex_thread_id": "thread", "codex_turn_id": "turn"},
+    ]
+    refreshes = []
+    monkeypatch.setattr(frame, "_refresh_chat_information", refreshes.append)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    event = main.CodexEvent(type="token_count", thread_id="thread", turn_id="turn",
+                            data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 400})
+    frame._on_codex_event_for_chat(frame.active_chat_id, event)
+    frame._on_codex_event_for_chat(frame.active_chat_id, event)
+    assert chat["codex_snapshot_error"] is False
+    assert refreshes == [chat]
+
+
 def test_codex_weekly_quota_uses_only_codex_10080_minute_window():
     parse = main.ChatFrame._codex_weekly_quota_label
     assert "剩余 75.0%" in parse({"rateLimits": {"limitId": "codex", "primary": {
@@ -276,7 +319,7 @@ def test_codex_without_pending_usage_clears_stale_context_usage(frame):
     frame._on_done(0, "codex answer", "", "codex/main", "", "chat-current")
 
     assert "context_usage" not in frame._current_chat_state
-    assert "暂无" in list(frame.answer_list.GetStrings())
+    assert frame.answer_list.GetString(0) == "累计暂无"
 
 
 def test_focus_latest_answer_ignores_context_usage_row(frame, monkeypatch):

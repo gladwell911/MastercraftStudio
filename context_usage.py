@@ -7,6 +7,48 @@ from typing import Any
 
 DEFAULT_CONTEXT_WINDOW = 128000
 
+NATIVE_USAGE_FIELDS = ("context_usage",) + tuple(
+    f"{provider}_{key}"
+    for provider in ("codex", "kimi")
+    for key in ("session_total_tokens", "total_observed_at", "usage_cache_owner",
+                "cache_hits", "context_error", "snapshot_error")
+)
+
+
+def native_token_count(value: Any) -> int | None:
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def cache_token_counts(input_tokens: Any, cached_tokens: Any) -> dict | None:
+    total, cached = native_token_count(input_tokens), native_token_count(cached_tokens)
+    if total is None or cached is None or cached > total:
+        return None
+    return {"input_tokens": total, "cached_tokens": cached}
+
+
+def format_cache_hit(counts: dict | None) -> str:
+    if isinstance(counts, dict):
+        valid = cache_token_counts(counts.get("input_tokens"), counts.get("cached_tokens"))
+        if valid and valid["input_tokens"] > 0:
+            return f"{valid['cached_tokens'] / valid['input_tokens']:.1%}"
+    return "暂不可用"
+
+
+def format_session_total_tokens(value: Any) -> str:
+    value = native_token_count(value)
+    if value is None:
+        return "累计暂无"
+    whole, remainder = divmod(value, 1000)
+    fraction = f".{remainder:03d}".rstrip("0") if remainder else ""
+    return f"累计 {whole}{fraction}k"
+
 MODEL_CONTEXT_WINDOWS = {
     "codex/main": 258400,
     "gpt-5-codex": 258400,

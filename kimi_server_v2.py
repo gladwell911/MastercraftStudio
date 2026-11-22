@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from context_usage import cache_token_counts, native_token_count
 from kimi_server_events import (
     KimiEvent,
     KimiServerError,
@@ -13,6 +14,41 @@ from kimi_server_events import (
 )
 from kimi_transcript import Transcript
 from typing import Any
+
+
+def _turn_usage(turn: dict) -> tuple:
+    step = max((step for step in turn.get("steps", []) if step.get("state") == "completed"),
+               key=lambda step: native_token_count(step.get("ordinal")) or 0, default=None)
+    last = None
+    if step is not None:
+        usage = step.get("usage") or {}
+        other, cached, created = (native_token_count(usage.get(field)) for field in
+                                  ("inputOther", "inputCacheRead", "inputCacheCreation"))
+        if None not in (other, cached, created):
+            last = cache_token_counts(other + cached + created, cached)
+    terminal = turn.get("state") in {"completed", "failed", "cancelled"}
+    usage = turn.get("usage") or {}
+    uncached, cached, output = (native_token_count(usage.get(field)) for field in
+                               ("inputTokens", "cachedTokens", "outputTokens"))
+    pair = cache_token_counts(uncached + cached, cached) if None not in (uncached, cached) else None
+    total = pair["input_tokens"] + output if pair is not None and output is not None else None
+    rank = native_token_count(str(turn["turnId"]).removeprefix("t")) or 0
+    return rank, step is not None, last, terminal, pair, total
+
+
+def _usage_totals(turns: dict) -> dict:
+    last_turn = max((row for row in turns.values() if row[1]), key=lambda row: row[0], default=None)
+    terminal = [row for row in turns.values() if row[3]]
+    pairs = [row[4] for row in terminal]
+    totals = [row[5] for row in terminal]
+    return {
+        "session_total_tokens": sum(totals) if totals and None not in totals else None,
+        "cache_hits": {
+            "last": last_turn[2] if last_turn is not None else None,
+            "total": cache_token_counts(sum(p["input_tokens"] for p in pairs), sum(p["cached_tokens"] for p in pairs))
+                if pairs and None not in pairs else None,
+        },
+    }
 
 
 class KimiServerV2Mixin:
@@ -48,6 +84,176 @@ class KimiServerV2Mixin:
         for request_id in self._v2_request_generations:
             self._subscribe_requests.pop(request_id, None)
         self._v2_request_generations.clear()
+        self._v2_usage_windows.clear()
+        self._v2_usage_ledgers.clear()
+        for wait in self._v2_usage_events.values():
+            wait.set()
+        self._v2_usage_events.clear()
+
+    def is_current_v2_usage(self, session_id: str, generation: int, client_id: int) -> bool:
+        with self._lifecycle_lock:
+            return (not self._closed and client_id == id(self) and generation == self._ws_generation
+                    and self._v2_ready_generations.get(session_id) == generation)
+
+    def _consume_v2_usage_window(self, frame: dict, *, ws=None, generation=None) -> None:
+        session = _str(frame.get("session_id"))
+        used = native_token_count(frame.get("context_tokens"))
+        if frame.get("agent_id") != "main" or used is None:
+            return
+        with self._lifecycle_lock:
+            current = self._ws_generation
+            if (self._closed or (ws is not None and self._ws is not ws)
+                    or (generation is not None and generation != current)):
+                return
+            ready = self._v2_ready_generations.get(session) == current
+            pending = any(self._v2_request_generations.get(key) == current and session in sessions
+                          for key, sessions in self._subscribe_requests.items())
+            if not ready and not pending:
+                return
+            usage = {"context_tokens": used, "max_context_tokens": native_token_count(frame.get("max_context_tokens"))}
+            changed = self._v2_usage_windows.get(session) != usage
+            self._v2_usage_windows[session] = usage
+            self._v2_usage_events.setdefault(session, threading.Event()).set()
+            if changed and ready:
+                self._emit_v2_usage(session, "status", usage)
+
+    def _v2_usage_socket_identity(self) -> dict:
+        return {"socket_generation": self._ws_generation, "usage_client": id(self)}
+
+    def _emit_v2_usage(self, session_id: str, kind: str, usage: dict) -> None:
+        self._enqueue_event(KimiEvent(
+            type="kimi_v2_usage", thread_id=session_id, session_id=session_id,
+            data={"kind": kind, "usage": {**usage, **self._v2_usage_socket_identity()}},
+        ))
+
+    def get_v2_usage_context(self, session_id: str) -> dict | None:
+        self._require_v2_ready(session_id)
+        with self._lifecycle_lock:
+            generation = self._ws_generation
+            wait = self._v2_usage_events.setdefault(session_id, threading.Event())
+        wait.wait(min(2.0, self.ws_connect_timeout))
+        with self._lifecycle_lock:
+            if not self.is_current_v2_usage(session_id, generation, id(self)):
+                raise KimiServerError("Kimi usage context socket changed")
+            usage = self._v2_usage_windows.get(session_id)
+            return {**usage, **self._v2_usage_socket_identity()} if usage is not None else None
+
+    def _v2_usage_ledger(self, session_id: str) -> dict:
+        return self._v2_usage_ledgers.setdefault(
+            session_id, {"turns": {}, "serial": 0, "scan_lock": threading.Lock(),
+                         "scan_generation": 0, "complete": False, "recovering": False},
+        )
+
+    def get_v2_usage_totals(self, session_id: str) -> dict:
+        self._require_v2_ready(session_id)
+        with self._lifecycle_lock:
+            generation = self._ws_generation
+            ledger = self._v2_usage_ledger(session_id)
+        with ledger["scan_lock"]:
+            with self._lifecycle_lock:
+                if not self.is_current_v2_usage(session_id, generation, id(self)):
+                    raise KimiServerError("Kimi transcript usage socket changed")
+                if ledger["complete"]:
+                    return {**self._v2_usage_result(ledger), **self._v2_usage_socket_identity()}
+                cursor_serial = ledger["serial"]
+                scan_generation = ledger["scan_generation"]
+            return self._scan_v2_usage(session_id, generation, ledger, cursor_serial, scan_generation)
+
+    def _scan_v2_usage(self, session_id: str, generation: int, ledger: dict,
+                       cursor_serial: int, scan_generation: int) -> dict:
+        deadline = time.monotonic() + self.rest_timeout
+        before = None
+        cursors = set()
+        turns = {}
+        for _ in range(100):
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise KimiServerError("Kimi transcript usage deadline exhausted")
+            page = self.get_transcript(session_id, before_turn=before, timeout=timeout)
+            if page.get("agent_id", "main") != "main" or not isinstance(page.get("items"), list):
+                raise KimiServerError("Kimi transcript usage page is invalid")
+            items = [turn for turn in page["items"] if turn.get("kind") == "turn"]
+            for turn in items:
+                turn_id = turn.get("turnId")
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise KimiServerError("Kimi transcript usage turn identity is missing")
+                turns.setdefault(turn_id, (cursor_serial, _turn_usage(turn)))
+            if not page.get("has_more"):
+                break
+            before = items[0]["turnId"] if items else None
+            if not before or before in cursors:
+                raise KimiServerError("Kimi transcript usage pagination made no progress")
+            cursors.add(before)
+        else:
+            raise KimiServerError("Kimi transcript usage page budget exhausted")
+        with self._lifecycle_lock:
+            if not self.is_current_v2_usage(session_id, generation, id(self)):
+                raise KimiServerError("Kimi transcript usage socket changed")
+            if ledger["scan_generation"] != scan_generation:
+                raise KimiServerError("Kimi transcript changed during usage scan")
+            newer = {key: value for key, value in ledger["turns"].items()
+                     if value[0] > cursor_serial}
+            ledger["turns"] = {**turns, **newer}
+            ledger["complete"] = True
+            ledger["serial"] += 1
+            return {**self._v2_usage_result(ledger), **self._v2_usage_socket_identity()}
+
+    @staticmethod
+    def _v2_usage_result(ledger: dict) -> dict:
+        result = _usage_totals({key: value[1] for key, value in ledger["turns"].items()})
+        return {**result, "serial": ledger["serial"], "scan_generation": ledger["scan_generation"]}
+
+    def is_current_v2_usage_scan(self, session_id: str, scan_generation: int) -> bool:
+        with self._lifecycle_lock:
+            ledger = self._v2_usage_ledgers.get(session_id)
+            return ledger is not None and ledger["scan_generation"] == scan_generation
+
+    def _invalidate_v2_usage_scan(self, session_id: str) -> None:
+        ledger = self._v2_usage_ledger(session_id)
+        ledger["scan_generation"] += 1
+        ledger["complete"] = False
+        ledger["turns"].clear()
+        if self._v2_ready_generations.get(session_id) == self._ws_generation:
+            self._emit_v2_usage(session_id, "snapshot_invalidated", {
+                "scan_generation": ledger["scan_generation"],
+            })
+
+    def _record_v2_transcript_usage(self, session_id: str, transcript: Transcript | None) -> None:
+        generation = self._ws_generation
+        if self._v2_ready_generations.get(session_id) != generation:
+            return
+        ledger = self._v2_usage_ledger(session_id)
+        observed = {turn_id: _turn_usage(turn) for turn_id, turn in transcript.items.items()} if transcript else {}
+        changes = {key: value for key, value in observed.items()
+                   if ledger["turns"].get(key, (None, None))[1] != value}
+        if changes:
+            ledger["serial"] += 1
+            ledger["turns"].update({key: (ledger["serial"], value) for key, value in changes.items()})
+        if ledger["complete"] and changes:
+            self._emit_v2_usage(session_id, "snapshot", self._v2_usage_result(ledger))
+        if ledger["complete"] or ledger["recovering"]:
+            return
+        ledger["recovering"] = True
+        scan_generation = ledger["scan_generation"]
+
+        def recover():
+            try:
+                usage = self.get_v2_usage_totals(session_id)
+                with self._lifecycle_lock:
+                    if (self.is_current_v2_usage(session_id, generation, id(self))
+                            and self.is_current_v2_usage_scan(session_id, usage["scan_generation"])):
+                        self._emit_v2_usage(session_id, "snapshot", usage)
+            except Exception:
+                # An explicit information refresh reports its own read error.
+                pass
+            finally:
+                with self._lifecycle_lock:
+                    ledger["recovering"] = False
+                    if (scan_generation != ledger["scan_generation"]
+                            and self.is_current_v2_usage(session_id, generation, id(self))):
+                        self._record_v2_transcript_usage(session_id, None)
+
+        threading.Thread(target=recover, daemon=True, name="kimi-usage-history").start()
 
     def get_transcript(self, session_id: str, *, before_turn: str | None = None,
                        timeout: float | None = None, agent_id: str = "main") -> dict[str, Any]:
@@ -165,12 +371,17 @@ class KimiServerV2Mixin:
                 return
             transcript = self._v2_transcripts.setdefault(sid, Transcript())
             seq = body.get("seq")
+            invalidate = message["type"] == "transcript.reset"
             if message["type"] == "transcript.reset":
                 # Reset is authoritative even when seq decreases after a restart.
                 transcript.reset(body.get("snapshot") or {}, seq)
             else:
-                transcript.apply(body.get("ops") or [], seq)
+                ops = body.get("ops") or []
+                applied = transcript.apply(ops, seq)
+                invalidate = applied and any(op.get("op") in {"reset", "items.remove"} for op in ops)
             needs_catchup = transcript.incomplete
+            if invalidate or needs_catchup:
+                self._invalidate_v2_usage_scan(sid)
             since = transcript.seq or 0
 
         transcript_source = "ws"
@@ -200,10 +411,16 @@ class KimiServerV2Mixin:
             self._enqueue_control({"type": "transport_recovered", "payload": {"session_ids": [sid]}})
 
         with self._lifecycle_lock:
-            if not current_socket() or self._v2_transcripts.get(sid) is not transcript or transcript.incomplete:
+            if not current_socket() or self._v2_transcripts.get(sid) is not transcript:
+                return
+            if transcript.incomplete:
+                self._record_v2_transcript_usage(sid, None)
                 return
             events = self._v2_execution_events(sid, transcript, transcript_source)
             needs_recovery = transcript.incomplete
+            if needs_recovery:
+                self._invalidate_v2_usage_scan(sid)
+            self._record_v2_transcript_usage(sid, None if needs_recovery else transcript)
         for event in events:
             self._enqueue_event(event)
         if needs_recovery:

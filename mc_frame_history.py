@@ -16,6 +16,7 @@ from codex_client import (
     normalize_codex_approval_mode,
     normalize_codex_sandbox,
 )
+from context_usage import NATIVE_USAGE_FIELDS
 from mc_frame_settings import (
     APP_DIR_NAME,
     APP_STATE_FILE,
@@ -213,8 +214,11 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        if "context_usage" in state:
-            slim["context_usage"] = copy.deepcopy(state.get("context_usage"))
+        for field in (*NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+                      "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
+                      "kimi_information_generation"):
+            if field in state:
+                slim[field] = copy.deepcopy(state[field])
         return slim
 
     def _persist_chat_history_to_store(self) -> None:
@@ -485,6 +489,9 @@ class ChatHistoryMixin:
                 current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
                 merged = copy.deepcopy(summary)
                 merged.update(current)
+                for field in NATIVE_USAGE_FIELDS:
+                    if field in summary:
+                        merged[field] = copy.deepcopy(summary[field])
                 merged["id"] = self.active_chat_id
                 merged["turns"] = self.active_session_turns
                 # Store metadata is the durable owner record.  A stale global
@@ -1394,8 +1401,10 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        if "context_usage" in self._current_chat_state:
-            archived["context_usage"] = copy.deepcopy(self._current_chat_state.get("context_usage"))
+        for field in (*NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+                      "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
+            if field in self._current_chat_state:
+                archived[field] = copy.deepcopy(self._current_chat_state[field])
         existing_matches = [
             (idx, existing)
             for idx, existing in enumerate(self.archived_chats)

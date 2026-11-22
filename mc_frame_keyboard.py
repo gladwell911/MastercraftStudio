@@ -68,36 +68,30 @@ class GlobalCtrlTapHook:
         self._hook_proc = None
         self._fallback_thread = None
         self._running = False
-        self._ctrl_down = False
-        self._combo_used = False
-        self._active_ctrl_side = "left"
+        self._hook_pressed_at = {}
+        self._hook_chords = set()
+        self._pressed_keys = set()
         self._using_fallback = False
         self._fallback_notice_sent = False
         self._last_hook_event_at = 0.0
         self._hook_stale_seconds = 0.45
         self._emit_lock = bindings.app.threading.Lock()
-        self._last_emit_at_by_side: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self._last_emit_at_by_side: dict[str, tuple[float, str]] = {}
         self._poller_left_down = False
         self._poller_right_down = False
+        self._poller_pressed_at = {}
+        self._poller_chords = set()
         self._backend_state = "hook+poller"
 
     @staticmethod
     def _should_mark_combo_key(vk: int) -> bool:
-        # Ignore modifier/IME pseudo keys to avoid false combo detection in some custom controls.
+        # Ignore IME pseudo keys. Modifiers count toward a Ctrl chord.
         if vk in {
             0,
             0xFF,
             VK_CONTROL,
             VK_LCONTROL,
             VK_RCONTROL,
-            VK_SHIFT,
-            VK_LSHIFT,
-            VK_RSHIFT,
-            VK_MENU,
-            VK_LMENU,
-            VK_RMENU,
-            VK_LWIN,
-            VK_RWIN,
             VK_PROCESSKEY,
             VK_PACKET,
         }:
@@ -151,25 +145,7 @@ class GlobalCtrlTapHook:
                 kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 msg = int(w_param)
                 vk = int(kb.vkCode)
-                is_ctrl = vk in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL)
-                if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    if is_ctrl:
-                        self._ctrl_down = True
-                        self._active_ctrl_side = "right" if vk == VK_RCONTROL else "left"
-                    elif self._ctrl_down and self._should_mark_combo_key(vk):
-                        self._combo_used = True
-                elif msg in (WM_KEYUP, WM_SYSKEYUP) and is_ctrl:
-                    combo = self._combo_used
-                    if vk == VK_RCONTROL:
-                        side = "right"
-                    elif vk == VK_LCONTROL:
-                        side = "left"
-                    else:
-                        # Some keyboards report VK_CONTROL on key-up; keep side from key-down.
-                        side = self._active_ctrl_side
-                    self._ctrl_down = False
-                    self._combo_used = False
-                    self._emit_ctrl_keyup(combo, side)
+                self._process_hook_key(vk, msg)
             return user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
 
         self._hook_proc = HOOKPROC(_low_level_proc)
@@ -206,6 +182,34 @@ class GlobalCtrlTapHook:
             self._hook_proc = None
             self._thread_id = 0
 
+    def _process_hook_key(self, vk: int, message: int) -> None:
+        key_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if not key_down and message not in (WM_KEYUP, WM_SYSKEYUP):
+            return
+        if vk not in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL):
+            if key_down and self._should_mark_combo_key(vk):
+                self._pressed_keys.add(vk)
+                self._hook_chords.update(self._hook_pressed_at)
+            elif not key_down:
+                self._pressed_keys.discard(vk)
+            return
+        side = "right" if vk == VK_RCONTROL else "left"
+        if not key_down and vk == VK_CONTROL and len(self._hook_pressed_at) == 1:
+            side = next(iter(self._hook_pressed_at))
+        now = self._last_hook_event_at
+        if key_down:
+            if side not in self._hook_pressed_at:
+                if self._hook_pressed_at or self._pressed_keys:
+                    self._hook_chords.update(self._hook_pressed_at)
+                    self._hook_chords.add(side)
+                self._hook_pressed_at[side] = now
+            return
+        started = self._hook_pressed_at.pop(side, None)
+        if started is not None:
+            combo = side in self._hook_chords or (side == "right" and now - started > 0.4)
+            self._hook_chords.discard(side)
+            self._emit_ctrl_keyup(combo, side, source="hook")
+
     def _run_fallback_poller(self) -> None:
         # Fallback for environments where low-level hook is blocked or unreliable.
         user32 = ctypes.windll.user32
@@ -216,36 +220,49 @@ class GlobalCtrlTapHook:
                 if (not self._hook or self._using_fallback) and (not self._fallback_notice_sent) and self.on_error:
                     self._fallback_notice_sent = True
                     bindings.app.wx_call_after_if_alive(self.on_error, "全局语音热键进入兼容模式（轮询）")
-                self._process_poller_state(left_down=left_down, right_down=right_down)
+                combo = (left_down and right_down) or (
+                    (left_down or right_down) and self._should_use_poller_release() and any(
+                        self._should_mark_combo_key(vk) and user32.GetAsyncKeyState(vk) & 0x8000
+                        for vk in range(8, 255)
+                    )
+                )
+                self._process_poller_state(left_down=left_down, right_down=right_down, combo=combo)
                 bindings.app.time.sleep(0.015)
         finally:
             self._using_fallback = False
 
     def _should_use_poller_release(self) -> bool:
-        return bool(self._running)
+        return self._running and (
+            not self._hook or self._using_fallback
+            or bindings.app.time.monotonic() - self._last_hook_event_at >= self._hook_stale_seconds
+        )
 
-    def _process_poller_state(self, *, left_down: bool, right_down: bool) -> None:
-        should_emit = self._should_use_poller_release()
-        prev_left_down = bool(self._poller_left_down)
-        prev_right_down = bool(self._poller_right_down)
-        self._poller_left_down = bool(left_down)
-        self._poller_right_down = bool(right_down)
-        if not should_emit:
-            return
-        if prev_left_down and (not left_down):
-            self._emit_ctrl_keyup(False, "left")
-        if prev_right_down and (not right_down):
-            self._emit_ctrl_keyup(False, "right")
+    def _process_poller_state(self, *, left_down: bool, right_down: bool, combo: bool = False) -> None:
+        now = bindings.app.time.monotonic()
+        for side, old, down in (("left", self._poller_left_down, left_down),
+                                ("right", self._poller_right_down, right_down)):
+            if down:
+                self._poller_pressed_at.setdefault(side, now)
+                if combo:
+                    self._poller_chords.add(side)
+            elif old:
+                started = self._poller_pressed_at.pop(side, now)
+                chord = side in self._poller_chords or (side == "right" and now - started > 0.4)
+                self._poller_chords.discard(side)
+                if self._should_use_poller_release():
+                    self._emit_ctrl_keyup(chord, side, source="poller")
+        self._poller_left_down = left_down
+        self._poller_right_down = right_down
 
-    def _emit_ctrl_keyup(self, combo_used: bool, side: str) -> None:
+    def _emit_ctrl_keyup(self, combo_used: bool, side: str, *, source: str = "") -> None:
         side_key = "right" if side == "right" else "left"
         now = bindings.app.time.monotonic()
         with self._emit_lock:
-            last = self._last_emit_at_by_side.get(side_key, 0.0)
+            last, previous_source = self._last_emit_at_by_side.get(side_key, (0.0, None))
             # Deduplicate hook/poller double delivery for the same key-up.
-            if (now - last) < 0.06:
+            if (now - last) < 0.06 and (not source or source != previous_source):
                 return
-            self._last_emit_at_by_side[side_key] = now
+            self._last_emit_at_by_side[side_key] = (now, source)
         bindings.app.wx_call_after_if_alive(self.on_ctrl_keyup, combo_used, side_key)
 
     @property

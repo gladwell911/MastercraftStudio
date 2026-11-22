@@ -181,8 +181,8 @@ def test_render_answer_list_keeps_empty_state_below_context_row(frame):
 
     frame._render_answer_list()
 
-    assert frame.answer_list.GetString(0) == "暂无"
-    assert frame.answer_meta[0] == ("context_usage", -1, "暂无", "")
+    assert frame.answer_list.GetString(0) == "累计暂无"
+    assert frame.answer_meta[0] == ("context_usage", -1, "累计暂无", "")
     assert all(meta[0] != "current_model" for meta in frame.answer_meta)
     assert frame.answer_list.GetString(1) == "暂无对话内容"
 
@@ -1154,8 +1154,8 @@ def test_render_answer_list_shows_each_uploaded_attachment_on_its_own_line(frame
     frame._render_answer_list()
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "time"
-    assert rows[1:] == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
+    assert [meta[0] for meta in frame.answer_meta[:2]] == ["context_usage", "time"]
+    assert rows[2:] == ["我", "图片上传成功", "图片上传成功", "alpha.txt 上传成功", "beta.txt 上传成功"]
 
 
 def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn(frame, tmp_path):
@@ -1184,8 +1184,8 @@ def test_render_answer_list_keeps_standard_qa_structure_for_attachment_only_turn
 
     rows = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
     meta_types = [meta[0] for meta in frame.answer_meta]
-    assert rows[1:] == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
-    assert meta_types == ["time", "user", "attachment", "ai", "answer"]
+    assert rows[2:] == ["我", "图片上传成功", "小诸葛", "cli 的回答"]
+    assert meta_types == ["context_usage", "time", "user", "attachment", "ai", "answer"]
 
 
 def test_update_active_answer_row_skips_repaint_when_text_is_unchanged(frame, monkeypatch):
@@ -1414,7 +1414,7 @@ def test_submit_question_appends_answer_rows_without_clearing_existing_answer_li
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
 
     class _NoOpThread:
-        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
             pass
 
         def start(self):
@@ -1422,7 +1422,7 @@ def test_submit_question_appends_answer_rows_without_clearing_existing_answer_li
 
     monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
     frame._render_answer_list()
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert frame.answer_list.GetString(0) == "累计暂无"
     monkeypatch.setattr(frame.answer_list, "Clear", lambda: pytest.fail("send should not clear answer list"))
 
     ok, message = frame._submit_question("马上显示的问题", source="local", model="openai/gpt-5.2")
@@ -1441,7 +1441,7 @@ def test_submit_question_appends_new_question_without_refreshing_answer_list(fra
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda *args, **kwargs: None)
 
     class _NoOpThread:
-        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
             pass
 
         def start(self):
@@ -1558,8 +1558,8 @@ def test_render_answer_list_hides_blank_user_for_assistant_only_turn(frame):
     frame._render_answer_list()
 
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert frame.answer_meta[0][0] == "time"
-    assert items[1:] == ["小诸葛", "只有回答"]
+    assert [meta[0] for meta in frame.answer_meta[:2]] == ["context_usage", "time"]
+    assert items[2:] == ["小诸葛", "只有回答"]
 
 
 def test_render_answer_list_filters_codex_file_tokens_when_enabled(frame):
@@ -1601,7 +1601,7 @@ def test_render_answer_list_filters_pytest_command_and_test_paths(frame):
     assert all("test_voice_input_ui_automation.py" not in item for item in answer_rows)
 
 
-def test_render_answer_list_does_not_filter_non_codex_answers(frame):
+def test_render_answer_list_shortens_paths_in_non_codex_answers(frame):
     frame.codex_answer_english_filter_enabled = True
     frame.active_session_turns = [
         {
@@ -1615,21 +1615,22 @@ def test_render_answer_list_does_not_filter_non_codex_answers(frame):
     frame._render_answer_list()
 
     items = [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())]
-    assert any("main.py" in item for item in items)
+    assert any("（文件）" in item for item in items)
+    assert all("main.py" not in item for item in items)
     assert any("test_render_answer_list_filters_codex_file_tokens_when_enabled" in item for item in items)
 
 
 @pytest.mark.parametrize("model", ["codex/main", "claudecode/default", "openclaw/main"])
-def test_answer_detail_html_filters_cli_models(frame, model):
+def test_answer_detail_html_preserves_complete_source_for_cli_models(frame, model):
     frame.codex_answer_english_filter_enabled = True
 
     codex_html = frame._build_answer_detail_html(
         "请查看 C:/code/codex/main.py 和 test_answer_detail_html_filters_cli_models",
         model,
     )
-    assert "[文件路径]" in codex_html
-    assert "main.py" not in codex_html
-    assert "test_answer_detail_html_filters_cli_models" not in codex_html
+    assert "[文件路径]" not in codex_html
+    assert "main.py" in codex_html
+    assert "test_answer_detail_html_filters_cli_models" in codex_html
 
     other_html = frame._build_answer_detail_html(
         "请查看 C:/code/codex/main.py 和 test_answer_detail_html_filters_cli_models",
@@ -1920,16 +1921,16 @@ def test_append_submitted_question_removes_all_initial_empty_rows_with_increment
     frame._current_chat_state = {"id": "chat-current", "turns": frame.active_session_turns, "context_usage": None}
     frame._render_answer_list()
 
-    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["暂无", "暂无对话内容"]
+    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["累计暂无", "暂无对话内容"]
 
     turn = {"question": "新问题", "answer_md": main.REQUESTING_TEXT, "model": main.DEFAULT_MODEL_ID}
     frame.active_session_turns.append(turn)
     changed = frame._append_submitted_question_to_answer_list(0, turn)
 
     assert changed is True
-    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == [main.UNKNOWN_TIME_LABEL, "我", "新问题"]
-    assert frame.answer_meta == [("time", 0, main.UNKNOWN_TIME_LABEL, ""), ("user", 0, "我", ""), ("question", 0, "新问题", "")]
-    assert frame.answer_list_model.visible_ids == ["time:0", "answer:0:user", "answer:0:question"]
+    assert [frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount())] == ["累计暂无", main.UNKNOWN_TIME_LABEL, "我", "新问题"]
+    assert frame.answer_meta == [("context_usage", -1, "累计暂无", ""), ("time", 0, main.UNKNOWN_TIME_LABEL, ""), ("user", 0, "我", ""), ("question", 0, "新问题", "")]
+    assert frame.answer_list_model.visible_ids == ["answer:special:context_usage", "time:0", "answer:0:user", "answer:0:question"]
 
 
 def test_answer_reconciliation_removes_stale_physical_tail_and_keeps_meta_aligned(frame):

@@ -13,7 +13,7 @@ from typing import Callable
 import tempfile
 from datetime import datetime
 
-from context_usage import normalize_context_usage
+from context_usage import cache_token_counts, normalize_context_usage
 from browser_open import browser_open_argv, bundled_skill_root
 
 
@@ -785,8 +785,10 @@ class CodexAppServerClient:
                         continue
                     usage = codex_context_usage_from_payload(payload, self.codex_model)
                     total = codex_session_total_tokens_from_payload(payload)
-                    if usage is not None or total is not None:
+                    cache_hits = codex_cache_hits_from_payload(payload)
+                    if usage is not None or total is not None or any(cache_hits.values()):
                         return {"context_usage": usage, "session_total_tokens": total,
+                                "cache_hits": cache_hits,
                                 "observed_at": record.get("timestamp")}
             if position:
                 raise ValueError("native usage scan limit reached (8 MiB)")
@@ -1152,6 +1154,7 @@ class CodexAppServerClient:
                 data["context_usage"] = usage
             if session_total_tokens is not None:
                 data["session_total_tokens"] = session_total_tokens
+            data["cache_hits"] = codex_cache_hits_from_payload(params)
             self._emit_event(
                 CodexEvent(
                     type="token_count",
@@ -1355,6 +1358,20 @@ def codex_session_total_tokens_from_payload(payload: dict) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+def codex_cache_hits_from_payload(payload: dict) -> dict:
+    info = _first_dict(payload.get("info"), payload.get("usage"), payload)
+    usage = _first_dict(payload.get("tokenUsage"), info.get("tokenUsage"), info.get("token_usage"))
+    hits = {}
+    for field in ("last", "total"):
+        counts = _first_dict(usage.get(field), info.get(f"{field}_token_usage"),
+                             info.get(f"{field}TokenUsage"))
+        hits[field] = cache_token_counts(
+            counts.get("inputTokens", counts.get("input_tokens")),
+            counts.get("cachedInputTokens", counts.get("cached_input_tokens")),
+        )
+    return hits
 
 
 def codex_context_usage_from_payload(payload: dict, fallback_model: str = DEFAULT_CODEX_MODEL) -> dict | None:

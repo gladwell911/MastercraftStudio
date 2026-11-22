@@ -40,3 +40,8 @@
 ## Deferred from: code review of plan-fix-kimicode-functional-20261119 (2026-11-19)
 
 - 904cda1 独立复审沿用既有 D2（medium，未证实）。kimi_server_client.py:936 缺 ID 成功响应需要固定 2.5.3 确已接纳的 HTTP 应答和同一 prompt 的 transcript 配对证据。见 [本轮裁决 1](review-kimicode-fresh-904cda1-20261119.md)。
+
+## Deferred from: code review of plan-mc-rc-chat-ux (2026-11-22)
+
+- RC 历史前插的 Flutter Semantics 断言和文件要约 owner 偏差在 b8a233e 复现。
+- MC 语音 UI 组合框模型排序与旧聊天快捷键失败在 f9674e1 复现。

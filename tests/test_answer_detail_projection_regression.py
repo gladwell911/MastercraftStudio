@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 import pytest
 
 import main
+from mc_frame_presentation import filter_answer_display_text
 
 
 @pytest.mark.parametrize("source, expected", [
@@ -20,6 +24,14 @@ import main
 ])
 def test_detail_projection_preserves_content(source, expected):
     assert main.answer_detail_plain_text(source) == expected
+
+
+@pytest.mark.parametrize("source, expected", json.loads(
+    Path(__file__).with_name("answer_display_cases.json").read_text(encoding="utf-8")
+))
+def test_ordinary_answer_matches_shared_display_cases(source, expected):
+    assert main.answer_detail_plain_text(source, ordinary=True) == expected
+    assert filter_answer_display_text(main.md_to_plain(source)) == expected
 
 
 def test_boundary_does_not_read_accumulated_output(monkeypatch):
