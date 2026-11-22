@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -72,10 +73,12 @@ def main() -> None:
 
     work_dir = Path(os.environ.get("FILE_E2E_APP_DATA", tempfile.mkdtemp(prefix="zgwd-file-e2e-")))
     storage_dir = work_dir / "storage"
-    source_dir = work_dir / "source"
+    source_dir = work_dir / os.environ.get("FILE_E2E_SOURCE_DIR_NAME", "source")
     source_dir.mkdir(parents=True, exist_ok=True)
     desktop_source = source_dir / desktop_name
-    desktop_source.write_text(desktop_content, encoding="utf-8")
+    desktop_bytes = desktop_content.encode("utf-8")
+    desktop_source.write_bytes(desktop_bytes)
+    extract_only = os.environ.get("FILE_E2E_EXTRACT_ONLY") == "1"
 
     tcp_port = _choose_available_port(preferred_port, NATS_E2E_PORT_FALLBACKS)
     websocket_port = _choose_available_port(preferred_ws_port, NATS_E2E_WS_PORT_FALLBACKS)
@@ -103,7 +106,8 @@ def main() -> None:
             time.sleep(file_probe_delay_seconds)
         return original_prepare(*args, **kwargs)
     library.prepare_local_file = prepare
-    desktop_record = library.add_local_file(desktop_source)
+    desktop_record = None if extract_only else library.add_local_file(desktop_source)
+    desktop_record_id = desktop_record.id if desktop_record else ""
     http_service = DesktopFileHttpService(library, host="127.0.0.1", port=0)
     frame.file_service = http_service
     server = NatsServerProcess(
@@ -125,11 +129,12 @@ def main() -> None:
     phone_upload_completed = threading.Event()
     phone_upload_record_id = ""
     offer_accepted = threading.Event()
-    desktop_download_record_ids = {desktop_record.id}
+    desktop_download_record_ids = {desktop_record_id} if desktop_record_id else set()
     publisher = None
     seen: dict[str, object] = {
-        "desktop_file_id": desktop_record.id,
+        "desktop_file_id": desktop_record_id,
         "desktop_download_completed": False,
+        "probed_paths": [],
         "desktop_download_progress_events": 0,
         "transfer_controls": [],
         "phone_upload_received": False,
@@ -173,6 +178,7 @@ def main() -> None:
                 seen["transfer_controls"].append(command_type)
             return 200, {"ok": True}
         if command_type in {"file_probe", "file_download_request"}:
+            seen["probed_paths"].append(str(body.get("path") or ""))
             status, response = frame._remote_api_file_command_worker(payload)
             if status == 200:
                 desktop_download_record_ids.add(response["file_id"])
@@ -209,10 +215,12 @@ def main() -> None:
             "endpoint": f"ws://127.0.0.1:{websocket_port}/nats",
             "token": token,
             "pair_id": pair_id,
-            "desktop_file_id": desktop_record.id,
+            "desktop_file_id": desktop_record_id,
             "desktop_path": str(desktop_source),
-            "desktop_file_name": desktop_record.name,
+            "desktop_file_name": desktop_source.name if desktop_record is None else desktop_record.name,
             "desktop_content": desktop_content,
+            "desktop_size": len(desktop_bytes),
+            "desktop_sha256": hashlib.sha256(desktop_bytes).hexdigest(),
             "phone_upload_name": phone_upload_name,
             "phone_upload_content": phone_upload_content,
             "storage_dir": str(storage_dir),
@@ -220,6 +228,7 @@ def main() -> None:
         ready_file.write_text(json.dumps(ready_payload, ensure_ascii=False), encoding="utf-8")
 
         def _publish_offer_until_seen() -> None:
+            assert desktop_record is not None
             while not stop.is_set() and not offer_accepted.is_set() and not desktop_download_completed.is_set():
                 offer = build_file_command_event(
                     request_id="",
@@ -239,11 +248,14 @@ def main() -> None:
                 stop.wait(1.0)
 
         publisher = threading.Thread(target=_publish_offer_until_seen, name="file-offer-publisher", daemon=True)
-        publisher.start()
+        if not extract_only:
+            publisher.start()
 
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline and not stop.wait(0.01):
             app.Yield()
+            if extract_only and desktop_download_completed.is_set():
+                break
             matches = sorted(storage_dir.glob(phone_upload_name))
             matches.extend(sorted(storage_dir.glob(f"{Path(phone_upload_name).stem} (*{Path(phone_upload_name).suffix}")))
             for candidate in matches:
@@ -262,7 +274,7 @@ def main() -> None:
                 and expected_controls.issubset(recorded_controls)
             ):
                 break
-        seen["timed_out"] = not (
+        seen["timed_out"] = not desktop_download_completed.is_set() if extract_only else not (
             desktop_download_completed.is_set()
             and phone_upload_received.is_set()
             and phone_upload_completed.is_set()
@@ -273,7 +285,7 @@ def main() -> None:
         result_file.write_text(json.dumps(seen, ensure_ascii=False), encoding="utf-8")
     finally:
         stop.set()
-        if publisher is not None:
+        if publisher is not None and publisher.ident is not None:
             publisher.join(timeout=2)
         frame._closing = True
         if transport is not None:

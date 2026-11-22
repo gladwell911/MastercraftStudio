@@ -291,7 +291,8 @@ class ChatHistoryMixin:
         previous = self._chat_turn_dirty_from.get(normalized)
         self._chat_turn_dirty_from[normalized] = index if previous is None else min(previous, index)
 
-    def _persist_dirty_chat_turns(self, store, chat_id: str, turns: list[dict]) -> None:
+    def _persist_dirty_chat_turns(self, store, chat_id: str, turns: list[dict], *,
+                                  attachment_scope: tuple = ()) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
@@ -311,7 +312,8 @@ class ChatHistoryMixin:
         start_index = max(0, min(int(dirty_from), len(turns or [])))
         replace_from = getattr(store, "replace_turns_from", None)
         if callable(replace_from):
-            replace_from(normalized, list(turns or [])[start_index:], start_index=start_index)
+            options = {"attachment_scope": attachment_scope} if attachment_scope else {}
+            replace_from(normalized, list(turns or [])[start_index:], start_index=start_index, **options)
         else:
             store.replace_turns(normalized, turns or [])
         if getattr(self, "_pending_answer_reads", None):

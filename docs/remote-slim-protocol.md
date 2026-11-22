@@ -14,6 +14,10 @@ Execution detail delivery applies withdrawal at read or publish time. A page or 
 
 Production uses separate `mc` and `mobile` users. The mobile password is the pairing token; the desktop password is independently generated in application data. Mobile permissions allow scoped RPC, notification consumption and ACK, but deny stream mutation and legacy mixed-stream access. Legacy token-only clients require a coordinated upgrade.
 
+## Chat attachments
+
+A negotiated V2 peer advertises chat-attachments-v1 when the managed HTTP receiver is available. RC requests each upload with file_upload_request and confirms it with file_complete for the same chat and send ID. It then submits one message with attachment_file_ids and client_send_id. MC derives source authority from the negotiated RPC and validates the references against source, chat and clear revision. PUT publishes complete bytes atomically. SQLite binds the receipt to the original payload and owner so acknowledgement loss can be retried. A send whose acceptance could not be confirmed after an MC exit stays pending. RC retains the option to save the draft locally.
+
 ## Recovery and migration
 
 Capable peers negotiate `notification-feed-v1` and the database UUID `notification_feed_id`. Baselines and recovery checkpoints are scoped to pair/feed/domain/connection scope. A changed database UUID establishes a new authority baseline without clearing canonical posted/terminal/read deduplication. Broker incarnation changes only paging; a lower sequence on the same feed never proves replacement. A restored backup with the same UUID cannot be identified automatically. Previously terminal events do not become new notifications after upgrade. See [the current deployment](handoff.md) for installed evidence and remaining acceptance.

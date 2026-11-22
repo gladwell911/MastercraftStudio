@@ -80,6 +80,36 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             } if row is not None and row["operation_id"] else None),
         }
 
+    def remote_attachment_send(self, scope: tuple, *, reserve: bool = False):
+        with self._connect() as conn:
+            if reserve:
+                conn.execute(
+                    "INSERT OR IGNORE INTO remote_attachment_sends "
+                    "(pair_id,device_id,chat_id,send_id,revision) VALUES(?,?,?,?,?)", scope
+                )
+            row = conn.execute(
+                "SELECT revision,fingerprint,state FROM remote_attachment_sends "
+                "WHERE pair_id=? AND device_id=? AND chat_id=? AND send_id=?", scope[:4]
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def claim_remote_attachment_send(self, scope: tuple, fingerprint: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute(
+                "UPDATE remote_attachment_sends SET fingerprint=?,state='starting' "
+                "WHERE pair_id=? AND device_id=? AND chat_id=? AND send_id=? AND revision=? "
+                "AND state='uploading' AND (fingerprint IS NULL OR fingerprint=?)",
+                (fingerprint, *scope, fingerprint),
+            ).rowcount == 1
+
+    def release_remote_attachment_send(self, scope: tuple) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE remote_attachment_sends SET state='uploading' "
+                "WHERE pair_id=? AND device_id=? AND chat_id=? AND send_id=? AND revision=? "
+                "AND state='starting'", scope
+            )
+
     @staticmethod
     def _eligible_clear_payload(payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict) or payload.get("local_command") or payload.get("deleted") or payload.get("is_deleted"):
@@ -696,13 +726,24 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             )
             self._backfill_canonical_turns_conn(conn, normalized, incoming, 0)
 
-    def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *, start_index: int = 0) -> None:
+    def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *,
+                           start_index: int = 0, attachment_scope: tuple = ()) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
         start = max(0, self._int_or(start_index, 0))
         suffix = turns or []
         with self._connect() as conn:
+            if attachment_scope:
+                updated = conn.execute(
+                    "UPDATE remote_attachment_sends SET state='accepted' "
+                    "WHERE pair_id=? AND device_id=? AND chat_id=? AND send_id=? AND revision=? "
+                    "AND state='starting' AND revision=MAX(1,COALESCE("
+                    "(SELECT revision FROM v2_chat_state WHERE chat_id=?),1))",
+                    (*attachment_scope, normalized),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("attachment_send_expired")
             existing = {int(row["turn_index"]): self._json_dict(row["payload_json"])
                         for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=? AND turn_index>=?", (normalized,start))}
             for offset, turn in enumerate(suffix):

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
+import logging
 import threading
 import time
+from requests import Timeout as RequestsTimeout
 from context_usage import cache_token_counts, native_token_count
 from kimi_server_events import (
     KimiEvent,
@@ -14,6 +17,21 @@ from kimi_server_events import (
 )
 from kimi_transcript import Transcript
 from typing import Any
+
+
+_USAGE_LOG = logging.getLogger(__name__)
+
+
+class KimiUsageQueryError(KimiServerError):
+    def __init__(self, message: str, *, stage: str, pages: int = 0, category: str = ""):
+        super().__init__(message)
+        self.stage = stage
+        self.pages = pages
+        self.category = category or type(self).__name__
+
+
+def _usage_field_count(usage, fields: tuple[str, ...]) -> int:
+    return sum(native_token_count(usage.get(field)) is not None for field in fields) if isinstance(usage, dict) else 0
 
 
 def _sum_terminal_step_usage(steps: list[dict]) -> tuple[int, int, int] | None:
@@ -45,12 +63,16 @@ def _turn_usage(turn: dict) -> tuple:
             last = cache_token_counts(other + cached + created, cached)
     terminal = turn.get("state") in {"completed", "failed", "cancelled"}
     usage = turn.get("usage") or {}
-    uncached, cached, output = (native_token_count(usage.get(field)) for field in
-                               ("inputTokens", "cachedTokens", "outputTokens"))
-    if terminal and turn.get("usage") is None:
+    fields = ("inputTokens", "cachedTokens", "outputTokens")
+    values = tuple(native_token_count(usage.get(field)) for field in fields)
+    if terminal and None in values:
         restored = _sum_terminal_step_usage(steps)
-        if restored is not None:
-            uncached, cached, output = restored
+        if restored is not None and all(
+            (usage.get(field) is None) or value == step_value
+            for field, value, step_value in zip(fields, values, restored)
+        ):
+            values = restored
+    uncached, cached, output = values
     pair = cache_token_counts(uncached + cached, cached) if None not in (uncached, cached) else None
     total = pair["input_tokens"] + output if pair is not None and output is not None else None
     rank = native_token_count(str(turn["turnId"]).removeprefix("t")) or 0
@@ -89,13 +111,23 @@ class KimiServerV2Mixin:
         self._send_ws({"type": "subscribe_v2", "id": request_id, "payload": payload}, send_timeout=timeout)
 
     def _require_v2_ready(self, session_id: str, *, timeout: float | None = None) -> None:
-        self.subscribe([session_id], timeout=timeout)
+        try:
+            self.subscribe([session_id], timeout=timeout)
+        except Exception as exc:
+            raise KimiUsageQueryError("Kimi subscribe_v2 send failed",
+                                      stage="subscribe_send", category=type(exc).__name__) from exc
         ready = self._v2_subscription_events.setdefault(session_id, threading.Event())
         if not ready.wait(min(self.ws_connect_timeout, timeout) if timeout is not None else self.ws_connect_timeout):
-            raise KimiServerError("Kimi compatibility failure at subscribe_v2: target session ACK timed out; request was not sent")
+            raise KimiUsageQueryError(
+                "Kimi compatibility failure at subscribe_v2: target session ACK timed out; request was not sent",
+                stage="subscribe_ack_timeout",
+            )
         with self._lifecycle_lock:
             if self._v2_ready_generations.get(session_id) != self._ws_generation or not self._ws_is_usable_locked():
-                raise KimiServerError("Kimi compatibility failure at subscribe_v2: target session not accepted on current socket; request was not sent")
+                raise KimiUsageQueryError(
+                    "Kimi compatibility failure at subscribe_v2: target session not accepted on current socket; request was not sent",
+                    stage="subscribe_ack_socket",
+                )
 
     def _clear_v2_readiness(self) -> None:
         self._v2_ready_sessions.clear()
@@ -155,7 +187,7 @@ class KimiServerV2Mixin:
         wait.wait(min(2.0, self.ws_connect_timeout))
         with self._lifecycle_lock:
             if not self.is_current_v2_usage(session_id, generation, id(self)):
-                raise KimiServerError("Kimi usage context socket changed")
+                raise KimiUsageQueryError("Kimi usage context socket changed", stage="socket_generation")
             usage = self._v2_usage_windows.get(session_id)
             return {**usage, **self._v2_usage_socket_identity()} if usage is not None else None
 
@@ -173,7 +205,7 @@ class KimiServerV2Mixin:
         with ledger["scan_lock"]:
             with self._lifecycle_lock:
                 if not self.is_current_v2_usage(session_id, generation, id(self)):
-                    raise KimiServerError("Kimi transcript usage socket changed")
+                    raise KimiUsageQueryError("Kimi transcript usage socket changed", stage="socket_generation")
                 if ledger["complete"]:
                     return {**self._v2_usage_result(ledger), **self._v2_usage_socket_identity()}
                 cursor_serial = ledger["serial"]
@@ -186,37 +218,63 @@ class KimiServerV2Mixin:
         before = None
         cursors = set()
         turns = {}
-        for _ in range(100):
+        field_counts = Counter()
+        for page_index in range(100):
             timeout = deadline - time.monotonic()
             if timeout <= 0:
-                raise KimiServerError("Kimi transcript usage deadline exhausted")
-            page = self.get_transcript(session_id, before_turn=before, timeout=timeout)
-            if page.get("agent_id", "main") != "main" or not isinstance(page.get("items"), list):
-                raise KimiServerError("Kimi transcript usage page is invalid")
+                raise KimiUsageQueryError("Kimi transcript usage deadline exhausted",
+                                          stage="rest_timeout", pages=page_index)
+            try:
+                page = self.get_transcript(session_id, before_turn=before, timeout=timeout)
+            except Exception as exc:
+                cause = exc.__cause__ or exc
+                timed_out = isinstance(cause, (TimeoutError, RequestsTimeout))
+                raise KimiUsageQueryError("Kimi transcript usage REST request failed",
+                    stage="rest_timeout" if timed_out else "rest_request",
+                    pages=page_index, category=type(cause).__name__) from exc
+            if (not isinstance(page, dict) or page.get("agent_id", "main") != "main"
+                    or not isinstance(page.get("items"), list)
+                    or any(not isinstance(item, dict) for item in page["items"])):
+                raise KimiUsageQueryError("Kimi transcript usage page is invalid",
+                                          stage="rest_page", pages=page_index)
             items = [turn for turn in page["items"] if turn.get("kind") == "turn"]
             for turn in items:
                 turn_id = turn.get("turnId")
                 if not isinstance(turn_id, str) or not turn_id:
-                    raise KimiServerError("Kimi transcript usage turn identity is missing")
-                turns.setdefault(turn_id, (cursor_serial, _turn_usage(turn)))
+                    raise KimiUsageQueryError("Kimi transcript usage turn identity is missing",
+                                              stage="rest_page", pages=page_index)
+                if turn_id in turns:
+                    continue
+                row = _turn_usage(turn)
+                turns[turn_id] = (cursor_serial, row)
+                state = turn.get("state")
+                state = state if state in ("completed", "failed", "cancelled", "interrupted") else "other"
+                field_counts[(state, _usage_field_count(turn.get("usage"),
+                    ("inputTokens", "cachedTokens", "outputTokens")), row[4] is not None, row[5] is not None)] += 1
             if not page.get("has_more"):
                 break
             before = items[0]["turnId"] if items else None
             if not before or before in cursors:
-                raise KimiServerError("Kimi transcript usage pagination made no progress")
+                raise KimiUsageQueryError("Kimi transcript usage pagination made no progress",
+                                          stage="pagination_cursor", pages=page_index + 1)
             cursors.add(before)
         else:
-            raise KimiServerError("Kimi transcript usage page budget exhausted")
+            raise KimiUsageQueryError("Kimi transcript usage page budget exhausted",
+                                      stage="pagination_budget", pages=page_index + 1)
         with self._lifecycle_lock:
             if not self.is_current_v2_usage(session_id, generation, id(self)):
-                raise KimiServerError("Kimi transcript usage socket changed")
+                raise KimiUsageQueryError("Kimi transcript usage socket changed",
+                                          stage="socket_generation", pages=page_index + 1)
             if ledger["scan_generation"] != scan_generation:
-                raise KimiServerError("Kimi transcript changed during usage scan")
+                raise KimiUsageQueryError("Kimi transcript changed during usage scan",
+                                          stage="scan_generation", pages=page_index + 1)
             newer = {key: value for key, value in ledger["turns"].items()
                      if value[0] > cursor_serial}
             ledger["turns"] = {**turns, **newer}
             ledger["complete"] = True
             ledger["serial"] += 1
+            _USAGE_LOG.debug("Kimi usage scan stages=subscribe_ack,rest_complete pages=%d turn_field_counts=%s",
+                             page_index + 1, dict(field_counts))
             return {**self._v2_usage_result(ledger), **self._v2_usage_socket_identity()}
 
     @staticmethod

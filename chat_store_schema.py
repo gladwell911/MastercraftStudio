@@ -200,6 +200,16 @@ class ChatStoreSchemaMixin:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL, event_id TEXT,
                     payload_json TEXT NOT NULL, created_at REAL NOT NULL DEFAULT (unixepoch())
                 );
+                CREATE TABLE IF NOT EXISTS remote_attachment_sends (
+                    pair_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    send_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    fingerprint TEXT,
+                    state TEXT NOT NULL DEFAULT 'uploading',
+                    PRIMARY KEY (pair_id, device_id, chat_id, send_id)
+                );
                 CREATE TABLE IF NOT EXISTS clear_operations (
                     operation_id TEXT PRIMARY KEY,
                     chat_id TEXT NOT NULL,

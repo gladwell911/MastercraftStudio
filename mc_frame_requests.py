@@ -782,8 +782,11 @@ class ChatRequestsMixin:
     def _on_send_clicked(self, _):
         return self._request_question_submit(require_focus=False, show_empty_warning=True)
 
-    def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *, client_send_id: str = "") -> tuple[bool, str]:
-        """Accept a remote turn for an off-screen owner without projecting it."""
+    def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *,
+                                         client_send_id: str = "", attachments=None,
+                                         attachment_scope: tuple = (), active: bool = False,
+                                         prepared_attachments=None) -> tuple[bool, str]:
+        """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
         resolved_model = bindings.app.normalize_model_id(model or "", default="")
         text = str(question or "").strip()
@@ -793,13 +796,16 @@ class ChatRequestsMixin:
         if getattr(self, "_chat_store_enabled", False) and store is not None:
             if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
                 return False, "Clear/resend recovery is still pending for this chat."
-            loaded = store.load_chat(owner_id, include_execution_steps=False)
+            has_live_turns = active or (attachments and isinstance(chat.get("turns"), list))
+            loaded = None if has_live_turns else store.load_chat(owner_id, include_execution_steps=False)
             if isinstance(loaded, dict):
                 # Preserve the object held by archived_chats while replacing
                 # summary-only metadata with this owner's complete durable state.
                 chat.clear()
                 chat.update(loaded)
-        turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
+        turns = self.active_session_turns if active else chat.get("turns")
+        if not isinstance(turns, list):
+            turns = []
         chat["turns"] = turns
         previous_model = self._model_for_chat_selection(chat) or STARTUP_DEFAULT_MODEL_ID
         turn_idx = len(turns)
@@ -811,6 +817,9 @@ class ChatRequestsMixin:
             "question_origin": "rc",
             "client_send_id": client_send_id,
         }
+        if attachments:
+            turn["attachments"] = attachments
+            turn["remote_attachment_source"] = list(attachment_scope[:2])
         previous_updated_at = chat.get("updated_at")
         turns.append(turn)
         chat["model"] = resolved_model
@@ -828,6 +837,7 @@ class ChatRequestsMixin:
                 worker = bindings.app.threading.Thread(
                     target=self._worker,
                     args=(bindings.app.openrouter_api_key_for_app(), turn_idx, text, resolved_model, False, owner_id),
+                    kwargs={"prepared_attachments": prepared_attachments} if prepared_attachments else {},
                     daemon=True,
                 )
                 started = worker.start()
@@ -841,9 +851,18 @@ class ChatRequestsMixin:
             else:
                 chat["updated_at"] = previous_updated_at
             return False, str(exc)
+        if active:
+            self.active_turn_idx = turn_idx
+            self.is_running = True
+            self._active_request_count = max(1, int(getattr(self, "_active_request_count", 0) or 0))
+            if self.view_mode == "active" and not self._append_submitted_question_to_answer_list(turn_idx, turn):
+                self._render_answer_list()
         self._play_send_sound()
         self._record_chat_activity(chat, turn["created_at"])
         self._mark_chat_turns_dirty(owner_id, turn_idx)
+        if attachment_scope:
+            store.upsert_chat(chat)
+            self._persist_dirty_chat_turns(store, owner_id, turns, attachment_scope=attachment_scope)
         self._defer_chat_state_save()
         if turn_idx == 0:
             self._schedule_first_question_auto_title(owner_id, text)

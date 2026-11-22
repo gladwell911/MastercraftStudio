@@ -1141,11 +1141,11 @@ class ChatFrame(
 
     def _set_input_hint_idle(self):
         self.input_hint_state = "输入"
-        self.input_edit.SetHint("输入")
+        self.input_edit.SetName(self.input_hint_state)
 
     def _set_input_hint_sent(self):
         self.input_hint_state = "已发送"
-        self.input_edit.SetHint("已发送")
+        self.input_edit.SetName(self.input_hint_state)
 
     def _open_local_webpage(self, page_path: Path) -> bool:
         try:

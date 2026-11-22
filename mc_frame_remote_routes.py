@@ -2,9 +2,11 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import uuid
 import wx
+from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from codex_client import (
     DEFAULT_CODEX_MODEL,
     codex_service_tier_label,
@@ -12,6 +14,7 @@ from codex_client import (
     normalize_codex_service_tier,
 )
 from execution_projection import project_execution_rows
+from kimi_server_client import is_kimi_model
 from mc_frame_presentation import _finite_timestamp, execution_answer_to_plain
 from mc_frame_settings import (
     DEFAULT_MODEL_ID,
@@ -625,7 +628,71 @@ class RemoteRoutesMixin:
         chat.update(self._codex_speed_payload_for_chat(chat))
         return chat
 
+    def _remote_chat_attachment_message_ui(self, payload: dict) -> tuple[int, dict]:
+        chat_id = str(payload.get("chat_id") or "").strip()
+        send_id = str(payload.get("client_send_id") or "").strip()
+        scope = self._remote_attachment_scope(payload, send_id)
+        text = str(payload.get("text") or "").strip()
+        refs = payload["attachment_file_ids"]
+        if not scope or not text:
+            return 400, {"accepted": False, "error": "invalid_attachment_submission"}
+        if (not isinstance(refs, list) or not refs
+                or any(not isinstance(ref, str) or not ref for ref in refs)
+                or len(set(refs)) != len(refs)):
+            return 400, {"accepted": False, "error": "invalid_attachment_references"}
+        store = getattr(self, "chat_store", None)
+        receipt = store.remote_attachment_send(scope) if store is not None else None
+        if receipt is None:
+            return 409, {"accepted": False, "error": "attachment_reference_unavailable"}
+        fingerprint = hashlib.sha256(json.dumps(
+            [text, refs, payload.get("model"), payload.get("model_change_mode")],
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if receipt["fingerprint"] and receipt["fingerprint"] != fingerprint:
+            return 409, {"accepted": False, "error": "attachment_send_conflict"}
+        confirmation = {"accepted": True, "chat_id": chat_id, "client_send_id": send_id}
+        if receipt["state"] == "accepted":
+            return 200, confirmation
+        if receipt["revision"] != scope[-1]:
+            return 409, {"accepted": False, "error": "attachment_send_expired"}
+        if receipt["state"] == "starting":
+            return 409, {"accepted": False, "error": "attachment_send_unconfirmed"}
+        active = chat_id in {self.active_chat_id, self.current_chat_id}
+        target = self._current_chat_state if active else self._find_archived_chat(chat_id)
+        attachments = self._resolve_remote_chat_attachments(refs, scope)
+        if attachments is None:
+            return 409, {"accepted": False, "error": "attachment_reference_unavailable"}
+        if active and self.is_running:
+            return 409, {"accepted": False, "error": "attachment_chat_busy"}
+        model, error = self._resolve_remote_message_model(
+            payload, target, current_model=self._model_for_chat_selection(target), is_new_chat=False,
+        )
+        if error:
+            return 400, {"accepted": False, "error": error}
+        prepared_attachments = None
+        if is_openrouter_claude_model(model):
+            try:
+                prepared_attachments = read_openrouter_claude_attachments(model, attachments)
+            except ValueError as exc:
+                return 400, {"accepted": False, "error": str(exc)}
+        elif not (is_codex_model(model) or is_kimi_model(model)):
+            return 400, {"accepted": False, "error": "attachment_model_unsupported"}
+        if not store.claim_remote_attachment_send(scope, fingerprint):
+            return 409, {"accepted": False, "error": "attachment_send_unconfirmed"}
+        accepted, message = self._submit_archived_remote_question(
+            target, text, model, client_send_id=send_id, attachments=attachments,
+            attachment_scope=scope, active=active, prepared_attachments=prepared_attachments,
+        )
+        if not accepted:
+            store.release_remote_attachment_send(scope)
+            return 400, {"accepted": False, "error": message}
+        self._push_remote_state(chat_id)
+        self._push_remote_history_changed(chat_id)
+        return 200, confirmation
+
     def _remote_api_message_ui(self, payload: dict) -> tuple[int, dict]:
+        if "attachment_file_ids" in payload:
+            return self._remote_chat_attachment_message_ui(payload)
         text = str(payload.get("text") or "").strip()
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}

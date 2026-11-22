@@ -1,5 +1,6 @@
 """Chat information and provider context usage."""
 
+import logging
 import math
 import wx
 from chat_information import ChatInformationSubscriptions
@@ -11,11 +12,15 @@ from context_usage import (
 )
 from datetime import timezone
 from kimi_server_client import KimiServerError, is_kimi_model, kimi_snapshot_total_tokens
+from kimi_server_v2 import KimiUsageQueryError
 from mc_frame_dialogs import ChatInformationDialog
 from mc_frame_settings import DEFAULT_MODEL_ID, REQUESTING_TEXT
 from openclaw_client import is_openclaw_model
 
 import mc_frame_bindings as bindings
+
+
+_USAGE_LOG = logging.getLogger(__name__)
 
 
 class ChatInformationMixin:
@@ -437,7 +442,8 @@ class ChatInformationMixin:
             try:
                 client = self._ensure_kimi_client()
                 client.start()
-            except Exception:
+            except Exception as exc:
+                _USAGE_LOG.warning("Kimi usage query failed stage=start category=%s", type(exc).__name__)
                 for kind in kinds:
                     self._call_after_if_alive(self._apply_kimi_chat_information_result,
                                               identity[0], generation, identity, kind, None, True)
@@ -452,7 +458,12 @@ class ChatInformationMixin:
                 try:
                     payload = getter(identity[2])
                     failed = False
-                except Exception:
+                except KimiUsageQueryError as exc:
+                    _USAGE_LOG.warning("Kimi usage query failed query=%s stage=%s pages=%d category=%s",
+                                      kind, exc.stage, exc.pages, exc.category)
+                    payload, failed = None, True
+                except Exception as exc:
+                    _USAGE_LOG.warning("Kimi usage query failed stage=%s category=%s", kind, type(exc).__name__)
                     payload, failed = None, True
                 self._call_after_if_alive(self._apply_kimi_chat_information_result,
                                           identity[0], generation, identity, kind, payload, failed)

@@ -6,7 +6,7 @@ def _noop(*_a, **_k):
     return None
 
 
-def test_single_right_ctrl_tap_starts_recording(monkeypatch):
+def test_double_right_ctrl_tap_starts_recording(monkeypatch):
     c = VoiceInputController(on_state_change=_noop, on_result=lambda *_a, **_k: None, on_error=_noop)
     started = {"mode": None}
 
@@ -14,6 +14,8 @@ def test_single_right_ctrl_tap_starts_recording(monkeypatch):
         started["mode"] = (mode, side)
 
     monkeypatch.setattr(c, "start_recording", fake_start)
+    c.on_ctrl_keyup(combo_used=False, side="right")
+    assert started["mode"] is None
     c.on_ctrl_keyup(combo_used=False, side="right")
     assert started["mode"] == (MODE_DIRECT, "right")
 
@@ -29,6 +31,18 @@ def test_left_ctrl_double_tap_starts_recording(monkeypatch):
     c.on_ctrl_keyup(combo_used=False, side="left")
     c.on_ctrl_keyup(combo_used=False, side="left")
     assert started["mode"] == (MODE_DIRECT, "left")
+
+
+def test_mixed_ctrl_taps_cannot_start(monkeypatch):
+    c = VoiceInputController(_noop, _noop, _noop)
+    started = []
+    monkeypatch.setattr(c, "start_recording", lambda mode, *, side: started.append(side))
+    c.on_ctrl_keyup(side="left")
+    c.on_ctrl_keyup(side="right")
+    c.on_ctrl_keyup(side="left")
+    assert started == []
+    c.on_ctrl_keyup(side="left")
+    assert started == ["left"]
 
 
 def test_right_ctrl_combo_does_not_start(monkeypatch):
@@ -49,6 +63,8 @@ def test_recording_stops_on_any_ctrl_tap(monkeypatch):
     c._session = speech_input._Session(1, MODE_DIRECT)
     called = {"stop": 0}
     monkeypatch.setattr(c, "stop_and_transcribe", lambda: called.__setitem__("stop", called["stop"] + 1))
+    c.on_ctrl_keyup(combo_used=True, side="left")
+    assert called["stop"] == 0
     c.on_ctrl_keyup(combo_used=False, side="left")
     assert called["stop"] == 1
 

@@ -182,6 +182,52 @@ def test_global_ctrl_hook_marks_each_right_tap_while_left_remains_down(monkeypat
     assert seen == [(True, "right"), (True, "right"), (True, "left"), (False, "right")]
 
 
+@pytest.mark.parametrize("backend", ["hook", "poller"])
+def test_global_ctrl_backends_classify_short_long_and_dual_side_releases(monkeypatch, backend):
+    from types import SimpleNamespace
+
+    seen = []
+    hook = main.GlobalCtrlTapHook(lambda combo, side: seen.append((combo, side)))
+    monkeypatch.setattr(main.wx, "CallAfter", lambda fn, *a, **k: fn(*a, **k))
+    left, right = main.VK_LCONTROL, main.VK_RCONTROL
+    timeline = iter([
+        (10.0, {left}), (10.1, set()),
+        (11.0, {left}), (11.41, set()),
+        (12.0, {right}), (12.1, set()),
+        (13.0, {right}), (13.41, set()),
+        (14.0, {left}), (14.1, {left, right}), (14.2, {left}), (14.3, set()),
+    ])
+    now, pressed = next(timeline)
+    monkeypatch.setattr(main.time, "monotonic", lambda: now)
+    if backend == "hook":
+        previous = set()
+        for now, pressed in [(now, pressed), *timeline]:
+            hook._last_hook_event_at = now
+            for key in previous - pressed:
+                hook._process_hook_key(key, main.WM_KEYUP)
+            for key in pressed - previous:
+                hook._process_hook_key(key, main.WM_KEYDOWN)
+            previous = pressed
+    else:
+        def next_poll(_interval):
+            nonlocal now, pressed
+            update = next(timeline, None)
+            if update is None:
+                hook._running = False
+            else:
+                now, pressed = update
+
+        monkeypatch.setattr(main.ctypes.windll, "user32", SimpleNamespace(
+            GetAsyncKeyState=lambda key: 0x8000 if key in pressed else 0,
+        ))
+        monkeypatch.setattr(main.time, "sleep", next_poll)
+        hook._running = True
+        hook._run_fallback_poller()
+
+    assert seen == [(False, "left"), (True, "left"), (False, "right"),
+                    (True, "right"), (True, "right"), (True, "left")]
+
+
 def test_external_voice_refuses_caret_drift_and_does_not_confirm_deletion(monkeypatch):
     from contextlib import nullcontext
     import windows_voice_target as target

@@ -26,7 +26,7 @@ $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid(
 
 客户端根据真实握手选择 V1 或 V2。V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
 
-Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。首次订阅中先到的帧暂存到同一 socket 代次，目标会话获 ACK 后才投递。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
+Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。首次订阅中先到的帧暂存到同一 socket 代次，目标会话获 ACK 后才投递。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。完整回合汇总优先。部分汇总只有在各消耗步骤终止、用量字段完整且与已知汇总逐项相符时才补齐，取消空回合缺少零用量证据时保留未知。上下文和累计分别判定可用性，零分母显示暂不可用，顶部累计以千为单位截去小数。查询诊断只记失败阶段、异常类别与聚合字段计数。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
 
 最终回答要求整个 turn completed，并取最高 ordinal 末步。末步通常 completed；真实追问可能留下 interrupted 且 `endReason` 精确为 `steered`，此时只取该步最后一个结构化 text/user frame 之后的公开 assistant 正文，无 user 则取该步正文。其他/缺失原因、tool、thinking-only、隐藏/空正文和不完整 transcript 均不发布，也不回退早先步骤；失败/取消仍保留失败语义。REST 与 V2 reset/ops 共用该提取规则，不改写服务端状态。
 

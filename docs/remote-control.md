@@ -26,6 +26,12 @@ $env:REMOTE_CONTROL_TOKEN = '<private-laptop-token>'
 
 `DOMAIN` 可输入域名或 ws/wss/http/https/nats URL；HTTP 转为对应 WebSocket，WebSocket 路径规范为 `/nats`。传输主题、执行游标、已读事件、复制连接 URL 与公开文件 URL 均采用该机器配置。公开文件 base URL 使用其对应 HTTP(S) 来源。
 
+## RC 聊天附件
+
+V2 对端公告 chat-attachments-v1 后，RC 可将已选电脑和聊天的文件与指令一起提交。支持 Codex、Kimi Code 和 OpenRouter Claude 各自可读取的附件类型。MC 只解析当前协商来源、聊天及发送请求拥有的托管文件编号。上传完成后按已冻结的请求 ID 受理，SQLite 记录回执，超时可恢复。清空后失效的请求可在手机存到文件管理。
+
+兼容构建先升级 MC，再升级 RC。旧 MC 和外部 Copyparty 进程模式下，RC 提供本地文件管理去向。部署状态见 [交接](handoff.md)。
+
 ## 升级、换目录与私有配置
 
 GitHub 只保存程序与示例，不包含实际机器 token、隧道凭据或手机私有构建 JSON。MC 身份保存在安装父目录的 `history/remote_machine.json`；当前 CX 为 `D:/code/cx/history/remote_machine.json`。原目录升级保留整个 history，用户先退出旧 MC，然后在源码目录执行：

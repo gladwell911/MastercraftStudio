@@ -128,7 +128,7 @@ def test_voice_replaces_external_selection_and_appends_in_background(
             frame._on_global_ctrl_keyup(False, "left")
             frame._on_global_ctrl_keyup(False, "left")
             _pump_until(wx_app, lambda: effects.count("ready") == count)
-            frame._on_global_ctrl_keyup(False, "right")
+            frame._on_global_ctrl_keyup(False, "left")
             assert controller.state == "finishing", effects
             rig.connect.set()
             _pump_until(wx_app, lambda: "error" in effects or effects.count(rig.text) == count, timeout=5)
@@ -139,8 +139,10 @@ def test_voice_replaces_external_selection_and_appends_in_background(
 
         rig.connect.clear()
         frame._on_global_ctrl_keyup(False, "right")
+        assert controller.state == "idle"
+        frame._on_global_ctrl_keyup(False, "right")
         _pump_until(wx_app, lambda: effects.count("ready") == 3)
-        frame._on_global_ctrl_keyup(False, "left")
+        frame._on_global_ctrl_keyup(False, "right")
         assert controller.state == "finishing", effects
         rig.connect.set()
         _pump_until(wx_app, lambda: effects.count(rig.text) == 3 or "error" in effects, timeout=5)

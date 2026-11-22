@@ -1,13 +1,20 @@
 # 当前交接
 
-更新日期 2026-11-22。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本轮功能提交为 `3e56bda`，提问框不折行基线为 `f9674e1`。本轮验收使用源码，日常目标为 `D:/code/cx/md/mc.exe`。
+更新日期 2026-11-22。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本轮用量、语音和 RC 分享从 3b85215 继续实施。验收使用源码与隔离设备，日常目标仍为 `D:/code/cx/md/mc.exe`。
+
+## 2026-11-22 Kimi 累计、双 Ctrl 和 RC 分享
+
+- Alt+Y 从可核验的 Kimi 2.5.3 终态历史恢复累计 token 和加权缓存命中率。未知字段及失效扫描保留各自状态。左右 Ctrl 同侧双击开始，短按停止，左侧追加到 MC，右侧写当前编辑位置。
+- RC 附件按协商来源、目标聊天、发送 ID 和清空代次归属。隔离 Android 用真实 RC 确认按钮走 NATS/HTTP，第二份附件首次 PUT 返回 503，首次已受理提交回执丢失。重试后选中聊天新增一轮，其他聊天为零。Codex 构造器收到指令和两个 localImage，托管字节与源文件的 SHA-256 一致。模型服务器使用测试替身。
+- 最终独立定向 30/30，通过真实隔离 Kimi 2.5.3、附件构造、HTTP、脱敏诊断及键盘回归。前一轮原生前台选区通过，最终轮记事本和 Edge 未取得焦点。命令范围与跨端结果见 [修复验证](../_bmad-output/implementation-artifacts/plan-fix-mc-rc-kimi-voice-share-review.md#auto-run-result)。
+- 接续验收需要日常受影响 Kimi 聊天、物理 Ctrl/麦克风、实体微信和 TalkBack、两台实际在线电脑以及真实模型响应。管理员 PowerShell 无法执行这轮 package_mc.ps1 -BuildOnly，冻结包验收待在非管理员隔离目录完成。
 
 ## 2026-11-22 聊天用量、语音、附件与无障碍阅读
 
 - Codex 与 KimiCode 显示原生用量和缓存命中率。累计行按当前会话归属更新，原文、同步和文件提取继续使用完整正文。语音按触发侧路由，OpenRouter Claude 在后台验证并发送实际附件。使用入口见 [README](../README.txt)。
 - 独立定向矩阵 438 项通过，含 Alt+Y 与用量 106 项、原生长行 2 项。隔离 `RICHEDIT50W` 控件验证 9,800 与 28,000 字符均为可横向滚动的单行，Home、End、方向键、复制与提交保留尾部标记，真实换行仍形成两行。宽套件 14 项旧失败及排除的两项旧语音 UI 用例均有精确基线对照。wx 清理有 COM `0x8001010d` 诊断。
 - 真实 OpenRouter Claude 请求在后续审查补丁前分别读回合成 PDF、PNG、TXT 标记。最终后台预检和历史附件重放已有本地覆盖。隔离 Kimi 2.5.3 通过空会话订阅 ACK 与上下文读取。命令、样本边界和 12 项审查修复见 [实施计划](../_bmad-output/implementation-artifacts/plan-mc-rc-chat-ux.md)。
-- 接续验收需核对真实非空 Kimi 历史分页累计、物理语音按键、隔离记事本与浏览器写入和冻结版 UI Automation。RC 实体 TalkBack 首项焦点仍待验收。本轮沿用源码验证，日常程序及设备未切换。
+- 该节保留先前源码证据，最新验收见本页首节。
 
 ## 2026-11-22 Kimi 键盘响应与执行历史
 

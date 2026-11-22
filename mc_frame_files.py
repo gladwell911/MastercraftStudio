@@ -157,7 +157,11 @@ class FileManagerMixin:
     def _file_command_body(self, payload: dict) -> dict:
         body = payload.get("body")
         if isinstance(body, dict):
-            return dict(body)
+            if "attachment_send_id" not in payload:
+                return dict(body)
+            attachment_fields = ("attachment_send_id", "attachment_upload_id", "file_id",
+                                 "name", "size_bytes", "transferred_bytes")
+            return {**{key: payload[key] for key in attachment_fields if key in payload}, **body}
         return {key: value for key, value in dict(payload or {}).items() if key not in {"type", "id", "event_id", "chat_id", "device_id", "created_at"}}
 
     def _refresh_file_manager_if_visible(self, selected_id: str | None = None) -> None:
@@ -316,10 +320,64 @@ class FileManagerMixin:
                 entry["done"].set()
         return result
 
+    def _remote_attachment_scope(self, payload: dict, send_id: str) -> tuple:
+        source = payload.get("_attachment_source")
+        chat_id = str(payload.get("chat_id") or "").strip()
+        if (not isinstance(source, tuple) or len(source) != 2 or not all(source)
+                or not chat_id or not send_id or len(send_id) > 128):
+            return ()
+        if chat_id not in {self.active_chat_id, self.current_chat_id} and not self._find_archived_chat(chat_id):
+            return ()
+        store = getattr(self, "chat_store", None)
+        revision = max(1, store.get_clear_reconciliation_authority(chat_id)["revision"]) if store else 1
+        return (*source, chat_id, send_id, revision)
+
+    def _resolve_remote_chat_attachments(
+        self, file_ids: list, scope: tuple, *, require_confirmation: bool = True,
+    ) -> list[dict] | None:
+        attachments = []
+        root = self.file_library.storage_dir.resolve()
+        for file_id in file_ids:
+            record = self.file_library.get_record(file_id)
+            if (record is None or record.attachment_scope != scope
+                    or record.direction != FileDirection.PHONE_TO_DESKTOP
+                    or (require_confirmation and not record.attachment_confirmed)
+                    or record.status != FileTransferStatus.COMPLETED):
+                return None
+            try:
+                path = record.stored_path.resolve(strict=True)
+                if path.parent != root or not path.is_file() or path.stat().st_size != record.size_bytes:
+                    return None
+                with path.open("rb"):
+                    pass
+            except OSError:
+                return None
+            attachments.append({"name": record.name, "path": str(path)})
+        successful, failed = self._normalize_outgoing_attachments(attachments)
+        return None if failed else successful
+
     def _remote_api_file_command_ui(self, payload: dict) -> tuple[int, dict]:
         command_type = str((payload or {}).get("type") or "").strip()
         body = self._file_command_body(payload or {})
         file_id = str(body.get("file_id") or "").strip()
+        existing = self.file_library.get_record(file_id) if file_id else None
+        if existing is not None and existing.attachment_scope:
+            scope = self._remote_attachment_scope(payload, str(body.get("attachment_send_id") or ""))
+            if scope != existing.attachment_scope:
+                return 403, {"accepted": False, "error": "attachment_owner_mismatch"}
+            if command_type == "file_complete":
+                if (type(body.get("size_bytes")) is not int or body["size_bytes"] != existing.size_bytes
+                        or ("transferred_bytes" in body and
+                            (type(body["transferred_bytes"]) is not int
+                             or body["transferred_bytes"] != existing.size_bytes))):
+                    return 400, {"accepted": False, "error": "unexpected_upload_size"}
+                if not self._resolve_remote_chat_attachments([file_id], scope, require_confirmation=False):
+                    return 409, {"accepted": False, "error": "attachment_upload_incomplete"}
+                if not self.file_library.confirm_attachment_upload(file_id, scope):
+                    return 409, {"accepted": False, "error": "attachment_upload_incomplete"}
+                return 200, {"accepted": True, "file_id": file_id}
+            if command_type != "file_cancel":
+                return 400, {"accepted": False, "error": "invalid_attachment_file_command"}
         if command_type == "file_list":
             self.file_library.sync_storage_dir()
             files = [
@@ -424,6 +482,8 @@ class FileManagerMixin:
                 self._broadcast_file_transfer_state("file_canceled", record)
             return (200 if record else 404), {"accepted": bool(record), "file_id": file_id}
         if command_type == "file_complete":
+            if "attachment_send_id" in body:
+                return 409, {"accepted": False, "error": "attachment_reference_unavailable"}
             existing = self.file_library.get_record(file_id)
             size = int(body.get("size_bytes") or (existing.size_bytes if existing else 0) or 0)
             transferred = int(body.get("transferred_bytes") or size)
@@ -487,9 +547,44 @@ class FileManagerMixin:
         if command_type == "file_upload_request":
             name = str(body.get("name") or "upload.bin").strip() or "upload.bin"
             size = int(body.get("size_bytes") or 0)
-            record = self.file_library.prepare_incoming_upload(name, size_bytes=size)
+            attachment_scope = ()
+            upload_id = ""
+            record = None
+            if "attachment_send_id" in body:
+                attachment_scope = self._remote_attachment_scope(payload, str(body["attachment_send_id"] or ""))
+                upload_id = str(body.get("attachment_upload_id") or "").strip()
+                if not attachment_scope or not upload_id or len(upload_id) > 180:
+                    return 403, {"accepted": False, "error": "attachment_owner_mismatch"}
+                if (size < 0 or len(name) > 240 or name.endswith((".", " "))
+                        or Path(name).is_reserved()
+                        or any(ord(ch) < 32 or ch in '<>:"/\\|?*' for ch in name)):
+                    return 400, {"accepted": False, "error": "invalid_attachment_file"}
+                store = getattr(self, "chat_store", None)
+                if store is None or not getattr(self, "_chat_store_enabled", False):
+                    return 503, {"accepted": False, "error": "attachment_upload_unavailable"}
+                receipt = store.remote_attachment_send(attachment_scope, reserve=True)
+                if receipt["revision"] != attachment_scope[-1] or receipt["state"] != "uploading":
+                    return 409, {"accepted": False, "error": "attachment_send_expired"}
+                for candidate in self.file_library.list_records():
+                    if candidate.attachment_scope != attachment_scope or candidate.attachment_upload_id != upload_id:
+                        continue
+                    if candidate.attachment_original_name != name or candidate.size_bytes != size:
+                        return 409, {"accepted": False, "error": "attachment_upload_conflict"}
+                    if self._resolve_remote_chat_attachments([candidate.id], attachment_scope, require_confirmation=False):
+                        return 200, {"accepted": True, "file_id": candidate.id, "upload_url": ""}
+                    if candidate.status == FileTransferStatus.ACCEPTED and candidate.size_bytes == size:
+                        record = candidate
+                        break
+            if record is None:
+                record = self.file_library.prepare_incoming_upload(
+                    name, size_bytes=size, attachment_scope=attachment_scope, attachment_upload_id=upload_id,
+                )
             service = getattr(self, "file_service", None)
-            upload_url = service.upload_url_for(record.name) if service is not None and hasattr(service, "upload_url_for") else ""
+            upload_url = ""
+            if service is not None and hasattr(service, "upload_url_for"):
+                upload_url = service.upload_url_for(record if attachment_scope else record.name)
+            if attachment_scope and not upload_url:
+                return 503, {"accepted": False, "error": "attachment_upload_unavailable"}
             self._refresh_file_manager_if_visible(selected_id=record.id)
             return 200, {"accepted": True, "file_id": record.id, "name": record.name, "size_bytes": record.size_bytes, "upload_url": upload_url}
         return 404, {"accepted": False, "error": "unknown_file_command"}
@@ -514,6 +609,7 @@ class FileManagerMixin:
         updated = self.file_library.update_record_status(
             file_id,
             status,
+            allowed_from=allowed_from,
             speed_bytes_per_second=0,
         )
         return updated, updated is not None and updated.status == status

@@ -74,6 +74,7 @@ class RemoteNatsTransport:
         invoke_callback: CallbackInvoker | None = None,
         durable_store: Any | None = None,
         desktop_password: str = "",
+        chat_attachment_support: bool = False,
     ) -> None:
         self.subjects = NatsSubjects.from_pair_id(pair_id)
         self.token = token
@@ -109,6 +110,7 @@ class RemoteNatsTransport:
         self.on_file_command = on_file_command
         self._invoke_callback = invoke_callback
         self.durable_store = durable_store
+        self.chat_attachment_support = chat_attachment_support
         self.protocol_version = 1
         self.connection_epoch = uuid.uuid4().hex
         self._sessions: dict[tuple[str, str], tuple[int, str]] = {}
@@ -283,9 +285,15 @@ class RemoteNatsTransport:
                     if negotiated_version == 2
                     else {}
                 )
+                capabilities = ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness",
+                                RPC_CAPABILITY, NOTIFY_CAPABILITY]
+                if self.durable_store is not None:
+                    capabilities.append(NOTIFY_FEED_CAPABILITY)
+                if self.chat_attachment_support and negotiated_version == 2 and reply_subject:
+                    capabilities.append("chat-attachments-v1")
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
-                    "capabilities": ["canonical-owner", "durable-outbox", "replay", "lightweight-readiness", RPC_CAPABILITY, NOTIFY_CAPABILITY] + ([NOTIFY_FEED_CAPABILITY] if self.durable_store is not None else []),
+                    "capabilities": capabilities,
                     "notification_incarnation": self.notification_incarnation,
                     "epoch": negotiated_epoch,
                     **watermark,
@@ -303,6 +311,18 @@ class RemoteNatsTransport:
                 if reply_subject and self.durable_store is not None:
                     body.update(self.durable_store.paired_feed_high_water(pair_id=self.subjects.pair_id, domain="events"))
             else:
+                # Scope attachment operations to the negotiated RPC installation and pair.
+                payload = {key: value for key, value in payload.items() if key != "_attachment_source"}
+                if "attachment_file_ids" in body_payload:
+                    for key in ("attachment_file_ids", "client_send_id", "text", "model", "model_change_mode"):
+                        if key in body_payload:
+                            payload.setdefault(key, body_payload[key])
+                if ("attachment_file_ids" in payload or "attachment_send_id" in payload
+                        or "attachment_send_id" in body_payload):
+                    payload["_attachment_source"] = (
+                        (self.subjects.pair_id, device_id)
+                        if self.chat_attachment_support and reply_subject and negotiated_version == 2 else None
+                    )
                 route = asyncio.to_thread(self._invoke_route_command, payload)
                 if payload.get("type") in {"history_list", "history_read", "execution_page_v3", "content_page"}:
                     try:

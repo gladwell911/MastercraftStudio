@@ -273,3 +273,23 @@ def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
         seen.append(frame.view_history_id)
 
     assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+
+
+@pytest.mark.parametrize("state", ["initial", "cleared", "sent", "typed"])
+def test_voice_append_preserves_empty_draft_and_real_placeholder_text(frame, monkeypatch, state):
+    monkeypatch.setattr(frame, "_voice_insertion_feedback", lambda *_: None)
+    if state == "cleared":
+        frame.input_edit.SetValue("old draft")
+        frame.input_edit.Clear()
+        frame._set_input_hint_idle()
+    elif state == "sent":
+        frame.input_edit.Clear()
+        frame._set_input_hint_sent()
+    elif state == "typed":
+        frame.input_edit.SetValue("输入")
+    frame.answer_list.SetFocus()
+    frame._append_voice_question("first")
+    frame._append_voice_question("second")
+    expected = ("输入\n" if state == "typed" else "") + "first；\nsecond；\n"
+    assert frame.input_edit.GetValue() == expected
+    assert frame.input_edit.GetInsertionPoint() == frame.input_edit.GetLastPosition()

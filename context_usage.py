@@ -45,9 +45,7 @@ def format_session_total_tokens(value: Any) -> str:
     value = native_token_count(value)
     if value is None:
         return "累计暂无"
-    whole, remainder = divmod(value, 1000)
-    fraction = f".{remainder:03d}".rstrip("0") if remainder else ""
-    return f"累计 {whole}{fraction}k"
+    return f"累计 {value // 1000}k"
 
 MODEL_CONTEXT_WINDOWS = {
     "codex/main": 258400,

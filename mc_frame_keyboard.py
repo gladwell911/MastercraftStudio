@@ -206,7 +206,7 @@ class GlobalCtrlTapHook:
             return
         started = self._hook_pressed_at.pop(side, None)
         if started is not None:
-            combo = side in self._hook_chords or (side == "right" and now - started > 0.4)
+            combo = side in self._hook_chords or now - started > 0.4
             self._hook_chords.discard(side)
             self._emit_ctrl_keyup(combo, side, source="hook")
 
@@ -247,7 +247,7 @@ class GlobalCtrlTapHook:
                     self._poller_chords.add(side)
             elif old:
                 started = self._poller_pressed_at.pop(side, now)
-                chord = side in self._poller_chords or (side == "right" and now - started > 0.4)
+                chord = side in self._poller_chords or now - started > 0.4
                 self._poller_chords.discard(side)
                 if self._should_use_poller_release():
                     self._emit_ctrl_keyup(chord, side, source="poller")

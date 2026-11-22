@@ -765,6 +765,9 @@ class RemoteRuntimeMixin:
                     on_notes_changes=self._remote_api_notes_changes,
                     on_notes_bulk_docs=self._remote_api_notes_bulk_docs,
                     on_file_command=None,
+                    chat_attachment_support=not getattr(
+                        self.file_service, "use_copyparty_process", False
+                    ),
                     durable_store=getattr(self, "chat_store", None),
                 )
                 transport.on_file_command = lambda payload, source_transport=transport: self._remote_api_file_command_worker(

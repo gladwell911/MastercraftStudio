@@ -1,6 +1,6 @@
 # 文档索引
 
-截至 2026-11-22，聊天用量、语音分流、Claude 附件和回答阅读改进已进入 `3e56bda`。日常包已具备固定 Kimi 2.5.3 运行时，后续源码改动尚待切换。各版本验证边界见 [当前交接](handoff.md)。
+截至 2026-11-22，源码已完成 Kimi 历史累计恢复、双 Ctrl 语音和 RC 聊天附件。日常包已具备固定 Kimi 2.5.3 运行时，后续源码改动尚待切换。各版本验证边界见 [当前交接](handoff.md)。
 
 ## 当前入口
 
@@ -58,7 +58,7 @@
 - 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
 - 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。2026-11-21 起增加 OneDrive `mc-private/` 机器配置恢复资料（显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值，实现见 `remote_machine_config.py`）。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 问题/答案按独立question_order/answer_order排序并在格式化前选择消息尾页；created_at/answer_at只用于时间标签，时间行累计300秒。终结重放保留顺序和时间；旧记录仅合并可信时间，不填当前时间。Kimi steer alias共用answer_identity，alias正文为空并引用answer_alias_of；旧手机忽略新增排序字段的显示边界保留。
-- Codex 和 KimiCode 的回答列表显示会话累计 token，Alt+Y 显示原生上下文、累计 token、按输入 token 加权的缓存命中率及各自额度。Kimi V2 的上下文与累计来源见 [Kimi 运行时](kimi-runtime.md)。
+- Codex 和 KimiCode 的回答列表以整数千位显示会话累计 token，Alt+Y 显示原生上下文、累计 token、按输入 token 加权的缓存命中率及各自额度。Kimi V2 的上下文与累计来源见 [Kimi 运行时](kimi-runtime.md)。
 - 回答列表与 Enter 详情缩短网址和文件路径。Shift+Enter 的网页、文件提取、跨端正文和继续提问使用完整回答。详情编辑仅保存在临时缓冲区，关闭窗口即丢弃。
 - 普通 OpenRouter Claude 附件经过有界后台读取，提交时重验草稿归属。当前选中文件按模态编码，后续请求重放同一会话内可读取的附件，无法读取的历史附件用具名提示表示。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。

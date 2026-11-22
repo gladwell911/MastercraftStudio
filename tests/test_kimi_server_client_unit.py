@@ -24,6 +24,7 @@ from kimi_server_client import (
     pick_free_port,
     resolve_kimi_launch_command,
 )
+from kimi_server_v2 import KimiUsageQueryError
 
 
 def test_v2_idle_usage_before_ack_and_complete_paged_cache(monkeypatch):
@@ -75,9 +76,50 @@ def test_v2_usage_rejects_scan_when_transcript_changes_mid_page(monkeypatch):
         return {"items": [], "has_more": False}
 
     monkeypatch.setattr(client, "get_transcript", page)
-    with pytest.raises(KimiServerError, match="changed during usage scan"):
+    with pytest.raises(KimiUsageQueryError, match="changed during usage scan") as failure:
         client.get_v2_usage_totals("s")
+    assert (failure.value.stage, failure.value.pages) == ("scan_generation", 1)
     assert client.get_v2_usage_totals("s")["scan_generation"] == 1
+
+
+@pytest.mark.parametrize(("failure_stage", "completed_pages"), [
+    ("subscribe_ack_timeout", 0),
+    ("rest_timeout", 1),
+    ("rest_page", 1),
+    ("pagination_cursor", 2),
+    ("socket_generation", 2),
+])
+def test_v2_usage_failure_reports_safe_phase_and_page_count(monkeypatch, failure_stage, completed_pages):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client.ws_connect_timeout = 0.001
+    monkeypatch.setattr(client, "subscribe", lambda *_a, **_k: None)
+    session = "PRIVATE-SESSION"
+    if failure_stage != "subscribe_ack_timeout":
+        client._v2_ready_generations[session] = client._ws_generation
+        monkeypatch.setattr(client, "_ws_is_usable_locked", lambda: True)
+        ready = client._v2_subscription_events[session] = threading.Event()
+        ready.set()
+
+    def transcript(_session, *, before_turn, timeout):
+        turn = {"kind": "turn", "turnId": "tPRIVATE", "state": "completed"}
+        if not before_turn:
+            return {"items": [turn], "has_more": True}
+        if failure_stage == "rest_timeout":
+            raise TimeoutError("PRIVATE request path")
+        if failure_stage == "rest_page":
+            return {"items": ["PRIVATE transcript"]}
+        if failure_stage == "socket_generation":
+            client._ws_generation += 1
+            return {"items": [], "has_more": False}
+        return {"items": [turn], "has_more": True}
+
+    monkeypatch.setattr(client, "get_transcript", transcript)
+    with pytest.raises(KimiUsageQueryError) as failure:
+        client.get_v2_usage_totals(session)
+    assert (failure.value.stage, failure.value.pages) == (failure_stage, completed_pages)
+    assert "PRIVATE" not in str(failure.value)
+    assert "PRIVATE" not in failure.value.category
 
 
 @pytest.mark.parametrize(("second_step", "turn_usage", "expected"), [
@@ -85,6 +127,14 @@ def test_v2_usage_rejects_scan_when_transcript_changes_mid_page(monkeypatch):
      None, (130, {"input_tokens": 118, "cached_tokens": 25})),
     ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3}, None, (None, None)),
     (None, None, (None, None)),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
+     {"inputTokens": 93, "outputTokens": 12}, (130, {"input_tokens": 118, "cached_tokens": 25})),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
+     {"inputTokens": 92}, (None, None)),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
+     {"inputTokens": "invalid"}, (None, None)),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3},
+     {"inputTokens": 93, "cachedTokens": 25}, (None, {"input_tokens": 118, "cached_tokens": 25})),
     ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
      {"inputTokens": 6, "cachedTokens": 4, "outputTokens": 2},
      (12, {"input_tokens": 10, "cached_tokens": 4})),
@@ -107,6 +157,28 @@ def test_v2_cold_usage_restores_only_complete_terminal_step_totals(monkeypatch, 
     snapshot = client.get_v2_usage_totals("s")
     assert (snapshot["session_total_tokens"], snapshot["cache_hits"]["total"]) == expected
     assert snapshot["cache_hits"]["last"] == {"input_tokens": 100, "cached_tokens": 20}
+
+
+def test_v2_empty_and_unproven_cancelled_usage_remains_unknown(monkeypatch):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client._v2_ready_generations["s"] = client._ws_generation
+    monkeypatch.setattr(client, "_require_v2_ready", lambda _sid: None)
+    items = []
+    monkeypatch.setattr(client, "get_transcript", lambda *_args, **_kwargs: {"items": items})
+
+    def scan():
+        client._invalidate_v2_usage_scan("s")
+        return client.get_v2_usage_totals("s")
+
+    assert scan()["session_total_tokens"] is None
+    items.append({"kind": "turn", "turnId": "t1", "state": "completed",
+                  "usage": {"inputTokens": 0, "cachedTokens": 0, "outputTokens": 0}})
+    assert scan()["session_total_tokens"] == 0
+    assert scan()["cache_hits"]["total"] == {"input_tokens": 0, "cached_tokens": 0}
+    items.append({"kind": "turn", "turnId": "t2", "state": "cancelled", "steps": []})
+    assert scan()["session_total_tokens"] is None
+    assert scan()["cache_hits"]["total"] is None
 
 
 @pytest.mark.parametrize("event_type", ["tool.call.started", "tool.result", "turn.step.started", "session.meta.updated"])

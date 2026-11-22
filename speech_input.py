@@ -17,15 +17,14 @@ MODE_OPTIMIZE = "optimize"
 class CtrlTapDetector:
     def __init__(self, double_tap_ms: int = 200) -> None:
         self.double_tap_s = double_tap_ms / 1000.0
-        self._last_tap_by_side: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self._last_side: str | None = None
         self._last_any_tap = 0.0
 
     def on_tap_idle(self, side: str) -> bool:
         now = time.monotonic()
         side_key = "right" if side == "right" else "left"
-        last = self._last_tap_by_side.get(side_key, 0.0)
-        hit = side_key == "right" or (now - last) <= self.double_tap_s
-        self._last_tap_by_side[side_key] = now
+        hit = self._last_side == side_key and now - self._last_any_tap <= self.double_tap_s
+        self._last_side = side_key
         self._last_any_tap = now
         return hit
 
@@ -36,7 +35,7 @@ class CtrlTapDetector:
         return hit
 
     def reset(self) -> None:
-        self._last_tap_by_side = {"left": 0.0, "right": 0.0}
+        self._last_side = None
         self._last_any_tap = 0.0
 
 
@@ -123,11 +122,12 @@ class VoiceInputController:
         self._dispatch(deliver)
 
     def on_ctrl_keyup(self, combo_used=False, side="left"):
+        if combo_used:
+            self.detector.reset()
+            return
         if self.state == "idle":
             side = "right" if side == "right" else "left"
-            if combo_used:
-                self.detector.reset()
-            elif self.detector.on_tap_idle(side):
+            if self.detector.on_tap_idle(side):
                 self.start_recording(MODE_DIRECT, side=side)
         elif self.state == "starting":
             self.cancel()

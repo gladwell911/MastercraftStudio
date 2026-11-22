@@ -1,5 +1,6 @@
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
+import pytest
 
 from file_transfer import (
     DesktopFileLibrary,
@@ -296,3 +297,76 @@ def test_prepared_copy_expiry_leaves_no_record_or_partial_file(tmp_path):
         library.prepare_local_file(source, deadline=time.monotonic() - 1)
     assert library.list_records() == []
     assert list(tmp_path.glob(".mc-file-*")) == []
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_concurrent_ordinary_and_attachment_puts_keep_the_reserved_complete_bytes(tmp_path, embedded):
+    import http.client
+    import socket
+    import time
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+    from file_transfer import CopypartyFileService, DesktopFileHttpService
+
+    library = DesktopFileLibrary(tmp_path / "storage")
+    service = (CopypartyFileService(library, host="127.0.0.1", port=0, use_copyparty_process=False)
+               if embedded else DesktopFileHttpService(library))
+    scope = ("laptop", "device", "chat", "send", 1)
+    attachment = library.prepare_incoming_upload("同名.txt", size_bytes=6, attachment_scope=scope)
+    ordinary = library.prepare_incoming_upload("同名.txt", size_bytes=8)
+    canceled = library.prepare_incoming_upload("同名.txt", size_bytes=6, attachment_scope=scope)
+    assert len({record.stored_path for record in (attachment, ordinary, canceled)}) == 3
+
+    def put(url, data):
+        try:
+            with urlopen(Request(url, data=data, method="PUT"), timeout=5) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
+
+    connections = []
+
+    def open_slow_put(url):
+        parsed = urlsplit(url)
+        stream = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        connections.append(stream)
+        stream.putrequest("PUT", f"{parsed.path}?{parsed.query}")
+        stream.putheader("Content-Length", "6")
+        stream.endheaders()
+        stream.send(b"bad")
+        deadline = time.monotonic() + 3
+        while not list(tmp_path.glob(".mc-upload-*")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert list(tmp_path.glob(".mc-upload-*"))
+        return stream
+
+    service.start()
+    try:
+        if embedded:
+            service.set_public_base_url(f"http://127.0.0.1:{service._embedded_server.server_port}")
+        upload_url = service.upload_url_for(attachment)
+        ordinary_url = service.upload_url_for(ordinary)
+        assert put(upload_url, b"wrong") == 400
+        wrong_token = urlsplit(upload_url)._replace(query=urlsplit(ordinary_url).query).geturl()
+        assert put(wrong_token, b"marker") == 403
+        interrupted = open_slow_put(upload_url)
+        assert library.sync_storage_dir() == []
+        assert not attachment.stored_path.exists()
+        assert put(ordinary_url, b"ordinary") == 201
+        assert put(upload_url, b"marker") == 201
+        interrupted.sock.shutdown(socket.SHUT_WR)
+        assert interrupted.getresponse().status == 400
+        assert put(upload_url, b"second") == 201
+        assert attachment.stored_path.read_bytes() == b"marker"
+        assert ordinary.stored_path.read_bytes() == b"ordinary"
+
+        in_flight = open_slow_put(service.upload_url_for(canceled))
+        library.update_record_status(canceled.id, FileTransferStatus.CANCELED)
+        in_flight.send(b"bad")
+        assert in_flight.getresponse().status == 409
+        assert not canceled.stored_path.exists()
+        assert not list(tmp_path.glob(".mc-upload-*"))
+    finally:
+        for stream in connections:
+            stream.close()
+        service.stop()

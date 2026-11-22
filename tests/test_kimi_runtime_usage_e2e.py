@@ -86,8 +86,9 @@ max_context_size = 32768
 
 
 def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
-    frame, wx_app, monkeypatch, loopback_kimi_home
+    frame, wx_app, monkeypatch, loopback_kimi_home, caplog
 ):
+    caplog.set_level("DEBUG", logger="kimi_server_v2")
     workspace, requests = loopback_kimi_home
     monkeypatch.setattr(frame, "_workspace_dir_for_kimi", lambda: str(workspace))
     monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda **_kwargs: None)
@@ -149,6 +150,7 @@ def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
         assert any("会话累计 token：110" in line for line in rows()), rows()
         assert any(line == "缓存命中：20.0%" for line in rows()), rows()
         assert any(line == "累计缓存命中：20.0%" for line in rows()), rows()
+        assert any("stages=subscribe_ack,rest_complete pages=1" in line for line in caplog.messages)
         assert len(requests) == 1, "opening the previous chat must use persisted history"
         print(f"KIMI_REOPEN_USAGE_OK rows={rows()[:4]}")
     finally:

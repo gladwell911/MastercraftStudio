@@ -1,5 +1,7 @@
 import ctypes
 
+import pytest
+
 import main
 
 
@@ -224,3 +226,17 @@ def test_ui_automation_context_row_selection_survives_visible_history_usage_refr
     assert frame.answer_list.GetString(0) == "40k / 258k"
     assert frame.answer_list.GetSelection() == 0
     assert frame.answer_meta[0][0] == "context_usage"
+
+
+@pytest.mark.parametrize(("total", "label"), [
+    (None, "累计暂无"), (0, "累计 0k"), (999, "累计 0k"),
+    (1000, "累计 1k"), (1999, "累计 1k"),
+])
+def test_kimi_session_total_top_row_uses_whole_thousands(frame, total, label):
+    frame.model_combo.SetValue("Kimi Code")
+    frame.selected_model = "kimi/main"
+    chat = frame._current_chat_state
+    chat["model"] = "kimi/main"
+    chat["kimi_session_total_tokens"] = total
+    chat["kimi_usage_cache_owner"] = frame._information_cache_owner(chat, "kimi")
+    assert frame._answer_usage_header_label() == label

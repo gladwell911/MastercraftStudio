@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import main
@@ -1256,3 +1257,189 @@ def test_file_worker_keeps_ui_responsive_and_commits_original_chat(frame, tmp_pa
             if thread.ident:
                 thread.join(1)
         http_service.stop()
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi", "claude", "unsupported"])
+def test_rc_attachment_wire_upload_and_provider_submission(frame, monkeypatch, tmp_path, provider):
+    import asyncio
+    import base64
+    from urllib.request import Request, urlopen
+
+    from chat_client import ChatClient
+    from file_transfer import DesktopFileHttpService, DesktopFileLibrary
+    from remote_nats import RemoteNatsTransport
+    from remote_nats_protocol import rpc_reply_subject
+
+    library = DesktopFileLibrary(tmp_path / "attachments")
+    frame.file_library = library
+    service = DesktopFileHttpService(library)
+    frame.file_service = service
+    frame._chat_store_enabled = True
+    frame.active_chat_id = frame.current_chat_id = "desktop-current"
+    model = {"codex": main.DEFAULT_CODEX_MODEL, "kimi": "kimi/main",
+             "claude": "anthropic/claude-sonnet-4.6", "unsupported": "openai/gpt-5.2"}[provider]
+    for chat in ("chosen-chat", "different-chat"):
+        frame.chat_store.upsert_chat({"id": chat, "title": "Same title", "model": model})
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    for method in ("_push_remote_state", "_push_remote_history_changed", "_schedule_first_question_auto_title",
+                   "_play_send_sound", "_defer_chat_state_save", "_call_after_if_alive", "_upsert_history_row"):
+        monkeypatch.setattr(frame, method, lambda *_a, **_k: None)
+
+    sent = []
+    rejected_once = []
+
+    class CodexClient:
+        def start(self):
+            pass
+
+        def start_turn(self, **kwargs):
+            sent.append(kwargs["input_items"])
+
+    class KimiClient:
+        protocol_version = 2
+
+        def start(self):
+            pass
+
+        def create_session(self, **kwargs):
+            return "kimi-session"
+
+        def submit_prompt(self, session, blocks, *, prompt_id):
+            sent.append(blocks)
+            return prompt_id
+
+    class ClaudeClient(ChatClient):
+        def _should_use_web(self, _user_text):
+            return False
+
+        def _stream_request(self, model, messages, on_delta, **kwargs):
+            sent.append(messages[-1]["content"])
+            return "provider received"
+
+    monkeypatch.setattr(frame, "_get_or_create_codex_client", lambda *_: CodexClient())
+    monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: KimiClient())
+    monkeypatch.setattr(main, "ChatClient", ClaudeClient)
+
+    def start_codex(owner, index, question, model):
+        if not rejected_once:
+            rejected_once.append(True)
+            return False
+        frame._run_codex_turn_worker(owner, index, question, model, from_recovery=False)
+
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", start_codex)
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn",
+                        lambda *args: frame._run_kimi_turn_worker(*args, from_recovery=False))
+
+    transport = RemoteNatsTransport(
+        pair_id="laptop", token="isolated", durable_store=frame.chat_store,
+        chat_attachment_support=True, on_file_command=frame._remote_api_file_command_ui,
+        on_message=frame._remote_api_message_ui,
+    )
+    frame._remote_nats_transport = transport
+    responses = []
+
+    class Connection:
+        async def publish(self, subject, data):
+            responses.append((subject, json.loads(data)))
+
+    transport._nats_client = Connection()
+    epochs = {}
+    seq = 0
+
+    def rpc(command, *, owner="chosen-chat", device="phone", flat_only=False, **fields):
+        nonlocal seq
+        seq += 1
+        request = f"rc-{seq}"
+        reply = rpc_reply_subject("laptop", device, "isolated-session", request)
+        envelope = {
+            **fields, "id": request, "type": command, "device_id": device,
+            "created_at": 123, "session_id": "isolated-session", "reply_subject": reply,
+        }
+        if command != "hello":
+            envelope.update(protocol_version=2, chat_id=owner, request_id=request, epoch=epochs[device],
+                            body={} if flat_only else fields)
+        asyncio.run(transport._handle_rpc_message(SimpleNamespace(data=json.dumps(envelope).encode())))
+        subject, response = responses.pop()
+        assert subject == reply
+        return response["status"], response["body"]
+
+    for device in ("phone", "other-phone"):
+        status, hello = rpc("hello", device=device, protocol_versions=[2])
+        assert status == 200
+        assert "chat-attachments-v1" in hello["capabilities"]
+        epochs[device] = hello["epoch"]
+
+    service.start()
+    try:
+        upload = {"name": "share.png", "size_bytes": 6, "attachment_send_id": "stable",
+                  "attachment_upload_id": "stable-0"}
+        status, response = rpc("file_upload_request", flat_only=True, **upload)
+        assert status == 200
+        ref = response["file_id"]
+        assert rpc("file_upload_request", **upload)[1]["file_id"] == ref
+        assert rpc("file_upload_request", **{**upload, "name": "other.png"})[0] == 409
+        assert rpc("file_upload_request", **{**upload, "size_bytes": 7})[0] == 409
+        submit = {"text": "Read the attachment", "client_send_id": "stable",
+                  "attachment_file_ids": [ref]}
+        complete = {"file_id": ref, "size_bytes": 6, "attachment_send_id": "stable"}
+        assert rpc("file_complete", **complete)[0] == 409
+        assert rpc("message", **submit)[0] == 409
+        request = Request(response["upload_url"], data=b"marker", method="PUT")
+        with urlopen(request) as transfer:
+            assert transfer.status == 201
+        assert rpc("message", **submit)[0] == 409
+        assert rpc("file_complete", **{**complete, "size_bytes": 5})[0] == 400
+        assert rpc("file_complete", device="other-phone", _attachment_source=["laptop", "phone"], **complete)[0] == 403
+        assert rpc("file_complete", **complete)[0] == 200
+        assert rpc("message", owner="different-chat", **submit)[0] == 409
+        assert rpc("message", device="other-phone", _attachment_source=["laptop", "phone"], **submit)[0] == 409
+
+        def questions():
+            rows = frame.chat_store.pending_outbox(pair_id="laptop", domain="events")
+            return [event for row in rows if (event := json.loads(row["payload"]))["kind"] == "execution_entry"
+                    and event["body"]["kind"] == "question"]
+
+        if provider == "unsupported":
+            assert rpc("message", **submit) == (400, {"accepted": False, "error": "attachment_model_unsupported"})
+            assert frame.chat_store.count_turns("chosen-chat") == 0
+            assert not questions()
+            return
+        if provider == "codex":
+            assert rpc("message", **submit)[0] == 400
+            assert frame.chat_store.count_turns("chosen-chat") == 0
+            assert frame._find_archived_chat("chosen-chat")["turns"] == []
+            assert not questions()
+        expected_ack = (200, {"accepted": True, "chat_id": "chosen-chat", "client_send_id": "stable"})
+        assert rpc("message", **submit) == expected_ack
+        assert rpc("message", **submit) == expected_ack
+        assert rpc("message", **{**submit, "text": "changed instruction"})[0] == 409
+        assert frame.chat_store.count_turns("chosen-chat") == 1
+        assert frame.chat_store.count_turns("different-chat") == 0
+        assert len(questions()) == 1
+
+        if provider == "codex":
+            assert sent == [[{"type": "text", "text": submit["text"]},
+                             {"type": "localImage", "path": str(library.get_record(ref).stored_path)}]]
+        elif provider == "kimi":
+            assert sent == [[{"type": "text", "text": submit["text"]},
+                             {"type": "image", "source": {"kind": "base64", "media_type": "image/png",
+                              "data": base64.b64encode(b"marker").decode()}}]]
+        else:
+            import time
+            deadline = time.monotonic() + 2
+            while not sent and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert sent == [[{"type": "text", "text": submit["text"]},
+                             {"type": "image_url", "image_url": {"url": "data:image/png;base64,bWFya2Vy"}}]]
+        partial = {**upload, "attachment_send_id": "partial", "attachment_upload_id": "partial-0"}
+        assert rpc("file_upload_request", **partial)[0] == 200
+        frame.chat_store.begin_clear_operation("chosen-chat", pair_id="laptop", idempotency_key="clear-once")
+        assert rpc("file_upload_request", **partial)[0] == 409
+        assert rpc("file_upload_request", **upload)[0] == 409
+        assert rpc("message", **submit) == expected_ack
+        assert rpc("message", **{**submit, "text": "changed after clear"})[0] == 409
+        assert len(sent) == 1
+        assert frame.chat_store.count_turns("chosen-chat") == 0
+    finally:
+        service.stop()
+        frame._remote_nats_transport = None
