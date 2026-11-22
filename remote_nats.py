@@ -28,6 +28,7 @@ from remote_nats_protocol import (
     NOTIFY_KINDS,
     compact_notification,
     feed_bound_fact,
+    canonical_durable_hash,
 )
 
 
@@ -491,9 +492,15 @@ class RemoteNatsTransport:
                                 envelope, pair_id=self.subjects.pair_id,
                                 notification_feed_id=self.durable_store.get_meta("notification_feed_id"))))
                     else:
-                        ack = await self.jetstream.publish(subject, encode_payload(feed_bound_fact(
+                        wire = feed_bound_fact(
                             envelope, pair_id=self.subjects.pair_id,
-                            notification_feed_id=self.durable_store.get_meta("notification_feed_id"))))
+                            notification_feed_id=self.durable_store.get_meta("notification_feed_id"))
+                        withdrawn = getattr(self.durable_store, "execution_fact_is_withdrawn", None)
+                        if envelope["kind"] == "execution_entry" and withdrawn and withdrawn(envelope["event_id"]):
+                            wire["body"] = {"kind": "info", "title": "内容已撤回", "withdrawn": True,
+                                            "canonical_item_id": envelope["body"].get("canonical_item_id")}
+                            wire["canonical_hash"] = canonical_durable_hash(wire)
+                        ack = await self.jetstream.publish(subject, encode_payload(wire))
                     if ack is None and type(self.jetstream).__module__.startswith("nats"):
                         raise RuntimeError("missing_publish_ack")
                     self.durable_store.mark_outbox_acked(row["sync_sequence"], consumer_id=f"publisher:{row['pair_id']}", **identity)

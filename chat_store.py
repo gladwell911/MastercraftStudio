@@ -183,6 +183,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("UPDATE chats SET updated_at=?,metadata_json=? WHERE id=?", (now, json.dumps(metadata, ensure_ascii=False), owner))
             conn.execute("DELETE FROM turns WHERE chat_id=?", (owner,))
             conn.execute("DELETE FROM execution_steps WHERE chat_id=?", (owner,))
+            conn.execute("DELETE FROM execution_assemblers WHERE chat_id=?", (owner,))
+            conn.execute("DELETE FROM execution_fragment_conflicts WHERE chat_id=?", (owner,))
+            self._invalidate_execution_snapshots(conn, owner)
             try:
                 conn.execute(
                     "INSERT INTO clear_operations(operation_id,chat_id,revision,idempotency_key,pair_id,domain,state,snapshot_json,source_turn_id,source_message_id,sound_permission,created_at,updated_at) "

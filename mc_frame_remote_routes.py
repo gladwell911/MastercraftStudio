@@ -40,6 +40,9 @@ class RemoteRoutesMixin:
                                 publication_deadline: float | None = None) -> bool | None:
         transport = getattr(self, "_remote_nats_transport", None)
         store = getattr(self, "chat_store", None)
+        source_revision = payload.get("_source_revision")
+        if source_revision is not None:
+            payload = {key: value for key, value in payload.items() if key != "_source_revision"}
         if (
             transport is not None
             and int(getattr(transport, "protocol_version", 1) or 1) >= 2
@@ -66,6 +69,12 @@ class RemoteRoutesMixin:
                 body["kind"] = str(payload.get("kind") or "info").strip() or "info"
             committed = False
             try:
+                revision_guard = {}
+                if source_revision is not None:
+                    current = store.get_clear_reconciliation_authority(chat_id)["revision"]
+                    if current > source_revision:
+                        return False
+                    revision_guard["revision"] = current
                 store.commit_durable_fact(
                     pair_id=transport.subjects.pair_id,
                     domain="files" if kind.startswith("file_") else "events",
@@ -75,6 +84,7 @@ class RemoteRoutesMixin:
                         "chat_id": chat_id,
                         "origin_client": str(payload.get("origin_client") or "mc").strip(),
                         "body": body,
+                        **revision_guard,
                     },
                     execution=kind == "execution_entry",
                     **({"publication_deadline": publication_deadline} if publication_deadline is not None else {}),
@@ -1002,7 +1012,7 @@ class RemoteRoutesMixin:
         turns = state.get("turns") if isinstance(state.get("turns"), list) else []
         with self._execution_step_persist_lock:
             dirty = bool(self._pending_execution_step_persists) or bool(self._execution_step_persist_worker_running)
-        dirty = dirty or bool(getattr(self, "_codex_ui_batch_depth", 0))
+        dirty = dirty or bool(getattr(self, "_codex_ui_batch_depth", 0)) or bool(self._kimi_execution_write_counts.get(owner))
         last_step = steps[-1] if steps and isinstance(steps[-1], dict) else {}
         active_turn_index = self._active_turn_index_value() if active else -1
         if active and self._safe_int(last_step.get("turn_idx"), -1) != active_turn_index:
@@ -1048,6 +1058,8 @@ class RemoteRoutesMixin:
         cursor = str(body.get("cursor") or "")
         snapshot_id = str(body.get("snapshot_id") or "")
         try:
+            if cursor and self._kimi_execution_write_counts.get(owner):
+                raise ValueError("EXECUTION_SOURCE_PENDING")
             if not cursor:
                 status, context = self._run_remote_ui_route(self._capture_execution_projection_context_ui, payload)
                 if status != 200 or context.get("dirty"):

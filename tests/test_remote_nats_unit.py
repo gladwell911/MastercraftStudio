@@ -1,7 +1,11 @@
 import asyncio
+import json
+
+import pytest
 from chat_store import ChatStore
 
 from remote_nats import RemoteNatsTransport
+from remote_nats_protocol import validate_v2_durable
 
 
 def test_transport_routes_scoped_chat_information_without_persistence():
@@ -625,6 +629,49 @@ def test_outbox_ack_loss_automatically_retries_beyond_five_identical_bytes(tmp_p
             row = conn.execute("SELECT * FROM publication_outbox WHERE event_id='first'").fetchone()
             assert row["attempts"] == 6 and row["blocked_reason"] is None
         await transport._close_async()
+
+    asyncio.run(run())
+
+
+def test_withdrawn_execution_replay_requires_snapshot_and_outbox_acks_safe_projection(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "withdrawal.db")
+        store.initialize()
+        scope = {"chat_id": "chat", "revision": 1, "thread_id": "session", "turn_id": "1",
+                 "provider": "kimi", "agent_id": "main", "native_id": "stream"}
+        key = store.execution_logical_key(scope)
+        canonical_id = f"execution-{key}"
+        body = {"kind": "thinking", "canonical_item_id": canonical_id, "detail": "private original"}
+        fact = store.commit_durable_fact(pair_id="default", domain="events", execution=True,
+            envelope={"event_id": "narrative", "kind": "execution_entry", "chat_id": "chat", "body": body})
+        later = store.commit_durable_fact(pair_id="default", domain="events",
+            envelope={"event_id": "later", "kind": "status", "chat_id": "chat", "body": {}})
+        original = store.replay_after(pair_id="default", domain="events", sync_sequence=0)[0]
+        store.apply_execution_fragment("chat", key, scope, fragment_id="", offset=0, text="",
+                                       projection_seed={"private_reasoning": True})
+        with pytest.raises(ValueError, match="SNAPSHOT_REQUIRED"):
+            store.replay_after(pair_id="default", domain="events", sync_sequence=0)
+        assert json.loads(store.replay_after(pair_id="default", domain="events", sync_sequence=fact["sync_sequence"])[0]) == later
+
+        jetstream = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id="default", token="secret", jetstream=jetstream, durable_store=store)
+        assert (await transport._drain_outbox_lane("other"))[0] == 2
+        assert store.pending_outbox(pair_id="default") == []
+        assert store.get_checkpoint("publisher:default", "events") == later["sync_sequence"]
+        wire = validate_v2_durable(json.loads(jetstream.published[0][1]))
+        assert wire["fact_hash"] == fact["canonical_hash"]
+        assert wire["event_id"] == fact["event_id"] and wire["sync_sequence"] == fact["sync_sequence"]
+        assert wire["execution_sequence"] == fact["execution_sequence"] and wire["body"]["withdrawn"]
+        assert b"private original" not in jetstream.published[0][1]
+        with store._connect() as conn:
+            row = conn.execute("SELECT f.envelope_json, o.payload FROM durable_facts f JOIN publication_outbox o USING(event_id) "
+                               "WHERE f.event_id='narrative'").fetchone()
+            assert row["envelope_json"].encode("utf-8") == row["payload"] == original
+        store.upsert_chat({"id": "chat", "title": "chat"})
+        store.begin_clear_operation("chat", idempotency_key="clear")
+        assert not store.load_execution_steps("chat")
+        with pytest.raises(ValueError, match="SNAPSHOT_REQUIRED"):
+            store.replay_after(pair_id="default", domain="events", sync_sequence=0)
 
     asyncio.run(run())
 

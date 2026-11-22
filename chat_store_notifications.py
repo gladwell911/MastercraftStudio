@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from chat_store_execution import _DISCLOSABLE_EXECUTION_FACT
 from chat_store_schema import MAX_INT64
 from typing import Any
 
@@ -713,5 +714,19 @@ class ChatStoreNotificationsMixin:
                 return []
             retained=int(state["n"] or 1)
             if int(sync_sequence)+1 < retained: raise ValueError("SNAPSHOT_REQUIRED")
-            rows=conn.execute("SELECT envelope_json FROM durable_facts WHERE pair_id=? AND domain=? AND sync_sequence>? ORDER BY sync_sequence LIMIT ?", (pair_id,domain,int(sync_sequence),max(1,int(limit)))).fetchall()
+            rows = conn.execute(
+                f"SELECT envelope_json, {_DISCLOSABLE_EXECUTION_FACT} AS disclosable FROM durable_facts AS fact "
+                "WHERE pair_id=? AND domain=? AND sync_sequence>? ORDER BY sync_sequence LIMIT ?",
+                (pair_id, domain, int(sync_sequence), max(1, int(limit))),
+            ).fetchall()
+            if any(not row["disclosable"] for row in rows):
+                raise ValueError("SNAPSHOT_REQUIRED")
         return [str(r["envelope_json"]).encode("utf-8") for r in rows]
+
+    def execution_fact_is_withdrawn(self, event_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {_DISCLOSABLE_EXECUTION_FACT} AS disclosable FROM durable_facts AS fact WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        return row is not None and not row["disclosable"]

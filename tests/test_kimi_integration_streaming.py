@@ -130,7 +130,7 @@ def test_rest_steering_alias_keeps_original_step_ownership(frame, monkeypatch, a
         callbacks = []
         original_call_after = frame._call_after_if_alive
         def defer_sync(fn, *args, **kwargs):
-            if fn == frame._kimi_sync_thinking_rows:
+            if fn == frame._start_kimi_thinking_sync:
                 callbacks.append((fn, args, kwargs))
                 return
             return original_call_after(fn, *args, **kwargs)
@@ -142,7 +142,7 @@ def test_rest_steering_alias_keeps_original_step_ownership(frame, monkeypatch, a
                                        "owner_generation": owner["generation"], "idle_verified": True}))
         assert not frame._kimi_prompt_owners
         fn, args, kwargs = callbacks[0]
-        assert fn(*args, **kwargs)
+        fn(*args, **kwargs)
     else:
         assert frame._kimi_sync_thinking_rows(_active_chat_id(frame), owner, messages)
     steps = [step for step in frame._current_chat_state["execution_steps"] if step.get("display_kind") == "thinking"]
@@ -197,6 +197,14 @@ def test_sdk_assistant_privacy_redacts_commentary_cache_and_answer_segments(fram
     with frame.chat_store._connect() as connection:
         states = connection.execute("SELECT state_json FROM execution_assemblers WHERE chat_id=?", (_active_chat_id(frame),)).fetchall()
     assert "SECRET" not in str([row["state_json"] for row in states])
+    frame._execution_delta_buffer.clear()
+    frame._kimi_execution_private_keys.clear()
+    frame._current_chat_state["execution_steps"] = []
+    monkeypatch.setattr(frame, "chat_store", main.ChatStore(frame.chat_store.db_path))
+    _sdk_push(frame, transport, session_id, "assistant.delta", 3, offset=len("SECRET prose"), delta="SECRET late")
+    assert any(state.get("private_reasoning") for state in frame._execution_delta_buffer.values())
+    assert "SECRET" not in str(frame._execution_delta_buffer)
+    assert frame._kimi_answer_parts(_active_chat_id(frame), session_id) == ""
     _sdk_push(frame, transport, session_id, "turn.step.started", 4, step=2, stepId="final-step")
     _sdk_push(frame, transport, session_id, "assistant.delta", 4, offset=0, delta="Public final answer")
     assert frame._kimi_answer_parts(_active_chat_id(frame), session_id) == "Public final answer"
@@ -321,7 +329,7 @@ def test_sdk_rest_append_failure_keeps_live_buffer_and_successful_retry(frame, m
     messages = [{"id": owner["prompt_id"], "role": "user", "content": []},
                 {"id": "retry", "role": "assistant", "content": [{"type": "thinking", "thinking": "Live prefix complete"}]}]
     original_persist = frame._persist_execution_step_or_queue
-    monkeypatch.setattr(frame, "_persist_execution_step_or_queue", lambda *_args: False)
+    monkeypatch.setattr(frame, "_persist_execution_step_or_queue", lambda *_args, **_kwargs: False)
     assert not frame._kimi_sync_thinking_rows(chat_id, owner, messages)
     assert frame._execution_delta_buffer
     assert not any("retry:thinking" in keys for keys in frame._kimi_thinking_synced.values())

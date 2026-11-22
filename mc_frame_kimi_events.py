@@ -3,10 +3,13 @@
 import copy
 import hashlib
 import json
+import logging
 import wx
 from codex_client import CodexEvent
 from collections import deque
+from functools import partial
 from kimi_server_client import DEFAULT_KIMI_MODEL, KimiServerError, is_kimi_model
+from execution_projection import execution_row_id
 from mc_frame_settings import (
     CODEX_UI_EVENT_BATCH_DELAY_MS,
     CODEX_UI_EVENT_BATCH_SIZE,
@@ -16,210 +19,588 @@ from mc_frame_settings import (
 
 import mc_frame_bindings as bindings
 
+logger = logging.getLogger(__name__)
+
+
+class _KimiRestCandidates:
+    def __init__(self):
+        self.steps = None
+        self.cursor = 0
+        self.fields = {}
+        self.logical = {}
+        self.matches_scope = lambda step: True
+
+    @staticmethod
+    def keys(step):
+        kind = step.get("display_kind")
+        if kind == "assistant":
+            kind = "commentary"
+        if kind in {"thinking", "commentary"}:
+            for field in ("rest_message_id", "item_id", "kimi_step_number"):
+                if step.get(field) is not None:
+                    yield kind, field, step[field]
+
+    def reset(self, steps):
+        self.steps = steps
+        self.cursor = 0
+        self.fields.clear()
+        self.logical.clear()
+
+    def add(self, step):
+        if not isinstance(step, dict):
+            return
+        identity = step.get("logical_key")
+        if identity:
+            self.logical[identity] = step
+        if self.matches_scope(step):
+            for key in self.keys(step):
+                self.fields.setdefault(key, {})[identity or id(step)] = step
+
+    def replace(self, steps, position, previous, step):
+        if previous is step or steps is not self.steps:
+            return
+        if previous is None:
+            if position == self.cursor:
+                self.add(step)
+                self.cursor += 1
+        elif position < self.cursor:
+            if isinstance(previous, dict):
+                identity = previous.get("logical_key")
+                if identity:
+                    self.logical.pop(identity, None)
+                for key in self.keys(previous):
+                    bucket = self.fields.get(key)
+                    if bucket is not None:
+                        bucket.pop(identity or id(previous), None)
+                        if not bucket:
+                            self.fields.pop(key)
+            if step is None:
+                self.cursor -= 1
+            else:
+                self.add(step)
+
+    def matching(self, kind, message_id, step_number):
+        matches = {}
+        for field, value in (("rest_message_id", message_id), ("item_id", message_id), ("kimi_step_number", step_number)):
+            matches.update(self.fields.get((kind, field, value), {}))
+        return matches
+
 
 class KimiEventsMixin:
-    def _redact_kimi_answer_stream(self, chat_id: str, session_id: str, agent_id: str, item_id: str) -> None:
-        for key, segments in self._kimi_turn_answer_segments.items():
-            if key[0] != chat_id or key[1] != session_id or key[3] != agent_id or key[4] != item_id:
-                continue
-            segments.clear()
-            # Legacy aliases share this list. Remove protected bytes from the
-            # cache as well as the segmented answer consumer.
-            parts = self._kimi_turn_answer_parts.get(key[:4])
-            if isinstance(parts, list):
-                parts[:] = [text for other, values in self._kimi_turn_answer_segments.items()
-                            if other[:4] == key[:4] for text in values.values()]
+    def _kimi_execution_owner_matches(self, chat: dict, owner: dict) -> bool:
+        turns = chat.get("turns", [])
+        index = owner.get("turn_idx")
+        if not isinstance(index, int) or not 0 <= index < len(turns) or not isinstance(turns[index], dict):
+            return False
+        turn = turns[index]
+        session_id = str(owner.get("session_id") or "")
+        prompt_id = str(owner.get("owner_prompt_id") or owner.get("prompt_id") or "")
+        if (str(turn.get("kimi_session_id") or "") != session_id
+                or (owner.get("turn_id") and str(turn.get("kimi_turn_id") or "") != str(owner["turn_id"]))
+                or (prompt_id and prompt_id != str(turn.get("kimi_owner_prompt_id") or turn.get("kimi_prompt_id") or ""))
+                or (owner.get("revision") is not None and self._safe_int(owner["revision"], -1) != self._safe_int(chat.get("revision"), 1))):
+            return False
+        generation = int(owner.get("generation") or 0)
+        if not generation:
+            return True
+        key = self._kimi_owner_key_for(owner)
+        with self._kimi_owner_lock:
+            current = self._kimi_prompt_owners.get(key)
+        return (isinstance(current, dict) and int(current.get("generation") or 0) == generation
+                or not current and turn.get("request_status") in {"done", "failed"})
 
-    def _redact_kimi_narrative(self, chat_id: str, previous: dict) -> bool:
+    def _resume_kimi_execution_boundaries(self, chat_id: str) -> None:
+        if getattr(self, "_close_complete", False):
+            return
+        queue = self._kimi_execution_boundaries.get(chat_id)
+        if not queue:
+            return
+        for _ in range(16):
+            if not queue or self._kimi_execution_write_counts.get(chat_id):
+                break
+            revision, event, owner = queue[0]
+            if event.type == "turn_completed" and self._kimi_thinking_sync_counts.get(chat_id):
+                return
+            queue.popleft()
+            chat = self._chat_state_for_execution_steps(chat_id)
+            if (isinstance(chat, dict) and self._safe_int(chat.get("revision"), 1) == revision
+                    and (owner is None or self._kimi_execution_owner_matches(chat, owner))):
+                self._apply_kimi_event_for_chat(chat_id, event)
+        if not queue:
+            self._kimi_execution_boundaries.pop(chat_id, None)
+        elif not self._kimi_execution_write_counts.get(chat_id):
+            self._call_after_if_alive(self._resume_kimi_execution_boundaries, chat_id)
+
+    def _redact_kimi_answer_stream(self, chat_id: str, session_id: str, owner_key: str, agent_id: str, item_id: str) -> None:
+        scope = (chat_id, session_id, owner_key, agent_id)
+        segments = self._kimi_turn_answer_segments.get((*scope, item_id))
+        if segments is None:
+            return
+        segments.clear()
+        # Aliases share the owning prompt's list.
+        parts = self._kimi_turn_answer_parts.get(scope)
+        if isinstance(parts, list):
+            parts[:] = [text for other, values in self._kimi_turn_answer_segments.items()
+                        if other[:4] == scope for text in values.values()]
+
+    def _redact_kimi_narrative(self, chat_id: str, previous: dict, *, owner_key=None,
+                              store_only=False, withdrawn_rows=None) -> bool:
         safe = dict(previous, private_reasoning=True, narrative_snapshot=True,
                     list_text="", kimi_summary="", detail_text="", raw_text="", text="",
                     source_detail={}, source_detail_history=[], diagnostic_history=[])
         item_id = str(previous.get("item_id") or "")
         session_id = str(previous.get("session_id") or previous.get("thread_id") or "")
         agent_id = str(previous.get("agent_id") or "main")
-        self._redact_kimi_answer_stream(chat_id, session_id, agent_id, item_id)
-        for key, state in self._execution_delta_buffer.items():
-            if (key[:3] != (chat_id, str(previous.get("turn_id") or ""), item_id)
-                    or (key[4] or "main") != agent_id):
+        turn_id = str(previous.get("turn_id") or "")
+        self._redact_kimi_answer_stream(chat_id, session_id, owner_key or turn_id, agent_id, item_id)
+        revision = self._safe_int(previous.get("revision"), 1)
+        lookup = (chat_id, revision, session_id, turn_id, agent_id, item_id)
+        for key in self._kimi_execution_buffer_index.get(lookup, ()):
+            state = self._execution_delta_buffer.get(key)
+            if state is None:
                 continue
             state.update(parts=[], segments={}, conflicts=[], private_reasoning=True, pending_gap=False)
             base = state.get("event")
             if isinstance(base, CodexEvent):
-                base = copy.copy(base)
-                base.text = base.raw_text = ""
-                base.data = {**base.data, "non_disclosable": True}
-                state["event"] = base
+                state["event"] = self._private_kimi_execution_event(base)
         store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
         if store is not None and previous.get("logical_key") and previous.get("logical_scope"):
-            store.apply_execution_fragment(chat_id, previous["logical_key"], previous["logical_scope"],
-                                           fragment_id="", offset=0, text="", projection_seed=safe)
-        return self._append_execution_entry_to_chat(chat_id, safe, save_state=True)
+            self._kimi_execution_private_keys.add(previous["logical_key"])
+            self._queue_kimi_execution_write(chat_id, partial(
+                store.apply_execution_fragment, chat_id, previous["logical_key"], dict(previous["logical_scope"]),
+                fragment_id="", offset=0, text="", projection_seed=copy.deepcopy(safe),
+            ))
+        if store_only:
+            self._invalidate_remote_state_cache()
+            changed = bool(store is not None and previous.get("logical_key"))
+        else:
+            changed = self._append_execution_entry_to_chat(chat_id, safe, save_state=False,
+                                                           sync_visible=withdrawn_rows is None)
+        if changed:
+            row_id = execution_row_id(chat_id, self._safe_int(previous.get("revision"), 1), previous)
+            dialog = getattr(self, "_active_answer_text_viewer", None)
+            if dialog is not None and getattr(self, "_execution_narrative_viewer_row", None) == row_id:
+                dialog.canonical_text = ""
+                dialog.text_ctrl.ChangeValue("")
+            if withdrawn_rows is None:
+                self._remove_visible_kimi_withdrawals(chat_id, {row_id})
+            else:
+                withdrawn_rows.add(row_id)
+        return changed
+
+    def _remove_visible_kimi_withdrawals(self, chat_id, row_ids):
+        if not row_ids or self._visible_execution_chat_id() != chat_id:
+            return
+        self._invalidate_execution_scan()
+        ids = self.execution_list_model.visible_ids
+        keep = [index for index, current in enumerate(ids) if current not in row_ids]
+        if len(keep) == len(ids):
+            return
+        if keep:
+            self._apply_execution_page(([(ids[index], self.execution_list.GetString(index)) for index in keep],
+                                        [self.execution_meta[index] for index in keep]))
+        else:
+            self._rebuild_execution_list_from_state()
+
+    def _prepare_kimi_thinking_rows(self, messages: list[dict]) -> list[tuple]:
+        """Extract only structured prompt boundaries and disclosable narratives."""
+        rows = [row for row in (messages or []) if isinstance(row, dict)]
+        if rows and all(str(row.get("created_at") or "").strip() for row in rows):
+            rows.sort(key=lambda row: str(row.get("created_at")))
+        prepared = []
+        for message in rows:
+            message_id = str(message.get("id") or "").strip()
+            if self._kimi_is_user_prompt(message):
+                prepared.append((message_id, None))
+                continue
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            commentary = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
+            message_private = self._kimi_private_reasoning(message)
+            blocks = {"thinking": [], "commentary": []}
+            protected = {"thinking": set(), "commentary": set()}
+            for index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type", "")
+                block_private = self._kimi_private_reasoning(block)
+                if kind == "thinking":
+                    if block_private:
+                        protected["thinking"].add(index)
+                    elif not message_private:
+                        text = str(block.get("text") or block.get("thinking") or "").strip()
+                        if text:
+                            blocks["thinking"].append((index, text))
+                elif kind in {"text", "output_text", ""} and block_private:
+                    protected["commentary"].add(index)
+            if commentary and not message_private:
+                text = self._kimi_message_text(message)
+                if text:
+                    blocks["commentary"].append(("commentary", text))
+            session = str(message.get("session_id") or "") if "session_id" in message else None
+            prepared.append((message_id, (session, commentary, message_private, blocks, protected)))
+        return prepared
+
+    def _schedule_kimi_thinking_sync(self, chat_id: str, owner: dict, messages: list[dict]) -> None:
+        # Called by the REST workers. Transfer only extracted data to wx.
+        prepared = self._prepare_kimi_thinking_rows(messages)
+        archived = None
+        store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
+        if getattr(self, "_closing", False):
+            return
+        withdrawals = []
+        durable = _KimiRestCandidates()
+        if store is not None:
+            if chat_id not in {self.active_chat_id, self.current_chat_id}:
+                archived = store.load_chat(chat_id)
+            if isinstance(owner.get("turn_idx"), int):
+                for step in store.load_execution_steps(chat_id, owner["turn_idx"]):
+                    if (step.get("provider") != "kimi"
+                            or step.get("revision") != owner.get("revision", step.get("revision"))
+                            or step.get("session_id") != owner.get("session_id")
+                            or (owner.get("turn_id") and str(step.get("turn_id") or "") != str(owner["turn_id"]))
+                            or str(step.get("agent_id") or "main") != "main"):
+                        continue
+                    if step.get("private_reasoning"):
+                        withdrawals.append((step.get("display_kind"), step.get("rest_message_id"),
+                                            step.get("kimi_rest_block_index"), step.get("kimi_step_number"),
+                                            step.get("kimi_rest_aggregate")))
+                    elif step.get("logical_key") and step.get("logical_scope"):
+                        durable.add(step)
+        signature = hashlib.sha256(repr(prepared).encode("utf-8")).digest()
+        self._call_after_if_alive(self._start_kimi_thinking_sync, chat_id, dict(owner), prepared, archived,
+                                  withdrawals, durable, signature)
+
+    def _start_kimi_thinking_sync(self, chat_id: str, owner: dict, prepared: list[tuple], archived=None,
+                                  withdrawals=(), durable=None, signature=None) -> None:
+        if getattr(self, "_closing", False):
+            return
+        chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict):
+            return
+        if isinstance(archived, dict) and self._safe_int(chat.get("revision"), 1) == self._safe_int(archived.get("revision"), 1):
+            for field in ("turns", "execution_steps"):
+                if field not in chat and isinstance(archived.get(field), list):
+                    chat[field] = archived[field]
+        if not self._kimi_execution_owner_matches(chat, owner):
+            return
+        owner = dict(owner)
+        owner.setdefault("revision", self._safe_int(chat.get("revision"), 1))
+        job = None
+        if signature is not None:
+            job = (self._kimi_owner_key_for(owner), owner.get("turn_idx"), owner.get("revision"),
+                   owner.get("turn_id"), owner.get("generation"), signature)
+            if job in self._kimi_thinking_sync_jobs:
+                return
+            self._kimi_thinking_sync_jobs.add(job)
+        self._kimi_thinking_sync_counts[chat_id] = self._kimi_thinking_sync_counts.get(chat_id, 0) + 1
+        withdrawn_rows = set()
+        updates = self._iter_kimi_thinking_updates(chat_id, owner, prepared, withdrawals, durable, withdrawn_rows)
+        self._continue_kimi_thinking_sync(updates, chat_id, job, withdrawn_rows)
+
+    def _continue_kimi_thinking_sync(self, updates, chat_id=None, job=None, withdrawn_rows=None) -> None:
+        if getattr(self, "_close_complete", False) or not self._is_ui_alive():
+            return
+        self._background_ui_update_depth += 1
+        self._codex_ui_batch_depth += 1
+        complete = False
+        try:
+            for _ in range(16):
+                next(updates)
+        except StopIteration:
+            complete = True
+        except Exception as exc:
+            logger.warning("Kimi REST execution projection failed (%s)", type(exc).__name__)
+            complete = True
+        finally:
+            self._background_ui_update_depth -= 1
+            self._codex_ui_batch_depth -= 1
+            if withdrawn_rows:
+                self._remove_visible_kimi_withdrawals(chat_id, withdrawn_rows)
+                withdrawn_rows.clear()
+            self._flush_deferred_execution_list_updates()
+            if not self._navigation_quiet_active():
+                self._flush_pending_background_ui_updates()
+            self._start_execution_step_persist_worker()
+        if complete:
+            self._finish_kimi_thinking_sync(chat_id, job)
+            return
+        if self._wx_main_loop_running():
+            timer = self._call_later_if_alive(CODEX_UI_EVENT_BATCH_DELAY_MS, self._continue_kimi_thinking_sync, updates, chat_id, job, withdrawn_rows)
+            if timer is not None:
+                return
+        if self._call_after_if_alive(self._continue_kimi_thinking_sync, updates, chat_id, job, withdrawn_rows) is False:
+            self._finish_kimi_thinking_sync(chat_id, job)
+
+    def _finish_kimi_thinking_sync(self, chat_id, job) -> None:
+        if job is not None:
+            self._kimi_thinking_sync_jobs.discard(job)
+        if chat_id is None:
+            return
+        count = self._kimi_thinking_sync_counts[chat_id] - 1
+        if count:
+            self._kimi_thinking_sync_counts[chat_id] = count
+        else:
+            self._kimi_thinking_sync_counts.pop(chat_id)
+            self._resume_kimi_execution_boundaries(chat_id)
 
     def _kimi_sync_thinking_rows(self, chat_id: str, owner: dict, messages: list[dict]) -> bool:
-        """Complete owned public streams from the main-agent REST transcript.
+        # Synchronous reconciliation for explicit callers; background REST
+        # deliveries use the same iterator in bounded wx batches.
+        changed = False
+        for update in self._iter_kimi_thinking_updates(chat_id, owner, self._prepare_kimi_thinking_rows(messages)):
+            changed = update or changed
+        return changed
 
-        SDK REST messages have no step ID. Within a complete prompt boundary,
-        assistant order is the step order; text/tool_use explicitly identifies
-        commentary. No prose matching or subagent-to-main fallback is used.
-        """
+    def _iter_kimi_thinking_updates(self, chat_id: str, owner: dict, rows: list[tuple], persisted_withdrawals=(),
+                                    durable=None, withdrawn_rows=None):
+        cache = _KimiRestCandidates()
+        watchers = self._kimi_rest_candidate_updates.setdefault(chat_id, set())
+        watchers.add(cache)
         try:
-            chat_id = str(chat_id or "").strip()
-            session_id = str((owner or {}).get("session_id") or "").strip()
-            turn_idx = (owner or {}).get("turn_idx")
-            if not chat_id or not session_id or not isinstance(turn_idx, int) or turn_idx < 0:
-                return False
-            chat = self._chat_state_for_execution_steps(chat_id)
-            turns = chat.get("turns", []) if isinstance(chat, dict) else []
-            if turn_idx >= len(turns) or not isinstance(turns[turn_idx], dict):
-                return False
-            turn = turns[turn_idx]
-            revision = self._safe_int(chat.get("revision", 1), 1)
-            turn_id = str(owner.get("turn_id") or turn.get("kimi_turn_id") or turn_idx)
-            prompt_id = str(owner.get("owner_prompt_id") or owner.get("prompt_id") or "").strip()
-            if not prompt_id:
-                return False
-            if (str(turn.get("kimi_session_id") or "") != session_id
-                    or (owner.get("turn_id") and str(turn.get("kimi_turn_id") or "") != str(owner["turn_id"]))
-                    or prompt_id != str(turn.get("kimi_owner_prompt_id") or turn.get("kimi_prompt_id") or "")
-                    or (owner.get("revision") is not None and self._safe_int(owner["revision"], -1) != revision)):
-                return False
-            synced_key = (chat_id, f"{revision}:{session_id}:{turn_id}")
-            with self._kimi_owner_lock:
-                synced = self._kimi_thinking_synced.setdefault(synced_key, set())
-            rows = [row for row in (messages or []) if isinstance(row, dict)]
-            if rows and all(str(row.get("created_at") or "").strip() for row in rows):
-                rows = [row for _idx, row in sorted(enumerate(rows), key=lambda pair: (str(pair[1].get("created_at")), pair[0]))]
-            # Steering aliases share the same native turn and step numbering.
-            # Start from the owning prompt, never restart ordinal 1 at an alias.
-            boundary_id = prompt_id
-            with self._kimi_owner_lock:
-                aliases = {str(candidate.get("prompt_id") or "") for candidate in self._kimi_prompt_owners.values()
-                           if candidate.get("chat_id") == chat_id and candidate.get("session_id") == session_id
-                           and str(candidate.get("owner_prompt_id") or candidate.get("prompt_id") or "") == prompt_id}
-            # Finalization retires live owners; accepted alias relationships
-            # remain on their persisted turns for an already queued REST sync.
-            aliases.update(str(candidate.get("kimi_prompt_id") or "") for candidate in turns
-                           if isinstance(candidate, dict) and candidate.get("kimi_session_id") == session_id
-                           and str(candidate.get("kimi_owner_prompt_id") or candidate.get("kimi_prompt_id") or "") == prompt_id
-                           and candidate.get("kimi_prompt_role") == "alias")
-            boundary = next((index for index, row in enumerate(rows)
-                             if self._kimi_is_user_prompt(row) and str(row.get("id") or "") == boundary_id), None)
-            if boundary is None:
-                return False
-            rows = rows[boundary + 1:]
-            changed = False
-            step_number = 0
-            for message in rows:
-                if self._kimi_is_user_prompt(message):
-                    if str(message.get("id") or "") in aliases:
-                        continue
+            yield from self._iter_kimi_thinking_updates_scoped(chat_id, owner, rows, persisted_withdrawals,
+                                                             durable, cache, withdrawn_rows)
+        finally:
+            watchers.remove(cache)
+            if not watchers:
+                self._kimi_rest_candidate_updates.pop(chat_id, None)
+
+    def _iter_kimi_thinking_updates_scoped(self, chat_id, owner, rows, persisted_withdrawals, durable, cache, withdrawn_rows):
+        chat_id = str(chat_id or "").strip()
+        session_id = str(owner.get("session_id") or "").strip()
+        turn_idx = owner.get("turn_idx")
+        prompt_id = str(owner.get("owner_prompt_id") or owner.get("prompt_id") or "").strip()
+        if not chat_id or not session_id or not prompt_id:
+            return
+        chat = self._chat_state_for_execution_steps(chat_id)
+        if not isinstance(chat, dict) or not self._kimi_execution_owner_matches(chat, owner):
+            return
+        turns = chat["turns"]
+        revision = self._safe_int(chat.get("revision"), 1)
+        turn_id = str(owner.get("turn_id") or turns[turn_idx].get("kimi_turn_id") or turn_idx)
+        owner = dict(owner, revision=revision)
+        for kind, message_id, index, step_number, aggregate in persisted_withdrawals:
+            kind = "commentary" if kind == "assistant" else kind
+            withdrawals = self._kimi_rest_withdrawals.setdefault((chat_id, revision, session_id, turn_id, kind), {})
+            if message_id:
+                withdrawals.setdefault(message_id, set()).add(None if aggregate or kind == "commentary" else index)
+            if step_number is not None:
+                withdrawals[step_number] = True if message_id else "native"
+            yield False
+        synced_key = (chat_id, f"{revision}:{session_id}:{turn_id}")
+        with self._kimi_owner_lock:
+            synced = self._kimi_thinking_synced.setdefault(synced_key, set())
+            aliases = {str(candidate.get("prompt_id") or "") for candidate in self._kimi_prompt_owners.values()
+                       if candidate.get("chat_id") == chat_id and candidate.get("session_id") == session_id
+                       and str(candidate.get("owner_prompt_id") or candidate.get("prompt_id") or "") == prompt_id}
+        # Already completed owners retain their alias boundaries on the turns.
+        for candidate in turns:
+            if (isinstance(candidate, dict) and candidate.get("kimi_session_id") == session_id
+                    and candidate.get("kimi_prompt_role") == "alias"
+                    and str(candidate.get("kimi_owner_prompt_id") or "") == prompt_id):
+                aliases.add(str(candidate.get("kimi_prompt_id") or ""))
+            yield False
+        def matches_scope(step):
+            return (str(step.get("session_id") or step.get("thread_id") or "") == session_id
+                    and str(step.get("turn_id") or "") == turn_id and step.get("revision", revision) == revision
+                    and str(step.get("agent_id") or "main") == "main")
+
+        cache.matches_scope = matches_scope
+
+        def current_chat():
+            current = self._chat_state_for_execution_steps(chat_id)
+            return current if isinstance(current, dict) and self._kimi_execution_owner_matches(current, owner) else None
+
+        step_number = 0
+        boundary_found = False
+        for message_id, narrative in rows:
+            if not boundary_found:
+                boundary_found = narrative is None and message_id == prompt_id
+                yield False
+                continue
+            if narrative is None:
+                if message_id in aliases:
+                    continue
+                break
+            step_number += 1
+            message_session, commentary, message_private, narratives, protected = narrative
+            if not message_id or (message_session is not None and message_session != session_id):
+                yield False
+                continue
+            while True:
+                chat = current_chat()
+                if chat is None:
+                    return
+                steps = chat.get("execution_steps", [])
+                if steps is not cache.steps:
+                    cache.reset(steps)
+                if cache.cursor >= len(steps):
                     break
-                if message.get("role") != "assistant":
-                    continue
-                step_number += 1
-                message_id = str(message.get("id") or "").strip()
-                if not message_id or message.get("session_id", session_id) != session_id:
-                    continue
-                content = message.get("content") if isinstance(message.get("content"), list) else []
-                commentary = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
-                if commentary:
-                    for key, state in list(self._execution_delta_buffer.items()):
-                        base = state.get("event")
-                        if (key[0] == chat_id and key[3] == "assistant" and isinstance(base, CodexEvent)
-                                and self._event_thread_id(base) == session_id and self._event_turn_id(base) == turn_id
-                                and self._kimi_event_agent_id(base) == "main" and base.data.get("step_number") == step_number):
-                            tool_boundary = copy.copy(base)
-                            tool_boundary.data = {**base.data, "source_kind": "tool.call.started"}
-                            self._promote_kimi_interim_assistant(chat_id, tool_boundary)
-                narratives = [(index, "thinking", str(block.get("text") or block.get("thinking") or "").strip())
-                              for index, block in enumerate(content) if isinstance(block, dict)
-                              and block.get("type") == "thinking" and not self._kimi_private_reasoning(block)]
-                if commentary:
-                    narratives.append(("commentary", "commentary", self._kimi_message_text(message)))
-                for kind in ("thinking", "commentary"):
-                    blocks = [(index, text) for index, block_kind, text in narratives if block_kind == kind and text]
-                    candidates = [step for step in chat.get("execution_steps", []) if isinstance(step, dict)
-                                  and str(step.get("session_id") or step.get("thread_id") or "") == session_id
-                                  and str(step.get("turn_id") or "") == turn_id and step.get("revision", revision) == revision
-                                  and str(step.get("agent_id") or "main") == "main" and step.get("display_kind") == kind
-                                  and (step.get("rest_message_id") == message_id or step.get("item_id") == message_id
-                                       or step.get("kimi_step_number") == step_number)]
-                    aggregate = len(candidates) == 1 and (
-                        kind == "commentary" or candidates[0].get("kimi_rest_aggregate")
-                        or bool(candidates[0].get("kimi_step_id"))
-                    )
-                    protected_indexes = {
-                        index for index, block in enumerate(content) if isinstance(block, dict)
-                        and block.get("type") in ({"thinking"} if kind == "thinking" else {"text", "output_text", ""})
-                        and self._kimi_private_reasoning(block)
-                    }
-                    message_private = self._kimi_private_reasoning(message)
-                    # Withdraw disclosure before dedupe. An aggregate cannot
-                    # separate its protected block; individually keyed REST
-                    # thinking rows keep their unaffected public siblings.
-                    for previous in candidates:
+                cache.add(steps[cache.cursor])
+                cache.cursor += 1
+                yield False
+            changed = False
+            # A real tool_use promotes any in-memory assistant stream for this
+            # step before snapshot projection. Do not scan every buffer for
+            # messages without a tool boundary.
+            if commentary:
+                scope = (chat_id, revision, session_id, turn_id, "main", "assistant", step_number)
+                for key in tuple(self._kimi_execution_buffer_index.get(scope, ())):
+                    state = self._execution_delta_buffer.get(key)
+                    if state and not state.get("pending_writes"):
+                        base = state["event"]
+                        tool_boundary = copy.copy(base)
+                        tool_boundary.data = {**base.data, "source_kind": "tool.call.started"}
+                        self._promote_kimi_interim_assistant(chat_id, tool_boundary, buffer_keys=(key,))
+                    yield False
+                    if current_chat() is None:
+                        return
+            for kind in ("thinking", "commentary"):
+                live = cache.matching(kind, message_id, step_number)
+                candidates = tuple(live.values())
+                aggregate = len(candidates) == 1 and (
+                    kind == "commentary" or candidates[0].get("kimi_rest_aggregate") or bool(candidates[0].get("kimi_step_id"))
+                )
+                protected_indexes = protected[kind]
+                withdrawal_key = (chat_id, revision, session_id, turn_id, kind)
+                withdrawals = self._kimi_rest_withdrawals.get(withdrawal_key, {})
+                whole_withdrawal = message_private or withdrawals.get(step_number) == "native"
+                if whole_withdrawal or protected_indexes:
+                    withdrawals = self._kimi_rest_withdrawals.setdefault(withdrawal_key, {})
+                    restrictions = withdrawals.setdefault(message_id, set())
+                    new_restrictions = set(protected_indexes)
+                    if whole_withdrawal or kind == "commentary":
+                        new_restrictions.add(None)
+                    new_restrictions.difference_update(restrictions)
+                    restrictions.update(new_restrictions)
+                    # A native aggregate cannot split a protected REST block.
+                    withdrawals[step_number] = True
+                if whole_withdrawal or protected_indexes:
+                    matches = durable.matching(kind, message_id, step_number) if durable is not None else {}
+                    matches = {key: step for key, step in matches.items() if matches_scope(step)}
+                    matches.update(live)
+                    covered = set()
+                    for key, previous in matches.items():
                         block_index = previous.get("kimi_rest_block_index")
                         if block_index is None and kind == "thinking":
                             suffix = str(previous.get("item_id") or "").removeprefix(f"kimi-thinking:{message_id}:")
                             block_index = int(suffix) if suffix.isdigit() else None
-                        if message_private or (protected_indexes and (
-                                aggregate or block_index in protected_indexes or block_index is None)):
-                            changed = self._redact_kimi_narrative(chat_id, previous) or changed
-                    if message_private:
+                        native = previous.get("kimi_step_id") or previous.get("kimi_rest_aggregate")
+                        if whole_withdrawal or native or kind == "commentary" or block_index in protected_indexes or block_index is None:
+                            covered.add(None if whole_withdrawal or kind == "commentary" else block_index)
+                            if not previous.get("private_reasoning"):
+                                changed = self._redact_kimi_narrative(
+                                    chat_id, previous, owner_key=prompt_id, store_only=key not in live,
+                                    withdrawn_rows=withdrawn_rows,
+                                ) or changed
+                        yield changed
+                        changed = False
+                        if current_chat() is None:
+                            return
+                    # A blocked assembler write may own a stream without a
+                    # projected row yet. Protect it before its callback runs.
+                    stream_kinds = ("thinking",) if kind == "thinking" else ("assistant", "commentary")
+                    for stream_kind in stream_kinds:
+                        scope = (chat_id, revision, session_id, turn_id, "main", stream_kind, step_number)
+                        for key in tuple(self._kimi_execution_buffer_index.get(scope, ())):
+                            state = self._execution_delta_buffer.get(key)
+                            if state and state.get("logical_scope") and not state.get("private_reasoning"):
+                                base = state["event"]
+                                previous = self._build_execution_entry(base) or {}
+                                previous.update(logical_key=state["logical_key"], logical_scope=state["logical_scope"],
+                                                item_id=key[2], session_id=session_id, turn_id=turn_id, agent_id="main",
+                                                revision=revision, display_kind=kind, provider="kimi", thread_id=session_id)
+                                changed = self._redact_kimi_narrative(chat_id, previous, owner_key=prompt_id,
+                                                                       withdrawn_rows=withdrawn_rows) or changed
+                            yield changed
+                            changed = False
+                            if current_chat() is None:
+                                return
+                    if new_restrictions:
+                        wanted = {None} if None in new_restrictions else new_restrictions
+                        indexes = sorted(wanted - covered, key=lambda index: -1 if index is None else index)
+                        for index in indexes:
+                            marker = {
+                                "event_type": f"{kind}_synced", "display_kind": kind, "source_kind": f"rest.{kind}",
+                                "provider": "kimi", "agent_id": "main", "private_reasoning": True,
+                                "thread_id": session_id, "session_id": session_id, "revision": revision,
+                                "turn_id": turn_id, "turn_idx": turn_idx, "status": "completed",
+                                "item_id": f"kimi-{kind}:{message_id}:{index if index is not None else 'withdrawn'}",
+                                "kimi_step_number": step_number, "rest_message_id": message_id,
+                                "kimi_rest_block_index": index, "kimi_rest_aggregate": index is None,
+                                "list_text": "", "detail_text": "",
+                            }
+                            self._append_execution_entry_to_chat(chat_id, marker, save_state=False, store_only=True)
+                            yield changed
+                            changed = False
+                            if current_chat() is None:
+                                return
+                if whole_withdrawal:
+                    continue
+                blocks = narratives[kind]
+                if aggregate and blocks:
+                    blocks = [(kind, "\n".join(text for _index, text in blocks))]
+                blocks_by_index = {}
+                for previous in candidates:
+                    index = previous.get("kimi_rest_block_index")
+                    if index is None:
+                        item = str(previous.get("item_id") or "")
+                        prefix = f"kimi-{kind}:{message_id}:"
+                        if item.startswith(prefix):
+                            index = item[len(prefix):]
+                            if index.isdigit():
+                                index = int(index)
+                    if index is not None:
+                        blocks_by_index[index] = previous
+                for block_index, text in blocks:
+                    current = current_chat()
+                    if current is None:
+                        return
+                    dedupe_key = f"{message_id}:{block_index}"
+                    withdrawals = self._kimi_rest_withdrawals.get(withdrawal_key, {})
+                    restrictions = withdrawals.get(message_id, ())
+                    step_withdrawal = withdrawals.get(step_number)
+                    if (dedupe_key in synced or None in restrictions or block_index in restrictions
+                            or step_withdrawal == "native" or (aggregate and (restrictions or step_withdrawal))):
                         continue
-                    if aggregate:
-                        blocks = [(kind, "\n".join(text for _index, text in blocks))] if blocks else []
-                    for block_index, text in blocks:
-                        dedupe_key = f"{message_id}:{block_index}"
-                        if dedupe_key in synced:
-                            continue
-                        previous = candidates[0] if aggregate else next((step for step in candidates
-                            if step.get("kimi_rest_block_index") == block_index
-                            or step.get("item_id") == f"kimi-{kind}:{message_id}:{block_index}"), {})
-                        # Redaction replaces the row in the chat; do not reuse
-                        # the stale public candidate captured above.
-                        previous = next((step for step in chat.get("execution_steps", [])
-                                         if previous and step.get("item_id") == previous.get("item_id")
-                                         and step.get("logical_key") == previous.get("logical_key")), previous)
-                        if previous.get("private_reasoning"):
-                            synced.add(dedupe_key)
-                            continue
-                        excerpt = self._kimi_thinking_excerpt(text)
-                        entry = {
-                            **previous, "event_type": f"{kind}_synced", "display_kind": kind,
-                            "list_text": excerpt, "detail_text": text, "kimi_summary": excerpt,
-                            "raw_text": text, "text": text, "narrative_snapshot": True,
-                            "thread_id": session_id, "session_id": session_id, "turn_idx": turn_idx,
-                            "turn_id": turn_id, "revision": revision, "provider": "kimi", "agent_id": "main",
-                            "item_id": previous.get("item_id") or f"kimi-{kind}:{message_id}:{block_index}",
-                            "source_kind": f"rest.{kind}", "status": "completed", "rest_message_id": message_id,
-                            "kimi_step_number": step_number, "kimi_rest_block_index": block_index,
-                            "kimi_rest_aggregate": bool(aggregate or kind == "commentary"),
-                        }
-                        appended = self._append_execution_entry_to_chat(chat_id, entry, save_state=True)
-                        if appended:
-                            changed = True
-                        elif not any(step.get("item_id") == entry["item_id"]
-                                     and step.get("rest_message_id") == message_id and step.get("status") == "completed"
-                                     and step.get("display_kind") == kind and step.get("detail_text") == text
-                                     and step.get("raw_text") == text and step.get("list_text") == excerpt
-                                     and step.get("revision", revision) == revision
-                                     and str(step.get("session_id") or "") == session_id
-                                     and str(step.get("turn_id") or "") == turn_id
-                                     and str(step.get("agent_id") or "main") == "main"
-                                     and step.get("provider") == "kimi" and step.get("source_kind") == f"rest.{kind}"
-                                     for step in chat.get("execution_steps", []) if isinstance(step, dict)):
-                            continue
-                        for buffer_key in list(self._execution_delta_buffer):
-                            if (buffer_key[:3] == (chat_id, turn_id, entry["item_id"])
-                                    and buffer_key[3] == kind and buffer_key[4] in {"", "main"}):
-                                self._execution_delta_buffer.pop(buffer_key, None)
+                    previous = candidates[0] if aggregate else blocks_by_index.get(block_index, {})
+                    if previous.get("private_reasoning"):
                         synced.add(dedupe_key)
-            return changed
-        except Exception:
-            # The sync is marshalled to the UI thread; never surface a fetch /
-            # shape failure as an unhandled wx event-loop exception.
-            return False
+                        continue
+                    excerpt = self._kimi_thinking_excerpt(text)
+                    entry = {
+                        **previous, "event_type": f"{kind}_synced", "display_kind": kind,
+                        "list_text": excerpt, "detail_text": text, "kimi_summary": excerpt,
+                        "raw_text": text, "text": text, "narrative_snapshot": True,
+                        "thread_id": session_id, "session_id": session_id, "turn_idx": turn_idx,
+                        "turn_id": turn_id, "revision": revision, "provider": "kimi", "agent_id": "main",
+                        "item_id": previous.get("item_id") or f"kimi-{kind}:{message_id}:{block_index}",
+                        "source_kind": f"rest.{kind}", "status": "completed", "rest_message_id": message_id,
+                        "kimi_step_number": step_number, "kimi_rest_block_index": block_index,
+                        "kimi_rest_aggregate": bool(aggregate or kind == "commentary"),
+                    }
+                    positions = cache.logical if current.get("execution_steps") is cache.steps else None
+                    def record_persisted(result, dedupe_key=dedupe_key):
+                        if result:
+                            synced.add(dedupe_key)
+
+                    appended = self._append_execution_entry_to_chat(
+                        chat_id, entry, save_state=False, logical_positions=positions, on_persisted=record_persisted,
+                    )
+                    if appended:
+                        changed = True
+                    elif not all(previous.get(field) == entry[field] for field in (
+                            "item_id", "rest_message_id", "status", "display_kind", "detail_text",
+                            "raw_text", "list_text", "revision", "session_id", "turn_id", "agent_id", "provider", "source_kind")):
+                        continue
+                    scope = (chat_id, revision, session_id, turn_id, "main", entry["item_id"])
+                    for buffer_key in tuple(self._kimi_execution_buffer_index.get(scope, ())):
+                        if buffer_key[3] == kind:
+                            self._discard_execution_delta(buffer_key)
+                    yield changed
+                    changed = False
+            yield changed
 
     def _on_kimi_client_exit(self, returncode) -> None:
         if bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():
@@ -501,20 +882,24 @@ class KimiEventsMixin:
             return len(self.active_session_turns) - 1 if isinstance(self.active_session_turns, list) and self.active_session_turns else -1
         return -1
 
-    def _accumulate_kimi_answer_delta(self, chat_id: str, event: CodexEvent) -> None:
-        text = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
+    def _kimi_answer_stream_scope(self, chat_id: str, event: CodexEvent, metadata=None) -> tuple:
         turn_id = self._event_turn_id(event)
         session_id = self._event_thread_id(event)
-        metadata = self._kimi_owner_for_event(event) or self._kimi_active_turns.get(str(chat_id or "").strip())
+        prompt_id = self._kimi_event_prompt_id(event)
+        metadata = metadata or self._kimi_owner_for_event(event) or self._kimi_active_turns.get(str(chat_id or "").strip())
         if isinstance(metadata, dict):
-            if not turn_id:
-                turn_id = str(metadata.get("turn_id") or "").strip()
-            if not session_id:
-                session_id = str(metadata.get("session_id") or "").strip()
-        owner_key = ""
-        if isinstance(metadata, dict):
+            owner_session = str(metadata.get("session_id") or "").strip()
+            owner_turn = str(metadata.get("turn_id") or "").strip()
             owner_key = str(metadata.get("owner_prompt_id") or metadata.get("prompt_id") or "").strip()
-        owner_key = owner_key or turn_id
+            if ((not session_id or not owner_session or session_id == owner_session)
+                    and (not turn_id or not owner_turn or turn_id == owner_turn)
+                    and (not prompt_id or prompt_id in {owner_key, metadata.get("prompt_id")})):
+                return (session_id or owner_session, turn_id or owner_turn, owner_key or turn_id or owner_turn)
+        return session_id, turn_id, prompt_id or turn_id
+
+    def _accumulate_kimi_answer_delta(self, chat_id: str, event: CodexEvent) -> None:
+        text = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
+        session_id, turn_id, owner_key = self._kimi_answer_stream_scope(chat_id, event)
         if not owner_key:
             return
         key = (str(chat_id or ""), session_id, owner_key, self._kimi_event_agent_id(event))
@@ -523,9 +908,12 @@ class KimiEventsMixin:
                      or getattr(event, "display_kind", "") or "assistant").strip()
         private_stream = self._kimi_private_reasoning(event_data) or any(
             buffer_key[:3] == (str(chat_id or ""), turn_id, stream) and state.get("private_reasoning")
+            and (len(buffer_key) == 6 or buffer_key[6] == session_id)
             for buffer_key, state in self._execution_delta_buffer.items()
         )
         target_chat = self._chat_state_for_execution_steps(chat_id) or {}
+        scope = (chat_id, self._safe_int(target_chat.get("revision"), 1), session_id, turn_id, "commentary")
+        private_stream = private_stream or event_data.get("step_number") in self._kimi_rest_withdrawals.get(scope, {})
         private_stream = private_stream or any(
             step.get("private_reasoning") and step.get("item_id") == stream
             and str(step.get("session_id") or step.get("thread_id") or "") == session_id
@@ -534,11 +922,14 @@ class KimiEventsMixin:
         )
         if private_stream:
             self._kimi_turn_answer_segments.setdefault((*key, stream), {})
-            self._redact_kimi_answer_stream(str(chat_id or ""), session_id, key[3], stream)
+            self._redact_kimi_answer_stream(str(chat_id or ""), session_id, owner_key, key[3], stream)
             return
         if not text:
             return
         offset = event_data.get("offset")
+        if offset is None and self._kimi_protocol_event(event) and getattr(event, "item_id", ""):
+            segments = self._kimi_turn_answer_segments.get((*key, stream), {})
+            offset = max((start + len(part) for start, part in segments.items()), default=0)
         if isinstance(offset, int):
             segment_key = (*key, stream)
             self._kimi_turn_answer_segments.setdefault(segment_key, {}).setdefault(offset, text)
@@ -1508,7 +1899,7 @@ class KimiEventsMixin:
     def _dispatch_kimi_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
         if not event:
             return
-        if not self._is_ui_alive():
+        if getattr(self, "_closing", False) or not self._is_ui_alive():
             return
         should_schedule = False
         with self._kimi_ui_event_lock:
@@ -1571,6 +1962,8 @@ class KimiEventsMixin:
         spawn a lightweight daemon fetch; the shared 2s per-session throttle
         keeps REST load negligible.
         """
+        if getattr(self, "_closing", False):
+            return
         try:
             if not self._kimi_protocol_event(event):
                 return
@@ -1643,7 +2036,7 @@ class KimiEventsMixin:
                 client, session_id, str(owner.get("owner_prompt_id") or owner.get("prompt_id") or ""), messages=messages,
                 deadline=bindings.app.time.monotonic() + float(timeout),
             )
-            self._call_after_if_alive(self._kimi_sync_thinking_rows, chat_id, owner, messages)
+            self._schedule_kimi_thinking_sync(chat_id, owner, messages)
         except Exception:
             pass
 
@@ -1657,11 +2050,31 @@ class KimiEventsMixin:
         self._on_kimi_event_for_chat(chat_id, event)
 
     def _on_kimi_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
+        if getattr(self, "_close_complete", False):
+            return
+        if isinstance(event, CodexEvent):
+            data = event.data if isinstance(event.data, dict) else {}
+            fragment = event.type == "agent_message_delta" and event.display_kind in {"thinking", "assistant"}
+            private = fragment and self._kimi_private_reasoning(data)
+            boundary = not fragment and event.type != "thread_status_changed"
+            if not private and (self._kimi_execution_boundaries.get(chat_id)
+                                or self._kimi_execution_write_counts.get(chat_id) and boundary
+                                or event.type == "turn_completed" and self._kimi_thinking_sync_counts.get(chat_id)):
+                chat = self._chat_state_for_execution_steps(chat_id)
+                if isinstance(chat, dict):
+                    revision = self._safe_int(chat.get("revision"), 1)
+                    owner = self._kimi_owner_for_event(event)
+                    self._kimi_execution_boundaries.setdefault(chat_id, deque()).append((revision, copy.deepcopy(event), owner))
+                return
+        self._apply_kimi_event_for_chat(chat_id, event)
+
+    def _apply_kimi_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
         chat_id = str(chat_id or "").strip()
         event_type = str(getattr(event, "type", "") or "").strip()
         event_turn_id = self._event_turn_id(event)
+        event_session_id = self._event_thread_id(event) or None
         if not chat_id:
             chat_id = self._resolve_kimi_event_chat_id(event)
             if not chat_id:
@@ -1688,10 +2101,10 @@ class KimiEventsMixin:
             # Thinking and assistant prose are separate streams. Keep the
             # latter until a tool boundary can identify interim commentary.
             if self._kimi_protocol_event(event):
-                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking")
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", session_id=event_session_id)
                 execution_entry = self._build_execution_entry(event)
             else:
-                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking")
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", session_id=event_session_id)
             self._buffer_execution_delta(chat_id, event)
             self._accumulate_kimi_answer_delta(chat_id, event)
         elif event_type == "agent_message_delta" and delta_kind == "assistant" and not authoritative:
@@ -1727,14 +2140,14 @@ class KimiEventsMixin:
             if event_type == "agent_message_delta":
                 if delta_kind == "thinking":
                     self._buffer_execution_delta(chat_id, event)
-                    self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True)
+                    self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True, session_id=event_session_id)
                 elif delta_kind == "commentary":
                     self._append_kimi_tool_diagnostic(chat_id, event)
                 elif execution_entry:
                     self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
                 return
             if event_type != "thread_status_changed" and not silent_notification:
-                self._flush_execution_delta(chat_id, event_turn_id or None)
+                self._flush_execution_delta(chat_id, event_turn_id or None, session_id=event_session_id)
             target_chat = self._find_archived_chat(chat_id)
             if not isinstance(target_chat, dict):
                 return
@@ -1814,14 +2227,14 @@ class KimiEventsMixin:
         if event_type == "agent_message_delta":
             if delta_kind == "thinking":
                 self._buffer_execution_delta(chat_id, event)
-                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True)
+                self._flush_execution_delta(chat_id, event_turn_id or None, display_kind="thinking", retain=True, session_id=event_session_id)
             elif delta_kind == "commentary":
                 self._append_kimi_tool_diagnostic(chat_id, event)
             elif execution_entry:
                 self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
             return
         if event_type != "thread_status_changed" and not silent_notification:
-            self._flush_execution_delta(chat_id, event_turn_id or None)
+            self._flush_execution_delta(chat_id, event_turn_id or None, session_id=event_session_id)
         if execution_entry:
             self._append_execution_entry_to_chat(chat_id, execution_entry, save_state=False)
         if context_usage is not None:

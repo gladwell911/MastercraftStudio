@@ -1180,6 +1180,7 @@ class AnswersMixin:
             on_continue=self._continue_from_answer_text_viewer if payload is not None else None,
         )
         self._answer_viewer_open = True
+        self._active_answer_text_viewer = dlg
         shown = False
         if _read_target:
             def on_shown(event):
@@ -1197,6 +1198,7 @@ class AnswersMixin:
             shown = False
         finally:
             self._answer_viewer_open = False
+            self._active_answer_text_viewer = None
             try:
                 dlg.Destroy()
             except RuntimeError:

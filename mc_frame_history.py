@@ -1197,6 +1197,8 @@ class ChatHistoryMixin:
         self._codex_background_flush_scheduled = False
         if not getattr(self, "_codex_background_flush_dirty", False):
             return
+        if getattr(self, "_kimi_execution_write_counts", None):
+            return
         self._codex_background_flush_dirty = False
         self._save_state()
         self._flush_pending_remote_finals()
@@ -1213,6 +1215,8 @@ class ChatHistoryMixin:
     def _flush_chat_state_save(self) -> None:
         self._chat_state_flush_scheduled = False
         if not getattr(self, "_chat_state_flush_dirty", False):
+            return
+        if getattr(self, "_kimi_execution_write_counts", None):
             return
         self._chat_state_flush_dirty = False
         self._save_state()

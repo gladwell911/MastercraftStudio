@@ -1,9 +1,12 @@
 import ctypes
+import sqlite3
+import threading
 import time
 
 import pytest
 
 import main
+from chat_store import ChatStore
 from kimi_server_client import KimiEvent, KimiServerClient, event_to_payload
 from kimi_test_support import FakeKimiServerClient, _setup_kimi_frame, _sdk_push
 from test_codex_ui_responsiveness_automation import _track_ui_timers_for_test
@@ -120,6 +123,592 @@ def _push_delta_events(frame, count, *, chat_id="chat-kimi"):
 def _drain_all_kimi_events(frame):
     while frame._pending_kimi_ui_events:
         frame._drain_kimi_ui_events()
+
+
+def test_native_navigation_precedes_sqlite_writer_release(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution", execution_steps=[
+        {"event_type": "plan_updated", "display_kind": "plan", "list_text": "first", "detail_text": "first", "turn_idx": 0},
+        {"event_type": "plan_updated", "display_kind": "plan", "list_text": "second", "detail_text": "second", "turn_idx": 0},
+    ])
+    monkeypatch.setattr(frame, "_maybe_trigger_kimi_thinking_sync", lambda *args: None)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    control = frame.execution_list
+    control.SetSelection(1)
+    control.SetFocusFromKbd()
+    wx_app.Yield()
+    assert control.HasFocus()
+    order = []
+    focus_events = []
+    selection_events = []
+
+    def record_focus(event):
+        focus_events.append(event.GetEventObject())
+        event.Skip()
+
+    def record_selection(event):
+        selection_events.append(event.GetSelection())
+        event.Skip()
+
+    for window in (frame.input_edit, frame.send_button, frame.history_list, frame.model_combo):
+        window.Bind(main.wx.EVT_SET_FOCUS, record_focus)
+    control.Bind(main.wx.EVT_LISTBOX, record_selection)
+
+    def navigate():
+        order.append("heartbeat")
+        _send_window_key(control, main.wx.WXK_DOWN)
+        order.append(("down", control.GetSelection()))
+        _send_window_key(control, main.wx.WXK_UP)
+        order.append(("up", control.GetSelection()))
+        _send_window_key(control, main.wx.WXK_TAB)
+        order.append(("tab", not control.HasFocus()))
+
+    apply_fragment = frame.chat_store.apply_execution_fragment
+    write_threads = []
+
+    def observe_writer(*args, **kwargs):
+        if not write_threads:
+            write_threads.append(threading.get_ident())
+            main.wx.CallAfter(navigate)
+        return apply_fragment(*args, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "apply_execution_fragment", observe_writer)
+    lock_ready = threading.Event()
+    unlock = threading.Event()
+
+    def hold_write_lock():
+        with sqlite3.connect(frame.chat_store.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lock_ready.set()
+            unlock.wait(2.0)
+            order.append("unlock")
+
+    locker = threading.Thread(target=hold_write_lock)
+    locker.start()
+    try:
+        assert lock_ready.wait(2.0)
+        transport = KimiServerClient()
+        for kind, payload in (
+            ("turn.step.started", {"step": 1, "stepId": "locked-step"}),
+            ("thinking.delta", {"offset": 0, "delta": "contiguous public thinking"}),
+        ):
+            transport._handle_ws_message({
+                "type": kind, "session_id": "session-1", "epoch": "sdk-epoch", "seq": 1,
+                "payload": {"type": kind, "agentId": "main", "turnId": "turn-1", **payload},
+            })
+            for message in transport.drain_pending_messages(100):
+                frame._dispatch_kimi_event_to_ui("chat-kimi", main.CodexEvent(**message["payload"]["event"]))
+        assert _yield_until(wx_app, lambda: ("tab", True) in order or "heartbeat" in order)
+        assert order[:4] == ["heartbeat", ("down", 2), ("up", 1), ("tab", True)]
+        assert "unlock" not in order
+        assert selection_events == [2, 1]
+        assert focus_events
+        assert write_threads == [write_threads[0]] and write_threads[0] != threading.get_ident()
+    finally:
+        unlock.set()
+        locker.join(3.0)
+    assert _yield_until(wx_app, lambda: any(meta[3] == "contiguous public thinking" for meta in frame.execution_meta))
+    assert frame._flush_execution_step_persists_sync()
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert any(step.get("detail_text") == "contiguous public thinking" for step in reopened.load_execution_steps("chat-kimi"))
+
+
+def test_long_rest_sync_yields_to_native_navigation_and_repeat_is_quiet(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    initial = [
+        {"event_type": "plan_updated", "display_kind": "plan", "list_text": f"previous {index}",
+         "detail_text": f"previous {index}", "turn_idx": 0}
+        for index in range(340)
+    ]
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution", execution_steps=initial)
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    frame.execution_visible_row_limit = 500
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    owner = dict(frame._kimi_active_turns["chat-kimi"], chat_id="chat-kimi", prompt_id="prompt-1", revision=1)
+    messages = [{"id": "prompt-1", "role": "user", "content": []}] + [
+        {"id": f"answer-{index}", "role": "assistant", "session_id": "session-1",
+         "content": [{"type": "thinking", "text": f"public {index}\nfull detail {index}"}]}
+        for index in range(100)
+    ]
+
+    class TranscriptClient:
+        def list_messages(self, session_id, **kwargs):
+            assert session_id == "session-1"
+            return messages
+
+    monkeypatch.setattr(frame, "_kimi_client", TranscriptClient())
+    control = frame.execution_list
+    control.SetSelection(1)
+    retained_row = frame.execution_list_model.selected_id()
+    control.SetFocusFromKbd()
+    wx_app.Yield()
+    assert control.HasFocus()
+    selected = []
+    focus = []
+
+    def selection_event(event):
+        selected.append(event.GetSelection())
+        event.Skip()
+
+    def focus_event(event):
+        focus.append(event.GetEventObject())
+        event.Skip()
+
+    control.Bind(main.wx.EVT_LISTBOX, selection_event)
+    for window in (frame.input_edit, frame.send_button, frame.history_list, frame.model_combo):
+        window.Bind(main.wx.EVT_SET_FOCUS, focus_event)
+    observations = []
+    scheduled = []
+    call_later = frame._call_later_if_alive
+
+    def navigate():
+        observations.append(len(frame._current_chat_state["execution_steps"]))
+        _send_window_key(control, main.wx.WXK_DOWN)
+        _send_window_key(control, main.wx.WXK_UP)
+        _send_window_key(control, main.wx.WXK_TAB)
+        observations.append(main.wx.Window.FindFocus())
+
+    def watch_batches(delay, callback, *args, **kwargs):
+        if callback == frame._continue_kimi_thinking_sync:
+            assert wx_app.IsMainLoopRunning()
+            scheduled.append(True)
+            if len(scheduled) == 1:
+                main.wx.CallAfter(navigate)
+        return call_later(delay, callback, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_later_if_alive", watch_batches)
+    worker = threading.Thread(target=frame._kimi_thinking_fetch_worker, args=(owner,))
+    worker.start()
+    worker.join(2.0)
+    assert not worker.is_alive()
+    completed = []
+
+    def check_done():
+        if (len(frame._current_chat_state["execution_steps"]) == len(initial) + 100
+                and not frame._kimi_thinking_sync_counts and not frame._kimi_execution_write_counts):
+            completed.append(True)
+            wx_app.ExitMainLoop()
+        else:
+            main.wx.CallLater(10, check_done)
+
+    main.wx.CallAfter(check_done)
+    timeout = main.wx.CallLater(8000, wx_app.ExitMainLoop)
+    try:
+        wx_app.MainLoop()
+    finally:
+        timeout.Stop()
+    assert completed and len(scheduled) > 1
+    assert observations[0] < len(initial) + 100
+    assert selected[:2] == [2, 1]
+    assert focus and observations[1] is not control
+    assert main.wx.Window.FindFocus() is observations[1]
+    assert frame.execution_list_model.selected_id() == retained_row
+    assert frame._flush_execution_step_persists_sync()
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert [step["detail_text"] for step in reopened.load_execution_steps("chat-kimi")] == [
+        f"public {index}\nfull detail {index}" for index in range(100)
+    ]
+
+    repaint = []
+    monkeypatch.setattr(frame, "_request_listbox_repaint", lambda *_args: repaint.append(True))
+    done = []
+    updates = frame._iter_kimi_thinking_updates("chat-kimi", owner, frame._prepare_kimi_thinking_rows(messages))
+
+    def repeat():
+        yield from updates
+        done.append(True)
+
+    frame._continue_kimi_thinking_sync(repeat())
+    assert _yield_until(wx_app, lambda: bool(done))
+    assert not repaint
+    assert main.wx.Window.FindFocus() is observations[1]
+    assert frame.execution_list_model.selected_id() == retained_row
+
+
+def test_fragment_retry_settles_before_terminal_and_close(frame, wx_app, monkeypatch, caplog):
+    _activate_frame(frame, wx_app)
+    save_state = frame._save_state
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution")
+    monkeypatch.setattr(frame, "_save_state", save_state)
+    monkeypatch.setattr(frame, "_maybe_trigger_kimi_thinking_sync", lambda *args: None)
+    entered = threading.Event()
+    release = threading.Event()
+    attempts = []
+    real_write = frame.chat_store.apply_execution_fragment
+
+    def blocked_write(*args, **kwargs):
+        attempts.append(threading.get_ident())
+        if len(attempts) < 5:
+            raise sqlite3.OperationalError("test transient failure")
+        if len(attempts) == 5:
+            entered.set()
+            assert release.wait(3.0)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "apply_execution_fragment", blocked_write)
+    deferred = []
+    closes = []
+    monkeypatch.setattr(frame, "_defer_close_for_persistence_worker", lambda: deferred.append(True))
+    monkeypatch.setattr(frame, "_stop_remote_servers", lambda: closes.append(True))
+
+    class CloseEvent:
+        def __init__(self):
+            self.vetoed = False
+            self.skipped = False
+
+        def Veto(self):
+            self.vetoed = True
+
+        def Skip(self):
+            self.skipped = True
+
+    transport = KimiServerClient()
+    _sdk_push(frame, transport, "session-1", "turn.step.started", 1, turnId="turn-1", step=1, stepId="retry-step")
+    try:
+        _sdk_push(frame, transport, "session-1", "thinking.delta", 1, turnId="turn-1", offset=0, delta="retry once")
+        assert entered.wait(2.0)
+        frame._on_kimi_event_for_chat("chat-kimi", main.CodexEvent(
+            type="turn_completed", thread_id="session-1", turn_id="turn-1", status="completed", text="final answer",
+        ))
+        first, second = CloseEvent(), CloseEvent()
+        frame._on_close(first)
+        frame._on_close(second)
+        assert first.vetoed and second.vetoed and len(deferred) == 2
+        assert not closes
+        assert frame.active_session_turns[0]["request_status"] == "pending"
+    finally:
+        release.set()
+
+    assert _yield_until(wx_app, lambda: not frame._kimi_execution_write_counts and not frame._kimi_execution_boundaries)
+    assert frame.active_session_turns[0]["request_status"] == "done"
+    final, repeated = CloseEvent(), CloseEvent()
+    frame._on_close(final)
+    frame._on_close(repeated)
+    assert final.skipped and repeated.skipped and closes == [True]
+    assert len(attempts) == 5 and len(set(attempts)) == 1 and attempts[0] != threading.get_ident()
+    assert "Retrying failed Kimi execution write" in caplog.text
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert [step["detail_text"] for step in reopened.load_execution_steps("chat-kimi")] == ["retry once", "final answer"]
+    assert reopened.load_chat("chat-kimi")["turns"][0]["answer_md"] == "final answer"
+
+
+@pytest.mark.parametrize("action", ["clear", "close"])
+def test_clear_between_rest_batches_cannot_restore_retired_projection(frame, wx_app, monkeypatch, action):
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution")
+    chat_id = "chat-kimi"
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    frame.chat_store.upsert_chat(frame._current_chat_state)
+    revision = frame.chat_store.allocate_chat_revision(chat_id)
+    frame._current_chat_state["revision"] = revision
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=revision)
+    messages = [{"id": "prompt-1", "role": "user", "content": []}] + [
+        {"id": f"row-{index}", "role": "assistant", "content": [{"type": "thinking", "text": f"retired {index}"}]}
+        for index in range(64)
+    ]
+    blocked = []
+    call_after = frame._call_after_if_alive
+
+    def pause_batch(callback, *args, **kwargs):
+        if callback == frame._continue_kimi_thinking_sync and not blocked:
+            blocked.append((callback, args, kwargs))
+            return True
+        return call_after(callback, *args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", pause_batch)
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    assert _yield_until(wx_app, lambda: bool(blocked))
+    assert 0 < len(frame._current_chat_state["execution_steps"]) < len(messages) - 1
+    assert frame._flush_execution_step_persists_sync()
+    callback, args, kwargs = blocked[0]
+    if action == "close":
+        class Close:
+            vetoed = skipped = False
+
+            def Veto(self):
+                self.vetoed = True
+
+            def Skip(self):
+                self.skipped = True
+
+        calls = []
+        monkeypatch.setattr(frame, "_defer_close_for_persistence_worker", lambda: calls.append(True))
+        first = Close()
+        frame._on_close(first)
+        assert first.vetoed and calls and frame._kimi_thinking_sync_counts
+        callback(*args, **kwargs)
+        assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts and not frame._kimi_execution_write_counts)
+        final = Close()
+        frame._on_close(final)
+        assert final.skipped
+        stored = ChatStore(frame.chat_store.db_path).load_execution_steps(chat_id)
+        assert len(stored) == 64 and stored[-1]["detail_text"] == "retired 63"
+        return
+    operation = frame.chat_store.begin_clear_operation(chat_id, idempotency_key="rest-clear")
+    frame._clear_context_chat_state(frame._current_chat_state, chat_id, time.time())
+    frame._current_chat_state["revision"] = operation["revision"]
+    callback(*args, **kwargs)
+    assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts)
+    assert not frame._current_chat_state["execution_steps"]
+    assert frame._flush_execution_step_persists_sync()
+    assert not ChatStore(frame.chat_store.db_path).load_execution_steps(chat_id)
+
+
+def test_rest_withdrawal_invalidates_visible_and_frozen_details(frame, wx_app, monkeypatch):
+    _activate_frame(frame, wx_app)
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution")
+    chat_id = "chat-kimi"
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    frame.chat_store.upsert_chat(frame._current_chat_state)
+    frame._apply_detail_panel_mode("execution", refresh_execution=True)
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    messages = [{"id": "prompt-1", "role": "user", "content": []}, {
+        "id": "rest-1", "role": "assistant", "content": [{"type": "thinking", "text": "withdrawn detail"}],
+    }]
+    old = frame._prepare_kimi_thinking_rows(messages)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert frame._flush_execution_step_persists_sync()
+    projected = frame.chat_store.load_execution_steps(chat_id)[0]
+    frame.chat_store.commit_durable_fact(pair_id="test", domain="events", execution=True, envelope={
+        "event_id": "public-execution", "chat_id": chat_id, "kind": "execution_entry",
+        "body": {"canonical_item_id": projected["canonical_item_id"], "detail": projected["detail_text"]},
+    })
+    source = frame.chat_store.read_execution_projection_source(chat_id)
+    snapshot = frame.chat_store.create_execution_projection_snapshot(
+        chat_id=chat_id, revision=source["revision"], source_hash=source["source_hash"],
+        rows=[{"row_id": "old", "detail_text": "withdrawn detail"}],
+    )
+    index = next(i for i, meta in enumerate(frame.execution_meta) if meta[3] == "withdrawn detail")
+    frame.execution_list.SetSelection(index)
+    frame._navigation_quiet_until = time.monotonic() + main.NAVIGATION_QUIET_SECONDS
+    messages[1]["content"][0]["hidden"] = True
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert "withdrawn detail" not in str(frame.execution_meta)
+    assert not any(frame._iter_kimi_thinking_updates(chat_id, owner, old))
+    assert frame._flush_execution_step_persists_sync()
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert "withdrawn detail" not in str(reopened.load_execution_steps(chat_id))
+    assert not reopened.load_execution_page(pair_id="test", domain="events", chat_id=chat_id, secret="test")["entries"]
+    with pytest.raises(ValueError, match="SNAPSHOT_REQUIRED"):
+        reopened.load_execution_range(
+            pair_id="test", domain="events", chat_id=chat_id, revision=source["revision"], start_sequence=1, end_sequence=1,
+        )
+    with pytest.raises(ValueError):
+        reopened.load_execution_projection_page(
+            pair_id="test", domain="events", chat_id=chat_id, secret="test", snapshot_id=snapshot,
+        )
+    with reopened._connect() as connection:
+        assert not connection.execute("SELECT row_json FROM execution_projection_rows WHERE snapshot_id=?", (snapshot,)).fetchall()
+        assert "withdrawn detail" not in str([row[0] for row in connection.execute("SELECT state_json FROM execution_assemblers")])
+
+    # A newly opened visible tail contains no private rows. A stale REST
+    # delivery must still discover the withdrawal from the reopened store.
+    frame._current_chat_state["execution_steps"] = []
+    frame._kimi_thinking_synced.clear()
+    frame._kimi_rest_withdrawals.clear()
+    monkeypatch.setattr(frame, "chat_store", reopened)
+    messages[1]["content"][0].pop("hidden")
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    wx_app.Yield()
+    assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts)
+    assert not frame._current_chat_state["execution_steps"]
+    assert "withdrawn detail" not in str(reopened.load_execution_steps(chat_id))
+
+
+def test_rest_withdraws_pruned_native_row_and_missing_sibling_after_reopen(frame, wx_app, monkeypatch):
+    chat_id = "chat-kimi"
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    frame.chat_store.upsert_chat(frame._current_chat_state)
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    native = {"display_kind": "thinking", "provider": "kimi", "turn_idx": 0, "turn_id": "turn-1",
+              "session_id": "session-1", "thread_id": "session-1", "agent_id": "main", "item_id": "native-stream",
+              "kimi_step_id": "native", "kimi_step_number": 1, "detail_text": "PRIVATE native", "list_text": "PRIVATE native"}
+    assert frame._append_execution_entry_to_chat(chat_id, native, save_state=False)
+    assert frame._flush_execution_step_persists_sync()
+    native = frame.chat_store.load_execution_steps(chat_id)[0]
+    frame._current_chat_state["execution_steps"].extend({"turn_idx": 0} for _ in range(500))
+    frame._prune_cached_execution_steps_for_turn(frame._current_chat_state, {"turn_idx": 0})
+    assert all(step.get("item_id") != "native-stream" for step in frame._current_chat_state["execution_steps"])
+    fact = frame.chat_store.commit_durable_fact(pair_id="test", domain="events", execution=True, envelope={
+        "event_id": "native-fact", "chat_id": chat_id, "kind": "execution_entry",
+        "body": {"kind": "thinking", "canonical_item_id": native["canonical_item_id"], "detail": "PRIVATE native"},
+    })
+    prompt = {"id": "prompt-1", "role": "user", "content": []}
+    first = {"id": "native-rest", "role": "assistant", "hidden": True, "content": []}
+    sibling = {"id": "sibling", "role": "assistant", "content": [{"type": "thinking", "text": "public sibling"}]}
+
+    def deliver(messages):
+        frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+        wx_app.Yield()
+        assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts and not frame._kimi_execution_write_counts)
+
+    deliver([prompt, first, sibling])
+    sibling["content"].append({"type": "thinking", "text": "PRIVATE sibling", "hidden": True})
+    deliver([prompt, first, sibling])
+    reopened = ChatStore(frame.chat_store.db_path)
+    stored = reopened.load_execution_steps(chat_id)
+    assert "PRIVATE" not in str(stored)
+    assert any(step.get("item_id") == "native-stream" and step.get("private_reasoning") for step in stored)
+    assert any(step.get("rest_message_id") == "sibling" and step.get("kimi_rest_block_index") == 1
+               and step.get("private_reasoning") for step in stored)
+    assert not reopened.load_execution_page(chat_id=chat_id, pair_id="test", domain="events", secret="secret")["entries"]
+    with pytest.raises(ValueError, match="SNAPSHOT_REQUIRED"):
+        reopened.replay_after(pair_id="test", domain="events", sync_sequence=fact["sync_sequence"] - 1)
+    monkeypatch.setattr(frame, "chat_store", reopened)
+    frame._current_chat_state["execution_steps"] = []
+    frame._kimi_thinking_synced.clear()
+    frame._kimi_rest_withdrawals.clear()
+    sibling["content"][1].pop("hidden")
+    deliver([prompt, first, sibling])
+    assert "PRIVATE" not in str(reopened.load_execution_steps(chat_id))
+
+
+def test_rest_single_large_message_keeps_cap_and_coalesces_inflight_snapshot(frame, wx_app, monkeypatch):
+    chat_id = "chat-kimi"
+    steps = [{"turn_idx": 0, "detail_text": f"prior {index}"} for index in range(500)]
+    _setup_active_kimi_chat(frame, monkeypatch, execution_steps=steps)
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    frame._chat_store_enabled = False
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    messages = [{"id": "prompt-1", "role": "user", "content": []}, {"id": "large", "role": "assistant",
+        "content": [{"type": "thinking", "text": f"block {index}"} for index in range(600)]}]
+    pending = []
+    count = [0]
+    iterations = []
+    original = frame._call_after_if_alive
+    append = frame._append_execution_entry_to_chat
+
+    def track(callback, *args, **kwargs):
+        if callback == frame._continue_kimi_thinking_sync:
+            pending.append((callback, args, kwargs))
+            return True
+        return original(callback, *args, **kwargs)
+
+    def append_row(*args, **kwargs):
+        count[0] += 1
+        return append(*args, **kwargs)
+
+    monkeypatch.setattr(frame, "_call_after_if_alive", track)
+    monkeypatch.setattr(frame, "_append_execution_entry_to_chat", append_row)
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    assert _yield_until(wx_app, lambda: bool(pending))
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    wx_app.Yield()
+    assert frame._kimi_thinking_sync_counts == {chat_id: 1} and len(pending) == 1
+    while pending and len(iterations) < 100:
+        callback, args, kwargs = pending.pop(0)
+        before = count[0]
+        callback(*args, **kwargs)
+        iterations.append(count[0] - before)
+    assert frame._kimi_thinking_sync_counts == {} and not pending
+    assert max(iterations) <= 16 and count[0] == 600
+    assert len(frame._current_chat_state["execution_steps"]) == 500
+    assert frame._current_chat_state["execution_steps"][-1]["detail_text"] == "block 599"
+
+    # A privacy change in the same transcript must get its own job while an
+    # identical repeat is already running.
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    assert _yield_until(wx_app, lambda: bool(pending))
+    messages[1]["content"][-1]["hidden"] = True
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    wx_app.Yield()
+    assert frame._kimi_thinking_sync_counts == {chat_id: 2}
+    for _ in range(120):
+        if not pending:
+            break
+        callback, args, kwargs = pending.pop(0)
+        callback(*args, **kwargs)
+    assert not pending and not frame._kimi_thinking_sync_counts
+    assert all(step.get("detail_text") != "block 599" for step in frame._current_chat_state["execution_steps"])
+
+
+def test_rest_withdrawal_groups_visible_changes_in_a_batch(frame, wx_app, monkeypatch):
+    chat_id = "chat-kimi"
+    _setup_active_kimi_chat(frame, monkeypatch, detail_panel_mode="execution")
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    messages = [{"id": "prompt-1", "role": "user"}, {"id": "response", "role": "assistant", "content": [
+        {"type": "thinking", "text": "first public"}, {"type": "thinking", "text": "second public"},
+    ]}]
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert frame._flush_execution_step_persists_sync()
+    removed = []
+    remove = frame._remove_visible_kimi_withdrawals
+
+    def track(chat, rows):
+        removed.append(set(rows))
+        return remove(chat, rows)
+
+    monkeypatch.setattr(frame, "_remove_visible_kimi_withdrawals", track)
+    for block in messages[1]["content"]:
+        block["hidden"] = True
+    frame._schedule_kimi_thinking_sync(chat_id, owner, messages)
+    wx_app.Yield()
+    assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts and not frame._kimi_execution_write_counts)
+    assert len(removed) == 1 and len(removed[0]) == 2
+
+
+def test_rest_withdrawal_between_blocks_stops_older_public_snapshot(frame, monkeypatch):
+    chat_id = "chat-kimi"
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    prompt = {"id": "prompt-1", "role": "user"}
+    public = {"id": "response", "role": "assistant", "content": [
+        {"type": "thinking", "text": f"withdrawn block {index}"} for index in range(32)
+    ]}
+
+    updates = frame._iter_kimi_thinking_updates(chat_id, owner, frame._prepare_kimi_thinking_rows([prompt, public]))
+    assert any(updates)
+    assert [step["detail_text"] for step in frame._current_chat_state["execution_steps"]] == ["withdrawn block 0"]
+    assert frame._kimi_rest_withdrawals == {}
+
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, [prompt, dict(public, hidden=True)])
+    assert not any(updates)
+    assert frame._flush_execution_step_persists_sync()
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert "withdrawn block" not in str(frame._current_chat_state["execution_steps"])
+    assert "withdrawn block" not in str(reopened.load_execution_steps(chat_id))
+
+
+def test_withdrawal_keeps_other_prompt_buffer_with_reused_item(frame, monkeypatch):
+    _setup_active_kimi_chat(frame, monkeypatch)
+    first = ("chat-kimi", "session-1", "prompt-A", "main")
+    second = ("chat-kimi", "session-1", "prompt-B", "main")
+    frame._kimi_turn_answer_segments.update({(*first, "same"): {0: "withdraw me"}, (*second, "same"): {0: "keep me"}})
+    frame._kimi_turn_answer_parts.update({first: ["withdraw me"], second: ["keep me"]})
+    frame._redact_kimi_narrative("chat-kimi", {"item_id": "same", "session_id": "session-1", "turn_id": "turn-1"},
+                                owner_key="prompt-A", store_only=True)
+    assert frame._kimi_turn_answer_segments[(*first, "same")] == {}
+    assert frame._kimi_turn_answer_parts[first] == []
+    assert frame._kimi_turn_answer_segments[(*second, "same")] == {0: "keep me"}
+    assert frame._kimi_turn_answer_parts[second] == ["keep me"]
+
+
+def test_rejected_rest_projection_allows_identical_redelivery(frame, monkeypatch):
+    chat_id = "chat-kimi"
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0]["kimi_prompt_id"] = "prompt-1"
+    owner = dict(frame._kimi_active_turns[chat_id], chat_id=chat_id, prompt_id="prompt-1", revision=1)
+    messages = [{"id": "prompt-1", "role": "user"}, {"id": "response", "role": "assistant",
+                 "content": [{"type": "thinking", "text": "retry REST publication"}]}]
+    upsert = frame.chat_store.upsert_execution_step
+
+    def reject(*args, **kwargs):
+        raise ValueError("test rejection")
+
+    monkeypatch.setattr(frame.chat_store, "upsert_execution_step", reject)
+    assert frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert frame._flush_execution_step_persists_sync()
+    assert not frame.chat_store.load_execution_steps(chat_id)
+    assert not any(frame._kimi_thinking_synced.values())
+
+    monkeypatch.setattr(frame.chat_store, "upsert_execution_step", upsert)
+    frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    assert frame._flush_execution_step_persists_sync()
+    assert not frame._kimi_sync_thinking_rows(chat_id, owner, messages)
+    reopened = ChatStore(frame.chat_store.db_path)
+    assert [step["detail_text"] for step in reopened.load_execution_steps(chat_id)] == ["retry REST publication"]
 
 
 def test_sdk_public_thinking_updates_execution_list_and_detail_without_moving_focus(frame, wx_app, monkeypatch):
@@ -448,6 +1037,7 @@ def test_kimi_status_batch_preserves_focus_selection_and_skips_noop_repaint(fram
         frame._dispatch_kimi_event_to_ui("chat-kimi", event)
     _drain_all_kimi_events(frame)
 
+    assert _yield_until(wx_app, lambda: not frame._kimi_execution_write_counts)
     rows = [frame.execution_list.GetString(idx) for idx in range(frame.execution_list.GetCount())]
     assert rows.count("The user") == 1
     assert frame.input_edit.HasFocus()
@@ -505,6 +1095,7 @@ def test_background_structured_kimi_batch_persists_owner_without_foreground_repa
     transport = KimiServerClient()
     _sdk_push(frame, transport, "session-bg", "turn.step.started", 1, chat_id="chat-bg", turnId="turn-bg", step=1, stepId="bg-step")
     _sdk_push(frame, transport, "session-bg", "thinking.delta", 1, chat_id="chat-bg", turnId="turn-bg", offset=0, delta="后台真实思考。")
+    assert _yield_until(wx_app, lambda: not frame._kimi_execution_write_counts)
     assert [step["detail_text"] for step in frame.archived_chats[0]["execution_steps"]] == ["后台真实思考。"]
     assert repaint == []
     assert frame.execution_list.GetSelection() == 1

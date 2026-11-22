@@ -741,6 +741,16 @@ class ChatFrame(
         self._execution_step_persist_scheduled = False
         self._execution_step_persist_worker_running = False
         self._execution_step_persist_thread = None
+        self._kimi_execution_write_counts = {}
+        self._kimi_execution_write_results = deque()
+        self._kimi_execution_write_result_scheduled = False
+        self._kimi_execution_boundaries = {}
+        self._kimi_execution_private_keys = set()
+        self._kimi_thinking_sync_counts = {}
+        self._kimi_thinking_sync_jobs = set()
+        self._kimi_rest_candidate_updates = {}
+        self._kimi_execution_buffer_index = {}
+        self._kimi_rest_withdrawals = {}
         self._chat_turn_dirty_from: dict[str, int] = {}
         self._remote_turn_payload_cache: dict[int, tuple[tuple, dict]] = {}
         self._context_usage_estimate_lock = threading.Lock()
@@ -1385,8 +1395,22 @@ class ChatFrame(
         return wx_call_later_if_alive(delay_ms, func, *args, **kwargs)
 
     def _on_close(self, event: wx.CloseEvent):
-        # Always allow close (e.g. Alt+F4) even during active reply.
+        # An active reply does not prevent closing once accepted writes settle.
+        if getattr(self, "_close_complete", False):
+            event.Skip()
+            return
         self._closing = True
+        if getattr(self, "_pending_kimi_ui_events", None):
+            self._drain_kimi_ui_events()
+        if (getattr(self, "_pending_kimi_ui_events", None) or getattr(self, "_kimi_execution_write_counts", None)
+                or getattr(self, "_kimi_thinking_sync_counts", None)
+                or getattr(self, "_kimi_execution_boundaries", None)):
+            try:
+                event.Veto()
+            except Exception:
+                pass
+            self._defer_close_for_persistence_worker()
+            return
         self._voice_input.shutdown()
         self._stop_answer_refresh_deadline()
         self._release_execution_focus_lease()
@@ -1456,6 +1480,7 @@ class ChatFrame(
             except Exception:
                 pass
             self._tray_icon = None
+        self._close_complete = True
         event.Skip()
 
 def app_instance_key() -> str:

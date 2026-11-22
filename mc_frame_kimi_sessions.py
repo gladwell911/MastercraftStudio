@@ -663,6 +663,10 @@ class KimiSessionsMixin:
     def _retire_kimi_chat_runtime(self, chat: dict, cleared_session: str) -> None:
         chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
         if chat_id:
+            self._kimi_execution_boundaries.pop(chat_id, None)
+            for key in list(self._execution_delta_buffer):
+                if key[0] == chat_id and len(key) > 6 and key[6] == cleared_session:
+                    self._discard_execution_delta(key)
             with self._kimi_owner_lock:
                 # Retire the lock and its session together before admitting
                 # the first send in the cleared conversation.
@@ -1675,13 +1679,9 @@ class KimiSessionsMixin:
                     )
                     if self._kimi_thinking_sync_due(session_id):
                         try:
-                            # The sync appends execution entries that repaint
-                            # the F1 list; marshal it to the UI thread like
-                            # the final-answer event below. Use the fully
-                            # paged rows so thinking blocks older than the
-                            # 50-message window are not skipped.
-                            self._call_after_if_alive(
-                                self._kimi_sync_thinking_rows,
+                            # Use the fully paged rows before delivering small
+                            # projection batches to the UI.
+                            self._schedule_kimi_thinking_sync(
                                 str(owner.get("chat_id") or "").strip(),
                                 owner,
                                 rows,

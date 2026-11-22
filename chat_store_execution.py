@@ -11,6 +11,16 @@ from chat_store_schema import MAX_INT64
 from typing import Any
 
 
+_DISCLOSABLE_EXECUTION_FACT = (
+    "NOT EXISTS (SELECT 1 FROM execution_steps AS step WHERE step.chat_id=fact.chat_id "
+    "AND step.logical_key=substr(json_extract(fact.envelope_json,'$.body.canonical_item_id'),11) "
+    "AND json_extract(step.payload_json,'$.private_reasoning')=1) "
+    "AND NOT EXISTS (SELECT 1 FROM v2_chat_state AS state WHERE state.chat_id=fact.chat_id "
+    "AND state.revision>fact.revision AND fact.kind='execution_entry' "
+    "AND json_extract(fact.envelope_json,'$.body.canonical_item_id') LIKE 'execution-%')"
+)
+
+
 class ChatStoreExecutionMixin:
     @staticmethod
     def _execution_cursor_token(payload: dict[str, Any], secret: str | bytes) -> str:
@@ -69,9 +79,10 @@ class ChatStoreExecutionMixin:
                 if snapshot_high < 0 or exclusive_before < 1 or exclusive_before > snapshot_high + 1:
                     raise ValueError("INVALID_EXECUTION_CURSOR")
             rows = conn.execute(
-                "SELECT envelope_json,execution_sequence FROM durable_facts "
+                "SELECT envelope_json,execution_sequence FROM durable_facts AS fact "
                 "WHERE pair_id=? AND domain=? AND chat_id=? AND revision=? "
                 "AND execution_sequence IS NOT NULL AND execution_sequence<=? AND execution_sequence<? "
+                f"AND {_DISCLOSABLE_EXECUTION_FACT} "
                 "ORDER BY execution_sequence DESC LIMIT ?",
                 (pair, sequence_domain, owner, revision, snapshot_high, exclusive_before, page_limit + 1),
             ).fetchall()
@@ -221,8 +232,9 @@ class ChatStoreExecutionMixin:
             if int(revision) != current_revision:
                 raise ValueError("SNAPSHOT_REQUIRED")
             rows = conn.execute(
-                "SELECT envelope_json FROM durable_facts WHERE pair_id=? AND domain=? AND chat_id=? "
-                "AND revision=? AND execution_sequence BETWEEN ? AND ? ORDER BY execution_sequence",
+                "SELECT envelope_json FROM durable_facts AS fact WHERE pair_id=? AND domain=? AND chat_id=? "
+                f"AND revision=? AND execution_sequence BETWEEN ? AND ? AND {_DISCLOSABLE_EXECUTION_FACT} "
+                "ORDER BY execution_sequence",
                 (str(pair_id), str(domain), owner, current_revision, start, end),
             ).fetchall()
         if len(rows) != end - start + 1:
@@ -472,6 +484,8 @@ class ChatStoreExecutionMixin:
         immutable = ("logical_key", "canonical_item_id", "provider", "thread_id", "turn_id", "revision", "agent_id")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if self._execution_scope_retired(conn, normalized, scope):
+                return {}
             assembler = conn.execute("SELECT scope_json FROM execution_assemblers WHERE chat_id=? AND logical_key=?",
                                      (normalized, logical_key)).fetchone()
             if assembler is not None and self._json_dict(assembler["scope_json"]) != scope:
@@ -490,6 +504,11 @@ class ChatStoreExecutionMixin:
                 for key in ("event_id", "canonical_item_id", "_execution_uid", "created_at", "ts", "execution_sequence", "revision"):
                     if previous.get(key) not in (None, ""):
                         incoming[key] = previous[key]
+                if previous.get("private_reasoning"):
+                    incoming.update(private_reasoning=True, list_text="", kimi_summary="", detail_text="", raw_text="",
+                                    text="", source_detail={}, source_detail_history=[], diagnostic_history=[])
+                elif incoming.get("private_reasoning"):
+                    self._invalidate_execution_snapshots(conn, normalized)
                 step_index = int(row["step_index"])
                 conn.execute(
                     """UPDATE execution_steps SET turn_idx=?,event_type=?,display_kind=?,list_text=?,detail_text=?,payload_json=?,visible=?
@@ -532,6 +551,19 @@ class ChatStoreExecutionMixin:
         ]
         return hashlib.sha256(json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _execution_scope_retired(conn, chat_id: str, scope: dict) -> bool:
+        if scope.get("provider") != "kimi":
+            return False
+        current = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+        return current is not None and current["revision"] > int(scope["revision"])
+
+    @staticmethod
+    def _invalidate_execution_snapshots(conn, chat_id: str) -> None:
+        conn.execute("DELETE FROM execution_projection_rows WHERE snapshot_id IN "
+                     "(SELECT snapshot_id FROM execution_projection_snapshots WHERE chat_id=?)", (chat_id,))
+        conn.execute("DELETE FROM execution_projection_snapshots WHERE chat_id=?", (chat_id,))
+
     def apply_execution_fragment(self, chat_id: str, logical_key: str, scope: dict[str, Any], *,
                                  fragment_id: str, offset: int | None, text: str,
                                  projection_seed: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -547,6 +579,8 @@ class ChatStoreExecutionMixin:
         incoming_private = bool(isinstance(projection_seed, dict) and projection_seed.get("private_reasoning"))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if self._execution_scope_retired(conn, normalized, scope):
+                return {"accepted": False, "stale": True}
             row = conn.execute("SELECT scope_json,state_json FROM execution_assemblers WHERE chat_id=? AND logical_key=?",
                                (normalized, logical_key)).fetchone()
             state = self._json_dict(row["state_json"]) if row else {"fragments": {}, "segments": {}, "ordered": [], "pending_gap": False}
@@ -558,19 +592,26 @@ class ChatStoreExecutionMixin:
                 state["segments"] = {key: "\0" * len(value) for key, value in state.get("segments", {}).items()}
                 state["ordered"] = [dict(part, text="\0" * len(str(part.get("text") or ""))) for part in state.get("ordered", [])]
                 state["assembled"] = "\0" * len(str(state.get("assembled") or ""))
+                conn.execute("UPDATE execution_fragment_conflicts SET payload_json='{}' WHERE chat_id=? AND logical_key=?",
+                             (normalized, logical_key))
+                self._invalidate_execution_snapshots(conn, normalized)
             state["private_reasoning"] = private_fragment
             stored_text = ("\0" * len(text)) if private_fragment else text
             if private_fragment:
                 safe_seed = dict(projection_seed) if isinstance(projection_seed, dict) else {}
-                safe_seed.update({"private_reasoning": True, "detail_text": "", "raw_text": "", "text": "",
+                # Older thinking projections use this fixed activity label.
+                caption = "正在分析问题" if safe_seed.get("display_kind") == "thinking" and safe_seed.get("list_text") == "正在分析问题" else ""
+                safe_seed.update({"private_reasoning": True, "list_text": caption, "kimi_summary": "", "detail_text": "", "raw_text": "", "text": "",
                                   "source_detail": {}, "source_detail_history": [], "diagnostic_history": []})
                 projection_seed = safe_seed
             prior = state["fragments"].get(fragment_id) if fragment_id else None
             if prior:
-                if prior != signature:
+                conflict = prior != signature
+                if conflict:
                     self._record_execution_conflict(conn, normalized, logical_key, fragment_id, "FRAGMENT_ID_CONFLICT",
                                                     {"offset": offset, "text": "<redacted>" if private_fragment else text})
-                    return {"accepted": False, "conflict": True, **state}
+                    if not incoming_private:
+                        return {"accepted": False, "conflict": True, **state}
                 projection = conn.execute(
                     "SELECT payload_json FROM execution_steps WHERE chat_id=? AND logical_key=?",
                     (normalized, logical_key),
@@ -596,7 +637,7 @@ class ChatStoreExecutionMixin:
                     (normalized, logical_key, json.dumps(scope, ensure_ascii=False, sort_keys=True),
                      json.dumps(state, ensure_ascii=False), self._clock.time()),
                 )
-                return {"accepted": False, "replay": True, "projection": payload, **state}
+                return {"accepted": False, "conflict" if conflict else "replay": True, "projection": payload, **state}
             if offset is not None:
                 for raw_offset, accepted in state["segments"].items():
                     accepted_offset = int(raw_offset)
@@ -683,8 +724,9 @@ class ChatStoreExecutionMixin:
                     payload["projection_ready"] = True
                 payload["incomplete"] = bool(state.get("pending_gap"))
                 conn.execute(
-                    "UPDATE execution_steps SET detail_text=?,payload_json=?,visible=? WHERE chat_id=? AND logical_key=?",
-                    (payload["detail_text"], json.dumps(payload, ensure_ascii=False), self._execution_visible(payload), normalized, logical_key),
+                    "UPDATE execution_steps SET list_text=?,detail_text=?,payload_json=?,visible=? WHERE chat_id=? AND logical_key=?",
+                    (payload["list_text"], payload["detail_text"], json.dumps(payload, ensure_ascii=False),
+                     self._execution_visible(payload), normalized, logical_key),
                 )
         return {"accepted": True, "projection": payload, **state}
 

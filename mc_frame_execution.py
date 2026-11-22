@@ -3,11 +3,14 @@
 import copy
 import hashlib
 import json
+import logging
 import re
+import sqlite3
 import uuid
 import wx
 from codex_client import CodexEvent
 from collections import Counter
+from functools import partial
 from execution_projection import (
     collapse_kimi_execution_lifecycle,
     execution_command_list_text,
@@ -37,6 +40,10 @@ from mc_frame_settings import (
 from pathlib import Path
 
 import mc_frame_bindings as bindings
+
+logger = logging.getLogger(__name__)
+_RETRYABLE_SQLITE_CODES = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR,
+                           sqlite3.SQLITE_FULL, sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_PROTOCOL}
 
 
 class ExecutionPageMixin:
@@ -937,6 +944,8 @@ class ExecutionPageMixin:
             entry = {}
         title = str(entry.get("list_text") or entry.get("step") or entry.get("text") or "").strip()
         detail = str(entry.get("detail_text") or entry.get("detail") or title).strip()
+        if entry.get("private_reasoning"):
+            title = detail = ""
         kind = str(entry.get("display_kind") or entry.get("event_type") or "info").strip() or "info"
         canonical_item_id = str(entry.get("canonical_item_id") or entry.get("event_id")
                                 or entry.get("id") or entry.get("_execution_uid") or "").strip()
@@ -961,7 +970,9 @@ class ExecutionPageMixin:
             payload["ts"] = ts
         return payload
 
-    def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True) -> bool:
+    def _append_execution_entry_to_chat(self, chat_id: str, entry: dict, *, save_state: bool = True,
+                                        logical_positions: dict | None = None, store_only: bool = False,
+                                        on_persisted=None, sync_visible: bool = True) -> bool:
         if not isinstance(entry, dict):
             return False
         self._invalidate_remote_state_cache()
@@ -1001,13 +1012,25 @@ class ExecutionPageMixin:
             stable_id = f"execution-{logical_key}"
             entry.setdefault("event_id", stable_id)
             entry.setdefault("_execution_uid", logical_key)
+        if store_only:
+            return self._persist_execution_step_or_queue(chat_id, entry)
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
         logical_key = str(entry.get("logical_key") or "")
         if logical_key:
-            for index, previous in enumerate(steps):
+            if logical_positions is None:
+                existing = enumerate(steps)
+            elif logical_key in logical_positions:
+                indexed_step = logical_positions[logical_key]
+                try:
+                    existing = ((steps.index(indexed_step), indexed_step),)
+                except ValueError:
+                    existing = enumerate(steps)
+            else:
+                existing = ()
+            for index, previous in existing:
                 if not isinstance(previous, dict) or str(previous.get("logical_key") or "") != logical_key:
                     continue
                 updated = dict(entry)
@@ -1034,15 +1057,20 @@ class ExecutionPageMixin:
                     updated.update(list_text="", kimi_summary="", detail_text="", raw_text="", text="",
                                    source_detail={}, source_detail_history=[], diagnostic_history=[])
                 if updated == previous:
+                    if on_persisted is not None:
+                        return self._persist_execution_step_or_queue(chat_id, previous, broadcast=True,
+                                                                     on_persisted=on_persisted)
                     return False
                 steps[index] = copy.deepcopy(updated)
                 resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
                 if resolved_chat_id:
-                    if not self._persist_execution_step_or_queue(resolved_chat_id, steps[index]):
+                    if not self._persist_execution_step_or_queue(resolved_chat_id, steps[index], broadcast=True,
+                                                                 on_persisted=on_persisted):
                         steps[index] = previous
                         return False
-                    self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[index]))
-                self._request_execution_list_sync(target_chat)
+                    self._notify_kimi_rest_candidate(resolved_chat_id, steps, index, previous, steps[index])
+                if sync_visible:
+                    self._request_execution_list_sync(target_chat)
                 if save_state:
                     self._defer_chat_state_save()
                 return True
@@ -1119,8 +1147,7 @@ class ExecutionPageMixin:
                 steps.insert(index, copy.deepcopy(entry))
                 resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
                 if resolved_chat_id:
-                    self._persist_execution_step_or_queue(resolved_chat_id, steps[index])
-                    self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[index]))
+                    self._persist_execution_step_or_queue(resolved_chat_id, steps[index], broadcast=True)
                 self._request_execution_list_sync(target_chat)
                 if save_state:
                     self._defer_chat_state_save()
@@ -1150,16 +1177,16 @@ class ExecutionPageMixin:
         steps.append(copy.deepcopy(entry))
         resolved_chat_id = str(chat_id or target_chat.get("id") or "").strip()
         if resolved_chat_id:
-            if not self._persist_execution_step_or_queue(resolved_chat_id, steps[-1]):
+            if not self._persist_execution_step_or_queue(resolved_chat_id, steps[-1], broadcast=True,
+                                                         on_persisted=on_persisted):
                 steps.pop()
                 return False
+            self._notify_kimi_rest_candidate(resolved_chat_id, steps, len(steps) - 1, None, steps[-1])
         self._prune_cached_execution_steps_for_turn(target_chat, steps[-1])
         steps = target_chat.get("execution_steps")
         if not isinstance(steps, list):
             steps = []
             target_chat["execution_steps"] = steps
-        if resolved_chat_id:
-            self._broadcast_remote_event(self._remote_execution_entry_payload(resolved_chat_id, steps[-1]))
         appended_visible = self._append_visible_execution_entry(target_chat, len(steps) - 1, steps[-1])
         if not appended_visible and self._execution_step_targets_visible_chat_while_hidden(target_chat):
             self._mark_execution_list_dirty()
@@ -1167,31 +1194,53 @@ class ExecutionPageMixin:
             self._defer_chat_state_save()
         return True
 
-    def _persist_execution_step_or_queue(self, chat_id: str, step: dict) -> bool:
-        if not getattr(self, "_chat_store_enabled", False) or getattr(self, "chat_store", None) is None:
-            return True
+    def _persist_execution_step_or_queue(self, chat_id: str, step: dict, *, broadcast: bool = False,
+                                         on_persisted=None) -> bool:
         if not chat_id or not isinstance(step, dict):
             return False
+        if not getattr(self, "_chat_store_enabled", False) or getattr(self, "chat_store", None) is None:
+            if broadcast:
+                self._broadcast_remote_event(self._remote_execution_entry_payload(chat_id, step))
+            if on_persisted is not None:
+                on_persisted(True)
+            return True
+        if step.get("provider") == "kimi" and step.get("logical_key"):
+            self._queue_kimi_execution_write(
+                chat_id, partial(self._persist_kimi_execution_step, self.chat_store, chat_id, copy.deepcopy(step), broadcast),
+                on_persisted,
+            )
+            return True
         if str(step.get("logical_key") or "").strip():
             try:
                 self._persist_execution_step(self.chat_store, chat_id, step)
-                return True
             except Exception:
                 return False
-        if int(getattr(self, "_codex_ui_batch_depth", 0) or 0) <= 0:
+        elif int(getattr(self, "_codex_ui_batch_depth", 0) or 0) <= 0:
             self._persist_execution_step(self.chat_store, chat_id, step)
-            return True
-        self._queue_execution_step_persist(chat_id, step)
+        else:
+            self._queue_execution_step_persist(chat_id, step)
+        if broadcast:
+            self._broadcast_remote_event(self._remote_execution_entry_payload(chat_id, step))
         return True
 
+    def _persist_kimi_execution_step(self, store, chat_id: str, step: dict, broadcast: bool) -> bool:
+        if step["logical_key"] in self._kimi_execution_private_keys:
+            step.update(private_reasoning=True, list_text="", detail_text="", kimi_summary="", raw_text="", text="",
+                        source_detail={}, source_detail_history=[], diagnostic_history=[])
+        persisted = self._persist_execution_step(store, chat_id, step)
+        if broadcast and persisted:
+            payload = self._remote_execution_entry_payload(chat_id, persisted)
+            payload["_source_revision"] = step["revision"]
+            self._broadcast_remote_event(payload, retry_on_failure=False)
+        return bool(persisted)
+
     @staticmethod
-    def _persist_execution_step(store, chat_id: str, step: dict) -> None:
+    def _persist_execution_step(store, chat_id: str, step: dict) -> dict | None:
         if str(step.get("logical_key") or "").strip():
             upsert = getattr(store, "upsert_execution_step", None)
             if not callable(upsert):
                 raise RuntimeError("EXECUTION_UPSERT_UNAVAILABLE")
-            upsert(chat_id, step)
-            return
+            return upsert(chat_id, step)
         replace_lifecycle = getattr(store, "replace_execution_lifecycle_step", None)
         if str(step.get("event_type") or "") == "item_completed" and callable(replace_lifecycle):
             if replace_lifecycle(chat_id, step):
@@ -1217,11 +1266,46 @@ class ExecutionPageMixin:
             return
         self._start_execution_step_persist_worker()
 
+    def _queue_kimi_execution_write(self, chat_id, write, on_result=None) -> None:
+        self._kimi_execution_write_counts[chat_id] = self._kimi_execution_write_counts.get(chat_id, 0) + 1
+        with self._execution_step_persist_lock:
+            self._pending_execution_step_persists.append((chat_id, write, on_result))
+        if not self._codex_ui_batch_depth:
+            self._start_execution_step_persist_worker()
+
+    def _drain_kimi_execution_write_results(self) -> None:
+        if getattr(self, "_close_complete", False):
+            return
+        with self._execution_step_persist_lock:
+            results = self._kimi_execution_write_results
+            batch = [results.popleft() for _ in range(min(len(results), 16))]
+            has_more = bool(results)
+            self._kimi_execution_write_result_scheduled = has_more
+        for chat_id, callback, result in batch:
+            try:
+                if callback is not None:
+                    callback(result)
+            except Exception as exc:
+                logger.warning("Kimi execution result could not be applied for chat %s (%s)", chat_id, type(exc).__name__)
+            count = self._kimi_execution_write_counts[chat_id] - 1
+            if count:
+                self._kimi_execution_write_counts[chat_id] = count
+            else:
+                self._kimi_execution_write_counts.pop(chat_id)
+                self._resume_kimi_execution_boundaries(chat_id)
+        if has_more:
+            self._call_after_if_alive(self._drain_kimi_execution_write_results)
+        if not self._kimi_execution_write_counts:
+            if self._chat_state_flush_dirty and not self._chat_state_flush_scheduled:
+                self._defer_chat_state_save()
+            if self._codex_background_flush_dirty and not self._codex_background_flush_scheduled:
+                self._defer_codex_state_save()
+
     def _start_execution_step_persist_worker(self) -> None:
         with self._execution_step_persist_lock:
             self._execution_step_persist_scheduled = False
             if (
-                bool(getattr(self, "_closing", False))
+                (bool(getattr(self, "_closing", False)) and not getattr(self, "_kimi_execution_write_counts", None))
                 or self._execution_step_persist_worker_running
                 or not self._pending_execution_step_persists
             ):
@@ -1234,7 +1318,8 @@ class ExecutionPageMixin:
             worker.start()
 
     def _execution_step_persist_worker(self) -> None:
-        current_thread = bindings.app.threading.current_thread()
+        with self._execution_step_persist_lock:
+            current_worker = self._execution_step_persist_thread
         try:
             while True:
                 with self._execution_step_persist_lock:
@@ -1245,7 +1330,40 @@ class ExecutionPageMixin:
                 store = getattr(self, "chat_store", None)
                 if store is None:
                     continue
-                for chat_id, step in batch:
+                for work in batch:
+                    if len(work) == 3:
+                        chat_id, write, callback = work
+                        result = None
+                        # Retries run before later writes. Fragments and
+                        # logical projection upserts are idempotent.
+                        delay = 0.05
+                        attempt = 0
+                        while True:
+                            attempt += 1
+                            try:
+                                result = write()
+                                break
+                            except (sqlite3.OperationalError, OSError) as exc:
+                                code = getattr(exc, "sqlite_errorcode", None)
+                                if code is not None and (code & 0xff) not in _RETRYABLE_SQLITE_CODES:
+                                    logger.warning("Kimi execution write rejected for chat %s (SQLite code %d)", chat_id, code)
+                                    break
+                                if attempt <= 4 or attempt % 30 == 0:
+                                    logger.warning("Retrying failed Kimi execution write for chat %s (attempt %d, %s)",
+                                                   chat_id, attempt, type(exc).__name__)
+                                bindings.app.time.sleep(delay)
+                                delay = min(2.0, delay * 2)
+                            except Exception as exc:
+                                logger.warning("Kimi execution write rejected for chat %s (%s)", chat_id, type(exc).__name__)
+                                break
+                        with self._execution_step_persist_lock:
+                            self._kimi_execution_write_results.append((chat_id, callback, result))
+                            schedule = not self._kimi_execution_write_result_scheduled
+                            self._kimi_execution_write_result_scheduled = True
+                        if schedule:
+                            self._call_after_if_alive(self._drain_kimi_execution_write_results)
+                        continue
+                    chat_id, step = work
                     try:
                         self._persist_execution_step(store, chat_id, step)
                     except Exception:
@@ -1253,12 +1371,12 @@ class ExecutionPageMixin:
         finally:
             restart = False
             with self._execution_step_persist_lock:
-                if self._execution_step_persist_thread is current_thread:
+                if self._execution_step_persist_thread is current_worker:
                     self._execution_step_persist_thread = None
                     self._execution_step_persist_worker_running = False
                     restart = bool(
                         self._pending_execution_step_persists
-                        and not bool(getattr(self, "_closing", False))
+                        and (not bool(getattr(self, "_closing", False)) or getattr(self, "_kimi_execution_write_counts", None))
                     )
                     if restart:
                         self._execution_step_persist_scheduled = True
@@ -1266,6 +1384,19 @@ class ExecutionPageMixin:
                 self._start_execution_step_persist_worker()
 
     def _flush_execution_step_persists_sync(self, *, worker_timeout: float = 5.0) -> bool:
+        if getattr(self, "_kimi_execution_write_counts", None):
+            deadline = bindings.app.time.monotonic() + max(0.0, float(worker_timeout))
+            while self._kimi_execution_write_counts:
+                self._start_execution_step_persist_worker()
+                with self._execution_step_persist_lock:
+                    worker = self._execution_step_persist_thread
+                if worker is not None:
+                    worker.join(timeout=max(0.0, deadline - bindings.app.time.monotonic()))
+                    if worker.is_alive():
+                        return False
+                self._drain_kimi_execution_write_results()
+                if self._kimi_execution_write_counts and bindings.app.time.monotonic() >= deadline:
+                    return False
         with self._execution_step_persist_lock:
             worker = self._execution_step_persist_thread
         if worker is not None and worker is not bindings.app.threading.current_thread():
@@ -1313,8 +1444,14 @@ class ExecutionPageMixin:
         overflow = len(matching_indexes) - limit
         if overflow <= 0:
             return
-        remove = set(matching_indexes[:overflow])
-        chat["execution_steps"] = [step for idx, step in enumerate(steps) if idx not in remove]
+        chat_id = str(chat.get("id") or "")
+        for idx in reversed(matching_indexes[:overflow]):
+            previous = steps.pop(idx)
+            self._notify_kimi_rest_candidate(chat_id, steps, idx, previous, None)
+
+    def _notify_kimi_rest_candidate(self, chat_id, steps, position, previous, step) -> None:
+        for index in self._kimi_rest_candidate_updates.get(chat_id, ()):
+            index.replace(steps, position, previous, step)
 
     def _buffer_execution_delta(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
@@ -1356,6 +1493,8 @@ class ExecutionPageMixin:
         narrative_private = (self._kimi_protocol_event(event) and display_kind in {"thinking", "assistant", "commentary"}
                              and self._kimi_private_reasoning(event_data))
         completed_kind = "commentary" if display_kind == "assistant" else display_kind
+        rest_private = provider == "kimi" and event_data.get("step_number") in self._kimi_rest_withdrawals.get(
+            (chat_id, revision, thread_scope, turn_scope, completed_kind), {})
         completed = [step for step in target_chat.get("execution_steps", []) if isinstance(step, dict)
                      and step.get("rest_message_id") and event_data.get("step_number") is not None
                      and step.get("kimi_step_number") == event_data["step_number"]
@@ -1364,15 +1503,18 @@ class ExecutionPageMixin:
                      and step.get("revision", revision) == revision
                      and step.get("display_kind") == completed_kind]
         if narrative_private:
+            answer_owner = self._kimi_answer_stream_scope(chat_id, event)[2]
             for step in completed or ([previous] if previous else []):
-                self._redact_kimi_narrative(chat_id, step)
+                self._redact_kimi_narrative(chat_id, step, owner_key=answer_owner)
             if completed:
                 return
-        if completed and not self._kimi_private_reasoning(event_data):
+        if completed and not narrative_private:
             return
-        if previous.get("rest_message_id") and not self._kimi_private_reasoning(event_data):
+        if previous.get("rest_message_id") and not narrative_private:
             return
         key = (str(chat_id or ""), turn_scope, native_id, display_kind, agent_id, source_kind)
+        if provider == "kimi":
+            key = (*key, thread_scope, revision)
         offset = getattr(event, "offset", None) if getattr(event, "offset", None) is not None else event_data.get("offset")
         accepted_origin = _finite_timestamp(getattr(event, "origin_timestamp", None))
         state = self._execution_delta_buffer.setdefault(
@@ -1381,7 +1523,7 @@ class ExecutionPageMixin:
              "last_event_at": 0.0, "start_offset": offset, "private_reasoning": False,
              "origin_timestamp": accepted_origin if accepted_origin is not None else bindings.app.time.time()},
         )
-        if narrative_private or (display_kind == "thinking" and self._kimi_private_reasoning(event_data)):
+        if narrative_private or rest_private or (display_kind == "thinking" and self._kimi_private_reasoning(event_data)):
             state["private_reasoning"] = True
         if previous.get("private_reasoning"):
             state["private_reasoning"] = True
@@ -1393,23 +1535,38 @@ class ExecutionPageMixin:
         fragment = str(getattr(event, "text", "") or getattr(event, "raw_text", "") or "")
         stored_fragment = "\0" * len(fragment) if effective_private else fragment
         if effective_private:
-            event = copy.copy(event)
-            event.text = event.raw_text = ""
-            event.data = {**event_data, "non_disclosable": True}
+            event = self._private_kimi_execution_event(event)
         fragment_id = str(getattr(event, "fragment_id", "") or event_data.get("fragment_id") or event_data.get("fragmentId") or "").strip()
         store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
         if store is not None and hasattr(store, "apply_execution_fragment"):
             scope = {"chat_id": str(chat_id or "").strip(), "revision": revision, "thread_id": thread_scope,
                      "turn_id": turn_scope, "provider": provider, "agent_id": agent_id, "native_id": native_id}
+            projection_seed = self._build_execution_entry(event)
+            if self._kimi_protocol_event(event) and display_kind in {"thinking", "assistant"} and not state.get("private_reasoning"):
+                # Publish only contiguous assembly, never a fragment suffix.
+                projection_seed = None
+            if effective_private:
+                projection_seed = dict(projection_seed or {}, list_text="", detail_text="", raw_text="", text="",
+                                       source_detail={}, private_reasoning=True)
+            if provider == "kimi":
+                if effective_private:
+                    self._kimi_execution_private_keys.add(logical_key)
+                event = copy.deepcopy(event)
+                event.revision = revision
+                state["event"] = event
+                self._index_kimi_execution_buffer(key, state, event)
+                state["logical_scope"] = scope
+                state["logical_key"] = logical_key
+                state["pending_writes"] = state.get("pending_writes", 0) + 1
+                owner = self._kimi_owner_for_event(event)
+                if isinstance(owner, dict):
+                    owner = dict(owner)
+                self._queue_kimi_execution_write(chat_id, partial(
+                    self._write_kimi_execution_fragment, store, chat_id, logical_key, dict(scope), fragment_id=fragment_id,
+                    offset=offset, text=fragment, projection_seed=copy.deepcopy(projection_seed),
+                ), partial(self._apply_kimi_execution_fragment_result, key, state, event, owner))
+                return
             try:
-                projection_seed = self._build_execution_entry(event)
-                if self._kimi_protocol_event(event) and display_kind in {"thinking", "assistant"} and not state.get("private_reasoning"):
-                    # A fragment is not a contiguous snapshot. Publish only
-                    # after assembly, so an offset gap cannot reveal a suffix.
-                    projection_seed = None
-                if bool(state.get("private_reasoning")) and isinstance(projection_seed, dict):
-                    projection_seed = dict(projection_seed, detail_text="", raw_text="", text="",
-                                           source_detail={}, private_reasoning=True)
                 result = store.apply_execution_fragment(str(chat_id or "").strip(), logical_key, scope,
                                                         fragment_id=fragment_id, offset=offset, text=fragment,
                                                         projection_seed=projection_seed)
@@ -1468,6 +1625,83 @@ class ExecutionPageMixin:
             state["fragment_signatures"][fragment_id] = signature
         state["event"] = event
         state["last_event_at"] = bindings.app.time.time()
+        if provider == "kimi":
+            self._index_kimi_execution_buffer(key, state, event)
+
+    def _index_kimi_execution_buffer(self, key, state, event):
+        chat_id, turn_id, item_id, kind, agent_id, _source, session_id, revision = key
+        scope = (chat_id, revision, session_id, turn_id, agent_id or "main")
+        ordinal = event.data.get("step_number") if isinstance(event.data, dict) else None
+        indexes = ((*scope, item_id), (*scope, kind, ordinal))
+        if indexes != state.get("buffer_indexes"):
+            self._unindex_kimi_execution_buffer(key, state)
+            state["buffer_indexes"] = indexes
+            for index in indexes:
+                self._kimi_execution_buffer_index.setdefault(index, set()).add(key)
+
+    def _unindex_kimi_execution_buffer(self, key, state):
+        for index in state.pop("buffer_indexes", ()):
+            keys = self._kimi_execution_buffer_index[index]
+            keys.discard(key)
+            if not keys:
+                self._kimi_execution_buffer_index.pop(index)
+
+    def _discard_execution_delta(self, key):
+        state = self._execution_delta_buffer.pop(key, None)
+        if state is not None:
+            self._unindex_kimi_execution_buffer(key, state)
+        return state
+
+    def _write_kimi_execution_fragment(self, store, chat_id, logical_key, scope, **fragment):
+        if logical_key in self._kimi_execution_private_keys:
+            fragment["projection_seed"] = dict(fragment["projection_seed"] or {}, private_reasoning=True,
+                                               list_text="", detail_text="", raw_text="", text="", source_detail={})
+        return store.apply_execution_fragment(chat_id, logical_key, scope, **fragment)
+
+    def _apply_kimi_execution_fragment_result(self, key, state, event, owner, result) -> None:
+        chat_id, turn_id, item_id, display_kind = key[:4]
+        state["pending_writes"] -= 1
+        if self._execution_delta_buffer.get(key) is not state:
+            return
+        chat = self._chat_state_for_execution_steps(chat_id)
+        if (not isinstance(chat, dict) or self._safe_int(chat.get("revision", 1), 1) != event.revision
+                or not self._kimi_event_is_compatible_with_chat(chat, event)
+                or (owner is not None and not self._kimi_execution_owner_matches(chat, owner))
+                or (isinstance(result, dict) and result.get("stale"))):
+            self._discard_execution_delta(key)
+            return
+        if state.get("private_reasoning") or (isinstance(result, dict) and result.get("private_reasoning")):
+            state["private_reasoning"] = True
+            state["parts"] = []
+            state["event"] = self._private_kimi_execution_event(state["event"])
+            self._kimi_execution_private_keys.add(state["logical_key"])
+            answer_owner = self._kimi_answer_stream_scope(chat_id, event, owner)[2]
+            self._redact_kimi_answer_stream(chat_id, key[6], answer_owner, self._kimi_event_agent_id(event), item_id)
+        if isinstance(result, dict) and (result.get("accepted") or result.get("replay")):
+            state["pending_gap"] = bool(result.get("pending_gap"))
+            if not state["private_reasoning"]:
+                state["parts"] = [str(result.get("assembled") or "")]
+                state["event"] = event
+            elif display_kind == "thinking":
+                entry = self._build_execution_entry(state["event"])
+                if entry:
+                    self._append_execution_entry_to_chat(chat_id, dict(entry, revision=event.revision), save_state=False)
+            state["last_event_at"] = bindings.app.time.time()
+        if not state["pending_writes"] and "flush_retain" in state:
+            retain = state.pop("flush_retain")
+            self._flush_execution_delta(chat_id, turn_id, item_id, display_kind, retain=retain, session_id=key[6])
+
+    @staticmethod
+    def _private_kimi_execution_event(event: CodexEvent) -> CodexEvent:
+        private = copy.copy(event)
+        private.text = private.raw_text = private.title = private.command = ""
+        source = event.data if isinstance(event.data, dict) else {}
+        private.data = {key: source[key] for key in (
+            "source_kind", "adapter", "step_id", "step_number", "epoch", "agent_id", "agentId", "turn_idx",
+            "prompt_id", "owner_generation", "lifecycle_stream", "offset", "fragment_id",
+        ) if key in source}
+        private.data["non_disclosable"] = True
+        return private
 
     def _append_kimi_tool_diagnostic(self, chat_id: str, event: CodexEvent) -> bool:
         if not self._kimi_protocol_event(event):
@@ -1510,12 +1744,15 @@ class ExecutionPageMixin:
             return True
         return False
 
-    def _promote_kimi_interim_assistant(self, chat_id: str, event: CodexEvent) -> None:
+    def _promote_kimi_interim_assistant(self, chat_id: str, event: CodexEvent, *, buffer_keys=None) -> None:
         """A real tool boundary identifies the preceding step's prose as commentary."""
         data = event.data if isinstance(event.data, dict) else {}
         if data.get("source_kind") not in {"tool.call.started", "shell.started"} or not data.get("step_id"):
             return
-        for key, state in list(self._execution_delta_buffer.items()):
+        for key in list(self._execution_delta_buffer) if buffer_keys is None else buffer_keys:
+            state = self._execution_delta_buffer.get(key)
+            if state is None:
+                continue
             base = state.get("event")
             if not isinstance(base, CodexEvent) or key[0] != chat_id or key[3] != "assistant":
                 continue
@@ -1529,28 +1766,31 @@ class ExecutionPageMixin:
             promoted.display_kind = "commentary"
             promoted.phase = "commentary"
             state["event"] = promoted
-            self._execution_delta_buffer.pop(key)
+            self._discard_execution_delta(key)
             commentary_key = (*key[:3], "commentary", *key[4:])
             self._execution_delta_buffer[commentary_key] = state
+            if len(commentary_key) == 8:
+                self._index_kimi_execution_buffer(commentary_key, state, promoted)
             # Keep the empty segmented stream as a boundary: legacy part lists
             # still contain these fragments, but must never become final text.
-            for answer_key in list(self._kimi_turn_answer_segments):
-                if (answer_key[0] == chat_id and answer_key[1] == self._event_thread_id(base)
-                        and answer_key[3] == self._kimi_event_agent_id(base) and answer_key[4] == key[2]):
-                    self._kimi_turn_answer_segments[answer_key] = {}
-            self._flush_execution_delta(chat_id, key[1], key[2], "commentary")
+            session_id, _, owner_key = self._kimi_answer_stream_scope(chat_id, base)
+            answer_key = (chat_id, session_id, owner_key, self._kimi_event_agent_id(base), key[2])
+            if answer_key in self._kimi_turn_answer_segments:
+                self._kimi_turn_answer_segments[answer_key] = {}
+            self._flush_execution_delta(chat_id, key[1], key[2], "commentary", session_id=self._event_thread_id(base),
+                                        buffer_keys=(commentary_key,))
 
     def _flush_execution_delta(
         self, chat_id: str, turn_id: str | None = None, item_id: str | None = None, display_kind: str | None = None,
-        *, retain: bool = False
+        *, retain: bool = False, session_id: str | None = None, buffer_keys=None
     ) -> bool:
         flushed = False
         normalized_chat_id = str(chat_id or "")
         normalized_turn_id = None if turn_id is None else str(turn_id or "").strip()
         normalized_item_id = None if item_id is None else str(item_id or "").strip()
         normalized_display_kind = None if display_kind is None else str(display_kind or "").strip()
-        for key in list(self._execution_delta_buffer.keys()):
-            buf_chat_id, buf_turn_id, buf_item_id, buf_display_kind, _buf_agent_id, _buf_source_kind = key
+        for key in list(self._execution_delta_buffer) if buffer_keys is None else buffer_keys:
+            buf_chat_id, buf_turn_id, buf_item_id, buf_display_kind = key[:4]
             if buf_chat_id != normalized_chat_id:
                 continue
             if normalized_turn_id is not None and buf_turn_id != normalized_turn_id:
@@ -1562,10 +1802,15 @@ class ExecutionPageMixin:
             state = self._execution_delta_buffer.get(key)
             if not isinstance(state, dict):
                 continue
+            if session_id is not None and self._event_thread_id(state["event"]) != session_id:
+                continue
+            if state.get("pending_writes"):
+                state["flush_retain"] = state.get("flush_retain", True) and retain
+                continue
             if bool(state.get("pending_gap")):
                 continue
             if not retain:
-                self._execution_delta_buffer.pop(key, None)
+                self._discard_execution_delta(key)
             text = "".join(str(part or "") for part in (state.get("parts") or []))
             base_event = state.get("event")
             if not text.strip() or not isinstance(base_event, CodexEvent):
@@ -2336,4 +2581,8 @@ class ExecutionPageMixin:
         if not content:
             return False
         title, text = content
-        return self._open_answer_text_viewer(title, text)
+        self._execution_narrative_viewer_row = self.execution_list_model.selected_id()
+        try:
+            return self._open_answer_text_viewer(title, text)
+        finally:
+            self._execution_narrative_viewer_row = None
