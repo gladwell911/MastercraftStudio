@@ -1,17 +1,21 @@
 # 当前交接
 
-更新日期 2026-11-21。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。2026-11-20~21 的需求修复与代码审查改动全部留在工作区未提交，待用户审阅；本轮按用户要求不做任何 git 暂存/提交，日常包未重打包。
+更新日期 2026-11-22。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。2026-11-20 至 2026-11-21 的 MC 改动已保存为基线 `969a145`，Kimi 键盘响应与执行历史修复已提交为 `65e5a36`。本轮验收使用源码，日常目标仍为 `D:/code/cx/md/mc.exe`。
 
-## 2026-11-20~21 需求修复与代码审查（未提交）
+## 2026-11-22 Kimi 键盘响应与执行历史
 
-背景见 [RC 与 MC 修复计划](../docs/rc-mc-remediation-plan.md)（工作区 `D:/code/sj/docs/`）。MC 侧完成：需求 2 电脑到手机中文文件名（`file_transfer.py` 统一生成 ASCII `filename` + UTF-8 `filename*`，纯中文名空词干回退 `file`+原扩展名；RC 侧解析 `filename*`）；需求 3 OneDrive 机器私有配置与恢复（`remote_machine_config.py`，建议目录 `mc-private/machines/<pair>.json`，显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值）；需求 7、10 独立笔记编辑窗口（`notes_edit_window.py`，普通回车保存关闭、Ctrl+回车换行，同条目重复打开 Raise 已有窗口，脏关闭确认）；需求 11 导出到剪贴板成功后删除（仅剪贴板写入成功并 Flush 通过后才删除，部分失败按已删条目重写剪贴板，删除 UPDATE 加版本守卫）；需求 8 Alt+A 音效（修正 Claude 分支位置参数传错导致模型落空，通用路径在有效重发被接受时播放一次）；需求 9 附件失败门禁（发送前明确说明并保留草稿）。
+- Kimi 流式执行写入在后台按序完成。REST 整理消息并分批更新 wx，重新校验归属和撤回状态。可重试存储故障恢复前，正常关闭继续等待已接收的 REST 批次和写入。撤回保护涵盖重开的 SQLite 执行详情和远端交付。
+- 独立审查落实 10 项修复并驳回 1 项。最终复验还修复了旧快照恢复后重新显示 31 个已撤回块的竞态。实际 wx 主循环中的 `CallLater` 续批和 SQLite 持有写锁期间均观测到原生焦点与选中事件，最后一条合法记录可从重开的临时 SQLite 读取。
+- 独立串行宽套件 wx 82 项通过、2 项既有失败，Kimi 集成 154 项通过、3 项既有失败。wx 的原生回答查看器测试也复现基线 Windows COM `0x8001010d`。最后一次竞态修正后，Kimi wx 21 项、定向流式和 REST 37 项、SQLite 与 NATS 131 项通过。命令、基线项与审查证据见 [Kimi 键盘响应实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md)。
+- 下一步在明确标识的目标构建，以相同控件和同一争渡环境对照空闲、Kimi 流式及 Codex 流式。记录物理按键到焦点和实际出声的时延，并验证真实云端。本轮未打包、部署或启动目标 `D:/code/cx/md/mc.exe`。日常程序退出和重启由用户安排，切包仍须核对数据路径。
 
-2026-11-21 四镜头代码审查 31 patch 项全部实施，quick 复审 11 项中 8 项再修复、2 项驳回、1 项 defer（sharedFilesChanged 链路属 RC，见 RC 交接）。实施与裁决见 [_bmad-output 修复计划](../_bmad-output/plan-fix-code-review-2026-11-21.md)（状态 built）。
+## 2026-11-20 至 2026-11-21 需求修复与代码审查
 
-- 改动文件（未提交）：`file_transfer.py`、`main.py`、`mc_frame_navigation.py`、`mc_frame_notes.py`、`mc_frame_remote_runtime.py`、`mc_frame_requests.py`、`notes_store.py`、`remote_machine_config.py`；新增 `notes_edit_window.py`；测试 `tests/test_file_transfer_unit.py`、`tests/test_main_navigation.py`、`tests/test_main_requests.py`、`tests/test_notes_desktop_acceptance.py`、`tests/test_notes_desktop_unit.py`，新增 `tests/test_notes_edit_window_unit.py`、`tests/test_remote_machine_config_restore.py`。
-- 已验证（2026-11-21 收尾复跑）：`test_notes_edit_window_unit.py`、`test_remote_machine_config_restore.py`、`test_file_transfer_unit.py` 共 55 项通过；`test_remote_machine_config.py` 37 项通过（1 项 `overlapping_starts` 为既有环境基线失败）；`test_notes_desktop_acceptance.py` 18 项通过（1 项 `detail_view_keeps_history_tab_position` 为既有基线失败）。既有基线失败不计：widget 与 requests/navigation 宽套件基线见下。
-- 未验证边界：`test_main_requests.py`（18 项）、`test_main_navigation.py`（8 项）既有环境基线失败未复跑全量；实体 NVDA/读屏、物理 Alt+A 按键听验、真实两台机器 OneDrive 恢复演练未验收；需求 9 桌面附件批呈现层为已声明边界。
-- 建议提交（经用户审阅后执行，本轮禁止 git 操作）：上述全部 mc 改动可作为一个 `feat:` 提交（建议标题：`feat: 实现独立笔记窗口与中文文件名传输并修复审查问题`），正文按需求分组列出。
+`969a145` 保存本阶段 MC 侧 20 个文件。内容包括中文文件名传输、OneDrive 机器私有配置恢复、独立笔记窗口、剪贴板导出删除、Alt+A 音效和附件失败门禁。联调背景与旧审查裁决分别保存在工作区上层 `docs/rc-mc-remediation-plan.md` 和 `_bmad-output/plan-fix-code-review-2026-11-21.md`。
+
+- 四镜头审查落实 31 项修复。quick 复审 11 项中 8 项再修复、2 项驳回，`sharedFilesChanged` 链路留在 RC 交接。
+- `test_notes_edit_window_unit.py`、`test_remote_machine_config_restore.py`、`test_file_transfer_unit.py` 共 55 项通过。中文文件名另实跑 8 例，机器恢复验证优先级与身份不匹配。`overlapping_starts` 和 `detail_view_keeps_history_tab_position` 仍是对应宽套件的基线失败。
+- 笔记存储、远程加固和 wx 入口也已隔离复验。附件验收和 UI 自动化共 5 项通过，已读与通知共 26 项通过。`test_main_requests.py` 补齐测试替身后 80 项通过，剩余 16 项既有失败。`test_main_navigation.py` 的 8 项失败与当时基线一致。实体读屏、物理 Alt+A 按键、双机 OneDrive 恢复、真实提供方附件读取仍待验收。
 
 ## 职责拆分与验收
 
@@ -95,14 +99,3 @@
 - **其他既有问题：** token-only app_state 保存和 Windows 并发 replace WinError5 未修；通知/远程旧TLS/发送/详情延迟、两项历史 remote-slim 失败不计通过。源码笔记路径与打包版 OneDrive 数据衔接仍按项目指令与 [远程配置](remote-control.md)，不清日常数据。
 
 下载/通知/FRP 的原始时间点、完整命令、私有证据位置和其他旧验证结果保存在 [交接前快照](archive/handoff-before-voice-local-first-2026-11-10.md)。该快照只证明对应历史版本；当前任务入口以上文为准。长期方法与真实纠错分别见 [experience](experience.md)、[reflection](reflection.md)。
-
-## 2026-11-21 三批修复复验补充（未提交树）
-
-隔离环境复验（临时目录/假凭据，未触日常安装、个人 OneDrive 或生产数据）：
-
-- 中文文件名：`content_disposition_attachment` 实跑 8 例（中文/空格/引号/emoji/纯 ASCII/重名）ASCII 回退 + RFC 5987 filename* 全部正确；`tests/test_file_transfer_unit.py` 全绿。
-- 机器私有配置恢复：临时 OneDrive 根 + 空应用目录实演四级优先级（OneDrive 恢复 → 本机配置 → 显式环境变量）与身份不匹配拒绝，全部符合；`test_remote_machine_config.py` 37 项中 1 项 `overlapping_starts` 为 HEAD 既有环境基线（已复现）。
-- 笔记窗口/导出删除：`test_notes_edit_window_unit.py`、`test_notes_desktop_unit.py`、`test_notes_remote_hardening_unit.py`（108 项）、`test_notes_desktop_acceptance.py`（18 项，1 项 `detail_view_keeps_history_tab_position` 为 HEAD 基线）、`test_notes_ui_automation.py`（7 项）全部通过。
-- Alt+A 音效：`test_main_requests.py` 复跑 80 通过；既有基线 18 项失败中与音效相关的 2 项（`test_active_clear_resend_sound_follows_worker_acceptance`）根因为测试替身缺少 `list_chat_summaries` 触发"Live chat titles cannot be enumerated"回滚，已在测试夹具补该替身方法（仅测试改动），2 项转通过后剩余 16 项失败与 HEAD 失败集合完全一致。物理 Alt+A 按键听验与实体 NVDA 仍为现场边界。
-- 附件：`test_chat_attachments_acceptance.py`（1 项）、`test_chat_attachments_ui_automation.py`（4 项）通过；`test_submit_question_allows_attachment_only_send_for_codex` 的渲染计数失败为 HEAD 既有基线。真实提供方（Claude CLI 工作目录、豆包图片/文档）端到端读取为现场边界。
-- `test_chat_read_state.py`+`test_notification_sync.py` 26 项通过；`test_main_navigation.py` 8 项失败与 HEAD 完全一致（既有基线）。

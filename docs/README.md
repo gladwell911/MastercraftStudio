@@ -1,6 +1,6 @@
 # 文档索引
 
-Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完成职责拆分和隔离构建验收。日常包已补齐固定 2.5.3 运行时，后续源码变更尚待日常切换。2026-11-20~21 需求修复（中文文件名、OneDrive 机器配置恢复、独立笔记编辑窗口、剪贴板导出删除、Alt+A 音效）与 2026-11-21 代码审查修复全部在工作区未提交，范围与验证见 [交接](handoff.md)。各版本的隔离云端、源码与冻结包验证范围见 [交接](handoff.md)。
+截至 2026-11-22，Kimi 键盘响应与执行历史修复已提交为 `65e5a36`。2026-11-20 至 2026-11-21 的需求与审查修复已保存为基线 `969a145`。现有包已补齐固定 Kimi 2.5.3 运行时，后续源码修复尚待日常切换。各版本的源码、隔离云端与冻结包证据见 [当前交接](handoff.md)。
 
 ## 当前入口
 
@@ -8,6 +8,7 @@ Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完�
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
 - [`kimi-runtime.md`](./kimi-runtime.md)：固定Kimi版本/哈希、显式准备、V2订阅/恢复及验证边界
+- [Kimi 键盘响应实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md) 记录后台写入、REST 续批、隐私撤回、独立审查与验证命令。
 - [Kimi 功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md) 与 [清理和交互复审修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md) 保存源码变更、审查裁决及验证命令。
 - [`../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md`](../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md)：steered REST恢复的实施、精确验证命令和真实隔离证据；[独立审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-recovery-20261118.md)的父裁决以计划为准
 - [steered REST 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 保存活动长任务断连的证据和未验证协议边界。

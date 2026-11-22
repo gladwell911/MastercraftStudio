@@ -36,6 +36,14 @@ V2 审批和提问按 session 与 interaction ID 归属。已知失败可经“�
 
 首次完整成功回答在前后台共用接纳边界保存并请求完成音，alias 只保留问题和回答身份引用。`MC_KIMI_COMPLETION_DIAGNOSTICS=1` 开启当前进程最多 128 条匿名完成/音效结果记录（`_kimi_completion_diagnostics`）；默认关闭，不保存正文或凭据，无历史补播。
 
+## 键盘导航与执行详情
+
+Kimi 流式片段、执行投影和隐私撤回按序在后台写入。REST 整理消息并分批应用到 wx，按 chat、revision、session、turn 和 prompt 归属处理。续批提交公开块前重新检查撤回状态，重复快照无需重绘列表。撤回处理覆盖超出可见缓存的持久化记录，保护重开的执行历史及远端交付。可重试存储故障持续时，正常关闭继续等待已经接收的批次和写入。
+
+源码测试已经在 SQLite 写锁持有期间和长 REST 快照的实际 wx 定时器续批之间记录 Tab 焦点与方向键选中事件。争渡声学出声与日常构建仍待现场验收。测试和审查证据见 [实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md)。
+
+## 兼容与验收
+
 固定版本不能保证云端 API 永远兼容。回退前必须验证升级后的会话格式可读，不能直接让旧程序写日常库。物理声音、新版 MC 日常切换与长期运行仍待验收。
 
 源码、隔离云端、frozen GUI 和日常包的验证状态及延期项集中记录在 [当前交接](handoff.md)。原有 steered 末步、journal 覆盖和权威 reset 的待证场景分别保存在 [steered 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 与 [稳定性审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)。

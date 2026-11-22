@@ -10,6 +10,8 @@ Foreground hints and live files use uncaptured Core subjects. Execution hints id
 
 The server owns `ZGWD_NOTIFY_<pair>` with limits of seven days, 32 MiB and 20,000 messages, and reads the limits back after updating. Compact projections preserve stable identities and carry their own hash. Canonical facts and full content remain in SQLite. Android pulls 50 records per batch with at most 100 pending acknowledgements. ACK does not mean read.
 
+Execution detail delivery applies withdrawal at read or publish time. A page or replay that needs a retired fact may require a fresh snapshot through `SNAPSHOT_REQUIRED`. A JetStream-only fallback publishes a content-free withdrawal projection with its own wire hash and the original fact hash, identity and sequence. The canonical fact and ordered publication acknowledgement remain in storage. The current source verification used local SQLite and an offline transport capture.
+
 Production uses separate `mc` and `mobile` users. The mobile password is the pairing token; the desktop password is independently generated in application data. Mobile permissions allow scoped RPC, notification consumption and ACK, but deny stream mutation and legacy mixed-stream access. Legacy token-only clients require a coordinated upgrade.
 
 ## Recovery and migration
