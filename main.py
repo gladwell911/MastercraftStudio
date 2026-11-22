@@ -934,7 +934,9 @@ class ChatFrame(
 
         right = wx.BoxSizer(wx.VERTICAL)
         right.Add(wx.StaticText(panel, label="输入："), 0, wx.LEFT | wx.TOP, 10)
-        self.input_edit = wx.TextCtrl(panel, style=wx.TE_MULTILINE, size=(-1, 140))
+        self.input_edit = wx.TextCtrl(
+            panel, style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP | wx.HSCROLL, size=(-1, 140)
+        )
         self.input_edit.SetName("输入")
         self.input_edit.SetToolTip("Enter发送，Ctrl+Enter换行，Alt+S发送，Alt+N新聊天")
         right.Add(self.input_edit, 0, wx.EXPAND | wx.ALL, 10)
