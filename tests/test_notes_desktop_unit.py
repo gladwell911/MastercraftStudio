@@ -1619,37 +1619,74 @@ def test_notes_blank_entry_cancel_deletes_persisted_row(frame):
 def test_new_entry_stays_draft_only_until_saved(frame):
     notebook = frame.notes_store.create_notebook("draft only notebook")
     frame._notes_select_notebook(notebook.id, view="note_detail")
-    frame._notes_create_entry()
+    assert frame._notes_create_entry() is True
 
-    assert frame.notes_controller.notes_view == "note_edit"
-    assert frame.notes_controller.active_entry_id == ""
-    assert frame.notes_store.list_entries(notebook.id) == []
+    windows = frame._notes_entry_edit_windows()
+    assert len(windows) == 1
+    window = windows[0]
+    try:
+        assert frame.notes_store.list_entries(notebook.id) == []
 
-    frame.notes_editor.SetValue("draft only entry")
-    frame._on_notes_editor_changed(None)
-    assert frame._notes_save_current_entry()
+        window.editor.SetValue("draft only entry")
+        assert window._save() is True
 
-    entries = frame.notes_store.list_entries(notebook.id)
-    assert len(entries) == 1
-    assert entries[0].content == "draft only entry"
+        entries = frame.notes_store.list_entries(notebook.id)
+        assert len(entries) == 1
+        assert entries[0].content == "draft only entry"
+    finally:
+        if not window.IsBeingDeleted():
+            window.Destroy()
 
 
-def test_new_entry_stays_draft_only_until_saved(frame):
-    notebook = frame.notes_store.create_notebook("draft only notebook")
+def test_new_entry_window_cancel_leaves_no_entry(frame, monkeypatch):
+    import notes_edit_window
+
+    prompts = []
+
+    class _Dialog:
+        def __init__(self, *args, **kwargs):
+            prompts.append(True)
+
+        def ShowModal(self):
+            return wx.ID_YES
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(notes_edit_window.wx, "MessageDialog", _Dialog)
+    notebook = frame.notes_store.create_notebook("cancel window notebook")
     frame._notes_select_notebook(notebook.id, view="note_detail")
-    frame._notes_create_entry()
+    assert frame._notes_create_entry() is True
 
-    assert frame.notes_controller.notes_view == "note_edit"
-    assert frame.notes_controller.active_entry_id == ""
-    assert frame.notes_store.list_entries(notebook.id) == []
+    windows = frame._notes_entry_edit_windows()
+    assert len(windows) == 1
+    window = windows[0]
 
-    frame.notes_editor.SetValue("draft only entry")
-    frame._on_notes_editor_changed(None)
-    assert frame._notes_save_current_entry()
+    class _CloseEvent:
+        def __init__(self):
+            self.skipped = False
 
-    entries = frame.notes_store.list_entries(notebook.id)
-    assert len(entries) == 1
-    assert entries[0].content == "draft only entry"
+        def CanVeto(self):
+            return True
+
+        def Veto(self, value=True):
+            raise AssertionError("confirmed discard must close the window")
+
+        def Skip(self):
+            self.skipped = True
+
+    try:
+        window.editor.SetValue("abandoned draft")
+        event = _CloseEvent()
+        window._on_close(event)
+        assert prompts == [True]
+        assert event.skipped is True
+        window.Destroy()
+    finally:
+        if not window.IsBeingDeleted():
+            window.Destroy()
+
+    assert frame.notes_store.list_entries(notebook.id, include_deleted=True) == []
 
 
 def test_notes_edit_cancel_dirty_prompts_and_can_discard(frame, monkeypatch):
@@ -2166,12 +2203,17 @@ def test_notes_create_entry_from_detail_keeps_blank_draft_and_focuses_editor(fra
 
     assert frame._notes_create_entry() is True
 
-    assert frame.notes_controller.notes_view == "note_edit"
-    assert frame.notes_controller.active_notebook_id == notebook.id
-    assert frame.notes_controller.active_entry_id == ""
-    assert frame.notes_editor.GetValue() == ""
-    assert frame.notes_editor.HasFocus()
-    assert frame.notes_store.list_entries(notebook.id) == [existing]
+    windows = frame._notes_entry_edit_windows()
+    assert len(windows) == 1
+    window = windows[0]
+    try:
+        assert frame.notes_controller.active_notebook_id == notebook.id
+        assert window.editor.GetValue() == ""
+        assert window.editor.HasFocus()
+        assert frame.notes_store.list_entries(notebook.id) == [existing]
+    finally:
+        if not window.IsBeingDeleted():
+            window.Destroy()
 
 
 def test_notes_menu_actions_search_and_import_entries(frame, monkeypatch, tmp_path):

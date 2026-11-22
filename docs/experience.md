@@ -1,5 +1,11 @@
 # 可复用经验
 
+## 2026-11-21 笔记导出删除与恢复资料一致性
+
+- “导出到剪贴板并删除”必须先把内容写入剪贴板并校验 `wx.TheClipboard.Flush()` 成功后才提交删除事务；部分失败时按仅已删条目重写剪贴板，全部保留时清空。删除 UPDATE 带 `AND version=?` 防 TOCTOU，0 行按冲突保留。剪贴板与 SQLite 无共同事务，顺序上宁留条目不丢内容。
+- 独立编辑窗口以 entry_id 登记活动窗口，重复打开 Raise 已有窗口；内嵌编辑入口加同一守卫防双轨并发。X/Esc 脏关闭弹确认。
+- OneDrive 机器恢复资料：写入前与旧 JSON/凭据 blob 比对，内容未变跳过以避免同步往返；DPAPI 失败仍刷新 JSON（凭据标 unavailable）；缺 `credential` 字段视为无效资料拒绝；token 清空时删除对应旧凭据文件。优先级固定为显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值。
+
 ## Kimi V2 协议与恢复边界
 
 - 核对固定二进制的线上schema、producer和consumer，不把持久wire事件当WebSocket帧。2.5.3的append offset按UTF-16 code unit计数；批次失败保留旧游标，正常中文与非BMP都要经client消费和权威完成断言。

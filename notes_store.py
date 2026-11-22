@@ -986,6 +986,45 @@ class NotesStore:
                     base_version=current.version,
                 )
 
+    def delete_entry_for_export(self, entry_id: str, *, record_outbox: bool = True) -> None:
+        """Export-migration delete: clear the active body and keep only the
+        tombstone metadata required for synchronization.
+
+        The whole operation is one transaction. The outbox payload keeps the
+        full entry field shape with an empty body so older sync peers still
+        recognize the deletion and old snapshots cannot resurrect the text.
+        """
+        current = self.get_entry(entry_id, include_deleted=True)
+        if current is None:
+            raise KeyError(entry_id)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE entries
+                SET deleted = 1, content = '', updated_at = ?, version = ?,
+                    device_id = ?, last_modified_by = ?, dirty = 1
+                WHERE id = ? AND version = ?
+                """,
+                (_utc_now(), current.version + 1, self.device_id, "desktop",
+                 entry_id, current.version),
+            )
+            if cursor.rowcount == 0:
+                # The entry changed between the read above and this UPDATE;
+                # refuse to export-delete a version we did not freeze on.
+                raise NotesPlacementConflict(entry_id)
+            row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+            assert row is not None
+            deleted_doc = EntryDoc.from_row(dict(row))
+            if record_outbox:
+                self._record_compat_op(
+                    conn,
+                    entity_type="entry",
+                    entity_id=entry_id,
+                    action="delete",
+                    payload=NoteEntry.from_doc(deleted_doc).to_dict(),
+                    base_version=current.version,
+                )
+
     def purge_entry(self, entry_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))

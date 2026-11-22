@@ -851,6 +851,10 @@ class ChatFrame(
         self._migrate_legacy_chat_json_if_needed()
         self._load_state()
         self.notes_controller.restore_state(self._current_notes_state)
+        if (str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit"
+                and self._notes_guard_embedded_edit_view(
+                    getattr(self.notes_controller, "active_entry_id", ""))):
+            self.notes_controller.notes_view = "note_detail"
         self._notes_refresh_ui()
         self._pending_clear_recoveries = self.chat_store.recoverable_clear_operations()
         self._realtime_call.update_settings(

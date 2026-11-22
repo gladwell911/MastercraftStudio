@@ -1903,6 +1903,7 @@ def test_active_clear_resend_sound_follows_worker_acceptance(frame, monkeypatch,
     frame.chat_store = SimpleNamespace(
         get_clear_operation=lambda _op: {**operation, "snapshot": {"question": "first", "model": model}},
         claim_clear_resend_dispatch=claim,
+        list_chat_summaries=lambda: [],
         consume_clear_resend_sound=lambda _op, *, chat_id, revision: (
             {"operation_id": "op"} if (chat_id, revision) == ("owner", 7) else None
         ),
@@ -1915,6 +1916,108 @@ def test_active_clear_resend_sound_follows_worker_acceptance(frame, monkeypatch,
     operation = {"operation_id": "op", "chat_id": "owner", "revision": 7}
     assert frame._dispatch_clear_operation_resend(operation, {"question": "first", "model": model}) is True
     assert events == ["accepted", "sound"]
+
+
+def _offscreen_resend_store(model: str, session_id: str = "") -> SimpleNamespace:
+    archived = {"id": "chat-archived", "turns": [{"question": "old memory"}],
+                "model": model, "claudecode_session_id": session_id}
+    return SimpleNamespace(
+        archived=archived,
+        get_clear_operation=lambda _op: {
+            "operation_id": "op", "chat_id": "chat-archived", "revision": 7,
+            "snapshot": {"question": "first", "model": model},
+        },
+        claim_clear_resend_dispatch=lambda _op, **_identity: {"operation_id": "op", "state": "resend_dispatched"},
+        consume_clear_resend_sound=lambda _op, *, chat_id, revision: {"operation_id": "op"},
+        transition_clear_operation=lambda _op, _state, **_kw: None,
+    )
+
+
+def _prepare_offscreen_resend(frame, store) -> None:
+    frame.archived_chats = [store.archived]
+    frame.active_chat_id = frame.current_chat_id = "chat-active"
+    frame.active_session_turns = [{"question": "active"}]
+    frame._current_chat_state = {"id": "chat-active", "turns": frame.active_session_turns}
+    frame.chat_store = store
+
+
+def test_offscreen_clear_resend_claude_passes_session_and_model_as_named_identity(frame, monkeypatch):
+    store = _offscreen_resend_store(main.DEFAULT_CLAUDECODE_MODEL, session_id="session-42")
+    _prepare_offscreen_resend(frame, store)
+    events = []
+    captured = {}
+
+    def starter(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        events.append("accepted")
+
+    monkeypatch.setattr(frame, "_start_claudecode_worker_for_turn", starter)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: events.append("sound"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    operation = {"operation_id": "op", "chat_id": "chat-archived", "revision": 7}
+    assert frame._dispatch_clear_operation_resend(
+        operation, {"question": "first", "model": main.DEFAULT_CLAUDECODE_MODEL}) is True
+
+    # chat_id, turn_idx, question, session_id, model — model must reach the
+    # model parameter instead of falling into the session_id slot.
+    assert captured["args"][0] == "chat-archived"
+    assert captured["args"][2] == "first"
+    assert captured["args"][3] == "session-42"
+    assert captured["args"][4] == main.DEFAULT_CLAUDECODE_MODEL
+    assert events == ["accepted", "sound"]
+    assert frame.active_chat_id == "chat-active"
+    assert frame.active_session_turns == [{"question": "active"}]
+
+
+def test_offscreen_clear_resend_generic_thread_sound_once_and_failure_silent(frame, monkeypatch):
+    store = _offscreen_resend_store("doubao-2.0-lite")
+    _prepare_offscreen_resend(frame, store)
+    events = []
+    spawned = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            spawned.append((args, kwargs))
+
+        def start(self):
+            events.append("accepted")
+
+    monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: events.append("sound"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    operation = {"operation_id": "op", "chat_id": "chat-archived", "revision": 7}
+    assert frame._dispatch_clear_operation_resend(
+        operation, {"question": "first", "model": "doubao-2.0-lite"}) is True
+    assert spawned, "generic providers must dispatch through the worker thread"
+    thread_args = spawned[0][1].get("args") or spawned[0][0]
+    assert thread_args[3] == "doubao-2.0-lite"
+    assert events == ["accepted", "sound"]
+
+
+def test_offscreen_clear_resend_sound_grant_failure_keeps_dispatch_silent(frame, monkeypatch):
+    store = _offscreen_resend_store("doubao-2.0-lite")
+    store.consume_clear_resend_sound = lambda _op, *, chat_id, revision: None
+    _prepare_offscreen_resend(frame, store)
+    events = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            events.append("accepted")
+
+    monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: pytest.fail("missing grant must stay silent"))
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+
+    operation = {"operation_id": "op", "chat_id": "chat-archived", "revision": 7}
+    assert frame._dispatch_clear_operation_resend(
+        operation, {"question": "first", "model": "doubao-2.0-lite"}) is True
+    assert events == ["accepted"]
 
 
 def test_active_clear_resend_rejected_start_is_silent(frame, monkeypatch):
@@ -2328,3 +2431,68 @@ def test_alt_a_real_store_claims_accepts_and_sounds_once(frame, tmp_path, monkey
     assert events == ["accepted", "sound"]
     assert frame._clear_context_and_start_new_chat(auto_resend_first=True, request_id="alt-a") is True
     assert events == ["accepted", "sound"]
+
+
+def test_submit_question_blocks_when_attachment_unreadable(frame, monkeypatch):
+    frame._pending_input_attachments = [
+        {
+            "name": "missing.png",
+            "path": r"D:\no\such\missing.png",
+            "kind": "image",
+            "direction": "outgoing",
+            "status": "queued",
+        }
+    ]
+    started = []
+
+    class _NoStartThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            started.append(target)
+
+        def start(self):
+            raise AssertionError("worker must not start with a failed attachment")
+
+    monkeypatch.setattr(main.threading, "Thread", _NoStartThread)
+
+    ok, message = frame._submit_question("带附件的问题", source="local", model="openai/gpt-5.2")
+
+    assert ok is False
+    assert "无法读取" in message
+    assert "missing.png" in message
+    assert started == []
+    # The draft and the attachment list stay for the user to repair.
+    assert frame._pending_input_attachments
+
+
+def test_submit_question_clear_resend_plays_accepted_sound_once(frame, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(frame, "_refresh_openclaw_sync_lifecycle", lambda force_replay=False: None)
+    send_sounds = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: send_sounds.append(True))
+    accepted = []
+    monkeypatch.setattr(
+        frame,
+        "_play_clear_resend_accepted_sound",
+        lambda op_id, chat_id, revision: accepted.append((op_id, chat_id, revision)) or True,
+    )
+
+    class _NoOpThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main.threading, "Thread", _NoOpThread)
+    monkeypatch.setattr(frame, "_clear_resend_operation_id", "op-clear-1", raising=False)
+    monkeypatch.setattr(frame, "_clear_resend_revision", 7, raising=False)
+
+    ok, message = frame._submit_question("清除后的重发", source="local", model="openai/gpt-5.2")
+
+    assert ok is True
+    assert message == ""
+    assert accepted and accepted[0][0] == "op-clear-1"
+    assert send_sounds == []
+    turn = frame.active_session_turns[-1]
+    assert turn.get("clear_operation_id") == "op-clear-1"

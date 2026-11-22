@@ -827,6 +827,7 @@ class NotesMixin:
             i_restore_backup = wx.NewIdRef()
             i_export_down = wx.NewIdRef()
             i_export_up = wx.NewIdRef()
+            i_export_delete = wx.NewIdRef()
             i_del_entry = wx.NewIdRef()
             i_edit_entry = wx.NewIdRef()
             i_pin_entry = wx.NewIdRef()
@@ -844,6 +845,7 @@ class NotesMixin:
             menu.Append(i_restore_backup, "恢复笔记")
             menu.Append(i_export_down, "向下导出全部到剪贴板")
             menu.Append(i_export_up, "向上导出全部到剪贴板")
+            menu.Append(i_export_delete, "从选中条目向下导出并删除")
             menu.Append(i_del_entry, "删除笔记条目")
             menu.Append(i_edit_entry, "编辑笔记条目")
             menu.Append(i_pin_entry, "取消置顶笔记条目" if entry_placement == "top" else "置顶笔记条目")
@@ -854,6 +856,7 @@ class NotesMixin:
             menu.Enable(i_pin_entry, current_entry is not None and entry_placement != "bottom")
             menu.Enable(i_bottom_entry, current_entry is not None and entry_placement != "bottom")
             menu.Enable(i_unbottom_entry, current_entry is not None and entry_placement == "bottom")
+            menu.Enable(i_edit_entry, current_entry is not None)
             menu.AppendSeparator()
             menu.Append(i_import_file, "从文件导入")
             menu.Append(i_import_clip, "从剪贴板导入")
@@ -863,6 +866,7 @@ class NotesMixin:
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_restore_from_backup_file(), id=i_restore_backup)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("down"), id=i_export_down)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard("up"), id=i_export_up)
+            self.Bind(wx.EVT_MENU, lambda _evt: self._notes_export_selected_range_to_clipboard_and_delete("down"), id=i_export_delete)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_delete_entry(), id=i_del_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_edit_entry(), id=i_edit_entry)
             self.Bind(wx.EVT_MENU, lambda _evt: self._notes_toggle_entry_pin(), id=i_pin_entry)
@@ -922,7 +926,28 @@ class NotesMixin:
             except Exception:
                 pass
 
+    def _notes_entry_edit_window_for(self, entry_id: str):
+        for window in list(getattr(self, "_open_notes_entry_edit_windows", None) or []):
+            if str(getattr(window, "_entry_id", "") or "") == str(entry_id or ""):
+                return window
+        return None
+
+    def _notes_guard_embedded_edit_view(self, entry_id: str) -> bool:
+        """An entry with a live independent edit window must not also enter
+        the embedded editor: raise the window and stay on the detail view."""
+        window = self._notes_entry_edit_window_for(entry_id)
+        if window is None:
+            return False
+        try:
+            window.Raise()
+        except Exception:
+            pass
+        return True
+
     def _notes_select_entry(self, entry_id: str, view: str = "note_edit", *, focus: bool = True) -> None:
+        view = str(view or "note_edit")
+        if view == "note_edit" and self._notes_guard_embedded_edit_view(entry_id):
+            view = "note_detail"
         self.notes_controller.root_tab = "notes"
         self.notes_controller.active_entry_id = str(entry_id or "")
         self.notes_controller.notes_view = str(view or "note_edit")
@@ -1064,27 +1089,106 @@ class NotesMixin:
         notebook = self._notes_current_notebook()
         if notebook is None:
             return False
-        self.notes_controller.root_tab = "notes"
-        self.notes_controller.active_notebook_id = notebook.id
-        self.notes_controller.active_entry_id = ""
-        self.notes_controller.notes_view = "note_edit"
-        self.notes_controller.entry_editor_draft = ""
-        self.notes_controller.entry_editor_dirty = False
-        self.notes_controller.entry_editor_base_version = 0
-        self._current_notes_state = self.notes_controller.to_state_dict()
-        self._notes_refresh_ui()
-        try:
-            self.notes_editor.SetFocus()
-        except Exception:
-            pass
-        return True
+        return self._notes_open_entry_edit_window(notebook=notebook, entry=None, base_version=0)
 
     def _notes_edit_entry(self) -> bool:
         entry = self._notes_current_entry()
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
         if entry is None:
             return False
-        self._notes_select_entry(entry.id, view="note_edit")
+        return self._notes_open_entry_edit_window(
+            notebook=notebook,
+            entry=entry,
+            base_version=int(getattr(entry, "version", 0) or 0),
+        )
+
+    def _notes_entry_edit_windows(self) -> list:
+        windows = getattr(self, "_open_notes_entry_edit_windows", None)
+        if windows is None:
+            windows = []
+            self._open_notes_entry_edit_windows = windows
+        return windows
+
+    def _notes_open_entry_edit_window(self, *, notebook, entry, base_version: int,
+                                      initial_content: str = "") -> bool:
+        from notes_edit_window import NoteEntryEditWindow
+
+        content = str(initial_content or "")
+        if entry is not None and not content:
+            content = str(getattr(entry, "content", "") or "")
+        entry_key = str(entry.id) if entry is not None else f"new:{notebook.id}"
+        windows = self._notes_entry_edit_windows()
+        # One edit window per entry: a repeated open raises the existing
+        # window instead of creating a second concurrent draft on the same
+        # entry/version.
+        for existing in list(windows):
+            if str(getattr(existing, "_entry_id", "") or "") == entry_key:
+                try:
+                    existing.Raise()
+                except Exception:
+                    pass
+                return True
+        window = NoteEntryEditWindow(
+            self,
+            title="编辑笔记条目" if entry is not None else "新建笔记条目",
+            content=content,
+            on_save=lambda text: self._notes_save_from_edit_window(
+                notebook=notebook, entry=entry, base_version=base_version, content=text,
+            ),
+        )
+        window._entry_id = entry_key
+        windows.append(window)
+        window.Bind(
+            wx.EVT_WINDOW_DESTROY,
+            lambda _evt, w=window: windows.remove(w) if w in windows else None,
+        )
+        window.Show()
         return True
+
+    def _notes_save_from_edit_window(self, *, notebook, entry, base_version: int,
+                                     content: str) -> tuple[bool, str]:
+        content = str(content or "").strip()
+        if not content:
+            return False, "内容为空，未保存"
+        try:
+            if entry is None:
+                saved = self.notes_store.create_entry(notebook.id, content, source="manual")
+            elif base_version and int(getattr(entry, "version", 0) or 0) != base_version:
+                conflict_content = f"【冲突副本：来自电脑端】\n{content}"
+                saved = self.notes_store.create_entry(
+                    notebook.id,
+                    conflict_content,
+                    source=str(getattr(entry, "source", None) or "manual"),
+                    device_id=self.notes_store.device_id,
+                    last_modified_by="desktop",
+                    is_conflict_copy=True,
+                    origin_entry_id=entry.id,
+                )
+                self._push_remote_notes_conflict(saved.to_dict())
+            else:
+                saved = self.notes_store.update_entry(entry.id, content, source="manual")
+        except Exception as exc:
+            return False, f"保存失败：{exc}"
+        self.notes_controller.active_entry_id = saved.id
+        self.notes_controller.entry_editor_draft = str(saved.content or "")
+        self.notes_controller.entry_editor_dirty = False
+        self.notes_controller.entry_editor_base_version = int(getattr(saved, "version", 0) or 0)
+        self.notes_controller.notes_view = "note_detail"
+        self._current_notes_state = self.notes_controller.to_state_dict()
+        self._notes_upsert_entry_row(saved.id)
+        model = getattr(self, "notes_entry_list_model", None)
+        if model is not None:
+            model.set_selection_by_id(saved.id)
+            self._notes_entry_ids = list(model.visible_ids)
+        self._notes_sync_view_visibility()
+        try:
+            self.notes_entry_list.SetFocus()
+        except Exception:
+            pass
+        self._notes_after_local_mutation(message="笔记已保存，待同步")
+        return True, ""
 
     def _notes_delete_entry(self) -> bool:
         entry = self._notes_current_entry()
@@ -1268,6 +1372,100 @@ class NotesMixin:
         self.SetStatusText(status_text)
         return True
 
+    def _notes_export_entries_to_clipboard_and_delete(self, entries, *, status_text: str) -> bool:
+        frozen = []
+        for entry in list(entries or []):
+            entry_id = str(getattr(entry, "id", "") or "")
+            if not entry_id:
+                continue
+            # Re-freeze from the authoritative store so repeated triggers skip
+            # entries already exported and deleted, and stale views cannot
+            # overwrite a newer version.
+            current = self.notes_store.get_entry(entry_id)
+            if current is None:
+                continue
+            frozen.append({
+                "id": entry_id,
+                "notebook_id": str(current.notebook_id),
+                "version": int(getattr(current, "version", 0) or 0),
+                "content": str(getattr(current, "content", "") or ""),
+            })
+        if not any(item["content"].strip() for item in frozen):
+            return False
+        text = "\n\n".join(item["content"] for item in frozen)
+        # Clipboard and SQLite share no transaction: copy first, delete only
+        # after the clipboard accepted the text. The flush pins the exported
+        # bytes because these entries are deleted right after; a flush failure
+        # aborts before any deletion and keeps every entry.
+        if not self._set_clipboard_text(text, flush=True):
+            self.SetStatusText("剪贴板不可用，笔记条目已保留")
+            return False
+        failures: list[str] = []
+        deleted: list[dict] = []
+        for item in frozen:
+            try:
+                current = self.notes_store.get_entry(item["id"], include_deleted=True)
+                if current is None:
+                    continue
+                if int(getattr(current, "version", 0) or 0) != item["version"]:
+                    failures.append(str(item["id"]))
+                    continue
+                self.notes_store.delete_entry_for_export(item["id"])
+                deleted.append(item)
+            except Exception:
+                failures.append(str(item["id"]))
+        notebook_id = frozen[0]["notebook_id"] if frozen else ""
+        if notebook_id:
+            self._notes_refresh_entries(notebook_id, self.notes_controller.active_entry_id)
+        self._notes_after_local_mutation()
+        if failures:
+            # The clipboard still holds the text of entries that were kept;
+            # rewrite it so it only contains what was actually deleted.
+            remaining = "\n\n".join(
+                str(item.get("content") or "")
+                for item in deleted
+                if str(item.get("content") or "").strip()
+            )
+            if remaining:
+                self._set_clipboard_text(remaining, flush=True)
+            else:
+                # Nothing was deleted at all; the clipboard must not keep text
+                # the user believes is already exported.
+                try:
+                    if wx.TheClipboard.Open():
+                        try:
+                            wx.TheClipboard.Clear()
+                        finally:
+                            wx.TheClipboard.Close()
+                except Exception:
+                    pass
+            self.SetStatusText("导出完成；以下条目因并发修改已保留，可重试："
+                               + "；".join(failures))
+        else:
+            self.SetStatusText(status_text)
+        return True
+
+    def _notes_export_selected_range_to_clipboard_and_delete(self, direction: str) -> bool:
+        notebook = self._notes_current_notebook()
+        if notebook is None:
+            return False
+        selected_entry_id = str(self._notes_selected_entry_id() or "").strip()
+        if not selected_entry_id:
+            return False
+        projection = getattr(self, "notes_projection", None)
+        entries = projection.list_entries(notebook.id) if projection is not None \
+            else self.notes_store.list_entries(notebook.id)
+        entry_ids = [str(entry.id) for entry in entries]
+        if selected_entry_id not in entry_ids:
+            return False
+        selected_index = entry_ids.index(selected_entry_id)
+        if str(direction or "") == "up":
+            export_entries = entries[: selected_index + 1]
+        else:
+            export_entries = entries[selected_index:]
+        return self._notes_export_entries_to_clipboard_and_delete(
+            export_entries, status_text="已导出到剪贴板并删除对应笔记条目")
+
     def _notes_export_selected_range_to_clipboard(self, direction: str) -> bool:
         notebook = self._notes_current_notebook()
         if notebook is None:
@@ -1406,7 +1604,14 @@ class NotesMixin:
             if self.notes_entry_list.HasFocus():
                 entry_id = self._notes_selected_entry_id()
                 if entry_id:
-                    self._notes_select_entry(entry_id, view="note_edit")
+                    notebook = self._notes_current_notebook()
+                    entry = self.notes_store.get_entry(entry_id) if notebook is not None else None
+                    if notebook is not None and entry is not None:
+                        self._notes_open_entry_edit_window(
+                            notebook=notebook,
+                            entry=entry,
+                            base_version=int(getattr(entry, "version", 0) or 0),
+                        )
                     return
         if key == wx.WXK_BACK:
             if self.notes_entry_list.HasFocus() and getattr(self, "notes_controller", None) and self.notes_controller.notes_view == "note_detail":

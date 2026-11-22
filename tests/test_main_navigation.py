@@ -252,6 +252,9 @@ def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, mon
             copied["text"] = data.GetText()
             return True
 
+        def Flush(self):
+            return True
+
         def Close(self):
             return True
 
@@ -1757,3 +1760,45 @@ def test_offscreen_clear_resend_dispatches_once_without_active_chat_or_focus_cha
     assert frame.active_session_turns == [{"question": "active stays"}]
     assert transitions == []
     assert sounds == ["send"]
+
+
+def test_set_clipboard_text_flushes_only_when_requested(frame, monkeypatch):
+    counts = {"flush": 0}
+
+    class _Clipboard:
+        def Open(self):
+            return True
+
+        def SetData(self, data):
+            return True
+
+        def Flush(self):
+            counts["flush"] += 1
+            return True
+
+        def Close(self):
+            return True
+
+    monkeypatch.setattr(main.wx, "TheClipboard", _Clipboard())
+    assert frame._set_clipboard_text("普通复制") is True
+    assert counts["flush"] == 0
+    assert frame._set_clipboard_text("导出删除", flush=True) is True
+    assert counts["flush"] == 1
+
+
+def test_set_clipboard_text_flush_failure_returns_false(frame, monkeypatch):
+    class _Clipboard:
+        def Open(self):
+            return True
+
+        def SetData(self, data):
+            return True
+
+        def Flush(self):
+            return False
+
+        def Close(self):
+            return True
+
+    monkeypatch.setattr(main.wx, "TheClipboard", _Clipboard())
+    assert frame._set_clipboard_text("导出删除", flush=True) is False

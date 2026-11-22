@@ -26,6 +26,32 @@ DEFAULT_MAX_FILE_TRANSFER_BYTES = 512 * 1024 * 1024
 FILE_TRANSFER_CHUNK_SIZE = 1024 * 1024
 FILE_SERVICE_FALLBACK_PORTS = tuple(range(49300, 49321))
 
+_ASCII_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9 ._\-()]")
+
+
+def content_disposition_attachment(filename: str) -> str:
+    """Build a Content-Disposition value that survives Python's Latin-1 header encoding.
+
+    Chinese and other non-ASCII names cannot be written as raw header bytes; a
+    safe ASCII fallback keeps legacy clients working while filename* carries the
+    exact UTF-8 name (RFC 5987) for clients that understand it.
+    """
+    raw = " ".join(str(filename or "").replace("\r", " ").replace("\n", " ").split())
+    if not raw:
+        raw = "file"
+    fallback = _ASCII_FILENAME_SAFE.sub("_", raw.encode("ascii", "ignore").decode("ascii"))
+    dot = fallback.find(".")
+    stem = fallback[:dot] if dot >= 0 else fallback
+    if not stem.strip(" ."):
+        # The ASCII-stripped stem collapsed (a pure Chinese name leaves only
+        # its extension): anchor it so distinct names cannot all collapse to
+        # the same dotless "txt".
+        fallback = "file" + (fallback[dot:] if dot >= 0 else "")
+    else:
+        fallback = fallback.strip(" .") or "file"
+    encoded = quote(raw, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
 
 def detect_lan_ip() -> str:
     override = str(os.environ.get("DESKTOP_FILE_SERVICE_PUBLIC_HOST") or "").strip()
@@ -668,7 +694,7 @@ class CopypartyFileService:
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "application/octet-stream")
         handler.send_header("Content-Length", str(size))
-        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.send_header("Content-Disposition", content_disposition_attachment(filename))
         handler.end_headers()
         if include_body:
             _stream_file_to_handler(target, handler)
@@ -801,7 +827,7 @@ class DesktopFileHttpService:
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "application/octet-stream")
         handler.send_header("Content-Length", str(size))
-        handler.send_header("Content-Disposition", f'attachment; filename="{record.name}"')
+        handler.send_header("Content-Disposition", content_disposition_attachment(record.name))
         handler.end_headers()
         _stream_file_to_handler(record.stored_path, handler)
 

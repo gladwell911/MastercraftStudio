@@ -7,11 +7,62 @@ from file_transfer import (
     FileTransferRecord,
     FileTransferStatus,
     append_file_transfer_token,
+    content_disposition_attachment,
     extract_windows_file_paths,
     file_transfer_token_for,
     is_valid_file_transfer_token,
     unique_destination_path,
 )
+
+
+def _parse_disposition(value: str) -> dict[str, str]:
+    parts = {}
+    for segment in value.split(";"):
+        segment = segment.strip()
+        if "=" in segment:
+            key, raw = segment.split("=", 1)
+            parts[key.strip().lower()] = raw.strip().strip('"')
+    return parts
+
+
+def test_content_disposition_attachment_survives_latin1_header_encoding():
+    cases = [
+        "中文 文件名.txt",
+        'quote"name.png',
+        "emoji😀报告.pdf",
+        "plain ascii.txt",
+        "semi;colon.dat",
+        "back\\slash/slash.bin",
+        "换\n行\r符.docx",
+        "",
+    ]
+    for name in cases:
+        header = content_disposition_attachment(name)
+        header.encode("latin-1")
+        parsed = _parse_disposition(header)
+        assert "attachment" in header
+        assert parsed["filename"].encode("latin-1")
+        assert "filename*" in parsed
+        assert parsed["filename*"].startswith("UTF-8''")
+
+
+def test_content_disposition_attachment_keeps_exact_utf8_name_in_filename_star():
+    from urllib.parse import unquote
+
+    header = content_disposition_attachment("中文 文件名.txt")
+    parsed = _parse_disposition(header)
+    assert unquote(parsed["filename*"].split("''", 1)[1]) == "中文 文件名.txt"
+    assert parsed["filename"] == "file.txt"
+
+
+def test_content_disposition_attachment_ascii_name_round_trips(tmp_path):
+    from urllib.parse import unquote
+
+    header = content_disposition_attachment("report final.txt")
+    parsed = _parse_disposition(header)
+    assert parsed["filename"] == "report final.txt"
+    assert unquote(parsed["filename*"].split("''", 1)[1]) == "report final.txt"
+
 
 
 def test_extract_windows_file_paths_from_plain_markdown_and_quotes():

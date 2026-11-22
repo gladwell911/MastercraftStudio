@@ -142,7 +142,7 @@ def test_notes_acceptance_list_detail_edit_and_exit_paths(frame, monkeypatch, ex
     _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, entry.id)
     monkeypatch.setattr(frame.notes_notebook_list, "HasFocus", lambda: False)
     monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
-    frame._on_notes_key_down(_key_event(wx.WXK_RETURN))
+    frame._notes_select_entry(entry.id, view="note_edit")
 
     assert frame.notes_controller.notes_view == "note_edit"
     assert frame.notes_controller.active_entry_id == entry.id
@@ -228,11 +228,17 @@ def test_notes_acceptance_menu_new_entry_creates_blank_draft_and_focuses_editor(
     event.SetEventObject(frame)
     frame.ProcessEvent(event)
 
-    assert frame.notes_controller.notes_view == "note_edit"
+    # The menu opens the independent new-entry window instead of the embedded
+    # editor; nothing is persisted until the window saves.
     assert frame.notes_controller.active_entry_id == ""
-    assert frame.notes_editor.GetValue() == ""
-    assert frame.notes_editor.HasFocus()
+    windows = frame._notes_entry_edit_windows()
+    assert len(windows) == 1
+    assert windows[0].editor.GetValue() == ""
+    assert windows[0].editor.HasFocus()
     assert frame.notes_store.list_entries(notebook.id) == [existing]
+    for window in list(windows):
+        if not window.IsBeingDeleted():
+            window.Destroy()
 
 
 def test_notes_acceptance_file_and_clipboard_imports_create_entries_from_ui(frame, monkeypatch, tmp_path):
@@ -414,6 +420,30 @@ def test_notes_acceptance_export_actions_from_notebook_and_entry_menus(frame, mo
     ]
 
 
+def test_notes_acceptance_export_selected_range_delete_up_and_down(frame, monkeypatch):
+    notebook = frame.notes_store.create_notebook("range delete acceptance notebook")
+    first = frame.notes_store.create_entry(notebook.id, "first range entry", source="manual")
+    second = frame.notes_store.create_entry(notebook.id, "second range entry", source="manual")
+    third = frame.notes_store.create_entry(notebook.id, "third range entry", source="manual")
+    captured: list[list[str]] = []
+
+    def _capture(entries, *, status_text):
+        captured.append([str(entry.id) for entry in entries])
+        return True
+
+    monkeypatch.setattr(frame, "_notes_export_entries_to_clipboard_and_delete", _capture)
+
+    frame._notes_select_notebook(notebook.id, view="note_detail")
+    _select_row_by_id(frame.notes_entry_list, frame._notes_entry_ids, second.id)
+
+    assert frame._notes_export_selected_range_to_clipboard_and_delete("down") is True
+    assert frame._notes_export_selected_range_to_clipboard_and_delete("up") is True
+    assert captured == [
+        [second.id, third.id],
+        [first.id, second.id],
+    ]
+
+
 def test_notes_acceptance_alt_x_creates_notebook_and_entry(frame, monkeypatch):
     notebook = frame.notes_store.create_notebook("acceptance shortcut notebook")
     entry_seen = {"notebook": 0, "entry": 0}
@@ -444,10 +474,13 @@ def test_notes_acceptance_alt_x_creates_notebook_and_entry(frame, monkeypatch):
 
     assert entry_seen["notebook"] == 1
     assert entry_seen["entry"] == 1
-    assert frame.notes_controller.notes_view == "note_edit"
+    # Alt+X on the entry list opens the independent new-entry window instead
+    # of switching the embedded view to note_edit.
+    assert len(frame._notes_entry_edit_windows()) == 1
     assert frame.notes_controller.active_entry_id == ""
-    assert frame.notes_editor.GetValue() == ""
-    assert frame.notes_editor.HasFocus()
+    window = frame._notes_entry_edit_windows()[0]
+    assert window.editor.GetValue() == ""
+    assert window.editor.HasFocus()
 
 
 def test_notes_acceptance_char_hook_enter_opens_notebook_without_send(frame, monkeypatch):
@@ -487,11 +520,18 @@ def test_notes_acceptance_same_slot_navigation_and_edit_replacement(frame, monke
     monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)
     frame._on_notes_key_down(_key_event(wx.WXK_RETURN))
 
-    assert frame.notes_list_panel.IsShown()
-    assert not frame.notes_detail_panel.IsShown()
-    assert frame.notes_edit_panel.IsShown()
-    assert not frame.notes_entry_list.IsEnabled()
-    assert frame.notes_editor.IsEnabled()
+    # Enter on an entry opens the independent edit window instead of the
+    # embedded editor; the detail view stays as-is behind it.
+    assert not frame.notes_list_panel.IsShown()
+    assert frame.notes_detail_panel.IsShown()
+    assert not frame.notes_edit_panel.IsShown()
+    windows = frame._notes_entry_edit_windows()
+    assert len(windows) == 1
+    assert getattr(windows[0], "_entry_id", "") == entry.id
+
+    for window in list(windows):
+        if not window.IsBeingDeleted():
+            window.Destroy()
 
     frame._notes_select_notebook(notebook.id, view="note_detail")
     monkeypatch.setattr(frame.notes_entry_list, "HasFocus", lambda: True)

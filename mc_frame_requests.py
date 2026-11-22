@@ -541,15 +541,16 @@ class ChatRequestsMixin:
             elif is_kimi_model(model):
                 self._start_kimi_worker_for_turn(owner, turn_idx, question, model)
             elif is_claudecode_model(model):
-                self._start_claudecode_worker_for_turn(owner, turn_idx, worker_question, model)
+                self._start_claudecode_worker_for_turn(
+                    owner, turn_idx, worker_question,
+                    str(target.get("claudecode_session_id") or ""), model)
             else:
                 bindings.app.threading.Thread(target=self._worker,
                                  args=(bindings.app.openrouter_api_key_for_app(), turn_idx, worker_question, model, False, owner),
                                  daemon=True).start()
-            if is_codex_model(model) or is_kimi_model(model):
-                self._play_clear_resend_accepted_sound(
-                    op_id, owner, revision
-                )
+            self._play_clear_resend_accepted_sound(
+                op_id, owner, revision
+            )
         except Exception:
             if 0 <= turn_idx < len(turns) and turns[turn_idx] is turn:
                 turns.pop(turn_idx)
@@ -856,6 +857,14 @@ class ChatRequestsMixin:
         success_attachments, failed_attachments = self._normalize_outgoing_attachments(requested_attachments)
         outgoing_attachments = success_attachments + failed_attachments
         display_question = q
+        if failed_attachments:
+            failed_names = "、".join(
+                str(item.get("name") or "").strip() for item in failed_attachments
+                if str(item.get("name") or "").strip()
+            ) or "未知附件"
+            # Keep the draft and the attachment list; nothing is submitted
+            # until the user removes or repairs the unreadable files.
+            return False, f"以下附件无法读取，本次未发送，请移除或修复后重试：{failed_names}"
         if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
         self._answer_list_tail_notice = ""
@@ -1199,7 +1208,7 @@ class ChatRequestsMixin:
             return rollback_rejected_start(turn_idx, exc)
         if turn_idx == 0:
             self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
-        if automatic_clear_resend and (is_codex_model(resolved_model) or is_kimi_model(resolved_model)):
+        if automatic_clear_resend:
             self._play_clear_resend_accepted_sound(
                 str(self._clear_resend_operation_id),
                 str(chat_id or self.active_chat_id or self.current_chat_id or ""),

@@ -885,13 +885,22 @@ class ChatNavigationMixin:
         cache[cache_key] = normalized_tuple
         return True
 
-    def _set_clipboard_text(self, text: str) -> bool:
+    def _set_clipboard_text(self, text: str, *, flush: bool = False) -> bool:
         payload = str(text or "")
         if not payload:
             return False
         if wx.TheClipboard.Open():
             try:
-                return bool(wx.TheClipboard.SetData(wx.TextDataObject(payload)))
+                if not wx.TheClipboard.SetData(wx.TextDataObject(payload)):
+                    return False
+                if flush:
+                    # Only the export-and-delete path pins the clipboard: those
+                    # entries are gone once the export succeeds, so a flush
+                    # failure must surface instead of silently losing them.
+                    # Regular copies keep the lazy-render privacy semantics.
+                    if not wx.TheClipboard.Flush():
+                        return False
+                return True
             finally:
                 wx.TheClipboard.Close()
         return False

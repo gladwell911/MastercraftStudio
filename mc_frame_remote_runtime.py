@@ -21,7 +21,7 @@ from mc_frame_settings import (
 )
 from nats_runtime import NatsRuntimeConfig
 from pathlib import Path
-from remote_machine_config import load_machine_config
+from remote_machine_config import load_machine_config, load_machine_config_with_restore
 from typing import Callable
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
@@ -64,9 +64,12 @@ class RemoteRuntimeMixin:
 
     def _initialize_remote_control_settings(self) -> None:
         machine_path = self.app_data_dir / "remote_machine.json"
-        machine = load_machine_config(machine_path,
-                                      default_domain=self.remote_control_domain or DEFAULT_REMOTE_CONTROL_DOMAIN,
-                                      default_token=self.remote_control_token or DEFAULT_REMOTE_CONTROL_TOKEN)
+        machine, machine_hints = load_machine_config_with_restore(
+            machine_path,
+            default_domain=self.remote_control_domain or DEFAULT_REMOTE_CONTROL_DOMAIN,
+            default_token=self.remote_control_token or DEFAULT_REMOTE_CONTROL_TOKEN)
+        for hint in machine_hints:
+            bindings.app.wx_call_after_if_alive(self.SetStatusText, hint)
         changed = self.remote_control_domain != machine["domain"]
         self.remote_control_pair_id = machine["pair_id"]
         self.remote_control_domain = machine["domain"]

@@ -1,6 +1,6 @@
 # 文档索引
 
-Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完成职责拆分和隔离构建验收。日常包已补齐固定 2.5.3 运行时，后续源码变更尚待日常切换。各版本的隔离云端、源码与冻结包验证范围见 [交接](handoff.md)。
+Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完成职责拆分和隔离构建验收。日常包已补齐固定 2.5.3 运行时，后续源码变更尚待日常切换。2026-11-20~21 需求修复（中文文件名、OneDrive 机器配置恢复、独立笔记编辑窗口、剪贴板导出删除、Alt+A 音效）与 2026-11-21 代码审查修复全部在工作区未提交，范围与验证见 [交接](handoff.md)。各版本的隔离云端、源码与冻结包验证范围见 [交接](handoff.md)。
 
 ## 当前入口
 
@@ -34,6 +34,7 @@ Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完�
 | 桌面装配、生命周期与启动 | `main.py`、`mc_frame_bindings.py` | `tests/test_main_entry.py` |
 | 桌面回答、执行、历史、模型与语音等功能 | `mc_frame_*.py` 中同领域模块 | `tests/test_main_*.py`，如 `tests/test_main_answers.py`、`tests/test_main_voice.py` |
 | 聊天存储、表结构、通知与执行分页 | `chat_store.py`、`chat_store_schema.py`、`chat_store_notifications.py`、`chat_store_execution.py` | `tests/test_chat_store_unit.py`、`tests/test_notification_sync.py` |
+| 独立笔记编辑窗口 | `notes_edit_window.py`（由 `mc_frame_notes.py` 打开） | `tests/test_notes_edit_window_unit.py` |
 | Kimi 客户端、事件、队列、V2 与 WebSocket | `kimi_server_client.py`、`kimi_server_events.py`、`kimi_server_queue.py`、`kimi_server_v2.py`、`kimi_server_websocket.py` | `tests/test_kimi_server_client_unit.py`、`tests/test_kimi_integration_*.py` |
 
 历史记录中的 `tests/test_main_unit.py` 和 `tests/test_kimi_integration.py` 对应拆分前的版本。迁移与验证记录见 [职责拆分计划](../_bmad-output/implementation-artifacts/plan-mc-code-split.md)。
@@ -53,7 +54,7 @@ Kimi 归属、取消、交互与清理修复已进入源码，2026-11-20 已完�
 - ChatStore 的 `execution_steps.visible` 在写入时按共享规则维护，旧库初始化一次原子回填；`idx_execution_visible_tail` 支持真实可视尾页有界读取。F1 复用同 owner/revision 的已知尾页，完整补齐在 worker，不能用原始行 LIMIT 或运行时 UDF 扫描假称前台工作量有界。
 - 聊天活动事实直接更新历史单行排序并保留身份/焦点；读取、标题、失败和重放不刷新活动时间。手机遵循相同规则。
 - 已读游标按 pair/chat/generation 单调合并；首次成功非空回答的 answer_seq 独立于活动时间、列表位置和执行序列。清空才更换 read generation；自动定位不确认已读。`mark_chat_read`、`chat_read_state` 和 `chat_read_changed` 合同见 RC 的 `docs/current/remote-control.md`，复跑见其 `testing.md`。
-- 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
+- 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。2026-11-21 起增加 OneDrive `mc-private/` 机器配置恢复资料（显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值，实现见 `remote_machine_config.py`）。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 问题/答案按独立question_order/answer_order排序并在格式化前选择消息尾页；created_at/answer_at只用于时间标签，时间行累计300秒。终结重放保留顺序和时间；旧记录仅合并可信时间，不填当前时间。Kimi steer alias共用answer_identity，alias正文为空并引用answer_alias_of；旧手机忽略新增排序字段的显示边界保留。
 - 聊天信息菜单、Codex主 `codex` 周额度和Kimi OAuth五小时/七日额度已有接入。V2不支持的旧status/snapshot能力明确报告不可用，不伪造上下文数值；其余信息行来源与异步身份约束以聊天信息规格及Story 1.1–1.5计划为准。
 - 回答详情编辑仅作用于一次性 scratch buffer；canonical 回答与冻结 owner payload 不可变，关闭窗口即丢弃编辑。
