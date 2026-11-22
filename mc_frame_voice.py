@@ -385,7 +385,7 @@ class VoiceInputMixin:
             return
 
         def current():
-            return not self._closing and self._voice_input.is_generation_current(generation)
+            return not getattr(self, "_closing", False) and self._voice_input.is_generation_current(generation)
 
         def worker():
             try:

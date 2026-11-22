@@ -97,10 +97,9 @@ def _focused_automation():
     comtypes.CoInitialize()
     try:
         api = client.GetModule("UIAutomationCore.dll")
-        automation = client.CreateObject(api.CUIAutomation, interface=api.IUIAutomation)
-        automation2 = automation.QueryInterface(api.IUIAutomation2)
-        automation2.ConnectionTimeout = 200
-        automation2.TransactionTimeout = 200
+        automation = client.CreateObject(api.CUIAutomation8, interface=api.IUIAutomation2)
+        automation.ConnectionTimeout = 200
+        automation.TransactionTimeout = 200
         yield api, automation
     finally:
         comtypes.CoUninitialize()

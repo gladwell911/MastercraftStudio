@@ -1,5 +1,21 @@
 # 测试自动化总结
 
+## 2026-11-22 发布路径复测
+
+- `tests/test_voice_native_foreground_e2e.py` 在自建记事本窗口和独立 Edge 配置中选择 `SELECT`，通过两侧 Ctrl 释放回调与合成 PCM/ASR 驱动真实 MC 语音控制器。两种编辑器的左 Ctrl 后台追加均成功，外部编辑器焦点、选区和正文保持。两种右 Ctrl 替换均失败，均报告未确认且外部正文仍为 `beforeSELECTafter`。物理 Ctrl 钩子、麦克风、ASR 云服务和实际音频未覆盖。
+- Windows 高优先级复现有两个阻塞。`windows_voice_target.py` 中 `CUIAutomation` 对 `IUIAutomation2` 返回 `0x80004002`。仅在测试进程内换为 `CUIAutomation8` 后，首次外部插入又因 `mc_frame_voice.py` 直接访问未初始化的 `_closing` 失败。两者均需要修复后复跑上述两个编辑器。
+- `tests/test_kimi_runtime_usage_e2e.py` 用固定 2.5.3 进程向回环合成模型发一轮请求，确认 `QA_RUNTIME_OK`、V2 和初次累计 110。启动全新 2.5.3 进程，从 MC 历史重新打开同一 chat，并通过绑定 Alt+Y 的菜单事件触发刷新。真实 REST transcript 仍有 completed turn，其 step 用量为 80 普通输入、20 缓存输入、0 缓存创建和 10 输出，但 turn 级 `usage` 为空。现有读取返回 `session_total_tokens=None`。预期从完备的已终态步骤恢复 110 token 和 20% 累计命中率。测试使用临时 home、合成数据及回环 provider。云端账号和计费未覆盖。
+- 共运行 3 个新增 opt-in 测试实例。两种 Windows 外部写入和一次 Kimi 冷恢复均复现失败，两个 Windows 后台追加以及 Kimi 首次用量通过各自中间断言。RC 真 Android 结果见对应仓库的同名摘要。证据保存在 `%TEMP%/mc-rc-chat-qa-20261122`，相关文件为 `windows-voice-final.log`、`windows-voice-coclass-counterfactual.log` 和 `kimi-reopen-evidence.log`。
+- 修复后 3 个 opt-in 实例均通过。记事本和 Edge 验证了两次后台追加和一次选区替换，新 2.5.3 进程回写 Alt+Y 累计 110、最近与累计命中率均 20.0%，回环模型只收到原始一轮请求。审查后复测日志为 `repair-reviewed-windows-voice.log` 和 `repair-reviewed-kimi-runtime.log`。
+- 相关单测与 wx 测试 307 通过。`test_register_global_hotkey_registers_backslash_variants` 在本轮和精确基线 `12518bb32f21a00074c32599ce84e63eb2975380` 均因旧的 `SetStatusText` 假对象不完整失败。证据见 `repair-affected-core.log` 和 `repair-exact-baseline-hotkey.log`。
+
+```powershell
+$env:MC_NATIVE_VOICE_TEST = '1'
+.venv/Scripts/python.exe -m pytest -p no:faulthandler -q -s --tb=short tests/test_voice_native_foreground_e2e.py
+$env:MC_KIMI_RUNTIME_TEST = '1'
+.venv/Scripts/python.exe -m pytest -p no:faulthandler -q -s --tb=short tests/test_kimi_runtime_usage_e2e.py
+```
+
 ## 生成的测试
 
 ### API 测试

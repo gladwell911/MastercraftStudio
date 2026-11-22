@@ -16,8 +16,25 @@ from kimi_transcript import Transcript
 from typing import Any
 
 
+def _sum_terminal_step_usage(steps: list[dict]) -> tuple[int, int, int] | None:
+    uncached = cached = output = 0
+    for step in steps:
+        if step.get("state") not in {"completed", "failed", "cancelled", "interrupted"}:
+            return None
+        usage = step.get("usage") or {}
+        other, read, created, generated = (native_token_count(usage.get(field)) for field in
+                                            ("inputOther", "inputCacheRead", "inputCacheCreation", "output"))
+        if None in (other, read, created, generated):
+            return None
+        uncached += other + created
+        cached += read
+        output += generated
+    return (uncached, cached, output) if steps else None
+
+
 def _turn_usage(turn: dict) -> tuple:
-    step = max((step for step in turn.get("steps", []) if step.get("state") == "completed"),
+    steps = turn.get("steps", [])
+    step = max((step for step in steps if step.get("state") == "completed"),
                key=lambda step: native_token_count(step.get("ordinal")) or 0, default=None)
     last = None
     if step is not None:
@@ -30,6 +47,10 @@ def _turn_usage(turn: dict) -> tuple:
     usage = turn.get("usage") or {}
     uncached, cached, output = (native_token_count(usage.get(field)) for field in
                                ("inputTokens", "cachedTokens", "outputTokens"))
+    if terminal and turn.get("usage") is None:
+        restored = _sum_terminal_step_usage(steps)
+        if restored is not None:
+            uncached, cached, output = restored
     pair = cache_token_counts(uncached + cached, cached) if None not in (uncached, cached) else None
     total = pair["input_tokens"] + output if pair is not None and output is not None else None
     rank = native_token_count(str(turn["turnId"]).removeprefix("t")) or 0

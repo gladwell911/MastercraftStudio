@@ -80,6 +80,35 @@ def test_v2_usage_rejects_scan_when_transcript_changes_mid_page(monkeypatch):
     assert client.get_v2_usage_totals("s")["scan_generation"] == 1
 
 
+@pytest.mark.parametrize(("second_step", "turn_usage", "expected"), [
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
+     None, (130, {"input_tokens": 118, "cached_tokens": 25})),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3}, None, (None, None)),
+    (None, None, (None, None)),
+    ({"inputOther": 10, "inputCacheRead": 5, "inputCacheCreation": 3, "output": 2},
+     {"inputTokens": 6, "cachedTokens": 4, "outputTokens": 2},
+     (12, {"input_tokens": 10, "cached_tokens": 4})),
+])
+def test_v2_cold_usage_restores_only_complete_terminal_step_totals(monkeypatch, second_step, turn_usage, expected):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client._v2_ready_generations["s"] = client._ws_generation
+    monkeypatch.setattr(client, "_require_v2_ready", lambda _sid: None)
+    item = {
+        "kind": "turn", "turnId": "t1", "state": "completed", "usage": turn_usage,
+        "steps": [
+            {"state": "interrupted", "ordinal": 1, "usage": second_step},
+            {"state": "completed", "ordinal": 2, "usage": {
+                "inputOther": 80, "inputCacheRead": 20, "inputCacheCreation": 0, "output": 10,
+            }},
+        ],
+    }
+    monkeypatch.setattr(client, "get_transcript", lambda *_args, **_kwargs: {"items": [item]})
+    snapshot = client.get_v2_usage_totals("s")
+    assert (snapshot["session_total_tokens"], snapshot["cache_hits"]["total"]) == expected
+    assert snapshot["cache_hits"]["last"] == {"input_tokens": 100, "cached_tokens": 20}
+
+
 @pytest.mark.parametrize("event_type", ["tool.call.started", "tool.result", "turn.step.started", "session.meta.updated"])
 def test_visible_and_lifecycle_events_retain_envelope_origin_timestamp(event_type):
     payload = {"type": event_type, "turnId": "turn-1", "toolCallId": "tool-1", "stepId": "step-1"}
