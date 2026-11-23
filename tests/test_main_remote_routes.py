@@ -867,8 +867,6 @@ def test_remote_offscreen_clear_real_store_stable_request_dispatches_exactly_onc
 
 
 def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, monkeypatch):
-    frame.view_mode = "history"
-    frame.view_history_id = "chat-history"
     frame.archived_chats = [
         {
             "id": "chat-history",
@@ -887,13 +885,15 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
             "updated_at": 1.0,
         }
     ]
-    frame.active_session_turns = []
+    frame.active_session_turns = [{"question": "old question", "answer_md": "old answer"}]
     frame.current_chat_id = "chat-current"
     frame.active_chat_id = "chat-current"
     frame._current_chat_state = {
         "id": "chat-current",
         "title": "当前聊天",
-        "turns": [],
+        "turns": frame.active_session_turns,
+        "created_at": .5,
+        "updated_at": .5,
         "context_usage": {
             "used_tokens": 31000,
             "context_window": 200000,
@@ -915,6 +915,22 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
             "updated_at": 1.0,
         }
     }
+    frame._mark_chat_turns_dirty("chat-current")
+    frame._save_state()
+    frame._refresh_history("chat-history")
+    frame._render_answer_list()
+    monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: frame.input_edit)
+    monkeypatch.setattr(frame.input_edit, "SetFocus", lambda: None)
+    titles, stops = [], []
+    frame._zdsr_tts = SimpleNamespace(
+        speak_chat_navigation=lambda title: titles.append(title) or True,
+        speak_state=lambda: pytest.fail("remote new must settle navigation before polling"),
+        stop=lambda: stops.append(True),
+    )
+    assert frame._navigate_history_chats(-1)
+    assert titles == ["历史会话"] and frame.history_list_model.selected_id() == "chat-history"
+    assert frame._chat_navigation_timer is not None and frame.view_history_id == "chat-history"
+    assert any(meta[0] == "answer" and meta[2] == "old answer" for meta in frame.answer_meta)
 
     frame._start_remote_new_chat({"model": "openai/gpt-5.2"})
 
@@ -922,7 +938,10 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
-    assert frame.answer_list.GetString(0) == "暂无"
+    assert stops == [True] and frame._chat_navigation_timer is None
+    assert frame.history_list_model.selected_id() == "chat-current"
+    assert frame.answer_list.FindString("暂无对话内容") != main.wx.NOT_FOUND
+    assert not any(meta[0] in {"answer", "question"} for meta in frame.answer_meta)
 
 
 def test_remote_rename_current_chat_matches_current_chat_id_and_invalidates_history_cache(frame, monkeypatch):

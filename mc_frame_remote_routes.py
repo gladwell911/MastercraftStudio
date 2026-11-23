@@ -890,6 +890,11 @@ class RemoteRoutesMixin:
         return 200, {"accepted": True, **chat}
 
     def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
+        if (getattr(self, "_chat_navigation_answer_rows_deferred", False)
+                or getattr(self, "_chat_navigation_history_selection_deferred", False)):
+            self._chat_navigation_answer_rows_deferred = False
+            self._chat_navigation_history_selection_deferred = False
+            self._cancel_chat_navigation_focus()
         previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         previous_codex_service_tier = self._current_codex_service_tier()
         archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)

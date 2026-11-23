@@ -341,12 +341,12 @@ class AnswersMixin:
         self._render_answer_list(refresh_execution=False)
 
     def _render_answer_list(self, refresh_execution: bool = True, *, preserve_panel=False, select_latest_message=False):
-        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
-            return
-        mode = self._detail_panel_mode() if preserve_panel else self._apply_detail_panel_mode()
         if preserve_panel and self.execution_list.IsShown():
             self._show_execution_loading_for_new_owner()
             self._render_execution_list(force=True)
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return
+        mode = self._detail_panel_mode() if preserve_panel else self._apply_detail_panel_mode()
         refresh_execution = refresh_execution and not preserve_panel
         rows: list[str] = []
         metas: list[tuple] = []

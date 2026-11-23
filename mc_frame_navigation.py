@@ -137,6 +137,8 @@ class ChatNavigationMixin:
         return True
 
     def _focus_history_list(self) -> bool:
+        self._cancel_chat_navigation_focus()
+        self._flush_chat_navigation_history_selection()
         return self._focus_control_safely(getattr(self, "history_list", None))
 
     def _handle_window_focus_shortcut(self, key: int, alt_down: bool, ctrl_down: bool) -> bool:
@@ -251,6 +253,7 @@ class ChatNavigationMixin:
         if self._handle_named_new_chat_shortcut(event):
             return
         if key == wx.WXK_F2 and self.history_list.HasFocus() and not ctrl_down and not alt_down:
+            self._flush_chat_navigation_history_selection()
             self._history_rename(None)
             return
         if (
@@ -556,10 +559,9 @@ class ChatNavigationMixin:
             timer.Stop()
             self._chat_navigation_timer = None
             if stop_speech:
-                self._chat_navigation_tts.stop()
+                self._zdsr_tts.stop()
         if stop_speech:
             self._flush_chat_navigation_answer_rows()
-            self._flush_chat_navigation_history_selection()
 
     def _flush_chat_navigation_history_selection(self) -> None:
         if not getattr(self, "_chat_navigation_history_selection_deferred", False):
@@ -579,25 +581,26 @@ class ChatNavigationMixin:
             self._render_answer_list(preserve_panel=True, select_latest_message=select_latest_message)
 
     def _on_chat_navigation_child_focus(self, event) -> None:
+        focus = wx.Window.FindFocus()
         if (getattr(self, "_chat_navigation_timer", None) is not None
-                and wx.Window.FindFocus() is not self._chat_navigation_origin):
+                and focus is not self._chat_navigation_origin):
             self._cancel_chat_navigation_focus()
+        if focus is self.history_list and getattr(self, "_chat_navigation_timer", None) is None:
+            self._flush_chat_navigation_history_selection()
         event.Skip()
 
     def _announce_chat_navigation(self, chat_id: str, title: str, focus) -> None:
-        tts = self._chat_navigation_tts
         navigation_generation = self._chat_navigation_generation
         self._chat_navigation_origin = focus
         started = bindings.app.time.monotonic()
         speaking = False
         retried = False
         idle_since = None
-        spoken = tts.speak_chat_navigation(title)
+        spoken = self._zdsr_tts.speak_chat_navigation(title)
 
         def finish():
             self._flush_chat_navigation_answer_rows(select_latest_message=True)
             self._focus_latest_answer_immediately(include_question=True, reveal_answers=True)
-            self._flush_chat_navigation_history_selection()
 
         def poll():
             nonlocal speaking, spoken, retried, idle_since
@@ -613,8 +616,8 @@ class ChatNavigationMixin:
                 return
             elapsed = bindings.app.time.monotonic() - started
             if spoken is None and elapsed < 4.0:
-                spoken = tts.speak_chat_navigation(title)
-            state = tts.speak_state() if spoken else None
+                spoken = self._zdsr_tts.speak_chat_navigation(title)
+            state = self._zdsr_tts.speak_state() if spoken else None
             if state is True:
                 speaking = True
                 idle_since = None
@@ -628,7 +631,7 @@ class ChatNavigationMixin:
             elif not retried and spoken is True and state is False and elapsed >= 1.75:
                 # Older DLLs can accept the first request while internally
                 # initializing, then never start it or report initialization.
-                spoken = tts.speak_chat_navigation(title)
+                spoken = self._zdsr_tts.speak_chat_navigation(title)
                 retried = True
             elif spoken is False or (elapsed >= 4.0 and (not speaking or state is None)):
                 self._cancel_chat_navigation_focus()
@@ -806,7 +809,7 @@ class ChatNavigationMixin:
                         self._confirm_answer_read(self._selected_read_target())
                 return True
             if focus is detail_target or focus in detail_controls:
-                self.history_list.SetFocus()
+                self._focus_history_list()
                 return True
             if focus is self.history_list:
                 self._notes_primary_tab_target().SetFocus()
@@ -814,7 +817,7 @@ class ChatNavigationMixin:
             return False
 
         if focus in {self.notes_notebook_list, self.notes_entry_list}:
-            self.history_list.SetFocus()
+            self._focus_history_list()
             return True
         if focus is self.history_list:
             if detail_target is not None:

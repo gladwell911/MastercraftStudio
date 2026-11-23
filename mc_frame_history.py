@@ -1167,9 +1167,10 @@ class ChatHistoryMixin:
         current_id = self._current_history_id()
         seen_ids = set()
         selected_id = self.history_list_model.selected_id() if hasattr(self, "history_list_model") else ""
-        if selected_id and getattr(self, "_chat_navigation_history_selection_deferred", False):
-            keep_id = selected_id
-        target = str(keep_id if keep_id is not None else selected_id or self.view_history_id or "").strip()
+        selection_deferred = getattr(self, "_chat_navigation_history_selection_deferred", False)
+        target = selected_id if selection_deferred else str(
+            keep_id if keep_id is not None else selected_id or self.view_history_id or ""
+        ).strip()
         for chat_id in self._get_all_chat_ids_in_order():
             if not chat_id or chat_id in seen_ids:
                 continue
@@ -1182,7 +1183,7 @@ class ChatHistoryMixin:
         selected_idx = None
         if target in ids:
             selected_idx = ids.index(target)
-        elif labels:
+        elif labels and not selection_deferred:
             selected_idx = 0
         selected_id = ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(ids) else ""
         if hasattr(self, "history_list_model"):
@@ -1277,8 +1278,6 @@ class ChatHistoryMixin:
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             return False
-        if getattr(self, "_chat_navigation_history_selection_deferred", False):
-            return True
         if hasattr(self, "history_list_model"):
             return self.history_list_model.set_selection_by_id(chat_id)
         try:
@@ -1671,9 +1670,18 @@ class ChatHistoryMixin:
                 self._confirm_answer_read({**identity, "chat_id": chat_id,
                                            "pair_id": frozen["pair_id"]})
 
+    def _on_answer_mouse_down(self, event):
+        self._answer_mouse_down_on_deferred_rows = getattr(self, "_chat_navigation_answer_rows_deferred", False)
+        event.Skip()
+
     def _on_answer_mouse_read(self, event):
+        pressed_on_deferred_rows = getattr(self, "_answer_mouse_down_on_deferred_rows", False)
+        self._answer_mouse_down_on_deferred_rows = False
         if getattr(self, "_chat_navigation_answer_rows_deferred", False):
             self._cancel_chat_navigation_focus()
+            return
+        if pressed_on_deferred_rows:
+            event.Skip()
             return
         index = self.answer_list.HitTest(event.GetPosition())
         target = self._selected_read_target(index)
@@ -1688,12 +1696,13 @@ class ChatHistoryMixin:
         self._touch_navigation_quiet_window(event)
         if self._handle_ctrl_history_navigation(event):
             return
-        if (getattr(self, "_chat_navigation_history_selection_deferred", False)
-                and event.GetKeyCode() not in (wx.WXK_CONTROL, wx.WXK_SHIFT, wx.WXK_ALT)):
-            self._cancel_chat_navigation_focus()
         if self._handle_primary_tab_navigation(event):
             return
         key = event.GetKeyCode()
+        if (getattr(self, "_chat_navigation_history_selection_deferred", False)
+                and key not in (wx.WXK_CONTROL, wx.WXK_SHIFT, wx.WXK_ALT)):
+            self._cancel_chat_navigation_focus()
+            self._flush_chat_navigation_history_selection()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._activate_selected_history()
             return
@@ -1716,9 +1725,22 @@ class ChatHistoryMixin:
         event.Skip()
 
     def _on_history_selected(self, event):
+        # A native selection event expresses the user's choice of a row.
+        if getattr(self, "_chat_navigation_history_selection_deferred", False):
+            self._chat_navigation_history_selection_deferred = False
+            self._cancel_chat_navigation_focus()
+        event.Skip()
+
+    def _on_history_mouse_down(self, event):
+        if getattr(self, "_chat_navigation_history_selection_deferred", False):
+            if self.history_list.HitTest(event.GetPosition()) != wx.NOT_FOUND:
+                self._chat_navigation_history_selection_deferred = False
+            self._cancel_chat_navigation_focus()
         event.Skip()
 
     def _on_history_context(self, _):
+        self._cancel_chat_navigation_focus()
+        self._flush_chat_navigation_history_selection()
         self._show_history_menu()
 
     def _model_for_chat_selection(self, chat: dict | None) -> str:
@@ -1750,6 +1772,9 @@ class ChatHistoryMixin:
         selected_id = str(chat_id or "").strip()
         if not selected_id:
             return False
+        if sync_history_selection and getattr(self, "_chat_navigation_history_selection_deferred", False):
+            self._chat_navigation_history_selection_deferred = False
+            self._cancel_chat_navigation_focus()
         self._flush_relevant_execution_deltas_for_switch()
         current_state_id = (
             str((self._current_chat_state or {}).get("id") or "").strip()
@@ -1841,6 +1866,9 @@ class ChatHistoryMixin:
             return False
 
     def _activate_selected_history(self) -> bool:
+        if getattr(self, "_chat_navigation_history_selection_deferred", False):
+            self._cancel_chat_navigation_focus()
+            self._flush_chat_navigation_history_selection()
         if self.history_list.GetCount() == 0:
             return False
         idx = self.history_list.GetSelection()
@@ -1899,12 +1927,12 @@ class ChatHistoryMixin:
         focus = wx.Window.FindFocus()
         title = str(chat.get("title") or "新聊天")
         self._cancel_chat_navigation_focus(stop_speech=False)
-        self._chat_navigation_answer_rows_deferred = focus is self.answer_list
-        self._chat_navigation_history_selection_deferred = focus is self.history_list
+        self._chat_navigation_answer_rows_deferred = True
+        self._chat_navigation_history_selection_deferred = True
         self._announce_chat_navigation(chat_id, title, focus)
         if not self._show_history_chat(
             chat_id, focus_answer_list=False, preserve_panel=True,
-            sync_history_selection=focus is not self.history_list,
+            sync_history_selection=False,
         ):
             self._cancel_chat_navigation_focus()
             return False

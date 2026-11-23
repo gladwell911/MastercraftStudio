@@ -617,7 +617,6 @@ class ChatFrame(
         self.voice_end_sound = self._resolve_sound_path("inputEnd")
         self.voice_wrong_sound = self._resolve_sound_path("inputWrong")
         self._zdsr_tts = ZDSRTTSClient()
-        self._chat_navigation_tts = ZDSRTTSClient(chat_navigation=True)
         self._cli_agent_manager = get_default_cli_agent_manager()
         self.selected_model = STARTUP_DEFAULT_MODEL_ID
 
@@ -1075,6 +1074,7 @@ class ChatFrame(
 
         self.answer_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("answer_key_down", self._on_answer_key_down))
         self.answer_list.Bind(wx.EVT_CHAR, self._on_answer_char)
+        self.answer_list.Bind(wx.EVT_LEFT_DOWN, self._on_answer_mouse_down)
         self.answer_list.Bind(wx.EVT_LEFT_UP, self._on_answer_mouse_read)
         self.answer_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_answer_activate)
         self.execution_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("execution_key_down", self._on_execution_key_down))
@@ -1090,6 +1090,7 @@ class ChatFrame(
         self.extracted_file_list.Bind(wx.EVT_CONTEXT_MENU, self._on_extracted_file_context)
         self.history_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("history_key_down", self._on_history_key_down))
         self.history_list.Bind(wx.EVT_CHAR, self._on_history_char)
+        self.history_list.Bind(wx.EVT_LEFT_DOWN, self._on_history_mouse_down)
         self.history_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _evt: self._activate_selected_history())
         self.history_list.Bind(wx.EVT_LISTBOX, self._on_history_selected)
         self.history_list.Bind(wx.EVT_CONTEXT_MENU, self._on_history_context)

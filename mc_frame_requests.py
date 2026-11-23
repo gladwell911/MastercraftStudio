@@ -1779,6 +1779,9 @@ class ChatRequestsMixin:
                 return rollback_new_chat(self.active_chat_id)
         except Exception:
             return rollback_new_chat(self.active_chat_id)
+        if getattr(self, "_chat_navigation_history_selection_deferred", False):
+            self._chat_navigation_history_selection_deferred = False
+            self._cancel_chat_navigation_focus()
         self._upsert_history_row(self.active_chat_id)
         self._select_history_row_if_present(self.active_chat_id)
         self._render_answer_list()

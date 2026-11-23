@@ -36,26 +36,18 @@ class ZDSRTTSClient:
     _lock = threading.Lock()
     _active_clients = weakref.WeakValueDictionary()
 
-    def __init__(self, *, chat_navigation: bool = False) -> None:
+    def __init__(self) -> None:
         self._init_tried = False
         self._ready = False
         self._api = None
         self.speech_generation = 0
-        self._chat_navigation = chat_navigation
-        self._type = 1 if chat_navigation else _env_int("ZDSR_TTS_TYPE", 0)
-        self._channel_name = f"MC.ChatNavigation.{os.getpid()}" if chat_navigation else os.getenv("ZDSR_TTS_CHANNEL", "").strip()
-        self._keydown_interrupt = not chat_navigation and _env_true("ZDSR_TTS_KEYDOWN_INTERRUPT", True)
-        self._speak_interrupt = chat_navigation or _env_true("ZDSR_TTS_INTERRUPT", True)
+        self._type = _env_int("ZDSR_TTS_TYPE", 0)
+        self._channel_name = os.getenv("ZDSR_TTS_CHANNEL", "").strip()
+        self._keydown_interrupt = _env_true("ZDSR_TTS_KEYDOWN_INTERRUPT", True)
+        self._speak_interrupt = _env_true("ZDSR_TTS_INTERRUPT", True)
 
     def _candidate_dirs(self) -> list[Path]:
         dirs = []
-        if self._chat_navigation:
-            # The installed SDK matches the running reader and reports when a
-            # newly created independent channel is still initializing.
-            for variable in ("ProgramFiles(x86)", "ProgramFiles"):
-                program_files = os.environ.get(variable)
-                if program_files:
-                    dirs.append(Path(program_files) / "zdsr" / "zdsr")
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).resolve().parent
             dirs.append(exe_dir)
@@ -156,8 +148,7 @@ class ZDSRTTSClient:
         return True
 
     def _speak_once(self, content: str) -> bool:
-        if not self._chat_navigation:
-            self._stop_selected_channel()
+        self._stop_selected_channel()
         try:
             ret = int(self._api.Speak(content, 1 if self._speak_interrupt else 0))
         except Exception:
@@ -189,7 +180,7 @@ class ZDSRTTSClient:
                 self._stop_selected_channel()
 
     def speak_chat_navigation(self, title: str) -> bool | None:
-        """Replace the title, or wait while the independent channel initializes."""
+        """Replace speech on the voice-input channel, or wait for it to initialize."""
         with self._lock:
             try:
                 if not self._ensure_ready():
