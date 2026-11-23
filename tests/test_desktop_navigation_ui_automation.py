@@ -48,20 +48,22 @@ def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, mo
     monkeypatch.setattr(wx, "CallLater", schedule)
 
     class ScreenReader:
-        speech_generation = 0
         state = False
         titles = []
+        stops = 0
 
-        def speak(self, title):
-            self.speech_generation += 1
+        def speak_chat_navigation(self, title):
             self.titles.append(title)
             return True
 
         def speak_state(self):
             return self.state
 
+        def stop(self):
+            self.stops += 1
+
     reader = ScreenReader()
-    frame._zdsr_tts = reader
+    frame._chat_navigation_tts = reader
     clock = [100.0]
     monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
     event = wx.KeyEvent(wx.wxEVT_CHAR_HOOK)
@@ -81,11 +83,14 @@ def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, mo
     frame.ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, int(frame._chat_navigation_right_id)))
     assert frame.view_mode == "active" and frame.active_chat_id == owner
     assert reader.titles[-1] == "activity owner"
+    assert reader.stops == 0
     stale()
     reader.state = True
     callbacks.pop(0)()
     assert focus[0] is frame.input_edit
     reader.state = False
+    callbacks.pop(0)()
+    clock[0] += .08
     callbacks.pop(0)()
     assert focus[0] is frame.answer_list
     assert "latest unanswered question" in frame.answer_list.GetString(frame.answer_list.GetSelection())
@@ -95,14 +100,18 @@ def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, mo
     interrupted = callbacks.pop(0)
     focus[0] = frame.history_list
     frame._on_chat_navigation_child_focus(wx.ChildFocusEvent(frame.history_list))
+    assert reader.stops == 1
     focus[0] = frame.input_edit
     interrupted()
     assert focus[0] is frame.input_edit
 
     frame._handle_vertical_chat_shortcut(1)
     clock[0] += 2.1
-    callbacks.pop(0)()  # Status stayed idle for the entire bounded fallback.
-    assert focus[0] is frame.answer_list
+    callbacks.pop(0)()  # A bundled SDK can lose the first accepted request.
+    assert reader.titles[-2:] == ["activity owner", "activity owner"]
+    clock[0] += 2.1
+    callbacks.pop(0)()
+    assert focus[0] is frame.input_edit and reader.stops == 2
 
 
 def test_chat_shortcut_reveals_answers_only_after_long_title(frame, monkeypatch):
@@ -133,10 +142,9 @@ def test_chat_shortcut_reveals_answers_only_after_long_title(frame, monkeypatch)
         return call_later(delay, callback, *args, **kwargs)
 
     class Reader:
-        speech_generation = 0
         speaking = True
 
-        def speak(self, _):
+        def speak_chat_navigation(self, _):
             return True
 
         def speak_state(self):
@@ -145,7 +153,7 @@ def test_chat_shortcut_reveals_answers_only_after_long_title(frame, monkeypatch)
     clock = [100.0]
     monkeypatch.setattr(wx, "CallLater", schedule)
     monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
-    frame._zdsr_tts = Reader()
+    frame._chat_navigation_tts = Reader()
     assert frame._handle_vertical_chat_shortcut(-1)
     assert focus[0] is frame.execution_list
     assert frame._execution_applied_owner == frame._execution_scan_key()[:3]
@@ -155,7 +163,9 @@ def test_chat_shortcut_reveals_answers_only_after_long_title(frame, monkeypatch)
     clock[0] += 20
     pending.pop(0)()
     assert pending and focus[0] is frame.execution_list
-    frame._zdsr_tts.speaking = False
+    frame._chat_navigation_tts.speaking = False
+    pending.pop(0)()
+    clock[0] += .08
     pending.pop(0)()
     assert frame.answer_list.IsShown()
     assert focus[0] is frame.answer_list
@@ -418,6 +428,141 @@ def activate(frame, control):
                           "control": int(control.GetHandle()), "has_focus": control.HasFocus(),
                           "actual_focus": int(focus.GetHandle()) if focus else None,
                           "foreground": int(user32.GetForegroundWindow() or 0)})
+
+
+@pytest.mark.parametrize("origin", ["input_edit", "answer_list", "history_list"])
+def test_native_chat_navigation_replaces_titles_and_delays_native_rows(frame, monkeypatch, origin):
+    owner = seed_history(frame, pinned=True)
+    for chat in [frame._current_chat_state, *frame.archived_chats]:
+        chat["turns"].append({"question": "question", "answer_md": f"answer for {chat['title']}"})
+        frame._mark_chat_turns_dirty(chat["id"])
+    frame._save_state()
+    frame._render_answer_list()
+
+    class Reader:
+        def __init__(self):
+            self.titles = []
+            self.speaking = False
+            self.stops = 0
+
+        def speak_chat_navigation(self, title):
+            self.titles.append(title)
+            self.speaking = True
+            return True
+
+        def speak_state(self):
+            return self.speaking
+
+        def stop(self):
+            self.stops += 1
+            self.speaking = False
+
+    reader = frame._chat_navigation_tts = Reader()
+    control = getattr(frame, origin)
+    activate(frame, control)
+    frame.answer_list.SetSelection(frame.answer_list.GetCount() - 1)
+    original_answer = frame.answer_list.GetString(frame.answer_list.GetSelection())
+
+    def send(keys, phase):
+        assert native_user32().GetForegroundWindow() == frame.GetHandle()
+        assert native_key_input_batch(keys, phase) == len(keys)
+        run_native_for(120)
+
+    def navigate(key):
+        send([(0xA2, 0), (key, 1), (key, 3), (0xA2, 2)], "chat-navigation")
+
+    navigate(0x26)
+    navigate(0x26)
+    navigate(0x28)
+    assert reader.titles == ["recent", "pinned", "recent"] and reader.stops == 0
+    assert wx.Window.FindFocus() is control
+    if origin == "history_list":
+        assert frame.history_list_model.selected_id() == owner
+    if origin == "answer_list":
+        assert frame.view_history_id == "recent"
+        assert "activity owner" in original_answer
+        assert frame.answer_list.GetString(frame.answer_list.GetSelection()) == original_answer
+        assert not frame._open_selected_answer_text_viewer()
+        assert frame._selected_read_target() is None
+    reader.speaking = False
+    run_native_for(180)
+    assert wx.Window.FindFocus() is frame.answer_list
+    assert "answer for recent" in frame.answer_list.GetString(frame.answer_list.GetSelection())
+    assert frame.history_list_model.selected_id() == "recent"
+
+    if origin == "answer_list":
+        opened = []
+        monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda _title, value, *_args: opened.append(value) or True)
+        navigate(0x28)
+        assert "answer for recent" in frame.answer_list.GetString(frame.answer_list.GetSelection())
+        send([(0x0D, 0), (0x0D, 2)], "ordinary-enter-key")
+        assert reader.stops == 1 and opened == ["answer for activity owner"]
+        navigate(0x26)
+        reader.speaking = False
+        run_native_for(180)
+
+    activate(frame, frame.input_edit)
+    navigate(0x28)
+    assert reader.titles[-1] == "activity owner"
+    frame.input_edit.ChangeValue("ordinary input")
+    frame.input_edit.SetInsertionPointEnd()
+    before_stops = reader.stops
+    send([(0x24, 1), (0x24, 3)], "ordinary-home-key")
+    assert reader.stops == before_stops + 1 and wx.Window.FindFocus() is frame.input_edit
+    assert frame.input_edit.GetInsertionPoint() == 0
+
+
+@pytest.mark.parametrize("completion", ["normal", "unavailable", "key"])
+def test_history_origin_selects_empty_target_when_title_settles(frame, monkeypatch, completion):
+    owner = seed_history(frame)
+    activate(frame, frame.history_list)
+
+    class Reader:
+        speaking = True
+
+        def speak_chat_navigation(self, _title):
+            return completion != "unavailable"
+
+        def speak_state(self):
+            return self.speaking
+
+        def stop(self):
+            pass
+
+    reader = frame._chat_navigation_tts = Reader()
+    assert frame._navigate_history_chats(-1)
+    frame._refresh_history("recent")
+    assert frame.history_list_model.selected_id() == owner
+    if completion == "key":
+        activated = []
+        monkeypatch.setattr(frame, "_activate_selected_history", lambda: activated.append(frame.history_list_model.selected_id()) or True)
+        assert native_key_input_batch([(0x0D, 0), (0x0D, 2)], "history-enter") == 2
+        run_native_for(90)
+        assert activated == ["recent"]
+    elif completion == "normal":
+        run_native_for(70)
+        assert frame.history_list_model.selected_id() == owner
+        reader.speaking = False
+        run_native_for(180)
+    else:
+        run_native_for(90)
+    assert frame.history_list_model.selected_id() == frame.view_history_id == "recent"
+    assert wx.Window.FindFocus() is frame.history_list
+
+
+def test_answer_mouse_discards_frozen_coordinates_then_reads_next_click(frame, monkeypatch):
+    from types import SimpleNamespace
+    reads, skipped, hit = [], [], []
+    event = SimpleNamespace(Skip=lambda: skipped.append(True), GetPosition=lambda: (10, 20))
+    monkeypatch.setattr(frame.answer_list, "HitTest", lambda point: hit.append(point) or 0)
+    monkeypatch.setattr(frame, "_selected_read_target", lambda row: {"row": row})
+    monkeypatch.setattr(frame, "_confirm_answer_read", reads.append)
+    frame._chat_navigation_answer_rows_deferred = True
+    frame._on_answer_mouse_read(event)
+    assert not frame._chat_navigation_answer_rows_deferred
+    assert not skipped and not hit and not reads
+    frame._on_answer_mouse_read(event)
+    assert skipped == [True] and hit == [(10, 20)] and reads == [{"row": 0}]
 
 
 def alt_c():

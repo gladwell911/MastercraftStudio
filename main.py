@@ -617,6 +617,7 @@ class ChatFrame(
         self.voice_end_sound = self._resolve_sound_path("inputEnd")
         self.voice_wrong_sound = self._resolve_sound_path("inputWrong")
         self._zdsr_tts = ZDSRTTSClient()
+        self._chat_navigation_tts = ZDSRTTSClient(chat_navigation=True)
         self._cli_agent_manager = get_default_cli_agent_manager()
         self.selected_model = STARTUP_DEFAULT_MODEL_ID
 

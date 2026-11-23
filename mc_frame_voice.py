@@ -446,6 +446,8 @@ class VoiceInputMixin:
             "last_error": "",
         }
         errors = []
+        if getattr(self, "_chat_navigation_timer", None) is not None:
+            self._cancel_chat_navigation_focus()
         try:
             ok = bool(self._zdsr_tts.speak(content))
         except Exception as exc:

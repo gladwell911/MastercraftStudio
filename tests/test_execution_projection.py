@@ -83,6 +83,34 @@ def test_history_context_uses_latest_turn_without_visible_steps():
     ]
 
 
+def test_final_answer_projects_exact_message_identity_for_equal_bodies():
+    turns = [{"answer_md": "**same**", "request_status": "done"} for _ in range(2)]
+    rows = [project_execution_rows(
+        chat_id="owner", revision=2, steps=[], turns=turns, view_mode="active",
+        active_turn_index=index, selected_model="", requesting_text="pending",
+        answer_to_plain=lambda answer, model: "same", answer_message_ids={0: "first", 1: "second"},
+    )[-1] for index in range(2)]
+    assert [row["message_id"] for row in rows] == ["first", "second"]
+    assert [row["kind"] for row in rows] == ["final", "final"]
+    assert [row["answer_text"] for row in rows] == ["**same**", "**same**"]
+
+
+@pytest.mark.parametrize("metadata,kind", [
+    ({"answer_at": 5}, "final"), ({"answer_order": 2}, "final"),
+    ({"request_status": "failed", "answer_at": 5}, "answer_preview"),
+    ({"request_status": "pending"}, "answer_preview"), ({}, "answer_preview"),
+    ({"request_status": "done", "private_reasoning": True}, None),
+])
+def test_execution_answer_action_requires_public_completion(metadata, kind):
+    rows = _context_rows([{"answer_md": "**legacy Markdown**", **metadata}])
+    if kind is None:
+        assert rows == []
+        return
+    assert rows[0]["kind"] == kind
+    assert "message_id" not in rows[0]
+    assert rows[0].get("answer_text") == ("**legacy Markdown**" if kind == "final" else None)
+
+
 @pytest.mark.parametrize("tail,expected", [
     ({"question": "last q", "answer_md": "last a"}, ["我：last q", "小诸葛：last a"]),
     ({"question": "", "answer_md": ""}, []),

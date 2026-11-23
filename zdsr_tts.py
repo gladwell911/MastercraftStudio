@@ -2,6 +2,7 @@ import ctypes
 import os
 import sys
 import threading
+import weakref
 from pathlib import Path
 
 
@@ -30,19 +31,31 @@ class ZDSRTTSClient:
       StopSpeak()
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
+    # The SDK keeps the selected channel in the loaded DLL, shared by all
+    # WinDLL wrappers in this process. Select a channel and call it atomically.
+    _lock = threading.Lock()
+    _active_clients = weakref.WeakValueDictionary()
+
+    def __init__(self, *, chat_navigation: bool = False) -> None:
         self._init_tried = False
         self._ready = False
         self._api = None
         self.speech_generation = 0
-        self._type = _env_int("ZDSR_TTS_TYPE", 0)
-        self._channel_name = os.getenv("ZDSR_TTS_CHANNEL", "").strip()
-        self._keydown_interrupt = _env_true("ZDSR_TTS_KEYDOWN_INTERRUPT", True)
-        self._speak_interrupt = _env_true("ZDSR_TTS_INTERRUPT", True)
+        self._chat_navigation = chat_navigation
+        self._type = 1 if chat_navigation else _env_int("ZDSR_TTS_TYPE", 0)
+        self._channel_name = f"MC.ChatNavigation.{os.getpid()}" if chat_navigation else os.getenv("ZDSR_TTS_CHANNEL", "").strip()
+        self._keydown_interrupt = not chat_navigation and _env_true("ZDSR_TTS_KEYDOWN_INTERRUPT", True)
+        self._speak_interrupt = chat_navigation or _env_true("ZDSR_TTS_INTERRUPT", True)
 
     def _candidate_dirs(self) -> list[Path]:
         dirs = []
+        if self._chat_navigation:
+            # The installed SDK matches the running reader and reports when a
+            # newly created independent channel is still initializing.
+            for variable in ("ProgramFiles(x86)", "ProgramFiles"):
+                program_files = os.environ.get(variable)
+                if program_files:
+                    dirs.append(Path(program_files) / "zdsr" / "zdsr")
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).resolve().parent
             dirs.append(exe_dir)
@@ -101,16 +114,18 @@ class ZDSRTTSClient:
         return None
 
     def _reset_state(self) -> None:
+        if self._api is not None and self._active_clients.get(self._module_key) is self:
+            self._active_clients.pop(self._module_key)
         self._ready = False
         self._init_tried = False
         self._api = None
 
+    @property
+    def _module_key(self):
+        return getattr(self._api, "_handle", id(self._api))
+
     def _ensure_ready(self) -> bool:
-        if self._ready:
-            return True
-        with self._lock:
-            if self._ready:
-                return True
+        if not self._ready:
             if self._init_tried:
                 return False
             self._init_tried = True
@@ -126,20 +141,23 @@ class ZDSRTTSClient:
                 api.StopSpeak.restype = None
             except Exception:
                 return False
-            channel = self._channel_name or None
-            ret = int(api.InitTTS(self._type, channel, 1 if self._keydown_interrupt else 0))
+            self._api = api
+        if self._active_clients.get(self._module_key) is not self:
+            self._active_clients.pop(self._module_key, None)
+            try:
+                ret = int(self._api.InitTTS(self._type, self._channel_name or None, int(self._keydown_interrupt)))
+            except Exception:
+                ret = -1
             if ret != 0:
                 self._reset_state()
                 return False
-            self._api = api
-            self._ready = True
-            return True
+            self._active_clients[self._module_key] = self
+        self._ready = True
+        return True
 
     def _speak_once(self, content: str) -> bool:
-        try:
-            self._api.StopSpeak()
-        except Exception:
-            pass
+        if not self._chat_navigation:
+            self._stop_selected_channel()
         try:
             ret = int(self._api.Speak(content, 1 if self._speak_interrupt else 0))
         except Exception:
@@ -150,24 +168,56 @@ class ZDSRTTSClient:
         content = str(text or "").strip()
         if not content:
             return False
-        self.speech_generation += 1
-        if not self._ensure_ready():
-            return False
-        if self._speak_once(content):
-            return True
         with self._lock:
+            self.speech_generation += 1
+            if not self._ensure_ready():
+                return False
+            if self._speak_once(content):
+                return True
             self._reset_state()
-        if not self._ensure_ready():
-            return False
-        return self._speak_once(content)
+            return self._ensure_ready() and self._speak_once(content)
 
-    def speak_state(self) -> bool | None:
-        """Return speaking/idle, or None when the 争渡 status API is unavailable."""
+    def _stop_selected_channel(self) -> None:
+        try:
+            self._api.StopSpeak()
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._ready and self._ensure_ready():
+                self._stop_selected_channel()
+
+    def speak_chat_navigation(self, title: str) -> bool | None:
+        """Replace the title, or wait while the independent channel initializes."""
+        with self._lock:
+            try:
+                if not self._ensure_ready():
+                    return False
+                if self._raw_speak_state() == 9:
+                    return None
+                result = int(self._api.Speak(title, 1))
+            except Exception:
+                result = 1
+            if result == 9:
+                return None
+            if result:
+                self._stop_selected_channel()
+                self._reset_state()
+            return result == 0
+
+    def _raw_speak_state(self) -> int | None:
         try:
             query = self._api.GetSpeakState
             query.argtypes = []
             query.restype = ctypes.c_int
-            state = int(query())
+            return int(query())
         except Exception:
             return None
-        return {3: True, 4: False}.get(state)
+
+    def speak_state(self) -> bool | None:
+        """Return speaking/idle, or None when the 争渡 status API is unavailable."""
+        with self._lock:
+            if not self._ready or not self._ensure_ready():
+                return None
+            return {3: True, 4: False}.get(self._raw_speak_state())

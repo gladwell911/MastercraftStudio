@@ -28,6 +28,8 @@ $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid(
 
 Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。首次订阅中先到的帧暂存到同一 socket 代次，目标会话获 ACK 后才投递。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。完整回合汇总优先。部分汇总只有在各消耗步骤终止、用量字段完整且与已知汇总逐项相符时才补齐，取消空回合缺少零用量证据时保留未知。上下文和累计分别判定可用性，零分母显示暂不可用，顶部累计以千为单位截去小数。查询诊断只记失败阶段、异常类别与聚合字段计数。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
 
+V1 完成回答后会补读同会话的 status/snapshot。已接受的用量刷新在本地或远端聊天信息观察者关闭后仍可结算。MC 保存会话累计并通知对应的 RC 会话。额度由聊天信息入口单独刷新。
+
 最终回答要求整个 turn completed，并取最高 ordinal 末步。末步通常 completed；真实追问可能留下 interrupted 且 `endReason` 精确为 `steered`，此时只取该步最后一个结构化 text/user frame 之后的公开 assistant 正文，无 user 则取该步正文。其他/缺失原因、tool、thinking-only、隐藏/空正文和不完整 transcript 均不发布，也不回退早先步骤；失败/取消仍保留失败语义。REST 与 V2 reset/ops 共用该提取规则，不改写服务端状态。
 
 ACK 只属于当前 socket generation，失效立即撤销就绪。running、queued、blocked 继续既有 monitor。V2 发 POST 前分配精确 prompt ID，回包结果不明时通过只读 transcript 确认唯一归属，遇到歧义明确失败，禁止自动重发。append 按 UTF-16 code unit 应用，批次失败时保留游标。终态缺正文仍走有界补齐，完成后释放正文和流缓存，最多保留 512 项完成身份和 32 个空闲 transcript，pending 文本保留。

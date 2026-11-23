@@ -186,6 +186,8 @@ class ChatInformationMixin:
         return result
 
     def _refresh_chat_information(self, chat: dict | None = None) -> None:
+        if isinstance(chat, dict):
+            self._publish_remote_session_usage(chat)
         scoped = getattr(self, "_scoped_chat_information", None)
         if scoped is not None:
             scoped.changed(chat)
@@ -408,9 +410,10 @@ class ChatInformationMixin:
         self._refresh_chat_information(chat)
 
     def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False,
-                                       context_only: bool = False, scoped: bool = False) -> None:
+                                       context_only: bool = False, scoped: bool = False,
+                                       usage_only: bool = False) -> None:
         subscriptions = getattr(self, "_scoped_chat_information", None)
-        if not scoped and subscriptions is not None and subscriptions.request(chat, model, context_only=context_only):
+        if not (scoped or usage_only) and subscriptions is not None and subscriptions.request(chat, model, context_only=context_only):
             return
         self._validate_information_cache_owner(chat, "kimi")
         identity = self._chat_information_identity(chat, model)
@@ -422,6 +425,8 @@ class ChatInformationMixin:
         pending = self._kimi_information_requests.get(identity[0])
         if (isinstance(pending, dict) and pending.get("identity") == identity
                 and bindings.app.time.monotonic() - pending.get("started", 0) < 30):
+            if usage_only:
+                pending["full_refresh_usage"] = True
             if not context_only and pending.get("context_only"):
                 pending["full_refresh_dialog"] = dialog
             return
@@ -436,6 +441,7 @@ class ChatInformationMixin:
             "started": bindings.app.time.monotonic(), "dialog": dialog if visible_only else None,
             "cache_owner": self._information_cache_owner(chat, "kimi"),
             "scoped": scoped,
+            "usage_only": usage_only,
         }
 
         def _read() -> None:
@@ -449,14 +455,14 @@ class ChatInformationMixin:
                                               identity[0], generation, identity, kind, None, True)
                 return
             if getattr(client, "protocol_version", 1) == 2:
-                getters = (("status", client.get_v2_usage_context), ("snapshot", client.get_v2_usage_totals))
+                getters = (("status", "get_v2_usage_context"), ("snapshot", "get_v2_usage_totals"))
             else:
-                getters = (("status", client.get_status), ("snapshot", client.get_snapshot))
-            for kind, getter in getters:
+                getters = (("status", "get_status"), ("snapshot", "get_snapshot"))
+            for kind, method in getters:
                 if kind not in kinds:
                     continue
                 try:
-                    payload = getter(identity[2])
+                    payload = getattr(client, method)(identity[2])
                     failed = False
                 except KimiUsageQueryError as exc:
                     _USAGE_LOG.warning("Kimi usage query failed query=%s stage=%s pages=%d category=%s",
@@ -604,7 +610,9 @@ class ChatInformationMixin:
         if (isinstance(payload, dict) and "socket_generation" in payload
                 and not self._current_kimi_usage_socket(identity[2], payload)):
             failed, payload = True, None
-        if (request.get("scoped") or request.get("scoped_observed")) and not self._information_subscriptions().interested(chat_id):
+        background_usage = request.get("usage_only") or request.get("full_refresh_usage")
+        if (not background_usage and (request.get("scoped") or request.get("scoped_observed"))
+                and not self._information_subscriptions().interested(chat_id)):
             self._kimi_information_requests.pop(chat_id, None)
             self._information_subscriptions().requests.pop(chat_id, None)
             return
@@ -627,7 +635,7 @@ class ChatInformationMixin:
                 if owner is not None and subscriptions.interested(chat_id):
                     subscriptions.request(*owner)
             return
-        if request.get("visible_only"):
+        if request.get("visible_only") and not background_usage:
             dialog = getattr(self, "_chat_information_dialog", None)
             if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
                     or request.get("dialog", dialog) is not dialog):
@@ -669,7 +677,9 @@ class ChatInformationMixin:
                 self._kimi_information_requests.pop(chat_id, None)
                 pending_dialog = request.get("full_refresh_dialog")
                 dialog = getattr(self, "_chat_information_dialog", None)
-                if (pending_dialog is not None and pending_dialog is dialog
+                if request.get("full_refresh_usage"):
+                    self._request_kimi_chat_information(chat, identity[1], usage_only=True)
+                elif (pending_dialog is not None and pending_dialog is dialog
                         and not dialog.IsBeingDeleted() and dialog.identity == identity):
                     self._request_kimi_chat_information(chat, identity[1], visible_only=True)
                 subscriptions = getattr(self, "_scoped_chat_information", None)
@@ -931,12 +941,14 @@ class ChatInformationMixin:
         owner = self._visible_chat_information_owner()
         if owner is None:
             return format_context_usage_label(self._active_chat_context_usage())
-        chat, model = owner
+        return format_session_total_tokens(self._session_total_tokens(*owner))
+
+    def _session_total_tokens(self, chat: dict, model: str) -> int | None:
         provider = "codex" if is_codex_model(model) else "kimi"
         cached_owner = chat.get(f"{provider}_usage_cache_owner")
         if cached_owner is not None and tuple(cached_owner) != self._information_cache_owner(chat, provider):
-            return format_session_total_tokens(None)
-        return format_session_total_tokens(chat.get(f"{provider}_session_total_tokens"))
+            return None
+        return native_token_count(chat.get(f"{provider}_session_total_tokens"))
 
     def _should_show_context_usage_row(self, label: str | None = None, turns: list[dict] | None = None) -> bool:
         if self._visible_chat_information_owner() is not None:
@@ -960,6 +972,8 @@ class ChatInformationMixin:
         return False
 
     def _refresh_context_usage_header_rows(self) -> bool:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return False
         if not hasattr(self, "answer_list"):
             return False
         handled = False
@@ -1063,6 +1077,11 @@ class ChatInformationMixin:
         return False
 
     def _refresh_context_usage_after_done(self, target_chat: dict, target_turns: list, turn_idx: int, used_model: str) -> None:
+        # The older Kimi runtime supplies context through status and cumulative
+        # usage through a separate snapshot. This read leaves quota untouched.
+        client = getattr(self, "_kimi_client", None)
+        if is_kimi_model(used_model) and client is not None and getattr(client, "protocol_version", 1) == 1:
+            self._request_kimi_chat_information(target_chat, used_model, usage_only=True)
         pending = self._pending_context_usage_by_turn.pop(self._context_usage_pending_key_from_chat(target_chat, turn_idx), None)
         if pending and self._pending_context_usage_matches_model(pending, used_model):
             self._set_chat_context_usage(target_chat, pending)

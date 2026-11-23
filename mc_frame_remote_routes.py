@@ -28,6 +28,50 @@ import mc_frame_bindings as bindings
 
 
 class RemoteRoutesMixin:
+    def _remote_session_usage(self, chat: dict, revision: int = 0) -> dict | None:
+        chat_id = str(chat.get("id") or "").strip()
+        if not chat_id:
+            return None
+        model = self._model_for_chat_selection(chat)
+        provider = "codex" if is_codex_model(model) else "kimi" if is_kimi_model(model) else ""
+        tokens = self._session_total_tokens(chat, model) if provider else None
+        owner = self._information_cache_owner(chat, provider) if provider else ()
+        key = (revision, provider, owner, tokens)
+        records = getattr(self, "_remote_session_usage_records", None)
+        if records is None:
+            records = self._remote_session_usage_records = {}
+        previous = records.get(chat_id)
+        if previous and previous[0] == key:
+            return previous[1]
+        stamp = bindings.app.time.time_ns() // 1000
+        if previous:
+            stamp = max(stamp, previous[1]["stamp"] + 1)
+        usage = {"stamp": stamp, "revision": revision, "supported": bool(provider), "tokens": tokens}
+        records[chat_id] = (key, usage)
+        return usage
+
+    def _publish_remote_session_usage(self, chat: dict) -> None:
+        chat_id = str(chat.get("id") or "").strip()
+        current = self._current_chat_state
+        if not chat_id or (chat is not current and chat is not self._find_archived_chat(chat_id)):
+            return
+        store = getattr(self, "chat_store", None)
+        revision = 0
+        if store is not None and hasattr(store, "get_clear_reconciliation_authority"):
+            try:
+                revision = store.get_clear_reconciliation_authority(chat_id)["revision"]
+            except (ValueError, RuntimeError):
+                pass
+        previous = getattr(self, "_remote_session_usage_records", {}).get(chat_id)
+        usage = self._remote_session_usage(chat, revision)
+        if previous and previous[1] is usage:
+            return
+        self._invalidate_remote_state_cache()
+        if usage["supported"] or previous:
+            self._publish_remote_nats_event({
+                "type": "chat_session_usage", "chat_id": chat_id, "session_usage": usage,
+            })
+
     def _publish_remote_nats_event(self, payload: dict) -> None:
         transport = getattr(self, "_remote_nats_transport", None)
         if transport is None:
@@ -534,6 +578,9 @@ class RemoteRoutesMixin:
         paged_chat["turns"] = turns[start:end]
         paged_chat["_turn_start_index"] = start
         snapshot = self._remote_chat_snapshot(paged_chat, include_execution_steps=include_execution_steps)
+        usage = self._remote_session_usage(chat, int(snapshot.get("revision") or 0))
+        if usage is not None:
+            snapshot["session_usage"] = usage
         snapshot["turn_count"] = total
         self._bound_remote_chat_content(snapshot)
         while len(snapshot.get("turns", [])) > 1 and len(json.dumps(snapshot, ensure_ascii=True).encode("utf-8")) > 96 * 1024:
@@ -591,6 +638,9 @@ class RemoteRoutesMixin:
             paged_chat,
             include_execution_steps=bool(payload.get("include_execution_steps")),
         )
+        usage = self._remote_session_usage(chat, int(snapshot.get("revision") or 0))
+        if usage is not None:
+            snapshot["session_usage"] = usage
         snapshot["turn_count"] = int(total or 0)
         self._bound_remote_chat_content(snapshot)
         while len(snapshot.get("turns", [])) > 1 and len(json.dumps(snapshot, ensure_ascii=True).encode("utf-8")) > 96 * 1024:
@@ -1162,6 +1212,7 @@ class RemoteRoutesMixin:
                     active_turn_index=active_index,
                     selected_model=context["selected_model"],
                     requesting_text=REQUESTING_TEXT,
+                    answer_message_ids=source["answer_message_ids"],
                     answer_to_plain=lambda answer_md, model: execution_answer_to_plain(
                         answer_md, model, context["english_filter"]),
                 )

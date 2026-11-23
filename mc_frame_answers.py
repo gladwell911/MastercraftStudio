@@ -31,6 +31,8 @@ import mc_frame_bindings as bindings
 
 class AnswersMixin:
     def _selected_answer_source_text(self) -> str:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return ""
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return ""
@@ -309,6 +311,8 @@ class AnswersMixin:
         return self.answer_list_model.replace_visible_page(list(zip(row_ids, rows)), selected_id=selected_id)
 
     def _refresh_answer_list_preserving_selection(self, refresh_execution: bool = True) -> None:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return
         selected_meta = None
         idx = self.answer_list.GetSelection() if hasattr(self, "answer_list") else wx.NOT_FOUND
         if idx != wx.NOT_FOUND and 0 <= idx < len(self.answer_meta):
@@ -336,7 +340,9 @@ class AnswersMixin:
             return
         self._render_answer_list(refresh_execution=False)
 
-    def _render_answer_list(self, refresh_execution: bool = True, *, preserve_panel=False):
+    def _render_answer_list(self, refresh_execution: bool = True, *, preserve_panel=False, select_latest_message=False):
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return
         mode = self._detail_panel_mode() if preserve_panel else self._apply_detail_panel_mode()
         if preserve_panel and self.execution_list.IsShown():
             self._show_execution_loading_for_new_owner()
@@ -446,6 +452,11 @@ class AnswersMixin:
             selected_idx = max(0, min(int(selected_idx), len(rows) - 1))
         else:
             selected_idx = None
+        if select_latest_message:
+            selected_idx = next(
+                (index for index in range(len(metas) - 1, -1, -1) if metas[index][0] in {"answer", "question"}),
+                selected_idx,
+            )
         changed = self._replace_answer_list_rows(rows, metas, selected_idx)
         self.answer_meta = metas
         self._active_answer_row_index = next(
@@ -464,7 +475,7 @@ class AnswersMixin:
         turn became active.  The authoritative active-turn list is the only
         source an answer fast path is allowed to project from.
         """
-        if self.view_mode != "active":
+        if self.view_mode != "active" or getattr(self, "_chat_navigation_answer_rows_deferred", False):
             return False
         try:
             index = int(turn_idx)
@@ -648,7 +659,7 @@ class AnswersMixin:
         return True
 
     def _update_active_answer_row(self, turn_idx: int, *, rebuild_if_missing: bool = True) -> bool:
-        if self.view_mode != "active":
+        if self.view_mode != "active" or getattr(self, "_chat_navigation_answer_rows_deferred", False):
             return False
         if (0 <= turn_idx < len(self.active_session_turns)
                 and self.active_session_turns[turn_idx].get("request_status") == "done"
@@ -994,6 +1005,8 @@ class AnswersMixin:
                 self._refresh_answer_list_preserving_selection()
 
     def _focus_latest_answer(self):
+        if getattr(self, "_chat_navigation_timer", None) is not None:
+            return
         if self._detail_panel_mode() != "answers":
             return
         if not self._can_focus_completion_result():
@@ -1005,6 +1018,11 @@ class AnswersMixin:
                 break
 
     def _on_answer_key_down(self, event):
+        if self._handle_ctrl_history_navigation(event):
+            return
+        if (getattr(self, "_chat_navigation_answer_rows_deferred", False)
+                and event.GetKeyCode() not in (wx.WXK_CONTROL, wx.WXK_SHIFT, wx.WXK_ALT)):
+            self._cancel_chat_navigation_focus()
         if self._on_any_key_down_escape_minimize(event):
             return
         if self._handle_input_focus_space_shortcut(event):
@@ -1018,8 +1036,6 @@ class AnswersMixin:
             if self._move_answer_list_selection_for_key(key):
                 self._confirm_answer_read(self._selected_read_target())
                 return
-        if self._handle_ctrl_history_navigation(event):
-            return
         if self._handle_primary_tab_navigation(event):
             return
         idx = self.answer_list.GetSelection()
@@ -1104,6 +1120,8 @@ class AnswersMixin:
         return True
 
     def _on_answer_char(self, event):
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            self._cancel_chat_navigation_focus()
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             if self._consume_answer_viewer_duplicate_event():
@@ -1120,6 +1138,9 @@ class AnswersMixin:
         event.Skip()
 
     def _on_answer_activate(self, _event):
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            self._cancel_chat_navigation_focus()
+            return
         if self._consume_answer_viewer_duplicate_event():
             return
         read_target = self._selected_read_target()
@@ -1145,6 +1166,8 @@ class AnswersMixin:
         return True
 
     def _selected_answer_text_viewer_content(self) -> tuple[str, str] | None:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return None
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return None
@@ -1208,6 +1231,8 @@ class AnswersMixin:
         return shown
 
     def _open_selected_answer_text_viewer(self) -> bool:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return False
         idx = self.answer_list.GetSelection()
         if idx != wx.NOT_FOUND and idx < len(self.answer_meta) and self.answer_meta[idx][0] == "more":
             self._show_more_answer_rows()
@@ -1233,6 +1258,8 @@ class AnswersMixin:
         return str(self.active_chat_id or self.current_chat_id or state.get("id") or "").strip()
 
     def _selected_answer_viewer_payload(self) -> AnswerViewerPayload | None:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return None
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return None
@@ -1444,6 +1471,8 @@ class AnswersMixin:
         return (str(turn.get("turn_id") or turn.get("id") or turn.get("answer_external_event_id") or "").strip(), "")
 
     def _try_open_selected_answer_detail(self) -> bool:
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return False
         read_target = self._selected_read_target()
         idx = self.answer_list.GetSelection()
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):

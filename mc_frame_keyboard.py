@@ -72,7 +72,6 @@ class GlobalCtrlTapHook:
         self._hook_chords = set()
         self._pressed_keys = set()
         self._using_fallback = False
-        self._fallback_notice_sent = False
         self._last_hook_event_at = 0.0
         self._hook_stale_seconds = 0.45
         self._emit_lock = bindings.app.threading.Lock()
@@ -127,9 +126,10 @@ class GlobalCtrlTapHook:
         self._poller_right_down = False
 
     def _thread_main(self) -> None:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        self._thread_id = int(kernel32.GetCurrentThreadId())
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
         user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD]
         user32.SetWindowsHookExW.restype = wintypes.HHOOK
         user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
@@ -149,24 +149,38 @@ class GlobalCtrlTapHook:
             return user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
 
         self._hook_proc = HOOKPROC(_low_level_proc)
+        msg = wintypes.MSG()
+        # Create the queue before making its ID available to stop().
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        self._thread_id = int(kernel32.GetCurrentThreadId())
         h_inst = kernel32.GetModuleHandleW(None)
-        self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc, h_inst, 0)
+        self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc, h_inst, 0) if h_inst else None
         if not self._hook:
             err = ctypes.get_last_error()
-            if self.on_error:
-                bindings.app.wx_call_after_if_alive(self.on_error, f"全局语音热键不可用（Windows Hook 安装失败，错误码 {err}）")
             self._using_fallback = True
             self._backend_state = "poller_only"
+            self._hook_proc = None
+            self._thread_id = 0
+            if self.on_error:
+                bindings.app.wx_call_after_if_alive(
+                    self.on_error, f"Windows 键盘钩子安装失败（错误码 {err}），语音热键已回退到轮询",
+                )
             return
+        self._using_fallback = False
+        self._backend_state = "hook+poller"
         self._last_hook_event_at = bindings.app.time.monotonic()
 
-        msg = wintypes.MSG()
         try:
             while self._running:
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret == -1:
+                    err = ctypes.get_last_error()
+                    self._using_fallback = True
+                    self._backend_state = "poller_only"
                     if self.on_error:
-                        bindings.app.wx_call_after_if_alive(self.on_error, "全局语音热键不可用（消息循环异常）")
+                        bindings.app.wx_call_after_if_alive(
+                            self.on_error, f"Windows 键盘钩子消息循环异常（错误码 {err}），语音热键已回退到轮询",
+                        )
                     break
                 if ret == 0:
                     break
@@ -217,9 +231,6 @@ class GlobalCtrlTapHook:
             while self._running:
                 left_down = bool(user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000)
                 right_down = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-                if (not self._hook or self._using_fallback) and (not self._fallback_notice_sent) and self.on_error:
-                    self._fallback_notice_sent = True
-                    bindings.app.wx_call_after_if_alive(self.on_error, "全局语音热键进入兼容模式（轮询）")
                 combo = (left_down and right_down) or (
                     (left_down or right_down) and self._should_use_poller_release() and any(
                         self._should_mark_combo_key(vk) and user32.GetAsyncKeyState(vk) & 0x8000

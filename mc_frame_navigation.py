@@ -549,12 +549,34 @@ class ChatNavigationMixin:
             return self._notes_move_entry_up() if direction < 0 else self._notes_move_entry_down()
         return self._navigate_history_chats(direction)
 
-    def _cancel_chat_navigation_focus(self) -> None:
+    def _cancel_chat_navigation_focus(self, *, stop_speech=True) -> None:
         self._chat_navigation_generation = getattr(self, "_chat_navigation_generation", 0) + 1
         timer = getattr(self, "_chat_navigation_timer", None)
         if timer is not None:
             timer.Stop()
             self._chat_navigation_timer = None
+            if stop_speech:
+                self._chat_navigation_tts.stop()
+        if stop_speech:
+            self._flush_chat_navigation_answer_rows()
+            self._flush_chat_navigation_history_selection()
+
+    def _flush_chat_navigation_history_selection(self) -> None:
+        if not getattr(self, "_chat_navigation_history_selection_deferred", False):
+            return
+        self._chat_navigation_history_selection_deferred = False
+        if getattr(self, "_closing", False) or not self._is_ui_alive():
+            return
+        owner = self.view_history_id if self.view_mode == "history" else self._current_history_id()
+        if owner and not self._select_history_row_if_present(owner):
+            self._refresh_history(owner)
+
+    def _flush_chat_navigation_answer_rows(self, *, select_latest_message=False) -> None:
+        if not getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return
+        self._chat_navigation_answer_rows_deferred = False
+        if not getattr(self, "_closing", False) and self._is_ui_alive():
+            self._render_answer_list(preserve_panel=True, select_latest_message=select_latest_message)
 
     def _on_chat_navigation_child_focus(self, event) -> None:
         if (getattr(self, "_chat_navigation_timer", None) is not None
@@ -563,50 +585,58 @@ class ChatNavigationMixin:
         event.Skip()
 
     def _announce_chat_navigation(self, chat_id: str, title: str, focus) -> None:
-        tts = self._zdsr_tts
-        try:
-            spoken = tts.speak(title)
-        except Exception:
-            spoken = False
-        speech_generation = tts.speech_generation
+        tts = self._chat_navigation_tts
         navigation_generation = self._chat_navigation_generation
         self._chat_navigation_origin = focus
         started = bindings.app.time.monotonic()
         speaking = False
+        retried = False
+        idle_since = None
+        spoken = tts.speak_chat_navigation(title)
 
         def finish():
-            if any(row[0] in {"answer", "question"} for row in self.answer_meta):
-                self._apply_detail_panel_mode("answers")
-                self._focus_latest_answer_immediately(include_question=True)
+            self._flush_chat_navigation_answer_rows(select_latest_message=True)
+            self._focus_latest_answer_immediately(include_question=True, reveal_answers=True)
+            self._flush_chat_navigation_history_selection()
 
         def poll():
-            nonlocal speaking
+            nonlocal speaking, spoken, retried, idle_since
             if navigation_generation != self._chat_navigation_generation:
                 return
-            self._chat_navigation_timer = None
             if (getattr(self, "_closing", False) or not self._is_ui_alive()
-                    or tts is not self._zdsr_tts or speech_generation != tts.speech_generation
                     or wx.Window.FindFocus() is not focus):
+                self._cancel_chat_navigation_focus()
                 return
             visible = self.view_history_id if self.view_mode == "history" else self._current_history_id()
             if visible != chat_id:
+                self._cancel_chat_navigation_focus()
                 return
             elapsed = bindings.app.time.monotonic() - started
+            if spoken is None and elapsed < 4.0:
+                spoken = tts.speak_chat_navigation(title)
             state = tts.speak_state() if spoken else None
             if state is True:
                 speaking = True
+                idle_since = None
             elif state is False and speaking:
-                finish()
-                return
-            elif not spoken or (elapsed >= 2.0 and (not speaking or state is None)):
-                # Degrade when speech never started or the reader stopped
-                # reporting state. Idle before onset is not completion.
-                finish()
+                if idle_since is None:
+                    idle_since = elapsed
+                elif elapsed - idle_since >= 0.075:
+                    self._chat_navigation_timer = None
+                    finish()
+                    return
+            elif not retried and spoken is True and state is False and elapsed >= 1.75:
+                # Older DLLs can accept the first request while internally
+                # initializing, then never start it or report initialization.
+                spoken = tts.speak_chat_navigation(title)
+                retried = True
+            elif spoken is False or (elapsed >= 4.0 and (not speaking or state is None)):
+                self._cancel_chat_navigation_focus()
                 return
             # A stuck reader must never move focus while reporting speech.
             self._chat_navigation_timer = wx.CallLater(250 if elapsed >= 15 else 25, poll)
 
-        self._chat_navigation_timer = wx.CallLater(25 if spoken else 1, poll)
+        self._chat_navigation_timer = wx.CallLater(25, poll)
 
     def _on_global_ctrl_arrow(self, direction: str) -> None:
         direction_key = str(direction or "").strip().lower()

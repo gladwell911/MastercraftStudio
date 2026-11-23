@@ -14,6 +14,12 @@ Execution detail delivery applies withdrawal at read or publish time. A page or 
 
 Production uses separate `mc` and `mobile` users. The mobile password is the pairing token; the desktop password is independently generated in application data. Mobile permissions allow scoped RPC, notification consumption and ACK, but deny stream mutation and legacy mixed-stream access. Legacy token-only clients require a coordinated upgrade.
 
+## Usage and final answers
+
+State and history detail snapshots can carry `session_usage` with `stamp`, `revision`, `supported` and `tokens`. The feed-scoped `chat_session_usage` hint sends the same structure when the owner’s usage changes. `tokens: null` means unknown and `0` is a measured zero. Older payloads may omit `session_usage`. The `chat_information` command keeps the four-row `rows` contract and adds `detail_rows` in desktop order plus optional `session_total_tokens`.
+
+`execution_page_v3` marks completed public answers as `kind: final` and sends `message_id` when the canonical assistant identity is available. The identity map participates in freezing the snapshot. `answer_text` preserves original Markdown and can carry `answer_text_continuation` for the owner-bound `content_page` command, including completed legacy answers without a canonical ID. Typed `answer_preview` rows represent partial or unconfirmed answers.
+
 ## Chat attachments
 
 A negotiated V2 peer advertises chat-attachments-v1 when the managed HTTP receiver is available. RC requests each upload with file_upload_request and confirms it with file_complete for the same chat and send ID. It then submits one message with attachment_file_ids and client_send_id. MC derives source authority from the negotiated RPC and validates the references against source, chat and clear revision. PUT publishes complete bytes atomically. SQLite binds the receipt to the original payload and owner so acknowledgement loss can be retried. A send whose acceptance could not be confirmed after an MC exit stays pending. RC retains the option to save the draft locally.

@@ -28,7 +28,9 @@ class ChatInformationSubscriptions:
 
     def snapshot(self, chat, model, subscription):
         frame = self.frame
-        rows = frame._chat_information_rows(chat, model)
+        detail_rows = frame._chat_information_rows(chat, model)
+        # Keep the mobile four-row contract after the desktop added cache hits.
+        rows = detail_rows[:2] + detail_rows[-2:]
         identity = frame._chat_information_identity(chat, model)
         provider = "codex" if model.startswith("codex/") else "kimi"
         owner = frame._information_cache_owner(chat, provider)
@@ -39,12 +41,15 @@ class ChatInformationSubscriptions:
         previous = self.snapshots.get(key)
         revision = previous[2] if previous else 0
         owner_identity = tuple(identity) + (int(owner[3]),)
-        if previous is None or previous[:2] != (owner_identity, tuple(rows)):
+        total = frame._session_total_tokens(chat, model)
+        facts = (tuple(detail_rows), total)
+        if previous is None or previous[:2] != (owner_identity, facts):
             revision += 1
-            self.snapshots[key] = (owner_identity, tuple(rows), revision)
+            self.snapshots[key] = (owner_identity, facts, revision)
         return {"chat_id": key, "subscription_id": subscription["subscription_id"],
                 "generation": subscription["generation"], "identity": identity,
-                "owner_generation": int(owner[3]), "revision": revision, "rows": rows}
+                "owner_generation": int(owner[3]), "revision": revision, "rows": rows,
+                "detail_rows": detail_rows, "session_total_tokens": total}
 
     def command(self, payload):
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
@@ -139,7 +144,7 @@ class ChatInformationSubscriptions:
                 "context_only": desktop_context, "started": kimi_pending.get("started", time.monotonic()),
                 "full_refresh": not context_only and desktop_context}
             self.requests[chat_id] = request
-            if not desktop_context:
+            if not desktop_context and (not kimi_pending.get("usage_only") or not context_only):
                 self.frame._request_kimi_quota(chat, model, scoped=True)
             return True
         self.generation -= 1

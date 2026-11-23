@@ -118,6 +118,58 @@ def test_global_ctrl_poller_release_enabled_when_hook_missing():
     assert hook._should_use_poller_release()
 
 
+@pytest.mark.parametrize("failure", ["install", "message_loop"])
+def test_global_ctrl_hook_preserves_hmodule_and_reports_native_error(monkeypatch, failure):
+    import ctypes
+    from ctypes import wintypes
+    from types import SimpleNamespace
+
+    class Function:
+        def __init__(self, run):
+            self.run = run
+
+        def __call__(self, *args):
+            return self.run(*args)
+
+    module = 0x123456789
+    passed = []
+    errors = []
+    unhooked = []
+
+    def install(_kind, _callback, handle, _thread):
+        passed.append(handle)
+        ctypes.set_last_error(1428)
+        return None if failure == "install" else 99
+
+    def get_message(*_args):
+        ctypes.set_last_error(123)
+        return -1
+
+    libraries = {
+        "kernel32": SimpleNamespace(GetModuleHandleW=Function(lambda _: module), GetCurrentThreadId=lambda: 1),
+        "user32": SimpleNamespace(SetWindowsHookExW=Function(install), CallNextHookEx=Function(lambda *_: 0),
+                                  UnhookWindowsHookEx=Function(unhooked.append), PeekMessageW=lambda *_: 0,
+                                  GetMessageW=get_message),
+    }
+
+    def load(name, *, use_last_error):
+        assert use_last_error
+        return libraries[name]
+
+    monkeypatch.setattr(ctypes, "WinDLL", load)
+    monkeypatch.setattr(main, "wx_call_after_if_alive", lambda callback, *args: callback(*args))
+    hook = main.GlobalCtrlTapHook(lambda *_: None, errors.append)
+    hook._running = True
+    hook._thread_main()
+    assert libraries["kernel32"].GetModuleHandleW.argtypes == [wintypes.LPCWSTR]
+    assert libraries["kernel32"].GetModuleHandleW.restype is wintypes.HMODULE
+    assert passed == [module]
+    assert hook.backend_state == "poller_only" and hook._should_use_poller_release()
+    expected_error = "1428" if failure == "install" else "123"
+    assert len(errors) == 1 and expected_error in errors[0] and "轮询" in errors[0]
+    assert unhooked == ([] if failure == "install" else [99])
+
+
 def test_global_ctrl_poller_release_disabled_when_hook_recent(monkeypatch):
     hook = main.GlobalCtrlTapHook(lambda *_a, **_k: None)
     hook._running = True

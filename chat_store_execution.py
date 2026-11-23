@@ -128,7 +128,9 @@ class ChatStoreExecutionMixin:
             step_rows = conn.execute(
                 "SELECT step_index,payload_json FROM execution_steps WHERE chat_id=? ORDER BY step_index", (owner,)
             ).fetchall()
-            current_hash = self._execution_projection_source_hash(current_revision, turn_rows, step_rows)
+            current_hash = self._execution_projection_source_hash(
+                current_revision, turn_rows, step_rows, self._execution_answer_message_ids(conn, owner),
+            )
             if current_revision != int(revision) or current_hash != source_hash:
                 raise ValueError("EXECUTION_SOURCE_CHANGED")
             previous = conn.execute(
@@ -205,7 +207,9 @@ class ChatStoreExecutionMixin:
             ).fetchall()]
         has_more = start > 0
         for projected in selected:
-            for field in ("list_text", "detail_text"):
+            for field in ("list_text", "detail_text", "answer_text"):
+                if field not in projected:
+                    continue
                 prefix, continuation = self.content_continuation(chat_id=owner,
                     text=str(projected.get(field) or ""), secret=secret, prefix_bytes=1024)
                 if continuation:
@@ -793,8 +797,9 @@ class ChatStoreExecutionMixin:
                           list_text,detail_text FROM execution_steps
                    WHERE chat_id=? ORDER BY step_index""", (owner,)
             ).fetchall()
+            answer_message_ids = self._execution_answer_message_ids(conn, owner)
             source_hash = self._execution_projection_source_hash(
-                int(state["revision"]) if state else 0, turn_rows, step_rows,
+                int(state["revision"]) if state else 0, turn_rows, step_rows, answer_message_ids,
             )
             turns = [self._json_dict(row["payload_json"]) for row in turn_rows]
             steps = []
@@ -813,14 +818,24 @@ class ChatStoreExecutionMixin:
             "source_hash": source_hash,
             "turns": turns,
             "steps": steps,
+            "answer_message_ids": answer_message_ids,
         }
 
     @staticmethod
-    def _execution_projection_source_hash(revision, turn_rows, step_rows) -> str:
+    def _execution_answer_message_ids(conn, owner: str) -> dict[int, str]:
+        return {int(row["legacy_turn_index"]): str(row["message_id"]) for row in conn.execute(
+            "SELECT legacy_turn_index, MIN(message_id) AS message_id FROM canonical_messages "
+            "WHERE chat_id=? AND role='assistant' AND legacy_turn_index IS NOT NULL "
+            "GROUP BY legacy_turn_index HAVING COUNT(*) = 1", (owner,)
+        )}
+
+    @staticmethod
+    def _execution_projection_source_hash(revision, turn_rows, step_rows, answer_message_ids) -> str:
         source = [
             int(revision),
             [str(row["payload_json"]) for row in turn_rows],
             [[int(row["step_index"]), str(row["payload_json"])] for row in step_rows],
+            sorted(answer_message_ids.items()),
         ]
         return hashlib.sha256(json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 

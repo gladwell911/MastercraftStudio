@@ -214,7 +214,7 @@ def execution_turn_context_steps(
     question = str(turn.get("question") or "").strip()
     answer_md = str(turn.get("answer_md") or "").strip()
     answer = ""
-    if answer_md and answer_md != requesting_text:
+    if answer_md and answer_md != requesting_text and not turn.get("private_reasoning"):
         answer = answer_to_plain(answer_md, str(turn.get("model") or selected_model or "")).strip()
 
     def timestamp(raw_kind: str):
@@ -336,6 +336,7 @@ def project_execution_rows(
     *, chat_id: str, revision: int, steps: list, turns: list,
     view_mode: str, active_turn_index: int, selected_model: str,
     requesting_text: str, answer_to_plain: Callable[[str, str], str],
+    answer_message_ids: dict[int, str] | None = None,
 ) -> list[dict]:
     """Project canonical source into ordered, readable content rows."""
     canonical = collapse_kimi_execution_lifecycle(steps)
@@ -358,11 +359,27 @@ def project_execution_rows(
         title, detail = execution_meta_text(step)
         if not title.strip():
             continue
-        rows.append({
+        row = {
             "row_id": execution_row_id(chat_id, revision, step, occurrences[index]),
             "list_text": title,
             "detail_text": detail,
             "created_at": _execution_timestamp(step),
             "turn_index": step.get("turn_idx") if isinstance(step, dict) else None,
-        })
+        }
+        if isinstance(step, dict) and step.get("synthetic") == "answer":
+            turn_index = step["turn_idx"]
+            turn = turns[turn_index]
+            status = str(turn.get("request_status") or "").strip().lower()
+            legacy_completion = not status and not turn.get("request_error") and (
+                _finite_timestamp(turn.get("answer_at")) is not None
+                or _finite_timestamp(turn.get("answer_order")) is not None
+            )
+            row["kind"] = "answer_preview"
+            if status in {"done", "completed"} or legacy_completion:
+                row["kind"] = "final"
+                row["answer_text"] = str(turn.get("answer_md") or "")
+                message_id = (answer_message_ids or {}).get(turn_index)
+                if message_id:
+                    row["message_id"] = message_id
+        rows.append(row)
     return rows

@@ -60,3 +60,29 @@ def test_zdsr_tts_reinitializes_after_speak_failure(monkeypatch):
     assert len(recovered.init_calls) == 1
     assert recovered.stop_calls == 1
     assert recovered.speak_calls == [("恢复朗读", 1)]
+
+
+def test_navigation_waits_for_named_channel_and_replaces_without_stopping(monkeypatch):
+    api = _FakeApi()
+    state = [9]
+    api.GetSpeakState = _Callable(lambda: state[0])
+    ordinary = zdsr_tts.ZDSRTTSClient()
+    titles = zdsr_tts.ZDSRTTSClient(chat_navigation=True)
+    for client in (ordinary, titles):
+        monkeypatch.setattr(client, "_load_api", lambda: api)
+    assert titles.speak_chat_navigation("discarded while starting") is None
+    assert api.speak_calls == []
+    state[0] = 4
+    assert titles.speak_chat_navigation("first") is True
+    assert titles.speak_chat_navigation("latest") is True
+    assert api.speak_calls == [("first", 1), ("latest", 1)]
+    assert len(api.init_calls) == 1 and api.init_calls[0][0::2] == (1, 0)
+    assert api.init_calls[0][1].startswith("MC.ChatNavigation.")
+    assert api.stop_calls == 0
+    titles.stop()
+    assert api.stop_calls == 1
+    assert ordinary.speak("ordinary")
+    assert api.init_calls[-1][0::2] == (0, 1)
+    assert titles.speak_chat_navigation("another title")
+    assert api.init_calls[-1] == api.init_calls[0]
+    assert api.stop_calls == 2

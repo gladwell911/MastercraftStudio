@@ -13,7 +13,7 @@
 - [Kimi 功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md) 与 [清理和交互复审修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md) 保存源码变更、审查裁决及验证命令。
 - [`../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md`](../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md)：steered REST恢复的实施、精确验证命令和真实隔离证据；[独立审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-recovery-20261118.md)的父裁决以计划为准
 - [steered REST 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 保存活动长任务断连的证据和未验证协议边界。
-- [`voice-input.md`](./voice-input.md)：双 Ctrl 使用反馈、设备/ASR会话所有权、FIFO与停止/取消约定；验收状态由handoff维护
+- [语音输入与争渡导航](voice-input.md) 说明双 Ctrl、设备与 ASR 会话、停止和取消，以及标题播报的打断与移焦。
 - [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
 - Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
@@ -59,6 +59,7 @@
 - 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。2026-11-21 起增加 OneDrive `mc-private/` 机器配置恢复资料（显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值，实现见 `remote_machine_config.py`）。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 问题/答案按独立question_order/answer_order排序并在格式化前选择消息尾页；created_at/answer_at只用于时间标签，时间行累计300秒。终结重放保留顺序和时间；旧记录仅合并可信时间，不填当前时间。Kimi steer alias共用answer_identity，alias正文为空并引用answer_alias_of；旧手机忽略新增排序字段的显示边界保留。
 - Codex 和 KimiCode 的回答列表以整数千位显示会话累计 token，Alt+Y 显示原生上下文、累计 token、按输入 token 加权的缓存命中率及各自额度。Kimi V2 的上下文与累计来源见 [Kimi 运行时](kimi-runtime.md)。
+- RC 的累计、六行聊天信息和执行页最终回答使用 MC 提供的会话数据。协议字段和兼容边界见 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
 - 回答列表与 Enter 详情缩短网址和文件路径。Shift+Enter 的网页、文件提取、跨端正文和继续提问使用完整回答。详情编辑仅保存在临时缓冲区，关闭窗口即丢弃。
 - 普通 OpenRouter Claude 附件经过有界后台读取，提交时重验草稿归属。当前选中文件按模态编码，后续请求重放同一会话内可读取的附件，无法读取的历史附件用具名提示表示。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。

@@ -61,8 +61,8 @@ def _information_command(frame, *, context_only=False, release=False, generation
 def test_mobile_information_reads_archived_owner_without_switching_desktop(frame, monkeypatch):
     desktop, target, published, reads, ready = _scoped_information_fixture(frame, monkeypatch)
     status, snapshot = _information_command(frame)
-    assert status == 200 and snapshot["rows"] == frame._chat_information_rows(target, "codex/main")
-    assert len(snapshot["rows"]) == 6 and ready.wait(2)
+    assert status == 200 and snapshot["detail_rows"] == frame._chat_information_rows(target, "codex/main")
+    assert len(snapshot["detail_rows"]) == 6 and len(snapshot["rows"]) == 4 and ready.wait(2)
     read = reads[0]
     payload = dict(read, native_usage={"session_total_tokens": 700,
         "context_usage": {"source": "codex", "used_tokens": 100, "context_window": 1000},
@@ -70,7 +70,7 @@ def test_mobile_information_reads_archived_owner_without_switching_desktop(frame
     frame._information_subscriptions().apply_codex("phone-a", {}, payload)
     assert target["codex_session_total_tokens"] == 700
     assert frame._current_chat_state is desktop and frame._chat_information_dialog is None
-    assert published[-1]["rows"] == frame._chat_information_rows(target, "codex/main")
+    assert published[-1]["detail_rows"] == frame._chat_information_rows(target, "codex/main")
     revision = published[-1]["revision"]
     count = len(published)
     frame._refresh_chat_information(target)
@@ -153,7 +153,8 @@ def test_mobile_kimi_without_session_still_reads_quota(frame, wx_app, monkeypatc
         time.sleep(.01)
     assert calls == ["start", "auth"]
     assert not frame._information_subscriptions().requests
-    assert "此登录方式不适用" in published[-1]["rows"][4]
+    assert "此登录方式不适用" in published[-1]["detail_rows"][4]
+    assert published[-1]["rows"][2] == published[-1]["detail_rows"][4]
     assert frame._current_chat_state is desktop and frame._chat_information_dialog is None
 
 
@@ -215,9 +216,70 @@ def test_mobile_kimi_adopts_usage_and_quota_when_desktop_window_closes(frame, wx
         {"session": {"usage": {"input_tokens": 8, "output_tokens": 2}}}, False)
     frame._apply_kimi_quota(17, identity, {"kind": "not_applicable"}, False)
     assert target["kimi_session_total_tokens"] == 10
-    assert "此登录方式不适用" in published[-1]["rows"][4]
+    assert "此登录方式不适用" in published[-1]["detail_rows"][4]
+    assert published[-1]["rows"][2] == published[-1]["detail_rows"][4]
     assert not frame._information_subscriptions().requests
     assert not frame._scoped_kimi_quota_requests and frame._chat_information_dialog is None
+
+
+@pytest.mark.parametrize("adopted", [False, True])
+def test_kimi_completion_usage_outlives_closed_information_observers(frame, wx_app, monkeypatch, adopted):
+    owner = "phone-a"
+    chat = {"id": owner, "title": "owner", "model": "kimi/main", "kimi_session_id": "session-a",
+            "turns": [{"question": "q", "answer_md": "a", "request_status": "done"}]}
+    frame.active_chat_id = frame.current_chat_id = owner
+    frame._current_chat_state = chat
+    frame.active_session_turns = chat["turns"]
+    frame.selected_model = "kimi/main"
+    frame._save_state()
+    callbacks, publishes, quota = [], [], []
+
+    class Client:
+        protocol_version = 1
+
+        def start(self):
+            pass
+
+        def get_status(self, _session):
+            return {"context_tokens": 2, "max_context_tokens": 10}
+
+        def get_snapshot(self, _session):
+            return {"session": {"usage": {"input_tokens": 21000, "output_tokens": 345}}}
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(frame, "_kimi_client", Client())
+    monkeypatch.setattr(main.ChatFrame, "_request_kimi_chat_information", _REAL_KIMI_INFORMATION_REQUEST)
+    monkeypatch.setattr(frame, "_publish_remote_nats_event", publishes.append)
+    monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_args, **_kwargs: quota.append(True))
+    with monkeypatch.context() as opening:
+        opening.setattr(frame, "_request_kimi_chat_information", lambda *_args, **_kwargs: None)
+        assert frame._show_chat_information()
+    quota.clear()
+    with monkeypatch.context() as worker:
+        worker.setattr(main.threading, "Thread", ImmediateThread)
+        worker.setattr(frame, "_call_after_if_alive", lambda fn, *args: callbacks.append((fn, args)))
+        frame._request_kimi_chat_information(chat, "kimi/main", visible_only=True, context_only=True)
+        frame._refresh_context_usage_after_done(chat, chat["turns"], 0, "kimi/main")
+        if adopted:
+            assert _information_command(frame, context_only=True)[0] == 200
+        frame._chat_information_dialog.Close()
+        if adopted:
+            assert _information_command(frame, release=True)[0] == 200
+        while callbacks:
+            fn, args = callbacks.pop(0)
+            fn(*args)
+    wx_app.Yield()
+    assert frame._current_chat_state["kimi_session_total_tokens"] == 21345
+    frame._flush_codex_background_updates()
+    assert frame.chat_store.load_chat(owner)["kimi_session_total_tokens"] == 21345
+    assert any(event["type"] == "chat_session_usage" and event["session_usage"]["tokens"] == 21345 for event in publishes)
+    assert not quota
 
 
 @pytest.mark.parametrize("provider", ["codex", "kimi"])

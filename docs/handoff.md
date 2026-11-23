@@ -1,13 +1,26 @@
 # 当前交接
 
-更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本轮从 `ca4170a` 开始，日常目标仍为 `D:/code/cx/md/mc.exe`。
+更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。语音与回答无障碍批次从 `267429d` 开始，日常目标为 `D:/code/cx/md/mc.exe`。
+
+## 2026-11-23 语音快捷键与回答无障碍
+
+- 源码修复 64 位双 Ctrl 钩子和争渡标题接替。输入、回答、历史三个原焦点均经过真实 wx 键盘路径验证。RC 收到同源累计、六行聊天信息与可续页的最终回答。见 [语音与导航](voice-input.md) 和 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
+- 最终补丁独立复验 MC 10 项、RC 5 项通过。独立进程装卸了 x64 钩子，争渡安装目录的 x64 SDK 通过 WASAPI 回环验证首次起声、接替与停止。宽测的 MC 6 项、RC 3 项失败在相应原基线复现。完整记录位于共享工作区 `D:/code/sj/_bmad-output/implementation-artifacts/plan-mc-rc-voice-answer-accessibility-20261123.md`。
+- 下一次验收使用明确标识的构建，核实体左右 Ctrl、连续标题实际听感及实体 Android TalkBack。当前证据来自源码和隔离探针。
+
+在 MC 根目录串行复现代表性用例：
+
+```powershell
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_desktop_navigation_ui_automation.py -k 'chat_shortcut or native_chat_navigation or history_origin_selects_empty or answer_mouse_discards'
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_main_entry.py::test_global_ctrl_hook_preserves_hmodule_and_reports_native_error tests/test_chat_information_ui_automation.py::test_kimi_completion_usage_outlives_closed_information_observers tests/test_main_execution_ui.py::test_remote_execution_projection_page_uses_canonical_steps
+```
 
 ## 2026-11-23 聊天交互、语音和退出
 
-- Ctrl+↑/↓ 切换历史。播报期间执行面板切换到当前会话的数据，原生焦点保留，播报结束后选中最后一条回答或未答提问。连续切换或主动移焦会取消旧定位。
+- `ca4170a` 起始批次首次实现 Ctrl+↑/↓ 后按标题结束定位。最新切换与取消规则见本页「语音快捷键与回答无障碍」。
 - Alt+A 先播放确认音，再按原聊天归属持久化清除和重发。已提交改名、后续回合与恢复身份在竞争中保留。语音输入保留设备尾段，最后发送一次终止帧。正常关闭先隐藏窗口并结算已接受的写入，持续存储故障恢复可访问窗口。实现入口见 [文档索引](README.md) 和 [关闭说明](runtime-maintenance.md#关闭与持久化)。
 - 第二轮定向 43 项通过，独立复验 11 项通过。快速复查修复后键盘定向 2 项通过，独立复验 2 项通过。原生 wx 清理仍可输出基线 COM `0x8001010d` 诊断，定向运行退出码为 0。
-- 早期隔离模拟器通过 V2 NATS 手机清除，只证明当时源码。日常进程和安装包未切换。争渡实际播报与物理按键、麦克风句尾及云识别、打包 MC 的实际 Alt+F4 退出待现场验收。各轮命令和模拟器版本以共享工作区 `_bmad-output/implementation-artifacts/` 下的 2026-11-23 交互主计划和复审修复计划为准。
+- 早期隔离模拟器的 V2 NATS 手机清除证据对应当时源码。麦克风句尾及云识别、打包 MC 的实际 Alt+F4 退出待现场验收。各轮命令和模拟器版本见共享工作区 `_bmad-output/implementation-artifacts/` 下的 2026-11-23 交互主计划和复审修复计划。
 
 在 MC 根目录复现最终键盘和代表性持久化、录音用例：
 

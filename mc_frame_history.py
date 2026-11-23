@@ -1167,6 +1167,8 @@ class ChatHistoryMixin:
         current_id = self._current_history_id()
         seen_ids = set()
         selected_id = self.history_list_model.selected_id() if hasattr(self, "history_list_model") else ""
+        if selected_id and getattr(self, "_chat_navigation_history_selection_deferred", False):
+            keep_id = selected_id
         target = str(keep_id if keep_id is not None else selected_id or self.view_history_id or "").strip()
         for chat_id in self._get_all_chat_ids_in_order():
             if not chat_id or chat_id in seen_ids:
@@ -1275,6 +1277,8 @@ class ChatHistoryMixin:
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             return False
+        if getattr(self, "_chat_navigation_history_selection_deferred", False):
+            return True
         if hasattr(self, "history_list_model"):
             return self.history_list_model.set_selection_by_id(chat_id)
         try:
@@ -1592,6 +1596,8 @@ class ChatHistoryMixin:
             return None
 
     def _selected_read_target(self, index=None):
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            return None
         index = self.answer_list.GetSelection() if index is None else index
         if index < 0 or index >= len(self.answer_meta) or self.answer_meta[index][0] != "answer":
             return None
@@ -1666,6 +1672,9 @@ class ChatHistoryMixin:
                                            "pair_id": frozen["pair_id"]})
 
     def _on_answer_mouse_read(self, event):
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            self._cancel_chat_navigation_focus()
+            return
         index = self.answer_list.HitTest(event.GetPosition())
         target = self._selected_read_target(index)
         event.Skip()
@@ -1679,6 +1688,9 @@ class ChatHistoryMixin:
         self._touch_navigation_quiet_window(event)
         if self._handle_ctrl_history_navigation(event):
             return
+        if (getattr(self, "_chat_navigation_history_selection_deferred", False)
+                and event.GetKeyCode() not in (wx.WXK_CONTROL, wx.WXK_SHIFT, wx.WXK_ALT)):
+            self._cancel_chat_navigation_focus()
         if self._handle_primary_tab_navigation(event):
             return
         key = event.GetKeyCode()
@@ -1733,7 +1745,8 @@ class ChatHistoryMixin:
         if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             self._sync_codex_speed_combo_from_chat(chat)
 
-    def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True, preserve_panel=False) -> bool:
+    def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True,
+                           preserve_panel=False, sync_history_selection=True) -> bool:
         selected_id = str(chat_id or "").strip()
         if not selected_id:
             return False
@@ -1757,7 +1770,7 @@ class ChatHistoryMixin:
                 self._render_answer_list(preserve_panel=True)
             else:
                 self._render_answer_list()
-            if not self._select_history_row_if_present(selected_id):
+            if sync_history_selection and not self._select_history_row_if_present(selected_id):
                 self._mark_history_list_dirty(selected_id)
             self._defer_chat_state_save()
             if focus_answer_list:
@@ -1777,7 +1790,7 @@ class ChatHistoryMixin:
             self._render_answer_list(preserve_panel=True)
         else:
             self._render_answer_list()
-        if not self._select_history_row_if_present(selected_id):
+        if sync_history_selection and not self._select_history_row_if_present(selected_id):
             self._mark_history_list_dirty(selected_id)
         self._defer_chat_state_save()
         self.SetStatusText("已切换到历史聊天")
@@ -1799,15 +1812,21 @@ class ChatHistoryMixin:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()
 
-    def _focus_latest_answer_immediately(self, *, include_question=False) -> bool:
+    def _focus_latest_answer_immediately(self, *, include_question=False, reveal_answers=False) -> bool:
         if not hasattr(self, "answer_list"):
             return False
         message_kinds = {"answer", "question"} if include_question else {"answer"}
         for i in range(len(getattr(self, "answer_meta", []) or []) - 1, -1, -1):
             if self.answer_meta[i][0] in message_kinds:
                 try:
-                    self.answer_list.SetSelection(i)
-                    self.answer_list.SetFocus()
+                    if self.answer_list.GetSelection() != i:
+                        self.answer_list.SetSelection(i)
+                    if reveal_answers:
+                        # Revealing the list can move native focus. Select its
+                        # destination before changing the panel.
+                        self._apply_detail_panel_mode("answers")
+                    if not self.answer_list.HasFocus():
+                        self.answer_list.SetFocus()
                     return True
                 except Exception:
                     return False
@@ -1874,15 +1893,21 @@ class ChatHistoryMixin:
     def _navigate_history_chats(self, direction: int) -> bool:
         self._release_execution_focus_lease()
         chat_id = self._adjacent_history_chat_id(direction)
-        if not chat_id:
+        chat = self._history_chat_for_id(chat_id) if chat_id else None
+        if chat is None:
             return False
-        self._cancel_chat_navigation_focus()
         focus = wx.Window.FindFocus()
-        if not self._show_history_chat(chat_id, focus_answer_list=False, preserve_panel=True):
-            return False
-        chat = self._find_archived_chat(chat_id) if self.view_mode == "history" else self._current_chat_state
-        title = str((chat or {}).get("title") or "新聊天")
+        title = str(chat.get("title") or "新聊天")
+        self._cancel_chat_navigation_focus(stop_speech=False)
+        self._chat_navigation_answer_rows_deferred = focus is self.answer_list
+        self._chat_navigation_history_selection_deferred = focus is self.history_list
         self._announce_chat_navigation(chat_id, title, focus)
+        if not self._show_history_chat(
+            chat_id, focus_answer_list=False, preserve_panel=True,
+            sync_history_selection=focus is not self.history_list,
+        ):
+            self._cancel_chat_navigation_focus()
+            return False
         return True
 
     def _switch_current_chat(self, chat_id: str) -> bool:

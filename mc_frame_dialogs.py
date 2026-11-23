@@ -694,7 +694,8 @@ class ChatInformationDialog(wx.Dialog):
         self.owner._codex_information_full_refresh = None
         self.owner._kimi_quota_request = None
         request = self.owner._kimi_information_requests.get(self.identity[0])
-        if isinstance(request, dict) and request.get("visible_only"):
+        if (isinstance(request, dict) and request.get("visible_only")
+                and not (request.get("usage_only") or request.get("full_refresh_usage"))):
             self.owner._kimi_information_requests.pop(self.identity[0], None)
         self.owner._chat_information_dialog = None
         target = self.focus_target

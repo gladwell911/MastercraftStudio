@@ -1334,15 +1334,26 @@ def test_execution_enter_opens_plain_text_viewer_instead_of_web_detail(frame, mo
     assert opened_web == []
 
 
-def test_remote_execution_projection_page_uses_canonical_steps(frame, tmp_path):
+@pytest.mark.parametrize("canonical", [False, True])
+def test_remote_execution_projection_page_uses_canonical_steps(frame, tmp_path, canonical):
+    from remote_nats import RemoteNatsTransport
+
+    markdown = "  # 标题\n\n" + ("**原文**与 Unicode 🌱\r\n" * 190) + "\n  "
+    turn = {"question": "问题", "answer_md": markdown, "model": main.DEFAULT_MODEL_ID,
+            "created_at": 1.0, "answer_at": 2.0}
     store = main.ChatStore(tmp_path / "execution-v3.db")
     store.initialize()
     store.upsert_chat({"id": "chat-v3", "title": "测试", "model": main.DEFAULT_MODEL_ID,
                        "created_at": 1.0, "updated_at": 1.0,
-                       "turns": [{"question": "问题", "answer_md": "回答", "model": main.DEFAULT_MODEL_ID,
-                                  "created_at": 1.0}]})
-    store.replace_turns("chat-v3", [{"question": "问题", "answer_md": "回答",
-                                     "model": main.DEFAULT_MODEL_ID, "created_at": 1.0}])
+                       "turns": [turn]})
+    store.replace_turns("chat-v3", [turn])
+    original_source = store.read_execution_projection_source("chat-v3")
+    if not canonical:
+        with store._connect() as conn:
+            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND role='assistant'", ("chat-v3",))
+        with pytest.raises(ValueError, match="EXECUTION_SOURCE_CHANGED"):
+            store.create_execution_projection_snapshot(chat_id="chat-v3", revision=original_source["revision"],
+                                                       source_hash=original_source["source_hash"], rows=[])
     store.replace_execution_steps("chat-v3", [
         {"turn_idx": 0, "display_kind": "commentary", "list_text": "可见过程", "detail_text": "完整过程"},
         {"turn_idx": 0, "display_kind": "command", "list_text": "隐藏命令", "detail_text": "命令详情"},
@@ -1359,13 +1370,27 @@ def test_remote_execution_projection_page_uses_canonical_steps(frame, tmp_path):
         {"chat_id": "chat-v3", "body": {"limit": 10}}, secret="secret"
     )
     assert status == 200
-    assert [row["list_text"] for row in tail["rows"]] == ["我：问题", "可见过程", "小诸葛：回答"]
+    assert [row["list_text"] for row in tail["rows"][:2]] == ["我：问题", "可见过程"]
     assert all(row["row_id"].startswith("execution:chat-v3:") for row in tail["rows"])
+    answer = tail["rows"][-1]
+    assert answer["kind"] == "final" and answer["list_text"].startswith("小诸葛：")
+    assert answer.get("message_id") == (original_source["answer_message_ids"][0] if canonical else None)
+    transport = RemoteNatsTransport(pair_id="default", token="secret", durable_store=store)
+    rebuilt = answer["answer_text"]
+    cursor = answer["answer_text_continuation"]
+    assert rebuilt != markdown and cursor
+    while cursor:
+        status, piece = transport._route_command({"type": "content_page", "chat_id": "chat-v3", "body": {"cursor": cursor}})
+        assert status == 200
+        rebuilt += piece["text"]
+        cursor = piece["cursor"]
+    assert rebuilt == markdown
     frame._current_execution_steps_for_render = lambda: (2, store.load_execution_steps("chat-v3"))
     desktop_rows, desktop_meta = frame._execution_page_projection()
     desktop_content = [(row_id, text) for (row_id, text), meta in zip(desktop_rows, desktop_meta)
                        if meta[0] == "execution"]
-    assert desktop_content == [(row["row_id"], row["list_text"]) for row in tail["rows"]]
+    assert [row_id for row_id, _ in desktop_content] == [row["row_id"] for row in tail["rows"]]
+    assert all(text.startswith(row["list_text"]) for (_, text), row in zip(desktop_content, tail["rows"]))
 
 
 def test_focus_latest_answer_does_not_steal_focus_from_execution_list_when_find_focus_is_empty(frame, monkeypatch):
