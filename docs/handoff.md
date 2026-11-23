@@ -1,10 +1,24 @@
 # 当前交接
 
-更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。语音与回答无障碍批次从 `267429d` 开始，日常目标为 `D:/code/cx/md/mc.exe`。
+更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。
+
+## 2026-11-23 聊天切换与争渡播报
+
+- `c96c3c0` 将已验收的原生列表试验合入源码。Ctrl+↑/↓ 的标题复用语音上屏的争渡通道。连续切换以当前打开会话为基准，最新标题正常结束才定位到最后一条有正文的回答或未答提问。返回或操作历史列表时再同步已打开的聊天。原生回答列表首次入焦可播报「回答：列表」，自动定位不确认已读。使用入口见 [语音与导航](voice-input.md#聊天标题播报)。
+- `0bfe30d` 落实四层顺序独立审查确认的修复。鼠标历史菜单使用实际点中的聊天，远程新建失败时恢复可用视图，跨刷新或清空的旧回答手势失效。导航取消仅在 SDK 已接纳过当前切换序列的标题时停止共用通道。末尾定位跳过空白占位。审查裁决、故障注入和三项延期见 [初版规格](../_bmad-output/implementation-artifacts/spec-mc-chat-shortcut-screen-reader.md) 与 [审查修复规格](../_bmad-output/implementation-artifacts/spec-mc-chat-navigation-review-fixes.md)。
+- 最终规格套件 86 项通过、2 项失败。`test_native_history_navigation_defers_current_completion_reorder` 和 `test_register_global_hotkey_registers_backslash_variants` 均在固定基线 `6d1bc189` 以同一断言复现。远程及本地新建定向 16 项通过，私有 Windows 桌面末轮定向 10 项通过。SQLite 写锁和原生 Win32 手势探针通过。模拟播报的 WinEvent 对照记录了标题期间和显式进入历史列表时的原生事件。
+- 已验收的独立原生列表试验保留。`%TEMP%/mc-chat-shortcut-candidate-81e9fde2/dist/mc/mc.exe` 对应 `c96c3c0`。最终补丁 `0bfe30d` 尚未进入日常包。后续使用单独输出和隔离数据构建最终候选，在实体争渡中复听连续切换以及外部按键或播报打断后的焦点，再由用户安排日常进程退出和切换。
+
+在 MC 根目录串行复现最终定向验证。
+
+```powershell
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_desktop_navigation_ui_automation.py tests/test_zdsr_tts_unit.py tests/test_zdsr_tts_packaged_unit.py tests/test_main_voice.py
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_main_remote_routes.py tests/test_main_requests.py tests/test_main_codex.py tests/test_main_chat_information.py -k 'remote_new_chat or new_chat_broadcasts_remote_history_changed'
+```
 
 ## 2026-11-23 本机 Kimi 2.6.3 与 Codex 代理
 
-- `1380852` 接入本机 Kimi 2.6.3 Server API，保留 2.5.3 协议兼容。安装包改用用户安装的 CLI。日常旧包仍在使用，配置与恢复入口见 [Kimi 运行时](kimi-runtime.md)。
+- `1380852` 接入本机 Kimi 2.6.3 Server API，保留 2.5.3 协议兼容。该源码构建使用用户安装的 CLI，配置与恢复入口见 [Kimi 运行时](kimi-runtime.md)。日常 KimiCode 2.6.3 重新登录后，从正在使用的桌面 MC 实际提交一次提问，约 4.5 秒收到 `KIMI_MC_OK_58D424AC`。聊天切换批次范围为桌面导航。
 - 独立隔离验证中，真实 wx 聊天和审批 2 项通过，最终定向 43 项通过、3 项已知基线失败。隔离 `-BuildOnly` 退出 0，产物位于 `%TEMP%/mc-kimi-server-review-package/dist/mc`。实际冻结界面收到 `FROZEN_KIMI_REVIEW_OK_842` 并持久化为 `done`。见 [复审规格](../_bmad-output/implementation-artifacts/spec-kimi-server-review-fixes.md)。
 - `e4f60b1` 接入 Codex OneDrive 代理。真实子进程回归覆盖两台机器的独立覆盖和配置缺失时的回退。见 [长期运行维护](runtime-maintenance.md#codex-代理)。
 - 接续先用隔离历史样本验证 2.5.3 到 2.6.3 迁移和降级读取，再由用户安排日常切换，并在台式机及实体读屏环境验证。见 [迁移规格](../_bmad-output/implementation-artifacts/spec-local-kimi-cli.md)。
@@ -13,22 +27,19 @@
 .venv/Scripts/python.exe -m pytest -q tests/test_kimi_server_client_unit.py tests/test_codex_client_unit.py tests/test_packaging_specs.py
 ```
 
-## 2026-11-23 语音快捷键与回答无障碍
+## 2026-11-23 双 Ctrl 与跨端回答无障碍
 
-- 源码修复 64 位双 Ctrl 钩子和争渡标题接替。输入、回答、历史三个原焦点均经过真实 wx 键盘路径验证。RC 收到同源累计、六行聊天信息与可续页的最终回答。见 [语音与导航](voice-input.md) 和 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
-- 最终补丁独立复验 MC 10 项、RC 5 项通过。独立进程装卸了 x64 钩子，争渡安装目录的 x64 SDK 通过 WASAPI 回环验证首次起声、接替与停止。宽测的 MC 6 项、RC 3 项失败在相应原基线复现。完整记录位于共享工作区 `D:/code/sj/_bmad-output/implementation-artifacts/plan-mc-rc-voice-answer-accessibility-20261123.md`。
-- 下一次验收使用明确标识的构建，核实体左右 Ctrl、连续标题实际听感及实体 Android TalkBack。当前证据来自源码和隔离探针。
+- `267429d` 起始批次修复 64 位双 Ctrl 钩子。RC 收到同源累计、六行聊天信息与可续页的最终回答。见 [语音与导航](voice-input.md) 和 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
+- 当时的补丁独立复验 MC 10 项、RC 5 项通过。独立进程装卸了 x64 钩子，争渡安装目录的 x64 SDK 通过 WASAPI 回环验证首次起声、接替与停止。宽测失败在相应原基线复现。各项与对应实现见共享工作区 `D:/code/sj/_bmad-output/implementation-artifacts/plan-mc-rc-voice-answer-accessibility-20261123.md`。实体左右 Ctrl 与 Android TalkBack 仍需在目标构建中验收。
 
 在 MC 根目录串行复现代表性用例：
 
 ```powershell
-.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_desktop_navigation_ui_automation.py -k 'chat_shortcut or native_chat_navigation or history_origin_selects_empty or answer_mouse_discards'
 .venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_main_entry.py::test_global_ctrl_hook_preserves_hmodule_and_reports_native_error tests/test_chat_information_ui_automation.py::test_kimi_completion_usage_outlives_closed_information_observers tests/test_main_execution_ui.py::test_remote_execution_projection_page_uses_canonical_steps
 ```
 
 ## 2026-11-23 聊天交互、语音和退出
 
-- `ca4170a` 起始批次首次实现 Ctrl+↑/↓ 后按标题结束定位。最新切换与取消规则见本页「语音快捷键与回答无障碍」。
 - Alt+A 先播放确认音，再按原聊天归属持久化清除和重发。已提交改名、后续回合与恢复身份在竞争中保留。语音输入保留设备尾段，最后发送一次终止帧。正常关闭先隐藏窗口并结算已接受的写入，持续存储故障恢复可访问窗口。实现入口见 [文档索引](README.md) 和 [关闭说明](runtime-maintenance.md#关闭与持久化)。
 - 第二轮定向 43 项通过，独立复验 11 项通过。快速复查修复后键盘定向 2 项通过，独立复验 2 项通过。原生 wx 清理仍可输出基线 COM `0x8001010d` 诊断，定向运行退出码为 0。
 - 早期隔离模拟器的 V2 NATS 手机清除证据对应当时源码。麦克风句尾及云识别、打包 MC 的实际 Alt+F4 退出待现场验收。各轮命令和模拟器版本见共享工作区 `_bmad-output/implementation-artifacts/` 下的 2026-11-23 交互主计划和复审修复计划。
@@ -36,7 +47,6 @@
 在 MC 根目录复现最终键盘和代表性持久化、录音用例：
 
 ```powershell
-.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_desktop_navigation_ui_automation.py::test_chat_shortcut_reveals_answers_only_after_long_title tests/test_desktop_navigation_ui_automation.py::test_chat_shortcuts_wait_for_current_title_then_focus_last_message
 .venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_main_history_storage.py::test_close_persists_other_rows_and_attention_after_retired_notification_conflict tests/test_kimi_ui_responsiveness_automation.py::test_close_persists_chat_while_notes_http_is_still_pending tests/test_notes_desktop_unit.py::test_notes_sync_close_detaches_network_and_waits_accepted_writes tests/test_voice_input_integration.py::test_stop_keeps_pcm_callback_still_buffered_in_device
 ```
 
@@ -59,7 +69,7 @@
 - Kimi 流式执行写入在后台按序完成。REST 整理消息并分批更新 wx，重新校验归属和撤回状态。可重试存储故障恢复前，正常关闭继续等待已接收的 REST 批次和写入。撤回保护涵盖重开的 SQLite 执行详情和远端交付。
 - 独立审查落实 10 项修复并驳回 1 项。最终复验还修复了旧快照恢复后重新显示 31 个已撤回块的竞态。实际 wx 主循环中的 `CallLater` 续批和 SQLite 持有写锁期间均观测到原生焦点与选中事件，最后一条合法记录可从重开的临时 SQLite 读取。
 - 独立串行宽套件 wx 82 项通过、2 项既有失败，Kimi 集成 154 项通过、3 项既有失败。wx 的原生回答查看器测试也复现基线 Windows COM `0x8001010d`。最后一次竞态修正后，Kimi wx 21 项、定向流式和 REST 37 项、SQLite 与 NATS 131 项通过。命令、基线项与审查证据见 [Kimi 键盘响应实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md)。
-- 下一步在明确标识的目标构建，以相同控件和同一争渡环境对照空闲、Kimi 流式及 Codex 流式。记录物理按键到焦点和实际出声的时延，并验证真实云端。本轮未打包、部署或启动目标 `D:/code/cx/md/mc.exe`。日常程序退出和重启由用户安排，切包仍须核对数据路径。
+- 下一步在明确标识的目标构建，以相同控件和同一争渡环境对照空闲、Kimi 流式及 Codex 流式。记录物理按键到焦点和实际出声的时延，并验证真实云端。日常程序退出和重启由用户安排，切包仍须核对数据路径。
 
 ## 2026-11-20 至 2026-11-21 需求修复与代码审查
 

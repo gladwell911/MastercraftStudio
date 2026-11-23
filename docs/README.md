@@ -1,6 +1,6 @@
 # 文档索引
 
-截至 2026-11-23，源码已完成聊天切换、Alt+A 后台清空、语音尾段和分阶段退出的交互改进。源码和隔离冻结包已验证本机 Kimi 2.6.3。日常包仍使用原有 Kimi 2.5.3，切换待现场验收。各版本验证边界见 [当前交接](handoff.md)。
+截至 2026-11-23，源码已完成聊天切换、Alt+A 后台清空、语音尾段和分阶段退出的交互改进。Kimi 2.6.3 已通过源码和隔离冻结包验证，重新登录后在日常桌面 MC 实测收到一次回复。争渡导航修复的日常部署和实体复听待验收。各版本验证边界见 [当前交接](handoff.md)。
 
 ## 当前入口
 
@@ -14,6 +14,7 @@
 - [`../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md`](../_bmad-output/implementation-artifacts/plan-kimi-steer-rest-recovery-20261118.md)：steered REST恢复的实施、精确验证命令和真实隔离证据；[独立审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-recovery-20261118.md)的父裁决以计划为准
 - [steered REST 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 保存活动长任务断连的证据和未验证协议边界。
 - [语音输入与争渡导航](voice-input.md) 说明双 Ctrl、设备与 ASR 会话、停止和取消，以及标题播报的打断与移焦。
+- [聊天切换独立审查修复](../_bmad-output/implementation-artifacts/spec-mc-chat-navigation-review-fixes.md) 记录原生鼠标和焦点、远程新建故障、共用播报通道的验收矩阵。
 - [`runtime-maintenance.md`](./runtime-maintenance.md)：有界维护、日志、构建边界、诊断开关及安全基准
 - [`remote-control.md`](./remote-control.md)：台式机 default、笔记本 laptop 固定配置和跨端部署边界
 - Epic1 的工作区实施记录与 QA 报告当前未找到，移除失效链接；聊天信息规格和五项任务见下列仓库记录，旧验证结论只证明当时版本。
