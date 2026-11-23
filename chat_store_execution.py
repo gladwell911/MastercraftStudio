@@ -568,6 +568,28 @@ class ChatStoreExecutionMixin:
                      "(SELECT snapshot_id FROM execution_projection_snapshots WHERE chat_id=?)", (chat_id,))
         conn.execute("DELETE FROM execution_projection_snapshots WHERE chat_id=?", (chat_id,))
 
+    def withdraw_kimi_execution_item(self, chat_id: str, scope: dict[str, Any]) -> None:
+        logical_key = self.execution_logical_key(scope)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._execution_scope_retired(conn, chat_id, scope):
+                return
+            conn.execute(
+                """DELETE FROM execution_steps WHERE chat_id=? AND (logical_key=? OR (
+                    json_extract(payload_json,'$.revision')=?
+                    AND COALESCE(json_extract(payload_json,'$.session_id'),json_extract(payload_json,'$.thread_id'))=?
+                    AND json_extract(payload_json,'$.turn_id')=?
+                    AND json_extract(payload_json,'$.provider') IN ('kimi','kimi_server')
+                    AND json_extract(payload_json,'$.agent_id')=?
+                    AND (? IN (json_extract(payload_json,'$.item_id'),json_extract(payload_json,'$.tool_call_id')))
+                ))""",
+                (chat_id, logical_key, scope["revision"], scope["thread_id"], scope["turn_id"],
+                 scope["agent_id"], scope["native_id"]),
+            )
+            conn.execute("DELETE FROM execution_assemblers WHERE chat_id=? AND logical_key=?", (chat_id, logical_key))
+            conn.execute("DELETE FROM execution_fragment_conflicts WHERE chat_id=? AND logical_key=?", (chat_id, logical_key))
+            self._invalidate_execution_snapshots(conn, chat_id)
+
     def apply_execution_fragment(self, chat_id: str, logical_key: str, scope: dict[str, Any], *,
                                  fragment_id: str, offset: int | None, text: str,
                                  projection_seed: dict[str, Any] | None = None) -> dict[str, Any]:

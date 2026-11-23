@@ -1417,3 +1417,48 @@ def test_turn_start_preserves_matching_confirmed_policy(monkeypatch):
     client.start_turn_items("thread", [], sandbox="danger-full-access")
     assert calls[1]["sandboxPolicy"] == {"type": "dangerFullAccess"}
     assert "thread" not in client.thread_configurations
+
+def test_onedrive_proxy_values_reach_real_codex_child(monkeypatch, tmp_path):
+    import sys
+
+    config = tmp_path / "OneDrive" / "code" / "data" / "mc"
+    machines = config / "machines"
+    machines.mkdir(parents=True)
+    (config / "codex-proxy.env").write_text(
+        "HTTP_PROXY=shared-http\nHTTPS_PROXY=shared-https\nNO_PROXY=localhost\n"
+        "ALL_PROXY=ignored\nKIMI_BIN=ignored\n", encoding="utf-8",
+    )
+    (machines / "desktop.env").write_text("HTTP_PROXY=desktop-http\n", encoding="utf-8")
+    (machines / "laptop.env").write_text("HTTPS_PROXY=laptop-https\n", encoding="utf-8")
+    keys = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "KIMI_BIN")
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OneDriveConsumer", str(tmp_path))
+    monkeypatch.setenv("HTTP_PROXY", "inherited")
+    script = tmp_path / "print_env.py"
+    script.write_text(
+        f"import json, os\nprint(json.dumps([os.getenv(key) for key in {keys!r}]), flush=True)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_client, "build_codex_app_server_command", lambda **_: [sys.executable, str(script)])
+
+    def child_values(machine):
+        monkeypatch.setenv("COMPUTERNAME", machine)
+        client = codex_client.CodexAppServerClient()
+        client._codex_home_dir = tmp_path / "codex-home"
+        monkeypatch.setattr(client, "_initialize", lambda: None)
+        monkeypatch.setattr(client, "_stdout_loop", lambda _: None)
+        monkeypatch.setattr(client, "_stderr_loop", lambda _: None)
+        try:
+            client._ensure_started()
+            stdout, _ = client._proc.communicate(timeout=5)
+            assert client._proc.returncode == 0
+            return json.loads(stdout)
+        finally:
+            client.close()
+
+    assert child_values("desktop") == ["desktop-http", "shared-https", "localhost", None, None]
+    assert child_values("laptop") == ["shared-http", "laptop-https", "localhost", None, None]
+    assert child_values("unknown") == ["shared-http", "shared-https", "localhost", None, None]
+    (config / "codex-proxy.env").unlink()
+    assert child_values("unknown") == ["inherited", None, None, None, None]

@@ -941,8 +941,6 @@ def test_v2_lost_wrapped_post_recovers_preallocated_id_after_store_reload(frame,
     attachment = tmp_path / "recovery-attachment.txt"
     attachment.write_text("test attachment", encoding="utf-8")
     frame._pending_input_attachments = [{"status": "success", "kind": "file", "path": str(attachment)}]
-    monkeypatch.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
-
     def lose_response(session_id, blocks, *, prompt_id):
         posts.append((session_id, blocks, prompt_id))
         fake.push_event(KimiEvent(type="turn_started", thread_id=session_id, turn_id="unrelated",
@@ -950,7 +948,9 @@ def test_v2_lost_wrapped_post_recovers_preallocated_id_after_store_reload(frame,
         raise KimiServerError("response lost", result_unknown=True)
 
     fake.submit_prompt = lose_response
-    _submit(frame, "new request")
+    with monkeypatch.context() as stop_recovery:
+        stop_recovery.setattr(frame, "_recover_kimi_pending_owners", lambda **_kwargs: None)
+        _submit(frame, "new request")
     sid, blocks, pid = posts[0]
     assert frame.active_session_turns[-1]["kimi_prompt_id"] == pid
     assert frame.active_session_turns[-1]["kimi_prompt_exact"] is True
@@ -978,9 +978,11 @@ def test_v2_lost_wrapped_post_recovers_preallocated_id_after_store_reload(frame,
     fake.reconcile_v2 = transport.reconcile_v2
     fake.recovery_messages_v2 = transport.recovery_messages_v2
     monkeypatch.setattr(frame, "_ensure_kimi_client", lambda: fake)
-    frame._reconcile_kimi_owner_worker(owner)
+    frame._on_kimi_client_message({"type": "transcript_recheck", "payload": {"session_ids": [sid]}})
     assert len(posts) == 1
     assert frame.active_session_turns[-1]["answer_md"] == "exact recovered answer"
+    frame._save_state()
+    assert frame.chat_store.load_turns(_active_chat_id(frame))[-1]["answer_md"] == "exact recovered answer"
 
 
 @pytest.mark.parametrize("steered", [True, False])

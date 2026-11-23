@@ -440,58 +440,43 @@ def _delta(text, *, thread="s", turn="t", item="i", kind="assistant", data=None)
 # A1-A2: launch command resolution
 
 
-def test_resolve_launch_command_env_override(monkeypatch, tmp_path):
-    kimi_bin = tmp_path / "kimi.exe"
-    kimi_bin.write_text("", encoding="utf-8")
-    monkeypatch.setenv("KIMI_BIN", str(kimi_bin))
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: r"C:\elsewhere\kimi.exe")
-
-    with pytest.raises(KimiServerError, match="SHA256"):
-        resolve_kimi_launch_command()
-
-
-def test_resolve_launch_command_env_override_missing_file(monkeypatch, tmp_path):
-    monkeypatch.setenv("KIMI_BIN", str(tmp_path / "no-such-kimi.exe"))
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: r"C:\elsewhere\kimi.exe")
-
-    with pytest.raises(KimiServerError):
-        resolve_kimi_launch_command()
-
-
-@pytest.fixture
-def missing_kimi_resource_root(monkeypatch, tmp_path):
+@pytest.mark.parametrize("override", [None, "override/带 空格.exe"])
+def test_resolve_launch_command_uses_local_install_or_override(monkeypatch, tmp_path, override):
     import kimi_runtime
 
-    monkeypatch.setattr(kimi_runtime, "resource_root", lambda: tmp_path)
-
-
-def test_resolve_launch_command_does_not_use_shared_path(monkeypatch, missing_kimi_resource_root):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.delenv("KIMI_BIN", raising=False)
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "/usr/bin/kimi")
-
-    with pytest.raises(KimiServerError, match="runtime missing"):
-        resolve_kimi_launch_command()
-
-
-def test_resolve_launch_command_does_not_use_shared_user_install(monkeypatch, tmp_path, missing_kimi_resource_root):
-    monkeypatch.delenv("KIMI_BIN", raising=False)
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: None)
-    monkeypatch.setattr(kimi_server_client.os, "name", "nt")
-    candidate = tmp_path / ".kimi-code" / "bin" / "kimi.exe"
+    candidate = tmp_path / (override or ".kimi-code/bin/kimi.exe")
     candidate.parent.mkdir(parents=True)
-    candidate.write_text("", encoding="utf-8")
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    candidate.write_bytes(b"verified runtime")
+    if override:
+        monkeypatch.setenv("KIMI_BIN", str(candidate))
+    digest = kimi_server_client.hashlib.sha256(candidate.read_bytes()).hexdigest()
+    monkeypatch.setattr(kimi_runtime, "SUPPORTED_BUILDS", {digest: "2.5.3"})
 
-    with pytest.raises(KimiServerError, match="runtime missing"):
-        resolve_kimi_launch_command()
+    def probe(argv, **kwargs):
+        assert argv == [str(candidate), "--version"]
+        assert kwargs["env"]["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+        return subprocess.CompletedProcess(argv, 0, b"2.5.3")
+
+    monkeypatch.setenv("KIMI_CODE_NO_AUTO_UPDATE", "0")
+    monkeypatch.setattr(kimi_runtime.subprocess, "run", probe)
+    assert resolve_kimi_launch_command() == [str(candidate)]
 
 
-def test_resolve_launch_command_not_found(monkeypatch, tmp_path, missing_kimi_resource_root):
+@pytest.mark.parametrize("override, error", [
+    (None, "runtime missing"), ("missing.exe", "runtime missing"), ("relative", "absolute path"),
+])
+def test_resolve_launch_command_never_falls_back_to_path(monkeypatch, tmp_path, override, error):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.delenv("KIMI_BIN", raising=False)
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: None)
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-
-    with pytest.raises(KimiServerError):
+    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "path-kimi")
+    if override is not None:
+        monkeypatch.setenv("KIMI_BIN", "kimi.exe" if override == "relative" else str(tmp_path / override))
+        candidate = tmp_path / ".kimi-code/bin/kimi.exe"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_bytes(b"default runtime")
+    with pytest.raises(KimiServerError, match=error):
         resolve_kimi_launch_command()
 
 
@@ -1912,30 +1897,21 @@ def test_v2_live_smoke_terminal_check_is_exact_prompt_and_offline():
         _assert_successful_prompt(client, "s", "p")
 
 
-def test_runtime_preparation_hash_version_and_environment_are_isolated(tmp_path, monkeypatch):
+def test_runtime_rejects_unverified_hash_before_probe_and_checks_verified_version(tmp_path, monkeypatch):
     import kimi_runtime
-    source = tmp_path / "candidate.exe"
-    source.write_bytes(b"synthetic runtime")
-    monkeypatch.setattr(kimi_runtime, "SUPPORTED_SHA256", kimi_server_client.hashlib.sha256(source.read_bytes()).hexdigest())
-    monkeypatch.setattr(kimi_runtime.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"2.5.3\n"))
-    target = kimi_runtime.prepare_runtime(source, tmp_path / "private/2.5.3")
-    assert kimi_runtime.validate_runtime(target) == target
-    with pytest.raises(RuntimeError, match="destination already exists"):
-        kimi_runtime.prepare_runtime(source, target.parent)
-    assert target.read_bytes() == source.read_bytes()
-    monkeypatch.setattr(kimi_runtime, "runtime_path", lambda: target)
-    monkeypatch.delenv("KIMI_BIN", raising=False)
-    monkeypatch.setattr(kimi_server_client.shutil, "which", lambda name: "changed-shared-version")
-    assert resolve_kimi_launch_command() == [str(target)]
-    assert kimi_runtime.child_environment({"KIMI_CODE_NO_AUTO_UPDATE": "0"})["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
-    target.write_bytes(b"changed")
-    with pytest.raises(KimiServerError, match="SHA256"):
+
+    candidate = tmp_path / "kimi.exe"
+    candidate.write_bytes(b"synthetic runtime")
+    monkeypatch.setenv("KIMI_BIN", str(candidate))
+    monkeypatch.setattr(kimi_runtime.subprocess, "run", lambda *a, **k: pytest.fail("unverified binary ran"))
+    with pytest.raises(KimiServerError, match="unverified SHA256") as failure:
         resolve_kimi_launch_command()
-    with pytest.raises(RuntimeError, match="destination already exists"):
-        kimi_runtime.prepare_runtime(source, target.parent)
-    assert target.read_bytes() == b"changed"
-    target.unlink()
-    with pytest.raises(KimiServerError, match="runtime missing"):
+    assert str(candidate) in str(failure.value)
+
+    digest = kimi_server_client.hashlib.sha256(candidate.read_bytes()).hexdigest()
+    monkeypatch.setattr(kimi_runtime, "SUPPORTED_BUILDS", {digest: "2.5.3"})
+    monkeypatch.setattr(kimi_runtime.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"9.9.9"))
+    with pytest.raises(KimiServerError, match="local '9.9.9', expected 2.5.3"):
         resolve_kimi_launch_command()
 
 
@@ -2269,3 +2245,318 @@ def test_v2_live_ws_assertions_reject_rest_snapshot_repaired_after_gap(rest_term
         expected = "no matching WS assistant delta"
     with pytest.raises(AssertionError, match=expected):
         _assert_streamed_answer(messages, "s", "p")
+
+
+def test_server_api_subscription_ack_is_generation_specific_and_gates_post(monkeypatch):
+    client = KimiServerClient()
+    client.protocol_version = 2
+    client._server_api = True
+    client.ws_connect_timeout = .001
+    ws = client._ws = object()
+    gen = client._ws_generation
+    sent, submitted = [], []
+
+    def send(payload, **kwargs):
+        sent.append(payload)
+
+    def request(method, path, **kwargs):
+        submitted.append((method, path))
+        return {"prompt_id": "p"}
+
+    monkeypatch.setattr(client, "_send_ws", send)
+    monkeypatch.setattr(client, "_ws_is_usable_locked", lambda: True)
+    monkeypatch.setattr(client, "_request_data", request)
+    monkeypatch.setattr(client, "_record_v2_transcript_usage", lambda *_: None)
+    with pytest.raises(KimiUsageQueryError, match="ACK timed out"):
+        client.submit_prompt("s", [{"type": "text", "text": "hello"}], prompt_id="p")
+    assert not submitted
+    assert sent[0] == {"type": "subscribe", "request_id": sent[0]["request_id"],
+                       "session_id": "s", "agent_ids": ["main"]}
+    ack = {"type": "response", "request_id": sent[0]["request_id"], "code": 0}
+    assert not client._handle_ws_message(ack, ws=ws, generation=gen - 1)
+    assert "s" not in client._v2_ready_generations
+    assert client._handle_ws_message(ack, ws=ws, generation=gen)
+    assert client.submit_prompt("s", [{"type": "text", "text": "hello"}], prompt_id="p") == "p"
+    assert submitted == [("POST", "/api/v1/sessions/s/prompts")]
+
+
+def test_server_api_prompt_recovery_uses_exact_opener_and_final_step(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    requests = []
+    opener = {"type": "user_message", "placement": "opener", "prompt_ids": ["p"],
+              "origin": {"kind": "user"}, "text": "question"}
+
+    def answer(identity, step, text, **flags):
+        return {"type": "assistant_message", "item_id": identity, "step_index": step,
+                "status": "ended", "outcome": "completed", "text": text, **flags}
+
+    wire = {
+        "turn_id": "opaque-old", "ordinal": 0, "kind": "agent", "status": "ended", "outcome": "completed",
+        "steps": [{"index": 1, "outcome": "completed"}, {"index": 2, "outcome": "completed"}],
+        "items": [opener, answer("init", 1, "pre-tool"), answer("hidden", 2, "private", hidden=True),
+                  answer("visible", 2, "done \U0001f9ea")],
+    }
+
+    def request(method, path, *, params, timeout):
+        requests.append((method, path, dict(params)))
+        if len(requests) == 1:
+            newer = {"kind": "user", "ordinal": 1, "turn_id": "opaque-new"}
+            return {"turns": [newer], "has_more": True}
+        return {"turns": [wire], "has_more": False}
+
+    monkeypatch.setattr(client, "_request_data", request)
+    event = client.reconcile_v2("s", "p")
+    assert (event.status, event.text, event.data["prompt_id"]) == ("completed", "done \U0001f9ea", "p")
+    assert requests == [
+        ("GET", "/api/v1/sessions/s/agents/main/turns", {"page_size": 100}),
+        ("GET", "/api/v1/sessions/s/agents/main/turns", {"page_size": 100, "before_ordinal": "1"}),
+    ]
+    wire["items"][0] = {**opener, "origin": {"kind": "injection"}}
+    assert client.reconcile_v2("s", "p") is None
+
+
+def test_server_api_heartbeat_and_manual_default_leave_legacy_behavior_intact(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    client.protocol_version = 2
+    ws = client._ws = object()
+    wire = []
+    monkeypatch.setattr(client, "_send_on_socket_locked", lambda sock, message: wire.append((sock, message)))
+    assert client._handle_ws_message({"type": "ping"}, ws=ws, generation=client._ws_generation)
+    assert wire == [(ws, {"type": "pong"})]
+    calls = []
+
+    def request(method, path, *, json_body):
+        calls.append((path, json_body["agent_config"]["permission_mode"]))
+        return {"id": "s"}
+
+    monkeypatch.setattr(client, "_request_data", request)
+    monkeypatch.setattr(client, "subscribe", lambda sessions: None)
+    assert client.create_session(cwd="D:/fixture") == "s"
+    assert client.create_session(cwd="D:/fixture", permission_mode="yolo") == "s"
+    assert client.steer_prompts("s", ["queued"]) is False
+    client._server_api = False
+    assert client.create_session(cwd="D:/fixture") == "s"
+    assert [permission for _, permission in calls] == ["manual", "manual", "yolo", "yolo", "auto", "auto"]
+
+def test_server_api_rechecks_unknown_approval_against_session_detail(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    ws = client._ws = object()
+    generation = client._ws_generation
+    client._v2_ready_generations["s"] = generation
+    current = "approval-id"
+
+    def subscribe(message, **_kwargs):
+        request_id = message["request_id"]
+        client._handle_server_api_frame({"type": "response", "request_id": request_id, "code": 0}, ws, generation)
+        client._handle_server_api_frame({
+            "type": "interaction", "interaction_id": current, "kind": "approval", "status": "pending",
+            "agent_id": "main", "session_id": "s",
+        }, ws, generation)
+
+    monkeypatch.setattr(client, "_send_ws", subscribe)
+    monkeypatch.setattr(client, "_record_v2_transcript_usage", lambda *_: None)
+    detail = {"pending_interaction": "approval"}
+
+    def request(method, path, **kwargs):
+        assert path.startswith("/api/v1/sessions/s")
+        if method == "POST":
+            raise KimiServerError("lost response")
+        assert path == "/api/v1/sessions/s"
+        if not detail:
+            raise KimiServerError("unreachable")
+        return detail
+
+    monkeypatch.setattr(client, "_request_data", request)
+    with pytest.raises(KimiServerError) as error:
+        client.answer_interaction("s", "approval-id", {"kind": "approval", "decision": "approved"})
+    assert error.value.result_unknown
+    assert client.interaction_state("s", "approval-id") == "pending"
+    current = "newer-approval"
+    assert client.interaction_state("s", "approval-id") == ""
+    client._clear_v2_readiness()
+    assert client.interaction_state("s", "approval-id") == ""
+    detail["pending_interaction"] = "none"
+    assert client.interaction_state("s", "approval-id") == "ended"
+    detail.clear()
+    with pytest.raises(KimiServerError, match="unreachable"):
+        client.interaction_state("s", "approval-id")
+
+
+@pytest.mark.parametrize("identity,outcome,success", [
+    ("approval-id", "approved", True), ("other-id", "approved", False),
+    ("approval-id", "rejected", False), ("approval-id", "cancelled", False),
+])
+def test_server_api_confirmed_approval_matches_identity_and_outcome(monkeypatch, identity, outcome, success):
+    client = KimiServerClient()
+    client._server_api = True
+    monkeypatch.setattr(client, "_request_data", lambda *_args, **_kwargs: {
+        "interaction_id": identity, "status": "ended", "outcome": outcome,
+    })
+    response = {"kind": "approval", "decision": "approved"}
+    if success:
+        client.answer_interaction("s", "approval-id", response)
+    else:
+        with pytest.raises(KimiServerError):
+            client.answer_interaction("s", "approval-id", response)
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_server_api_accepts_real_minimal_interaction_response(monkeypatch, decision):
+    client = KimiServerClient()
+    client._server_api = True
+
+    def request(method, path, *, json_body):
+        assert (method, path) == ("POST", "/api/v1/sessions/session%2Fid/interactions/approval%2Fid")
+        assert json_body == {"kind": "approval", "decision": decision}
+        return {"ended_at": "2026-11-23T12:00:00Z", "outcome": decision}
+
+    monkeypatch.setattr(client, "_request_data", request)
+    client.answer_interaction("session/id", "approval/id", {"kind": "approval", "decision": decision})
+
+
+def _server_api_events(messages, event_type):
+    return [message["payload"]["event"] for message in messages if message["type"] == "event"
+            and message["payload"]["event"]["type"] == event_type]
+
+
+def test_server_api_item_update_replaces_text_and_removal_blocks_late_frames():
+    client = KimiServerClient()
+    client._server_api = True
+    ws = client._ws = object()
+    generation = client._ws_generation
+    client._v2_ready_generations["s"] = generation
+
+    def send(kind, **fields):
+        assert client._handle_server_api_frame({
+            "type": kind, "session_id": "s", "agent_id": "main", "turn_id": "t", **fields,
+        }, ws, generation)
+
+    send("turn.started", turn={"turn_id": "t", "kind": "agent", "status": "running"})
+    send("item.ended", item={"item_id": "u", "type": "user_message", "placement": "opener",
+                             "origin": {"kind": "user"}, "prompt_ids": ["p"]})
+    item = {"item_id": "a", "type": "thinking", "step_index": 1, "text": "old"}
+    send("item.started", item=item)
+    assert [event["text"] for event in _server_api_events(client.drain_pending_messages(), "agent_message_delta")] == ["old"]
+    send("item.updated", item_id="a", set={"text": "replacement"})
+    events = client.drain_pending_messages()
+    assert _server_api_events(events, "execution_item_withdrawn")[0]["item_id"] == "a"
+    assert [event["text"] for event in _server_api_events(events, "agent_message_delta")] == ["replacement"]
+    send("item.updated", item_id="a", set={"hidden": True, "text": "private"})
+    events = client.drain_pending_messages()
+    assert _server_api_events(events, "execution_item_withdrawn")
+    assert not _server_api_events(events, "agent_message_delta")
+    send("item.removed", item_id="a")
+    assert _server_api_events(client.drain_pending_messages(), "execution_item_withdrawn")
+    send("item.ended", item=item)
+    send("item.delta", item_id="a", field="text", delta="late")
+    assert not client.drain_pending_messages()
+
+
+def test_server_api_terminal_recheck_does_not_block_reader_or_publish_stale_generation(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    client.protocol_version = 2
+    ws = client._ws = object()
+    generation = client._ws_generation
+    client._v2_ready_generations.update(s=generation, other=generation)
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        raise KimiServerError("blocked")
+
+    sent = []
+    monkeypatch.setattr(client, "get_transcript", blocked)
+    monkeypatch.setattr(client, "_send_on_socket_locked", lambda sock, message: sent.append(message))
+    try:
+        frame = {"type": "turn.ended", "session_id": "s", "agent_id": "main", "turn": {"turn_id": "t"}}
+        assert client._handle_ws_message(frame, ws=ws, generation=generation)
+        assert entered.wait(2)
+        assert client._handle_ws_message({"type": "ping"}, ws=ws, generation=generation)
+        assert sent == [{"type": "pong"}]
+        assert client._handle_ws_message({"type": "interaction", "session_id": "other", "agent_id": "main",
+                                          "interaction_id": "i", "kind": "approval", "status": "pending"},
+                                         ws=ws, generation=generation)
+        assert _server_api_events(client.drain_pending_messages(), "server_request")
+        with client._lifecycle_lock:
+            client._ws_generation += 1
+        release.set()
+        client._server_api_terminal_pool.shutdown(wait=True)
+        assert not client.drain_pending_messages()
+        assert not client._server_api_terminal_jobs
+    finally:
+        release.set()
+        client.close()
+
+
+def test_server_api_failed_terminal_lookup_requests_transcript_recheck(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    ws = client._ws = object()
+    client._v2_ready_generations["s"] = client._ws_generation
+    def unexpected_error(*_args, **_kwargs):
+        raise ValueError("malformed response")
+
+    monkeypatch.setattr(client, "get_transcript", unexpected_error)
+    try:
+        client._server_api_terminal("s", {"turn_id": "t"}, ws, client._ws_generation)
+        client._server_api_terminal_pool.shutdown(wait=True)
+        assert client.drain_pending_messages() == [
+            {"type": "transcript_recheck", "payload": {"session_ids": ["s"]}},
+        ]
+    finally:
+        client.close()
+
+
+def test_server_api_snapshot_and_opener_changes_withdraw_execution(monkeypatch):
+    client = KimiServerClient()
+    client._server_api = True
+    ws = client._ws = object()
+    generation = client._ws_generation
+    client._v2_ready_generations["s"] = generation
+    turn = {"turn_id": "t", "kind": "agent", "status": "running"}
+    opener = {"item_id": "u", "type": "user_message", "placement": "opener", "origin": {"kind": "user"},
+              "prompt_ids": ["p"], "text": "private opener", "hidden": True}
+    public = {"item_id": "a", "type": "thinking", "step_index": 1, "text": "old text"}
+
+    def send(kind, **fields):
+        assert client._handle_server_api_frame({
+            "type": kind, "session_id": "s", "agent_id": "main", "turn_id": "t", **fields,
+        }, ws, generation)
+        return client.drain_pending_messages()
+
+    messages = send("turns", turns=[dict(turn, items=[opener, public])])
+    assert "private opener" not in str(messages)
+    assert _server_api_events(messages, "agent_message_delta")[0]["text"] == "old text"
+    messages = send("item.ended", item=dict(opener, item_id="u2", prompt_ids=["p2"]))
+    assert any(event["item_id"] == "a" for event in _server_api_events(messages, "execution_item_withdrawn"))
+    send("item.removed", item_id="u2")
+    client._clear_v2_readiness()
+    client._ws_generation += 1
+    generation = client._ws_generation
+    client._v2_ready_generations["s"] = generation
+    messages = send("turns", turns=[dict(turn, items=[opener, dict(public, hidden=True)])])
+    assert any(event["item_id"] == "a" for event in _server_api_events(messages, "execution_item_withdrawn"))
+    assert not _server_api_events(send("turns", turns=[dict(turn, items=[opener, public])]), "agent_message_delta")
+    monkeypatch.setattr(client, "_request_data", lambda *_args, **_kwargs: {
+        "turns": [dict(turn, items=[opener, public], ordinal=1)],
+    })
+    projected = client.get_transcript("s")["items"][0]
+    assert projected["prompt"] == ""
+    assert "old text" not in str(projected)
+    send("item.removed", item_id="a")
+    assert not _server_api_events(send("turns", turns=[dict(turn, items=[opener, public])]), "agent_message_delta")
+
+
+def test_v2_attribution_rejects_nonadjacent_repeated_pagination_cursor(monkeypatch):
+    client = KimiServerClient()
+    cursors = iter(("30", "20", "30"))
+    monkeypatch.setattr(client, "get_transcript", lambda *_args, **_kwargs: {
+        "has_more": True, "next_cursor": next(cursors), "items": [],
+    })
+    with pytest.raises(KimiServerError, match="pagination made no progress"):
+        client.recovery_messages_v2("s")

@@ -75,7 +75,9 @@ def _turn_usage(turn: dict) -> tuple:
     uncached, cached, output = values
     pair = cache_token_counts(uncached + cached, cached) if None not in (uncached, cached) else None
     total = pair["input_tokens"] + output if pair is not None and output is not None else None
-    rank = native_token_count(str(turn["turnId"]).removeprefix("t")) or 0
+    rank = native_token_count(turn.get("ordinal"))
+    if rank is None:
+        rank = native_token_count(str(turn["turnId"]).removeprefix("t")) or 0
     return rank, step is not None, last, terminal, pair, total
 
 
@@ -101,6 +103,9 @@ class KimiServerV2Mixin:
             self._subscribed_sessions.add(session_id)
             if self._v2_ready_generations.get(session_id) == self._ws_generation and self._ws_is_usable_locked():
                 return
+            if self._server_api and any(session_id in sessions and self._v2_request_generations.get(req) == self._ws_generation
+                                        for req, sessions in self._subscribe_requests.items()):
+                return
             self._subscribe_requests[request_id] = {session_id}
             self._v2_request_generations[request_id] = self._ws_generation
             self._v2_subscription_events.setdefault(session_id, threading.Event()).clear()
@@ -108,7 +113,9 @@ class KimiServerV2Mixin:
             payload = {"session_id": session_id, "transcript": {"main": "delta"}}
             if transcript is not None and transcript.seq is not None and not transcript.incomplete:
                 payload["transcript_since"] = {"main": transcript.seq}
-        self._send_ws({"type": "subscribe_v2", "id": request_id, "payload": payload}, send_timeout=timeout)
+        message = ({"type": "subscribe", "request_id": request_id, "session_id": session_id, "agent_ids": ["main"]}
+                   if self._server_api else {"type": "subscribe_v2", "id": request_id, "payload": payload})
+        self._send_ws(message, send_timeout=timeout)
 
     def _require_v2_ready(self, session_id: str, *, timeout: float | None = None) -> None:
         try:
@@ -130,6 +137,14 @@ class KimiServerV2Mixin:
                 )
 
     def _clear_v2_readiness(self) -> None:
+        self._server_api_previous_turns.update(self._server_api_turns)
+        while len(self._server_api_previous_turns) > 512:
+            self._server_api_previous_turns.pop(next(iter(self._server_api_previous_turns)))
+        self._server_api_turns.clear()
+        self._server_api_pending.clear()
+        for _, event in self._server_api_pending_checks.values():
+            event.set()
+        self._server_api_pending_checks.clear()
         self._v2_ready_sessions.clear()
         self._v2_ready_generations.clear()
         for ready in self._v2_subscription_events.values():
@@ -253,7 +268,7 @@ class KimiServerV2Mixin:
                     ("inputTokens", "cachedTokens", "outputTokens")), row[4] is not None, row[5] is not None)] += 1
             if not page.get("has_more"):
                 break
-            before = items[0]["turnId"] if items else None
+            before = page.get("next_cursor") or (items[0]["turnId"] if items else None)
             if not before or before in cursors:
                 raise KimiUsageQueryError("Kimi transcript usage pagination made no progress",
                                           stage="pagination_cursor", pages=page_index + 1)
@@ -344,6 +359,7 @@ class KimiServerV2Mixin:
     def reconcile_v2(self, session_id: str, prompt_id: str, *, timeout: float | None = None) -> KimiEvent | None:
         deadline = time.monotonic() + (timeout if timeout is not None else self.rest_timeout)
         before = None
+        cursors = set()
         for _ in range(100):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -369,11 +385,12 @@ class KimiServerV2Mixin:
             if matching or not page.get("has_more"):
                 return None
             turns = [item for item in page.get("items", []) if item.get("kind") == "turn"]
-            if not turns:
+            cursor = page.get("next_cursor") or (turns[0]["turnId"] if turns else None)
+            if not cursor:
                 raise KimiServerError("Kimi transcript recovery pagination made no progress")
-            cursor = turns[0]["turnId"]
-            if cursor == before:
+            if cursor in cursors:
                 raise KimiServerError("Kimi transcript recovery repeated pagination cursor")
+            cursors.add(cursor)
             before = cursor
         raise KimiServerError("Kimi transcript recovery page budget exhausted")
 
@@ -382,6 +399,7 @@ class KimiServerV2Mixin:
         deadline = time.monotonic() + (timeout if timeout is not None else self.rest_timeout)
         before, rows, seen = None, [], set()
         listed_prompts = {}
+        cursors = set()
         for _ in range(100):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -418,9 +436,10 @@ class KimiServerV2Mixin:
             rows = page_rows + rows
             if not page.get("has_more"):
                 return rows + [row for pid, row in listed_prompts.items() if pid not in seen]
-            cursor = turns[0]["turnId"] if turns else None
-            if not cursor or cursor == before:
+            cursor = page.get("next_cursor") or (turns[0]["turnId"] if turns else None)
+            if not cursor or cursor in cursors:
                 raise KimiServerError("Kimi prompt attribution pagination made no progress")
+            cursors.add(cursor)
             before = cursor
         raise KimiServerError("Kimi prompt attribution page budget exhausted")
 

@@ -1,4 +1,4 @@
-"""Opt-in real Kimi 2.5.3 server against a loopback model with known usage."""
+"""Opt-in real Kimi server against a loopback model with known usage."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -14,7 +14,7 @@ from test_voice_input_ui_automation import _pump_until
 
 pytestmark = pytest.mark.skipif(
     os.getenv("MC_KIMI_RUNTIME_TEST") != "1",
-    reason="set MC_KIMI_RUNTIME_TEST=1 to spawn the fixed runtime",
+    reason="set MC_KIMI_RUNTIME_TEST=1 to spawn the local runtime",
 )
 
 
@@ -49,9 +49,9 @@ def loopback_kimi_home(tmp_path, monkeypatch):
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Model) as server:
         port = server.server_port
-        runtime = (Path(__file__).resolve().parents[1] / "runtimes/kimi/2.5.3/kimi.exe").resolve()
+        runtime = Path(os.getenv("MC_KIMI_RUNTIME_BIN") or Path.home() / ".kimi-code/bin/kimi.exe")
         if not runtime.is_file():
-            pytest.skip("fixed Kimi 2.5.3 runtime is unavailable")
+            pytest.skip("local Kimi runtime is unavailable")
         home = tmp_path / "isolated-home"
         config = home / ".kimi-code"
         config.mkdir(parents=True)

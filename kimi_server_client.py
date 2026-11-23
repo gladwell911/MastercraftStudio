@@ -33,6 +33,8 @@ from urllib.parse import quote
 
 import requests
 
+from kimi_runtime import child_environment, runtime_path, validate_runtime_version
+from kimi_server_api import KimiServerApiMixin
 from kimi_server_events import (
     KimiEvent,
     KimiServerError,
@@ -84,11 +86,15 @@ def kimi_model_to_server_alias(model: str) -> str:
 
 
 def resolve_kimi_launch_command() -> list[str]:
-    """Resolve only an explicitly verified isolated runtime or KIMI_BIN."""
-    from kimi_runtime import runtime_path, validate_runtime
-    path = Path(os.environ["KIMI_BIN"].strip()) if os.getenv("KIMI_BIN", "").strip() else runtime_path()
+    """Resolve the verified local Kimi CLI."""
+    return _resolve_kimi_runtime()[0]
+
+
+def _resolve_kimi_runtime():
     try:
-        return [str(validate_runtime(path))]
+        path = runtime_path()
+        version = validate_runtime_version(path)
+        return [str(path)], version
     except RuntimeError as exc:
         raise KimiServerError(str(exc)) from exc
 
@@ -125,7 +131,7 @@ def parse_token_from_banner(line: str) -> str:
     return ""
 
 
-class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQueueMixin):
+class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQueueMixin):
     """Owns one ``kimi web`` child process, one WebSocket, and the event queue."""
 
     def __init__(
@@ -150,6 +156,15 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
         volatile_replay_window: int = DEFAULT_VOLATILE_REPLAY_WINDOW,
     ) -> None:
         self.protocol_version = 1
+        self._server_api = False
+        self._server_api_turns = {}
+        self._server_api_previous_turns = {}
+        self._server_api_item_restrictions = {}
+        self._server_api_pending = {}
+        self._server_api_pending_checks = {}
+        self._server_api_terminal_jobs = set()
+        self._server_api_terminal_pool = None
+        self._server_api_interactions = {}
         self._v2_transcripts = {}
         self._v2_completed = set()
         self._v2_completed_order = deque()
@@ -242,7 +257,11 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
                     port = self.port or pick_free_port()
                     self.port = port
                     self.base_url = f"http://127.0.0.1:{port}"
-                    command = list(self.launch_command or resolve_kimi_launch_command())
+                    if self.launch_command:
+                        command = list(self.launch_command)
+                    else:
+                        command, runtime_version = _resolve_kimi_runtime()
+                        self._server_api = runtime_version == "2.6.3"
                     args = command + ["web", "--no-open", "--port", str(port)]
                     if self.process_factory is not None:
                         self.process = self.process_factory(args)
@@ -256,7 +275,7 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
                             encoding="utf-8",
                             errors="replace",
                             creationflags=self._creationflags(),
-                            env={**os.environ, "KIMI_CODE_NO_AUTO_UPDATE": "1"},
+                            env=child_environment(),
                         )
                     self._banner_thread = threading.Thread(target=self._banner_loop, daemon=True)
                     self._banner_thread.start()
@@ -295,7 +314,12 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
             self._v2_completed_order.clear()
             self._v2_started.clear()
             self._v2_frame_texts.clear()
+            self._server_api_item_restrictions.clear()
+            self._server_api_previous_turns.clear()
             proc = self.process
+            pool = self._server_api_terminal_pool
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
         self._close_ws_locked(ws)
         if proc is None:
             return
@@ -332,9 +356,11 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
         cwd: str,
         model: str = "",
         title: str = "",
-        permission_mode: str = "auto",
+        permission_mode: str | None = None,
         goal_objective: str = "",
     ) -> str:
+        if permission_mode is None:
+            permission_mode = "manual" if self._server_api else "auto"
         agent_config: dict[str, Any] = {"permission_mode": permission_mode}
         alias = kimi_model_to_server_alias(model) if model else ""
         if alias:
@@ -390,6 +416,10 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
 
     def steer_prompts(self, session_id: str, prompt_ids: list[str]) -> bool | None:
         """Return accepted/rejected/unknown without guessing ambiguous POSTs."""
+        if self._server_api:
+            # The normal POST already accepted this independent queued prompt.
+            # The new dialect has not demonstrated same-turn alias semantics.
+            return False
         try:
             self._request_data(
                 "POST",
@@ -446,7 +476,7 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
             self._request_data("GET", f"/api/v1/sessions/{session_id}", timeout=timeout)
             return True
         except KimiServerError as exc:
-            if exc.status_code == 404:
+            if exc.status_code in {404, 40401}:
                 return False
             raise
 
@@ -482,10 +512,48 @@ class KimiServerClient(KimiServerV2Mixin, KimiServerWebSocketMixin, KimiServerQu
             if exc.status_code is None:
                 exc.result_unknown = True
             raise
+        if self._server_api:
+            outcome = data.get("outcome")
+            intended = (response.get("decision") if response.get("kind") == "approval"
+                        else ("dismissed" if response.get("dismissed") else "answered"))
+            # In 2.6.3 the interaction-specific URL binds the acknowledgment.
+            # Its minimal response contains ended_at and outcome.
+            if (data.get("interaction_id", interaction_id) != interaction_id
+                    or data.get("status", "ended") != "ended"
+                    or outcome not in ("approved", "rejected", "cancelled", "answered", "dismissed")):
+                raise KimiServerError("Kimi did not confirm the interaction response", result_unknown=True)
+            if outcome != intended:
+                raise KimiServerError("Kimi ended the interaction with a different outcome", status_code=40902)
+            return
         if data.get("outcome") not in {"approved", "rejected", "cancelled", "answered", "dismissed"}:
             raise KimiServerError("Kimi did not confirm the interaction response", result_unknown=True)
 
     def interaction_state(self, session_id: str, interaction_id: str, agent_id: str = "main") -> str:
+        if self._server_api:
+            key = (session_id, interaction_id, agent_id)
+            with self._lifecycle_lock:
+                ended = self._server_api_interactions.get(key)
+            if ended is not None:
+                return ended or "ended"
+            sid = quote(session_id, safe="")
+            try:
+                data = self._request_data("GET", f"/api/v1/sessions/{sid}", timeout=min(self.rest_timeout, 5.0))
+            except KimiServerError as exc:
+                if exc.status_code in {404, 40401}:
+                    return "ended"
+                raise
+            with self._lifecycle_lock:
+                ended = self._server_api_interactions.get(key)
+            if ended is not None:
+                return ended or "ended"
+            if "pending_interaction" not in data:
+                return ""
+            pending = data["pending_interaction"]
+            if pending in (None, "none"):
+                return "ended"
+            if pending not in ("approval", "question"):
+                return ""
+            return self._server_api_check_pending(session_id, interaction_id, agent_id, pending)
         page = self.get_transcript(session_id, agent_id=agent_id, timeout=min(self.rest_timeout, 5.0))
         return next((_str(row.get("state")) for row in page.get("interactions", [])
                      if row.get("interactionId") == interaction_id), "")

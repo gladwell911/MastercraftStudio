@@ -1,30 +1,25 @@
 # MC 的 Kimi 运行时
 
-MC 使用独立运行时 `runtimes/kimi/2.5.3/kimi.exe`。目录根与现有 `browser_open.resource_root()` 一致，源码运行使用项目目录，onedir 使用 `mc/_internal`。固定文件缺失时明确报错，禁止自动查找共享 PATH 或用户 CLI 安装目录。
-
-受支持记录位于 `kimi_runtime.py`：版本 2.5.3，WebSocket 协议 2，SHA256 `3fe337ab7aa742ba0b72cc87fcc9a267756e609a54358c0d85bbe200da9bec8d`。这是本次实际核对的 Windows 二进制；其他构建需要先验证协议并更新支持记录，不会仅因版本字符串相同而接纳。
-
-首次在本机使用默认 spec 构建前，从已经核验的本地文件显式准备源码运行时。已有文件通过校验时可继续使用。`--destination` 指向版本目录。
+MC 启动 Kimi 功能时查找本机 CLI。显式设置 `KIMI_BIN` 时，值须为可执行文件的绝对路径。未设置时使用当前用户目录下的 `.kimi-code/bin/kimi.exe`。显式路径无效会报告该路径。MC 和 Codex 可在 Kimi CLI 缺失时启动。
 
 ```powershell
-.venv/Scripts/python.exe kimi_runtime.py --source '<已验证的本地kimi.exe>' --destination 'runtimes/kimi/2.5.3'
+$env:KIMI_BIN = 'C:/path/to/verified/kimi.exe'
 ```
 
-准备入口先核对 SHA256，再执行版本探针，然后复制并复验。目标已经存在时保留原文件。显式 `KIMI_BIN` 只影响 MC 客户端运行时解析，仍执行相同版本和哈希检查。探针和 MC 子进程都强制 `KIMI_CODE_NO_AUTO_UPDATE=1`。
+`kimi_runtime.py` 按 SHA-256 识别已验证构建，然后执行 `--version` 确认版本。受支持的 Windows 2.5.3 构建 SHA-256 为 `3fe337ab7aa742ba0b72cc87fcc9a267756e609a54358c0d85bbe200da9bec8d`。未知哈希会在执行前被拒绝。版本探针和服务进程均设置 `KIMI_CODE_NO_AUTO_UPDATE=1`，CLI 安装和升级由用户自行管理。
 
-默认 `zgwd.spec` 在收集前校验源码固定文件，将它作为单条 DATA 收入 `mc/_internal/runtimes/kimi/2.5.3/kimi.exe`，保留原字节。`package_mc.ps1` 在更新前校验暂存包，在启动前再校验最终包。自定义 spec 同样必须交付固定文件。`KIMI_BIN`、共享 PATH 和用户安装目录均无法替代缺失的包内文件。
+受支持的 Windows x64 2.6.3 构建 SHA-256 为 `b50c7ce3bed69e9be58f9a29aa090c0e7c61f7a1887503c4943267384a71ef30`。新版 API 使用带 Bearer 子协议的 WebSocket、当前连接的逐会话订阅确认，以及 `ping/pong`。MC 使用主代理 REST turn 的明确 opener prompt 身份、终态和最后完整步骤发布回答。断线后重新订阅并只读核对旧 prompt，不重新提交。新版新建会话默认逐次审批。活动中的后续输入进入独立队列；同轮追问沿用旧版本经确认的协议。
 
-在非管理员 PowerShell 中可用独立目录验收构建。`-BuildOnly` 仍会更新传入的 `DistPath`，因此验收时显式传入临时目录。
+2.6.3 已在隔离环境实测真实模型连续两问、窗口审批允许和拒绝、精确取消与活动断线后恢复。旧会话跨构建迁移和降级可读性仍待验证。
+
+`zgwd.spec` 无需准备 Kimi 文件。默认及自定义 spec 的暂存和最终产物均不得携带 Kimi CLI。更新包时旧 `_internal/runtimes/kimi` 随旧程序文件清理。构建验收须在非管理员 PowerShell 中运行，并传入临时目录。
 
 ```powershell
 $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid().ToString('N'))
 .\package_mc.ps1 -DistPath (Join-Path $isolated 'dist') -WorkPath (Join-Path $isolated 'work') -BuildOnly
-.venv/Scripts/python.exe kimi_runtime.py --package-root (Join-Path $isolated 'dist/mc')
 ```
 
-2026-11-18 用准备入口补齐了源码和日常包的固定文件，两处版本探针均为 2.5.3。2026-11-19 再次回读，两处 SHA256 均匹配固定记录。非管理员隔离构建的默认 spec 暂存包和最终包均通过门禁。日常包当时只更新运行时文件，后续源码修复尚待打包切换。复制阶段失败可能留下部分程序文件，最终校验会阻止启动，回滚仍是维护留项。见 [打包修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimi-runtime-packaging-20261118.md) 与 [功能审查](../_bmad-output/implementation-artifacts/review-kimicode-functional-20261119.md)。
-
-客户端根据真实握手选择 V1 或 V2。V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
+旧方言根据真实握手选择 V1 或 V2。2.5.3 的 V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
 
 Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。首次订阅中先到的帧暂存到同一 socket 代次，目标会话获 ACK 后才投递。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。完整回合汇总优先。部分汇总只有在各消耗步骤终止、用量字段完整且与已知汇总逐项相符时才补齐，取消空回合缺少零用量证据时保留未知。上下文和累计分别判定可用性，零分母显示暂不可用，顶部累计以千为单位截去小数。查询诊断只记失败阶段、异常类别与聚合字段计数。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
 

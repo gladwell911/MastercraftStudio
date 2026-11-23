@@ -1755,7 +1755,7 @@ class KimiEventsMixin:
         except (KimiServerError, OSError) as exc:
             server_state = ""
             error = error or str(exc)
-        if server_state in {"approved", "rejected", "cancelled", "answered", "dismissed"}:
+        if server_state in {"approved", "rejected", "cancelled", "answered", "dismissed", "ended"}:
             self._complete_kimi_interaction_attempt(key, request, previous_state, "ended",
                                                    success=server_state == request.get("intended_outcome"))
         elif server_state == "pending":
@@ -2072,6 +2072,40 @@ class KimiEventsMixin:
                 return
         self._apply_kimi_event_for_chat(chat_id, event)
 
+    def _withdraw_kimi_execution_item(self, chat_id, chat, event):
+        session_id, turn_id, owner_key = self._kimi_answer_stream_scope(chat_id, event)
+        agent_id = self._kimi_event_agent_id(event)
+        item_id = event.item_id
+        revision = self._safe_int(chat.get("revision"), 1)
+        lookup = (chat_id, revision, session_id, turn_id, agent_id, item_id)
+        for key in tuple(self._kimi_execution_buffer_index.get(lookup, ())):
+            self._discard_execution_delta(key)
+        self._redact_kimi_answer_stream(chat_id, session_id, owner_key, agent_id, item_id)
+        steps = chat.get("execution_steps", [])
+        withdrawn = [step for step in steps if isinstance(step, dict)
+                     and item_id in (step.get("item_id"), step.get("tool_call_id"))
+                     and step.get("revision", revision) == revision
+                     and (step.get("session_id") or step.get("thread_id")) == session_id
+                     and step.get("turn_id") == turn_id
+                     and step.get("agent_id") == agent_id
+                     and step.get("provider") in {"kimi", "kimi_server"}]
+        steps[:] = [step for step in steps if step not in withdrawn]
+        row_ids = {execution_row_id(chat_id, revision, step) for step in withdrawn}
+        dialog = getattr(self, "_active_answer_text_viewer", None)
+        if dialog is not None and getattr(self, "_execution_narrative_viewer_row", None) in row_ids:
+            dialog.canonical_text = ""
+            dialog.text_ctrl.ChangeValue("")
+        store = getattr(self, "chat_store", None) if getattr(self, "_chat_store_enabled", False) else None
+        if store is not None:
+            scope = {"chat_id": chat_id, "revision": revision, "thread_id": session_id, "turn_id": turn_id,
+                     "provider": "kimi", "agent_id": agent_id, "native_id": item_id}
+            self._queue_kimi_execution_write(
+                chat_id, partial(store.withdraw_kimi_execution_item, chat_id, scope),
+                lambda _: self._request_execution_list_sync(chat),
+            )
+        self._invalidate_remote_state_cache()
+        self._remove_visible_kimi_withdrawals(chat_id, row_ids)
+
     def _apply_kimi_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
@@ -2088,6 +2122,10 @@ class KimiEventsMixin:
         if isinstance(identity_chat, dict) and not self._kimi_event_is_compatible_with_chat(identity_chat, event):
             return
         authoritative = self._kimi_event_is_authoritative(event)
+        if event_type == "execution_item_withdrawn":
+            if authoritative and isinstance(identity_chat, dict):
+                self._withdraw_kimi_execution_item(chat_id, identity_chat, event)
+            return
         if authoritative:
             self._apply_kimi_event_scope(chat_id, event)
         self._promote_kimi_interim_assistant(chat_id, event)

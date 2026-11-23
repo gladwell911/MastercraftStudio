@@ -3,19 +3,8 @@
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
-from kimi_runtime import runtime_relative_path, validate_runtime
 from package_inputs import filter_package_toc
 
-
-kimi_relative_path = runtime_relative_path()
-try:
-    kimi_source = validate_runtime(Path(SPECPATH).resolve() / kimi_relative_path)
-except (OSError, RuntimeError) as exc:
-    raise SystemExit(
-        f"Cannot collect Kimi runtime: {exc}\n"
-        f"Prepare explicitly: python kimi_runtime.py --source <verified-local-kimi.exe> "
-        f"--destination {Path(SPECPATH).resolve() / kimi_relative_path.parent}"
-    ) from exc
 
 nats_server = Path("tools/nats-server/nats-server.exe")
 if not nats_server.is_file() or nats_server.stat().st_size == 0:
@@ -121,7 +110,6 @@ coll = COLLECT(
     a.datas,
     b.binaries,
     b.datas,
-    [(str(kimi_relative_path), str(kimi_source), 'DATA')],
     strip=False,
     upx=True,
     upx_exclude=['ZDSRAPI.dll', 'ZDSRAPI_x64.dll'],

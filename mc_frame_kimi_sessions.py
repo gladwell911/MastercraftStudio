@@ -1209,7 +1209,7 @@ class KimiSessionsMixin:
                 original_error=error_text,
             )
             return
-        if message_type in {"transport_recovered", "resync_required"}:
+        if message_type in {"transport_recovered", "resync_required", "transcript_recheck"}:
             payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
             session_ids = {
                 str(value or "").strip()

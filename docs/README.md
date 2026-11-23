@@ -7,7 +7,7 @@
 - [`../README.txt`](../README.txt)：项目主入口，包含运行、打包、代码入口和维护约定
 - [`F5_QUICK_RUN.md`](./F5_QUICK_RUN.md)：F5 快速运行功能的当前简版说明
 - [`handoff.md`](./handoff.md)：当前阶段状态、验证结果和后续事项
-- [`kimi-runtime.md`](./kimi-runtime.md)：固定Kimi版本/哈希、显式准备、V2订阅/恢复及验证边界
+- [`kimi-runtime.md`](./kimi-runtime.md)：Kimi 本机路径、受支持的构建、V2 订阅与恢复
 - [Kimi 键盘响应实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md) 记录后台写入、REST 续批、隐私撤回、独立审查与验证命令。
 - [MC 和 RC 聊天体验实施计划](../_bmad-output/implementation-artifacts/plan-mc-rc-chat-ux.md) 记录用量、语音、附件、阅读改进的契约、审查和验收。
 - [Kimi 功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md) 与 [清理和交互复审修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md) 保存源码变更、审查裁决及验证命令。

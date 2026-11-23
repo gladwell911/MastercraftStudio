@@ -928,3 +928,38 @@ def test_failed_tool_events_create_no_execution_row(frame, monkeypatch):
     steps = frame._current_chat_state.get("execution_steps") or []
     assert not any(step.get("kimi_summary") for step in steps)
     assert not any(str(step.get("display_kind") or "") in {"command", "tool"} for step in steps)
+
+def test_server_api_withdrawal_replaces_and_removes_durable_execution_row(frame, monkeypatch):
+    fake = _setup_kimi_frame(frame, monkeypatch)
+    _submit(frame, "Review execution withdrawal")
+    session_id = fake.created_sessions[0]["session_id"]
+    prompt_id = fake.submitted[0]["prompt_id"]
+    client = KimiServerClient()
+    client._server_api = True
+    ws = client._ws = object()
+    generation = client._ws_generation
+    client._v2_ready_generations[session_id] = generation
+
+    def send(kind, **fields):
+        assert client._handle_server_api_frame({
+            "type": kind, "session_id": session_id, "agent_id": "main", "turn_id": TEST_TURN_ID, **fields,
+        }, ws, generation)
+        for message in client.drain_pending_messages():
+            frame._on_kimi_event_for_chat(_active_chat_id(frame), CodexEvent(**message["payload"]["event"]))
+        return _canonical_kimi_rows(frame)
+
+    send("turn.started", turn={"turn_id": TEST_TURN_ID, "kind": "agent", "status": "running"})
+    send("item.ended", item={"item_id": "u", "type": "user_message", "placement": "opener",
+                             "origin": {"kind": "user"}, "prompt_ids": [prompt_id]})
+    rows = send("item.started", item={"item_id": "a", "type": "thinking", "step_index": 1,
+                                     "text": "first execution snapshot"})
+    assert any("first execution snapshot" in row.get("detail_text", "") for row in rows)
+    rows = send("item.updated", item_id="a", set={"text": "corrected execution snapshot"})
+    assert any("corrected execution snapshot" in row.get("detail_text", "") for row in rows)
+    assert "first execution snapshot" not in str(rows)
+    send("item.removed", item_id="a")
+    rows = send("item.delta", item_id="a", field="text", delta="late delta")
+    assert "execution snapshot" not in str(rows)
+    assert "late delta" not in str(rows)
+    assert not [row for row in frame.chat_store.load_execution_steps(_active_chat_id(frame))
+                if row.get("item_id") == "a"]

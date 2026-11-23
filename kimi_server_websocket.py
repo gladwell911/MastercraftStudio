@@ -67,10 +67,15 @@ class KimiServerWebSocketMixin:
             subscriptions = sorted(self._subscribed_sessions)
             cursors = deepcopy(self._session_cursors)
             hello_id = self._next_id()
-            subscribe_id = self._next_id() if subscriptions else ""
+            subscribe_id = self._next_id() if subscriptions and not self._server_api else ""
             self._hello_ids = {generation: hello_id}
             self._transport_ready_events[generation] = threading.Event()
             self._hello_acknowledged.discard(generation)
+            if self._server_api:
+                self.protocol_version = 2
+                self._hello_acknowledged.add(generation)
+                if not subscriptions:
+                    self._transport_ready_events[generation].set()
             self._subscription_acknowledged.discard(generation)
             if subscribe_id:
                 self._subscribe_requests[subscribe_id] = set(subscriptions)
@@ -84,7 +89,8 @@ class KimiServerWebSocketMixin:
 
                 candidate = websocket.create_connection(
                     url,
-                    header=headers,
+                    header=headers if not self._server_api else [],
+                    **({"subprotocols": [f"kimi-code.bearer.{self.token}"]} if self._server_api else {}),
                     http_no_proxy=["127.0.0.1", "localhost", "::1"],
                     timeout=min(self.ws_connect_timeout, timeout) if timeout is not None else self.ws_connect_timeout,
                 )
@@ -93,7 +99,7 @@ class KimiServerWebSocketMixin:
                     candidate.settimeout(min(self.ws_connect_timeout, timeout) if timeout is not None else self.ws_connect_timeout)
             if bool(getattr(candidate, "closed", False)):
                 raise KimiServerError("kimi websocket factory returned a closed socket")
-            if self.ws_factory is None:
+            if self.ws_factory is None and not self._server_api:
                 greeting = json.loads(candidate.recv())
                 if greeting.get("type") != "server_hello":
                     raise KimiServerError("Kimi handshake missing server_hello")
@@ -104,27 +110,28 @@ class KimiServerWebSocketMixin:
                 self._v2_ready_sessions.clear()
                 if hasattr(candidate, "settimeout"):
                     candidate.settimeout(None)
-            self._send_on_socket_locked(
-                candidate,
-                {
-                    "type": "client_hello",
-                    "id": hello_id,
-                    "payload": {
-                        "client_id": "zgwd",
-                        "subscriptions": [],
-                        "cursors": cursors,
-                    },
-                },
-            )
-            if subscriptions and self.protocol_version == 1:
+            if not self._server_api:
                 self._send_on_socket_locked(
                     candidate,
                     {
-                        "type": "subscribe",
-                        "id": subscribe_id,
-                        "payload": {"session_ids": subscriptions},
+                        "type": "client_hello",
+                        "id": hello_id,
+                        "payload": {
+                            "client_id": "zgwd",
+                            "subscriptions": [],
+                            "cursors": cursors,
+                        },
                     },
                 )
+                if subscriptions and self.protocol_version == 1:
+                    self._send_on_socket_locked(
+                        candidate,
+                        {
+                            "type": "subscribe",
+                            "id": subscribe_id,
+                            "payload": {"session_ids": subscriptions},
+                        },
+                    )
         except Exception as exc:
             self._close_ws_locked(candidate)
             if isinstance(exc, KimiServerError):
@@ -290,6 +297,10 @@ class KimiServerWebSocketMixin:
                     return False
                 if generation is not None and generation != self._ws_generation:
                     return False
+        if self._server_api and isinstance(message, dict):
+            handled = self._handle_server_api_frame(message, ws, generation)
+            if handled is not None:
+                return handled
         if isinstance(message, dict) and message.get("type") == "server_hello":
             version = _payload_of(message).get("protocol_version", 1)
             if version not in (1, 2):
@@ -345,7 +356,7 @@ class KimiServerWebSocketMixin:
                     target_generation = self._ws_generation
                 self._send_on_socket_locked(
                     target,
-                    {"type": "pong", "payload": {"nonce": payload.get("nonce")}},
+                    ({"type": "pong"} if self._server_api else {"type": "pong", "payload": {"nonce": payload.get("nonce")}}),
                 )
                 with self._lifecycle_lock:
                     if self._ws is not target or self._ws_generation != target_generation:
