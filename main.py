@@ -13,6 +13,7 @@ import socket
 import subprocess
 import shutil
 import sqlite3
+import logging
 import threading
 import time
 import uuid
@@ -700,6 +701,8 @@ class ChatFrame(
         self._codex_background_flush_dirty = False
         self._pending_codex_ui_events: list[tuple] = []
         self._codex_ui_event_lock = threading.Lock()
+        self._close_admission_lock = threading.Lock()
+        self._accepted_background_callbacks = 0
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
         self._pending_kimi_ui_events: list[tuple[str, CodexEvent]] = []
@@ -1058,6 +1061,7 @@ class ChatFrame(
         self.answer_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.history_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.Bind(wx.EVT_CHILD_FOCUS, self._on_chat_navigation_child_focus)
         self.Bind(wx.EVT_SHOW, self._on_show_sync_tray_state)
         self.Bind(wx.EVT_ACTIVATE, self._on_application_activate)
         self.Bind(wx.EVT_CLOSE, self._on_close)
@@ -1094,9 +1098,9 @@ class ChatFrame(
         self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
         self.new_chat_button.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.new_chat_button.Bind(wx.EVT_CHAR, self._on_generic_key_down)
-        self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(-1), id=int(self._chat_navigation_left_id))
-        self.Bind(wx.EVT_MENU, lambda _evt: self._navigate_history_chats(1), id=int(self._chat_navigation_right_id))
-        self.Bind(wx.EVT_MENU, lambda _evt: self._clear_context_and_start_new_chat(auto_resend_first=True), id=int(self._clear_context_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._handle_vertical_chat_shortcut(-1), id=int(self._chat_navigation_left_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._handle_vertical_chat_shortcut(1), id=int(self._chat_navigation_right_id))
+        self.Bind(wx.EVT_MENU, lambda _evt: self._trigger_shortcut_clear(), id=int(self._clear_context_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_common_commands_surface(), id=int(self._common_commands_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_chat_information(), id=int(self._chat_information_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_pending_kimi_interaction(retry=True),
@@ -1114,12 +1118,10 @@ class ChatFrame(
         self.SetAcceleratorTable(
             wx.AcceleratorTable(
                 [
-                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_LEFT, int(self._chat_navigation_left_id)),
-                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_RIGHT, int(self._chat_navigation_right_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._chat_navigation_left_id)),
+                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._chat_navigation_right_id)),
                     wx.AcceleratorEntry(wx.ACCEL_ALT, ord("A"), int(self._clear_context_id)),
                     wx.AcceleratorEntry(wx.ACCEL_ALT, ord("Z"), int(self._common_commands_menu_id)),
-                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_UP, int(self._notes_move_entry_up_id)),
-                    wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_DOWN, int(self._notes_move_entry_down_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_HOME, int(self._notes_move_entry_top_id)),
                     wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_END, int(self._notes_move_entry_bottom_id)),
                 ]
@@ -1339,25 +1341,12 @@ class ChatFrame(
         # This is only a candidate.  Allocation or an accepted submission is
         # the owner-consuming action that commits it to a chat.
 
-    def _defer_close_for_persistence_worker(self) -> None:
-        if bool(getattr(self, "_persistence_close_retry_scheduled", False)):
-            return
-        self._persistence_close_retry_scheduled = True
-
-        def retry_close():
-            self._persistence_close_retry_scheduled = False
-            try:
-                self.Close()
-            except Exception:
-                pass
-
-        wx.CallLater(100, retry_close)
-
     def _on_application_activate(self, event) -> None:
         active = bool(event.GetActive())
         self._application_active = active
         if not active:
             self._release_execution_focus_lease()
+            self._cancel_chat_navigation_focus()
         event.Skip()
 
                         # Content pagination does not change the readable identity.
@@ -1391,99 +1380,238 @@ class ChatFrame(
             return False
 
     def _call_after_if_alive(self, func, *args, **kwargs) -> bool:
-        return wx_call_after_if_alive(func, *args, **kwargs)
+        lock = getattr(self, "_close_admission_lock", None)
+        settlement = getattr(func, "__name__", "") in {
+            "_advance_close", "_finish_shortcut_clear", "_drain_kimi_execution_write_results",
+            "_drain_kimi_ui_events", "_drain_codex_ui_events", "_continue_kimi_thinking_sync",
+        }
+        if lock is None or settlement or threading.current_thread() is threading.main_thread():
+            return wx_call_after_if_alive(func, *args, **kwargs)
+        with lock:
+            if getattr(self, "_close_producer_fenced", False):
+                return False
+            self._accepted_background_callbacks += 1
+
+        @functools.wraps(func)
+        def deliver():
+            try:
+                if self._is_ui_alive():
+                    func(*args, **kwargs)
+            finally:
+                with lock:
+                    self._accepted_background_callbacks -= 1
+                self._schedule_close_progress()
+
+        if wx_call_after_if_alive(deliver):
+            return True
+        with lock:
+            self._accepted_background_callbacks -= 1
+        return False
 
     def _call_later_if_alive(self, delay_ms: int, func, *args, **kwargs):
         return wx_call_later_if_alive(delay_ms, func, *args, **kwargs)
 
     def _on_close(self, event: wx.CloseEvent):
-        # An active reply does not prevent closing once accepted writes settle.
         if getattr(self, "_close_complete", False):
             event.Skip()
             return
-        self._closing = True
+        can_veto = getattr(event, "CanVeto", lambda: True)()
+        if can_veto:
+            event.Veto()
+        if getattr(self, "_close_write_error", None) is not None:
+            self._close_write_error = None
+            self._close_write_done.clear()
+            self._close_write_started = False
+            self.Hide()
+            self._advance_close()
+        if not getattr(self, "_close_started", False):
+            self._close_started = time.monotonic()
+            transport = getattr(self, "_remote_nats_transport", None)
+            self._close_publication_pair = (transport.subjects.pair_id
+                if transport is not None and int(getattr(transport, "protocol_version", 1) or 1) >= 2 else "")
+            self._close_pair_id = self._read_pair_id()
+            self._closing = True
+            self.Hide()
+            self._close_hidden_at = time.monotonic()
+            self._cancel_chat_navigation_focus()
+            if self._tray_icon:
+                try:
+                    self._tray_icon.RemoveIcon()
+                    self._tray_icon.Destroy()
+                except Exception:
+                    pass
+                self._tray_icon = None
+            self._unregister_global_hotkey()
+            self._capture_notes_ui_state(capture_notes_editor=True)
+            self._voice_input.shutdown()
+            self._stop_answer_refresh_deadline()
+            self._release_execution_focus_lease()
+            self._invalidate_execution_scan()
+            if self._answer_redirect_timer:
+                self._answer_redirect_timer.Stop()
+                self._answer_redirect_timer = None
+            self._start_close_producers()
+            self._advance_close()
+        if not can_veto:
+            # A system close can arrive before the usual wx callback. Pump
+            # the same drain for a bounded interval and keep its async writer
+            # running if the OS grants more time.
+            deadline = time.monotonic() + 4.0
+            app = wx.GetApp()
+            if app is not None and not getattr(self, "_close_force_waiting", False):
+                self._close_force_waiting = True
+                try:
+                    while (time.monotonic() < deadline and not getattr(self, "_close_complete", False)
+                           and not getattr(self, "_close_write_error", None)):
+                        app.Yield()
+                        self._advance_close()
+                        time.sleep(.01)
+                finally:
+                    self._close_force_waiting = False
+
+    def _start_close_producers(self) -> None:
+        clients = list(getattr(self, "_codex_clients", {}).values())
+        clients.extend((getattr(self, "_codex_client", None), getattr(self, "_kimi_client", None)))
+        clients = list({id(client): client for client in clients if client is not None}.values())
+        self._close_producers_done = threading.Event()
+        self._close_write_done = threading.Event()
+        self._close_write_started = False
+        self._close_write_error = None
+        close_tasks = [client.close for client in clients]
+        close_tasks.extend((self.notes_sync.close, self._stop_remote_servers,
+                            self._global_ctrl_hook.stop, self._realtime_call.shutdown,
+                            self._stop_openclaw_sync))
+        service = getattr(self, "file_service", None)
+        if service is not None:
+            close_tasks.append(service.stop)
+        # Notes close detaches network I/O and waits for locally accepted writes.
+        notes_close = close_tasks.pop(len(clients))
+        tunnel_process = getattr(self, "_managed_cloudflared_process", None)
+        nats_process = getattr(getattr(self, "_remote_nats_process", None), "_process", None)
+
+        def close_task(task):
+            try:
+                task()
+            except Exception:
+                logging.getLogger(__name__).exception("Close task failed")
+
+        def close_producers():
+            deadline = self._close_started + 3.0
+            notes = threading.Thread(target=close_task, args=(notes_close,), daemon=True)
+            notes.start()
+            workers = [threading.Thread(target=close_task, args=(task,), daemon=True) for task in close_tasks]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(max(0, deadline - .4 - time.monotonic()))
+            processes = [getattr(client, "process", None) for client in clients]
+            processes.extend((tunnel_process, nats_process))
+            for action, cutoff in (("terminate", deadline - .15), ("kill", deadline)):
+                for proc in processes:
+                    try:
+                        if proc is not None and proc.poll() is None:
+                            getattr(proc, action)()
+                    except Exception:
+                        pass
+                for worker in workers:
+                    worker.join(max(0, cutoff - time.monotonic()))
+            with self._close_admission_lock, self._codex_ui_event_lock, self._kimi_ui_event_lock:
+                self._close_producer_fenced = True
+            notes.join()
+            self._close_producers_at = time.monotonic()
+            self._close_producers_done.set()
+            self._call_after_if_alive(self._advance_close)
+
+        threading.Thread(target=close_producers, name="mc-close-producers", daemon=True).start()
+
+    def _schedule_close_progress(self) -> None:
+        if getattr(self, "_close_started", False) and not getattr(self, "_close_complete", False):
+            self._call_after_if_alive(self._advance_close)
+
+    def _advance_close(self) -> None:
+        if getattr(self, "_close_complete", False) or not self._is_ui_alive():
+            return
+        timer = getattr(self, "_close_poll_timer", None)
+        if timer is not None:
+            timer.Stop()
+            self._close_poll_timer = None
+        if self._close_complete_if_written():
+            return
         if getattr(self, "_pending_kimi_ui_events", None):
             self._drain_kimi_ui_events()
-        if (getattr(self, "_pending_kimi_ui_events", None) or getattr(self, "_kimi_execution_write_counts", None)
-                or getattr(self, "_kimi_thinking_sync_counts", None)
-                or getattr(self, "_kimi_execution_boundaries", None)):
-            try:
-                event.Veto()
-            except Exception:
-                pass
-            self._defer_close_for_persistence_worker()
-            return
-        self._voice_input.shutdown()
-        self._stop_answer_refresh_deadline()
-        self._release_execution_focus_lease()
-        self._invalidate_execution_scan()
-        self._flush_chat_state_save()
-        if not self._flush_execution_step_persists_sync():
-            try:
-                event.Veto()
-            except Exception:
-                pass
-            self._defer_close_for_persistence_worker()
-            return
-        self._realtime_call.shutdown()
-        if self._answer_redirect_timer:
-            try:
-                if self._answer_redirect_timer.IsRunning():
-                    self._answer_redirect_timer.Stop()
-            except Exception:
-                pass
-            self._answer_redirect_timer = None
-        for client in list(getattr(self, "_codex_clients", {}).values()):
-            try:
-                client.close()
-            except Exception:
-                pass
-        if getattr(self, "_codex_client", None) is not None:
-            try:
-                self._codex_client.close()
-            except Exception:
-                pass
-        if getattr(self, "_kimi_client", None) is not None:
-            try:
-                self._kimi_client.close()
-            except Exception:
-                pass
-        try:
-            self.notes_sync.close()
-        except Exception:
-            pass
-        try:
-            self._stop_remote_servers()
-        except Exception:
-            pass
-        try:
-            service = getattr(self, "file_service", None)
-            if service is not None:
-                service.stop()
-        except Exception:
-            pass
-        # Producer shutdown can enqueue a final execution update. Drain once
-        # more before wx destroys the frame and the interpreter releases the
-        # backing SQLite store.
-        if not self._flush_execution_step_persists_sync():
-            try:
-                event.Veto()
-            except Exception:
-                pass
-            self._defer_close_for_persistence_worker()
-            return
-        self._save_state(capture_notes_editor=True)
-        self._global_ctrl_hook.stop()
-        self._unregister_global_hotkey()
-        if self._tray_icon:
-            try:
-                self._tray_icon.RemoveIcon()
-                self._tray_icon.Destroy()
-            except Exception:
-                pass
-            self._tray_icon = None
+        if getattr(self, "_pending_codex_ui_events", None):
+            self._drain_codex_ui_events()
+        if getattr(self, "_kimi_execution_write_results", None):
+            self._drain_kimi_execution_write_results()
+        self._start_execution_step_persist_worker()
+        with self._execution_step_persist_lock:
+            execution_pending = (self._execution_step_persist_worker_running
+                                 or bool(self._pending_execution_step_persists))
+        with self._close_admission_lock:
+            background_pending = self._accepted_background_callbacks
+        pending = (background_pending or execution_pending or getattr(self, "_pending_kimi_ui_events", None)
+                   or getattr(self, "_pending_codex_ui_events", None)
+                   or getattr(self, "_kimi_execution_write_counts", None)
+                   or getattr(self, "_kimi_thinking_sync_counts", None)
+                   or getattr(self, "_kimi_execution_boundaries", None)
+                   or getattr(self, "_shortcut_clear_pending", None))
+        if self._close_producers_done.is_set() and not pending and not self._close_write_started:
+            self._close_write_started = True
+            if not hasattr(self, "_close_write_batch"):
+                try:
+                    self._close_write_batch = self._capture_close_write_batch()
+                except Exception as exc:
+                    self._close_write_error = exc
+                    self._close_write_done.set()
+                    self._close_complete_if_written()
+                    return
+            batch = self._close_write_batch
+
+            def write_final_state():
+                for attempt in range(3):
+                    try:
+                        self._write_close_batch(batch)
+                    except (sqlite3.OperationalError, OSError) as exc:
+                        if attempt < 2:
+                            time.sleep(.15 * (attempt + 1))
+                            continue
+                        self._close_write_error = exc
+                    except Exception as exc:
+                        self._close_write_error = exc
+                    else:
+                        self._close_write_error = None
+                    self._close_write_done.set()
+                    self._call_after_if_alive(self._advance_close)
+                    return
+
+            threading.Thread(target=write_final_state, name="mc-close-writes", daemon=True).start()
+        if self._close_producers_done.is_set() and not self._close_write_started:
+            self._close_poll_timer = wx.CallLater(25, self._advance_close)
+
+    def _close_complete_if_written(self) -> bool:
+        if not self._close_write_done.is_set():
+            return False
+        if self._close_write_error is not None:
+            if not self.IsShown():
+                logging.getLogger(__name__).error("MC close persistence failed", exc_info=self._close_write_error)
+                self.Show()
+                self.Raise()
+                message = "未能保存聊天，数据仍在内存中。解决存储错误后，按 Alt+F4 重试保存并退出。"
+                self.SetStatusText(message)
+                self.SetTitle(message)
+                self._speak_text_via_screen_reader(message)
+            return True
         self._close_complete = True
-        event.Skip()
+        self._close_poll_timer = None
+        logging.getLogger(__name__).info(
+            "MC close timing: hide %.1f ms, producers %.1f ms, final %.1f ms",
+            (self._close_hidden_at - self._close_started) * 1000,
+            (self._close_producers_at - self._close_started) * 1000,
+            (time.monotonic() - self._close_started) * 1000,
+        )
+        self.Destroy()
+        return True
+
 
 def app_instance_key() -> str:
     # Separate installed copies have separate chat stores. Prevent two writers

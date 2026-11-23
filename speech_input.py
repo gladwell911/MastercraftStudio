@@ -12,6 +12,7 @@ from realtime_asr import BLOCK_FRAMES, CHANNELS, SAMPLE_RATE, RealtimeAsrClient,
 
 MODE_DIRECT = "direct"
 MODE_OPTIMIZE = "optimize"
+DEVICE_BLOCK_FRAMES = SAMPLE_RATE // 50  # 20 ms at the microphone; ASR still sends 200 ms blocks.
 
 
 class CtrlTapDetector:
@@ -45,8 +46,9 @@ class _Session:
     mode: str
     side: str | None = None
     started_at: float = field(default_factory=time.monotonic)
-    buffer: PcmBuffer = field(default_factory=PcmBuffer)
+    buffer: PcmBuffer = field(default_factory=lambda: PcmBuffer(packet_bytes=BLOCK_FRAMES * CHANNELS * 2))
     intent: threading.Event = field(default_factory=threading.Event)
+    abort_audio: threading.Event = field(default_factory=threading.Event)
     audio_done: threading.Event = field(default_factory=threading.Event)
     network_done: bool = False
     cancelled: bool = False
@@ -203,6 +205,7 @@ class VoiceInputController:
                 session.buffer.failure = session.buffer.failure or message
                 message = session.buffer.failure
             session.failed = True
+            session.abort_audio.set()
             session.intent.set()
             self.state = "cancelling"
         self._emit(session, "error", message)
@@ -232,7 +235,7 @@ class VoiceInputController:
                     else:
                         session.buffer.append(bytes(indata))
                 self._mark(session, "device_open")
-                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK_FRAMES,
+                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=DEVICE_BLOCK_FRAMES,
                                            channels=CHANNELS, dtype="int16", callback=callback)
                 if session.intent.is_set():
                     continue
@@ -264,6 +267,15 @@ class VoiceInputController:
                         failure = session.buffer.failure
                     if failure:
                         self._fail(session, failure)
+                if "stop" in session.milestones and not session.abort_audio.is_set():
+                    # Cover host input latency plus two callback periods. The
+                    # deadline is measured from key-up and cancellation wakes it.
+                    period = DEVICE_BLOCK_FRAMES / SAMPLE_RATE
+                    latency = float(getattr(stream, "latency", 0) or 0)
+                    tail_seconds = min(.12, max(0, latency) + 2 * period)
+                    self._mark(session, "tail_wait")
+                    remaining = session.milestones["stop"] + tail_seconds - time.monotonic()
+                    session.abort_audio.wait(max(0, remaining))
             except Exception as exc:
                 self._fail(session, f"麦克风不可用：{exc}")
             finally:
@@ -293,8 +305,8 @@ class VoiceInputController:
                 starting = False
                 session = self._session
                 self.state = "finishing"
-                session.intent.set()
                 self._mark(session, "stop")
+                session.intent.set()
             else:
                 return
         if starting:
@@ -338,6 +350,7 @@ class VoiceInputController:
             if not session or self.state == "closed":
                 return
             session.cancelled = True
+            session.abort_audio.set()
             session.intent.set()
             session.buffer.discard()
             self.state = "idle" if session.converged else "cancelling"
@@ -353,6 +366,7 @@ class VoiceInputController:
             session = self._session
             if session:
                 session.cancelled = True
+                session.abort_audio.set()
                 session.intent.set()
                 session.buffer.discard()
             loop = self._asr_loop

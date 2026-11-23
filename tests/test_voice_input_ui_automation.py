@@ -48,8 +48,7 @@ def test_queued_ready_is_suppressed_by_close_even_when_persistence_vetoes(frame,
     c = frame._voice_input
     c._dispatch = queued.append
     monkeypatch.setattr(frame, '_play_voice_begin_sound', lambda: cues.append(True))
-    monkeypatch.setattr(frame, '_flush_execution_step_persists_sync', lambda: False)
-    monkeypatch.setattr(frame, '_defer_close_for_persistence_worker', lambda: None)
+    monkeypatch.setattr(frame, '_advance_close', lambda: None)
     try:
         c.start_recording()
         wait_until(lambda: c.state == 'recording')
@@ -67,6 +66,7 @@ def test_queued_ready_is_suppressed_by_close_even_when_persistence_vetoes(frame,
         assert c._shutdown_done.wait(3)
         c._audio_thread.join(2)
         rig.assert_closed()
+        assert frame._close_producers_done.wait(5)
 
 
 @pytest.mark.parametrize('invalidate', ['none', 'new_session', 'cancel', 'close'])
@@ -202,7 +202,7 @@ def test_voice_input_ui_automation_duplicate_callbacks_repeat(frame, monkeypatch
     assert frame.input_edit.GetValue() == "浠婂ぉ澶╂皵涓嶉敊浠婂ぉ澶╂皵涓嶉敊"
 
 
-def test_ui_automation_ctrl_right_can_continue_past_recent_chats(frame):
+def test_ui_automation_ctrl_down_can_continue_past_recent_chats(frame):
     frame.Show()
     frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
@@ -219,7 +219,7 @@ def test_ui_automation_ctrl_right_can_continue_past_recent_chats(frame):
 
     class E:
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return main.wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -236,7 +236,7 @@ def test_ui_automation_ctrl_right_can_continue_past_recent_chats(frame):
     assert frame.view_history_id == "chat-b"
 
 
-def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
+def test_ui_automation_ctrl_down_reaches_pinned_and_older_chats(frame):
     frame.Show()
     frame.current_chat_id = "chat-e"
     frame._current_chat_state["id"] = "chat-e"
@@ -255,8 +255,11 @@ def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
     frame.answer_list.SetFocus()
 
     class E:
+        def __init__(self, key):
+            self.key = key
+
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return self.key
 
         def ControlDown(self):
             return True
@@ -268,11 +271,15 @@ def test_ui_automation_ctrl_right_reaches_pinned_and_older_chats(frame):
             raise AssertionError("should not skip")
 
     seen = [frame.current_chat_id]
+    for _ in range(3):
+        frame._on_char_hook(E(main.wx.WXK_UP))
+        seen.append(frame.view_history_id or frame.current_chat_id)
     for _ in range(6):
-        frame._on_char_hook(E())
-        seen.append(frame.view_history_id)
+        frame._on_char_hook(E(main.wx.WXK_DOWN))
+        seen.append(frame.view_history_id or frame.current_chat_id)
 
-    assert seen == ["chat-e", "chat-f", "chat-c", "chat-g", "chat-b", "chat-a", "chat-d"]
+    assert seen == ["chat-e", "chat-g", "chat-c", "chat-f", "chat-c",
+                    "chat-g", "chat-e", "chat-b", "chat-a", "chat-d"]
 
 
 @pytest.mark.parametrize("state", ["initial", "cleared", "sent", "typed"])

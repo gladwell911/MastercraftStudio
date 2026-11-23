@@ -1300,12 +1300,15 @@ class ExecutionPageMixin:
                 self._defer_chat_state_save()
             if self._codex_background_flush_dirty and not self._codex_background_flush_scheduled:
                 self._defer_codex_state_save()
+        if batch and getattr(self, "_close_started", False):
+            self._schedule_close_progress()
 
     def _start_execution_step_persist_worker(self) -> None:
         with self._execution_step_persist_lock:
             self._execution_step_persist_scheduled = False
             if (
-                (bool(getattr(self, "_closing", False)) and not getattr(self, "_kimi_execution_write_counts", None))
+                (bool(getattr(self, "_closing", False)) and not getattr(self, "_kimi_execution_write_counts", None)
+                 and not getattr(self, "_close_started", False))
                 or self._execution_step_persist_worker_running
                 or not self._pending_execution_step_persists
             ):
@@ -1376,12 +1379,15 @@ class ExecutionPageMixin:
                     self._execution_step_persist_worker_running = False
                     restart = bool(
                         self._pending_execution_step_persists
-                        and (not bool(getattr(self, "_closing", False)) or getattr(self, "_kimi_execution_write_counts", None))
+                        and (not bool(getattr(self, "_closing", False)) or getattr(self, "_kimi_execution_write_counts", None)
+                             or getattr(self, "_close_started", False))
                     )
                     if restart:
                         self._execution_step_persist_scheduled = True
             if restart:
                 self._start_execution_step_persist_worker()
+            if getattr(self, "_close_started", False):
+                self._schedule_close_progress()
 
     def _flush_execution_step_persists_sync(self, *, worker_timeout: float = 5.0) -> bool:
         if getattr(self, "_kimi_execution_write_counts", None):

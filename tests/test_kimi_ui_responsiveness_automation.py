@@ -1,4 +1,5 @@
 import ctypes
+import json
 import sqlite3
 import threading
 import time
@@ -346,9 +347,7 @@ def test_fragment_retry_settles_before_terminal_and_close(frame, wx_app, monkeyp
         return real_write(*args, **kwargs)
 
     monkeypatch.setattr(frame.chat_store, "apply_execution_fragment", blocked_write)
-    deferred = []
     closes = []
-    monkeypatch.setattr(frame, "_defer_close_for_persistence_worker", lambda: deferred.append(True))
     monkeypatch.setattr(frame, "_stop_remote_servers", lambda: closes.append(True))
 
     class CloseEvent:
@@ -373,18 +372,16 @@ def test_fragment_retry_settles_before_terminal_and_close(frame, wx_app, monkeyp
         first, second = CloseEvent(), CloseEvent()
         frame._on_close(first)
         frame._on_close(second)
-        assert first.vetoed and second.vetoed and len(deferred) == 2
-        assert not closes
+        assert first.vetoed and second.vetoed and not frame.IsShown()
+        assert not getattr(frame, "_close_complete", False)
         assert frame.active_session_turns[0]["request_status"] == "pending"
     finally:
         release.set()
 
     assert _yield_until(wx_app, lambda: not frame._kimi_execution_write_counts and not frame._kimi_execution_boundaries)
     assert frame.active_session_turns[0]["request_status"] == "done"
-    final, repeated = CloseEvent(), CloseEvent()
-    frame._on_close(final)
-    frame._on_close(repeated)
-    assert final.skipped and repeated.skipped and closes == [True]
+    assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False), timeout=5)
+    assert closes == [True]
     assert len(attempts) == 5 and len(set(attempts)) == 1 and attempts[0] != threading.get_ident()
     assert "Retrying failed Kimi execution write" in caplog.text
     reopened = ChatStore(frame.chat_store.db_path)
@@ -430,16 +427,12 @@ def test_clear_between_rest_batches_cannot_restore_retired_projection(frame, wx_
             def Skip(self):
                 self.skipped = True
 
-        calls = []
-        monkeypatch.setattr(frame, "_defer_close_for_persistence_worker", lambda: calls.append(True))
         first = Close()
         frame._on_close(first)
-        assert first.vetoed and calls and frame._kimi_thinking_sync_counts
+        assert first.vetoed and not frame.IsShown() and frame._kimi_thinking_sync_counts
         callback(*args, **kwargs)
         assert _yield_until(wx_app, lambda: not frame._kimi_thinking_sync_counts and not frame._kimi_execution_write_counts)
-        final = Close()
-        frame._on_close(final)
-        assert final.skipped
+        assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False), timeout=5)
         stored = ChatStore(frame.chat_store.db_path).load_execution_steps(chat_id)
         assert len(stored) == 64 and stored[-1]["detail_text"] == "retired 63"
         return
@@ -1103,7 +1096,7 @@ def test_background_structured_kimi_batch_persists_owner_without_foreground_repa
 
 
 # D5 — 活跃 turn 中关闭 frame：close 在超时内完成且 client.close() 恰好调用一次
-def test_frame_close_with_active_kimi_turn_does_not_hang(frame, monkeypatch):
+def test_frame_close_with_active_kimi_turn_does_not_hang(frame, wx_app, monkeypatch):
     fake = _setup_kimi_frame(frame, monkeypatch)
     frame.input_edit.SetValue("长任务")
     frame._on_send_clicked(None)
@@ -1113,19 +1106,165 @@ def test_frame_close_with_active_kimi_turn_does_not_hang(frame, monkeypatch):
     assert frame.is_running is True
 
     class _CloseEvent:
-        skipped = False
+        vetoed = False
 
-        def Skip(self):
-            self.skipped = True
+        def Veto(self):
+            self.vetoed = True
 
     event = _CloseEvent()
     started = time.perf_counter()
     frame._on_close(event)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 5.0
+    assert elapsed < .5 and not frame.IsShown() and event.vetoed
+    assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False))
     assert fake.closed == 1
-    assert event.skipped is True
+
+
+@pytest.mark.parametrize("phase", ["producer", "database"])
+def test_close_hides_in_first_dispatch_and_pumps_until_accepted_writes_finish(frame, wx_app, monkeypatch, phase, caplog):
+    _setup_active_kimi_chat(frame, monkeypatch)
+    monkeypatch.setattr(frame, "_stop_remote_servers", lambda: None)
+    monkeypatch.setattr(frame.file_service, "stop", lambda: None)
+    frame._global_ctrl_hook.stop()
+    frame.Show()
+    frame.active_session_turns[0].update(answer_md="accepted before close", request_status="done")
+    frame._mark_chat_turns_dirty()
+    database = frame.chat_store.db_path
+    entered, release = threading.Event(), threading.Event()
+
+    def block():
+        entered.set()
+        assert release.wait(4)
+
+    if phase == "producer":
+        monkeypatch.setattr(frame.notes_sync, "close", block)
+    else:
+        write = frame.chat_store.upsert_chat
+
+        def blocked_write(chat):
+            block()
+            return write(chat)
+
+        monkeypatch.setattr(frame.chat_store, "upsert_chat", blocked_write)
+    ticked = []
+    with caplog.at_level("INFO"):
+        try:
+            frame.Close()
+            assert not frame.IsShown()
+            assert _yield_until(wx_app, entered.is_set, timeout=5)
+            main.wx.CallAfter(ticked.append, True)
+            assert _yield_until(wx_app, lambda: bool(ticked))
+            assert not getattr(frame, "_close_complete", False)
+        finally:
+            release.set()
+        assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False), timeout=5)
+    assert "MC close timing: hide" in caplog.text
+    print(next(record.message for record in caplog.records if record.message.startswith("MC close timing")))
+    assert ChatStore(database).load_chat("chat-kimi")["turns"][0]["answer_md"] == "accepted before close"
+
+
+def test_close_drains_remote_final_and_fences_producer_after_optional_budget(frame, wx_app, monkeypatch):
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0].update(answer_md="canonical close answer", request_status="done")
+    frame._mark_chat_turns_dirty()
+    frame._queue_remote_final("chat-kimi", 0)
+    database = frame.chat_store.db_path
+    release_producer, release_storage, writing, producer_finished = (threading.Event() for _ in range(4))
+    late = []
+    write = frame._write_close_batch
+
+    def slow_producer():
+        assert release_producer.wait(6)
+        late.append(frame._call_after_if_alive(frame._on_delta, 0, "late answer", "chat-kimi"))
+        producer_finished.set()
+
+    def gated_write(batch):
+        writing.set()
+        assert release_storage.wait(3)
+        write(batch)
+
+    monkeypatch.setattr(frame, "_stop_remote_servers", slow_producer)
+    monkeypatch.setattr(frame, "_write_close_batch", gated_write)
+    frame.Close()
+    try:
+        assert _yield_until(wx_app, writing.is_set, timeout=5)
+        frame.active_session_turns[0]["answer_md"] = "mutation after capture"
+        release_producer.set()
+        assert producer_finished.wait(1)
+        assert late == [False]
+    finally:
+        release_producer.set()
+        release_storage.set()
+    assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False))
+    reopened = ChatStore(database)
+    assert reopened.load_turns("chat-kimi")[0]["answer_md"] == "canonical close answer"
+    kinds = [json.loads(bytes(row["payload"]).decode())["kind"]
+             for row in reopened.pending_outbox(pair_id=frame._close_pair_id, domain="events")]
+    assert kinds.count("assistant_final") == 1
+
+
+def test_close_persists_chat_while_notes_http_is_still_pending(frame, monkeypatch, wait_for_wx):
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0].update(answer_md="accepted chat answer", request_status="done")
+    frame._mark_chat_turns_dirty()
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowNotesClient:
+        def write_documents(self, docs):
+            return []
+
+        def fetch_changes(self, checkpoint):
+            entered.set()
+            assert release.wait(6)
+            return {"results": [], "last_seq": "late-sequence"}
+
+        def close(self):
+            pass
+
+    notes = frame.notes_sync
+    checkpoint = notes.get_checkpoint()
+    notes.configure("", "", client=SlowNotesClient())
+    worker = threading.Thread(target=notes.sync_once, daemon=True)
+    worker.start()
+    database = frame.chat_store.db_path
+    try:
+        assert entered.wait(2)
+        frame.Close()
+        wait_for_wx(lambda: getattr(frame, "_close_complete", False), "close while HTTP remains blocked")
+        assert worker.is_alive()
+        assert ChatStore(database).load_turns("chat-kimi")[0]["answer_md"] == "accepted chat answer"
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert notes.get_checkpoint() == checkpoint
+
+
+@pytest.mark.parametrize("failure, attempts", [(OSError, 3), (ValueError, 1)])
+def test_close_force_persists_after_accessible_storage_retry(frame, wx_app, monkeypatch, failure, attempts):
+    _setup_active_kimi_chat(frame, monkeypatch)
+    frame.active_session_turns[0].update(answer_md="retained answer", request_status="done")
+    frame._mark_chat_turns_dirty()
+    database = frame.chat_store.db_path
+    write = frame._write_close_batch
+    tries, spoken = [], []
+
+    def store_error(batch):
+        tries.append(batch)
+        raise failure("controlled storage failure")
+
+    monkeypatch.setattr(frame, "_speak_text_via_screen_reader", spoken.append)
+    monkeypatch.setattr(frame, "_write_close_batch", store_error)
+    frame.Close(force=True)
+    assert _yield_until(wx_app, lambda: bool(spoken))
+    assert len(tries) == attempts
+    assert frame.IsShown() and "Alt+F4" in frame.GetTitle()
+    assert not getattr(frame, "_close_complete", False)
+    monkeypatch.setattr(frame, "_write_close_batch", write)
+    frame.Close(force=True)
+    assert _yield_until(wx_app, lambda: getattr(frame, "_close_complete", False))
+    assert ChatStore(database).load_turns("chat-kimi")[0]["answer_md"] == "retained answer"
 
 
 def test_kimi_candidate_new_chat_reopen_codex_and_dispatch_by_owner(frame, wx_app, monkeypatch):

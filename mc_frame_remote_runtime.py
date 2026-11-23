@@ -359,6 +359,8 @@ class RemoteRuntimeMixin:
         self.file_http_base_url = service.base_url
 
     def _remote_nats_call_ui(self, callback: Callable[[], tuple[int, dict]]) -> tuple[int, dict]:
+        if getattr(self, "_closing", False):
+            return 503, {"accepted": False, "error": "closing"}
         if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             return callback()
 
@@ -367,7 +369,10 @@ class RemoteRuntimeMixin:
 
         def _run() -> None:
             try:
-                result["value"] = callback()
+                if getattr(self, "_closing", False):
+                    result["value"] = (503, {"accepted": False, "error": "closing"})
+                else:
+                    result["value"] = callback()
             except Exception as exc:
                 result["error"] = exc
             finally:

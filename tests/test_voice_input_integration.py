@@ -1,3 +1,4 @@
+import asyncio
 import threading
 
 import pytest
@@ -50,6 +51,45 @@ def test_local_ready_precedes_connection_and_early_stop_preserves_all_pcm(contro
     assert rig.packets[2][1] == rig.tail
     assert rig.packets[3][1] == b''
     assert sum(data.startswith(b'RIFF') for _, data in rig.packets) == 1
+
+
+def test_stop_keeps_pcm_callback_still_buffered_in_device(controller, rig, monkeypatch):
+    import speech_input
+
+    c, seen = controller
+    requests = []
+    input_stream = speech_input.sd.RawInputStream
+    def capture_stream(**kwargs):
+        requests.append(kwargs["blocksize"])
+        return input_stream(**kwargs)
+    monkeypatch.setattr(speech_input.sd, "RawInputStream", capture_stream)
+    blocks = [bytes([sample, 0]) * 320 for sample in range(1, 11)]
+    rig.first = blocks[0]
+    rig.tail = b'\x71\x29' * 113
+    rig.connect.set()
+    c.start_recording()
+    wait_until(lambda: c.state == 'recording')
+    wait_until(lambda: bool(rig.sockets))
+    assert requests == [320]
+
+    async def drain_ready_websocket_tasks():
+        for _ in range(4):
+            await asyncio.sleep(0)
+
+    asyncio.run_coroutine_threadsafe(drain_ready_websocket_tasks(), c._asr_loop).result(1)
+    assert not rig.packets
+    for block in blocks[1:]:
+        rig.frame(block)
+    wait_until(lambda: len(rig.packets) == 1)
+    assert rig.packets[0][0] > 0 and rig.packets[0][1].startswith(b'RIFF')
+    assert rig.packets[0][1][44:] == b''.join(blocks)
+    c.stop_and_transcribe()
+    assert c.state == 'finishing' and seen['stop'] == [True]
+    assert rig.stopped.wait(2)
+    wait_until(lambda: c.state == 'idle')
+    assert [seq > 0 for seq, _ in rig.packets] == [True, True, False]
+    assert [pcm for _, pcm in rig.packets[1:]] == [rig.tail, b'']
+    assert seen['results'] and not seen['errors']
 
 
 @pytest.mark.parametrize('mode', [MODE_DIRECT, MODE_OPTIMIZE])

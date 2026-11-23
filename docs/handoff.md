@@ -1,6 +1,20 @@
 # 当前交接
 
-更新日期 2026-11-22。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本轮用量、语音和 RC 分享从 3b85215 继续实施。验收使用源码与隔离设备，日常目标仍为 `D:/code/cx/md/mc.exe`。
+更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本轮从 `ca4170a` 开始，日常目标仍为 `D:/code/cx/md/mc.exe`。
+
+## 2026-11-23 聊天交互、语音和退出
+
+- Ctrl+↑/↓ 切换历史。播报期间执行面板切换到当前会话的数据，原生焦点保留，播报结束后选中最后一条回答或未答提问。连续切换或主动移焦会取消旧定位。
+- Alt+A 先播放确认音，再按原聊天归属持久化清除和重发。已提交改名、后续回合与恢复身份在竞争中保留。语音输入保留设备尾段，最后发送一次终止帧。正常关闭先隐藏窗口并结算已接受的写入，持续存储故障恢复可访问窗口。实现入口见 [文档索引](README.md) 和 [关闭说明](runtime-maintenance.md#关闭与持久化)。
+- 第二轮定向 43 项通过，独立复验 11 项通过。快速复查修复后键盘定向 2 项通过，独立复验 2 项通过。原生 wx 清理仍可输出基线 COM `0x8001010d` 诊断，定向运行退出码为 0。
+- 早期隔离模拟器通过 V2 NATS 手机清除，只证明当时源码。日常进程和安装包未切换。争渡实际播报与物理按键、麦克风句尾及云识别、打包 MC 的实际 Alt+F4 退出待现场验收。各轮命令和模拟器版本以共享工作区 `_bmad-output/implementation-artifacts/` 下的 2026-11-23 交互主计划和复审修复计划为准。
+
+在 MC 根目录复现最终键盘和代表性持久化、录音用例：
+
+```powershell
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_desktop_navigation_ui_automation.py::test_chat_shortcut_reveals_answers_only_after_long_title tests/test_desktop_navigation_ui_automation.py::test_chat_shortcuts_wait_for_current_title_then_focus_last_message
+.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_main_history_storage.py::test_close_persists_other_rows_and_attention_after_retired_notification_conflict tests/test_kimi_ui_responsiveness_automation.py::test_close_persists_chat_while_notes_http_is_still_pending tests/test_notes_desktop_unit.py::test_notes_sync_close_detaches_network_and_waits_accepted_writes tests/test_voice_input_integration.py::test_stop_keeps_pcm_callback_still_buffered_in_device
+```
 
 ## 2026-11-22 Kimi 累计、双 Ctrl 和 RC 分享
 
@@ -14,7 +28,7 @@
 - Codex 与 KimiCode 显示原生用量和缓存命中率。累计行按当前会话归属更新，原文、同步和文件提取继续使用完整正文。语音按触发侧路由，OpenRouter Claude 在后台验证并发送实际附件。使用入口见 [README](../README.txt)。
 - 独立定向矩阵 438 项通过，含 Alt+Y 与用量 106 项、原生长行 2 项。隔离 `RICHEDIT50W` 控件验证 9,800 与 28,000 字符均为可横向滚动的单行，Home、End、方向键、复制与提交保留尾部标记，真实换行仍形成两行。宽套件 14 项旧失败及排除的两项旧语音 UI 用例均有精确基线对照。wx 清理有 COM `0x8001010d` 诊断。
 - 真实 OpenRouter Claude 请求在后续审查补丁前分别读回合成 PDF、PNG、TXT 标记。最终后台预检和历史附件重放已有本地覆盖。隔离 Kimi 2.5.3 通过空会话订阅 ACK 与上下文读取。命令、样本边界和 12 项审查修复见 [实施计划](../_bmad-output/implementation-artifacts/plan-mc-rc-chat-ux.md)。
-- 该节保留先前源码证据，最新验收见本页首节。
+- 该节保留 2026-11-22 的源码证据。同日附件和用量接续见「2026-11-22 Kimi 累计、双 Ctrl 和 RC 分享」。
 
 ## 2026-11-22 Kimi 键盘响应与执行历史
 

@@ -63,7 +63,7 @@ def test_char_hook_ctrl_history_navigation_noops_without_archived_chats(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_LEFT
+            return wx.WXK_UP
 
         def ControlDown(self):
             return True
@@ -77,7 +77,7 @@ def test_char_hook_ctrl_history_navigation_noops_without_archived_chats(frame):
     frame._on_char_hook(E())
 
     assert seen["switched"] is False
-    assert seen["skipped"] is True
+    assert seen["skipped"] is False
 
 
 def test_history_view_uses_viewed_archived_chat_detail_panel_mode(frame):
@@ -1643,7 +1643,7 @@ def test_history_delete_removes_current_chat_from_persisted_state(frame, monkeyp
     assert data.get("active_session_turns") == []
 
 
-def test_on_close_marks_archived_chat_pending_turns_before_save(frame, monkeypatch):
+def test_on_close_marks_archived_chat_pending_turns_before_save(frame, wait_for_wx):
     frame.active_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
     frame.active_session_turns = []
@@ -1676,31 +1676,45 @@ def test_on_close_marks_archived_chat_pending_turns_before_save(frame, monkeypat
     ]
     frame.history_ids = ["chat-old"]
 
-    seen = {}
-
-    def _save_state():
-        seen["archived"] = copy.deepcopy(frame.archived_chats)
-
-    monkeypatch.setattr(frame, "_save_state", _save_state)
-    monkeypatch.setattr(frame._voice_input, "cancel", lambda: None)
-    monkeypatch.setattr(frame._realtime_call, "shutdown", lambda: None)
-    monkeypatch.setattr(frame, "_stop_openclaw_sync", lambda: None)
-    monkeypatch.setattr(frame, "_global_ctrl_hook", type("H", (), {"stop": lambda self: None})())
-    monkeypatch.setattr(frame, "_unregister_global_hotkey", lambda: None)
-    monkeypatch.setattr(frame, "_tray_icon", None, raising=False)
-
-    class _Event:
-        def Skip(self):
-            pass
-
-    frame._on_close(_Event())
-
-    archived = next(chat for chat in seen["archived"] if chat.get("id") == "chat-old")
-    turns = archived["turns"]
+    database = frame.chat_store.db_path
+    frame.Close()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "close-persistence")
+    turns = main.ChatStore(database).load_turns("chat-old")
     assert turns[0]["request_status"] == "pending"
     assert turns[0]["request_recoverable"] is True
     assert turns[1]["request_status"] == "pending"
     assert turns[1]["request_recoverable"] is False
+
+
+def test_close_persists_other_rows_and_attention_after_retired_notification_conflict(tmp_path):
+    from mc_frame_history import ChatHistoryMixin
+
+    store = main.ChatStore(tmp_path / "history.sqlite3")
+    store.initialize()
+    owner, other = "owner", "other"
+    old = {"question": "same question", "answer_md": "old answer",
+           "request_status": "done", "question_origin": "mc"}
+    store.upsert_chat({"id": owner, "title": "Owner"})
+    store.replace_turns(owner, [old])
+    ChatHistoryMixin._persist_close_turn_facts(store, "default", owner, "Owner", 0, old)
+    store.begin_clear_operation(owner, idempotency_key="local-before-close")
+    new = dict(old, answer_md="new answer")
+    failed = {"question": "other question", "request_status": "failed",
+              "request_error": "provider failed", "client_send_id": "failed-request"}
+    path = tmp_path / "state.json"
+    rows = [{"id": owner, "title": "Owner", "turns": [new]},
+            {"id": other, "title": "Other", "turns": [failed]}]
+    ChatHistoryMixin._write_close_batch(
+        (store, path, {"saved": True}, rows, {owner: 0, other: 0}, "default", "default", (), (), ()),
+    )
+
+    reopened = main.ChatStore(store.db_path)
+    assert reopened.load_turns(owner)[0]["answer_md"] == "new answer"
+    assert reopened.load_turns(other)[0]["request_status"] == "failed"
+    assert json.loads(path.read_text(encoding="utf-8")) == {"saved": True}
+    events = [json.loads(bytes(row["payload"]))
+              for row in reopened.pending_outbox(pair_id="default", domain="events")]
+    assert [event["body"]["text"] for event in events if event["kind"] == "failed"] == ["provider failed"]
 
 
 def test_cli_auto_title_updates_after_background_answer(frame, monkeypatch):

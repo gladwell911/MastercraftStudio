@@ -181,6 +181,8 @@ class ChatNavigationMixin:
         return False
 
     def _on_char_hook(self, event):
+        if getattr(self, "_closing", False):
+            return
         key = event.GetKeyCode()
         ctrl_down = self._event_control_down(event)
         alt_down = self._event_alt_down(event)
@@ -192,6 +194,10 @@ class ChatNavigationMixin:
                 or self.notes_editor.HasFocus()
             )
         )
+        if self._handle_ctrl_history_navigation(event):
+            return
+        if key not in (wx.WXK_CONTROL, wx.WXK_SHIFT, wx.WXK_ALT):
+            self._cancel_chat_navigation_focus()
         if key == wx.WXK_ALT and alt_down and not ctrl_down:
             event.Skip()
             return
@@ -280,12 +286,9 @@ class ChatNavigationMixin:
             self._toggle_detail_panel_mode(focus_detail=True)
             return
         if self._is_clear_context_shortcut(key, alt_down):
-            self._clear_context_and_start_new_chat(auto_resend_first=True)
+            if not bool(getattr(event, "IsAutoRepeat", lambda: False)()):
+                self._trigger_shortcut_clear()
             return
-        if ctrl_down and key in (wx.WXK_LEFT, wx.WXK_RIGHT):
-            direction = -1 if key == wx.WXK_LEFT else 1
-            if self._navigate_history_chats(direction):
-                return
         if self._is_new_chat_shortcut(key, alt_down):
             self._trigger_new_chat()
             return
@@ -424,7 +427,8 @@ class ChatNavigationMixin:
             self._trigger_send()
             return
         if self._is_clear_context_shortcut(key, event.AltDown()):
-            self._clear_context_and_start_new_chat(auto_resend_first=True)
+            if not bool(getattr(event, "IsAutoRepeat", lambda: False)()):
+                self._trigger_shortcut_clear()
             return
         if self._is_new_chat_shortcut(key, event.AltDown()):
             self._trigger_new_chat()
@@ -538,15 +542,83 @@ class ChatNavigationMixin:
         except Exception:
             return
 
+    def _handle_vertical_chat_shortcut(self, direction: int) -> bool:
+        notes = getattr(self, "notes_entry_list", None)
+        if notes and notes.HasFocus():
+            self._cancel_chat_navigation_focus()
+            return self._notes_move_entry_up() if direction < 0 else self._notes_move_entry_down()
+        return self._navigate_history_chats(direction)
+
+    def _cancel_chat_navigation_focus(self) -> None:
+        self._chat_navigation_generation = getattr(self, "_chat_navigation_generation", 0) + 1
+        timer = getattr(self, "_chat_navigation_timer", None)
+        if timer is not None:
+            timer.Stop()
+            self._chat_navigation_timer = None
+
+    def _on_chat_navigation_child_focus(self, event) -> None:
+        if (getattr(self, "_chat_navigation_timer", None) is not None
+                and wx.Window.FindFocus() is not self._chat_navigation_origin):
+            self._cancel_chat_navigation_focus()
+        event.Skip()
+
+    def _announce_chat_navigation(self, chat_id: str, title: str, focus) -> None:
+        tts = self._zdsr_tts
+        try:
+            spoken = tts.speak(title)
+        except Exception:
+            spoken = False
+        speech_generation = tts.speech_generation
+        navigation_generation = self._chat_navigation_generation
+        self._chat_navigation_origin = focus
+        started = bindings.app.time.monotonic()
+        speaking = False
+
+        def finish():
+            if any(row[0] in {"answer", "question"} for row in self.answer_meta):
+                self._apply_detail_panel_mode("answers")
+                self._focus_latest_answer_immediately(include_question=True)
+
+        def poll():
+            nonlocal speaking
+            if navigation_generation != self._chat_navigation_generation:
+                return
+            self._chat_navigation_timer = None
+            if (getattr(self, "_closing", False) or not self._is_ui_alive()
+                    or tts is not self._zdsr_tts or speech_generation != tts.speech_generation
+                    or wx.Window.FindFocus() is not focus):
+                return
+            visible = self.view_history_id if self.view_mode == "history" else self._current_history_id()
+            if visible != chat_id:
+                return
+            elapsed = bindings.app.time.monotonic() - started
+            state = tts.speak_state() if spoken else None
+            if state is True:
+                speaking = True
+            elif state is False and speaking:
+                finish()
+                return
+            elif not spoken or (elapsed >= 2.0 and (not speaking or state is None)):
+                # Degrade when speech never started or the reader stopped
+                # reporting state. Idle before onset is not completion.
+                finish()
+                return
+            # A stuck reader must never move focus while reporting speech.
+            self._chat_navigation_timer = wx.CallLater(250 if elapsed >= 15 else 25, poll)
+
+        self._chat_navigation_timer = wx.CallLater(25 if spoken else 1, poll)
+
     def _on_global_ctrl_arrow(self, direction: str) -> None:
         direction_key = str(direction or "").strip().lower()
-        step = -1 if direction_key == "left" else 1
+        if direction_key not in {"up", "down"}:
+            return
+        step = -1 if direction_key == "up" else 1
         active, details = self._global_chat_navigation_target_state()
         if not active:
             self._log_ctrl_navigation_debug(direction_key, reason="inactive_target", details=details)
-            self.SetStatusText("Ctrl+左右未生效：当前前台焦点不属于本程序")
+            self.SetStatusText("Ctrl+上下未生效：当前前台焦点不属于本程序")
             return
-        navigated = bool(self._navigate_history_chats(step))
+        navigated = bool(self._handle_vertical_chat_shortcut(step))
         self._log_ctrl_navigation_debug(
             direction_key,
             result="navigated" if navigated else "no_target",

@@ -653,6 +653,8 @@ class RemoteRoutesMixin:
         confirmation = {"accepted": True, "chat_id": chat_id, "client_send_id": send_id}
         if receipt["state"] == "accepted":
             return 200, confirmation
+        if self._clear_pending_for(chat_id):
+            return 409, {"accepted": False, "error": "clear_context_pending"}
         if receipt["revision"] != scope[-1]:
             return 409, {"accepted": False, "error": "attachment_send_expired"}
         if receipt["state"] == "starting":
@@ -698,6 +700,8 @@ class RemoteRoutesMixin:
             return 400, {"accepted": False, "error": "empty_text"}
         requested_chat_id = str(payload.get("chat_id") or "").strip()
         previous_owner_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+        if self._clear_pending_for(requested_chat_id or previous_owner_id):
+            return 409, {"accepted": False, "error": "clear_context_pending"}
         previous_selected_model = str(self.selected_model or STARTUP_DEFAULT_MODEL_ID)
         previous_combo_value = self.model_combo.GetValue() if bindings.app.threading.current_thread() is bindings.app.threading.main_thread() else ""
         previous_input_value = self.input_edit.GetValue() if bindings.app.threading.current_thread() is bindings.app.threading.main_thread() else ""
@@ -1463,6 +1467,8 @@ class RemoteRoutesMixin:
         pending.add((str(chat_id), int(turn_index)))
 
     def _flush_pending_remote_finals(self) -> None:
+        if getattr(self, "_close_started", False):
+            return
         pending = getattr(self, "_pending_remote_finals", None)
         if not pending:
             return

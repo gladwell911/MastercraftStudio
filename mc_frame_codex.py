@@ -1019,6 +1019,8 @@ class CodexSessionsMixin:
             return
         should_schedule = False
         with self._codex_ui_event_lock:
+            if getattr(self, "_close_producer_fenced", False) and bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():
+                return
             self._pending_codex_ui_events.append((str(chat_id or "").strip(), event, source_client))
             if not self._codex_ui_event_flush_scheduled:
                 self._codex_ui_event_flush_scheduled = True

@@ -72,7 +72,7 @@ def _run_with_wx_yield(wx_app, command: list[str], cwd: Path, timeout: float = 3
     return subprocess.CompletedProcess(command, process.returncode, "".join(output), "")
 
 
-def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, tmp_path):
+def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, tmp_path, monkeypatch):
     active_chat_id = "chat-clear-context-active-e2e"
     chat_id = "chat-clear-context-e2e"
     active_question = "desktop active running question remains"
@@ -132,6 +132,9 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
         }
     ]
     frame._render_answer_list()
+    model_starts = []
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: model_starts.append(args))
+    frame._save_state()
     wx_app.Yield()
     assert any(active_question in frame.answer_list.GetString(i) for i in range(frame.answer_list.GetCount()))
 
@@ -143,6 +146,8 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
             port=tcp_port,
             websocket_host="0.0.0.0",
             websocket_port=websocket_port,
+            role_permissions=True,
+            pair_id=pair_id,
         ),
         bundled_dir=Path(__file__).resolve().parents[1] / "tools" / "nats-server",
     )
@@ -174,9 +179,13 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
             token=token,
             on_state=frame._remote_api_state_ui,
             on_clear_context=frame._remote_api_clear_context_ui,
+            on_history_read=frame._remote_api_history_read_ui,
+            durable_store=frame.chat_store,
+            desktop_password=server.config.desktop_password,
             invoke_callback=invoke_on_ui,
         )
         transport.start_threaded(f"nats://127.0.0.1:{tcp_port}", timeout=20)
+        frame._remote_nats_transport = transport
 
         rc_dir = Path(__file__).resolve().parents[2] / "rc"
         flutter_bin = shutil.which("flutter.bat") or shutil.which("flutter")
@@ -185,7 +194,6 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
         reversed_websocket = False
         if (
             endpoint_host == "127.0.0.1"
-            and not device_id.startswith("emulator-")
             and device_id not in {"windows", "chrome", "edge"}
         ):
             assert adb_bin, "adb executable was not found on PATH"
@@ -231,6 +239,7 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
         assert len(archived["turns"]) == 1
         assert archived["turns"][0]["question"] == question
         assert archived["turns"][0]["clear_operation_id"]
+        assert [args[0] for args in model_starts] == [chat_id]
         assert archived["execution_steps"] == []
         assert frame.active_chat_id == active_chat_id
         assert frame.current_chat_id == active_chat_id
@@ -249,4 +258,5 @@ def test_mobile_emulator_clear_context_clears_desktop_chat_frame(frame, wx_app, 
             )
         if transport is not None:
             transport.stop()
+            frame._remote_nats_transport = None
         server.stop()

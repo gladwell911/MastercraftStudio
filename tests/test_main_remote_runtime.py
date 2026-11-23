@@ -1108,7 +1108,7 @@ def test_remote_nats_runtime_falls_back_when_default_port_is_excluded(frame, mon
     assert frame.remote_nats_runtime_status["tcp_url"] == "nats://127.0.0.1:4622"
 
 
-def test_on_close_stops_remote_servers(frame, monkeypatch):
+def test_on_close_stops_remote_servers(frame, monkeypatch, wait_for_wx):
     called = []
     monkeypatch.setattr(frame, "_stop_remote_servers", lambda: called.append("stop"))
     monkeypatch.setattr(frame._voice_input, "cancel", lambda: None)
@@ -1118,19 +1118,9 @@ def test_on_close_stops_remote_servers(frame, monkeypatch):
     monkeypatch.setattr(frame._global_ctrl_hook, "stop", lambda: None)
     monkeypatch.setattr(frame, "_unregister_global_hotkey", lambda: None)
 
-    class _Event:
-        def __init__(self):
-            self.skipped = False
-
-        def Skip(self):
-            self.skipped = True
-
-    event = _Event()
-
-    frame._on_close(event)
-
+    frame.Close()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "remote-close")
     assert called == ["stop"]
-    assert event.skipped is True
 
 
 def test_managed_cloudflared_starts_supplied_token_file_command_and_releases_lease(frame, monkeypatch, tmp_path):

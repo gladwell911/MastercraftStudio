@@ -41,7 +41,9 @@ class NotesSyncService:
         self._on_remote_ops_applied = on_remote_ops_applied
         self._on_status_changed = on_status_changed
         self._client: CouchDbClient | None = None
+        self._active_client: CouchDbClient | None = None
         self._sync_lock = threading.Lock()
+        self._local_write_lock = threading.Lock()
 
     def configure(
         self,
@@ -51,16 +53,26 @@ class NotesSyncService:
         session=None,
         client: CouchDbClient | None = None,
     ) -> None:
-        if client is not None:
-            self._client = client
-            return
-        self._client = CouchDbClient(base_url=base_url, database=database, session=session)
+        replacement = client if client is not None else CouchDbClient(
+            base_url=base_url, database=database, session=session,
+        )
+        with self._local_write_lock:
+            previous = self._client
+            self._client = replacement
+            if previous is self._active_client or previous is replacement:
+                previous = None
+        self._close_client(previous)
 
     def close(self) -> None:
-        client = None
-        with self._sync_lock:
+        with self._local_write_lock:
             client = self._client
             self._client = None
+            if client is self._active_client:
+                return
+        self._close_client(client)
+
+    @staticmethod
+    def _close_client(client: CouchDbClient | None) -> None:
         if client is None:
             return
         try:
@@ -76,7 +88,9 @@ class NotesSyncService:
 
     def sync_once(self) -> dict[str, Any]:
         with self._sync_lock:
-            client = self._client
+            with self._local_write_lock:
+                client = self._client
+                self._active_client = client
             if client is None:
                 return {
                     "configured": False,
@@ -85,17 +99,28 @@ class NotesSyncService:
                     "checkpoint": self.get_checkpoint(),
                     "conflicts": [],
                 }
-            self._emit_status("sending", cursor=self.get_checkpoint())
-            pushed, conflicts = self._push_dirty_documents(client)
-            pulled, checkpoint = self._pull_remote_changes(client)
-            self._emit_status("synced" if not conflicts else "failed", cursor=checkpoint)
-            return {
-                "configured": True,
-                "pushed": pushed,
-                "pulled": pulled,
-                "checkpoint": checkpoint,
-                "conflicts": conflicts,
-            }
+            try:
+                with self._local_write_lock:
+                    if self._client is client:
+                        self._emit_status("sending", cursor=self.get_checkpoint())
+                pushed, conflicts = self._push_dirty_documents(client)
+                pulled, checkpoint = self._pull_remote_changes(client)
+                with self._local_write_lock:
+                    if self._client is client:
+                        self._emit_status("synced" if not conflicts else "failed", cursor=checkpoint)
+                return {
+                    "configured": True,
+                    "pushed": pushed,
+                    "pulled": pulled,
+                    "checkpoint": checkpoint,
+                    "conflicts": conflicts,
+                }
+            finally:
+                with self._local_write_lock:
+                    self._active_client = None
+                    retired = self._client is not client
+                if retired:
+                    self._close_client(client)
 
     def _emit_status(self, status: str, *, message: str | None = None, cursor: str | None = None) -> None:
         if callable(self._on_status_changed):
@@ -118,38 +143,46 @@ class NotesSyncService:
         for entry in snapshot.entries:
             if entry.dirty:
                 dirty_docs.append(self._entry_to_couch_document(entry))
-        if not dirty_docs:
+        if not dirty_docs or self._client is not client:
             return [], []
 
         results = client.write_documents(dirty_docs)
         pushed: list[str] = []
         conflicts: list[dict[str, Any]] = []
-        with self.store._connect() as conn:
-            for item in results:
-                doc_id = str(item.get("id") or "").strip()
-                rev = str(item.get("rev") or "").strip()
-                error = str(item.get("error") or "").strip()
-                if error:
-                    conflicts.append({"id": doc_id, "error": error, "reason": str(item.get("reason") or "")})
-                    continue
-                if not doc_id or not rev:
-                    continue
-                self._mark_document_synced(conn, doc_id, rev)
-                pushed.append(doc_id)
+        with self._local_write_lock:
+            if self._client is not client:
+                return [], []
+            with self.store._connect() as conn:
+                for item in results:
+                    doc_id = str(item.get("id") or "").strip()
+                    rev = str(item.get("rev") or "").strip()
+                    error = str(item.get("error") or "").strip()
+                    if error:
+                        conflicts.append({"id": doc_id, "error": error, "reason": str(item.get("reason") or "")})
+                        continue
+                    if not doc_id or not rev:
+                        continue
+                    self._mark_document_synced(conn, doc_id, rev)
+                    pushed.append(doc_id)
         return pushed, conflicts
 
     def _pull_remote_changes(self, client: CouchDbClient) -> tuple[list[dict[str, Any]], str]:
         checkpoint = self.get_checkpoint()
+        if self._client is not client:
+            return [], checkpoint
         payload = client.fetch_changes(checkpoint)
         rows = list(payload.get("results") or [])
-        applied = self._apply_remote_change_rows(rows)
         next_checkpoint = str(payload.get("last_seq") or checkpoint or "0")
-        self._set_sync_state(CHECKPOINT_STATE_KEY, next_checkpoint)
-        if applied and callable(self._on_remote_ops_applied):
-            try:
-                self._on_remote_ops_applied({"cursor": next_checkpoint, "applied": applied, "conflicts": []})
-            except Exception:
-                pass
+        with self._local_write_lock:
+            if self._client is not client:
+                return [], checkpoint
+            applied = self._apply_remote_change_rows(rows)
+            self._set_sync_state(CHECKPOINT_STATE_KEY, next_checkpoint)
+            if applied and callable(self._on_remote_ops_applied):
+                try:
+                    self._on_remote_ops_applied({"cursor": next_checkpoint, "applied": applied, "conflicts": []})
+                except Exception:
+                    pass
         return applied, next_checkpoint
 
     @staticmethod

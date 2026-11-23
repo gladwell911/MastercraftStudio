@@ -148,10 +148,16 @@ class ChatRequestsMixin:
         model: str = DEFAULT_CLAUDECODE_MODEL,
     ) -> None:
         resolved_model = str(model or DEFAULT_CLAUDECODE_MODEL).strip() or DEFAULT_CLAUDECODE_MODEL
+        owns_turn = self._bind_provider_turn(chat_id, turn_idx)
+
+        def deliver(callback, *args):
+            self._post_provider_turn(owns_turn, callback, *args)
 
         def _worker() -> None:
             client = None
             try:
+                if not owns_turn():
+                    return
                 client = bindings.app.ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
 
                 def is_current_target() -> bool:
@@ -173,12 +179,12 @@ class ChatRequestsMixin:
                     if is_current_target():
                         self.active_claudecode_session_id = value
 
-                if is_current_target():
+                if owns_turn() and is_current_target():
                     # 保存客户端引用，以便在用户发送消息时使用
                     self._set_active_claudecode_client(client, chat_id)
 
                 def on_delta(delta):
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, delta, chat_id)
+                    deliver(self._on_delta, turn_idx, delta, chat_id)
 
                 def on_user_input(params: dict) -> str:
                     """处理用户输入请求"""
@@ -188,11 +194,11 @@ class ChatRequestsMixin:
                     request_msg = format_remote_user_input_request(params)
 
                     # 显示请求消息
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", chat_id)
+                    deliver(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", chat_id)
 
                     # 显示交互式界面（如果有回调）
                     if is_current_target() and hasattr(self, '_show_claudecode_user_input'):
-                        bindings.app.wx_call_after_if_alive(self._show_claudecode_user_input, turn_idx, params, client)
+                        deliver(self._show_claudecode_user_input, turn_idx, params, client)
 
                     # 返回空字符串，让 Claude Code 等待 stdin
                     # 用户会通过发送消息来提供输入，该消息会被拦截并写入 stdin
@@ -206,11 +212,11 @@ class ChatRequestsMixin:
                     request_msg = format_remote_approval_request(params)
 
                     # 显示请求消息
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", chat_id)
+                    deliver(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", chat_id)
 
                     # 显示交互式界面（如果有回调）
                     if is_current_target() and hasattr(self, '_show_claudecode_approval'):
-                        bindings.app.wx_call_after_if_alive(self._show_claudecode_approval, turn_idx, params, client)
+                        deliver(self._show_claudecode_approval, turn_idx, params, client)
 
                     # 返回空字符串，让 Claude Code 等待 stdin
                     # 用户会通过发送消息来提供批准，该消息会被拦截并写入 stdin
@@ -224,20 +230,51 @@ class ChatRequestsMixin:
                     on_approval=on_approval
                 )
                 if new_session_id:
-                    sync_session_id(new_session_id)
+                    deliver(sync_session_id, new_session_id)
                 last_context_usage = getattr(client, "last_context_usage", None)
-                if last_context_usage:
+                if last_context_usage and owns_turn():
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
-                bindings.app.wx_call_after_if_alive(self._on_done, turn_idx, full_text, "", resolved_model, "", chat_id)
+                deliver(self._on_done, turn_idx, full_text, "", resolved_model, "", chat_id)
             except Exception as exc:
                 error_msg = str(exc)
-                bindings.app.wx_call_after_if_alive(self._on_done, turn_idx, "", error_msg, resolved_model, "", chat_id)
+                deliver(self._on_done, turn_idx, "", error_msg, resolved_model, "", chat_id)
             finally:
                 # 清除客户端引用
                 if client is not None:
                     self._clear_active_claudecode_client(client)
 
         bindings.app.threading.Thread(target=_worker, daemon=True).start()
+
+    def _bind_provider_turn(self, owner, index):
+        chat, turns, _current = self._chat_target_for_request(owner)
+        owner = str(owner or (chat or {}).get("id") or self.active_chat_id or "").strip()
+        turn = turns[index] if 0 <= index < len(turns) else None
+        token = turn.setdefault("_provider_request_id", uuid.uuid4().hex) if isinstance(turn, dict) else None
+        generation = getattr(self, "_shortcut_clear_revisions", {}).get(owner)
+
+        def owns_turn():
+            if generation != getattr(self, "_shortcut_clear_revisions", {}).get(owner):
+                return False
+            target, current_turns, _active = self._chat_target_for_request(owner)
+            return isinstance(target, dict) and (token is None or (
+                index < len(current_turns) and isinstance(current_turns[index], dict)
+                and current_turns[index].get("_provider_request_id") == token))
+
+        return owns_turn
+
+    def _post_provider_turn(self, owns_turn, callback, *args):
+        def apply():
+            if owns_turn():
+                callback(*args)
+        self._call_after_if_alive(apply)
+
+    def _launch_generic_worker(self, args, *, prepared_attachments=None):
+        owns_turn = self._bind_provider_turn(args[5], args[1])
+        options = {"owns_turn": owns_turn}
+        if prepared_attachments:
+            options["prepared_attachments"] = prepared_attachments
+        worker = bindings.app.threading.Thread(target=self._worker, args=args, kwargs=options, daemon=True)
+        return worker.start()
 
     def _update_busy_state(self) -> None:
         busy = bool(self._active_request_count or self.is_running)
@@ -310,8 +347,109 @@ class ChatRequestsMixin:
             ev.SetEventObject(self.new_chat_button)
             wx.PostEvent(self.new_chat_button, ev)
 
+    def _visible_clear_owner(self) -> str:
+        if getattr(self, "view_mode", "") == "history" and self.view_history_id:
+            return str(self.view_history_id).strip()
+        return str(getattr(self, "active_chat_id", "") or getattr(self, "current_chat_id", "") or "").strip()
+
+    def _clear_pending_for(self, owner: str) -> bool:
+        return str(owner or "").strip() in getattr(self, "_shortcut_clear_pending", {})
+
+    def _trigger_shortcut_clear(self) -> bool:
+        if getattr(self, "_closing", False) or not self.new_chat_button.IsEnabled():
+            return False
+        owner = self._visible_clear_owner() or self._ensure_active_chat_id()
+        pending = getattr(self, "_shortcut_clear_pending", None)
+        if pending is None:
+            pending = self._shortcut_clear_pending = {}
+        if owner in pending:
+            return False
+        target, turns, current = self._chat_target_for_request(owner)
+        store = getattr(self, "chat_store", None)
+        if (not isinstance(target, dict) or store is None
+                or not callable(getattr(store, "begin_clear_operation", None))):
+            return False
+        request_id = f"local-key-{uuid.uuid4().hex}"
+        pending[owner] = request_id
+        self._play_send_sound()
+        summary = copy.deepcopy({key: value for key, value in target.items()
+                                 if key not in {"turns", "execution_steps"}})
+        pending_turns = copy.deepcopy(turns) if current or "turns" in target else None
+        revision = ChatStore._clear_revision_value(summary.get("revision"))
+        pair_id = self._read_pair_id()
+
+        def clear():
+            operation, claimed, failed, missing_owner = None, False, False, False
+            try:
+                operation = store.begin_clear_operation(
+                    owner, idempotency_key=request_id, pair_id=pair_id,
+                    pending_chat=summary, pending_turns=pending_turns,
+                    expected_revision=revision, allow_new_owner=current, play_resend_sound=False,
+                )
+                if operation.get("snapshot") and not getattr(self, "_closing", False):
+                    claimed = store.claim_clear_resend_dispatch(operation["operation_id"],
+                        chat_id=owner, revision=operation["revision"]) is not None
+                    failed = not claimed
+            except Exception as exc:
+                failed = True
+                missing_owner = isinstance(exc, KeyError) and exc.args == ("CHAT_NOT_FOUND",)
+            self._call_after_if_alive(self._finish_shortcut_clear, owner, request_id,
+                                      operation, claimed, failed, missing_owner)
+
+        bindings.app.threading.Thread(target=clear, name="mc-keyboard-clear", daemon=True).start()
+        return True
+
+    def _finish_shortcut_clear(self, owner, request_id, operation, claimed, failed, missing_owner=False):
+        if self._shortcut_clear_pending.get(owner) != request_id:
+            return
+        if claimed and getattr(self, "_closing", False):
+            releases = getattr(self, "_close_unattempted_resends", ())
+            self._close_unattempted_resends = (*releases, (operation["operation_id"], owner, operation["revision"]))
+        self._shortcut_clear_pending.pop(owner)
+        if getattr(self, "_close_started", False):
+            self._schedule_close_progress()
+        if operation is None:
+            if missing_owner:
+                self._discard_deleted_chat_view(owner)
+                self._refresh_history()
+                self._render_answer_list()
+            message = "无法安全清空上下文，请重试"
+            self.SetStatusText(message)
+            self._speak_text_via_screen_reader(message)
+            return
+        target, _turns, is_current = self._chat_target_for_request(owner)
+        if not isinstance(target, dict):
+            return
+        generations = getattr(self, "_shortcut_clear_revisions", None)
+        if generations is None:
+            generations = self._shortcut_clear_revisions = {}
+        generations[owner] = operation["revision"]
+        self._record_clear_revision(target, operation)
+        if is_current:
+            self._apply_active_clear_projection(owner, bindings.app.time.time())
+        else:
+            self._clear_context_chat_state(target, owner, bindings.app.time.time())
+            self._mark_chat_turns_dirty(owner, 0)
+            self._defer_chat_state_save()
+            self._push_remote_history_changed(owner)
+            self._push_remote_state(owner)
+        visible = self._visible_clear_owner() == owner
+        if not getattr(self, "_closing", False):
+            if claimed:
+                failed = not self._submit_clear_snapshot_offscreen(operation, operation["snapshot"], preclaimed=True)
+            if visible:
+                self._answer_list_tail_notice = "以开启新会话"
+                self._answer_list_tail_notice_chat_id = owner
+                self._render_answer_list()
+            if failed:
+                self.SetStatusText("已清空上下文，自动重发失败")
+                if visible:
+                    self._offer_clear_operation_recovery(operation["operation_id"])
+            else:
+                self.SetStatusText("已清空上下文")
+
     def _clear_context_and_start_new_chat(self, auto_resend_first: bool = False, *, request_id: str = "") -> bool:
-        if not self.new_chat_button.IsEnabled():
+        if getattr(self, "_closing", False) or not self.new_chat_button.IsEnabled():
             return False
         visible_history_id = str(getattr(self, "view_history_id", "") or "").strip()
         if getattr(self, "view_mode", "") == "history" and visible_history_id:
@@ -326,13 +464,10 @@ class ChatRequestsMixin:
             self.active_chat_id = self._ensure_active_chat_id()
         if not self.current_chat_id:
             self.current_chat_id = self.active_chat_id
-        first_question = ""
         first_payload = None
         for t in self.active_session_turns or []:
             if not ChatStore._eligible_clear_payload(t):
                 continue
-            q = str(t.get("question") or "").strip() or str(t.get("text") or "").strip()
-            first_question = q
             first_payload = copy.deepcopy(t)
             break
         try:
@@ -346,14 +481,26 @@ class ChatRequestsMixin:
             self._reconcile_clear_operation_projection(clear_operation)
             return True
         if clear_operation is not None:
+            self._record_clear_revision(self._current_chat_state, clear_operation)
             first_payload = copy.deepcopy(clear_operation.get("snapshot"))
-            first_question = str((first_payload or {}).get("question") or (first_payload or {}).get("text") or "")
+        self._apply_active_clear_projection(self.active_chat_id, now)
+        if auto_resend_first and first_payload:
+            dispatched = self._dispatch_clear_operation_resend(clear_operation, first_payload)
+            if not dispatched and clear_operation is not None:
+                self._offer_clear_operation_recovery(clear_operation["operation_id"])
+        return True
+
+    def _apply_active_clear_projection(self, owner: str, now: float) -> None:
         self._retire_kimi_chat_runtime(
             self._current_chat_state, str(self.active_kimi_session_id or self._current_chat_state.get("kimi_session_id") or "").strip()
         )
+        self._clear_codex_context_usage_for_thread_change(self._current_chat_state)
         self.active_session_turns = []
         self.active_session_started_at = now
         self.active_turn_idx = -1
+        self.is_running = False
+        self._active_request_count = 0
+        self._update_busy_state()
         self.active_openclaw_session_key = DEFAULT_OPENCLAW_SESSION_KEY
         self.active_openclaw_session_id = ""
         self.active_openclaw_session_file = ""
@@ -380,21 +527,18 @@ class ChatRequestsMixin:
         self._current_chat_state["claudecode_session_id"] = self.active_claudecode_session_id
         self._current_chat_state["context_usage"] = None
         self._current_chat_state["execution_steps"] = []
-        self._answer_list_tail_notice = "以开启新会话"
-        self._answer_list_tail_notice_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        self._render_answer_list()
+        if self._visible_clear_owner() == owner and not getattr(self, "_closing", False):
+            self._answer_list_tail_notice = "以开启新会话"
+            self._answer_list_tail_notice_chat_id = owner
+            self._render_answer_list()
         self._defer_chat_state_save()
         self._mark_openclaw_lifecycle_dirty()
         self._push_remote_history_changed(self.active_chat_id)
         self._push_remote_state(self.active_chat_id)
         self.SetStatusText("已清空上下文")
-        if auto_resend_first and first_payload:
-            dispatched = self._dispatch_clear_operation_resend(clear_operation, first_payload)
-            if not dispatched and clear_operation is not None:
-                self._offer_clear_operation_recovery(clear_operation["operation_id"])
-        return True
-
     def _begin_durable_clear_operation(self, chat_id: str, *, request_id: str) -> dict | None:
+        if self._clear_pending_for(chat_id):
+            raise RuntimeError("CLEAR_PENDING")
         store = getattr(self, "chat_store", None)
         if not (getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "begin_clear_operation")):
             return None
@@ -408,6 +552,13 @@ class ChatRequestsMixin:
             store.replace_turns(chat_id, turns)
         return store.begin_clear_operation(chat_id, idempotency_key=request_id, pair_id=pair_id)
 
+    @staticmethod
+    def _record_clear_revision(target, operation):
+        current = ChatStore._clear_revision_value(target.get("revision")) or 0
+        revision = ChatStore._clear_revision_value(operation.get("revision")) or 0
+        if revision >= current:
+            target["revision"] = revision
+
     def _reconcile_clear_operation_projection(self, operation: dict) -> None:
         if not isinstance(operation, dict) or operation.get("state") == "superseded":
             return
@@ -415,7 +566,10 @@ class ChatRequestsMixin:
         target, turns, is_current = self._chat_target_for_request(owner)
         if not isinstance(target, dict):
             return
-        revision = operation.get("revision")
+        revision = ChatStore._clear_revision_value(operation.get("revision"))
+        if revision is None or revision <= (ChatStore._clear_revision_value(target.get("revision")) or 0):
+            return
+        self._record_clear_revision(target, operation)
         owned = [turn for turn in turns if isinstance(turn, dict)
                  and turn.get("clear_operation_id") == operation.get("operation_id")
                  and turn.get("clear_revision") == revision]
@@ -494,21 +648,21 @@ class ChatRequestsMixin:
             store.transition_clear_operation(op_id, "resend_blocked", failure_code="PROVIDER_REJECTED")
         return bool(ok)
 
-    def _submit_clear_snapshot_offscreen(self, operation: dict, snapshot: dict) -> bool:
-        """Dispatch for an archived owner without changing selection, focus, or active input."""
+    def _submit_clear_snapshot_offscreen(self, operation: dict, snapshot: dict, *, preclaimed=False) -> bool:
+        """Dispatch without changing the visible chat, selection, or draft."""
         owner = str(operation.get("chat_id") or "").strip()
         op_id = str(operation.get("operation_id") or "").strip()
         store = getattr(self, "chat_store", None)
-        target = self._find_archived_chat(owner)
+        target, _turns, is_current = self._chat_target_for_request(owner)
         if not owner or not op_id or store is None:
             return False
         if not isinstance(target, dict):
             store.transition_clear_operation(op_id, "resend_blocked", failure_code="OWNER_UNAVAILABLE")
             return False
         revision = ChatStore._clear_revision_value(operation.get("revision"))
-        if revision is None or store.claim_clear_resend_dispatch(
+        if revision is None or (not preclaimed and store.claim_clear_resend_dispatch(
             op_id, chat_id=owner, revision=revision
-        ) is None:
+        ) is None):
             return False
         question = str(snapshot.get("question") or "").strip() or str(snapshot.get("text") or "").strip()
         model = bindings.app.normalize_model_id(snapshot.get("model") or target.get("model") or DEFAULT_MODEL_ID)
@@ -528,6 +682,11 @@ class ChatRequestsMixin:
             target["turns"] = turns
         turn_idx = len(turns)
         turns.append(turn)
+        previous_busy = (self.is_running, self._active_request_count) if is_current else None
+        if is_current:
+            self.active_turn_idx = turn_idx
+            self.is_running = True
+            self._active_request_count = max(1, int(self._active_request_count or 0))
         self._mark_turn_request_pending(turn, model, question)
         target["updated_at"] = bindings.app.time.time()
         self._mark_chat_turns_dirty(owner, turn_idx)
@@ -546,15 +705,16 @@ class ChatRequestsMixin:
                     owner, turn_idx, worker_question,
                     str(target.get("claudecode_session_id") or ""), model)
             else:
-                bindings.app.threading.Thread(target=self._worker,
-                                 args=(bindings.app.openrouter_api_key_for_app(), turn_idx, worker_question, model, False, owner),
-                                 daemon=True).start()
-            self._play_clear_resend_accepted_sound(
-                op_id, owner, revision
-            )
+                self._launch_generic_worker((bindings.app.openrouter_api_key_for_app(), turn_idx,
+                                             worker_question, model, False, owner))
+            if not preclaimed:
+                self._play_clear_resend_accepted_sound(op_id, owner, revision)
         except Exception:
             if 0 <= turn_idx < len(turns) and turns[turn_idx] is turn:
                 turns.pop(turn_idx)
+                if is_current:
+                    self.active_turn_idx = len(turns) - 1
+                    self.is_running, self._active_request_count = previous_busy
                 self._mark_chat_turns_dirty(owner, turn_idx)
                 self._defer_chat_state_save()
             store.transition_clear_operation(op_id, "resend_blocked", failure_code="PROVIDER_REJECTED")
@@ -684,6 +844,8 @@ class ChatRequestsMixin:
 
     def _clear_context_for_chat_id(self, chat_id: str, *, auto_resend_first: bool = False,
                                    request_id: str = "") -> str:
+        if getattr(self, "_closing", False):
+            return "unavailable"
         target_id = str(chat_id or "").strip()
         if not target_id:
             return "missing"
@@ -711,6 +873,8 @@ class ChatRequestsMixin:
         if operation is not None and operation.get("idempotent_replay"):
             self._reconcile_clear_operation_projection(operation)
             return "cleared"
+        if operation is not None:
+            self._record_clear_revision(target_chat, operation)
         self._clear_context_chat_state(target_chat, target_id, bindings.app.time.time())
         self._mark_chat_turns_dirty(target_id, 0)
         if getattr(self, "_chat_store_enabled", False) and getattr(self, "chat_store", None) is not None:
@@ -788,6 +952,8 @@ class ChatRequestsMixin:
                                          prepared_attachments=None) -> tuple[bool, str]:
         """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
+        if self._clear_pending_for(owner_id):
+            return False, "正在清空此聊天的上下文"
         resolved_model = bindings.app.normalize_model_id(model or "", default="")
         text = str(question or "").strip()
         if not owner_id or not resolved_model or not text:
@@ -834,13 +1000,10 @@ class ChatRequestsMixin:
                     owner_id, turn_idx, text, str(chat.get("claudecode_session_id") or ""), resolved_model
                 )
             else:
-                worker = bindings.app.threading.Thread(
-                    target=self._worker,
-                    args=(bindings.app.openrouter_api_key_for_app(), turn_idx, text, resolved_model, False, owner_id),
-                    kwargs={"prepared_attachments": prepared_attachments} if prepared_attachments else {},
-                    daemon=True,
+                started = self._launch_generic_worker(
+                    (bindings.app.openrouter_api_key_for_app(), turn_idx, text, resolved_model, False, owner_id),
+                    prepared_attachments=prepared_attachments,
                 )
-                started = worker.start()
             if started is False:
                 raise RuntimeError("Provider rejected submission")
         except Exception as exc:
@@ -920,6 +1083,10 @@ class ChatRequestsMixin:
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "", *,
                          client_send_id: str = "", _verified_attachments=None) -> tuple[bool, str]:
+        if getattr(self, "_closing", False):
+            return False, "程序正在关闭"
+        if self._clear_pending_for(chat_id or self._visible_clear_owner()):
+            return False, "正在清空此聊天的上下文"
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         raw_question = str(question or "")
@@ -1212,11 +1379,8 @@ class ChatRequestsMixin:
             self._active_answer_row_index = -1
             self._refresh_openclaw_sync_lifecycle()
             self._append_submitted_question_to_answer_list(self.active_turn_idx, turn)
-            bindings.app.threading.Thread(
-                target=self._worker,
-                args=("", self.active_turn_idx, worker_question, resolved_model, False, chat_id or self.active_chat_id, openclaw_session_id),
-                daemon=True,
-            ).start()
+            self._launch_generic_worker(("", self.active_turn_idx, worker_question, resolved_model,
+                                         False, chat_id or self.active_chat_id, openclaw_session_id))
             if self.active_turn_idx == 0:
                 self._schedule_first_question_auto_title(chat_id or self.active_chat_id, display_question)
             self._record_chat_activity(self._current_chat_state, turn["created_at"])
@@ -1285,8 +1449,7 @@ class ChatRequestsMixin:
                         False, chat_id or self.active_chat_id or self.current_chat_id or "")
                 if prepared_attachments:
                     args += ("", prepared_attachments)
-                t = bindings.app.threading.Thread(target=self._worker, args=args, daemon=True)
-                started = t.start()
+                started = self._launch_generic_worker(args)
             if started is False:
                 raise RuntimeError("Provider rejected submission")
         except Exception as exc:
@@ -1367,6 +1530,8 @@ class ChatRequestsMixin:
         chat_id: str = "",
         openclaw_session_id: str = "",
         prepared_attachments=None,
+        *,
+        owns_turn=None,
     ):
         full = ""
         err = ""
@@ -1375,6 +1540,14 @@ class ChatRequestsMixin:
         target_chat, target_turns, is_current_target = self._chat_target_for_request(chat_id)
         if target_chat is None:
             return
+        request_owner = str(chat_id or target_chat.get("id") or self.active_chat_id or "").strip()
+        owner_is_current = owns_turn or self._bind_provider_turn(request_owner, turn_idx)
+        if not owner_is_current():
+            return
+
+        def deliver_owned(callback, *args):
+            self._post_provider_turn(owner_is_current, callback, *args)
+
         history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
         outgoing = target_turns[turn_idx].get("attachments") if 0 <= turn_idx < len(target_turns) else None
         has_claude_attachments = bool(is_openrouter_claude_model(model) and (prepared_attachments or outgoing))
@@ -1385,7 +1558,7 @@ class ChatRequestsMixin:
                 c = bindings.app.OpenClawClient(model=model, cli_manager=self._cli_agent_manager)
                 c.stream_chat(question, session_id=session_id)
                 last_context_usage = getattr(c, "last_context_usage", None)
-                if last_context_usage:
+                if last_context_usage and owner_is_current():
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
                 full = ""
             elif is_codex_model(model):
@@ -1394,20 +1567,20 @@ class ChatRequestsMixin:
                 full = ""
             elif is_claudecode_model(model):
                 def on_delta(d):
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, d, chat_id)
+                    deliver_owned(self._on_delta, turn_idx, d, request_owner)
 
                 def on_user_input(params: dict) -> str:
                     """处理用户输入请求"""
                     from claudecode_remote_protocol import format_remote_user_input_request
                     request_msg = format_remote_user_input_request(params)
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", chat_id)
+                    deliver_owned(self._on_delta, turn_idx, f"\n\n【Claude Code 需要你的输入】\n{request_msg}\n\n", request_owner)
                     return ""
 
                 def on_approval(params: dict) -> str:
                     """处理批准请求"""
                     from claudecode_remote_protocol import format_remote_approval_request
                     request_msg = format_remote_approval_request(params)
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", chat_id)
+                    deliver_owned(self._on_delta, turn_idx, f"\n\n【Claude Code 需要批准】\n{request_msg}\n\n", request_owner)
                     return ""
 
                 client = bindings.app.ClaudeCodeClient(full_auto=True, cli_manager=self._cli_agent_manager)
@@ -1418,14 +1591,14 @@ class ChatRequestsMixin:
                     on_user_input=on_user_input,
                     on_approval=on_approval
                 )
-                if new_session_id:
+                if new_session_id and owner_is_current():
                     self._sync_claudecode_session_id_for_worker_chat(target_chat, is_current_target, new_session_id)
                 last_context_usage = getattr(client, "last_context_usage", None)
-                if last_context_usage:
+                if last_context_usage and owner_is_current():
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = last_context_usage
             else:
                 def on_delta(d):
-                    bindings.app.wx_call_after_if_alive(self._on_delta, turn_idx, d, chat_id)
+                    deliver_owned(self._on_delta, turn_idx, d, request_owner)
 
                 c = bindings.app.ChatClient(api_key=api_key, model=model)
                 if has_claude_attachments:
@@ -1433,7 +1606,7 @@ class ChatRequestsMixin:
                     full = c.stream_chat(question, on_delta, history_turns=history_turns, attachments=attachments)
                 else:
                     full = c.stream_chat(question, on_delta, history_turns=history_turns)
-                if c.last_context_usage:
+                if c.last_context_usage and owner_is_current():
                     self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
         except Exception as e:
             err = str(e)
@@ -1443,7 +1616,7 @@ class ChatRequestsMixin:
                     try:
                         c = bindings.app.ChatClient(api_key=api_key, model=fb_model)
                         full = c.stream_chat(question, on_delta, history_turns=history_turns)
-                        if c.last_context_usage:
+                        if c.last_context_usage and owner_is_current():
                             self._pending_context_usage_by_turn[self._context_usage_pending_key(chat_id, turn_idx)] = c.last_context_usage
                         used_model = fb_model
                         err = ""
@@ -1453,7 +1626,7 @@ class ChatRequestsMixin:
                         err = str(fb_e)
         if skip_done and not err:
             return
-        self._call_after_if_alive(self._on_done, turn_idx, full, err, used_model, fallback_msg, chat_id)
+        deliver_owned(self._on_done, turn_idx, full, err, used_model, fallback_msg, request_owner)
 
     def _load_project_folder(self, _event=None):
         dlg = wx.DirDialog(
@@ -1478,6 +1651,8 @@ class ChatRequestsMixin:
         self.SetStatusText(f"已载入项目：{folder_name}")
 
     def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False):
+        if getattr(self, "_closing", False):
+            return False
         manual_title = str(title or "").strip()
         manual = bool(title_manual and manual_title)
         store = getattr(self, "chat_store", None)

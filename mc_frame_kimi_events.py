@@ -344,6 +344,8 @@ class KimiEventsMixin:
         else:
             self._kimi_thinking_sync_counts.pop(chat_id)
             self._resume_kimi_execution_boundaries(chat_id)
+            if getattr(self, "_close_started", False):
+                self._schedule_close_progress()
 
     def _kimi_sync_thinking_rows(self, chat_id: str, owner: dict, messages: list[dict]) -> bool:
         # Synchronous reconciliation for explicit callers; background REST
@@ -1899,10 +1901,12 @@ class KimiEventsMixin:
     def _dispatch_kimi_event_to_ui(self, chat_id: str, event: CodexEvent) -> None:
         if not event:
             return
-        if getattr(self, "_closing", False) or not self._is_ui_alive():
+        if not self._is_ui_alive():
             return
         should_schedule = False
         with self._kimi_ui_event_lock:
+            if getattr(self, "_close_producer_fenced", False) and bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():
+                return
             self._pending_kimi_ui_events.append((str(chat_id or "").strip(), event))
             if not self._kimi_ui_event_flush_scheduled:
                 self._kimi_ui_event_flush_scheduled = True

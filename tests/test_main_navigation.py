@@ -138,7 +138,7 @@ def test_char_hook_touches_quiet_window_before_alt_a_clear(frame, monkeypatch):
         return True
 
     monkeypatch.setattr(main.time, "monotonic", lambda: 200.0)
-    monkeypatch.setattr(frame, "_clear_context_and_start_new_chat", fake_clear)
+    monkeypatch.setattr(frame, "_trigger_shortcut_clear", fake_clear)
 
     event = _QuietKeyEvent(ord("A"), alt=True)
     frame._on_char_hook(event)
@@ -293,7 +293,7 @@ def test_answer_list_ctrl_c_char_hook_copies_without_moving_selection(frame, mon
     assert frame.answer_list.GetSelection() == 1
 
 
-def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
+def test_char_hook_ctrl_up_switches_to_previous_chat_from_any_focus(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
@@ -308,7 +308,7 @@ def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_LEFT
+            return wx.WXK_UP
 
         def ControlDown(self):
             return True
@@ -324,7 +324,7 @@ def test_char_hook_ctrl_left_switches_to_previous_chat_from_any_focus(frame):
     assert seen["chat_id"] == "chat-c"
 
 
-def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
+def test_char_hook_ctrl_down_switches_to_next_chat_from_any_focus(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
@@ -339,7 +339,7 @@ def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -355,7 +355,7 @@ def test_char_hook_ctrl_right_switches_to_next_chat_from_any_focus(frame):
     assert seen["chat_id"] == "chat-a"
 
 
-def test_input_key_down_ctrl_left_switches_to_previous_chat(frame):
+def test_input_key_down_ctrl_up_switches_to_previous_chat(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
@@ -369,7 +369,7 @@ def test_input_key_down_ctrl_left_switches_to_previous_chat(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_LEFT
+            return wx.WXK_UP
 
         def ControlDown(self):
             return True
@@ -383,10 +383,10 @@ def test_input_key_down_ctrl_left_switches_to_previous_chat(frame):
     frame._on_input_key_down(E())
 
     assert seen["chat_id"] == "chat-c"
-    assert seen["skipped"] == 1
+    assert seen["skipped"] == 0
 
 
-def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
+def test_input_key_down_ctrl_down_switches_to_next_chat(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state.update({"id": "chat-b", "updated_at": 2.0})
@@ -400,7 +400,7 @@ def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -414,10 +414,10 @@ def test_input_key_down_ctrl_right_switches_to_next_chat(frame):
     frame._on_input_key_down(E())
 
     assert seen["chat_id"] == "chat-a"
-    assert seen["skipped"] == 1
+    assert seen["skipped"] == 0
 
 
-def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
+def test_generic_key_down_ctrl_down_switches_to_next_chat(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state["id"] = "chat-b"
@@ -432,7 +432,7 @@ def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
 
     class E:
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -447,7 +447,7 @@ def test_generic_key_down_ctrl_right_switches_to_next_chat(frame):
 
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-a"
-    assert seen["skipped"] >= 1
+    assert seen["skipped"] == 0
 
 
 def test_input_enter_during_ime_composition_does_not_send(frame):
@@ -931,36 +931,38 @@ def test_global_ctrl_arrow_noops_when_app_is_not_foreground(frame, monkeypatch):
     monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (False, {"frame_hwnd": 1, "fg_hwnd": 2, "root_hwnd": 2}))
     monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
 
-    frame._on_global_ctrl_arrow("right")
+    frame._on_global_ctrl_arrow("down")
 
     assert seen == []
 
 
 def test_global_ctrl_arrow_logs_reason_when_app_is_not_foreground(frame, monkeypatch):
+    monkeypatch.setenv("MC_CTRL_NAVIGATION_DEBUG", "1")
     statuses = []
     monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (False, {"frame_hwnd": 1, "fg_hwnd": 2, "root_hwnd": 2}))
     monkeypatch.setattr(frame, "SetStatusText", statuses.append)
 
-    frame._on_global_ctrl_arrow("right")
+    frame._on_global_ctrl_arrow("down")
 
     log_text = (frame.app_data_dir / "ctrl_navigation_debug.log").read_text(encoding="utf-8")
-    assert "direction=right" in log_text
+    assert "direction=down" in log_text
     assert "reason=inactive_target" in log_text
-    assert statuses[-1] == "Ctrl+左右未生效：当前前台焦点不属于本程序"
+    assert statuses[-1] == "Ctrl+上下未生效：当前前台焦点不属于本程序"
 
 
 def test_global_ctrl_arrow_logs_successful_navigation(frame, monkeypatch):
+    monkeypatch.setenv("MC_CTRL_NAVIGATION_DEBUG", "1")
     statuses = []
     seen = []
     monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (True, {"frame_hwnd": 1, "fg_hwnd": 1, "root_hwnd": 1}))
     monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
     monkeypatch.setattr(frame, "SetStatusText", statuses.append)
 
-    frame._on_global_ctrl_arrow("left")
+    frame._on_global_ctrl_arrow("up")
 
     log_text = (frame.app_data_dir / "ctrl_navigation_debug.log").read_text(encoding="utf-8")
     assert seen == [-1]
-    assert "direction=left" in log_text
+    assert "direction=up" in log_text
     assert "result=navigated" in log_text
     assert statuses == []
 

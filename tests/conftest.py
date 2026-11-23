@@ -1,5 +1,6 @@
 import sys
 import ctypes
+import time
 from pathlib import Path
 
 import wx
@@ -18,6 +19,18 @@ def wx_app():
     app = wx.App(False)
     yield app
     app.Destroy()
+
+
+@pytest.fixture
+def wait_for_wx(wx_app):
+    def wait(predicate, description, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            wx_app.Yield()
+            time.sleep(.01)
+        assert predicate(), f"Timed out waiting for {description}"
+
+    return wait
 
 
 @pytest.fixture(autouse=True)

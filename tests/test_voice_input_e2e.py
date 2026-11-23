@@ -67,7 +67,7 @@ def test_voice_input_controller_duplicate_callbacks_insert_twice(frame, monkeypa
     assert frame.input_edit.GetValue() == "浠婂ぉ澶╂皵涓嶉敊浠婂ぉ澶╂皵涓嶉敊"
 
 
-def test_e2e_ctrl_right_from_input_walks_older_chats(frame):
+def test_e2e_ctrl_down_from_input_walks_older_chats(frame):
     frame.current_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
     frame._current_chat_state["title"] = "当前聊天"
@@ -86,7 +86,7 @@ def test_e2e_ctrl_right_from_input_walks_older_chats(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return main.wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -101,14 +101,14 @@ def test_e2e_ctrl_right_from_input_walks_older_chats(frame):
     second = E()
 
     frame._on_input_key_down(first)
-    assert frame.current_chat_id == "chat-c"
+    assert frame.view_history_id == "chat-c"
     frame._on_input_key_down(second)
-    assert frame.current_chat_id == "chat-b"
-    assert first.skipped == 1
-    assert second.skipped == 1
+    assert frame.view_history_id == "chat-b"
+    assert first.skipped == 0
+    assert second.skipped == 0
 
 
-def test_e2e_ctrl_left_from_input_walks_back_to_newer_chats(frame):
+def test_e2e_ctrl_up_from_input_walks_back_to_newer_chats(frame):
     frame.current_chat_id = "chat-a"
     frame.active_chat_id = "chat-a"
     frame._current_chat_state["id"] = "chat-a"
@@ -128,7 +128,7 @@ def test_e2e_ctrl_left_from_input_walks_back_to_newer_chats(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return main.wx.WXK_LEFT
+            return main.wx.WXK_UP
 
         def ControlDown(self):
             return True
@@ -144,13 +144,13 @@ def test_e2e_ctrl_left_from_input_walks_back_to_newer_chats(frame):
 
     for event in events:
         frame._on_input_key_down(event)
-        seen.append(frame.current_chat_id)
+        seen.append(frame.view_history_id or frame.current_chat_id)
 
     assert seen == ["chat-a", "chat-b", "chat-c", "chat-d"]
-    assert all(event.skipped == 1 for event in events)
+    assert all(event.skipped == 0 for event in events)
 
 
-def test_e2e_ctrl_right_from_input_reaches_pinned_and_older_chats(frame):
+def test_e2e_ctrl_down_from_input_reaches_pinned_and_older_chats(frame):
     frame.current_chat_id = "chat-e"
     frame._current_chat_state["id"] = "chat-e"
     frame._current_chat_state["title"] = "聊天E"
@@ -168,11 +168,12 @@ def test_e2e_ctrl_right_from_input_reaches_pinned_and_older_chats(frame):
     frame.input_edit.SetFocus()
 
     class E:
-        def __init__(self):
+        def __init__(self, key):
             self.skipped = 0
+            self.key = key
 
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return self.key
 
         def ControlDown(self):
             return True
@@ -183,18 +184,18 @@ def test_e2e_ctrl_right_from_input_reaches_pinned_and_older_chats(frame):
         def Skip(self):
             self.skipped += 1
 
-    events = [E() for _ in range(6)]
+    events = [E(main.wx.WXK_UP) for _ in range(3)] + [E(main.wx.WXK_DOWN) for _ in range(6)]
     seen = [frame.current_chat_id]
 
     for event in events:
         frame._on_input_key_down(event)
-        seen.append(frame.current_chat_id)
+        seen.append(frame.view_history_id or frame.current_chat_id)
 
-    assert seen == ["chat-e", "chat-g", "chat-f", "chat-b", "chat-c", "chat-a", "chat-d"]
-    assert all(event.skipped == 1 for event in events)
+    assert seen == ["chat-e", "chat-g", "chat-c", "chat-f", "chat-c", "chat-g", "chat-e", "chat-b", "chat-a", "chat-d"]
+    assert all(event.skipped == 0 for event in events)
 
 
-def test_e2e_ctrl_right_from_startup_history_selection_without_current_chat(frame):
+def test_e2e_ctrl_down_from_startup_history_selection_without_current_chat(frame):
     frame.current_chat_id = None
     frame.active_chat_id = ""
     frame.archived_chats = [
@@ -213,7 +214,7 @@ def test_e2e_ctrl_right_from_startup_history_selection_without_current_chat(fram
             self.skipped = 0
 
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return main.wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -227,12 +228,12 @@ def test_e2e_ctrl_right_from_startup_history_selection_without_current_chat(fram
     event = E()
     frame._on_input_key_down(event)
 
-    assert frame.current_chat_id == "chat-f"
-    assert frame.active_chat_id == "chat-f"
-    assert event.skipped == 1
+    assert frame.view_history_id == "chat-b"
+    assert frame.active_chat_id == ""
+    assert event.skipped == 0
 
 
-def test_e2e_ctrl_right_accelerator_switches_chat_from_startup_input_focus(frame):
+def test_e2e_ctrl_down_accelerator_switches_chat_from_startup_input_focus(frame):
     frame.Show()
     frame.current_chat_id = None
     frame.active_chat_id = ""
@@ -250,8 +251,8 @@ def test_e2e_ctrl_right_accelerator_switches_chat_from_startup_input_focus(frame
     event = main.wx.CommandEvent(main.wx.wxEVT_MENU, int(frame._chat_navigation_right_id))
     assert frame.ProcessEvent(event)
 
-    assert frame.current_chat_id == "chat-f"
-    assert frame.active_chat_id == "chat-f"
+    assert frame.view_history_id == "chat-b"
+    assert frame.active_chat_id == ""
 
 
 @pytest.mark.parametrize(
@@ -264,11 +265,10 @@ def test_e2e_ctrl_right_accelerator_switches_chat_from_startup_input_focus(frame
         "new_chat_button",
         "model_combo",
         "notes_notebook_list",
-        "notes_entry_list",
         "notes_editor",
     ],
 )
-def test_e2e_ctrl_right_accelerator_switches_chat_from_any_focused_control(frame, focus_attr):
+def test_e2e_ctrl_down_accelerator_switches_chat_from_any_focused_control(frame, focus_attr):
     frame.Show()
     frame.current_chat_id = None
     frame.active_chat_id = ""
@@ -297,8 +297,8 @@ def test_e2e_ctrl_right_accelerator_switches_chat_from_any_focused_control(frame
     event = main.wx.CommandEvent(main.wx.wxEVT_MENU, int(frame._chat_navigation_right_id))
     assert frame.ProcessEvent(event)
 
-    assert frame.current_chat_id == "chat-f"
-    assert frame.active_chat_id == "chat-f"
+    assert frame.view_history_id == "chat-b"
+    assert frame.active_chat_id == ""
 
 
 @pytest.mark.parametrize(
@@ -310,11 +310,10 @@ def test_e2e_ctrl_right_accelerator_switches_chat_from_any_focused_control(frame
         ("new_chat_button", "_on_generic_key_down"),
         ("model_combo", "_on_generic_key_down"),
         ("notes_notebook_list", "_on_notes_key_down"),
-        ("notes_entry_list", "_on_notes_key_down"),
         ("notes_editor", "_on_notes_key_down"),
     ],
 )
-def test_e2e_ctrl_right_switches_chat_from_any_focused_control(frame, focus_attr, handler_name):
+def test_e2e_ctrl_down_switches_chat_from_any_focused_control(frame, focus_attr, handler_name):
     frame.current_chat_id = "chat-e"
     frame.active_chat_id = "chat-e"
     frame._current_chat_state["id"] = "chat-e"
@@ -348,7 +347,7 @@ def test_e2e_ctrl_right_switches_chat_from_any_focused_control(frame, focus_attr
             self.skipped = 0
 
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return main.wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -362,9 +361,9 @@ def test_e2e_ctrl_right_switches_chat_from_any_focused_control(frame, focus_attr
     event = E()
     getattr(frame, handler_name)(event)
 
-    assert frame.current_chat_id == "chat-g"
-    assert frame.active_chat_id == "chat-g"
-    assert event.skipped == (0 if handler_name == "_on_notes_key_down" else 1)
+    assert frame.view_history_id == "chat-b"
+    assert frame.active_chat_id == "chat-e"
+    assert event.skipped == 0
 
 
 def test_e2e_double_ctrl_voice_input_still_triggers_screen_reader(frame, monkeypatch):
@@ -418,7 +417,7 @@ def test_e2e_global_ctrl_arrow_switches_chat_even_when_input_event_path_is_unava
             self.skipped = 0
 
         def GetKeyCode(self):
-            return main.wx.WXK_RIGHT
+            return main.wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -431,21 +430,22 @@ def test_e2e_global_ctrl_arrow_switches_chat_even_when_input_event_path_is_unava
 
     input_event = E()
     frame._on_input_key_down(input_event)
-    assert frame.current_chat_id == "chat-f"
+    assert frame.view_history_id == "chat-b"
 
     frame.current_chat_id = None
     frame.active_chat_id = ""
     frame.active_session_turns = []
     frame._current_chat_state.clear()
+    frame.view_mode = "active"
+    frame.view_history_id = None
     frame.archived_chats = [dict(chat) for chat in chats]
     frame._refresh_history("chat-g")
     frame.history_list.SetSelection(frame.history_ids.index("chat-g"))
-    frame._on_global_ctrl_arrow("right")
+    frame._on_global_ctrl_arrow("down")
 
-    assert frame.current_chat_id == "chat-f"
-    assert frame.active_chat_id == "chat-f"
-    assert frame.answer_list.GetCount() == 1
-    assert frame.answer_list.GetString(0) == "暂无对话内容"
+    assert frame.view_history_id == "chat-b"
+    assert frame.active_chat_id == ""
+    assert "暂无对话内容" in frame.answer_list.GetStrings()
 
 
 def test_e2e_enter_on_notes_notebook_opens_detail_without_send(frame, monkeypatch):

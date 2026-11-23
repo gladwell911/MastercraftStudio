@@ -135,7 +135,11 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def begin_clear_operation(self, chat_id: str, *, idempotency_key: str,
                               pair_id: str = "default", domain: str = "events",
-                              operation_id: str | None = None) -> dict[str, Any]:
+                              operation_id: str | None = None,
+                              pending_chat: dict | None = None, pending_turns: list | None = None,
+                              expected_revision: int | None = None,
+                              allow_new_owner: bool = False,
+                              play_resend_sound: bool = True) -> dict[str, Any]:
         """Atomically snapshot the first eligible payload, reset the chat and publish clear."""
         if not self.v2_writes_enabled:
             raise RuntimeError("V2_READ_ONLY_RECOVERY")
@@ -161,9 +165,27 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 replay = self._decode_clear_operation(duplicate)
                 replay["idempotent_replay"] = True
                 return replay
+            state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            observed_revision = int(state["revision"]) if state is not None else 1
+            if expected_revision is not None and observed_revision != expected_revision:
+                raise RuntimeError("CLEAR_GENERATION_CHANGED")
+            chat = conn.execute("SELECT * FROM chats WHERE id=?", (owner,)).fetchone()
+            if chat is None and (not allow_new_owner or conn.execute(
+                    "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",),
+            ).fetchone() is not None):
+                raise KeyError("CHAT_NOT_FOUND")
+            if pending_chat is not None:
+                merged = {**pending_chat, "id": owner}
+                if chat is not None:
+                    for field in ("title", "title_revision", "title_source", "title_manual",
+                                  "title_updated_at", "pinned", "detail_panel_mode"):
+                        merged[field] = chat[field]
+                self._upsert_chat_conn(conn, merged)
             chat = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (owner,)).fetchone()
             if chat is None:
                 raise KeyError("CHAT_NOT_FOUND")
+            if pending_turns is not None:
+                self._replace_turns_conn(conn, owner, pending_turns)
             conn.execute("INSERT OR IGNORE INTO v2_chat_state(chat_id) VALUES(?)", (owner,))
             state = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
             current_revision = int(state["revision"])
@@ -224,7 +246,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (op_id, owner, revision, key, pair, event_domain, "requested",
                      json.dumps(snapshot, ensure_ascii=False, sort_keys=True) if snapshot is not None else None,
-                     source_turn_id, source_message_id, 1 if snapshot is not None else 0, now, now),
+                     source_turn_id, source_message_id, 1 if snapshot is not None and play_resend_sound else 0, now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("OPERATION_ID_CONFLICT") from exc
@@ -416,6 +438,19 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                                          row["chat_id"], int(row["revision"]), "resend_dispatched")
             return self._decode_clear_operation(conn.execute("SELECT * FROM clear_operations WHERE operation_id=?", (str(operation_id),)).fetchone())
 
+    def release_unattempted_clear_resend(self, operation_id: str, *, chat_id: str, revision: int) -> None:
+        """The coordinator still owns this claim and has never called a provider."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM clear_operations WHERE operation_id=? AND chat_id=? AND revision=? "
+                               "AND state='resend_dispatched'", (operation_id, chat_id, revision)).fetchone()
+            if row is None:
+                return
+            conn.execute("UPDATE clear_operations SET state='clear_acknowledged',dispatch_claimed_at=NULL,updated_at=? "
+                         "WHERE operation_id=?", (time.time(), operation_id))
+            self._insert_clear_fact_conn(conn, row["pair_id"], row["domain"], operation_id,
+                                         chat_id, revision, "clear_acknowledged")
+
     def consume_clear_resend_sound(self, operation_id: str, *, chat_id: str,
                                    revision: int) -> dict[str, Any] | None:
         """Atomically grant the one send sound for a verified accepted resend.
@@ -566,6 +601,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.close()
 
     def upsert_chat(self, chat: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            self._upsert_chat_conn(conn, chat)
+
+    def _upsert_chat_conn(self, conn, chat):
         if not isinstance(chat, dict):
             return
         chat_id = str(chat.get("id") or "").strip()
@@ -580,41 +619,40 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if detail_panel_mode != "execution":
             detail_panel_mode = "answers"
         metadata = {k: v for k, v in chat.items() if k not in CHAT_PAYLOAD_FIELDS}
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO chats (
-                    id, title, model, created_at, updated_at, pinned, title_manual,
-                    title_source, title_updated_at, title_revision, detail_panel_mode, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title=excluded.title,
-                    model=excluded.model,
-                    created_at=excluded.created_at,
-                    updated_at=MAX(chats.updated_at, excluded.updated_at),
-                    pinned=excluded.pinned,
-                    title_manual=excluded.title_manual,
-                    title_source=excluded.title_source,
-                    title_updated_at=excluded.title_updated_at,
-                    title_revision=excluded.title_revision,
-                    detail_panel_mode=excluded.detail_panel_mode,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    chat_id,
-                    str(chat.get("title") or "新聊天"),
-                    str(chat.get("model") or ""),
-                    created,
-                    updated,
-                    1 if self._bool_value(chat.get("pinned")) else 0,
-                    1 if title_manual else 0,
-                    title_source,
-                    title_updated,
-                    self._int_or(chat.get("title_revision"), 1),
-                    detail_panel_mode,
-                    json.dumps(metadata, ensure_ascii=False),
-                ),
-            )
+        conn.execute(
+            """
+            INSERT INTO chats (
+                id, title, model, created_at, updated_at, pinned, title_manual,
+                title_source, title_updated_at, title_revision, detail_panel_mode, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title,
+                model=excluded.model,
+                created_at=excluded.created_at,
+                updated_at=MAX(chats.updated_at, excluded.updated_at),
+                pinned=excluded.pinned,
+                title_manual=excluded.title_manual,
+                title_source=excluded.title_source,
+                title_updated_at=excluded.title_updated_at,
+                title_revision=excluded.title_revision,
+                detail_panel_mode=excluded.detail_panel_mode,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                chat_id,
+                str(chat.get("title") or "新聊天"),
+                str(chat.get("model") or ""),
+                created,
+                updated,
+                1 if self._bool_value(chat.get("pinned")) else 0,
+                1 if title_manual else 0,
+                title_source,
+                title_updated,
+                self._int_or(chat.get("title_revision"), 1),
+                detail_panel_mode,
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
 
     def list_chat_summaries(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -692,6 +730,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.executemany("DELETE FROM chats WHERE id = ?", [(chat_id,) for chat_id in normalized_ids])
 
     def _commit_chat_delete_conn(self, conn: sqlite3.Connection, chat_id: str) -> None:
+        conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')", (f"deleted-chat:{chat_id}",))
         if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
             return
         row = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
@@ -705,26 +744,29 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
-        incoming = [turn for turn in (turns or []) if isinstance(turn, dict)]
         with self._connect() as conn:
-            existing = {int(row["turn_index"]): self._json_dict(row["payload_json"])
-                        for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
-            for index, turn in enumerate(incoming):
-                old = existing.get(index)
-                if old is not None and not self._same_canonical_turn(old, turn):
-                    conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
-                    conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
-            conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
-            conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
-            conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
-            conn.executemany(
-                "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
-                [
-                    (normalized, idx, json.dumps(turn, ensure_ascii=False))
-                    for idx, turn in enumerate(incoming)
-                ],
-            )
-            self._backfill_canonical_turns_conn(conn, normalized, incoming, 0)
+            self._replace_turns_conn(conn, normalized, turns)
+
+    def _replace_turns_conn(self, conn, normalized, turns):
+        incoming = [turn for turn in (turns or []) if isinstance(turn, dict)]
+        existing = {int(row["turn_index"]): self._json_dict(row["payload_json"])
+                    for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
+        for index, turn in enumerate(incoming):
+            old = existing.get(index)
+            if old is not None and not self._same_canonical_turn(old, turn):
+                conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+                conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
+        conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
+        conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
+        conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
+        conn.executemany(
+            "INSERT INTO turns(chat_id, turn_index, payload_json) VALUES (?, ?, ?)",
+            [
+                (normalized, idx, json.dumps(turn, ensure_ascii=False))
+                for idx, turn in enumerate(incoming)
+            ],
+        )
+        self._backfill_canonical_turns_conn(conn, normalized, incoming, 0)
 
     def replace_turns_from(self, chat_id: str, turns: list[dict[str, Any]], *,
                            start_index: int = 0, attachment_scope: tuple = ()) -> None:

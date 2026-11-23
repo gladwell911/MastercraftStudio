@@ -168,7 +168,7 @@ class OpenClawSessionsMixin:
         new_offset, events = read_session_events(session_file, offset=offset)
         if not events and not needs_replay and new_offset == previous_offset:
             return
-        bindings.app.wx_call_after_if_alive(
+        self._call_after_if_alive(
             self._apply_openclaw_sync_batch,
                 {
                     "session_id": session_id,
@@ -219,7 +219,7 @@ class OpenClawSessionsMixin:
             new_offset, events = read_session_events(session_file, offset=offset)
             if not events and not file_changed and not session_changed and new_offset == previous_offset:
                 continue
-            bindings.app.wx_call_after_if_alive(
+            self._call_after_if_alive(
                 self._apply_openclaw_sync_batch,
                 {
                     "chat_id": str(chat.get("id") or "").strip(),

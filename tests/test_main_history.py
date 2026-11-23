@@ -89,7 +89,7 @@ def test_ctrl_history_navigation_keeps_focus_on_origin_control(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -103,7 +103,7 @@ def test_ctrl_history_navigation_keeps_focus_on_origin_control(frame):
     event = E()
     frame._on_input_key_down(event)
 
-    assert event.skipped == 1
+    assert event.skipped == 0
     assert frame.input_edit.HasFocus()
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-a"
@@ -215,7 +215,7 @@ def test_ctrl_history_navigation_keeps_history_order_unchanged(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -229,7 +229,7 @@ def test_ctrl_history_navigation_keeps_history_order_unchanged(frame):
     event = E()
     frame._on_input_key_down(event)
 
-    assert event.skipped == 1
+    assert event.skipped == 0
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-b"
     assert frame.history_ids == before_ids
@@ -291,7 +291,7 @@ def test_ctrl_history_navigation_stops_at_last_chat_without_wrap(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -305,7 +305,7 @@ def test_ctrl_history_navigation_stops_at_last_chat_without_wrap(frame):
     event = E()
     frame._on_input_key_down(event)
 
-    assert event.skipped >= 1
+    assert event.skipped == 0
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-a"
 
@@ -344,7 +344,7 @@ def test_switch_current_chat_refreshes_answers_list_in_answers_mode(frame):
     assert any("历史回答" == row for row in rows)
 
 
-def test_answer_key_down_ctrl_right_navigates_history_view(frame):
+def test_answer_key_down_ctrl_down_navigates_history_view(frame):
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
     frame._current_chat_state["id"] = "chat-b"
@@ -364,7 +364,7 @@ def test_answer_key_down_ctrl_right_navigates_history_view(frame):
             self.skipped = 0
 
         def GetKeyCode(self):
-            return wx.WXK_RIGHT
+            return wx.WXK_DOWN
 
         def ControlDown(self):
             return True
@@ -380,10 +380,10 @@ def test_answer_key_down_ctrl_right_navigates_history_view(frame):
 
     assert frame.view_mode == "history"
     assert frame.view_history_id == "chat-a"
-    assert event.skipped >= 1
+    assert event.skipped == 0
 
 
-def test_accelerator_ctrl_right_navigates_history_view_from_button_focus(frame):
+def test_accelerator_ctrl_down_navigates_history_view_from_button_focus(frame):
     frame.Show()
     frame.active_chat_id = "chat-b"
     frame.current_chat_id = "chat-b"
@@ -863,8 +863,10 @@ def test_global_ctrl_arrow_navigates_history_when_app_is_foreground(frame, monke
     monkeypatch.setattr(frame, "_global_chat_navigation_target_state", lambda: (True, {"frame_hwnd": 1, "fg_hwnd": 1, "root_hwnd": 1}))
     monkeypatch.setattr(frame, "_navigate_history_chats", lambda direction: seen.append(direction) or True)
 
-    frame._on_global_ctrl_arrow("right")
     frame._on_global_ctrl_arrow("left")
+    frame._on_global_ctrl_arrow("right")
+    frame._on_global_ctrl_arrow("down")
+    frame._on_global_ctrl_arrow("up")
 
     assert seen == [1, -1]
 
@@ -1485,7 +1487,7 @@ def test_history_rename_current_chat_updates_active_state(frame, monkeypatch):
     assert pushed == ["chat-current"]
 
 
-def test_on_close_marks_current_chat_pending_turns_before_save(frame, monkeypatch):
+def test_on_close_marks_current_chat_pending_turns_before_save(frame, wait_for_wx):
     frame.active_chat_id = "chat-current"
     frame._current_chat_state["id"] = "chat-current"
     frame.active_session_turns = [
@@ -1509,31 +1511,14 @@ def test_on_close_marks_current_chat_pending_turns_before_save(frame, monkeypatc
     frame.archived_chats = []
     frame.history_ids = ["chat-current"]
 
-    seen = {}
-
-    def _save_state():
-        seen["current"] = copy.deepcopy(frame.active_session_turns)
-        seen["archived"] = copy.deepcopy(frame.archived_chats)
-
-    monkeypatch.setattr(frame, "_save_state", _save_state)
-    monkeypatch.setattr(frame._voice_input, "cancel", lambda: None)
-    monkeypatch.setattr(frame._realtime_call, "shutdown", lambda: None)
-    monkeypatch.setattr(frame, "_stop_openclaw_sync", lambda: None)
-    monkeypatch.setattr(frame, "_global_ctrl_hook", type("H", (), {"stop": lambda self: None})())
-    monkeypatch.setattr(frame, "_unregister_global_hotkey", lambda: None)
-    monkeypatch.setattr(frame, "_tray_icon", None, raising=False)
-
-    class _Event:
-        def Skip(self):
-            seen["skip"] = True
-
-    frame._on_close(_Event())
-
-    assert seen["current"][0]["request_status"] == "pending"
-    assert seen["current"][0]["request_recoverable"] is True
-    assert seen["current"][1]["request_status"] == "done"
-    assert seen["archived"] == []
-    assert seen["skip"] is True
+    database = frame.chat_store.db_path
+    frame.Close()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "close-persistence")
+    turns = main.ChatStore(database).load_turns("chat-current")
+    assert turns[0]["request_status"] == "pending"
+    assert turns[0]["request_recoverable"] is True
+    assert turns[1]["request_status"] == "done"
+    assert turns[1]["request_recoverable"] is False
 
 
 def test_resolve_app_data_dir_is_dist_history():

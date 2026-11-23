@@ -225,7 +225,7 @@ def test_slow_persistence_worker_defers_close_without_draining_under_live_sqlite
     assert store.appended == [("chat-1", {"text": "pending"})]
 
 
-def test_close_vetoes_and_schedules_retry_while_persistence_worker_is_live():
+def test_close_vetoes_reentry_without_restarting_cleanup():
     class _CloseEvent:
         def __init__(self):
             self.vetoed = False
@@ -233,17 +233,9 @@ def test_close_vetoes_and_schedules_retry_while_persistence_worker_is_live():
         def Veto(self):
             self.vetoed = True
 
-    deferred = []
-    frame = SimpleNamespace(
-        _release_execution_focus_lease=lambda: None,
-        _invalidate_execution_scan=lambda: None,
-        _flush_chat_state_save=lambda: None,
-        _flush_execution_step_persists_sync=lambda: False,
-        _defer_close_for_persistence_worker=lambda: deferred.append(True),
-    )
+    frame = SimpleNamespace(_close_started=True)
     event = _CloseEvent()
 
     main.ChatFrame._on_close(frame, event)
 
     assert event.vetoed is True
-    assert deferred == [True]

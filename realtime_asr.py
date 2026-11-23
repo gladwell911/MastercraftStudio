@@ -255,9 +255,10 @@ class PcmBuffer:
     MAX_BYTES = 640000
     MAX_FRAME_BYTES = 6400
 
-    def __init__(self):
+    def __init__(self, *, packet_bytes=None):
         self.lock = threading.Lock()
         self.frames = deque()
+        self.packet_bytes = packet_bytes
         self.size = 0
         self.peak = 0
         self.sealed = False
@@ -303,7 +304,14 @@ class PcmBuffer:
                 self.failure = "语音缓存已满，本次未写入，请重试"
                 self._wake_locked()
                 return False
-            self.frames.append(data)
+            if self.packet_bytes and self.frames and len(self.frames[-1]) < self.packet_bytes:
+                remaining = self.packet_bytes - len(self.frames[-1])
+                self.frames[-1] += data[:remaining]
+                data_to_queue = data[remaining:]
+            else:
+                data_to_queue = data
+            if data_to_queue:
+                self.frames.append(data_to_queue)
             self.size += len(data)
             self.peak = max(self.peak, self.size)
             if self.first_frame_at is None:
@@ -485,7 +493,12 @@ class RealtimeAsrClient:
                     raise asyncio.CancelledError()
                 if self.buffer.sealed and drain_deadline is None:
                     drain_deadline = time.monotonic() + self.DRAIN_TIMEOUT
-                chunk = self.buffer.frames.popleft() if self.buffer.frames else None
+                frames = self.buffer.frames
+                has_packet = frames and (
+                    self.buffer.sealed or not self.buffer.packet_bytes
+                    or len(frames[0]) >= self.buffer.packet_bytes
+                )
+                chunk = frames.popleft() if has_packet else None
                 if chunk is not None:
                     self.buffer.size -= len(chunk)
                 sealed = self.buffer.sealed

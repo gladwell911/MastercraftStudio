@@ -320,7 +320,7 @@ def test_ui_automation_history_f2_opens_rename_for_selected_chat(frame, wx_app, 
     assert frame.history_ids[frame.history_list.GetSelection()] == "chat-a"
 
 
-def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_running_active_chat(frame, wx_app, monkeypatch):
+def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_running_active_chat(frame, wx_app, monkeypatch, wait_for_wx):
     frame.Show()
     frame.active_chat_id = "chat-a"
     frame.current_chat_id = "chat-a"
@@ -364,7 +364,8 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
             "updated_at": 1.0,
         }
     ]
-    monkeypatch.setattr(frame, "_save_state", lambda *args, **kwargs: None)
+    frame._save_state()
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: None)
     monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
     monkeypatch.setattr(frame, "_push_remote_history_changed", lambda *args, **kwargs: None)
     monkeypatch.setattr(frame, "_push_remote_state", lambda *args, **kwargs: None)
@@ -377,7 +378,7 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
     wx_app.Yield()
 
     frame._on_char_hook(_AltAEvent(frame.answer_list))
-    wx_app.Yield()
+    wait_for_wx(lambda: not frame._shortcut_clear_pending, "archived keyboard clear")
 
     archived = frame._find_archived_chat("chat-b")
     assert frame.active_chat_id == "chat-a"
@@ -392,7 +393,7 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
     assert archived["codex_turn_active"] is False
     assert archived["execution_steps"] == []
     rows = list(frame.answer_list.GetStrings())
-    assert "B old question" not in rows
+    assert "B old answer" not in rows
     assert rows[-1] == "以开启新会话"
 
     assert frame._show_history_chat("chat-a")

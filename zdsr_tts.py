@@ -35,6 +35,7 @@ class ZDSRTTSClient:
         self._init_tried = False
         self._ready = False
         self._api = None
+        self.speech_generation = 0
         self._type = _env_int("ZDSR_TTS_TYPE", 0)
         self._channel_name = os.getenv("ZDSR_TTS_CHANNEL", "").strip()
         self._keydown_interrupt = _env_true("ZDSR_TTS_KEYDOWN_INTERRUPT", True)
@@ -149,6 +150,7 @@ class ZDSRTTSClient:
         content = str(text or "").strip()
         if not content:
             return False
+        self.speech_generation += 1
         if not self._ensure_ready():
             return False
         if self._speak_once(content):
@@ -158,3 +160,14 @@ class ZDSRTTSClient:
         if not self._ensure_ready():
             return False
         return self._speak_once(content)
+
+    def speak_state(self) -> bool | None:
+        """Return speaking/idle, or None when the 争渡 status API is unavailable."""
+        try:
+            query = self._api.GetSpeakState
+            query.argtypes = []
+            query.restype = ctypes.c_int
+            state = int(query())
+        except Exception:
+            return None
+        return {3: True, 4: False}.get(state)

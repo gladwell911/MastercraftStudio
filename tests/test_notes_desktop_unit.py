@@ -641,11 +641,73 @@ def test_notes_sync_push_dirty_documents_does_not_load_full_snapshot(tmp_path, m
             written.extend(docs)
             return [{"id": doc["_id"], "rev": "1-test"} for doc in docs]
 
-    pushed, conflicts = sync._push_dirty_documents(_Client())
+    client = _Client()
+    sync.configure("", "", client=client)
+    pushed, conflicts = sync._push_dirty_documents(client)
 
     assert conflicts == []
     assert {item["_id"] for item in written} == {f"notebook:{notebook.id}", f"entry:{entry.id}"}
     assert set(pushed) == {f"notebook:{notebook.id}", f"entry:{entry.id}"}
+
+
+@pytest.mark.parametrize("phase", ["network-push", "network-pull", "local-pull"])
+def test_notes_sync_close_detaches_network_and_waits_accepted_writes(tmp_path, monkeypatch, phase):
+    import threading
+
+    store = main.NotesStore(tmp_path / "notes.sqlite3", device_id="desktop-test")
+    store.initialize()
+    document = store.create_notebook("dirty") if phase == "network-push" else None
+    entered, release, closed = (threading.Event() for _ in range(3))
+
+    def pause():
+        entered.set()
+        assert release.wait(4)
+
+    class Client:
+        def write_documents(self, docs):
+            assert phase == "network-push"
+            pause()
+            return [{"id": row["_id"], "rev": "1-remote"} for row in docs]
+
+        def fetch_changes(self, checkpoint):
+            assert phase != "network-push"
+            if phase == "network-pull":
+                pause()
+            return {"results": [], "last_seq": "5"}
+
+        def close(self):
+            pass
+
+    service = main.NotesSyncService(store)
+    service.configure("", "", client=Client())
+    if phase == "local-pull":
+        apply = service._apply_remote_change_rows
+
+        def hold_apply(rows):
+            pause()
+            return apply(rows)
+
+        monkeypatch.setattr(service, "_apply_remote_change_rows", hold_apply)
+    worker = threading.Thread(target=service.sync_once, daemon=True)
+    closer = threading.Thread(target=lambda: (service.close(), closed.set()), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        closer.start()
+        if phase == "local-pull":
+            assert not closed.wait(.1)
+        else:
+            assert closed.wait(1)
+            assert worker.is_alive()
+    finally:
+        release.set()
+        worker.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+    assert closed.is_set() and not worker.is_alive()
+    assert service.get_checkpoint() == ("5" if phase == "local-pull" else "0")
+    if document is not None:
+        assert [item.id for item in store.load_dirty_documents().notebooks] == [document.id]
 
 
 def test_remote_create_preserves_incoming_entry_id_and_modifier_identity(tmp_path):

@@ -336,8 +336,12 @@ class AnswersMixin:
             return
         self._render_answer_list(refresh_execution=False)
 
-    def _render_answer_list(self, refresh_execution: bool = True):
-        mode = self._apply_detail_panel_mode()
+    def _render_answer_list(self, refresh_execution: bool = True, *, preserve_panel=False):
+        mode = self._detail_panel_mode() if preserve_panel else self._apply_detail_panel_mode()
+        if preserve_panel and self.execution_list.IsShown():
+            self._show_execution_loading_for_new_owner()
+            self._render_execution_list(force=True)
+        refresh_execution = refresh_execution and not preserve_panel
         rows: list[str] = []
         metas: list[tuple] = []
         self._active_answer_row_index = -1

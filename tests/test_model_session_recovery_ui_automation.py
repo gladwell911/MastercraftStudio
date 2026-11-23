@@ -381,16 +381,15 @@ def test_codex_native_alt_a_new_thread_and_stale_terminal(frame, monkeypatch, tm
         print("NATIVE_CLEAR_MENU", record, flush=True)
         event.Skip()
     frame.Bind(wx.EVT_MENU, observe_menu, id=int(frame._clear_context_id))
-    actual_clear = frame._clear_context_and_start_new_chat
+    actual_clear = frame._trigger_shortcut_clear
     def observe_clear(*args, **kwargs):
-        record = {"auto_resend_first": kwargs.get("auto_resend_first", args[0] if args else False),
-                  "at": time.monotonic(), **native_focus_evidence(frame)}
+        record = {"at": time.monotonic(), **native_focus_evidence(frame)}
         observed["clear"].append(record)
         print("NATIVE_CLEAR_ENTER", record, flush=True)
         result = actual_clear(*args, **kwargs)
         print("NATIVE_CLEAR_RETURN", result, native_focus_evidence(frame), flush=True)
         return result
-    monkeypatch.setattr(frame, "_clear_context_and_start_new_chat", observe_clear)
+    monkeypatch.setattr(frame, "_trigger_shortcut_clear", observe_clear)
 
     def observe_focus(event):
         record = {"event": "set" if event.GetEventType() == wx.wxEVT_SET_FOCUS else "kill",
@@ -436,7 +435,7 @@ def test_codex_native_alt_a_new_thread_and_stale_terminal(frame, monkeypatch, tm
             wait_for(lambda: any(item["kind"] == "codex_submit" and item["question"] == "HOLD" for item in events(folder)), "codex-active-gate")
             assert frame.is_running
         # Real keyboard failure path must leave the durable context intact.
-        original = frame._begin_durable_clear_operation
+        original = frame.chat_store.begin_clear_operation
         operations = []
         def capture_operation(*args, **kwargs):
             observed["durable"].append({"attempt": "success", "at": time.monotonic()})
@@ -448,16 +447,16 @@ def test_codex_native_alt_a_new_thread_and_stale_terminal(frame, monkeypatch, tm
             observed["durable"].append({"attempt": "failure", "at": time.monotonic()})
             print("NATIVE_DURABLE_ENTER", "failure OSError", flush=True)
             raise OSError("controlled durable failure")
-        monkeypatch.setattr(frame, "_begin_durable_clear_operation", durable_failure)
+        monkeypatch.setattr(frame.chat_store, "begin_clear_operation", durable_failure)
         alt_a(frame)
         try:
-            wait_for(lambda: "Unable to clear context safely" in frame.GetStatusBar().GetStatusText(), "clear-failure-visible")
+            wait_for(lambda: "无法安全清空上下文" in frame.GetStatusBar().GetStatusText(), "clear-failure-visible")
         except AssertionError:
             print("NATIVE_CLEAR_FAILURE_DIAGNOSTIC", observed, "status", frame.GetStatusBar().GetStatusText(), flush=True)
             raise
         assert frame.active_codex_thread_id == old_thread
         assert len(frame.active_session_turns) == (3 if active else 2)
-        monkeypatch.setattr(frame, "_begin_durable_clear_operation", capture_operation)
+        monkeypatch.setattr(frame.chat_store, "begin_clear_operation", capture_operation)
         alt_a(frame)
         wait_for(lambda: operations and len(frame.active_session_turns) == 1 and frame.active_session_turns[0].get("request_status") == "done", "native-alt-a-clear-and-resend")
         assert frame.active_session_turns[0]["question"] == "first"

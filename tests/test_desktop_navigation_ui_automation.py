@@ -1,5 +1,6 @@
 """Native Alt+C and quiet history activity with isolated controlled providers."""
 import ctypes
+import threading
 import time
 
 import pytest
@@ -15,6 +16,353 @@ from test_model_session_recovery_ui_automation import (
 
 
 CONTINUE = "好的，继续"
+
+
+def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, monkeypatch):
+    owner = seed_history(frame)
+    frame.archived_chats[0]["detail_panel_mode"] = "execution"
+    for chat in [frame._current_chat_state, frame.archived_chats[0]]:
+        chat["turns"].extend([
+            {"question": "answered question", "answer_md": "old answer", "model": main.DEFAULT_CODEX_MODEL},
+            {"question": "latest unanswered question", "answer_md": main.REQUESTING_TEXT,
+             "model": main.DEFAULT_CODEX_MODEL},
+        ])
+        frame._mark_chat_turns_dirty(chat["id"])
+    frame._save_state()
+    focus = [frame.input_edit]
+    monkeypatch.setattr(wx.Window, "FindFocus", lambda: focus[0])
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: focus.__setitem__(0, frame.answer_list))
+    callbacks = []
+    call_later = wx.CallLater
+
+    class Timer:
+        def Stop(self):
+            pass
+
+    def schedule(delay, callback, *args, **kwargs):
+        if callback.__name__ == "poll":
+            callbacks.append(callback)
+            return Timer()
+        return call_later(delay, callback, *args, **kwargs)
+
+    monkeypatch.setattr(wx, "CallLater", schedule)
+
+    class ScreenReader:
+        speech_generation = 0
+        state = False
+        titles = []
+
+        def speak(self, title):
+            self.speech_generation += 1
+            self.titles.append(title)
+            return True
+
+        def speak_state(self):
+            return self.state
+
+    reader = ScreenReader()
+    frame._zdsr_tts = reader
+    clock = [100.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    event = wx.KeyEvent(wx.wxEVT_CHAR_HOOK)
+    event.SetControlDown(True)
+    event.SetKeyCode(wx.WXK_LEFT)
+    frame._on_char_hook(event)
+    assert frame.view_mode == "active" and reader.titles == []
+    event.SetKeyCode(wx.WXK_UP)
+    frame._on_char_hook(event)
+    assert frame.view_history_id == "recent" and reader.titles == ["recent"]
+    callbacks.pop(0)()  # Idle before audio starts must not move focus.
+    assert focus[0] is frame.input_edit
+    clock[0] += .5
+    callbacks.pop(0)()
+    assert focus[0] is frame.input_edit
+    stale = callbacks.pop(0)
+    frame.ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, int(frame._chat_navigation_right_id)))
+    assert frame.view_mode == "active" and frame.active_chat_id == owner
+    assert reader.titles[-1] == "activity owner"
+    stale()
+    reader.state = True
+    callbacks.pop(0)()
+    assert focus[0] is frame.input_edit
+    reader.state = False
+    callbacks.pop(0)()
+    assert focus[0] is frame.answer_list
+    assert "latest unanswered question" in frame.answer_list.GetString(frame.answer_list.GetSelection())
+
+    focus[0] = frame.input_edit
+    frame._on_char_hook(event)
+    interrupted = callbacks.pop(0)
+    focus[0] = frame.history_list
+    frame._on_chat_navigation_child_focus(wx.ChildFocusEvent(frame.history_list))
+    focus[0] = frame.input_edit
+    interrupted()
+    assert focus[0] is frame.input_edit
+
+    frame._handle_vertical_chat_shortcut(1)
+    clock[0] += 2.1
+    callbacks.pop(0)()  # Status stayed idle for the entire bounded fallback.
+    assert focus[0] is frame.answer_list
+
+
+def test_chat_shortcut_reveals_answers_only_after_long_title(frame, monkeypatch):
+    seed_history(frame)
+    target = frame._find_archived_chat("recent")
+    target["turns"].append({"question": "question", "answer_md": "answer"})
+    target["detail_panel_mode"] = "execution"
+    frame._mark_chat_turns_dirty("recent")
+    frame._save_state()
+    frame._apply_detail_panel_mode("execution")
+    frame.execution_list_model.replace_visible_page([("old-step", "old owner body")], selected_id="old-step")
+    frame.execution_meta = [("execution", 0, "old owner body", "old owner details")]
+    frame._execution_applied_owner = frame._execution_scan_key()[:3]
+    focus = [frame.execution_list]
+    monkeypatch.setattr(wx.Window, "FindFocus", lambda: focus[0])
+    monkeypatch.setattr(frame.answer_list, "SetFocus", lambda: focus.__setitem__(0, frame.answer_list))
+    pending = []
+    call_later = wx.CallLater
+
+    class Timer:
+        def Stop(self):
+            pass
+
+    def schedule(delay, callback, *args, **kwargs):
+        if callback.__name__ == "poll":
+            pending.append(callback)
+            return Timer()
+        return call_later(delay, callback, *args, **kwargs)
+
+    class Reader:
+        speech_generation = 0
+        speaking = True
+
+        def speak(self, _):
+            return True
+
+        def speak_state(self):
+            return self.speaking
+
+    clock = [100.0]
+    monkeypatch.setattr(wx, "CallLater", schedule)
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    frame._zdsr_tts = Reader()
+    assert frame._handle_vertical_chat_shortcut(-1)
+    assert focus[0] is frame.execution_list
+    assert frame._execution_applied_owner == frame._execution_scan_key()[:3]
+    assert frame.execution_list.FindString("old owner body") == wx.NOT_FOUND
+    assert frame._selected_execution_text_viewer_content() is None
+    pending.pop(0)()
+    clock[0] += 20
+    pending.pop(0)()
+    assert pending and focus[0] is frame.execution_list
+    frame._zdsr_tts.speaking = False
+    pending.pop(0)()
+    assert frame.answer_list.IsShown()
+    assert focus[0] is frame.answer_list
+    assert "answer" in frame.answer_list.GetString(frame.answer_list.GetSelection())
+
+
+def test_alt_a_retires_busy_without_resend_and_continues_after_remote_clear(frame, monkeypatch, wait_for_wx):
+    owner = seed_history(frame)
+    frame.active_session_turns[:] = [{
+        "question": "", "attachments": [{"name": "voice.wav"}], "answer_md": main.REQUESTING_TEXT,
+        "origin": "voice", "question_origin": "voice", "model": main.DEFAULT_CODEX_MODEL,
+    }]
+    frame.is_running = True
+    frame._active_request_count = 1
+    errors = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_speak_text_via_screen_reader", errors.append)
+    assert frame._trigger_shortcut_clear()
+    wait_for_wx(lambda: not frame._shortcut_clear_pending, "first local clear")
+    assert not frame.active_session_turns
+    assert not frame.is_running and frame._active_request_count == 0
+    local = frame._current_chat_state["revision"]
+    status, result = frame._remote_api_clear_context_ui({"chat_id": owner, "request_id": "remote-between"})
+    assert status == 200 and result["revision"] == local + 1
+    subsequent = {"question": "accepted after clear", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}
+    frame.active_session_turns.append(subsequent)
+    replay, authority = frame._remote_api_clear_context_ui({"chat_id": owner, "request_id": "remote-between"})
+    assert replay == 200 and authority["revision"] == local + 1
+    assert frame.active_session_turns == [subsequent]
+    frame.active_session_turns.clear()
+    assert frame._trigger_shortcut_clear()
+    wait_for_wx(lambda: not frame._shortcut_clear_pending, "second local clear")
+    assert not errors
+    assert frame._current_chat_state["revision"] == local + 2
+
+
+def test_alt_a_preserves_title_committed_after_snapshot(frame, monkeypatch, wait_for_wx):
+    owner = seed_history(frame)
+    entered, release = threading.Event(), threading.Event()
+    original = frame.chat_store.begin_clear_operation
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "begin_clear_operation", blocked)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    assert frame._trigger_shortcut_clear()
+    try:
+        assert entered.wait(1)
+        frame._bump_chat_title_revision(frame._current_chat_state, "manual", title="committed title")
+        frame.chat_store.upsert_chat(frame._slim_active_chat_state())
+    finally:
+        release.set()
+    wait_for_wx(lambda: not frame._shortcut_clear_pending, "clear after rename")
+    assert frame.chat_store.load_chat(owner)["title"] == "committed title"
+
+
+def test_close_releases_keyboard_clear_claim_that_never_dispatched(frame, monkeypatch, wait_for_wx):
+    owner = seed_history(frame)
+    frame.active_session_turns[:] = [{"question": "resend me", "answer_md": "answer", "model": main.DEFAULT_CODEX_MODEL}]
+    frame._mark_chat_turns_dirty()
+    frame._save_state()
+    claimed, release = threading.Event(), threading.Event()
+    original = frame.chat_store.claim_clear_resend_dispatch
+
+    def hold_claim(*args, **kwargs):
+        operation = original(*args, **kwargs)
+        claimed.set()
+        assert release.wait(3)
+        return operation
+
+    launches = []
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: launches.append(args))
+    monkeypatch.setattr(frame.chat_store, "claim_clear_resend_dispatch", hold_claim)
+    store = frame.chat_store
+    assert frame._trigger_shortcut_clear()
+    try:
+        assert claimed.wait(1)
+        frame.Close()
+    finally:
+        release.set()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "close after claim")
+    assert launches == []
+    [operation] = main.ChatStore(store.db_path).recoverable_clear_operations()
+    assert operation["chat_id"] == owner
+    assert operation["state"] == "clear_acknowledged"
+
+
+def test_alt_a_acknowledges_before_blocked_clear_and_resends_only_original_owner(frame, monkeypatch):
+    owner = seed_history(frame)
+    frame.active_session_turns.append({"question": "original question", "answer_md": "original answer",
+                                      "model": main.DEFAULT_CODEX_MODEL, "origin": "local"})
+    frame._mark_chat_turns_dirty(owner)
+    frame._save_state()
+    entered, release = threading.Event(), threading.Event()
+    order = []
+    original = frame.chat_store.begin_clear_operation
+
+    def block_clear(*args, **kwargs):
+        order.append("store")
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "begin_clear_operation", block_clear)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: order.append("sound"))
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: order.append(args))
+    try:
+        frame.ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, int(frame._clear_context_id)))
+        assert entered.wait(1)
+        assert order == ["sound", "store"]
+        assert frame._show_history_chat("recent", focus_answer_list=False)
+        release.set()
+        wait_for(lambda: not frame._shortcut_clear_pending, "keyboard-clear-completed")
+        assert frame.view_history_id == "recent"
+        assert order[2][0] == owner and order[2][2] == "original question"
+        assert len(order) == 3
+        assert frame.active_session_turns[0]["clear_operation_id"]
+        assert frame.is_running and frame._active_request_count == 1
+        assert frame._find_archived_chat("recent")["turns"] == []
+    finally:
+        release.set()
+
+
+def test_alt_a_blocks_archived_send_and_does_not_recreate_deleted_owner(frame, monkeypatch):
+    seed_history(frame)
+    assert frame._show_history_chat("recent", focus_answer_list=False)
+    entered, release = threading.Event(), threading.Event()
+    original = frame.chat_store.begin_clear_operation
+    spoken = []
+
+    def hold(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "begin_clear_operation", hold)
+    monkeypatch.setattr(frame, "_speak_text_via_screen_reader", spoken.append)
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    try:
+        assert frame._trigger_shortcut_clear()
+        assert entered.wait(1)
+        assert frame._remote_api_message_ui({"chat_id": "recent", "text": "late"})[0] == 409
+        assert not frame._submit_archived_remote_question(frame.archived_chats[0], "late", main.DEFAULT_CODEX_MODEL)[0]
+        frame.history_list.SetSelection(frame.history_ids.index("recent"))
+        frame._history_delete(None)
+        assert frame.chat_store.load_chat("recent") is not None
+        frame.chat_store.delete_chat("recent")
+        release.set()
+        wait_for(lambda: bool(spoken), "keyboard clear storage failure")
+        frame._save_state()
+        assert frame.chat_store.load_chat("recent") is None
+        assert "无法安全清空" in spoken[0]
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("provider", ["generic", "claudecode"])
+def test_provider_callbacks_are_bound_to_turn_at_launch(frame, monkeypatch, provider):
+    owner = seed_history(frame)
+    turns = frame.active_session_turns
+    turns[:] = [{"question": "old"}]
+    jobs, callbacks, results = [], [], []
+
+    class HeldThread:
+        def __init__(self, target, args=(), kwargs=None, **_):
+            jobs.append(lambda: target(*args, **(kwargs or {})))
+        def start(self):
+            pass
+
+    class Provider:
+        last_context_usage = None
+        def __init__(self, **_):
+            pass
+        def stream_chat(self, question, *args, **kwargs):
+            results.append(question)
+            if provider == "claudecode":
+                kwargs["on_delta"]("stale delta")
+                return "stale final", "stale session"
+            args[0]("stale delta")
+            return "stale final"
+
+    monkeypatch.setattr(main.threading, "Thread", HeldThread)
+    monkeypatch.setattr(main, "ChatClient", Provider)
+    monkeypatch.setattr(main, "ClaudeCodeClient", Provider)
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda callback, *a: callbacks.append(lambda: callback(*a)) or True)
+    monkeypatch.setattr(frame, "_on_done", lambda *_: pytest.fail("stale final reached replacement turn"))
+    monkeypatch.setattr(frame, "_on_delta", lambda *_: pytest.fail("stale delta reached replacement turn"))
+
+    def launch():
+        if provider == "claudecode":
+            frame._start_claudecode_worker_for_turn(owner, 0, "old", "old-session")
+        else:
+            frame._launch_generic_worker(("unused", 0, "old", "openai/gpt-5.2", False, owner))
+
+    launch()
+    launch()
+    jobs[0]()  # Provider has queued its output but wx has not consumed it.
+    turns[:] = [{"question": "replacement"}]
+    jobs[1]()  # This provider was launched before replacement but starts now.
+    for callback in callbacks:
+        callback()
+    assert results == ["old"]
+    assert turns == [{"question": "replacement"}]
 
 
 def seed_history(frame, *, pinned=False, active_pinned=False):
