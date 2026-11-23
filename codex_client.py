@@ -15,6 +15,7 @@ from datetime import datetime
 
 from context_usage import cache_token_counts, normalize_context_usage
 from browser_open import browser_open_argv, bundled_skill_root
+from remote_machine_config import resolve_onedrive_sj_root
 
 
 CODEX_MODEL_PREFIX = "codex/"
@@ -294,6 +295,39 @@ def _update_plugin_settings(target_home: Path, settings: dict) -> None:
     temporary = config.with_suffix(".toml.tmp")
     temporary.write_text(updated, encoding="utf-8")
     temporary.replace(config)
+
+
+def _load_onedrive_codex_proxy(env: dict[str, str]) -> None:
+    # Windows exposes uppercase keys when os.environ is copied into a dict.
+    sj_root = resolve_onedrive_sj_root({
+        "OneDriveConsumer": env.get("OneDriveConsumer") or env.get("ONEDRIVECONSUMER"),
+        "OneDrive": env.get("OneDrive") or env.get("ONEDRIVE"),
+    })
+    if sj_root is None:
+        return
+    config_dir = sj_root.parent / "mc"
+    paths = [config_dir / "codex-proxy.env"]
+    computer = env.get("COMPUTERNAME", "")
+    if re.fullmatch(r"[a-zA-Z0-9_-]+", computer):
+        paths.append(config_dir / "machines" / f"{computer}.env")
+
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            key, separator, value = line.partition("=")
+            key = key.strip()
+            if not separator or key not in {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}:
+                continue
+            value = value.strip()
+            if value.startswith(('"', "'")):
+                if len(value) < 2 or value[-1] != value[0]:
+                    continue
+                value = value[1:-1]
+            if "\x00" not in value:
+                env[key] = value
 
 
 def build_codex_app_server_env(cwd: str | None = None) -> tuple[dict[str, str], Path | None]:
@@ -957,6 +991,7 @@ class CodexAppServerClient:
         else:
             env = os.environ.copy()
             env["CODEX_HOME"] = str(self._codex_home_dir)
+        _load_onedrive_codex_proxy(env)
         # These inherited compatibility flags break restricted Windows process
         # creation together even with an elevated Codex token (native A/B).
         for key in list(env):
