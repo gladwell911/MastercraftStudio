@@ -2,6 +2,17 @@
 
 更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。语音与回答无障碍批次从 `267429d` 开始，日常目标为 `D:/code/cx/md/mc.exe`。
 
+## 2026-11-23 本机 Kimi 2.6.3 与 Codex 代理
+
+- `1380852` 接入本机 Kimi 2.6.3 Server API，保留 2.5.3 协议兼容。安装包改用用户安装的 CLI。日常旧包仍在使用，配置与恢复入口见 [Kimi 运行时](kimi-runtime.md)。
+- 独立隔离验证中，真实 wx 聊天和审批 2 项通过，最终定向 43 项通过、3 项已知基线失败。隔离 `-BuildOnly` 退出 0，产物位于 `%TEMP%/mc-kimi-server-review-package/dist/mc`。实际冻结界面收到 `FROZEN_KIMI_REVIEW_OK_842` 并持久化为 `done`。见 [复审规格](../_bmad-output/implementation-artifacts/spec-kimi-server-review-fixes.md)。
+- `e4f60b1` 接入 Codex OneDrive 代理。真实子进程回归覆盖两台机器的独立覆盖和配置缺失时的回退。见 [长期运行维护](runtime-maintenance.md#codex-代理)。
+- 接续先用隔离历史样本验证 2.5.3 到 2.6.3 迁移和降级读取，再由用户安排日常切换，并在台式机及实体读屏环境验证。见 [迁移规格](../_bmad-output/implementation-artifacts/spec-local-kimi-cli.md)。
+
+```powershell
+.venv/Scripts/python.exe -m pytest -q tests/test_kimi_server_client_unit.py tests/test_codex_client_unit.py tests/test_packaging_specs.py
+```
+
 ## 2026-11-23 语音快捷键与回答无障碍
 
 - 源码修复 64 位双 Ctrl 钩子和争渡标题接替。输入、回答、历史三个原焦点均经过真实 wx 键盘路径验证。RC 收到同源累计、六行聊天信息与可续页的最终回答。见 [语音与导航](voice-input.md) 和 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
@@ -73,7 +84,7 @@
 
 ## Kimi 源码与运行时
 
-- `8d896e8` 增加固定运行时收集和暂存、最终包门禁。源码及日常文件 SHA256 已回读一致，2026-11-18 独立版本探针均为 2.5.3。当天以非管理员身份完成隔离默认 spec 构建，日常进程保持运行。准备命令、校验和包内路径见 [Kimi 运行时](kimi-runtime.md)，当时的构建证据见 [打包修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimi-runtime-packaging-20261118.md)。
+- `8d896e8` 增加固定运行时收集和暂存、最终包门禁。源码及日常文件 SHA256 已回读一致，2026-11-18 独立版本探针均为 2.5.3。当天以非管理员身份完成隔离默认 spec 构建，日常进程保持运行。当时的准备命令、包内路径和构建证据见 [打包修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimi-runtime-packaging-20261118.md)。
 - `904cda1` 落实 P1–P11 和七组审查补丁，涵盖原聊天归属、精确 prompt 中断、交互答复与只读重查、不同 owner 的独立恢复预算、未决 POST 和 WS/REST 来源区分。协议和验证命令见 [功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md)。
 - `dec061a` 落实全新审查的八项产品修复及两项验证补强。普通 `/clear` 在聊天发送入口退休旧会话，保留历史并结算旧提问。旧回包、早到 WS 认领、延迟界面回调和归属重建均受原会话身份约束。交互使用原生单列控件，长选项可横向滚动。多个未决请求可轮流重查，启动失败仍可再次查询。归档重载只显示有效的重试提示，终态按完成顺序保留最近 512 项。审批可视正文和 `/stop` 被拒后的原请求状态均有回归。见 [独立审查](../_bmad-output/implementation-artifacts/review-kimicode-fresh-904cda1-20261119.md) 和 [最终修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md)。
 
@@ -90,7 +101,7 @@
 
 ## Kimi 接续
 
-1. 拆分后的冻结包已通过回环服务连续问答。日常切换需先核对部署路径和聊天、笔记数据归属，应用退出和重启由用户安排。物理键盘、读屏、声学出声、真实云端审批/提问及长时运行仍待现场验收。
+1. 拆分后的冻结包已通过回环服务连续问答。日常切换需先核对部署路径和聊天、笔记数据归属，应用退出和重启由用户安排。物理键盘、读屏、声学出声、日常环境的云端审批与长时运行仍待现场验收。
 2. 继续保留纯 REST 自动调度、真实未决 POST 的整体恢复、完成身份淘汰后收到旧重放等验证边界。固定版本的 steered 末步、journal 覆盖和权威 reset 等待证形态见 [steered 后续审查](../_bmad-output/implementation-artifacts/review-kimi-steer-rest-followup-20261118.md) 和 [稳定性审查](../_bmad-output/implementation-artifacts/review-kimi-stability-order-sound-20261118.md)。
 3. [功能修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-functional-20261119.md) 保留中途硬退出、有成功状态但缺失 prompt ID 或响应畸形，以及代次切换后旧队列项的三组延期项。[最终修复计划](../_bmad-output/implementation-artifacts/plan-fix-kimicode-fresh-904cda1-20261119.md) 另保留静置过期后重试菜单暂时可用和入站过期 pending 会触发远程提醒两项既有问题。安装复制中途失败时缺乏回滚独立留在 [原功能审查](../_bmad-output/implementation-artifacts/review-kimicode-functional-20261119.md)。
 

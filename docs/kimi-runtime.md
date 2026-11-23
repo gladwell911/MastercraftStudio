@@ -12,7 +12,7 @@ $env:KIMI_BIN = 'C:/path/to/verified/kimi.exe'
 
 2.6.3 已在隔离环境实测真实模型连续两问、窗口审批允许和拒绝、精确取消与活动断线后恢复。旧会话跨构建迁移和降级可读性仍待验证。
 
-`zgwd.spec` 无需准备 Kimi 文件。默认及自定义 spec 的暂存和最终产物均不得携带 Kimi CLI。更新包时旧 `_internal/runtimes/kimi` 随旧程序文件清理。构建验收须在非管理员 PowerShell 中运行，并传入临时目录。
+`zgwd.spec` 无需准备 Kimi 文件。默认及自定义 spec 的暂存树均不得携带 Kimi CLI，检查包括 `_internal/history` 和 `_internal/.codex-home`。最终树验证跳过这两个保留用户数据目录。更新包时旧 `_internal/runtimes/kimi` 随旧程序文件清理。构建验收须在非管理员 PowerShell 中运行，并传入临时目录。
 
 ```powershell
 $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid().ToString('N'))
@@ -21,7 +21,7 @@ $isolated = Join-Path ([IO.Path]::GetTempPath()) ('mc-build-' + [Guid]::NewGuid(
 
 旧方言根据真实握手选择 V1 或 V2。2.5.3 的 V2 用 `subscribe_v2` 的目标 session ACK 作为发送前门禁，使用主代理 transcript 的 `triggerPromptId` 和 `turn.state` 接纳最终回答。断线补齐走 `/transcript/ops`，日志缺失或服务重启时刷新 `/transcript`；按 prompt 分页恢复，不猜最后一条 assistant。不支持的旧 status/snapshot 能力明确报错，不伪造上下文数据。Kimi 2.5.3 的 schema/路由事实已从其打包 JS 核对，测试夹具均为合成正文。
 
-Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。首次订阅中先到的帧暂存到同一 socket 代次，目标会话获 ACK 后才投递。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。完整回合汇总优先。部分汇总只有在各消耗步骤终止、用量字段完整且与已知汇总逐项相符时才补齐，取消空回合缺少零用量证据时保留未知。上下文和累计分别判定可用性，零分母显示暂不可用，顶部累计以千为单位截去小数。查询诊断只记失败阶段、异常类别与聚合字段计数。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
+Alt+Y 的 V2 当前上下文取自主代理的顶层 `usage` 帧。2.5.3 暂存先到的用量帧，目标会话获 ACK 后才投递。2.6.3 目前只消费当前代次 ACK 后的用量帧，隔离实测初始用量在 ACK 后到达。累计从主代理 transcript 分页读取，按 `turnId` 对终态回合去重并合并当前增量。最近命中率用最新完成 step 的输入，累计命中率用各回合 `inputTokens + cachedTokens` 的总和作分母。完整回合汇总优先。部分汇总只有在各消耗步骤终止、用量字段完整且与已知汇总逐项相符时才补齐，取消空回合缺少零用量证据时保留未知。上下文和累计分别判定可用性，零分母显示暂不可用，顶部累计以千为单位截去小数。查询诊断只记失败阶段、异常类别与聚合字段计数。重置、删除和序列缺口会使旧扫描失效。套接字、账号和会话归属均参与回写校验。V1 继续读取原有 status/snapshot，额度刷新独立进行。
 
 V1 完成回答后会补读同会话的 status/snapshot。已接受的用量刷新在本地或远端聊天信息观察者关闭后仍可结算。MC 保存会话累计并通知对应的 RC 会话。额度由聊天信息入口单独刷新。
 
@@ -31,13 +31,13 @@ ACK 只属于当前 socket generation，失效立即撤销就绪。running、que
 
 普通 `/clear` 在发送入口退休当前聊天的会话关联，保留历史并结算此前未完成的 Kimi 提问。新问题分配新会话，迟到的回包、早到 WS 认领和延迟界面回调都校验提交时的锁身份。V2 `/stop` 按当前准确的 session 与 prompt 发送。服务端受理后等待权威终态，被拒后原提问仍可完成。
 
-V2 审批和提问按 session 与 interaction ID 归属。已知失败可经“应用 → 重试 Kimi 请求”再次答复，结果未知先只读查询。菜单轮流处理当前聊天的未决请求，历史归档仅在对应请求仍有效时显示重试提示。HTTP 响应、WS ended 和本地退休共用终态处理，最多保留 512 个近期终态用于抑制重放，活动请求保持可用。
+V2 审批和提问按 session 与 interaction ID 归属。已知失败可经“应用 → 重试 Kimi 请求”再次答复，结果未知先只读查询。菜单轮流处理当前聊天的未决请求，历史归档仅在对应请求仍有效时显示重试提示。2.6.3 用交互专用 URL 绑定 POST 回包，核对实际 `outcome`。结果未知时先查会话的待交互类别，再通过当前 socket 重订阅取得带精确 ID 的 pending 帧。连接变化、身份无法确认或查询失败时保持未知。HTTP 响应、WS ended 和本地退休共用终态处理，最多保留 512 个近期终态用于抑制重放，活动请求保持可用。
 
 首次完整成功回答在前后台共用接纳边界保存并请求完成音，alias 只保留问题和回答身份引用。`MC_KIMI_COMPLETION_DIAGNOSTICS=1` 开启当前进程最多 128 条匿名完成/音效结果记录（`_kimi_completion_diagnostics`）；默认关闭，不保存正文或凭据，无历史补播。
 
 ## 键盘导航与执行详情
 
-Kimi 流式片段、执行投影和隐私撤回按序在后台写入。REST 整理消息并分批应用到 wx，按 chat、revision、session、turn 和 prompt 归属处理。续批提交公开块前重新检查撤回状态，重复快照无需重绘列表。撤回处理覆盖超出可见缓存的持久化记录，保护重开的执行历史及远端交付。可重试存储故障持续时，正常关闭继续等待已经接收的批次和写入。
+Kimi 流式片段、执行投影和隐私撤回按序在后台写入。2.6.3 用 `item_id` 和 `set` 合并更新，条目删除、隐藏或失去 prompt 归属会撤回相应内容。终态 REST 查证在有界后台执行，查不到结果时触发会话级只读补查。REST 整理消息并分批应用到 wx，按 chat、revision、session、turn 和 prompt 归属处理。续批提交公开块前重新检查撤回状态，重复快照无需重绘列表。撤回处理覆盖超出可见缓存的持久化记录，保护重开的执行历史及远端交付。可重试存储故障持续时，正常关闭继续等待已经接收的批次和写入。
 
 源码测试已经在 SQLite 写锁持有期间和长 REST 快照的实际 wx 定时器续批之间记录 Tab 焦点与方向键选中事件。争渡声学出声与日常构建仍待现场验收。测试和审查证据见 [实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md)。
 

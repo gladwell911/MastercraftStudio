@@ -13,7 +13,7 @@
 
 ## Kimi Code
 
-MC 使用独立、固定版本的 Kimi 2.5.3 Windows 二进制，启动前核对版本和 SHA256，子进程禁自动更新。缺少运行时时，按 [Kimi 运行时](docs/kimi-runtime.md) 从已验证的本地候选显式准备。`KIMI_BIN` 覆盖也需相同校验。
+MC 使用当前用户安装的 Kimi CLI，默认查找用户目录下的 `.kimi-code/bin/kimi.exe`。可将 `KIMI_BIN` 设为绝对路径。启动 Kimi 时校验版本和构建哈希，受支持的 Windows 构建包括 2.6.3 和 2.5.3。安装和更新由用户管理。参见 [Kimi 运行时](docs/kimi-runtime.md)。
 
 当前源码中，`/clear` 清除会话关联并保留聊天记录，下一问使用新会话。`/stop` 中断当前已开始的任务，服务器受理后界面等待实际终态。审批和提问通过对话框处理，可从“应用 → 重试 Kimi 请求”查看或重试当前聊天的未决请求。
 
@@ -48,6 +48,8 @@ MC 使用独立、固定版本的 Kimi 2.5.3 Windows 二进制，启动前核对
 F1 即时可视尾页与索引、消息活动即时排序、Kimi 本机安全 GET 恢复保留。2026-10-04 对应自动化与私有 Local 场景通过，物理 F1、公网 Kimi 与实体手机不在当次验证范围。
 
 既有独立答案完成时间、累计五分钟标记、通知路由与 Codex 执行语义修复保留。菜单“应用 → Codex 执行审批”默认自动审查，访问权限独立保存，默认完全访问，原生默认参数为 on-request / danger-full-access / auto_review。缺失或无效的访问权限回退完全访问，已有有效手选保持不变。旧无版本审批配置仅迁移一次，此后保留用户手选的“不询问”“需要时询问”或自动审查；只影响后续线程启动/恢复。官方审核不保证批准，拒绝后停止。
+
+Codex app-server 的共享代理和计算机名覆盖配置见 [长期运行维护](docs/runtime-maintenance.md#codex-代理)。
 
 Codex 隔离 home 通过整目录 symlink/Junction 复用当前用户的 `.codex/skills` 和 `.codex/plugins`；用户 `.agents/skills` 与源码/随包 `assets/codex-skills` 在每个新任务前合并去重，向原生发现注册并刷新。同名技能优先级及插件身份由 Codex 处理。旧普通目录保存在同 home 的 `skills.legacy-*` / `plugins.legacy-*`，源缺失时保留旧内容；链接失败明确报错，不退回复制，不改全局文件（包括 BOM）。插件或 marketplaces 配置变化在新任务前更新对应配置并重启 app-server，通过原 thread 恢复；执行中追加输入保持当前任务。
 

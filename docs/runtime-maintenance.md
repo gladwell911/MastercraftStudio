@@ -51,6 +51,10 @@ $env:MC_CTRL_NAVIGATION_DEBUG = '1'
 
 输出区分全库 `counts` 与 `selected_pair_counts`（outbox/facts/pending），给出两个lane的实际查询计划和首轮、暖态median/p95。完整迁移 `upgrade_ms` 从临时旧schema状态执行真实 `initialize()`，包括新增索引、进度表及播种；它是总elapsed，不是单独写锁持有时间。首轮连接读取不等于清空操作系统缓存。合成数据、真实备份和不同轮次不能混合计算提升倍数。
 
+## Codex 代理
+
+共享配置位于 OneDrive MC 数据目录的 `codex-proxy.env`，按 `COMPUTERNAME` 匹配的 `machines/<计算机名>.env` 可逐键覆盖。以 `OneDriveConsumer`（优先）或 `OneDrive` 为根时，MC 数据目录为 `OneDrive/code/data/mc`。配置格式为 `KEY=value`，仅 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY` 应用到 Codex app-server 子进程。配置文件缺失时保留已有环境和可读的共享配置。
+
 ## 构建输出与复制边界
 
 `package_mc.ps1` 默认WorkPath为源码下 `.dev/build/pyinstaller`，临时staging也在所选WorkPath内；自定义WorkPath、DistPath、SpecPath保持有效。这里只改变未来输出位置，不自动清理旧树，也不设累计开发磁盘配额。

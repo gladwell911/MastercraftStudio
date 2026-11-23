@@ -1,6 +1,6 @@
 # 文档索引
 
-截至 2026-11-23，源码已完成聊天切换、Alt+A 后台清空、语音尾段和分阶段退出的交互改进。日常包具备固定 Kimi 2.5.3 运行时，后续源码改动待打包切换。各版本验证边界见 [当前交接](handoff.md)。
+截至 2026-11-23，源码已完成聊天切换、Alt+A 后台清空、语音尾段和分阶段退出的交互改进。源码和隔离冻结包已验证本机 Kimi 2.6.3。日常包仍使用原有 Kimi 2.5.3，切换待现场验收。各版本验证边界见 [当前交接](handoff.md)。
 
 ## 当前入口
 
@@ -37,7 +37,7 @@
 | 桌面回答、执行、历史、模型与语音等功能 | `mc_frame_*.py` 中同领域模块 | `tests/test_main_*.py`，如 `tests/test_main_answers.py`、`tests/test_main_voice.py` |
 | 聊天存储、表结构、通知与执行分页 | `chat_store.py`、`chat_store_schema.py`、`chat_store_notifications.py`、`chat_store_execution.py` | `tests/test_chat_store_unit.py`、`tests/test_notification_sync.py` |
 | 独立笔记编辑窗口 | `notes_edit_window.py`（由 `mc_frame_notes.py` 打开） | `tests/test_notes_edit_window_unit.py` |
-| Kimi 客户端、事件、队列、V2 与 WebSocket | `kimi_server_client.py`、`kimi_server_events.py`、`kimi_server_queue.py`、`kimi_server_v2.py`、`kimi_server_websocket.py` | `tests/test_kimi_server_client_unit.py`、`tests/test_kimi_integration_*.py` |
+| Kimi 客户端、事件、队列、V2 与 WebSocket | `kimi_server_api.py`、`kimi_server_client.py`、`kimi_server_events.py`、`kimi_server_queue.py`、`kimi_server_v2.py`、`kimi_server_websocket.py` | `tests/test_kimi_server_client_unit.py`、`tests/test_kimi_integration_*.py` |
 
 历史记录中的 `tests/test_main_unit.py` 和 `tests/test_kimi_integration.py` 对应拆分前的版本。迁移与验证记录见 [职责拆分计划](../_bmad-output/implementation-artifacts/plan-mc-code-split.md)。
 
