@@ -1075,6 +1075,7 @@ class ChatFrame(
         self.answer_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("answer_key_down", self._on_answer_key_down))
         self.answer_list.Bind(wx.EVT_CHAR, self._on_answer_char)
         self.answer_list.Bind(wx.EVT_LEFT_DOWN, self._on_answer_mouse_down)
+        self.answer_list.Bind(wx.EVT_LEFT_DCLICK, self._on_answer_mouse_double_click)
         self.answer_list.Bind(wx.EVT_LEFT_UP, self._on_answer_mouse_read)
         self.answer_list.Bind(wx.EVT_LISTBOX_DCLICK, self._on_answer_activate)
         self.execution_list.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("execution_key_down", self._on_execution_key_down))

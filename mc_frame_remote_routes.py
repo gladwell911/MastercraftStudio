@@ -890,60 +890,85 @@ class RemoteRoutesMixin:
         return 200, {"accepted": True, **chat}
 
     def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
-        if (getattr(self, "_chat_navigation_answer_rows_deferred", False)
-                or getattr(self, "_chat_navigation_history_selection_deferred", False)):
+        navigation_deferred = (
+            getattr(self, "_chat_navigation_answer_rows_deferred", False)
+            or getattr(self, "_chat_navigation_history_selection_deferred", False)
+        )
+        previous_history_id = self.view_history_id if self.view_mode == "history" else None
+        archive_completed = False
+        try:
+            previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+            previous_codex_service_tier = self._current_codex_service_tier()
+            archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
+            archive_completed = True
+            self._reset_active_codex_session_state()
+            self._reset_active_kimi_session_state()
+            self.view_mode = "active"
+            self.view_history_id = None
+            self._pending_context_usage_by_turn = {}
+            self._codex_early_context_usage_owner = {}
+            self._clear_active_claudecode_client()
+            self.current_chat_id = ""
+            self.active_chat_id = ""
+            self.active_session_turns = []
+            now = bindings.app.time.time()
+            default_title = str((payload or {}).get("title") or "").strip() or self._next_default_chat_title()
+            self.active_session_started_at = now
+            self._current_chat_state = {
+                "id": "",
+                "title": default_title,
+                "title_manual": False,
+                "title_source": "default",
+                "title_updated_at": now,
+                "title_revision": 1,
+                "turns": self.active_session_turns,
+                "context_usage": None,
+                "created_at": now,
+                "updated_at": now,
+                "detail_panel_mode": "answers",
+                "execution_steps": [],
+                "codex_service_tier": "",
+            }
+            requested_chat_id = str((payload or {}).get("chat_id") or "").strip()
+            self.active_chat_id = requested_chat_id or str(uuid.uuid4())
+            self.current_chat_id = self.active_chat_id
+            self._current_chat_state["id"] = self.active_chat_id
+            self._reset_answer_visible_row_limit()
+            self._reset_current_turn_execution_view()
+            model = bindings.app.normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
+            self.selected_model = model
+            self._current_chat_state["model"] = model
+            self._write_active_codex_session_state_to_chat(self._current_chat_state)
+            self._write_active_kimi_session_state_to_chat(self._current_chat_state)
+            if is_codex_model(model):
+                self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
+            on_ui_thread = bindings.app.threading.current_thread() is bindings.app.threading.main_thread()
+            if on_ui_thread:
+                self.model_combo.SetValue(bindings.app.model_display_name(model))
+                self._sync_codex_speed_combo_from_chat(self._current_chat_state)
+            self._save_state()
+        except Exception as error:
+            if not archive_completed and previous_history_id and self._find_archived_chat(previous_history_id):
+                self.view_mode = "history"
+                self.view_history_id = previous_history_id
+            self._chat_navigation_answer_rows_deferred = True
+            self._chat_navigation_history_selection_deferred = True
+            try:
+                self._cancel_chat_navigation_focus()
+            except Exception as recovery_error:
+                error.add_note(f"Could not recover answer rows: {recovery_error!r}")
+            try:
+                self._flush_chat_navigation_history_selection()
+            except Exception as recovery_error:
+                self._chat_navigation_history_selection_deferred = True
+                error.add_note(f"Could not recover history selection: {recovery_error!r}")
+            raise
+        if navigation_deferred:
             self._chat_navigation_answer_rows_deferred = False
             self._chat_navigation_history_selection_deferred = False
             self._cancel_chat_navigation_focus()
-        previous_chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        previous_codex_service_tier = self._current_codex_service_tier()
-        archived = self._archive_active_session(quick_title=True, schedule_async_rename=True)
-        self._reset_active_codex_session_state()
-        self._reset_active_kimi_session_state()
-        self.view_mode = "active"
-        self.view_history_id = None
-        self._pending_context_usage_by_turn = {}
-        self._codex_early_context_usage_owner = {}
-        self._clear_active_claudecode_client()
-        self.current_chat_id = ""
-        self.active_chat_id = ""
-        self.active_session_turns = []
-        now = bindings.app.time.time()
-        default_title = str((payload or {}).get("title") or "").strip() or self._next_default_chat_title()
-        self.active_session_started_at = now
-        self._current_chat_state = {
-            "id": "",
-            "title": default_title,
-            "title_manual": False,
-            "title_source": "default",
-            "title_updated_at": now,
-            "title_revision": 1,
-            "turns": self.active_session_turns,
-            "context_usage": None,
-            "created_at": now,
-            "updated_at": now,
-            "detail_panel_mode": "answers",
-            "execution_steps": [],
-            "codex_service_tier": "",
-        }
-        requested_chat_id = str((payload or {}).get("chat_id") or "").strip()
-        self.active_chat_id = requested_chat_id or str(uuid.uuid4())
-        self.current_chat_id = self.active_chat_id
-        self._current_chat_state["id"] = self.active_chat_id
-        self._reset_answer_visible_row_limit()
-        self._reset_current_turn_execution_view()
-        model = bindings.app.normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
-        self.selected_model = model
-        self._current_chat_state["model"] = model
-        self._write_active_codex_session_state_to_chat(self._current_chat_state)
-        self._write_active_kimi_session_state_to_chat(self._current_chat_state)
-        if is_codex_model(model):
-            self._current_chat_state["codex_service_tier"] = previous_codex_service_tier
-        if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
-            self.model_combo.SetValue(bindings.app.model_display_name(model))
-            self._sync_codex_speed_combo_from_chat(self._current_chat_state)
+        if on_ui_thread:
             self.input_edit.SetFocus()
-        self._save_state()
         self._refresh_history(archived["id"] if archived else previous_chat_id or None)
         self._render_answer_list()
         self.SetStatusText("已开始远程新聊天")

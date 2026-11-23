@@ -1,3 +1,5 @@
+import sqlite3
+
 import main
 import pytest
 from types import SimpleNamespace
@@ -866,7 +868,8 @@ def test_remote_offscreen_clear_real_store_stable_request_dispatches_exactly_onc
     assert len(rows) == 1
 
 
-def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, monkeypatch):
+@pytest.mark.parametrize("remote", [True, False])
+def test_remote_new_chat_or_local_new_chat_settles_history_navigation(frame, monkeypatch, remote):
     frame.archived_chats = [
         {
             "id": "chat-history",
@@ -924,7 +927,7 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
     titles, stops = [], []
     frame._zdsr_tts = SimpleNamespace(
         speak_chat_navigation=lambda title: titles.append(title) or True,
-        speak_state=lambda: pytest.fail("remote new must settle navigation before polling"),
+        speak_state=lambda: pytest.fail("new chat must settle navigation before polling"),
         stop=lambda: stops.append(True),
     )
     assert frame._navigate_history_chats(-1)
@@ -932,16 +935,105 @@ def test_remote_new_chat_from_history_clears_pending_and_history_context(frame, 
     assert frame._chat_navigation_timer is not None and frame.view_history_id == "chat-history"
     assert any(meta[0] == "answer" and meta[2] == "old answer" for meta in frame.answer_meta)
 
-    frame._start_remote_new_chat({"model": "openai/gpt-5.2"})
+    if remote:
+        frame._start_remote_new_chat({"model": "openai/gpt-5.2"})
+    else:
+        assert frame._on_new_chat_clicked(None)
 
     assert frame.view_mode == "active"
     assert frame.view_history_id is None
     assert frame._pending_context_usage_by_turn == {}
     assert frame._current_chat_state.get("context_usage") is None
     assert stops == [True] and frame._chat_navigation_timer is None
-    assert frame.history_list_model.selected_id() == "chat-current"
+    assert frame.history_list_model.selected_id() == ("chat-current" if remote else frame.active_chat_id)
     assert frame.answer_list.FindString("暂无对话内容") != main.wx.NOT_FOUND
     assert not any(meta[0] in {"answer", "question"} for meta in frame.answer_meta)
+
+
+@pytest.mark.parametrize("failed_save, projected_answers, render_error", [
+    ("archive_start", False, False),
+    ("archive_end", False, False),
+    ("archive_end", False, True),
+    ("new_chat", False, False),
+    ("new_chat", True, False),
+])
+def test_remote_new_chat_failure_syncs_answer_and_history_to_view(
+    frame, monkeypatch, failed_save, projected_answers, render_error,
+):
+    def completed_turn(body):
+        return {"question": "question", "answer_md": body, "request_status": "done"}
+
+    frame.active_chat_id = frame.current_chat_id = "chat-current"
+    frame.active_session_turns = [completed_turn("current answer")]
+    frame._current_chat_state = {
+        "id": "chat-current", "title": "current", "turns": frame.active_session_turns,
+        "created_at": 2.0, "updated_at": 2.0,
+    }
+    frame.archived_chats = [{
+        "id": "chat-history", "title": "history", "turns": [completed_turn("history answer")],
+        "created_at": 1.0, "updated_at": 1.0,
+    }]
+    for owner in ("chat-current", "chat-history"):
+        frame._mark_chat_turns_dirty(owner)
+    frame._save_state()
+    frame._refresh_history("chat-current")
+    frame._render_answer_list()
+    frame.answer_list.SetSelection(frame.answer_list.FindString("current answer"))
+    monkeypatch.setattr(main.wx.Window, "FindFocus", lambda: frame.input_edit)
+    stops = []
+    frame._zdsr_tts = SimpleNamespace(
+        speak_chat_navigation=lambda _: True, speak_state=lambda: True, stop=lambda: stops.append(True),
+    )
+    assert frame._navigate_history_chats(1)
+    assert frame.view_history_id == "chat-history"
+    assert frame.history_list_model.selected_id() == "chat-current"
+    assert frame.answer_list.GetStringSelection() == "current answer"
+    assert frame._selected_read_target() is None
+    if projected_answers:
+        frame._cancel_chat_navigation_focus()
+        assert frame.answer_list.FindString("history answer") != main.wx.NOT_FOUND
+        assert frame._chat_navigation_history_selection_deferred
+
+    save_state = frame._save_state
+    expected_owner = "chat-new" if failed_save == "new_chat" else "chat-history"
+    storage_error = sqlite3.OperationalError("database is locked")
+
+    def save_or_raise(**kwargs):
+        owner = frame._visible_answer_owner_chat_id()
+        if (
+            (failed_save == "archive_start" and owner == "chat-history")
+            or (failed_save == "archive_end" and frame.view_mode == "active" and not frame.active_chat_id)
+            or (failed_save == "new_chat" and owner == "chat-new")
+        ):
+            raise storage_error
+        return save_state(**kwargs)
+
+    monkeypatch.setattr(frame, "_save_state", save_or_raise)
+    if render_error:
+        def fail_render(**kwargs):
+            raise RuntimeError("answer rendering failed")
+
+        monkeypatch.setattr(frame, "_render_answer_list", fail_render)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked") as failure:
+        frame._remote_api_new_chat_ui({"chat_id": "chat-new"})
+
+    assert failure.value is storage_error
+    assert stops == [True] and frame._chat_navigation_timer is None
+    assert frame._chat_navigation_answer_rows_deferred == render_error
+    assert not frame._chat_navigation_history_selection_deferred
+    assert frame._visible_answer_owner_chat_id() == expected_owner
+    assert frame.history_list_model.selected_id() == expected_owner
+    if render_error:
+        assert frame.answer_list.GetStringSelection() == "current answer"
+        assert frame._selected_read_target() is None
+        assert "answer rendering failed" in failure.value.__notes__[0]
+        return
+    assert frame.answer_list.FindString("current answer") == main.wx.NOT_FOUND
+    if failed_save != "new_chat":
+        frame.answer_list.SetSelection(frame.answer_list.FindString("history answer"))
+        assert frame._selected_read_target()["chat_id"] == expected_owner
+    else:
+        assert frame._selected_read_target() is None
 
 
 def test_remote_rename_current_chat_matches_current_chat_id_and_invalidates_history_cache(frame, monkeypatch):

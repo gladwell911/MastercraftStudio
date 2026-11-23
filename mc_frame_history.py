@@ -1670,23 +1670,48 @@ class ChatHistoryMixin:
                 self._confirm_answer_read({**identity, "chat_id": chat_id,
                                            "pair_id": frozen["pair_id"]})
 
-    def _on_answer_mouse_down(self, event):
-        self._answer_mouse_down_on_deferred_rows = getattr(self, "_chat_navigation_answer_rows_deferred", False)
-        event.Skip()
+    def _invalidate_answer_mouse_gesture(self):
+        self._answer_mouse_press = None
+        self._answer_mouse_click = None
 
-    def _on_answer_mouse_read(self, event):
-        pressed_on_deferred_rows = getattr(self, "_answer_mouse_down_on_deferred_rows", False)
-        self._answer_mouse_down_on_deferred_rows = False
+    def _on_answer_mouse_down(self, event):
+        self._invalidate_answer_mouse_gesture()
         if getattr(self, "_chat_navigation_answer_rows_deferred", False):
             self._cancel_chat_navigation_focus()
             return
-        if pressed_on_deferred_rows:
-            event.Skip()
-            return
-        index = self.answer_list.HitTest(event.GetPosition())
-        target = self._selected_read_target(index)
+        self._answer_mouse_press = self._answer_mouse_row(event)
         event.Skip()
-        self._confirm_answer_read(target)
+
+    def _answer_mouse_row(self, event):
+        index = self.answer_list.HitTest(event.GetPosition())
+        if 0 <= index < len(self.answer_meta):
+            return self._visible_answer_owner_chat_id(), index, self.answer_meta[index]
+        return None
+
+    def _on_answer_mouse_read(self, event):
+        pressed = getattr(self, "_answer_mouse_press", None)
+        self._answer_mouse_press = None
+        self._answer_mouse_click = None
+        event.Skip()  # Let the native list box release mouse capture.
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            self._cancel_chat_navigation_focus()
+            return
+        if pressed is None or pressed != self._answer_mouse_row(event):
+            return
+        self._answer_mouse_click = pressed
+        self._confirm_answer_read(self._selected_read_target(pressed[1]))
+
+    def _on_answer_mouse_double_click(self, event):
+        clicked = getattr(self, "_answer_mouse_click", None)
+        self._answer_mouse_click = None
+        if getattr(self, "_chat_navigation_answer_rows_deferred", False):
+            self._cancel_chat_navigation_focus()
+            return
+        if clicked is not None and clicked == self._answer_mouse_row(event):
+            # Handle activation with the validated row before native processing.
+            if self.answer_list.GetSelection() != clicked[1]:
+                self.answer_list.SetSelection(clicked[1])
+            self._on_answer_activate(event)
 
     def _on_history_key_down(self, event):
         if self._on_any_key_down_escape_minimize(event):
@@ -1738,10 +1763,18 @@ class ChatHistoryMixin:
             self._cancel_chat_navigation_focus()
         event.Skip()
 
-    def _on_history_context(self, _):
+    def _on_history_context(self, event):
+        position = event.GetPosition()
+        if position == wx.DefaultPosition:
+            self._cancel_chat_navigation_focus()
+            self._flush_chat_navigation_history_selection()
+            self._show_history_menu()
+            return
+        index = self.history_list.HitTest(self.history_list.ScreenToClient(position))
+        chat_id = self.history_ids[index] if 0 <= index < len(self.history_ids) else None
         self._cancel_chat_navigation_focus()
-        self._flush_chat_navigation_history_selection()
-        self._show_history_menu()
+        if chat_id:
+            self._show_history_menu(chat_id)
 
     def _model_for_chat_selection(self, chat: dict | None) -> str:
         model = bindings.app.normalize_model_id(str((chat or {}).get("model") or "").strip(), default="")
@@ -1840,21 +1873,23 @@ class ChatHistoryMixin:
     def _focus_latest_answer_immediately(self, *, include_question=False, reveal_answers=False) -> bool:
         if not hasattr(self, "answer_list"):
             return False
-        message_kinds = {"answer", "question"} if include_question else {"answer"}
-        for i in range(len(getattr(self, "answer_meta", []) or []) - 1, -1, -1):
-            if self.answer_meta[i][0] in message_kinds:
-                try:
-                    if self.answer_list.GetSelection() != i:
-                        self.answer_list.SetSelection(i)
-                    if reveal_answers:
-                        # Revealing the list can move native focus. Select its
-                        # destination before changing the panel.
-                        self._apply_detail_panel_mode("answers")
-                    if not self.answer_list.HasFocus():
-                        self.answer_list.SetFocus()
-                    return True
-                except Exception:
-                    return False
+        metas = getattr(self, "answer_meta", []) or []
+        index = self._latest_answer_message_row(metas) if include_question else next(
+            (i for i in range(len(metas) - 1, -1, -1) if metas[i][0] == "answer"), None
+        )
+        if index is not None:
+            try:
+                if self.answer_list.GetSelection() != index:
+                    self.answer_list.SetSelection(index)
+                if reveal_answers:
+                    # Revealing the list can move native focus. Select its
+                    # destination before changing the panel.
+                    self._apply_detail_panel_mode("answers")
+                if not self.answer_list.HasFocus():
+                    self.answer_list.SetFocus()
+                return True
+            except Exception:
+                return False
         if include_question:
             return False
         try:
@@ -1927,6 +1962,7 @@ class ChatHistoryMixin:
         focus = wx.Window.FindFocus()
         title = str(chat.get("title") or "新聊天")
         self._cancel_chat_navigation_focus(stop_speech=False)
+        self._invalidate_answer_mouse_gesture()
         self._chat_navigation_answer_rows_deferred = True
         self._chat_navigation_history_selection_deferred = True
         self._announce_chat_navigation(chat_id, title, focus)
@@ -2026,28 +2062,32 @@ class ChatHistoryMixin:
             self._call_after_if_alive(self._show_pending_kimi_interaction)
         return True
 
-    def _show_history_menu(self):
+    def _selected_history_chat_id(self):
         idx = self.history_list.GetSelection()
-        if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
+        return self.history_ids[idx] if 0 <= idx < len(self.history_ids) else None
+
+    def _show_history_menu(self, chat_id=None):
+        target_id = chat_id or self._selected_history_chat_id()
+        c = self._history_chat_for_id(target_id)
+        if not c:
             return
         m = wx.Menu()
         i_del = wx.NewIdRef()
         i_pin = wx.NewIdRef()
         i_clr = wx.NewIdRef()
         i_ren = wx.NewIdRef()
-        c = self._history_chat_for_id(self.history_ids[idx])
-        if not c:
-            return
         m.Append(i_del, "删除聊天")
         m.Append(i_pin, "取消置顶" if c.get("pinned") else "置顶聊天")
         m.Append(i_clr, "清空所有非置顶聊天")
         m.Append(i_ren, "重命名聊天")
-        self.Bind(wx.EVT_MENU, self._history_delete, id=i_del)
-        self.Bind(wx.EVT_MENU, self._history_pin, id=i_pin)
-        self.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
-        self.Bind(wx.EVT_MENU, self._history_rename, id=i_ren)
-        self.PopupMenu(m)
-        m.Destroy()
+        m.Bind(wx.EVT_MENU, lambda event: self._history_delete(event, chat_id=target_id), id=i_del)
+        m.Bind(wx.EVT_MENU, lambda event: self._history_pin(event, chat_id=target_id), id=i_pin)
+        m.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
+        m.Bind(wx.EVT_MENU, lambda event: self._history_rename(event, chat_id=target_id), id=i_ren)
+        try:
+            self.PopupMenu(m)
+        finally:
+            m.Destroy()
 
     def _history_chat_for_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()
@@ -2100,11 +2140,10 @@ class ChatHistoryMixin:
         except Exception:
             pass
 
-    def _history_delete(self, _):
-        idx = self.history_list.GetSelection()
-        if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
+    def _history_delete(self, _, *, chat_id=None):
+        cid = chat_id or self._selected_history_chat_id()
+        if not cid or self._history_chat_for_id(cid) is None:
             return
-        cid = self.history_ids[idx]
         if self._clear_pending_for(cid):
             self.SetStatusText("正在清空此聊天的上下文，请稍后删除")
             return
@@ -2159,11 +2198,8 @@ class ChatHistoryMixin:
                 except Exception:
                     continue
 
-    def _history_pin(self, _):
-        idx = self.history_list.GetSelection()
-        if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
-            return
-        c = self._history_chat_for_id(self.history_ids[idx])
+    def _history_pin(self, _, *, chat_id=None):
+        c = self._history_chat_for_id(chat_id or self._selected_history_chat_id())
         if not c:
             return
         c["pinned"] = not bool(c.get("pinned"))
@@ -2189,11 +2225,8 @@ class ChatHistoryMixin:
         self._push_remote_history_changed()
         self._render_answer_list()
 
-    def _history_rename(self, _):
-        idx = self.history_list.GetSelection()
-        if idx == wx.NOT_FOUND or idx >= len(self.history_ids):
-            return
-        c = self._history_chat_for_id(self.history_ids[idx])
+    def _history_rename(self, _, *, chat_id=None):
+        c = self._history_chat_for_id(chat_id or self._selected_history_chat_id())
         if not c:
             return
         d = bindings.app.RenameDialog(self, str(c.get("title") or ""))

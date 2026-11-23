@@ -1,5 +1,6 @@
 """Native Alt+C and quiet history activity with isolated controlled providers."""
 import ctypes
+from ctypes import wintypes
 import threading
 import time
 from types import SimpleNamespace
@@ -19,13 +20,14 @@ from test_model_session_recovery_ui_automation import (
 CONTINUE = "好的，继续"
 
 
-def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, monkeypatch):
+@pytest.mark.parametrize("last_answer", [main.REQUESTING_TEXT, " \t"])
+def test_chat_shortcuts_wait_for_current_title_then_focus_last_message(frame, monkeypatch, last_answer):
     owner = seed_history(frame)
     frame.archived_chats[0]["detail_panel_mode"] = "execution"
     for chat in [frame._current_chat_state, frame.archived_chats[0]]:
         chat["turns"].extend([
             {"question": "answered question", "answer_md": "old answer", "model": main.DEFAULT_CODEX_MODEL},
-            {"question": "latest unanswered question", "answer_md": main.REQUESTING_TEXT,
+            {"question": "latest unanswered question", "answer_md": last_answer,
              "model": main.DEFAULT_CODEX_MODEL},
         ])
         frame._mark_chat_turns_dirty(chat["id"])
@@ -448,6 +450,77 @@ def activate(frame, control):
                           "foreground": int(user32.GetForegroundWindow() or 0)})
 
 
+def send_list_mouse_message(control, row, message, buttons=0):
+    user32 = native_user32()
+    send = user32.SendMessageW
+    send.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    send.restype = ctypes.c_ssize_t
+    handle = control.GetHandle()
+    if row == wx.NOT_FOUND:
+        point = (7, control.GetClientSize().height - 3)
+    else:
+        rect = wintypes.RECT()
+        assert send(handle, 0x0198, row, ctypes.addressof(rect)) != -1  # LB_GETITEMRECT
+        point = (rect.left + 7, (rect.top + rect.bottom) // 2)
+    assert control.HitTest(point) == row
+    if message == 0x007B:  # WM_CONTEXTMENU supplies screen coordinates.
+        point = control.ClientToScreen(point)
+        buttons = handle
+    x, y = point
+    send(handle, message, buttons, (x & 0xFFFF) | ((y & 0xFFFF) << 16))
+
+
+def test_native_history_context_targets_clicked_row_and_keyboard_syncs(frame, monkeypatch):
+    owner = seed_history(frame, pinned=True)
+    history = frame.history_list
+    activate(frame, history)
+    stops = []
+    frame._zdsr_tts = SimpleNamespace(
+        speak_chat_navigation=lambda _: True, speak_state=lambda: True, stop=lambda: stops.append(True),
+    )
+    renamed, popups = [], []
+
+    def observe_rename(event, *, chat_id=None):
+        renamed.append(chat_id or frame.history_list_model.selected_id())
+
+    monkeypatch.setattr(frame, "_history_rename", observe_rename)
+
+    def popup(menu):
+        index = 1 if not popups else 3
+        popups.append(index)
+        menu.ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, menu.FindItemByPosition(index).GetId()))
+        return True
+
+    monkeypatch.setattr(frame, "PopupMenu", popup)
+    assert frame._navigate_history_chats(-1)
+    assert frame.view_history_id == "recent"
+    assert frame.history_list_model.selected_id() == owner
+    send_list_mouse_message(history, frame.history_ids.index("pinned"), 0x007B)
+    assert not frame._find_archived_chat("pinned")["pinned"]
+    assert not frame.chat_store.load_chat("pinned")["pinned"]
+    assert frame.history_list_model.selected_id() == owner
+
+    assert native_key_input_batch([(0x5D, 1), (0x5D, 3)], "history-menu-key") == 2
+    run_native_for(80)
+    assert renamed and set(renamed) == {"recent"}
+    assert frame.history_list_model.selected_id() == "recent"
+
+    assert frame._navigate_history_chats(1)
+    assert frame.history_list_model.selected_id() == "recent"
+    assert native_key_input_batch([(0x71, 0), (0x71, 2)], "history-f2-key") == 2
+    run_native_for(80)
+    assert renamed[-1] == owner
+    assert frame.history_list_model.selected_id() == owner
+
+    assert frame._navigate_history_chats(-1)
+    assert stops == [True, True]
+    before_blank = list(popups)
+    send_list_mouse_message(history, wx.NOT_FOUND, 0x007B)
+    assert stops == [True, True, True] and frame._chat_navigation_timer is None
+    assert popups == before_blank
+    assert history.HasFocus()
+
+
 @pytest.mark.parametrize("origin", ["input_edit", "answer_list", "history_list"])
 def test_native_chat_navigation_replaces_titles_and_delays_native_rows(frame, monkeypatch, origin):
     owner = seed_history(frame, pinned=True)
@@ -588,6 +661,8 @@ def test_history_origin_keeps_old_selection_until_user_operates_list(frame, monk
         run_native_for(90)
     assert frame.history_list_model.selected_id() == owner and frame.view_history_id == "recent"
     assert wx.Window.FindFocus() is frame.history_list
+    if completion == "unavailable":
+        assert reader.stops == 0
     if completion == "blank":
         monkeypatch.setattr(frame.history_list, "HitTest", lambda _: wx.NOT_FOUND)
         event = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
@@ -608,58 +683,156 @@ def test_history_origin_keeps_old_selection_until_user_operates_list(frame, monk
     assert wx.Window.FindFocus() is frame.answer_list
 
 
-def test_answer_mouse_discards_frozen_coordinates_then_reads_next_click(frame, monkeypatch):
-    reads, skipped, hit = [], [], []
-    event = SimpleNamespace(Skip=lambda: skipped.append(True), GetPosition=lambda: (10, 20))
-    monkeypatch.setattr(frame.answer_list, "HitTest", lambda point: hit.append(point) or 0)
-    monkeypatch.setattr(frame, "_selected_read_target", lambda row: {"row": row})
-    monkeypatch.setattr(frame, "_confirm_answer_read", reads.append)
-    frame._chat_navigation_answer_rows_deferred = True
-    frame._on_answer_mouse_read(event)
-    assert not frame._chat_navigation_answer_rows_deferred
-    assert not skipped and not hit and not reads
-    frame._on_answer_mouse_read(event)
-    assert skipped == [True] and hit == [(10, 20)] and reads == [{"row": 0}]
-
-
-def test_answer_mouse_release_after_focus_refresh_discards_press_on_old_rows(frame, monkeypatch):
-    seed_history(frame)
+@pytest.mark.parametrize("press_before_switch", [False, True])
+def test_native_answer_gesture_does_not_follow_replaced_rows(frame, monkeypatch, press_before_switch):
+    owner = seed_history(frame)
     for chat in (frame._current_chat_state, frame.archived_chats[0]):
-        chat["turns"].append({"question": "question", "answer_md": f"answer for {chat['title']}"})
+        chat["turns"].append({
+            "question": "question", "answer_md": f"answer for {chat['title']}", "request_status": "done",
+        })
         frame._mark_chat_turns_dirty(chat["id"])
     frame._save_state()
     frame._render_answer_list()
-    activate(frame, frame.input_edit)
-    stops = []
-    frame._zdsr_tts = SimpleNamespace(speak_chat_navigation=lambda title: True,
-                                     speak_state=lambda: True,
-                                     stop=lambda: stops.append(True))
-    reads = []
-    hits = []
     answer = frame.answer_list
-    monkeypatch.setattr(answer, "HitTest", lambda point: hits.append(point) or answer.GetCount() - 1)
-    monkeypatch.setattr(frame, "_selected_read_target", lambda index: answer.GetString(index))
-    monkeypatch.setattr(frame, "_confirm_answer_read", reads.append)
+    activate(frame, answer)
+    row = answer.FindString("answer for activity owner")
+    stops, opened = [], []
+    frame._zdsr_tts = SimpleNamespace(
+        speak_chat_navigation=lambda _: True, speak_state=lambda: True, stop=lambda: stops.append(True),
+    )
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda _, body, *_args: opened.append(body) or True)
 
-    def dispatch(event_type):
-        event = wx.MouseEvent(event_type)
-        event.SetEventObject(answer)
-        answer.GetEventHandler().ProcessEvent(event)
-
+    if press_before_switch:
+        send_list_mouse_message(answer, row, 0x0201, 1)  # WM_LBUTTONDOWN
     assert frame._navigate_history_chats(-1)
-    assert "answer for activity owner" in answer.GetString(answer.GetCount() - 1)
-    dispatch(wx.wxEVT_LEFT_DOWN)
-    answer.SetFocus()
-    run_native_for(60)
-    assert answer.HasFocus()
-    assert stops == [True] and not frame._chat_navigation_answer_rows_deferred
-    refreshed = answer.GetString(answer.GetCount() - 1)
-    assert "answer for recent" in refreshed
-    dispatch(wx.wxEVT_LEFT_UP)
-    assert not hits and not reads
-    dispatch(wx.wxEVT_LEFT_DOWN)
-    dispatch(wx.wxEVT_LEFT_UP)
-    assert len(hits) == 1 and reads == [refreshed]
+    assert answer.GetString(row) == "answer for activity owner"
+    if not press_before_switch:
+        send_list_mouse_message(answer, row, 0x0201, 1)
+        assert stops == [True] and frame._chat_navigation_timer is None
+
+    send_list_mouse_message(answer, row, 0x0202)  # WM_LBUTTONUP
+    assert stops == [True] and frame._chat_navigation_timer is None
+    assert answer.GetString(row) == "answer for recent"
+    send_list_mouse_message(answer, row, 0x0203, 1)  # WM_LBUTTONDBLCLK
+    send_list_mouse_message(answer, row, 0x0202)
+    assert frame._chat_read_state("recent")["read_seq"] == 0
+    assert frame._chat_read_state(owner)["read_seq"] == 0
+    assert not opened
+
+    send_list_mouse_message(answer, row, 0x0201, 1)
+    send_list_mouse_message(answer, row, 0x0202)
+    recent = frame._chat_read_state("recent")
+    assert recent["read_seq"] == recent["latest_readable_seq"] > 0
+    send_list_mouse_message(answer, row, 0x0203, 1)
+    send_list_mouse_message(answer, row, 0x0202)
+    assert opened == ["answer for recent"]
+
+
+@pytest.mark.parametrize("clear_active", [True, False])
+def test_native_answer_gesture_drops_identical_row_recreated_by_clear(frame, monkeypatch, clear_active):
+    active_owner = seed_history(frame)
+    chat = frame._current_chat_state if clear_active else frame._find_archived_chat("recent")
+    owner = active_owner if clear_active else "recent"
+    turn = {"question": "same question", "answer_md": "same answer", "request_status": "done"}
+    chat["turns"].append(dict(turn))
+    frame._mark_chat_turns_dirty(owner)
+    frame._save_state()
+    if not clear_active:
+        assert frame._show_history_chat(owner, focus_answer_list=False)
+    frame._render_answer_list()
+    answer = frame.answer_list
+    activate(frame, answer)
+    row = answer.FindString("same answer")
+    original_row = frame.answer_meta[row]
+    old_generation = frame._chat_read_state(owner)["generation"]
+    opened, confirmed = [], []
+    monkeypatch.setattr(frame, "_open_answer_text_viewer", lambda _, body, *_args: opened.append(body) or True)
+    monkeypatch.setattr(frame, "_confirm_answer_read", confirmed.append)
+
+    send_list_mouse_message(answer, row, 0x0201, 1)
+    if not clear_active:
+        send_list_mouse_message(answer, row, 0x0202)
+        assert confirmed.pop()["chat_id"] == owner
+    assert frame._clear_context_for_chat_id(owner) == "cleared"
+    chat["turns"].append(dict(turn))
+    frame._mark_chat_turns_dirty(owner)
+    frame._save_state()
+    frame._render_answer_list()
+    assert frame.answer_meta[row] == original_row
+    assert frame._chat_read_state(owner)["generation"] != old_generation
+
+    if clear_active:
+        send_list_mouse_message(answer, row, 0x0202)
+    send_list_mouse_message(answer, row, 0x0203, 1)
+    send_list_mouse_message(answer, row, 0x0202)
+    assert frame._chat_read_state(owner)["read_seq"] == 0
+    assert not opened and not confirmed
+
+    send_list_mouse_message(answer, row, 0x0201, 1)
+    send_list_mouse_message(answer, row, 0x0202)
+    assert confirmed[0]["chat_id"] == owner
+    assert confirmed[0]["generation"] != old_generation
+    send_list_mouse_message(answer, row, 0x0203, 1)
+    send_list_mouse_message(answer, row, 0x0202)
+    assert opened == ["same answer"]
+
+
+@pytest.mark.parametrize("end", ["key", "timeout", "voice", "accepted_then_waiting", "waiting_then_accepted"])
+def test_navigation_cancels_only_accepted_sdk_titles(frame, monkeypatch, end):
+    from test_zdsr_tts_unit import _Callable, _FakeApi
+
+    seed_history(frame)
+    activate(frame, frame.input_edit)
+    api = _FakeApi()
+    sdk_state = [4]
+    api.GetSpeakState = _Callable(lambda: sdk_state[0])
+    frame._zdsr_tts = main.ZDSRTTSClient()
+    monkeypatch.setattr(frame._zdsr_tts, "_load_api", lambda: api)
+    frame._speak_text_via_screen_reader("previous voice")
+    assert frame.voice_screen_reader_status["last_success"]
+    assert api.stop_calls == 1
+    sdk_state[0] = 3 if end in {"voice", "accepted_then_waiting"} else 9
+    clock = [time.monotonic()]
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    try:
+        assert frame._navigate_history_chats(-1)
+        assert frame._chat_navigation_timer is not None
+        run_native_for(50)
+        if end == "accepted_then_waiting":
+            assert api.speak_calls[-1] == ("recent", 1)
+            sdk_state[0] = 9
+            assert frame._navigate_history_chats(1)
+            run_native_for(50)
+            assert api.stop_calls == 1
+        elif end == "waiting_then_accepted":
+            assert api.speak_calls[-1][0] == "previous voice"
+            sdk_state[0] = 3
+            run_native_for(50)
+            assert api.speak_calls[-1] == ("recent", 1)
+        if end in {"key", "accepted_then_waiting", "waiting_then_accepted"}:
+            assert native_key_input_batch([(0x24, 1), (0x24, 3)], "cancel-waiting-title") == 2
+        elif end == "timeout":
+            clock[0] += 4.1
+        else:
+            assert api.speak_calls[-1] == ("recent", 1)
+            frame._speak_text_via_screen_reader("replacement voice")
+            assert frame.voice_screen_reader_status["last_success"]
+            assert api.speak_calls[-1][0] == "replacement voice"
+        sdk_state[0] = 4 if end == "voice" else 9
+        run_native_for(150)
+        assert frame.input_edit.HasFocus()
+        assert frame._chat_navigation_timer is None
+        assert not frame._chat_navigation_answer_rows_deferred
+        if end == "voice":
+            assert api.stop_calls == 3
+        elif end in {"accepted_then_waiting", "waiting_then_accepted"}:
+            assert api.stop_calls == 2
+            assert [phrase for phrase, _ in api.speak_calls] == ["previous voice", "recent"]
+        else:
+            assert api.stop_calls == 1
+            assert [phrase for phrase, _ in api.speak_calls] == ["previous voice"]
+    finally:
+        frame._cancel_chat_navigation_focus()
 
 
 def alt_c():

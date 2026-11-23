@@ -67,18 +67,18 @@ def test_navigation_reuses_voice_input_channel_and_replaces_without_stopping(mon
     monkeypatch.setenv("ZDSR_TTS_TYPE", "0")
     monkeypatch.setenv("ZDSR_TTS_CHANNEL", "configured voice channel")
     monkeypatch.setenv("ZDSR_TTS_KEYDOWN_INTERRUPT", "1")
-    monkeypatch.setenv("ZDSR_TTS_INTERRUPT", "1")
+    monkeypatch.setenv("ZDSR_TTS_INTERRUPT", "0")
     state = [9]
     api.GetSpeakState = _Callable(lambda: state[0])
     client = zdsr_tts.ZDSRTTSClient()
     monkeypatch.setattr(client, "_load_api", lambda: api)
     assert client.speak("voice input") is True
     assert client.speak_chat_navigation("discarded while starting") is None
-    assert api.speak_calls == [("voice input", 1)]
+    assert api.speak_calls == [("voice input", 0)]
     state[0] = 4
     assert client.speak_chat_navigation("first") is True
     assert client.speak_chat_navigation("latest") is True
-    assert api.speak_calls == [("voice input", 1), ("first", 1), ("latest", 1)]
+    assert api.speak_calls == [("voice input", 0), ("first", 1), ("latest", 1)]
     assert api.init_calls == [(0, "configured voice channel", 1)]
     assert api.stop_calls == 1
     state[0] = 3
@@ -88,3 +88,13 @@ def test_navigation_reuses_voice_input_channel_and_replaces_without_stopping(mon
     client.stop()
     assert api.stop_calls == 2
     assert len(api.init_calls) == 1
+
+
+def test_navigation_speak_failure_does_not_stop_voice_channel(monkeypatch):
+    api = _FakeApi(speak_ret=-1)
+    client = zdsr_tts.ZDSRTTSClient()
+    monkeypatch.setattr(client, "_load_api", lambda: api)
+
+    assert client.speak_chat_navigation("failed title") is False
+    assert api.speak_calls == [("failed title", 1)]
+    assert api.stop_calls == 0

@@ -340,6 +340,21 @@ class AnswersMixin:
             return
         self._render_answer_list(refresh_execution=False)
 
+    @staticmethod
+    def _latest_answer_message_row(metas: list[tuple]) -> int | None:
+        for index in range(len(metas) - 1, -1, -1):
+            kind, _, body, markdown = metas[index]
+            if kind == "question" and str(body or "").strip():
+                return index
+            if (
+                kind == "answer"
+                and str(body or "").strip()
+                and str(markdown or "").strip()
+                and markdown != REQUESTING_TEXT
+            ):
+                return index
+        return None
+
     def _render_answer_list(self, refresh_execution: bool = True, *, preserve_panel=False, select_latest_message=False):
         if preserve_panel and self.execution_list.IsShown():
             self._show_execution_loading_for_new_owner()
@@ -453,10 +468,9 @@ class AnswersMixin:
         else:
             selected_idx = None
         if select_latest_message:
-            selected_idx = next(
-                (index for index in range(len(metas) - 1, -1, -1) if metas[index][0] in {"answer", "question"}),
-                selected_idx,
-            )
+            latest = self._latest_answer_message_row(metas)
+            if latest is not None:
+                selected_idx = latest
         changed = self._replace_answer_list_rows(rows, metas, selected_idx)
         self.answer_meta = metas
         self._active_answer_row_index = next(

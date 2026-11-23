@@ -558,9 +558,11 @@ class ChatNavigationMixin:
         if timer is not None:
             timer.Stop()
             self._chat_navigation_timer = None
-            if stop_speech:
-                self._zdsr_tts.stop()
         if stop_speech:
+            title_accepted = getattr(self, "_chat_navigation_title_accepted", False)
+            self._chat_navigation_title_accepted = False
+            if title_accepted:
+                self._zdsr_tts.stop()
             self._flush_chat_navigation_answer_rows()
 
     def _flush_chat_navigation_history_selection(self) -> None:
@@ -578,7 +580,11 @@ class ChatNavigationMixin:
             return
         self._chat_navigation_answer_rows_deferred = False
         if not getattr(self, "_closing", False) and self._is_ui_alive():
-            self._render_answer_list(preserve_panel=True, select_latest_message=select_latest_message)
+            try:
+                self._render_answer_list(preserve_panel=True, select_latest_message=select_latest_message)
+            except Exception:
+                self._chat_navigation_answer_rows_deferred = True
+                raise
 
     def _on_chat_navigation_child_focus(self, event) -> None:
         focus = wx.Window.FindFocus()
@@ -596,7 +602,14 @@ class ChatNavigationMixin:
         speaking = False
         retried = False
         idle_since = None
-        spoken = self._zdsr_tts.speak_chat_navigation(title)
+
+        def speak_title():
+            result = self._zdsr_tts.speak_chat_navigation(title)
+            if result is True:
+                self._chat_navigation_title_accepted = True
+            return result
+
+        spoken = speak_title()
 
         def finish():
             self._flush_chat_navigation_answer_rows(select_latest_message=True)
@@ -616,7 +629,7 @@ class ChatNavigationMixin:
                 return
             elapsed = bindings.app.time.monotonic() - started
             if spoken is None and elapsed < 4.0:
-                spoken = self._zdsr_tts.speak_chat_navigation(title)
+                spoken = speak_title()
             state = self._zdsr_tts.speak_state() if spoken else None
             if state is True:
                 speaking = True
@@ -626,12 +639,13 @@ class ChatNavigationMixin:
                     idle_since = elapsed
                 elif elapsed - idle_since >= 0.075:
                     self._chat_navigation_timer = None
+                    self._chat_navigation_title_accepted = False
                     finish()
                     return
             elif not retried and spoken is True and state is False and elapsed >= 1.75:
                 # Older DLLs can accept the first request while internally
                 # initializing, then never start it or report initialization.
-                spoken = self._zdsr_tts.speak_chat_navigation(title)
+                spoken = speak_title()
                 retried = True
             elif spoken is False or (elapsed >= 4.0 and (not speaking or state is None)):
                 self._cancel_chat_navigation_focus()

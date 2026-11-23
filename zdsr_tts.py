@@ -193,7 +193,6 @@ class ZDSRTTSClient:
             if result == 9:
                 return None
             if result:
-                self._stop_selected_channel()
                 self._reset_state()
             return result == 0
 

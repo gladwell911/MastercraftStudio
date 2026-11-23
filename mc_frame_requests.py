@@ -491,6 +491,8 @@ class ChatRequestsMixin:
         return True
 
     def _apply_active_clear_projection(self, owner: str, now: float) -> None:
+        if self._visible_clear_owner() == owner:
+            self._invalidate_answer_mouse_gesture()
         self._retire_kimi_chat_runtime(
             self._current_chat_state, str(self.active_kimi_session_id or self._current_chat_state.get("kimi_session_id") or "").strip()
         )
@@ -898,6 +900,8 @@ class ChatRequestsMixin:
         return "cleared"
 
     def _clear_context_chat_state(self, chat: dict, chat_id: str, updated_at: float) -> None:
+        if self._visible_clear_owner() == chat_id:
+            self._invalidate_answer_mouse_gesture()
         self._retire_kimi_chat_runtime(chat, str(chat.get("kimi_session_id") or "").strip())
         self._clear_codex_context_usage_for_thread_change(chat)
         chat["id"] = str(chat.get("id") or chat_id or "").strip()
