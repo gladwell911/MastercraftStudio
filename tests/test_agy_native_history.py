@@ -1,6 +1,8 @@
 import json
 import sys
 
+import pytest
+
 from agy_acp import AgyAcpClient
 
 
@@ -33,7 +35,7 @@ for line in sys.stdin:
         else:
             result = {"sessions": [source["session"]]}
     elif method == "session/load":
-        assert params["cwd"] == source["session"]["cwd"]
+        assert params["cwd"] == source.get("expected_cwd", source["session"]["cwd"])
         for index, pair in enumerate(source["turns"]):
             update(session, "user_message_chunk", messageId=f"u{index}",
                    content={"type": "text", "text": pair[0]})
@@ -55,7 +57,12 @@ for line in sys.stdin:
 """
 
 
-def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypatch, wait_for_wx):
+@pytest.mark.parametrize("provider_drive_path", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows AGY path")),
+])
+def test_discovers_replays_and_resumes_native_history(
+        frame, tmp_path, monkeypatch, wait_for_wx, provider_drive_path):
     script = tmp_path / "agy_fixture.py"
     script.write_text(FAKE_AGY, encoding="utf-8")
     trace = tmp_path / "trace.jsonl"
@@ -63,7 +70,10 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     project = tmp_path / "native project"
     project.mkdir()
     fixture.write_text(json.dumps({
-        "session": {"sessionId": "terminal-id", "cwd": str(project), "title": "原生标题",
+        "expected_cwd": str(project),
+        "session": {"sessionId": "terminal-id",
+                    "cwd": "/" + project.as_posix() if provider_drive_path else str(project),
+                    "title": "原生标题",
                     "updatedAt": "2026-11-26T06:00:00Z"},
         "turns": [["同文问题", "完整正文和尾标"], ["同文问题", "完整正文和尾标"]],
     }), encoding="utf-8")
@@ -95,6 +105,13 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     assert len({turn["turn_id"] for turn in frame.chat_store.load_turns(chat_id)}) == 2
     status, alias = frame._remote_api_rename_chat_ui({"chat_id": chat_id, "title": "共享显示名"})
     assert status == 200, alias
+
+    if provider_drive_path:
+        # A row imported before normalization keeps its original workspace across refresh.
+        legacy = frame._find_archived_chat(chat_id)
+        legacy["agy_workspace"] = legacy["native_cwd"] = "/" + project.as_posix()
+        frame.chat_store.upsert_chat(legacy)
+        assert frame.chat_store.load_chat_summary(chat_id)["agy_workspace"] == legacy["agy_workspace"]
 
     status, accepted = frame._remote_api_message_ui({"chat_id": chat_id, "text": "续聊", "model": "agy/main"})
     assert status == 200, accepted

@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -123,8 +124,16 @@ def find_agy_executable() -> str:
     return ""
 
 
+def normalize_agy_workspace(value: str) -> str:
+    value = value.strip()
+    # AGY reports Windows drive paths as /D:/project in ACP session metadata.
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:/", value):
+        return str(Path(value[1:]))
+    return value
+
+
 def validate_workspace(value: str) -> str:
-    candidate = Path(value.strip())
+    candidate = Path(normalize_agy_workspace(value))
     if not candidate.is_absolute():
         raise AgyError("请选择运行电脑上的 AGY 项目目录（绝对路径）")
     try:

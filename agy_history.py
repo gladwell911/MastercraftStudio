@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 import time
 
-from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, agy_session_is_busy, validate_workspace
+from agy_acp import (
+    AGY_MODEL_ID, AgyAcpClient, AgyError, agy_session_is_busy, normalize_agy_workspace, validate_workspace,
+)
 from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot
 
 
@@ -37,6 +39,7 @@ def list_agy_sessions(executable: str, pair_id: str):
                 session_id, cwd = info.get("sessionId"), info.get("cwd")
                 if not isinstance(session_id, str) or not session_id or not isinstance(cwd, str) or not cwd:
                     continue
+                cwd = normalize_agy_workspace(cwd)
                 identity = NativeSessionIdentity(pair_id, "agy", client.native_storage(), session_id)
                 account = client.native_account()
                 legacy = {"agy_session_id": session_id, "agy_native_owner": client.native_owner(pair_id)}

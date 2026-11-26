@@ -360,7 +360,7 @@ class AgySessionsMixin:
             reason = error = ""
             result_unknown = False
             try:
-                validate_workspace(cwd)
+                workspace = validate_workspace(cwd)
                 # Idle ACP processes do not see work accepted by a separate terminal.
                 if prepared_attachments is not None and client is not None and client is not active_client:
                     client.close()
@@ -371,7 +371,7 @@ class AgySessionsMixin:
                     if prepared_attachments is not None:
                         raise AgyError("用于检查附件的 AGY 连接已退出，请重新发送")
                     active_client = self._open_agy_client(
-                        cwd, session_id=session_id, owner=owner, native_identity=native_identity, chat_id=chat_id)
+                        workspace, session_id=session_id, owner=owner, native_identity=native_identity, chat_id=chat_id)
                 elif (active_client.session_id != session_id
                       or active_client.native_owner(self._read_pair_id()) != owner
                       or (native_identity and self._agy_native_identity(active_client, session_id) != native_identity)):
