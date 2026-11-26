@@ -1636,9 +1636,11 @@ def app_instance_key() -> str:
 
 class ChatApp(wx.App):
     def OnInit(self):
+        terminal_start = "--shared-terminal-start" in sys.argv[1:]
         self._checker = wx.SingleInstanceChecker(app_instance_key())
         if self._checker.IsAnotherRunning():
-            self._activate_existing_window()
+            if not terminal_start:
+                self._activate_existing_window()
             return False
         try:
             resolve_common_commands_path()
@@ -1646,9 +1648,47 @@ class ChatApp(wx.App):
         except RuntimeError as exc:
             wx.MessageBox(str(exc), "启动数据不可用", wx.OK | wx.ICON_ERROR)
             return False
-        f = ChatFrame()
-        f.Show()
+        frame = ChatFrame()
+        if terminal_start:
+            frame.ShowWithoutActivating()
+        else:
+            frame.Show()
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            self._start_shared_terminal(frame, report_dialog=not terminal_start)
         return True
+
+    def _start_shared_terminal(self, frame, *, report_dialog):
+        from shared_terminal import TerminalError, TerminalServer
+        from shared_terminal_command import register_commands, terminal_endpoint
+        from shared_terminal_routes import dispatch_terminal
+
+        gui = Path(sys.executable)
+        try:
+            self._shared_terminal = TerminalServer(
+                terminal_endpoint(gui), lambda op, body: dispatch_terminal(frame, op, body),
+            )
+            self._shared_terminal.__enter__()
+            conflicts = []
+            if os.getenv("MC_SHARED_TERMINAL_REGISTER", "1") != "0":
+                conflicts = register_commands(gui.with_name("mc_worker.exe"))
+            if conflicts:
+                message = "\n".join(conflicts)
+                logging.getLogger(__name__).warning("PowerShell command registration conflicts: %s", message)
+                if report_dialog:
+                    wx.CallAfter(frame._show_ok_dialog,
+                                 message + "\n如需使用 MC 命令，请先调整这些同名命令，再重启 MC。", "PowerShell 命令冲突")
+        except (OSError, TerminalError) as exc:
+            logging.getLogger(__name__).warning("MC terminal setup failed: %s", exc)
+            if report_dialog:
+                wx.CallAfter(frame._show_ok_dialog,
+                             "无法设置 PowerShell 命令。请检查当前用户的本机应用目录和 Path 设置，再重启 MC。",
+                             "PowerShell 命令设置失败")
+
+    def OnExit(self):
+        service = getattr(self, "_shared_terminal", None)
+        if service is not None:
+            service.close()
+        return super().OnExit()
 
     def _activate_existing_window(self):
         user32 = ctypes.windll.user32

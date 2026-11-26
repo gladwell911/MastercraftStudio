@@ -894,6 +894,18 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 turn["answer_at"] = timestamp
         return turns
 
+    def find_turn_by_client_send_id(self, chat_id: str, client_send_id: str) -> tuple[int, dict] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT turn_index, payload_json FROM turns
+                WHERE chat_id=? AND json_extract(payload_json, '$.client_send_id')=?
+                ORDER BY turn_index DESC LIMIT 1""",
+                (self.normalize_chat_id(chat_id), client_send_id),
+            ).fetchone()
+        if row is not None:
+            return int(row["turn_index"]), self._json_dict(row["payload_json"])
+        return None
+
     def load_turns_page(
         self,
         chat_id: str,

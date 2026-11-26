@@ -14,5 +14,8 @@ if __name__ == "__main__":
     configure_utf8_stdio()
     if sys.argv[1:2] == ["--browser-open"]:
         raise SystemExit(browser_open.main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--shared-terminal"]:
+        from shared_terminal_command import main
+        raise SystemExit(main(sys.argv[2:]))
     from codex_worker_process import main
     raise SystemExit(main())

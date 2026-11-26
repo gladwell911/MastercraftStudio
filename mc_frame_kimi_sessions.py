@@ -863,6 +863,15 @@ class KimiSessionsMixin:
             history_turns = target_turns[:turn_idx]
             client = self._ensure_kimi_client()
             self._start_kimi_client_with_retry(client)
+            terminal_resume = turn.get("question_origin") == "terminal"
+            if terminal_resume:
+                auth = client.get_auth(timeout=5)
+                provider = auth.get("managed_provider")
+                ready = auth.get("models_ready")
+                managed_unavailable = (isinstance(provider, dict)
+                                       and provider.get("status") in {"unauthenticated", "expired", "revoked"})
+                if ready is False or (ready is not True and (managed_unavailable or auth.get("providers_count") == 0)):
+                    raise RuntimeError("Kimi Code 登录或模型配置不可用。请在官方 Kimi CLI 登录或配置提供方后重试。")
             if discard_stale_submission():
                 return
             if session_id:
@@ -880,6 +889,8 @@ class KimiSessionsMixin:
                             bindings.app.time.sleep(min(float(self._kimi_reconcile_backoff) * (2 ** attempt), 2.0))
                 if exists_error is not None:
                     raise exists_error
+            if terminal_resume and not session_id:
+                raise RuntimeError("Kimi Code 无法打开原生会话。请检查当前账号和会话，再重试。")
             if session_id:
                 try:
                     client.subscribe([session_id])
