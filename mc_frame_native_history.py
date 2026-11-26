@@ -9,6 +9,9 @@ import wx
 
 from agy_acp import AgyError, find_agy_executable
 from agy_history import list_agy_sessions, read_agy_session
+from kimi_history import KimiHistoryReader
+from kimi_runtime import runtime_path as kimi_runtime_path
+from kimi_server_client import KimiServerClient, KimiServerError
 from native_history import NATIVE_CHAT_FIELDS
 
 
@@ -26,8 +29,20 @@ class NativeHistoryMixin:
                 lambda session: read_agy_session(executable, session),
             )
 
+        try:
+            available = kimi_runtime_path().is_file()
+        except (RuntimeError, OSError):
+            available = False
+        if available:
+            self._native_history_kimi_client = KimiServerClient()
+            reader = KimiHistoryReader(
+                self._native_history_kimi_client, self._read_pair_id(), self._kimi_is_user_prompt,
+            )
+            yield reader.list_sessions, reader.read_session
+
     def _start_native_history_refresh(self) -> None:
         self._native_history_worker = None
+        self._native_history_kimi_client = None
         self._native_history_last_scan = 0.0
         self._native_history_reserved = set()
         self._native_history_timer = None
@@ -87,6 +102,8 @@ class NativeHistoryMixin:
 
     def _scan_native_history(self, discoverers) -> None:
         for list_sessions, read_session in discoverers:
+            if getattr(self, "_closing", False):
+                return
             try:
                 seen = set()
                 for session in list_sessions():
@@ -118,7 +135,7 @@ class NativeHistoryMixin:
                             turns = self.chat_store.load_turns(owner)
                     finally:
                         self._call_after_if_alive(self._publish_native_history_ui, owner, changed, turns, session)
-            except (AgyError, sqlite3.Error, OSError) as exc:
+            except (AgyError, KimiServerError, sqlite3.Error, OSError) as exc:
                 _LOG.info("Native session discovery deferred (%s)", type(exc).__name__)
 
     def _publish_native_history_ui(self, owner, changed, turns, session) -> tuple[int, dict]:

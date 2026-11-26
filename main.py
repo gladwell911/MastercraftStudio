@@ -1490,7 +1490,8 @@ class ChatFrame(
 
     def _start_close_producers(self) -> None:
         clients = list(getattr(self, "_codex_clients", {}).values())
-        clients.extend((getattr(self, "_codex_client", None), getattr(self, "_kimi_client", None)))
+        clients.extend((getattr(self, "_codex_client", None), getattr(self, "_kimi_client", None),
+                        getattr(self, "_native_history_kimi_client", None)))
         clients = list({id(client): client for client in clients if client is not None}.values())
         self._close_producers_done = threading.Event()
         self._close_write_done = threading.Event()

@@ -12,6 +12,7 @@ for path in (ROOT, ROOT / "tests"):
         sys.path.insert(0, str(path))
 
 import main
+import mc_frame_native_history
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -65,6 +66,8 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     assert Path(main.resolve_notes_data_dir()).resolve() != Path(r"D:\code\note").resolve()
+    if "loopback_kimi_home" not in request.fixturenames:
+        monkeypatch.setattr(mc_frame_native_history, "kimi_runtime_path", lambda: tmp_path / "no-kimi")
     f = main.ChatFrame()
     f.Hide()
     yield f
@@ -73,6 +76,8 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     # no daemon SQLite worker survives the fixture that owns its ChatStore.
     f._closing = True
     f._stop_native_history_refresh()
+    if f._native_history_kimi_client is not None:
+        f._native_history_kimi_client.close()
     f._flush_execution_step_persists_sync()
     try:
         f.Hide()

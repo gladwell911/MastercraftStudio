@@ -85,7 +85,13 @@ def project_turn(turn):
             continue
         kind = item.get("type")
         if kind == "tool_call":
-            step["frames"].append({"kind": "tool", "frameId": identity})
+            frame = {"kind": "tool", "frameId": identity}
+            if _public(item):
+                frame.update(name=item.get("name"), input=item.get("input"), output=item.get("output"),
+                             state=item.get("outcome") or item.get("status"))
+            else:
+                frame["disclosable"] = False
+            step["frames"].append(frame)
         elif kind in ("assistant_message", "thinking", "reasoning", "user_message") and _public(item):
             text = item.get("text")
             if not isinstance(text, str):

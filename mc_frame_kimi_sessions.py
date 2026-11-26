@@ -12,6 +12,7 @@ from kimi_server_client import (
     event_to_payload as kimi_event_to_payload,
     is_kimi_model,
 )
+from kimi_history import KimiHistoryReader, kimi_history_account, kimi_history_storage
 from mc_frame_settings import REQUESTING_TEXT
 from pathlib import Path
 
@@ -874,6 +875,23 @@ class KimiSessionsMixin:
                     raise RuntimeError("Kimi Code 登录或模型配置不可用。请在官方 Kimi CLI 登录或配置提供方后重试。")
             if discard_stale_submission():
                 return
+            storage = kimi_history_storage()
+            expected_storage = target_chat.get("kimi_storage_id")
+            if session_id and expected_storage and expected_storage != storage:
+                raise RuntimeError("Kimi Code 会话属于其他 Kimi Home。请恢复原 Kimi Home 再重试。")
+            native_cwd = str(target_chat.get("native_cwd") or "") if session_id else ""
+            if native_cwd:
+                if target_chat.get("native_account") != kimi_history_account():
+                    raise RuntimeError("Kimi Code 会话属于其他系统账号。")
+                if not Path(native_cwd).is_dir():
+                    raise RuntimeError(f"Kimi Code 原会话工作目录不可用：{native_cwd}")
+                info = client.get_session(session_id)
+                if (status := KimiHistoryReader.busy_status(info)) and not self._kimi_should_steer_turn(target_chat, target_chat is self._current_chat_state):
+                    raise RuntimeError(status)
+                metadata = info.get("metadata")
+                actual_cwd = metadata.get("cwd") if isinstance(metadata, dict) else None
+                if not actual_cwd or Path(actual_cwd).resolve() != Path(native_cwd).resolve():
+                    raise RuntimeError("Kimi Code 原会话工作目录已变化。请检查原会话后重试。")
             if session_id:
                 exists_error: Exception | None = None
                 for attempt in range(max(1, int(self._kimi_reconcile_attempts))):
@@ -889,7 +907,7 @@ class KimiSessionsMixin:
                             bindings.app.time.sleep(min(float(self._kimi_reconcile_backoff) * (2 ** attempt), 2.0))
                 if exists_error is not None:
                     raise exists_error
-            if terminal_resume and not session_id:
+            if (terminal_resume or native_cwd) and not session_id:
                 raise RuntimeError("Kimi Code 无法打开原生会话。请检查当前账号和会话，再重试。")
             if session_id:
                 try:
@@ -984,6 +1002,7 @@ class KimiSessionsMixin:
                     submission_lock,
                     {
                         **unresolved_owner,
+                        "kimi_storage_id": storage,
                         "active": True,
                         "prompt_role": "unresolved",
                         "unresolved": True,
@@ -1067,6 +1086,7 @@ class KimiSessionsMixin:
                 submission_lock,
                 {
                     "session_id": session_id,
+                    "kimi_storage_id": storage,
                     "prompt_id": str(prompt_id or "").strip(),
                     "question": str(question or "").strip(),
                     "turn_idx": int(turn_idx),
@@ -1114,6 +1134,8 @@ class KimiSessionsMixin:
                 if session_changed:
                     self._clear_kimi_information_for_session_change(target_chat, refresh=False)
                 target_chat["kimi_session_id"] = session_id
+                if payload.get("kimi_storage_id"):
+                    target_chat["kimi_storage_id"] = payload["kimi_storage_id"]
                 if is_current_target:
                     self.active_kimi_session_id = session_id
             if "turn_id" in payload:

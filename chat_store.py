@@ -670,12 +670,19 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 raise ValueError("Invalid legacy history field")
         if snapshot.legacy_fields:
             predicates = " AND ".join(f"json_extract(metadata_json,'$.{field}')=?" for field in snapshot.legacy_fields)
+            compatible = {field: value for field, value in snapshot.chat_fields.items()
+                          if field.endswith("_storage_id") and field not in snapshot.legacy_fields}
+            for field in compatible:
+                if not field.isidentifier():
+                    raise ValueError("Invalid legacy storage field")
+                predicates += f" AND COALESCE(json_extract(metadata_json,'$.{field}'),?)=?"
             legacy = conn.execute(
                 f"SELECT c.id FROM chats c LEFT JOIN native_history_owners n ON n.chat_id=c.id "
                 f"WHERE n.chat_id IS NULL AND c.model=? AND {predicates} "
                 "AND COALESCE(json_extract(metadata_json,'$.native_identity'),?)=? "
                 "ORDER BY c.created_at,c.id LIMIT 1",
-                (snapshot.model, *snapshot.legacy_fields.values(), native_id, native_id),
+                (snapshot.model, *snapshot.legacy_fields.values(),
+                 *(value for value in compatible.values() for _ in range(2)), native_id, native_id),
             ).fetchone()
             if legacy is not None:
                 return str(legacy["id"]), True
@@ -769,10 +776,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     @staticmethod
     def _native_turn_matches(stored: dict, replayed: dict) -> bool:
-        for key in ("provider_user_message_id", "provider_message_id"):
+        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id"):
             if stored.get(key) and replayed.get(key) and stored[key] != replayed[key]:
                 return False
-        if stored.get("question", "") != replayed.get("question", ""):
+        if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question")):
             return False
         old_answer = str(stored.get("answer_md") or "")
         new_answer = str(replayed.get("answer_md") or "")

@@ -1539,7 +1539,7 @@ class ChatHistoryMixin:
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
         for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
-                      "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
+                      "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation", "kimi_storage_id"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
         existing_matches = [

@@ -38,6 +38,17 @@ def loopback_kimi_home(tmp_path, monkeypatch):
                 {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10,
                                           "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 20}}},
             ]
+            last = next((message for message in reversed(body["messages"])
+                         if message.get("role") == "tool" or "QA_NATIVE_TOOL_CALL" in str(message.get("content"))), {})
+            if last.get("role") == "user":
+                chunks[:2] = [
+                    {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+                        {"index": 0, "id": "call_qa_native_glob", "type": "function", "function": {
+                            "name": "Glob", "arguments": '{"pattern":"qa-native-*.txt"}',
+                        }},
+                    ]}, "finish_reason": None}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                ]
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -86,7 +97,7 @@ max_context_size = 32768
 
 
 def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
-    frame, wx_app, monkeypatch, loopback_kimi_home, caplog
+    loopback_kimi_home, frame, wx_app, monkeypatch, caplog
 ):
     caplog.set_level("DEBUG", logger="kimi_server_v2")
     workspace, requests = loopback_kimi_home
