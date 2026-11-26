@@ -1,6 +1,15 @@
 # 当前交接
 
-更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。
+更新日期 2026-11-26。日常源码工作树为 `D:/code/sj/mc`，主分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。本批功能与交接位于独立的 `feat/mc-rc-three-cli-shared-sessions` 候选分支。
+
+## 2026-11-26 三家 CLI 共享会话
+
+- T01–T12 已合入本地双仓候选，整体验收 T13 进行中。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
+- 本机工作区 `D:/code/sj` 下，`_bmad-output/implementation-artifacts/mc-rc-three-cli-shared-sessions-acceptance.md` 逐项记录 A-01 至 A-12 和复现指令，`.build-work/mc-rc-three-cli-shared-sessions/candidate-final` 保存构建脚本、产物哈希、冻结演练和隔离证据。文档提交后重建该批产物仍使用上述源码提交。
+- 从候选工作树用 `package_mc.ps1 -BuildOnly`，并为 `-DistPath`、`-WorkPath` 指定隔离目录。最终包并发运行三家 `--list` 只启动一个 MC，热态复用。用包内 NATS 和 ACP 替身读到了同工具行的执行中、完成与终答。冒烟使用隔离目录并关闭真实 HKCU 注册。
+- 最终源码以实际 Codex 0.171.0 和 Kimi 2.5.3、2.6.3 CLI 配合本地模型替身验证原生历史、继续和适用控制。实际 AGY 1.5.17 通过隔离本地 NATS 验证了同原生 ID 的工具进度、跨临时目录免逐次工具审批和补充问题。此处手机角色的协议探针与 RC 界面验收分别计入。2026-11-26 文档核对另跑 `python -m pytest tests/test_shared_terminal.py tests/test_agy_workspace.py -q -p no:cacheprovider -p no:faulthandler`，使用 `PYTHONUTF8=1`，7 项通过。
+- 同批 RC 的隔离 ARM64 QA 包已读到 AGY 种子终答。第二个终端回合的用户问题进入手机执行页，实际工具和终答待复现，重试遇到供应商新建超时和模拟器未恢复连接。先确认 RC 到隔离 NATS 及业务握手就绪，再按同一来源、原生 ID、回合、工具身份和最终答复逐段比对宿主与界面证据。固定夹具用于复现，真实 AGY 用于复验。
+- 待办还包括两台真实电脑、干净 Windows 用户实际注册和升级、真实 NATS 与供应商、Windows 物理键盘和争渡、实体 ARM64 手机和 TalkBack、同批附件与通知的完整验收。使用合成数据，避免让空 Android 配置命中既有默认来源。隔离 APK 的细节和阻塞见 RC 的交接、测试说明与工作区验收报告。
 
 ## 2026-11-23 聊天切换与争渡播报
 

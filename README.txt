@@ -19,11 +19,13 @@ MC 使用当前用户安装的 Kimi CLI，默认查找用户目录下的 `.kimi-
 
 ## PowerShell 共享聊天
 
-首次打开新版安装包后，从开始菜单新开 PowerShell，输入 `mc-kimi`。选会话编号，或输入完整的 MC 聊天 ID 或原生会话 ID。直接在提示符输入问题，终端显示本轮可见的执行步骤和最终答复。回合结束后输入 `/exit` 返回 PowerShell。任务进行中按 Ctrl+C 返回终端，可在 MC 或 RC 的同一聊天继续观察或停止任务。
+首次打开支持共享聊天的 MC 安装包后，新开 PowerShell，按提供方输入 `mc-codex`、`mc-kimi` 或 `mc-agy`。选会话编号，也可用 `--list` 查看会话，再以 `--chat <ID>` 指定完整的 MC 聊天 ID 或原生会话 ID。Codex 打开原生 TUI，Kimi 和 AGY 在当前提示符输入问题、查看公开步骤和终答，回合结束后可用 `/exit`。Kimi 或 AGY 的终端按 Ctrl+C 可以退出观察，仍在运行的任务可从 MC 或 RC 的同一聊天查看和停止。
 
 每台电脑独立连接本机 MC。MC 关闭时，命令启动当前注册的安装并等待服务就绪。换安装目录后，先手动打开新目录的 MC 一次。若命令被 Windows PowerShell 的别名、函数或已有程序占用，可用 `Get-Command mc-kimi -All` 查看来源，调整冲突后重开 MC，再新开 PowerShell。MC 在当前用户目录注册命令并更新用户 Path。
 
-同一安装还注册 `mc-codex` 和 `mc-agy`。从 MC 或 RC 创建 AGY 聊天并选择运行电脑上的项目目录后，可以从 `mc-agy` 按同一个原生会话 ID 进入。AGY 使用当前 Windows 账号和 Windows 访问权限，默认跳过逐次工具审批。AGY 补充问题仍可在 MC 或 RC 回答。在 MC 的同一聊天输入 `/reply` 可以重新打开等待中的提问，输入 `/stop` 可以请求停止。RC 在任务状态处提供停止按钮。执行期间在两端正常发送文本可追加指令。
+在 MC 先选择模型再新建聊天，在 RC 新建时选择来源和模型。从任一端创建 AGY 聊天时选择运行电脑上的项目目录，随后可从 `mc-agy` 按同一个原生会话 ID 进入。AGY 使用当前 Windows 账号和 Windows 访问权限，默认跳过逐次工具审批。AGY 补充问题仍可在 MC 或 RC 回答。在 MC 的同一聊天输入 `/reply` 可以重新打开等待中的提问，输入 `/stop` 可以请求停止。RC 在任务状态处提供停止按钮。执行期间在两端正常发送文本可追加指令。
+
+直接打开普通供应商终端所产生的已落盘历史也可同步到 MC 和 RC，并按原会话 ID 继续。要从两端实时观察及控制新回合，使用共享命令或应用入口。标题与删除行为见 [共享会话](docs/remote-control.md#三家-cli-共享会话)。本地候选和实体验收进度见 [当前交接](docs/handoff.md)。
 
 测试副本可在启动前设置 `MC_SHARED_TERMINAL_REGISTER=0`，保留本机服务并跳过用户命令注册。
 
