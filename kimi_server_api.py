@@ -4,7 +4,7 @@ from threading import Event
 from urllib.parse import quote
 
 from context_usage import native_token_count
-from kimi_server_events import KimiEvent, KimiServerError, _provider_origin_timestamp, map_session_event
+from kimi_server_events import KimiEvent, KimiServerError, _provider_origin_timestamp
 from kimi_transcript import Transcript
 
 
@@ -88,7 +88,8 @@ def project_turn(turn):
             frame = {"kind": "tool", "frameId": identity}
             if _public(item):
                 frame.update(name=item.get("name"), input=item.get("input"), output=item.get("output"),
-                             state=item.get("outcome") or item.get("status"))
+                             state=item.get("outcome") or item.get("status"), display=item.get("display"),
+                             error=item.get("error"), diff=item.get("diff"), exitCode=item.get("exit_code"))
             else:
                 frame["disclosable"] = False
             step["frames"].append(frame)
@@ -296,6 +297,9 @@ class KimiServerApiMixin:
                 for frame_key in tuple(self._v2_frame_texts):
                     if frame_key[:3] == (sid, turn_id, old_prompt) and frame_key[-1] == identity:
                         self._v2_frame_texts.pop(frame_key)
+                for frame_key in tuple(self._v2_tool_frames):
+                    if frame_key[:3] == (sid, turn_id, old_prompt) and frame_key[-1] == identity:
+                        self._v2_tool_frames.pop(frame_key)
                 self._enqueue_event(KimiEvent(type="execution_item_withdrawn", thread_id=sid, turn_id=turn_id,
                     item_id=identity, data={"source_kind": "item.withdrawn", "agent_id": "main",
                                            "prompt_id": old_prompt, "authoritative": True}))
@@ -357,25 +361,7 @@ class KimiServerApiMixin:
                 self._server_api_restrict_item(sid, turn_id, identity, "hidden")
             if self._server_api_item_restrictions.get((sid, turn_id), {}).get(identity) == "hidden":
                 items[identity] = item = dict(item, hidden=True)
-        prompt = self._server_api_publish_execution(sid, turn, old_items, items)
-        if kind in {"item.started", "item.updated", "item.ended"} and item.get("type") == "tool_call" and _public(item):
-            if prompt:
-                finished = kind == "item.ended" or item.get("status") == "ended"
-                source = "tool.result" if finished else "tool.call.started"
-                arguments, display = _object(item.get("input")), _object(item.get("display"))
-                event = map_session_event({
-                    "type": source, "session_id": sid,
-                    "payload": {
-                        "turnId": turn_id, "promptId": prompt, "agentId": "main",
-                        "toolCallId": item["item_id"], "name": item.get("name"),
-                        "display": display, "command": display.get("command"),
-                        "status": item.get("outcome"), "output": item.get("error") or item.get("output"),
-                        "created_at": item.get("created_at"), "args": arguments,
-                    },
-                }, step_scope={"step_id": str(item.get("step_index", ""))})
-                if event is not None:
-                    event.data["authoritative"] = True
-                    self._enqueue_event(event)
+        self._server_api_publish_execution(sid, turn, old_items, items)
 
     def _server_api_terminal(self, sid, wire_turn, ws, generation):
         turn_id = _id(wire_turn.get("turn_id"))

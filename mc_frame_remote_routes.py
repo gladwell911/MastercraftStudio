@@ -44,6 +44,17 @@ class RemoteRoutesMixin:
             snapshot["pending_request"] = pending
             snapshot["prompt"] = pending["prompt"]
 
+    def _apply_kimi_remote_snapshot(self, chat, snapshot, *, include_request=True):
+        owner = self._kimi_active_control_owner(chat)
+        running = bool(owner or chat.get("kimi_turn_active"))
+        pending = self._kimi_remote_interaction_payload(owner)
+        kind = pending["request_kind"] if pending else ""
+        snapshot.update(active_turn=running, running=running,
+                        native_turn_id=owner.get("prompt_id", ""),
+                        status=f"waiting_{kind}" if kind else "running" if running else "idle", request_kind=kind)
+        if pending and include_request:
+            snapshot.update(pending_request=pending, prompt=pending["prompt"])
+
     def _remote_session_usage(self, chat: dict, revision: int = 0) -> dict | None:
         chat_id = str(chat.get("id") or "").strip()
         if not chat_id:
@@ -494,6 +505,8 @@ class RemoteRoutesMixin:
             **self._codex_speed_payload_for_chat(chat),
         }
         self._apply_codex_terminal_remote_snapshot(chat, snapshot, include_request=False)
+        if is_kimi_model(model):
+            self._apply_kimi_remote_snapshot(chat, snapshot, include_request=False)
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
@@ -822,6 +835,24 @@ class RemoteRoutesMixin:
             if expected_turn and (not preview_chat.get("codex_turn_active")
                                   or self._codex_turn_id_for_chat(preview_chat) != expected_turn):
                 return 409, {"accepted": False, "chat_id": target_owner, "message": "此 Codex 回合已结束或已更换。"}
+        if is_kimi_model(model) and isinstance(preview_chat, dict):
+            expected_prompt = str(payload.get("expected_native_turn_id") or "")
+            target_owner = str(preview_chat.get("id") or "")
+            if expected_prompt:
+                if text == "/stop":
+                    ok, message = self._stop_shared_kimi_turn(preview_chat, expected_prompt)
+                elif self._kimi_active_control_owner(preview_chat).get("prompt_id") != expected_prompt:
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                else:
+                    ok, message = self._submit_archived_remote_question(
+                        preview_chat, text, model, active=archived_target is None,
+                        client_send_id=str(payload.get("client_send_id") or ""),
+                        expected_kimi_prompt_id=expected_prompt,
+                    )
+                    if ok:
+                        self._push_remote_state(target_owner)
+                        self._push_remote_history_changed(target_owner)
+                return 200 if ok else 409, {"accepted": ok, "chat_id": target_owner, "message": message}
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
                 if archived_target is not None:
@@ -1074,7 +1105,10 @@ class RemoteRoutesMixin:
         text = str(payload.get("text") or "").strip()
         owner = str(payload.get("chat_id") or "").strip()
         interaction_id = str(payload.get("interaction_id") or "").strip()
-        if interaction_id or self._codex_terminal_pending(owner):
+        chat, _, _ = self._chat_target_for_request(owner) if owner else (None, [], False)
+        if interaction_id and chat and is_kimi_model(self._model_for_chat_selection(chat)):
+            ok, message = self._reply_remote_kimi_interaction(chat, interaction_id, text, payload.get("kimi_answers"))
+        elif interaction_id or self._codex_terminal_pending(owner):
             ok, message = self._reply_codex_terminal_request(owner, interaction_id, text=text)
         elif owner and owner not in {self.active_chat_id, self.current_chat_id}:
             ok, message = False, "当前聊天没有待回复的请求。"
@@ -1446,6 +1480,9 @@ class RemoteRoutesMixin:
             running = chat_id in self._agy_busy
             chat["active_turn"] = chat["running"] = running
             status, request_kind = ("running" if running else "idle"), ""
+        elif is_kimi_model(chat.get("model", "")):
+            self._apply_kimi_remote_snapshot(source_chat, chat)
+            status, request_kind = chat["status"], chat["request_kind"]
         elif source_chat.get("codex_terminal_thread") == source_chat.get("codex_thread_id") and source_chat.get("codex_terminal_thread"):
             self._apply_codex_terminal_remote_snapshot(source_chat, chat)
             status, request_kind = chat["status"], chat["request_kind"]

@@ -965,14 +965,15 @@ class ChatRequestsMixin:
     def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *,
                                          client_send_id: str = "", attachments=None,
                                          attachment_scope: tuple = (), active: bool = False,
-                                         prepared_attachments=None, source: str = "rc") -> tuple[bool, str]:
+                                         prepared_attachments=None, source: str = "rc",
+                                         expected_kimi_prompt_id: str = "") -> tuple[bool, str]:
         """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
         if self._clear_pending_for(owner_id):
             return False, "正在清空此聊天的上下文"
         resolved_model = bindings.app.normalize_model_id(model or "", default="")
-        if is_codex_model(resolved_model) and owner_id in getattr(self, "_native_history_reserved", ()):
-            return False, "正在同步原生 Codex 历史，请稍后重试"
+        if (is_codex_model(resolved_model) or is_kimi_model(resolved_model)) and owner_id in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生聊天历史，请稍后重试"
         text = str(question or "").strip()
         if not owner_id or not resolved_model or not text:
             return False, "invalid archived chat submission"
@@ -980,7 +981,8 @@ class ChatRequestsMixin:
         if getattr(self, "_chat_store_enabled", False) and store is not None:
             if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
                 return False, "Clear/resend recovery is still pending for this chat."
-            has_live_turns = active or ((attachments or chat.get("codex_terminal_thread"))
+            has_live_turns = active or ((attachments or chat.get("codex_terminal_thread")
+                                         or (is_kimi_model(resolved_model) and self._kimi_should_steer_turn(chat, active)))
                                         and isinstance(chat.get("turns"), list))
             loaded = None if has_live_turns else store.load_chat(owner_id, include_execution_steps=False)
             if isinstance(loaded, dict):
@@ -1007,6 +1009,8 @@ class ChatRequestsMixin:
             "question_origin": source,
             "client_send_id": client_send_id,
         }
+        if expected_kimi_prompt_id:
+            turn["kimi_expected_prompt_id"] = expected_kimi_prompt_id
         if attachments:
             turn["attachments"] = attachments
             turn["remote_attachment_source"] = list(attachment_scope[:2])
@@ -1121,6 +1125,8 @@ class ChatRequestsMixin:
         if self._current_chat_state.get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
+        if is_kimi_model(resolved_model) and (chat_id or self.active_chat_id) in self._native_history_reserved:
+            return False, "正在同步原生 Kimi Code 历史，请稍后重试"
         if resolved_model == AGY_MODEL_ID and requested_attachments:
             return False, "此版本的 AGY 聊天暂不支持附件"
         if resolved_model == AGY_MODEL_ID:

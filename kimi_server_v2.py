@@ -14,6 +14,7 @@ from kimi_server_events import (
     _payload_of,
     _provider_origin_timestamp,
     _str,
+    map_session_event,
 )
 from kimi_transcript import Transcript
 from typing import Any
@@ -556,6 +557,9 @@ class KimiServerV2Mixin:
             for frame_key in list(self._v2_frame_texts):
                 if frame_key[:3] == (sid, turn["turnId"], turn["triggerPromptId"]):
                     self._v2_frame_texts.pop(frame_key, None)
+            for frame_key in tuple(self._v2_tool_frames):
+                if frame_key[:3] == (sid, turn["turnId"], turn["triggerPromptId"]):
+                    self._v2_tool_frames.pop(frame_key)
             idle_sessions = [session for session, state in self._v2_transcripts.items() if not state.items]
             for session in idle_sessions[:-32]:
                 self._v2_transcripts.pop(session, None)
@@ -564,24 +568,57 @@ class KimiServerV2Mixin:
         events = []
         for turn in transcript.items.values():
             prompt = turn.get("triggerPromptId")
-            if not prompt or turn.get("state") != "running":
+            if not prompt or turn.get("state") not in {"running", "completed", "failed", "cancelled"}:
                 continue
             key = (sid, turn["turnId"], prompt)
-            if (sid, prompt, turn["turnId"]) in self._v2_completed:
+            if ((sid, prompt, turn["turnId"]) in self._v2_completed
+                    or turn["state"] != "running" and key not in self._v2_started):
                 continue
             base = {"agent_scope": "main", "agent_id": "main", "prompt_id": prompt, "authoritative": True,
                     "transcript_source": transcript_source}
-            if key not in self._v2_started:
+            if key not in self._v2_started and turn["state"] == "running":
                 events.append(KimiEvent(type="turn_started", thread_id=sid, turn_id=turn["turnId"],
                     text=str(turn.get("prompt") or ""), data={**base, "source_kind": "turn.started"}))
                 self._v2_started.add(key)
             for step in turn.get("steps", []):
                 for frame in step.get("frames", []):
-                    if frame.get("kind") not in {"text", "thinking"}:
+                    public = (not any(frame.get(k) for k in ("private", "hidden", "non_disclosable"))
+                              and frame.get("disclosable", True) is not False)
+                    if frame.get("kind") == "tool" and frame.get("frameId"):
+                        frame_key = (*key, step["stepId"], frame["frameId"])
+                        previous = self._v2_tool_frames.get(frame_key)
+                        if not public:
+                            if previous is not None:
+                                self._v2_tool_frames.pop(frame_key)
+                                events.append(KimiEvent(type="execution_item_withdrawn", thread_id=sid,
+                                    turn_id=turn["turnId"], item_id=previous["toolCallId"], data=base))
+                            continue
+                        display = frame.get("display") if isinstance(frame.get("display"), dict) else {}
+                        state = frame.get("state")
+                        tool = {
+                            "turnId": turn["turnId"], "promptId": prompt, "agentId": "main",
+                            "toolCallId": frame.get("toolCallId") or frame["frameId"],
+                            "name": frame.get("name"), "display": display,
+                            "command": display.get("command"), "args": frame.get("input"),
+                            "status": state, "output": frame.get("error") or frame.get("output"),
+                            "diff": frame.get("diff") or display.get("diff"), "exitCode": frame.get("exitCode"),
+                        }
+                        if previous == tool:
+                            continue
+                        self._v2_tool_frames[frame_key] = tool
+                        if len(self._v2_tool_frames) > 1024:
+                            self._v2_tool_frames.pop(next(iter(self._v2_tool_frames)))
+                        finished = state in {"done", "ended", "completed", "failed", "error", "cancelled", "interrupted"}
+                        source = "tool.result" if finished else "tool.call.started"
+                        event = map_session_event({"type": source, "session_id": sid, "payload": tool},
+                                                  step_scope={"step_id": step["stepId"]})
+                        if event is not None:
+                            event.data.update(base)
+                            events.append(event)
+                        continue
+                    if not public or turn["state"] != "running" or frame.get("kind") not in {"text", "thinking"}:
                         continue
                     if frame.get("kind") == "text" and frame.get("role") != "assistant":
-                        continue
-                    if any(frame.get(k) for k in ("private", "hidden", "non_disclosable")) or frame.get("disclosable", True) is False:
                         continue
                     frame_key = (*key, step["stepId"], frame["frameId"])
                     text = str(frame.get("text") or "")
