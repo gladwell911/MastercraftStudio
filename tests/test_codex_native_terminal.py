@@ -59,6 +59,7 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
     from shared_terminal_routes import dispatch_terminal
 
     release = threading.Event()
+    consumed_answer = threading.Event()
     text = '\u9694\u79bb\u539f\u751f\u7ec8\u7aef\u56de\u7b54\u3002\u672b\u5c3e\u6807\u8bc6 NATIVE_TAIL_04'
     item = {'id': 'msg_fixture', 'type': 'message', 'status': 'completed', 'role': 'assistant',
             'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}
@@ -82,6 +83,11 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
                 self.wfile.flush()
 
             serialized_input = json.dumps(payload.get('input', []))
+            for part in payload.get('input', []):
+                if (part.get('type') == 'function_call_output' and part.get('call_id') == 'call_mc_test_input'
+                        and 'Blue' in str(part.get('output') or '')):
+                    consumed_answer.set()
+            tool = None
             if 'Synthetic command approval' in serialized_input and 'call_mc_test_shell' not in serialized_input:
                 tool = {'id': 'fc_mc_test_shell', 'type': 'function_call', 'status': 'completed',
                         'name': 'exec_command', 'call_id': 'call_mc_test_shell', 'arguments': json.dumps({
@@ -89,6 +95,15 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
                             'sandbox_permissions': 'require_escalated',
                             'justification': 'Print an isolated test marker.',
                         })}
+            elif 'Synthetic structured question' in serialized_input and 'call_mc_test_input' not in serialized_input:
+                tool = {'id': 'fc_mc_test_input', 'type': 'function_call', 'status': 'completed',
+                        'name': 'request_user_input', 'call_id': 'call_mc_test_input', 'arguments': json.dumps({
+                            'questions': [{'id': 'color', 'header': 'Color', 'question': 'Which color?', 'options': [
+                                {'label': 'Blue', 'description': 'Use blue.'},
+                                {'label': 'Red', 'description': 'Use red.'},
+                            ]}],
+                        })}
+            if tool is not None:
                 emit('response.created', response=dict(response, output=[], status='in_progress'))
                 emit('response.output_item.added', item=dict(tool, arguments='', status='in_progress'), output_index=0)
                 emit('response.output_item.done', item=tool, output_index=0)
@@ -140,7 +155,8 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
     with ThreadingHTTPServer(('127.0.0.1', 0), Model) as http:
         threading.Thread(target=http.serve_forever, daemon=True).start()
         (home / 'config.toml').write_text('approval_policy="on-request"\nsandbox_mode="workspace-write"\n'
-            'approvals_reviewer="user"\nmodel="gpt-5.4"\nmodel_provider="fixture"\n[model_providers.fixture]\n'
+            'approvals_reviewer="user"\nmodel="gpt-5.4"\nmodel_provider="fixture"\n'
+            '[features]\ndefault_mode_request_user_input=true\n[model_providers.fixture]\n'
             f'name="Fixture"\nbase_url="http://127.0.0.1:{http.server_port}/v1"\n'
             'env_key="MC_LOCAL_FAKE_MODEL_KEY"\nwire_api="responses"\n', encoding='utf-8')
         pty = None
@@ -231,7 +247,21 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
                     assert remote._route_command(decision)[0] == 400
                     status, projection = remote._route_command({'type': 'execution_page_v3', 'chat_id': owner})
                     assert status == 200
-                    assert any('MC_APPROVAL_TEST_OUTPUT' in row.get('detail_text', '') for row in projection['rows']), projection['rows']
+                    assert any('MC_APPROVAL_TEST_OUTPUT' in row.get('detail_text', '').splitlines()
+                               for row in projection['rows'])
+                    pty.close(force=True)
+                    pty = spawn_tui('Synthetic structured question')
+                    wait_for_wx(pending_approval, 'Codex TUI structured question on RC')
+                    request = pending_approval()
+                    assert request['request_kind'] == 'user_input'
+                    assert request['body']['params']['questions'][0]['id'] == 'color'
+                    answer = {'type': 'reply_request', 'chat_id': owner, 'text': 'Blue',
+                              'interaction_id': request['body']['interaction_id']}
+                    assert remote._route_command(answer)[0] == 200
+                    wait_for_wx(lambda: pending_approval() is None and observed_turn()['request_status'] == 'done',
+                                'structurally answered native turn')
+                    assert consumed_answer.is_set()
+                    assert remote._route_command(answer)[0] == 400
         finally:
             release.set()
             if pty is not None:
