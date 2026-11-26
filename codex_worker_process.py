@@ -231,8 +231,10 @@ class CodexWorkerRuntime:
             with self._lock:
                 previous = self._clients.get(key)
                 binding = self._terminal_threads.get(key)
-                if binding and binding["thread_id"] != expected_thread:
+                if binding and (binding["thread_id"] != expected_thread or binding["context_generation"] != generation):
                     raise RuntimeError("Codex 聊天已更换线程。请重新选择聊天。")
+                if binding is None and payload.get("require_existing_terminal"):
+                    raise RuntimeError("原 Codex 共享 App Server 无法确认，请检查已有终端。")
                 if binding is None and key in self._active_command_owners:
                     raise RuntimeError("此聊天正在使用原运行时。请等待当前回合结束后打开共享终端。")
             if scoped_home is not None:
@@ -593,12 +595,14 @@ class CodexWorkerRuntime:
         accepted = False
         try:
             self._check_native_paths(payload)
+            shared = self._terminal_threads.get(startup_key)
+            if shared is None and payload.get("require_existing_terminal"):
+                raise RuntimeError("原 Codex 共享 App Server 无法确认，请检查已有终端。")
             client = self._client_for(chat_id, model, payload)
             with self._lock:
                 self._turn_indices[(chat_id, model)] = turn_idx
 
             thread_id = str(payload.get("thread_id") or "").strip()
-            shared = self._terminal_threads.get((chat_id, model))
             exact_resume = bool(payload.get("native_home"))
             options = self._approval_options(payload)
             if shared is not None and shared["thread_id"] != thread_id:

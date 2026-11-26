@@ -9,6 +9,7 @@ import re
 import secrets
 import subprocess
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import websocket
@@ -49,6 +50,15 @@ class CodexTerminalClient(CodexAppServerClient):
         self._executable = None
         self._token = secrets.token_urlsafe(32)
         self._transport_lock = threading.RLock()
+        # Never hold the observer lock while waiting for an RPC reply.
+        self._observer_lock = threading.RLock()
+        self._observer_stop = threading.Event()
+        self._observer_retry = None
+        self._observer_thread_id = ""
+        self._last_seen_turn_id = None
+        self._observed_turns = OrderedDict()
+        self._reconnect_events = None
+        self._reconnect_bytes = 0
         self._listener_ready = threading.Event()
         self._transport_error = "Codex 原生终端连接已断开。请重新打开该聊天检查当前状态。"
 
@@ -68,13 +78,28 @@ class CodexTerminalClient(CodexAppServerClient):
             _link_user_codex_directories(_user_home() / ".codex", self._codex_home_dir)
         self._refresh_native_skills(cwd)
 
+    def _request_thread_configuration(self, method, params):
+        result = super()._request_thread_configuration(method, params)
+        thread = result.get("thread") or {}
+        with self._observer_lock:
+            if not self._observer_thread_id and thread.get("id"):
+                self._observer_thread_id = thread["id"]
+                turns = thread.get("turns") or []
+                if turns:
+                    self._last_seen_turn_id = turns[-1]["id"]
+                elif method == "thread/start":
+                    self._last_seen_turn_id = ""
+        return result
+
     def _ensure_started(self):
         with self._transport_lock:
-            if self._closed:
+            if self._closed or self._observer_stop.is_set():
                 raise RuntimeError("Codex 原生终端运行时已关闭。")
             if self._socket is not None and self._initialized:
                 return
             if self._proc is None or self._proc.poll() is not None:
+                if self._observer_thread_id:
+                    raise RuntimeError("原 Codex 共享 App Server 已退出，无法确认原回合状态。")
                 self._listener_ready.clear()
                 self._endpoint = None
                 argv = self._app_server_command()
@@ -99,15 +124,145 @@ class CodexTerminalClient(CodexAppServerClient):
                 header={"Authorization": f"Bearer {self._token}"},
             )
             ws.settimeout(None)
-            self._socket = ws
+            with self._observer_lock:
+                self._socket = ws
+                thread_id = self._observer_thread_id
+                self._reconnect_events = [] if thread_id else None
+                self._reconnect_bytes = 0
             self._stdout_thread = threading.Thread(target=self._read_socket, args=(ws,), daemon=True)
             self._stdout_thread.start()
             try:
                 self._initialize()
+                if thread_id:
+                    self._resubscribe(ws, thread_id)
             except Exception:
-                self._socket = None
+                with self._observer_lock:
+                    if self._socket is ws:
+                        self._socket = None
+                        self._initialized = False
+                        self._reconnect_events = None
                 ws.shutdown()
                 raise
+
+    def _resubscribe(self, ws, thread_id):
+        resume = self._request_internal("thread/resume", {"threadId": thread_id, "excludeTurns": True}, timeout=5)
+        if (resume.get("thread") or {}).get("id") != thread_id:
+            raise RuntimeError("Codex 未恢复到原共享线程。")
+        read = self._request_internal("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=5)
+        thread = read.get("thread") or {}
+        if thread.get("id") != thread_id:
+            raise RuntimeError("Codex 未返回原共享线程的状态。")
+        with self._observer_lock:
+            if self._socket is not ws or self._closed:
+                raise RuntimeError(self._transport_error)
+            queued = self._reconnect_events
+            self._reconnect_events = None
+            self._reconcile_turns(thread_id, thread.get("turns") or [], queued)
+
+    def _reconcile_turns(self, thread_id, turns, queued):
+        # Only the turns observed while running, and those after the last known
+        # turn, can belong to this observation gap. Earlier history stays history.
+        ids = [turn["id"] for turn in turns]
+        anchor = self._last_seen_turn_id
+        new_ids = set(ids[ids.index(anchor) + 1:]) if anchor in ids else set()
+        if anchor == "":
+            new_ids = set(ids)
+        elif anchor is None and ids:
+            # Some resumed threads omit turns. An unknown baseline must not
+            # turn pre-existing history into new activity on first reconnect.
+            self._last_seen_turn_id = ids[-1]
+        snapshots = OrderedDict((turn["id"], turn) for turn in turns
+                                if turn["id"] in new_ids or self._observed_turns.get(turn["id"]) is not None)
+        for event in queued:
+            if event.thread_id == thread_id:
+                turn_id = event.turn_id
+                if turn_id in snapshots or event.type == "turn_started":
+                    # Settle older turns before the next turn claims the chat.
+                    while snapshots and next(iter(snapshots)) != turn_id:
+                        self._recover_turn(thread_id, snapshots.popitem(last=False)[1])
+                turn = snapshots.get(turn_id)
+                if turn is not None and event.type != "turn_started":
+                    self._restore_turn_start(thread_id, turn)
+                    if event.type == "turn_completed":
+                        self._recover_turn(thread_id, snapshots.pop(turn_id))
+            self._deliver_observer_event(event)
+        for turn in snapshots.values():
+            self._recover_turn(thread_id, turn)
+
+    def _restore_turn_start(self, thread_id, turn):
+        if turn["id"] not in self._observed_turns:
+            self._emit_protocol_event("turn/started", {"threadId": thread_id, "turn": turn}, {})
+
+    def _recover_turn(self, thread_id, turn):
+        self._restore_turn_start(thread_id, turn)
+        turn_id = turn["id"]
+        seen = self._observed_turns.get(turn_id)
+        if seen is None:
+            return
+        terminal = turn.get("status") in {"completed", "failed", "interrupted"}
+        remaining = []
+        for item in turn.get("items") or ():
+            method = "item/started" if item.get("status") == "inProgress" else "item/completed"
+            if (method, item.get("id")) in seen:
+                continue
+            if terminal and item.get("type") != "userMessage":
+                remaining.append(item)
+            else:
+                self._emit_protocol_event(method, {"threadId": thread_id, "turnId": turn_id, "item": item}, {})
+        if terminal:
+            self._emit_protocol_event("turn/completed", {"threadId": thread_id, "turn": dict(turn, items=remaining)}, {})
+
+    def _emit_event(self, event):
+        with self._observer_lock:
+            if self._reconnect_events is not None:
+                self._reconnect_events.append(event)
+            else:
+                self._deliver_observer_event(event)
+
+    def _deliver_observer_event(self, event):
+        if event.turn_id and event.thread_id == self._observer_thread_id:
+            turn_id = event.turn_id
+            if event.type == "turn_started":
+                if turn_id in self._observed_turns:
+                    return
+                self._last_seen_turn_id = turn_id
+                self._observed_turns[turn_id] = set()
+            elif event.type in {"item_started", "item_completed"} and event.item_id:
+                items = self._observed_turns.get(turn_id)
+                if items is not None:
+                    method = "item/started" if event.type == "item_started" else "item/completed"
+                    items.add((method, event.item_id))
+            elif event.type == "turn_completed":
+                if turn_id in self._observed_turns and self._observed_turns[turn_id] is None:
+                    return
+                self._observed_turns[turn_id] = None
+                self._observed_turns.move_to_end(turn_id)
+                if len(self._observed_turns) > 256:
+                    self._observed_turns.popitem(last=False)
+        super()._emit_event(event)
+
+    def _start_observer_retry(self):
+        if self._observer_thread_id and self._observer_retry is None and not self._observer_stop.is_set():
+            self._observer_retry = threading.Thread(target=self._retry_observer, daemon=True,
+                                                    name="codex-terminal-observer")
+            self._observer_retry.start()
+
+    def _retry_observer(self):
+        delay = 0.1
+        try:
+            while not self._observer_stop.wait(delay):
+                try:
+                    self._ensure_started()
+                    return
+                except (RuntimeError, OSError, websocket.WebSocketException):
+                    if self._proc is None or self._proc.poll() is not None:
+                        return
+                    delay = min(delay * 2, 5)
+        finally:
+            with self._observer_lock:
+                self._observer_retry = None
+                if self._socket is None and self._proc is not None and self._proc.poll() is None:
+                    self._start_observer_retry()
 
     def _read_listener(self, process):
         try:
@@ -131,15 +286,28 @@ class CodexTerminalClient(CodexAppServerClient):
                     message = json.loads(frame)
                 except (ValueError, TypeError):
                     continue
-                self._handle_message(message)
+                with self._observer_lock:
+                    if self._socket is not ws:
+                        return
+                    if self._reconnect_events is not None and isinstance(message, dict) and (
+                            "method" in message or message.get("type") == "event_msg"):
+                        self._reconnect_bytes += len(frame.encode("utf-8") if isinstance(frame, str) else frame)
+                        if len(self._reconnect_events) >= 1024 or self._reconnect_bytes > 4 * 1024 * 1024:
+                            # Retry from another authoritative snapshot when
+                            # the stream outpaces the bounded reconnect buffer.
+                            return
+                    self._handle_message(message)
         except (OSError, websocket.WebSocketException):
             pass
         finally:
-            if self._socket is ws:
-                self._socket = None
-                self._initialized = False
-                self._fail_pending_requests(self._transport_error)
-                self._emit_event(CodexEvent(type="shared_transport_lost", text=self._transport_error))
+            with self._observer_lock:
+                if self._socket is ws:
+                    self._socket = None
+                    self._initialized = False
+                    self._reconnect_events = None
+                    self._fail_pending_requests(self._transport_error)
+                    self._start_observer_retry()
+                    super()._emit_event(CodexEvent(type="shared_transport_lost", text=self._transport_error))
             ws.shutdown()
 
     def _send_json(self, payload):
@@ -153,8 +321,15 @@ class CodexTerminalClient(CodexAppServerClient):
                 raise RuntimeError(self._transport_error) from exc
 
     def _stop_process(self):
-        ws = self._socket
-        self._socket = None
+        with self._observer_lock:
+            ws = self._socket
+            self._socket = None
+            self._reconnect_events = None
         if ws is not None:
             ws.shutdown()
         super()._stop_process()
+
+    def close(self):
+        self._observer_stop.set()
+        with self._transport_lock:
+            super().close()
