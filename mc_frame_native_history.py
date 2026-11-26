@@ -1,6 +1,7 @@
 """Background native discovery and application history publication."""
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import sqlite3
@@ -10,7 +11,7 @@ import time
 import wx
 
 from agy_acp import AgyError, find_agy_executable
-from agy_history import list_agy_sessions, read_agy_session
+from agy_history import list_agy_sessions, read_agy_session, verify_agy_session_absent
 from codex_client import is_codex_model
 from codex_history import CodexHistoryReader, codex_history_homes
 from codex_worker_client import codex_worker_workspace
@@ -18,16 +19,182 @@ from kimi_history import KimiHistoryReader, kimi_history_storage
 from kimi_server_client import is_kimi_model
 from kimi_runtime import runtime_path as kimi_runtime_path
 from kimi_server_client import KimiServerClient, KimiServerError
-from native_history import NATIVE_CHAT_FIELDS, TITLE_FIELDS, NativeTitleRejected
+from native_history import (
+    NATIVE_CHAT_FIELDS, TITLE_FIELDS, NativeDeletionRejected, NativeSessionIdentity, NativeTitleRejected,
+)
 
 
 _LOG = logging.getLogger(__name__)
 _REFRESH_SECONDS = 60
 _NATIVE_TITLE_FIELDS = ("native_title", "native_title_revision", "native_title_observed_at")
 _RENAME_UNKNOWN = "原生改名结果尚未确认，已保留上次确认的标题，将重新读取。"
+_DELETE_UNKNOWN = "尚未确认原始会话已删除。当前聊天已保留，请刷新后重试。"
+_AGY_MANUAL_DELETE = ("请在来源电脑的原 AGY 项目目录运行 agy，输入 /resume，选中指定会话后按 F4，"
+                      "并按原生提示确认。完成后在此选择刷新确认。")
+_PROVIDER_NAMES = {"codex": "Codex", "kimi": "Kimi Code", "agy": "AGY"}
 
 
 class NativeHistoryMixin:
+    def _native_history_reference(self, chat):
+        pair = self._read_pair_id()
+        provider = session_id = storage = ""
+        if is_codex_model(chat.get("model")) and chat.get("codex_thread_id"):
+            provider, session_id = "codex", chat["codex_thread_id"]
+            home = chat.get("codex_home") or codex_worker_workspace() / ".codex-home"
+            storage = chat.get("codex_storage_id") or os.path.normcase(str(Path(home).resolve()))
+        elif is_kimi_model(chat.get("model")) and chat.get("kimi_session_id"):
+            provider, session_id = "kimi", chat["kimi_session_id"]
+            storage = chat.get("kimi_storage_id") or os.path.normcase(str((Path.home() / ".kimi-code").resolve()))
+        elif chat.get("agy_session_id"):
+            provider, session_id = "agy", chat["agy_session_id"]
+        identity = chat.get("native_identity")
+        if storage:
+            derived = NativeSessionIdentity(pair, provider, storage, session_id).chat_id
+            if identity and identity != derived:
+                return {}
+            identity = derived
+        return {"pair_id": pair, "provider": provider, "session_id": session_id,
+                "identity": identity} if provider and identity else {}
+
+    def _hide_history_chat_ui(self, owner):
+        chat = self._history_chat_for_id(owner)
+        if chat is None:
+            if self.chat_store.get_meta(f"deleted-chat:{owner}"):
+                return 200, {"accepted": True}
+            return 404, {"accepted": False, "message": "找不到要隐藏的聊天。"}
+        self._flush_chat_state_save()
+        native_id = self._history_hide_identity(chat)
+        if native_id is None:
+            return 409, {"accepted": False, "message": "正在确认原始会话，请稍后隐藏。"}
+        try:
+            self._delete_chat_from_store(owner, native_id=native_id)
+        except (sqlite3.Error, OSError):
+            return 503, {"accepted": False, "message": "无法保存聊天隐藏状态，请稍后重试。"}
+        self._remove_history_chat_view_ui(chat)
+        return 200, {"accepted": True}
+
+    def _history_hide_identity(self, chat):
+        owner = str(chat["id"]).strip()
+        if self._clear_pending_for(owner):
+            return None
+        reference = self._native_history_reference(chat)
+        if reference:
+            return reference["identity"]
+        if (any(chat.get(field) for field in ("codex_thread_id", "kimi_session_id", "agy_session_id",
+                                              "codex_turn_active", "kimi_turn_active"))
+                or owner in self._agy_busy):
+            return None
+        if (is_codex_model(chat.get("model")) or is_kimi_model(chat.get("model"))) and any(
+                turn.get("request_status") == "pending" for turn in chat.get("turns", ())):
+            return None
+        return ""
+
+    def _native_delete_target_ui(self, owner):
+        chat = self._history_chat_for_id(owner)
+        reference = self._native_history_reference(chat or {})
+        if not reference:
+            return 409, {"accepted": False, "message": "尚未确认原始会话身份，请刷新历史。"}
+        provider = reference["provider"]
+        source = "笔记本" if reference["pair_id"] == "laptop" else "台式机"
+        cwd = chat.get("native_cwd") or chat.get("agy_workspace")
+        detail = (f"来源 {source}（{reference['pair_id']}）\n"
+                  f"提供方 {_PROVIDER_NAMES[provider]}\n"
+                  f"会话 {chat.get('title') or owner}\n"
+                  f"原始会话 ID {reference['session_id']}")
+        if cwd:
+            detail += f"\n工作目录 {cwd}"
+        detail += "\n\n永久删除原始会话及历史，无法撤销。"
+        if provider == "agy":
+            detail += "\n\n" + _AGY_MANUAL_DELETE
+        return 200, {"target": reference, "description": detail, "manual": provider == "agy"}
+
+    def _queue_native_delete_ui(self, owner, target, confirmed, *, local=False):
+        chat = self._history_chat_for_id(owner)
+        reference = self._native_history_reference(chat or {})
+        if confirmed is not True or not reference or target != reference:
+            return 409, {"accepted": False, "message": "原始会话身份未确认，请重新打开删除操作。"}
+        provider = reference["provider"]
+        if (not getattr(self, "_chat_store_enabled", False) or self._clear_pending_for(owner)
+                or owner in self._native_title_pending or owner in self._agy_busy
+                or owner in self._native_history_reserved
+                or chat.get("codex_turn_active") or chat.get("kimi_turn_active")
+                or any(turn.get("request_status") == "pending" for turn in chat.get("turns", ()))):
+            return 409, {"accepted": False, "message": "原始会话正在使用，请在当前回合结束后重试。"}
+        self._flush_chat_state_save()
+        stored = self.chat_store.load_chat_summary(owner)
+        if not stored or self._native_history_reference(stored) != reference:
+            return 409, {"accepted": False, "message": "原始会话已变更，请刷新后重试。"}
+        self._native_history_reserved.add(owner)
+        self._native_delete_pending.add(owner)
+        return 202, {"_native_delete": self._native_rename_executor.submit(
+            self._delete_native_session, owner, reference, stored,
+            self._kimi_client if provider == "kimi" else None, local,
+        )}
+
+    def _delete_native_session(self, owner, reference, stored, kimi_client, local):
+        status, message = 503, _DELETE_UNKNOWN
+        try:
+            if self._delete_or_verify_provider_session(reference, stored, kimi_client):
+                self.chat_store.delete_chat(owner, native_id=reference["identity"], native_deleted=True)
+                status, message = 200, "已确认删除原始会话。"
+        except NativeDeletionRejected as exc:
+            status, message = 409, str(exc)
+        except (RuntimeError, OSError, ValueError, sqlite3.Error) as exc:
+            _LOG.info("Native deletion could not be confirmed (%s)", type(exc).__name__)
+        return self._run_remote_ui_route(
+            lambda: self._finish_native_delete_ui(owner, reference, status, message, local))
+
+    def _delete_or_verify_provider_session(self, reference, chat, kimi_client):
+        pair, provider, sid = (reference[field] for field in ("pair_id", "provider", "session_id"))
+        cwd, account = chat.get("native_cwd"), chat.get("native_account")
+        if provider == "agy":
+            return verify_agy_session_absent(find_agy_executable(), pair, sid, reference["identity"], account, cwd)
+        if provider == "codex":
+            home = chat.get("codex_home") or codex_worker_workspace() / ".codex-home"
+            home = Path(home).resolve()
+            reader = CodexHistoryReader(home, not chat.get("codex_user_home"), pair, lambda: [])
+            try:
+                if NativeSessionIdentity(pair, provider, reader.storage_id, sid).chat_id != reference["identity"]:
+                    raise NativeDeletionRejected("Codex 原始存储已变更，请刷新后重试。")
+                return reader.delete_session(sid, cwd, account)
+            finally:
+                reader.client.close()
+        client = kimi_client or KimiServerClient()
+        try:
+            return KimiHistoryReader(client, pair, self._kimi_is_user_prompt).delete_session(
+                sid, cwd, chat.get("kimi_storage_id"), account)
+        finally:
+            if kimi_client is None:
+                client.close()
+
+    def _finish_native_delete_ui(self, owner, target, status, message, local):
+        try:
+            if status == 200:
+                chat = self._history_chat_for_id(owner)
+                if self._native_history_reference(chat or {}) != target:
+                    return 409, {"accepted": False, "message": "聊天已变更，请刷新核对原始会话。"}
+                agy_client = self._agy_clients.pop(owner, None)
+                if agy_client is not None:
+                    threading.Thread(target=agy_client.close, name="agy-delete-close", daemon=True).start()
+                self._remove_history_chat_view_ui(chat)
+        except (sqlite3.Error, OSError):
+            status, message = 503, _DELETE_UNKNOWN
+        finally:
+            self._native_delete_pending.discard(owner)
+            self._native_history_reserved.discard(owner)
+        if local:
+            self.SetStatusText(message)
+        return status, {"accepted": status == 200, "message": message}
+
+    def _remove_history_chat_view_ui(self, chat):
+        owner = str(chat["id"]).strip()
+        self._cleanup_chat_detail_pages(chat)
+        self._discard_deleted_chat_view(owner)
+        self._save_state()
+        self._refresh_history()
+        self._push_remote_history_changed(owner, removed=True)
+        self._render_answer_list()
+
     def _native_history_discoverers(self):
         for home, private in codex_history_homes():
             reader = CodexHistoryReader(home, private, self._read_pair_id(), self.chat_store.list_chat_summaries)
@@ -61,6 +228,7 @@ class NativeHistoryMixin:
         self._native_title_recheck = None
         self._native_rename_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native-rename")
         self._native_title_pending = {}
+        self._native_delete_pending = set()
         self._poll_native_history()
 
     def _poll_native_history(self) -> None:
@@ -312,7 +480,8 @@ class NativeHistoryMixin:
 
     def _publish_native_history_ui(self, owner, changed, turns, session) -> tuple[int, dict]:
         self._native_history_reserved.discard(owner)
-        if changed is None or getattr(self, "_closing", False):
+        if (changed is None or getattr(self, "_closing", False)
+                or self.chat_store.get_meta(f"deleted-chat:{owner}")):
             return 200, {}
         active = owner == self.active_chat_id
         target = self._current_chat_state if active else self._chat_summary_by_id(owner)

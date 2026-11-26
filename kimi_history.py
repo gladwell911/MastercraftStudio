@@ -8,7 +8,7 @@ import time
 from kimi_server_client import DEFAULT_KIMI_MODEL, KimiServerError, kimi_code_home
 from kimi_server_events import _provider_origin_timestamp
 from kimi_transcript import Transcript, final_message_identity
-from native_history import NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
+from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
 
 
 def kimi_history_storage() -> str:
@@ -49,6 +49,26 @@ class KimiHistoryReader:
         if row.get("id") == sid and row.get("title") == title:
             return title
         return None
+
+    def delete_session(self, sid, cwd, storage, account):
+        original = storage or os.path.normcase(str((Path.home() / ".kimi-code").resolve()))
+        if original != kimi_history_storage() or (account and account != kimi_history_account()):
+            raise NativeDeletionRejected("Kimi Code 原始存储或账号已变更，请切回后重试。")
+        self.client.start(timeout=10)
+        if self.client.runtime_version not in {"2.5.3", "2.6.3"}:
+            raise NativeDeletionRejected("当前 Kimi Code 版本没有经验证的原生删除接口。")
+        row = self.client.get_session(sid)
+        actual_cwd = (row.get("metadata") or {}).get("cwd")
+        if row.get("id") != sid or not actual_cwd or (cwd and Path(actual_cwd).resolve() != Path(cwd).resolve()):
+            raise NativeDeletionRejected("无法在原工作目录确认 Kimi Code 会话。")
+        if self.busy_status(row):
+            raise NativeDeletionRejected("Kimi Code 原始会话正在使用，请等本轮结束后重试。")
+        try:
+            self.client.delete_session(sid)
+        except KimiServerError as exc:
+            if exc.status_code and not exc.result_unknown:
+                raise NativeDeletionRejected("Kimi Code 拒绝删除原始会话，请检查原生会话状态。") from exc
+        return self.client.session_exists(sid) is False
 
     def list_sessions(self):
         client = self.client

@@ -356,7 +356,8 @@ class ChatRequestsMixin:
         return str(getattr(self, "active_chat_id", "") or getattr(self, "current_chat_id", "") or "").strip()
 
     def _clear_pending_for(self, owner: str) -> bool:
-        return str(owner or "").strip() in getattr(self, "_shortcut_clear_pending", {})
+        owner = str(owner or "").strip()
+        return owner in getattr(self, "_shortcut_clear_pending", {}) or owner in getattr(self, "_native_delete_pending", ())
 
     def _trigger_shortcut_clear(self) -> bool:
         if getattr(self, "_closing", False) or not self.new_chat_button.IsEnabled():
@@ -365,7 +366,7 @@ class ChatRequestsMixin:
         pending = getattr(self, "_shortcut_clear_pending", None)
         if pending is None:
             pending = self._shortcut_clear_pending = {}
-        if owner in pending:
+        if self._clear_pending_for(owner):
             return False
         target, turns, current = self._chat_target_for_request(owner)
         if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:
@@ -857,6 +858,8 @@ class ChatRequestsMixin:
         target_id = str(chat_id or "").strip()
         if not target_id:
             return "missing"
+        if target_id in getattr(self, "_native_delete_pending", ()):
+            return "unavailable"
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
         target, _, _ = self._chat_target_for_request(target_id)

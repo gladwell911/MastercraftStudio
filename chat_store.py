@@ -623,7 +623,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if not isinstance(chat, dict):
             return
         chat_id = str(chat.get("id") or "").strip()
-        if not chat_id:
+        if not chat_id or conn.execute("SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{chat_id}",)).fetchone():
             return
         created = self._float_or(chat.get("created_at"), 0.0)
         updated = self._float_or(chat.get("updated_at"), created)
@@ -671,7 +671,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
         native_id = snapshot.identity.chat_id
-        if conn.execute("SELECT 1 FROM meta WHERE key=?", (f"retired-native-history:{native_id}",)).fetchone():
+        if conn.execute("SELECT 1 FROM meta WHERE key IN (?,?,?)", (
+            f"retired-native-history:{native_id}", f"hidden-native-history:{native_id}",
+            f"deleted-native-history:{native_id}",
+        )).fetchone():
             return native_id, False
         row = conn.execute(
             "SELECT chat_id,account FROM native_history_owners WHERE native_chat_id=?", (native_id,)
@@ -949,11 +952,17 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             chat["execution_steps"] = self.load_execution_steps(normalized)
         return chat
 
-    def delete_chat(self, chat_id: str) -> None:
+    def delete_chat(self, chat_id: str, *, native_id: str = "", native_deleted: bool = False) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
         with self._connect() as conn:
+            if native_id:
+                disposition = "deleted" if native_deleted else "hidden"
+                conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                             (f"{disposition}-native-history:{native_id}",))
+                if native_deleted:
+                    conn.execute("DELETE FROM meta WHERE key=?", (f"hidden-native-history:{native_id}",))
             self._commit_chat_delete_conn(conn, normalized)
             conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
@@ -962,13 +971,16 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
             conn.execute("DELETE FROM chats WHERE id = ?", (normalized,))
 
-    def delete_chats(self, chat_ids: list[str]) -> None:
+    def delete_chats(self, chat_ids: list[str], *, native_ids: dict[str, str] | None = None) -> None:
         normalized_ids = [str(chat_id or "").strip() for chat_id in chat_ids or []]
         normalized_ids = [chat_id for chat_id in normalized_ids if chat_id]
         if not normalized_ids:
             return
         with self._connect() as conn:
             for chat_id in normalized_ids:
+                if native_id := (native_ids or {}).get(chat_id):
+                    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                                 (f"hidden-native-history:{native_id}",))
                 self._commit_chat_delete_conn(conn, chat_id)
             conn.executemany("DELETE FROM canonical_messages WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM canonical_turns WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])

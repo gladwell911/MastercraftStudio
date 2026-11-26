@@ -26,6 +26,11 @@ DEFAULT_CODEX_MODEL = "codex/main"
 class CodexRpcError(RuntimeError):
     """A JSON-RPC error response from the Codex App Server."""
 
+    def __init__(self, message, *, code=None, rpc_message=""):
+        super().__init__(message)
+        self.code = code
+        self.rpc_message = rpc_message
+
 
 CODEX_MODEL_CONFIGS = {
     "codex/gpt-5.4-medium": {
@@ -658,6 +663,7 @@ class CodexAppServerClient:
         self._pending_requests: dict[str | int, dict] = {}
         self.last_context_usage = None
         self._initialized = False
+        self.server_user_agent = ""
         self._initializing = False
         self._closed = False
         self._codex_home_dir = native_home
@@ -1043,7 +1049,7 @@ class CodexAppServerClient:
             return
         self._initializing = True
         try:
-            self._request_internal(
+            response = self._request_internal(
                 "initialize",
                 {
                     "clientInfo": {"name": "zgwd", "version": "1.0"},
@@ -1051,6 +1057,7 @@ class CodexAppServerClient:
                 },
                 timeout=DEFAULT_INITIALIZE_TIMEOUT,
             )
+            self.server_user_agent = str(response.get("userAgent") or "")
             self._send_json({"method": "initialized"})
             self._initialized = True
         finally:
@@ -1078,8 +1085,10 @@ class CodexAppServerClient:
         error = state.get("error")
         if error:
             message = str(error.get("message") or "unknown error")
-            error_type = CodexRpcError if isinstance(error.get("code"), int) else RuntimeError
-            raise error_type(f"Codex app-server request failed: {method}: {message}")
+            detail = f"Codex app-server request failed: {method}: {message}"
+            if isinstance(error.get("code"), int):
+                raise CodexRpcError(detail, code=error["code"], rpc_message=message)
+            raise RuntimeError(detail)
         result = state.get("result")
         return result if isinstance(result, dict) else {}
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, validate_workspace
-from native_history import NativeSessionIdentity, NativeSessionSnapshot
+from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot
 
 
 def _timestamp(value) -> float:
@@ -67,6 +67,42 @@ def read_agy_session(executable: str, session: NativeSessionSnapshot) -> None:
             session.chat_fields["agy_options"] = client.options
     except AgyError as exc:
         session.status = str(exc)
+
+
+def verify_agy_session_absent(executable, pair, session_id, identity, account, cwd):
+    if not executable:
+        raise NativeDeletionRejected("未找到来源电脑上的 AGY，无法刷新确认。")
+    cwd = validate_workspace(cwd)
+    with _reading_client(executable, cwd) as client:
+        actual = NativeSessionIdentity(pair, "agy", client.native_storage(), session_id)
+        if actual.chat_id != identity or client.native_account() != account:
+            raise NativeDeletionRejected("AGY 原始账号或存储已变更，请切回后刷新。")
+        capabilities = client.capabilities.get("sessionCapabilities") or {}
+        if ((client.initialization.get("agentInfo") or {}).get("version") != "1.5.17"
+                or client.capabilities.get("loadSession") is not True
+                or not isinstance(capabilities.get("list"), dict)):
+            raise NativeDeletionRejected("当前 AGY 版本无法读取原始会话清单。")
+        cursor = None
+        seen = set()
+        while True:
+            page = client.request("session/list", {"cursor": cursor} if cursor else {})
+            rows = page.get("sessions")
+            if not isinstance(rows, list) or any(
+                    not isinstance(row, dict) or not isinstance(row.get("sessionId"), str) for row in rows):
+                return False
+            if any(row["sessionId"] == session_id for row in rows):
+                raise NativeDeletionRejected("AGY 原始会话仍在清单中，请在原生选择器删除后刷新确认。")
+            cursor = page.get("nextCursor")
+            if cursor is None or cursor == "":
+                break
+            if not isinstance(cursor, str) or cursor in seen:
+                return False
+            seen.add(cursor)
+        try:
+            client.request("session/load", {"sessionId": session_id, "cwd": cwd, "mcpServers": []})
+        except AgyError as exc:
+            return exc.code == -32002 and exc.rpc_message == f"Session not found: {session_id}"
+        return False
 
 
 @contextmanager

@@ -2094,14 +2094,17 @@ class ChatHistoryMixin:
         i_pin = wx.NewIdRef()
         i_clr = wx.NewIdRef()
         i_ren = wx.NewIdRef()
-        m.Append(i_del, "删除聊天")
+        m.Append(i_del, "从历史隐藏聊天")
         m.Append(i_pin, "取消置顶" if c.get("pinned") else "置顶聊天")
-        m.Append(i_clr, "清空所有非置顶聊天")
+        m.Append(i_clr, "隐藏所有非置顶聊天")
         m.Append(i_ren, "重命名聊天")
         m.Bind(wx.EVT_MENU, lambda event: self._history_delete(event, chat_id=target_id), id=i_del)
         m.Bind(wx.EVT_MENU, lambda event: self._history_pin(event, chat_id=target_id), id=i_pin)
         m.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
         m.Bind(wx.EVT_MENU, lambda event: self._history_rename(event, chat_id=target_id), id=i_ren)
+        if self._native_history_reference(c):
+            native_delete = m.Append(wx.ID_ANY, "删除原始会话")
+            m.Bind(wx.EVT_MENU, lambda _event: self._history_delete_native(target_id), native_delete)
         if c.get("agy_session_id") and c.get("native_title"):
             native_title = m.Append(wx.ID_ANY, "查看 AGY 原生标题")
             m.Bind(wx.EVT_MENU, lambda _event: wx.MessageBox(
@@ -2131,26 +2134,16 @@ class ChatHistoryMixin:
                 return self._current_chat_state
         return self._find_archived_chat(normalized)
 
-    def _delete_chat_from_store(self, chat_id: str) -> None:
+    def _delete_chat_from_store(self, chat_id: str, *, native_id: str = "") -> None:
         store = getattr(self, "chat_store", None)
         if not (getattr(self, "_chat_store_enabled", False) and store is not None):
             return
         delete = getattr(store, "delete_chat", None)
         if callable(delete):
-            delete(chat_id)
-
-    def _delete_chats_from_store(self, chat_ids: list[str]) -> None:
-        store = getattr(self, "chat_store", None)
-        if not (getattr(self, "_chat_store_enabled", False) and store is not None):
-            return
-        delete_many = getattr(store, "delete_chats", None)
-        if callable(delete_many):
-            delete_many(chat_ids)
-            return
-        delete_one = getattr(store, "delete_chat", None)
-        if callable(delete_one):
-            for chat_id in chat_ids:
-                delete_one(chat_id)
+            if native_id:
+                delete(chat_id, native_id=native_id)
+            else:
+                delete(chat_id)
 
     def _handle_ctrl_history_navigation(self, event) -> bool:
         key = event.GetKeyCode()
@@ -2181,17 +2174,27 @@ class ChatHistoryMixin:
             self.SetStatusText("正在清空此聊天的上下文，请稍后删除")
             return
         self._flush_chat_state_save()
-        if not self._confirm("确定删除该聊天吗？") or self._clear_pending_for(cid):
+        if not self._confirm("确定从历史隐藏该聊天吗？原始会话将保留。") or self._clear_pending_for(cid):
             return
-        target_chat = self._history_chat_for_id(cid)
-        if target_chat:
-            self._cleanup_chat_detail_pages(target_chat)
-        self._delete_chat_from_store(str((target_chat or {}).get("id") or cid))
-        self._discard_deleted_chat_view(cid)
-        self._save_state()
-        self._refresh_history()
-        self._push_remote_history_changed(cid)
-        self._render_answer_list()
+        status, result = self._hide_history_chat_ui(cid)
+        if status != 200:
+            self.SetStatusText(result["message"])
+
+    def _history_delete_native(self, owner):
+        status, detail = self._native_delete_target_ui(owner)
+        if status != 200:
+            self.SetStatusText(detail["message"])
+            return
+        title = "刷新确认原始会话删除" if detail["manual"] else "删除原始会话"
+        dialog = wx.MessageDialog(self, detail["description"], title, wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING)
+        dialog.SetYesNoLabels("刷新确认" if detail["manual"] else "永久删除", "取消")
+        try:
+            confirmed = dialog.ShowModal() == wx.ID_YES
+        finally:
+            dialog.Destroy()
+        if confirmed:
+            status, result = self._queue_native_delete_ui(owner, detail["target"], True, local=True)
+            self.SetStatusText("正在确认原始会话删除" if status == 202 else result["message"])
 
     def _discard_deleted_chat_view(self, cid):
         normalized_cid = str(cid or "").strip()
@@ -2242,21 +2245,28 @@ class ChatHistoryMixin:
 
     def _history_clear_non_pinned(self, _):
         self._flush_chat_state_save()
-        if not self._confirm("确定清空所有非置顶聊天吗？"):
+        if not self._confirm("确定隐藏所有非置顶聊天吗？原始会话将保留。"):
             return
-        removed_ids = [str(c.get("id") or "").strip() for c in self.archived_chats
-                       if not c.get("pinned") and not self._clear_pending_for(c.get("id"))]
-        self.archived_chats = [c for c in self.archived_chats if str(c.get("id") or "").strip() not in removed_ids]
-        self._delete_chats_from_store(removed_ids)
-        if self.view_mode == "history" and str(self.view_history_id or "").strip() not in {
-            str(c.get("id") or "").strip() for c in self.archived_chats
-        }:
+        candidates = {str(c["id"]).strip(): self._history_hide_identity(c)
+                      for c in self.archived_chats if not c.get("pinned") and c.get("id")}
+        removed = {owner: identity for owner, identity in candidates.items() if identity is not None}
+        if getattr(self, "_chat_store_enabled", False):
+            try:
+                self.chat_store.delete_chats(list(removed), native_ids=removed)
+            except (OSError, sqlite3.Error):
+                self.SetStatusText("无法保存聊天隐藏状态，请稍后重试。")
+                return
+        self.archived_chats = [c for c in self.archived_chats if str(c.get("id") or "").strip() not in removed]
+        if str(self.view_history_id or "").strip() in removed:
             self.view_mode = "active"
             self.view_history_id = None
         self._save_state()
         self._refresh_history()
-        self._push_remote_history_changed()
+        for owner in removed:
+            self._push_remote_history_changed(owner, removed=True)
         self._render_answer_list()
+        if len(removed) != len(candidates):
+            self.SetStatusText("部分聊天仍在处理，请稍后隐藏。")
 
     def _history_rename(self, _, *, chat_id=None):
         c = self._history_chat_for_id(chat_id or self._selected_history_chat_id())
