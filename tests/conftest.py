@@ -42,6 +42,7 @@ def disable_system_hooks(monkeypatch):
     monkeypatch.setenv("AUTO_START_QUICK_TUNNEL", "0")
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "0")
     monkeypatch.setenv("DESKTOP_FILE_SERVICE_AUTOSTART", "0")
+    monkeypatch.setenv("MC_AGY_EXECUTABLE", str(Path(__file__).resolve().parent / "no-agy-runtime"))
     monkeypatch.delenv("REMOTE_CONTROL_TUNNEL_MODE", raising=False)
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
@@ -71,6 +72,7 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     # Still honor its persistence barrier before destroying wx/native state so
     # no daemon SQLite worker survives the fixture that owns its ChatStore.
     f._closing = True
+    f._stop_native_history_refresh()
     f._flush_execution_step_persists_sync()
     try:
         f.Hide()

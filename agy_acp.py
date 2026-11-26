@@ -138,6 +138,16 @@ class AgyAcpClient:
         user = os.path.expanduser("~")
         return hashlib.sha256(json.dumps([pair_id, user, account], ensure_ascii=False).encode()).hexdigest()
 
+    def native_account(self) -> str:
+        return self.native_owner("")
+
+    def native_storage(self) -> str:
+        metadata = self.initialization.get("_meta") or {}
+        storage = metadata.get("storageId") or ""
+        return hashlib.sha256(json.dumps(
+            [os.path.normcase(os.path.abspath(os.path.expanduser("~"))), storage], ensure_ascii=False,
+        ).encode()).hexdigest()
+
     def _send(self, payload: dict) -> None:
         with self._lock:
             try:
@@ -162,7 +172,11 @@ class AgyAcpClient:
         error = response.get("error")
         if isinstance(error, dict):
             message = str(error.get("message") or "").strip()
-            if error.get("code") == -32000 or any(term in message.lower() for term in ("auth_required", "authentication required", "not logged in", "sign in", "unauthenticated")):
+            if method in {"session/load", "session/resume", "session/prompt"} and any(
+                term in message.lower() for term in ("already in use", "session is busy", "session is locked")
+            ):
+                raise AgyError("AGY 原会话正在另一进程中使用，请等终端结束后重试")
+            if any(term in message.lower() for term in ("auth_required", "authentication required", "not logged in", "sign in", "unauthenticated")):
                 raise AgyError("请先在运行电脑上登录 AGY，再重新打开聊天")
             if error.get("code") == -32601:
                 raise AgyError(f"此电脑上的 AGY 不支持 {method}，请检查安装版本")

@@ -10,6 +10,7 @@ import sys
 import uuid
 import wx
 from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
+from native_history import NATIVE_CHAT_FIELDS
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
@@ -215,7 +216,7 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -542,6 +543,8 @@ class ChatHistoryMixin:
 
     def _load_state(self):
         if not self.state_path.exists():
+            if getattr(self, "_chat_store_enabled", False):
+                self.archived_chats = self.chat_store.list_chat_summaries()
             return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -597,7 +600,7 @@ class ChatHistoryMixin:
                 current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
                 merged = copy.deepcopy(summary)
                 merged.update(current)
-                for field in NATIVE_USAGE_FIELDS:
+                for field in (*NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS):
                     if field in summary:
                         merged[field] = copy.deepcopy(summary[field])
                 merged["id"] = self.active_chat_id
@@ -1535,7 +1538,7 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
@@ -1810,6 +1813,7 @@ class ChatHistoryMixin:
 
     def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True,
                            preserve_panel=False, sync_history_selection=True) -> bool:
+        self._request_native_history_refresh()
         selected_id = str(chat_id or "").strip()
         if not selected_id:
             return False
@@ -1832,6 +1836,8 @@ class ChatHistoryMixin:
             self.view_mode = "active"
             self.view_history_id = None
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
+            if native_status := self._current_chat_state.get("native_history_status"):
+                self.SetStatusText(native_status)
             if preserve_panel:
                 self._render_answer_list(preserve_panel=True)
             else:
@@ -1859,7 +1865,7 @@ class ChatHistoryMixin:
         if sync_history_selection and not self._select_history_row_if_present(selected_id):
             self._mark_history_list_dirty(selected_id)
         self._defer_chat_state_save()
-        self.SetStatusText("已切换到历史聊天")
+        self.SetStatusText(str(chat.get("native_history_status") or "已切换到历史聊天"))
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()

@@ -14,6 +14,7 @@ from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
 from context_usage import NATIVE_USAGE_FIELDS
 from execution_projection import canonical_answer_timestamp, should_show_execution_step
+from native_history import NativeSessionSnapshot
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -654,6 +655,129 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             ),
         )
 
+    def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
+        native_id = snapshot.identity.chat_id
+        row = conn.execute(
+            "SELECT chat_id,account FROM native_history_owners WHERE native_chat_id=?", (native_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row["chat_id"]), row["account"] == snapshot.account
+
+        # Existing provider-created application chats may predate discovery.
+        # The adapter supplies its complete legacy owner identity.
+        for field in snapshot.legacy_fields:
+            if not field.isidentifier():
+                raise ValueError("Invalid legacy history field")
+        if snapshot.legacy_fields:
+            predicates = " AND ".join(f"json_extract(metadata_json,'$.{field}')=?" for field in snapshot.legacy_fields)
+            legacy = conn.execute(
+                f"SELECT c.id FROM chats c LEFT JOIN native_history_owners n ON n.chat_id=c.id "
+                f"WHERE n.chat_id IS NULL AND c.model=? AND {predicates} "
+                "AND COALESCE(json_extract(metadata_json,'$.native_identity'),?)=? "
+                "ORDER BY c.created_at,c.id LIMIT 1",
+                (snapshot.model, *snapshot.legacy_fields.values(), native_id, native_id),
+            ).fetchone()
+            if legacy is not None:
+                return str(legacy["id"]), True
+        return native_id, True
+
+    def native_history_target(self, snapshot: NativeSessionSnapshot) -> tuple[str, float]:
+        with self._connect() as conn:
+            owner, matches = self._native_history_target(conn, snapshot)
+            if not matches or conn.execute(
+                "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",)
+            ).fetchone():
+                return "", 0
+            row = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (owner,)).fetchone()
+            metadata = self._metadata_from_row(row) if row else {}
+            return owner, self._float_or(metadata.get("native_replayed_at"), 0)
+
+    def merge_native_history(self, snapshot: NativeSessionSnapshot, *, expected_chat_id: str,
+                             expected_revision: int = 0) -> dict | None:
+        """Commit only an append-compatible replay to the chat that authorized it."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner, matches = self._native_history_target(conn, snapshot)
+            revision = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            if (int(revision[0]) if revision else 0) != expected_revision:
+                return None
+            if not matches or owner != expected_chat_id or conn.execute(
+                "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",)
+            ).fetchone():
+                return None
+            row = conn.execute(
+                "SELECT c.*,(SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (owner,),
+            ).fetchone()
+            previous = self._summary_from_row(row) if row else {}
+            if snapshot.updated_at and snapshot.updated_at < previous.get("native_updated_at", 0):
+                return None
+            conn.execute(
+                "INSERT OR IGNORE INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
+                (snapshot.identity.chat_id, owner, snapshot.account),
+            )
+            chat = previous.copy()
+            for field, value in snapshot.chat_fields.items():
+                chat.setdefault(field, value)
+            chat.update(
+                id=owner, model=snapshot.model,
+                native_identity=snapshot.identity.chat_id, native_account=snapshot.account,
+                native_cwd=previous.get("native_cwd") or snapshot.cwd,
+                native_title=snapshot.title or previous.get("native_title", ""),
+                native_updated_at=max(previous.get("native_updated_at", 0), snapshot.updated_at),
+                native_history_status=snapshot.status,
+            )
+            old_count = int(previous.get("turn_count", 0))
+            appended = 0
+            if snapshot.turns is not None and len(snapshot.turns) >= old_count:
+                stored = (self._json_dict(entry[0]) for entry in conn.execute(
+                    "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
+                ))
+                if all(self._native_turn_matches(old, new) for old, new in zip(stored, snapshot.turns)):
+                    chat["native_replayed_at"] = snapshot.updated_at
+                    appended = len(snapshot.turns) - old_count
+                elif old_count:
+                    chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
+            chat.setdefault("created_at", snapshot.updated_at)
+            if not previous or appended:
+                chat["updated_at"] = max(previous.get("updated_at", 0), snapshot.updated_at)
+            if not previous:
+                chat["title"] = snapshot.title or snapshot.cwd
+                chat["title_source"] = "native"
+                chat["title_updated_at"] = snapshot.updated_at
+                chat["title_revision"] = 1
+            elif (previous.get("title_source") == "native" and not previous.get("title_manual")
+                  and snapshot.title and snapshot.title != previous["title"]):
+                chat.update(title=snapshot.title, title_updated_at=snapshot.updated_at,
+                            title_revision=previous["title_revision"] + 1)
+            if chat == previous and not appended:
+                return None
+            self._upsert_chat_conn(conn, chat)
+            if appended:
+                incoming = [dict(turn, native_history=True) for turn in snapshot.turns[old_count:]]
+                conn.executemany(
+                    "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?)",
+                    [(owner, index, json.dumps(turn, ensure_ascii=False))
+                     for index, turn in enumerate(incoming, old_count)],
+                )
+                self._backfill_canonical_turns_conn(conn, owner, incoming, old_count)
+                for step in snapshot.execution_steps:
+                    if old_count <= step["turn_idx"] < len(snapshot.turns):
+                        self._append_execution_step_on_conn(conn, owner, step)
+            chat["turn_count"] = old_count + appended
+            return chat
+
+    @staticmethod
+    def _native_turn_matches(stored: dict, replayed: dict) -> bool:
+        for key in ("provider_user_message_id", "provider_message_id"):
+            if stored.get(key) and replayed.get(key) and stored[key] != replayed[key]:
+                return False
+        if stored.get("question", "") != replayed.get("question", ""):
+            return False
+        old_answer = str(stored.get("answer_md") or "")
+        new_answer = str(replayed.get("answer_md") or "")
+        return old_answer == new_answer or (bool(new_answer) and old_answer.startswith(new_answer))
+
     def list_chat_summaries(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -731,8 +855,15 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def _commit_chat_delete_conn(self, conn: sqlite3.Connection, chat_id: str) -> None:
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')", (f"deleted-chat:{chat_id}",))
-        if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
+        record = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if record is None:
             return
+        native = self._metadata_from_row(record)
+        if native.get("native_identity") and native.get("native_account"):
+            conn.execute(
+                "INSERT OR IGNORE INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
+                (native["native_identity"], chat_id, native["native_account"]),
+            )
         row = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
         revision = int(row[0]) + 1 if row else 1
         pairs = conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM notification_feed_devices UNION SELECT pair_id FROM v2_feed_state WHERE domain='__pair__'").fetchall()
