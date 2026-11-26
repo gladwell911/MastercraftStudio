@@ -51,6 +51,7 @@ class RemoteNatsTransport:
         on_reply_request: Callback | None = None,
         on_state: Callback | None = None,
         on_rename_chat: Callback | None = None,
+        on_history_mutation: Callback | None = None,
         on_update_settings: Callback | None = None,
         on_speed_options: Callback | None = None,
         on_set_speed: Callback | None = None,
@@ -90,6 +91,7 @@ class RemoteNatsTransport:
         self.on_reply_request = on_reply_request
         self.on_state = on_state
         self.on_rename_chat = on_rename_chat
+        self.on_history_mutation = on_history_mutation
         self.on_update_settings = on_update_settings
         self.on_speed_options = on_speed_options
         self.on_set_speed = on_set_speed
@@ -756,6 +758,8 @@ class RemoteNatsTransport:
             return self.on_common_commands_move_down(payload)
         if command_type == "rename_chat" and callable(self.on_rename_chat):
             return self.on_rename_chat(payload)
+        if command_type in {"hide_history_chat", "native_delete_target", "delete_native_session"} and callable(self.on_history_mutation):
+            return self.on_history_mutation(payload)
         if command_type == "update_settings" and callable(self.on_update_settings):
             return self.on_update_settings(payload)
         if command_type == "speed_options" and callable(self.on_speed_options):

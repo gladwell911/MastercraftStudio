@@ -184,6 +184,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         self.http_session_factory = http_session_factory
         self.ws_factory = ws_factory
         self.launch_command = list(launch_command) if launch_command else None
+        self.runtime_version = ""
         self.port = int(port) if port else None
         self._configured_token = str(token) if token is not None else None
         self.token = self._configured_token
@@ -262,6 +263,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
                         command = list(self.launch_command)
                     else:
                         command, runtime_version = _resolve_kimi_runtime()
+                        self.runtime_version = runtime_version
                         self._server_api = runtime_version == "2.6.3"
                     args = command + ["web", "--no-open", "--port", str(port)]
                     if self.process_factory is not None:
@@ -449,6 +451,10 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
     def set_session_title(self, session_id: str, title: str) -> None:
         sid = quote(session_id, safe="")
         self._request_data("POST", f"/api/v1/sessions/{sid}/profile", json_body={"title": title})
+
+    def delete_session(self, session_id: str) -> None:
+        sid = quote(session_id, safe="")
+        self._request_data("POST", f"/api/v1/sessions/{sid}:delete", json_body={})
 
     def list_messages(
         self,

@@ -9,6 +9,10 @@ class NativeTitleRejected(RuntimeError):
     """A provider or identity check explicitly rejected a title update."""
 
 
+class NativeDeletionRejected(RuntimeError):
+    """The selected provider session cannot be safely removed."""
+
+
 @dataclass(frozen=True)
 class NativeSessionIdentity:
     pair_id: str

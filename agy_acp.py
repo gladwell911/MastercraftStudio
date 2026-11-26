@@ -29,7 +29,10 @@ MAX_AGY_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
 
 class AgyError(RuntimeError):
-    pass
+    def __init__(self, message, *, code=None, rpc_message=""):
+        super().__init__(message)
+        self.code = code
+        self.rpc_message = rpc_message
 
 
 def read_prompt_attachments(capabilities: dict, attachments: list[dict]) -> list[dict]:
@@ -262,7 +265,8 @@ class AgyAcpClient:
             return AgyError("请先在运行电脑上登录 AGY，再重新打开聊天")
         if error.get("code") == -32601:
             return AgyError(f"此电脑上的 AGY 不支持 {method}，请检查安装版本")
-        return AgyError(f"AGY {method} 失败：{message or error.get('code')}")
+        return AgyError(f"AGY {method} 失败：{message or error.get('code')}",
+                        code=error.get("code"), rpc_message=message)
 
     def _read(self) -> None:
         try:

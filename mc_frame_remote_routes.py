@@ -332,7 +332,7 @@ class RemoteRoutesMixin:
         )
         return True
 
-    def _push_remote_history_changed(self, chat_id: str | None = None, *, title_update=None) -> None:
+    def _push_remote_history_changed(self, chat_id: str | None = None, *, title_update=None, removed=False) -> None:
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         payload = {
@@ -343,6 +343,8 @@ class RemoteRoutesMixin:
         }
         if title_update is not None:
             payload["title_update"] = title_update
+        if removed:
+            payload["removed"] = True
         self._broadcast_remote_event(payload)
 
     def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
@@ -1580,6 +1582,26 @@ class RemoteRoutesMixin:
             return future.result(timeout=20)
         except TimeoutError:
             return 503, {"accepted": False, "error": "原生改名尚未确认，请稍后刷新聊天。"}
+
+    def _remote_api_history_mutation(self, payload: dict) -> tuple[int, dict]:
+        owner = payload.get("chat_id")
+        if not isinstance(owner, str) or not owner.strip() or len(owner) > 512:
+            return 400, {"accepted": False, "message": "缺少要操作的聊天。"}
+        owner = owner.strip()
+        action = payload.get("type")
+        if action == "hide_history_chat":
+            return self._run_remote_ui_route(self._hide_history_chat_ui, owner)
+        if action == "native_delete_target":
+            return self._run_remote_ui_route(self._native_delete_target_ui, owner)
+        status, body = self._run_remote_ui_route(
+            lambda: self._queue_native_delete_ui(owner, payload.get("target"), payload.get("confirmed")))
+        future = body.pop("_native_delete", None)
+        if future is None:
+            return status, body
+        try:
+            return future.result(timeout=42)
+        except TimeoutError:
+            return 503, {"accepted": False, "message": "原始会话删除仍待确认，请稍后刷新。"}
 
     def _remote_api_rename_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()

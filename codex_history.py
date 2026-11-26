@@ -12,7 +12,7 @@ from codex_client import (
     _provider_origin_timestamp, _user_home, resolve_codex_launch_command,
 )
 from codex_worker_client import codex_worker_workspace
-from native_history import NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
+from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
 
 
 # The local App Server in 0.171.0 also writes threads with the vscode source.
@@ -101,6 +101,28 @@ class CodexHistoryReader:
         if thread.get("id") == thread_id and thread.get("name") == title:
             return title
         return None
+
+    def delete_session(self, thread_id, cwd, account):
+        try:
+            require_codex_history_owner(self.client, thread_id, cwd, account)
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise NativeDeletionRejected(str(exc)) from exc
+        version = self.client.server_user_agent.split(" ", 1)[0].partition("/")[2]
+        if version != "0.171.0":
+            raise NativeDeletionRejected("当前 Codex 版本没有经验证的原生删除接口。")
+        try:
+            if self.client.request("thread/delete", {"threadId": thread_id}) != {}:
+                return False
+        except CodexRpcError as exc:
+            raise NativeDeletionRejected("Codex 拒绝删除原始会话，请检查原生会话状态。") from exc
+        proof = CodexAppServerClient(native_home=self.home, use_native_config=True, timeout=8)
+        try:
+            proof.read_thread(thread_id, include_turns=False)
+        except CodexRpcError as exc:
+            return exc.code == -32600 and exc.rpc_message == f"thread not loaded: {thread_id}"
+        finally:
+            proof.close()
+        return False
 
     def _known_snapshots(self):
         known = {}
