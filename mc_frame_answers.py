@@ -5,6 +5,7 @@ import markdown
 import re
 import uuid
 import wx
+from agy_acp import AGY_MODEL_ID
 from claudecode_client import is_claudecode_model
 from codex_client import is_codex_model
 from kimi_server_client import is_kimi_model
@@ -888,7 +889,8 @@ class AnswersMixin:
         cur = str(target_turns[turn_idx].get("answer_md") or "")
         if cur == REQUESTING_TEXT:
             cur = ""
-        target_turns[turn_idx]["answer_md"] = cur + remove_emojis(delta)
+        turn = target_turns[turn_idx]
+        turn["answer_md"] = cur + (delta if turn.get("model") == AGY_MODEL_ID else remove_emojis(delta))
         target_turns[turn_idx]["request_last_attempt_at"] = bindings.app.time.time()
         resolved_chat_id = str(chat_id or (target_chat.get("id") if isinstance(target_chat, dict) else "") or self.active_chat_id or self.current_chat_id or "").strip()
         self._mark_chat_turns_dirty(resolved_chat_id, turn_idx)
@@ -939,6 +941,8 @@ class AnswersMixin:
                 elif is_claudecode_model(used_model):
                     clean = remove_emojis(full.strip())
                     target_turns[turn_idx]["answer_md"] = clean if clean else "未返回任何内容。"
+                elif used_model == AGY_MODEL_ID:
+                    target_turns[turn_idx]["answer_md"] = full if full.strip() else "未返回任何内容。"
                 else:
                     clean = remove_emojis(full.strip())
                     target_turns[turn_idx]["answer_md"] = clean if clean else "未返回任何内容。"
