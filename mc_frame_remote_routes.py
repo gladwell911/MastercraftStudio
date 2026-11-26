@@ -457,6 +457,9 @@ class RemoteRoutesMixin:
             "chat_id": chat_id,
             "title": title,
             "model": model,
+            **({"native_workspace": chat.get("native_cwd", ""),
+                "native_history_status": chat.get("native_history_status", "")}
+               if chat.get("native_identity") else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
                 "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
@@ -534,6 +537,9 @@ class RemoteRoutesMixin:
             "title_updated_at": float(chat.get("title_updated_at") or updated_at),
             "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
+            **({"native_workspace": chat.get("native_cwd", ""),
+                "native_history_status": chat.get("native_history_status", "")}
+               if chat.get("native_identity") else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
                 "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),

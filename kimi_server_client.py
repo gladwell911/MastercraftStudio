@@ -435,6 +435,15 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
                 return False
             raise
 
+    def list_sessions(self, *, before_id: str | None = None) -> dict[str, Any]:
+        params = {"page_size": 100}
+        if before_id:
+            params["before_id"] = before_id
+        return self._request_data("GET", "/api/v1/sessions", params=params)
+
+    def get_session(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", f"/api/v1/sessions/{session_id}", timeout=timeout)
+
     def list_messages(
         self,
         session_id: str,
