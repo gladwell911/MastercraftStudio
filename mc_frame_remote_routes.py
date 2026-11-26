@@ -1215,8 +1215,8 @@ class RemoteRoutesMixin:
         active = owner in {str(getattr(self, "active_chat_id", "") or ""),
                            str(getattr(self, "current_chat_id", "") or "")}
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
-        steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
-        turns = state.get("turns") if isinstance(state.get("turns"), list) else []
+        steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else ()
+        turns = state.get("turns") if isinstance(state.get("turns"), list) else ()
         with self._execution_step_persist_lock:
             dirty = bool(self._pending_execution_step_persists) or bool(self._execution_step_persist_worker_running)
         dirty = dirty or bool(getattr(self, "_codex_ui_batch_depth", 0)) or bool(self._kimi_execution_write_counts.get(owner))
