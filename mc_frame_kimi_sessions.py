@@ -866,9 +866,12 @@ class KimiSessionsMixin:
             terminal_resume = turn.get("question_origin") == "terminal"
             if terminal_resume:
                 auth = client.get_auth(timeout=5)
-                provider = auth.get("managed_provider") if isinstance(auth, dict) else None
-                if isinstance(provider, dict) and provider.get("status") in {"unauthenticated", "expired", "revoked"}:
-                    raise RuntimeError("Kimi Code 尚未登录或登录已失效。请在官方 Kimi CLI 登录后重试。")
+                provider = auth.get("managed_provider")
+                ready = auth.get("models_ready")
+                managed_unavailable = (isinstance(provider, dict)
+                                       and provider.get("status") in {"unauthenticated", "expired", "revoked"})
+                if ready is False or (ready is not True and (managed_unavailable or auth.get("providers_count") == 0)):
+                    raise RuntimeError("Kimi Code 登录或模型配置不可用。请在官方 Kimi CLI 登录或配置提供方后重试。")
             if discard_stale_submission():
                 return
             if session_id:

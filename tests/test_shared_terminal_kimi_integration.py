@@ -82,12 +82,16 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
 
 
 
-@pytest.mark.parametrize("must_log_in", [True, False])
-def test_terminal_kimi_reports_login_or_missing_session_without_forking_history(frame, monkeypatch, wait_for_wx, must_log_in):
+@pytest.mark.parametrize(("auth", "message"), [
+    ({"managed_provider": {"status": "expired"}}, "官方 Kimi CLI 登录"),
+    ({"managed_provider": None, "models_ready": False, "providers_count": 0}, "官方 Kimi CLI 登录"),
+    ({"managed_provider": None, "models_ready": True, "providers_count": 1}, "无法打开原生会话"),
+])
+def test_terminal_kimi_reports_login_or_missing_session_without_forking_history(
+    frame, monkeypatch, wait_for_wx, auth, message,
+):
     fake = FakeKimiServerClient(on_message=frame._on_kimi_client_message)
-    fake.get_auth = lambda *, timeout: {
-        "managed_provider": {"status": "expired" if must_log_in else "authenticated"},
-    }
+    fake.get_auth = lambda *, timeout: auth
     owner = "archived-kimi"
     session = "original-native-id"
     chat = {"id": owner, "model": main.DEFAULT_KIMI_MODEL, "kimi_session_id": session}
@@ -104,6 +108,6 @@ def test_terminal_kimi_reports_login_or_missing_session_without_forking_history(
         return dispatch_terminal(frame, "watch", scope)[1]
 
     wait_for_wx(lambda: outcome().get("state") == "failed", "actionable Kimi failure")
-    assert ("官方 Kimi CLI 登录" if must_log_in else "无法打开原生会话") in outcome()["message"]
+    assert message in outcome()["message"]
     assert fake.created_sessions == [] and fake.submitted == []
     assert frame._find_archived_chat(owner)["kimi_session_id"] == session
