@@ -191,7 +191,7 @@ def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
 
 
 def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
-    loopback_kimi_home, frame, monkeypatch, wait_for_wx, gated_reply,
+    loopback_kimi_home, frame, wx_app, monkeypatch, wait_for_wx, gated_reply,
 ):
     workspace, requests = loopback_kimi_home
     seed = subprocess.run([os.environ["KIMI_BIN"], "-p", "QA_SHARED_SEED"], cwd=workspace,
@@ -285,14 +285,23 @@ def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
                 return next((row for row in page["rows"] if row.get("kind") == "final"
                              and row.get("turn_index") == 1), None)
 
+            # wx timers which persist the accepted turn run in the native main loop.
+            def check_durable(_event):
+                if remote_final() is not None:
+                    wx_app.ExitMainLoop()
+
+            poll = wx.Timer(frame)
+            frame.Bind(wx.EVT_TIMER, check_durable, poll)
+            poll.Start(30)
+            timeout = wx.CallLater(5000, wx_app.ExitMainLoop)
             try:
-                wait_for_wx(remote_final, "durable execution includes final answer")
-            except AssertionError as exc:
-                raise AssertionError((frame._chat_state_flush_dirty, frame._chat_state_flush_scheduled,
-                    frame._codex_background_flush_dirty, frame._codex_background_flush_scheduled,
-                    frame._chat_turn_dirty_from, frame._kimi_execution_write_counts,
-                    frame._close_started, remote_command(reconnect, "execution_page_v3")["rows"])) from exc
+                wx_app.MainLoop()
+            finally:
+                timeout.Stop()
+                poll.Stop()
+                frame.Unbind(wx.EVT_TIMER, source=poll)
             answer = remote_final()
+            assert answer is not None, "durable execution includes final answer"
             text = answer["answer_text"]
             cursor = answer["answer_text_continuation"]
             assert cursor
