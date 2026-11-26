@@ -953,7 +953,7 @@ class ChatRequestsMixin:
     def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *,
                                          client_send_id: str = "", attachments=None,
                                          attachment_scope: tuple = (), active: bool = False,
-                                         prepared_attachments=None) -> tuple[bool, str]:
+                                         prepared_attachments=None, source: str = "rc") -> tuple[bool, str]:
         """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
         if self._clear_pending_for(owner_id):
@@ -984,7 +984,7 @@ class ChatRequestsMixin:
             "answer_md": REQUESTING_TEXT,
             "model": resolved_model,
             "created_at": bindings.app.time.time(),
-            "question_origin": "rc",
+            "question_origin": source,
             "client_send_id": client_send_id,
         }
         if attachments:
