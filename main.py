@@ -457,6 +457,8 @@ def model_display_name(model_id: str) -> str:
         return "codex"
     if model_id.startswith("claudecode/"):
         return "claudeCode"
+    if model_id == AGY_MODEL_ID:
+        return "AGY"
     if model_id.startswith("kimi/"):
         return "Kimi Code"
     if model_id.startswith("openclaw/"):
@@ -476,6 +478,8 @@ def model_id_from_display_name(display_name: str) -> str:
         return "codex/gpt-5.3-codex-spark-high"
     if display_name == "claudeCode":
         return "claudecode/default"
+    if display_name.lower() == "agy":
+        return AGY_MODEL_ID
     if display_name == "Kimi Code":
         return "kimi/main"
     if display_name == "openclaw":
@@ -545,6 +549,8 @@ from mc_frame_presentation import (
 from mc_frame_remote_proxy import CloudflaredOriginProxy
 from mc_frame_remote_routes import RemoteRoutesMixin
 from mc_frame_remote_runtime import RemoteRuntimeMixin
+from agy_acp import AGY_MODEL_ID
+from mc_frame_agy import AgySessionsMixin
 from mc_frame_requests import ChatRequestsMixin
 from mc_frame_voice import VoiceInputMixin
 
@@ -565,6 +571,7 @@ class ChatFrame(
     KimiSessionsMixin,
     KimiEventsMixin,
     ChatRequestsMixin,
+    AgySessionsMixin,
     ChatNavigationMixin,
     wx.Frame,
 ):
@@ -575,6 +582,9 @@ class ChatFrame(
 
         self.app_data_dir = resolve_app_data_dir()
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self._agy_clients = {}
+        self._agy_busy = {}
+        self._agy_new_chat_pending = False
         self.state_path = self.app_data_dir / APP_STATE_FILE
         self.detail_pages_dir = self.app_data_dir / "detail_pages"
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
@@ -1481,7 +1491,7 @@ class ChatFrame(
         self._close_write_started = False
         self._close_write_error = None
         close_tasks = [client.close for client in clients]
-        close_tasks.extend((self.notes_sync.close, self._stop_remote_servers,
+        close_tasks.extend((self.notes_sync.close, self._close_agy_clients, self._stop_remote_servers,
                             self._global_ctrl_hook.stop, self._realtime_call.shutdown,
                             self._stop_openclaw_sync))
         service = getattr(self, "file_service", None)

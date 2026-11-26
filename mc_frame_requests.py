@@ -3,6 +3,7 @@
 import copy
 import uuid
 import wx
+from agy_acp import AGY_MODEL_ID, AgyError
 from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from chat_store import ChatStore
 from claudecode_client import DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -365,6 +366,9 @@ class ChatRequestsMixin:
         if owner in pending:
             return False
         target, turns, current = self._chat_target_for_request(owner)
+        if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:
+            self.SetStatusText("请新建 AGY 聊天以开始新的上下文")
+            return False
         store = getattr(self, "chat_store", None)
         if (not isinstance(target, dict) or store is None
                 or not callable(getattr(store, "begin_clear_operation", None))):
@@ -853,6 +857,9 @@ class ChatRequestsMixin:
             return "missing"
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
+        target, _, _ = self._chat_target_for_request(target_id)
+        if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:
+            return "unavailable"
         if target_id in current_ids:
             try:
                 cleared = self._clear_context_and_start_new_chat(
@@ -973,6 +980,11 @@ class ChatRequestsMixin:
                 # summary-only metadata with this owner's complete durable state.
                 chat.clear()
                 chat.update(loaded)
+        if resolved_model == AGY_MODEL_ID:
+            try:
+                self._validate_agy_submission(chat)
+            except AgyError as exc:
+                return False, str(exc)
         turns = self.active_session_turns if active else chat.get("turns")
         if not isinstance(turns, list):
             turns = []
@@ -999,6 +1011,8 @@ class ChatRequestsMixin:
                 started = self._start_codex_worker_for_turn(owner_id, turn_idx, text, resolved_model)
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(owner_id, turn_idx, text, resolved_model)
+            elif resolved_model == AGY_MODEL_ID:
+                started = self._start_agy_worker_for_turn(owner_id, turn_idx, text, resolved_model)
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     owner_id, turn_idx, text, str(chat.get("claudecode_session_id") or ""), resolved_model
@@ -1096,7 +1110,16 @@ class ChatRequestsMixin:
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
+        if self._current_chat_state.get("agy_workspace") and not model:
+            model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
+        if resolved_model == AGY_MODEL_ID and requested_attachments:
+            return False, "此版本的 AGY 聊天暂不支持附件"
+        if resolved_model == AGY_MODEL_ID:
+            try:
+                self._validate_agy_submission(self._current_chat_state)
+            except AgyError as exc:
+                return False, str(exc)
         if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:
             return self._preflight_claude_attachment_draft(
                 raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
@@ -1440,6 +1463,10 @@ class ChatRequestsMixin:
                 started = self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
+            elif resolved_model == AGY_MODEL_ID:
+                started = self._start_agy_worker_for_turn(
+                    chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model
+                )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     chat_id or self.active_chat_id or self.current_chat_id or "",
@@ -1654,9 +1681,11 @@ class ChatRequestsMixin:
         self._render_answer_list()
         self.SetStatusText(f"已载入项目：{folder_name}")
 
-    def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False):
+    def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False, *, agy_workspace=None):
         if getattr(self, "_closing", False):
             return False
+        if agy_workspace is None and self._resolve_current_model() == AGY_MODEL_ID:
+            return self._choose_agy_workspace(title, title_manual)
         manual_title = str(title or "").strip()
         manual = bool(title_manual and manual_title)
         store = getattr(self, "chat_store", None)
@@ -1754,7 +1783,10 @@ class ChatRequestsMixin:
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
-        model = bindings.app.normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
+        model = AGY_MODEL_ID if agy_workspace else bindings.app.normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
+        if agy_workspace:
+            self._current_chat_state.update(agy_workspace)
+            self.model_combo.SetValue(bindings.app.model_display_name(model))
         self.selected_model = model
         self._current_chat_state["model"] = model
         self._write_active_codex_session_state_to_chat(self._current_chat_state)

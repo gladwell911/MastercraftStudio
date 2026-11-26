@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agy_acp import AGY_MODEL_ID, AGY_WORKSPACE_CAPABILITY
+
 import hashlib
 import os
 import time
@@ -45,6 +47,7 @@ class RemoteNatsTransport:
         jetstream: Any | None = None,
         on_message: Callback | None = None,
         on_new_chat: Callback | None = None,
+        on_agy_configure: Callback | None = None,
         on_reply_request: Callback | None = None,
         on_state: Callback | None = None,
         on_rename_chat: Callback | None = None,
@@ -83,6 +86,7 @@ class RemoteNatsTransport:
         self._loop = event_loop
         self.on_message = on_message
         self.on_new_chat = on_new_chat
+        self.on_agy_configure = on_agy_configure
         self.on_reply_request = on_reply_request
         self.on_state = on_state
         self.on_rename_chat = on_rename_chat
@@ -114,6 +118,7 @@ class RemoteNatsTransport:
         self.protocol_version = 1
         self.connection_epoch = uuid.uuid4().hex
         self._sessions: dict[tuple[str, str], tuple[int, str]] = {}
+        self._agy_workspace_sessions: set[tuple[str, str]] = set()
         self._outbox_locks = {lane: asyncio.Lock() for lane in ("notification", "other")}
         self._outbox_tasks: dict[str, asyncio.Task] = {}
         self._outbox_maintenance_after = 0.0
@@ -291,6 +296,12 @@ class RemoteNatsTransport:
                     capabilities.append(NOTIFY_FEED_CAPABILITY)
                 if self.chat_attachment_support and negotiated_version == 2 and reply_subject:
                     capabilities.append("chat-attachments-v1")
+                client_capabilities = payload.get("capabilities", body_payload.get("capabilities", []))
+                self._agy_workspace_sessions.discard(session_key)
+                if (self.on_agy_configure and negotiated_version == 2 and reply_subject
+                        and isinstance(client_capabilities, list) and AGY_WORKSPACE_CAPABILITY in client_capabilities):
+                    self._agy_workspace_sessions.add(session_key)
+                    capabilities.append(AGY_WORKSPACE_CAPABILITY)
                 event = build_response_event(request_id=request_id, status=200, body={
                     "accepted": True, "protocol_version": negotiated_version,
                     "capabilities": capabilities,
@@ -323,6 +334,12 @@ class RemoteNatsTransport:
                         (self.subjects.pair_id, device_id)
                         if self.chat_attachment_support and reply_subject and negotiated_version == 2 else None
                     )
+                command_type = str(payload.get("type") or "").lower()
+                agy_capable = session_key in self._agy_workspace_sessions
+                if command_type in {"agy_configure", "new_chat"} and not agy_capable:
+                    requested_model = str(payload.get("model") or body_payload.get("model") or "").strip().lower()
+                    if command_type == "agy_configure" or requested_model in {AGY_MODEL_ID, "agy"}:
+                        raise ValueError("AGY_WORKSPACE_CAPABILITY_REQUIRED")
                 route = asyncio.to_thread(self._invoke_route_command, payload)
                 if payload.get("type") in {"history_list", "history_read", "execution_page_v3", "content_page"}:
                     try:
@@ -331,6 +348,9 @@ class RemoteNatsTransport:
                         status, body = 503, {"accepted": False, "error": "READ_DEADLINE_EXCEEDED"}
                 else:
                     status, body = await route
+                if command_type == "model_list" and not agy_capable and isinstance(body.get("models"), list):
+                    body = {**body, "models": [item for item in body["models"]
+                            if not isinstance(item, dict) or item.get("id") != AGY_MODEL_ID]}
             event = build_response_event(
                 request_id=request_id,
                 status=status,
@@ -713,6 +733,9 @@ class RemoteNatsTransport:
             return self.on_reply_request(payload)
         if command_type == "state" and callable(self.on_state):
             return self.on_state(payload)
+        if command_type == "agy_configure" and callable(self.on_agy_configure):
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            return self.on_agy_configure({**body, **payload})
         if command_type == "model_list" and callable(self.on_model_list):
             return self.on_model_list()
         if command_type == "common_commands_list" and callable(self.on_common_commands_list):

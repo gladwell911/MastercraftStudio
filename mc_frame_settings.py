@@ -85,6 +85,7 @@ MODEL_IDS = [
     "codex/gpt-5.3-codex-spark-high",
     "claudecode/default",
     "kimi/main",
+    "agy/main",
     "openclaw/main",
     "stepfun/step-3.5-flash",
     "meta-llama/llama-3.1-8b-instruct",

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import uuid
 import wx
+from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
@@ -214,7 +215,7 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        for field in (*NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -1102,6 +1103,13 @@ class ChatHistoryMixin:
         if not self._is_default_chat_title(str(chat.get("title") or "")):
             return
         expected_title_revision = int(chat.get("title_revision") or 0)
+        if chat.get("model") == AGY_MODEL_ID:
+            title = self._compact_first_question_title(normalized_question, 18)
+            if title:
+                self._apply_generated_first_question_title(
+                    resolved_chat_id, normalized_question, title, expected_title_revision
+                )
+            return
         command_title = self._cd_command_title(normalized_question)
         if command_title:
             self._apply_generated_first_question_title(
@@ -1527,7 +1535,7 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        for field in (*NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])

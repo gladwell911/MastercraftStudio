@@ -6,6 +6,7 @@ import hashlib
 import json
 import uuid
 import wx
+from agy_acp import AGY_MODEL_ID, AgyError
 from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from codex_client import (
     DEFAULT_CODEX_MODEL,
@@ -393,7 +394,7 @@ class RemoteRoutesMixin:
         cached = cache.get(cache_key)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
             return dict(cached[1])
-        answer = answer_md
+        answer = "" if model == AGY_MODEL_ID and answer_md == REQUESTING_TEXT else answer_md
         payload = {
             "question": question,
             "client_send_id": str(turn.get("client_send_id") or ""),
@@ -456,6 +457,7 @@ class RemoteRoutesMixin:
             "chat_id": chat_id,
             "title": title,
             "model": model,
+            **({"agy_workspace": chat.get("agy_workspace", "")} if model == AGY_MODEL_ID else {}),
             "created_at": created_at,
             "updated_at": updated_at,
             "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
@@ -530,6 +532,7 @@ class RemoteRoutesMixin:
             "title_updated_at": float(chat.get("title_updated_at") or updated_at),
             "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
+            **({"agy_workspace": chat.get("agy_workspace", "")} if model == AGY_MODEL_ID else {}),
             "running": False,
             "request_kind": request_kind,
             "current": bool(chat_id) and chat_id == current_id,
@@ -763,7 +766,7 @@ class RemoteRoutesMixin:
         if requested_chat_id and requested_chat_id not in current_ids:
             archived_target = self._find_archived_chat(requested_chat_id)
             is_new_chat = archived_target is None
-        preview_chat = self._current_chat_state if requested_chat_id in current_ids else archived_target
+        preview_chat = self._current_chat_state if not requested_chat_id or requested_chat_id in current_ids else archived_target
         if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             current_model = self._resolve_current_model()
         else:
@@ -777,6 +780,10 @@ class RemoteRoutesMixin:
         if model_error:
             error = "missing_explicit_model" if model_error == "missing_explicit_model" else "invalid_explicit_model"
             return 400, {"accepted": False, "error": error, "chat_id": requested_chat_id or str(self.active_chat_id or self.current_chat_id or "").strip()}
+        if model == AGY_MODEL_ID and (not isinstance(preview_chat, dict) or not preview_chat.get("agy_workspace")):
+            return 400, {"accepted": False, "message": "请先为 AGY 新建聊天并选择项目目录"}
+        if isinstance(preview_chat, dict) and preview_chat.get("agy_workspace") and model != AGY_MODEL_ID:
+            return 400, {"accepted": False, "message": "请为其他提供方新建聊天"}
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
                 if archived_target is not None:
@@ -885,11 +892,42 @@ class RemoteRoutesMixin:
             return chat_model or STARTUP_DEFAULT_MODEL_ID, ""
         return bindings.app.normalize_model_id(current_model or STARTUP_DEFAULT_MODEL_ID), ""
 
-    def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
-        chat = self._start_remote_new_chat(payload)
+    def _remote_api_new_chat(self, payload: dict) -> tuple[int, dict]:
+        model = bindings.app.normalize_model_id(payload.get("model"), default="")
+        if model != AGY_MODEL_ID:
+            return self._run_remote_ui_route(self._remote_api_new_chat_ui, payload)
+        try:
+            raw_cwd = payload.get("agy_workspace")
+            client, fields = self._prepare_agy_workspace(raw_cwd if isinstance(raw_cwd, str) else "")
+        except AgyError as exc:
+            return 400, {"accepted": False, "message": str(exc)}
+        committed = False
+        try:
+            status, body = self._run_remote_ui_route(
+                lambda data: self._remote_api_new_chat_ui(data, agy_workspace=(client, fields)), payload
+            )
+            committed = status == 200
+            return status, body
+        finally:
+            if not committed:
+                client.close()
+
+    def _remote_api_new_chat_ui(self, payload: dict, *, agy_workspace=None) -> tuple[int, dict]:
+        model = bindings.app.normalize_model_id(payload.get("model"), default="")
+        if getattr(self, "_closing", False):
+            return 503, {"accepted": False, "message": "电脑端正在关闭"}
+        if model == AGY_MODEL_ID and agy_workspace is None:
+            return 400, {"accepted": False, "message": "请选择运行电脑上的 AGY 项目目录"}
+        if not model and self._resolve_current_model() == AGY_MODEL_ID:
+            payload = {**payload, "model": STARTUP_DEFAULT_MODEL_ID}
+        fields = agy_workspace[1] if agy_workspace else None
+        chat = self._start_remote_new_chat(payload, agy_fields=fields)
+        if agy_workspace:
+            self._remember_agy_workspace(agy_workspace[0], chat["chat_id"], fields["agy_workspace"])
+            chat.update(agy_workspace=fields["agy_workspace"], agy_options=fields["agy_options"])
         return 200, {"accepted": True, **chat}
 
-    def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
+    def _start_remote_new_chat(self, payload: dict | None = None, *, agy_fields=None) -> dict:
         navigation_deferred = (
             getattr(self, "_chat_navigation_answer_rows_deferred", False)
             or getattr(self, "_chat_navigation_history_selection_deferred", False)
@@ -938,6 +976,8 @@ class RemoteRoutesMixin:
             model = bindings.app.normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
             self.selected_model = model
             self._current_chat_state["model"] = model
+            if agy_fields:
+                self._current_chat_state.update(agy_fields)
             self._write_active_codex_session_state_to_chat(self._current_chat_state)
             self._write_active_kimi_session_state_to_chat(self._current_chat_state)
             if is_codex_model(model):
@@ -992,7 +1032,8 @@ class RemoteRoutesMixin:
         return 200, {
             "accepted": True,
             "models": [
-                {"id": model_id, "label": bindings.app.model_display_name(model_id)}
+                {"id": model_id, "label": bindings.app.model_display_name(model_id),
+                 **({"agy_workspace": self._agy_workspace_descriptor()} if model_id == AGY_MODEL_ID else {})}
                 for model_id in VISIBLE_MODEL_IDS
             ],
         }
@@ -1343,8 +1384,13 @@ class RemoteRoutesMixin:
                     include_execution_steps=include_execution_steps,
                 ) or {}
                 chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
-        status = "waiting_user_input" if self.active_codex_pending_request else "idle"
-        request_kind = "user_input" if self.active_codex_pending_request else ""
+        if chat.get("model") == AGY_MODEL_ID:
+            running = chat_id in self._agy_busy
+            chat["active_turn"] = chat["running"] = running
+            status, request_kind = ("running" if running else "idle"), ""
+        else:
+            status = "waiting_user_input" if self.active_codex_pending_request else "idle"
+            request_kind = "user_input" if self.active_codex_pending_request else ""
         chat.update(
             {
                 "chat_id": chat.get("chat_id") or chat_id,
