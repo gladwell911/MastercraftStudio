@@ -551,6 +551,7 @@ from mc_frame_remote_routes import RemoteRoutesMixin
 from mc_frame_remote_runtime import RemoteRuntimeMixin
 from agy_acp import AGY_MODEL_ID
 from mc_frame_agy import AgySessionsMixin
+from mc_frame_native_history import NativeHistoryMixin
 from mc_frame_requests import ChatRequestsMixin
 from mc_frame_voice import VoiceInputMixin
 
@@ -571,6 +572,7 @@ class ChatFrame(
     KimiSessionsMixin,
     KimiEventsMixin,
     ChatRequestsMixin,
+    NativeHistoryMixin,
     AgySessionsMixin,
     ChatNavigationMixin,
     wx.Frame,
@@ -585,6 +587,8 @@ class ChatFrame(
         self._agy_clients = {}
         self._agy_busy = {}
         self._agy_new_chat_pending = False
+        self._agy_remote_creations = 0
+        self._agy_creation_lock = threading.Lock()
         self.state_path = self.app_data_dir / APP_STATE_FILE
         self.detail_pages_dir = self.app_data_dir / "detail_pages"
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
@@ -908,6 +912,7 @@ class ChatFrame(
         self._set_input_hint_idle()
         if self._kimi_pending_owners() and self._kimi_client is None:
             self._recover_kimi_pending_owners()
+        self._start_native_history_refresh()
         wx_call_after_if_alive(self.input_edit.SetFocus)
 
     def _build_ui(self):
@@ -1444,6 +1449,7 @@ class ChatFrame(
                 if transport is not None and int(getattr(transport, "protocol_version", 1) or 1) >= 2 else "")
             self._close_pair_id = self._read_pair_id()
             self._closing = True
+            self._stop_native_history_refresh()
             self.Hide()
             self._close_hidden_at = time.monotonic()
             self._cancel_chat_navigation_focus()

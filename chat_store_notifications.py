@@ -435,7 +435,7 @@ class ChatStoreNotificationsMixin:
         if chat_id is not None:
             sql = sql.replace("WHERE NOT EXISTS", "WHERE a.chat_id=? AND NOT EXISTS", 1)
             args = (chat_id, pair_id)
-        candidates = conn.execute(sql + " AND json_extract(t.payload_json,'$.request_status')='done' AND length(trim(json_extract(t.payload_json,'$.answer_md')))>0 AND length(trim(c.title))>0 LIMIT 100", args).fetchall()
+        candidates = conn.execute(sql + " AND COALESCE(json_extract(t.payload_json,'$.native_history'),0)=0 AND json_extract(t.payload_json,'$.request_status')='done' AND length(trim(json_extract(t.payload_json,'$.answer_md')))>0 AND length(trim(c.title))>0 LIMIT 100", args).fetchall()
         for row in candidates:
             turn = self._json_dict(row["payload_json"])
             if turn.get("request_status") == "done" and str(turn.get("answer_md") or "").strip():

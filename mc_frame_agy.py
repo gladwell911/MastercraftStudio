@@ -8,6 +8,9 @@ import wx
 from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, find_agy_executable, selected_options, validate_workspace
 
 
+from native_history import NativeSessionIdentity
+
+
 class AgySessionsMixin:
     def _agy_workspace_preference_key(self) -> str:
         return f"agy-workspace:{self._read_pair_id()}"
@@ -30,18 +33,28 @@ class AgySessionsMixin:
             "agy_workspace": cwd,
             "agy_session_id": client.session_id,
             "agy_native_owner": client.native_owner(self._read_pair_id()),
+            "native_identity": self._agy_native_identity(client, client.session_id),
+            "native_account": client.native_account(),
+            "native_cwd": cwd,
             "agy_options": client.options,
             "agy_config": {},
         }
 
-    def _open_agy_client(self, cwd: str, *, session_id: str = "", owner: str = "") -> AgyAcpClient:
+    def _agy_native_identity(self, client: AgyAcpClient, session_id: str) -> str:
+        return NativeSessionIdentity(self._read_pair_id(), "agy", client.native_storage(), session_id).chat_id
+
+    def _open_agy_client(self, cwd: str, *, session_id: str = "", owner: str = "",
+                         native_identity: str = "") -> AgyAcpClient:
         executable = find_agy_executable()
         if not executable:
             raise AgyError("此电脑尚未安装 AGY，请安装或设置 MC_AGY_EXECUTABLE")
         client = AgyAcpClient(executable, cwd)
         try:
             client.initialize()
-            if session_id and owner != client.native_owner(self._read_pair_id()):
+            if session_id and (
+                owner != client.native_owner(self._read_pair_id())
+                or (native_identity and self._agy_native_identity(client, session_id) != native_identity)
+            ):
                 raise AgyError("此聊天属于原运行电脑或 AGY 登录账号，请恢复原来的账号")
             client.open_session(session_id)
             return client
@@ -142,6 +155,8 @@ class AgySessionsMixin:
 
     def _validate_agy_submission(self, chat: dict) -> str:
         chat_id = str(chat.get("id") or "")
+        if chat_id in self._native_history_reserved:
+            raise AgyError("此 AGY 聊天正在更新原生历史，请稍后重试")
         if chat_id in self._agy_busy:
             raise AgyError("此 AGY 聊天正在执行，请等待当前回答完成")
         if not chat.get("agy_session_id"):
@@ -153,6 +168,7 @@ class AgySessionsMixin:
         cwd = str(chat["agy_workspace"])
         session_id = str(chat["agy_session_id"])
         owner = str(chat.get("agy_native_owner") or "")
+        native_identity = str(chat.get("native_identity") or "")
         options = chat.get("agy_options") or []
         config = dict(chat.get("agy_config") or {})
         turn = turns[turn_idx]
@@ -211,9 +227,17 @@ class AgySessionsMixin:
             error = ""
             try:
                 validate_workspace(cwd)
+                # An independently run terminal can advance the persisted
+                # transcript while an idle ACP process still has the old copy.
+                if turn_idx > 0 and active_client is not None:
+                    active_client.close()
+                    active_client = None
                 if active_client is None or not active_client.alive:
-                    active_client = self._open_agy_client(cwd, session_id=session_id, owner=owner)
-                elif active_client.session_id != session_id or active_client.native_owner(self._read_pair_id()) != owner:
+                    active_client = self._open_agy_client(
+                        cwd, session_id=session_id, owner=owner, native_identity=native_identity)
+                elif (active_client.session_id != session_id
+                      or active_client.native_owner(self._read_pair_id()) != owner
+                      or (native_identity and self._agy_native_identity(active_client, session_id) != native_identity)):
                     raise AgyError("AGY 原会话归属已变化，请重新打开聊天")
                 active_client.configure(config, options)
                 reason = active_client.prompt(question, on_update)
