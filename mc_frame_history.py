@@ -1871,6 +1871,7 @@ class ChatHistoryMixin:
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()
+        self._call_after_if_alive(self._show_pending_kimi_interaction)
         return True
 
     def _enter_history_view(self, chat_id: str, *, focus_answer_list: bool = True) -> bool:

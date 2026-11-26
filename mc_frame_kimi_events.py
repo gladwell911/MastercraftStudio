@@ -1742,10 +1742,21 @@ class KimiEventsMixin:
             active[1].EndModal(wx.ID_CANCEL)
 
     def _visible_kimi_interaction(self, *states: str):
-        chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        session_id = self._kimi_session_id_for_chat(self._current_chat_state)
+        visible_history = self.view_history_id if self.view_mode == "history" else ""
+        if visible_history:
+            chat = self._find_archived_chat(visible_history) or {}
+            owner = self._kimi_active_control_owner(chat)
+            if not owner:
+                return None
+            session_id, chat_id = owner["session_id"], owner["chat_id"]
+        else:
+            chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+            session_id = self._kimi_session_id_for_chat(self._current_chat_state)
+            owner = self._kimi_active_control_owner(self._current_chat_state)
         return next(((key, request) for key, request in self._kimi_interactions.items()
-                     if key[0] == session_id and request["state"] in states and request["chat_id"] == chat_id), None)
+                     if key[0] == session_id and request["state"] in states and request["chat_id"] == chat_id
+                     and (not request.get("control_prompt_id") and not visible_history
+                          or request.get("control_prompt_id") == owner.get("prompt_id"))), None)
 
     def _show_pending_kimi_interaction(self, *, retry: bool = False) -> None:
         if self._kimi_interaction_dialog:
@@ -1838,16 +1849,17 @@ class KimiEventsMixin:
                 expired = self._kimi_interaction_expired(request)
             control_id = request.get("control_prompt_id")
             if not expired and control_id:
-                if getattr(client, "_server_api", False):
-                    client.subscribe([key[0]])
+                try:
+                    if getattr(client, "_server_api", False):
+                        client.subscribe([key[0]])
                     observed = client.interaction_state(*key, request["agent_id"])
-                    if observed != "pending":
-                        if observed:
-                            self._complete_kimi_interaction_attempt(key, request, "responding", "ended")
-                        else:
-                            self._complete_kimi_interaction_attempt(key, request, "responding", "uncertain",
-                                                                   error="未确认当前连接的原生交互请求")
-                        return
+                except (KimiServerError, OSError):
+                    observed = ""
+                if observed != "pending":
+                    state = "ended" if observed else "uncertain"
+                    self._complete_kimi_interaction_attempt(key, request, "responding", state,
+                                                           error="未确认当前连接的原生交互请求")
+                    return
                 with self._kimi_owner_lock:
                     current = self._kimi_active_turns.get(request["chat_id"]) or {}
                     if self._kimi_interactions.get(key) is not request or request["state"] != "responding":

@@ -190,8 +190,9 @@ def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
             frame._kimi_client.close()
 
 
+@pytest.mark.parametrize("stop_remotely", [False, True], ids=["complete", "stop"])
 def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
-    loopback_kimi_home, frame, wx_app, monkeypatch, wait_for_wx, gated_reply,
+    loopback_kimi_home, frame, wx_app, monkeypatch, wait_for_wx, gated_reply, stop_remotely,
 ):
     workspace, requests = loopback_kimi_home
     seed = subprocess.run([os.environ["KIMI_BIN"], "-p", "QA_SHARED_SEED"], cwd=workspace,
@@ -212,7 +213,7 @@ def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
     def remote():
         return RemoteNatsTransport(
             pair_id="default", token="synthetic", durable_store=frame.chat_store, on_state=frame._remote_api_state_ui,
-            on_history_read=frame._remote_api_history_read_ui,
+            on_history_read=frame._remote_api_history_read_ui, on_message=frame._remote_api_message_ui,
             on_execution_page=lambda payload: frame._remote_api_execution_page_ui(payload, secret="synthetic"),
         )
 
@@ -271,6 +272,19 @@ def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
                         "tool output replaces the in-progress row")
             wait_for_wx(lambda: observed_tool(reconnect) and observed_tool(reconnect)["row_id"] == row_id,
                         "reconnected execution updates the same row")
+            if stop_remotely:
+                stop = {"type": "message", "chat_id": chat_id, "text": "/stop",
+                        "expected_native_turn_id": state["native_turn_id"]}
+                assert reconnect._route_command({**stop, "expected_native_turn_id": "expired"})[0] == 409
+                assert reconnect._route_command(stop)[0] == 200
+                wait_for_wx(lambda: command.poll() is not None, "PowerShell receives native cancellation", timeout=15)
+                assert command.returncode != 0
+                assert "已中断" in errors_path.read_text(encoding="utf-8", errors="replace")
+                assert not gated_reply.is_set()
+                assert not remote_command(reconnect, "state")["running"]
+                assert reconnect._route_command(stop)[0] == 409
+                assert len(requests) == 3
+                return
             gated_reply.set()
             wait_for_wx(lambda: command.poll() is not None, "PowerShell final answer", timeout=20)
             assert command.returncode == 0, errors_path.read_text(encoding="utf-8", errors="replace")

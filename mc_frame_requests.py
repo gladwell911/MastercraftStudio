@@ -1126,8 +1126,6 @@ class ChatRequestsMixin:
         if (candidate or {}).get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
-        if is_kimi_model(resolved_model) and (chat_id or self.active_chat_id) in self._native_history_reserved:
-            return False, "正在同步原生 Kimi Code 历史，请稍后重试"
         if resolved_model == AGY_MODEL_ID and requested_attachments:
             return False, "此版本的 AGY 聊天暂不支持附件"
         if resolved_model == AGY_MODEL_ID:
@@ -1177,6 +1175,8 @@ class ChatRequestsMixin:
         ).strip()
         if is_codex_model(resolved_model) and submit_owner in getattr(self, "_native_history_reserved", ()):
             return False, "正在同步原生 Codex 历史，请稍后重试"
+        if is_kimi_model(resolved_model) and submit_owner in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生 Kimi Code 历史，请稍后重试"
         if not submit_owner:
             self._ensure_active_chat_id()
             submit_owner = str(self.active_chat_id or self.current_chat_id or "").strip()

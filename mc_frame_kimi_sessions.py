@@ -91,15 +91,15 @@ class KimiSessionsMixin:
             return False, "此 Kimi Code 回合已结束或已更换。"
         chat_id = str(chat["id"])
         client = self._kimi_client
-        if client is None or client.protocol_version != 2:
+        if getattr(client, "protocol_version", 0) != 2:
             return False, "当前 Kimi Code 连接不支持精确中断。"
 
         def stop():
             try:
                 self._handle_kimi_stop_command(client, chat, owner, chat_id)
             except (KimiServerError, OSError) as exc:
-                self._call_after_if_alive(self._push_remote_attention, chat_id, "status",
-                                          expected_prompt, str(exc))
+                self._call_after_if_alive(self._push_remote_attention, chat_id, "failed",
+                                          f"stop:{expected_prompt}", f"Kimi Code 中断未获确认：{exc}")
                 self._recover_kimi_pending_owners(session_ids={owner["session_id"]})
 
         bindings.app.threading.Thread(target=stop, daemon=True, name="kimi-shared-stop").start()

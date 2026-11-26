@@ -848,11 +848,13 @@ class RemoteRoutesMixin:
             if expected_turn and (not preview_chat.get("codex_turn_active")
                                   or self._codex_turn_id_for_chat(preview_chat) != expected_turn):
                 return 409, {"accepted": False, "chat_id": target_owner, "message": "此 Codex 回合已结束或已更换。"}
-        if is_kimi_model(model) and isinstance(preview_chat, dict):
+        if isinstance(preview_chat, dict) and is_kimi_model(self._model_for_chat_selection(preview_chat)):
             expected_prompt = str(payload.get("expected_native_turn_id") or "")
             target_owner = str(preview_chat.get("id") or "")
-            if expected_prompt:
-                if text == "/stop":
+            if expected_prompt or text == "/stop":
+                if not is_kimi_model(model):
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                elif text == "/stop":
                     ok, message = self._stop_shared_kimi_turn(preview_chat, expected_prompt)
                 elif self._kimi_active_control_owner(preview_chat).get("prompt_id") != expected_prompt:
                     ok, message = False, "此 Kimi Code 回合已结束或已更换。"
