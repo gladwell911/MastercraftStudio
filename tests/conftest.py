@@ -68,6 +68,8 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     assert Path(main.resolve_notes_data_dir()).resolve() != Path(r"D:\code\note").resolve()
     if "loopback_kimi_home" not in request.fixturenames:
         monkeypatch.setattr(mc_frame_native_history, "kimi_runtime_path", lambda: tmp_path / "no-kimi")
+    if "codex_homes" not in request.fixturenames:
+        monkeypatch.setattr(mc_frame_native_history, "codex_history_homes", lambda: ())
     f = main.ChatFrame()
     f.Hide()
     yield f
@@ -76,6 +78,9 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     # no daemon SQLite worker survives the fixture that owns its ChatStore.
     f._closing = True
     f._stop_native_history_refresh()
+    if "codex_homes" in request.fixturenames:
+        for client in tuple(f._codex_clients.values()):
+            client.close()
     if f._native_history_kimi_client is not None:
         f._native_history_kimi_client.close()
     f._flush_execution_step_persists_sync()

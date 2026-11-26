@@ -635,6 +635,9 @@ class CodexAppServerClient:
         on_event: Callable[[CodexEvent], None] | None = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT,
         codex_model: str = DEFAULT_CODEX_MODEL,
+        native_home: Path | None = None,
+        use_native_config: bool = False,
+        unload_idle_threads: bool = False,
     ) -> None:
         self.on_event = on_event
         self.timeout = max(int(timeout or DEFAULT_REQUEST_TIMEOUT), 1)
@@ -650,7 +653,9 @@ class CodexAppServerClient:
         self._initialized = False
         self._initializing = False
         self._closed = False
-        self._codex_home_dir: Path | None = None
+        self._codex_home_dir = native_home
+        self.use_native_config = use_native_config
+        self._unload_idle_threads = unload_idle_threads
         self._owns_codex_home_dir = False
         self._global_plugin_settings: dict | None = None
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -692,6 +697,10 @@ class CodexAppServerClient:
 
     def prepare_task(self, cwd: str | None = None) -> None:
         """Refresh native skill discovery before starting or resuming a new task."""
+        if self.use_native_config:
+            self._ensure_started()
+            self._refresh_native_skills(cwd)
+            return
         source_home = _user_home() / ".codex"
         settings = _plugin_settings(source_home)
         if self._codex_home_dir is None:
@@ -747,10 +756,10 @@ class CodexAppServerClient:
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
-            **resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
-            "personality": personality,
-            "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
+        if not self.use_native_config:
+            params.update(resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
+                          personality=personality, serviceTier=normalize_codex_service_tier(service_tier) or None)
         if cwd:
             params["cwd"] = str(cwd).strip()
         return self._request_thread_configuration("thread/resume", params)
@@ -835,6 +844,9 @@ class CodexAppServerClient:
 
     def read_rate_limits(self) -> dict:
         return self.request("account/rateLimits/read")
+
+    def release_idle_thread(self, thread_id: str) -> None:
+        self.request("thread/unsubscribe", {"threadId": thread_id}, timeout=4)
 
     def compact_thread(self, thread_id: str) -> dict:
         return self.request("thread/compact/start", {"threadId": str(thread_id or "").strip()})
@@ -967,8 +979,11 @@ class CodexAppServerClient:
                 self._initialize()
             return
 
+        command = self._app_server_command()
+        if self._unload_idle_threads:
+            command.extend(("-c", "thread_unload_delay_secs=0"))
         self._proc = subprocess.Popen(
-            build_codex_app_server_command(codex_model=self.codex_model),
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -987,6 +1002,11 @@ class CodexAppServerClient:
         self._initialized = False
         self._initialize()
 
+    def _app_server_command(self) -> list[str]:
+        if self.use_native_config:
+            return [*resolve_codex_launch_command(), "app-server", "--listen", "stdio://"]
+        return build_codex_app_server_command(codex_model=self.codex_model)
+
     def _build_launch_env(self) -> dict[str, str]:
         if self._codex_home_dir is None:
             env, codex_home_dir = build_codex_app_server_env()
@@ -996,7 +1016,8 @@ class CodexAppServerClient:
         else:
             env = os.environ.copy()
             env["CODEX_HOME"] = str(self._codex_home_dir)
-        _load_onedrive_codex_proxy(env)
+        if not self.use_native_config:
+            _load_onedrive_codex_proxy(env)
         # These inherited compatibility flags break restricted Windows process
         # creation together even with an elevated Codex token (native A/B).
         for key in list(env):

@@ -14,6 +14,8 @@ from mc_frame_settings import DEFAULT_MODEL_ID, MODEL_IDS, REQUESTING_TEXT, STAR
 from openclaw_client import DEFAULT_OPENCLAW_SESSION_KEY, is_openclaw_model
 from pathlib import Path
 
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS
+
 import mc_frame_bindings as bindings
 
 
@@ -911,6 +913,9 @@ class ChatRequestsMixin:
             self._invalidate_answer_mouse_gesture()
         self._retire_kimi_chat_runtime(chat, str(chat.get("kimi_session_id") or "").strip())
         self._clear_codex_context_usage_for_thread_change(chat)
+        if chat.get("codex_thread_id"):
+            for field in (*CODEX_STORAGE_FIELDS, *NATIVE_CHAT_FIELDS):
+                chat.pop(field, None)
         chat["id"] = str(chat.get("id") or chat_id or "").strip()
         chat["turns"] = []
         chat["updated_at"] = updated_at
@@ -966,6 +971,8 @@ class ChatRequestsMixin:
         if self._clear_pending_for(owner_id):
             return False, "正在清空此聊天的上下文"
         resolved_model = bindings.app.normalize_model_id(model or "", default="")
+        if is_codex_model(resolved_model) and owner_id in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生 Codex 历史，请稍后重试"
         text = str(question or "").strip()
         if not owner_id or not resolved_model or not text:
             return False, "invalid archived chat submission"
@@ -1162,6 +1169,8 @@ class ChatRequestsMixin:
         submit_owner = str(
             chat_id or selected_history_id or self.active_chat_id or self.current_chat_id or ""
         ).strip()
+        if is_codex_model(resolved_model) and submit_owner in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生 Codex 历史，请稍后重试"
         if not submit_owner:
             self._ensure_active_chat_id()
             submit_owner = str(self.active_chat_id or self.current_chat_id or "").strip()

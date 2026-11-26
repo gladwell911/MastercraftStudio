@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codex_worker_protocol
 import copy
+import os
 import re
 import wx
 from codex_client import (
@@ -19,7 +20,9 @@ from codex_client import (
     normalize_codex_approval_mode,
     normalize_codex_sandbox,
     normalize_codex_service_tier,
+    resolve_codex_launch_command,
 )
+from codex_history import codex_native_open_command
 from context_usage import context_usage_from_dict, format_context_usage_label
 from remote_protocol import format_remote_approval_request, format_remote_user_input_request, parse_remote_approval_reply, parse_remote_user_input_reply
 from mc_frame_settings import (
@@ -34,6 +37,30 @@ import mc_frame_bindings as bindings
 
 
 class CodexSessionsMixin:
+    @staticmethod
+    def _codex_native_scope(chat):
+        if not chat.get("codex_thread_id") or not chat.get("codex_home"):
+            return {}
+        return {
+            "native_home": chat["codex_home"],
+            "native_user_home": bool(chat.get("codex_user_home")),
+            "native_account": chat.get("native_account", ""),
+            "cwd": chat.get("native_cwd", ""),
+        }
+
+    @staticmethod
+    def _remember_codex_storage(chat, thread_id, home, cwd):
+        if not thread_id or not home or not cwd or chat.get("codex_home"):
+            return
+        chat["codex_home"] = home
+        chat["codex_storage_id"] = os.path.normcase(home)
+        chat["native_cwd"] = cwd
+        try:
+            launch = resolve_codex_launch_command()
+        except FileNotFoundError:
+            launch = ("codex",)
+        chat["native_open_command"] = codex_native_open_command(home, cwd, thread_id, launch)
+
     def _prepare_codex_terminal_open(self, payload):
         chat_id, thread_id = payload.get("chat_id"), payload.get("session_id")
         if (not isinstance(chat_id, str) or not chat_id or len(chat_id) > 512
@@ -43,7 +70,8 @@ class CodexSessionsMixin:
         if not chat or chat.get("id") != chat_id or getattr(self, "_closing", False):
             return 404, {"error": "chat_not_found"}
         model = self._model_for_chat_selection(chat)
-        if not is_codex_model(model) or self._clear_pending_for(chat_id):
+        if (not is_codex_model(model) or self._clear_pending_for(chat_id)
+                or chat_id in getattr(self, "_native_history_reserved", ())):
             return 409, {"error": "chat_changed"}
         if self._codex_thread_id_for_chat(chat) != thread_id:
             return 409, {"error": "chat_changed"}
@@ -54,6 +82,7 @@ class CodexSessionsMixin:
             "chat_id": chat_id, "model": model, "thread_id": thread_id,
             "context_generation": int(chat.get("codex_context_generation") or 0),
             "cwd": self._workspace_dir_for_codex(), "title": str(chat.get("title") or "新聊天"),
+            **self._codex_native_scope(chat),
             "service_tier": self._codex_service_tier_for_chat(chat),
             "approval_policy": self.codex_approval_policy, "sandbox": self.codex_sandbox,
         }
@@ -72,6 +101,7 @@ class CodexSessionsMixin:
             self.active_codex_thread_id = thread_id
         chat["codex_thread_id"] = thread_id
         chat["codex_terminal_thread"] = thread_id
+        self._remember_codex_storage(chat, thread_id, result["home"], result["cwd"])
         chat["codex_thread_configuration"] = result.get("thread_configuration", {})
         chat["codex_thread_configuration_thread_id"] = thread_id
         self._defer_codex_state_save()
@@ -808,7 +838,9 @@ class CodexSessionsMixin:
         if client is None or not hasattr(client, "compact_thread"):
             return "## Codex 压缩\n\n当前 Codex 客户端不支持 `thread/compact/start`。"
         chat_id = str((chat or {}).get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-        client.compact_thread(thread_id, chat_id=chat_id, model=str(model or (chat or {}).get("model") or DEFAULT_CODEX_MODEL))
+        client.compact_thread(thread_id, chat_id=chat_id,
+                              model=str(model or (chat or {}).get("model") or DEFAULT_CODEX_MODEL),
+                              **self._codex_native_scope(chat or {}))
         return f"## Codex 压缩\n\n已开始压缩当前 Codex 线程：`{thread_id}`。"
 
     def _handle_codex_model_command(self, args: str, chat: dict) -> str:
@@ -1035,13 +1067,14 @@ class CodexSessionsMixin:
             client.start()
             if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
                 return
+            scope = {"cwd": self._workspace_dir_for_codex(), **self._codex_native_scope(target_chat)}
             client.start_turn(
                 chat_id=client_chat_id,
                 turn_idx=turn_idx,
                 context_generation=int(target_turns[turn_idx].get("codex_context_generation") or 0),
                 question=send_question,
                 model=model,
-                cwd=self._workspace_dir_for_codex(),
+                **scope,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 input_items=input_items,
@@ -2015,6 +2048,7 @@ class CodexSessionsMixin:
                     key = self._context_usage_pending_key_from_chat(target_chat, turn_idx)
                     self._codex_early_context_usage_owner.pop(key, None)
             target_chat["codex_thread_id"] = thread_id
+            self._remember_codex_storage(target_chat, thread_id, payload.get("codex_home"), payload.get("cwd"))
             if "thread_configuration" in payload:
                 configuration = payload.get("thread_configuration")
                 target_chat["codex_thread_configuration"] = dict(configuration) if isinstance(configuration, dict) else {}

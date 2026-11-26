@@ -19,6 +19,10 @@ from codex_worker_protocol import (
 )
 
 
+def codex_worker_workspace() -> Path:
+    return Path(__file__).resolve().parent
+
+
 class CodexWorkerClient:
     def __init__(
         self,
@@ -62,7 +66,7 @@ class CodexWorkerClient:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    cwd=str(Path(__file__).resolve().parent),
+                    cwd=str(codex_worker_workspace()),
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -164,12 +168,12 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(self._next_id(), "reply_terminal_interaction", payload))
 
     def read_chat_information(self, *, chat_id: str, model: str, identity: list[str], generation: int,
-                              context_only: bool = False) -> str:
+                              context_only: bool = False, **scope) -> str:
         request_id = self._next_id()
         self._send_message(make_ui_request(request_id, "read_chat_information", {
             "chat_id": str(chat_id or ""), "model": str(model or ""), "identity": list(identity),
             "generation": int(generation),
-            "context_only": bool(context_only),
+            "context_only": bool(context_only), **scope,
         }))
         return request_id
 
@@ -184,9 +188,10 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(message_id, "reply_command_approval", payload))
         return message_id
 
-    def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "") -> str:
+    def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "", **scope) -> str:
         request_id = self._next_id()
-        payload = {"chat_id": str(chat_id or ""), "model": str(model or ""), "thread_id": str(thread_id or "")}
+        payload = {"chat_id": str(chat_id or ""), "model": str(model or ""),
+                   "thread_id": str(thread_id or ""), **scope}
         self._send_message(make_ui_request(request_id, "compact_thread", payload))
         return request_id
 

@@ -484,8 +484,9 @@ class RemoteRoutesMixin:
             "title": title,
             "model": model,
             **({"native_workspace": chat.get("native_cwd", ""),
-                "native_history_status": chat.get("native_history_status", "")}
-               if chat.get("native_identity") else {}),
+                "native_history_status": chat.get("native_history_status", ""),
+                "native_open_command": chat.get("native_open_command", "")}
+               if chat.get("native_identity") or is_codex_model(model) else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
                 "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
@@ -565,8 +566,9 @@ class RemoteRoutesMixin:
             "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
             **({"native_workspace": chat.get("native_cwd", ""),
-                "native_history_status": chat.get("native_history_status", "")}
-               if chat.get("native_identity") else {}),
+                "native_history_status": chat.get("native_history_status", ""),
+                "native_open_command": chat.get("native_open_command", "")}
+               if chat.get("native_identity") or is_codex_model(model) else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
                 "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
