@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 import json
 from pathlib import Path
+import time
 
 from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, validate_workspace
 from native_history import NativeSessionIdentity, NativeSessionSnapshot
@@ -28,6 +29,7 @@ def list_agy_sessions(executable: str, pair_id: str):
         cursor = ""
         seen = set()
         while True:
+            observed_at = time.time()
             page = client.request("session/list", {"cursor": cursor} if cursor else {})
             for info in page.get("sessions") or []:
                 if not isinstance(info, dict):
@@ -43,7 +45,7 @@ def list_agy_sessions(executable: str, pair_id: str):
                 yield NativeSessionSnapshot(
                     identity, account, AGY_MODEL_ID, cwd, str(info.get("title") or ""),
                     _timestamp(info.get("updatedAt")), {"agy_workspace": cwd, **legacy},
-                    status=status, legacy_fields=legacy,
+                    status=status, legacy_fields=legacy, title_observed_at=observed_at,
                 )
             cursor = page.get("nextCursor")
             if not isinstance(cursor, str) or not cursor or cursor in seen:

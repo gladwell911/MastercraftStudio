@@ -14,7 +14,9 @@ from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
 from context_usage import NATIVE_USAGE_FIELDS
 from execution_projection import canonical_answer_timestamp, should_show_execution_step
-from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, NativeSessionIdentity, NativeSessionSnapshot
+from native_history import (
+    CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, NativeSessionIdentity, NativeSessionSnapshot, merge_native_title,
+)
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -714,7 +716,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             return owner, self._float_or(metadata.get("native_replayed_at"), 0)
 
     def merge_native_history(self, snapshot: NativeSessionSnapshot, *, expected_chat_id: str,
-                             expected_revision: int = 0) -> dict | None:
+                             expected_revision: int = 0, merge_title: bool = True) -> dict | None:
         """Commit only an append-compatible replay to the chat that authorized it."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -744,7 +746,6 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 id=owner, model=previous.get("model") or snapshot.model,
                 native_identity=snapshot.identity.chat_id, native_account=snapshot.account,
                 native_cwd=previous.get("native_cwd") or snapshot.cwd,
-                native_title=snapshot.title or previous.get("native_title", ""),
                 native_updated_at=max(previous.get("native_updated_at", 0), snapshot.updated_at),
                 native_history_status=snapshot.status,
             )
@@ -763,14 +764,13 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             if not previous or appended:
                 chat["updated_at"] = max(previous.get("updated_at", 0), snapshot.updated_at)
             if not previous:
-                chat["title"] = snapshot.title or snapshot.cwd
-                chat["title_source"] = "native"
-                chat["title_updated_at"] = snapshot.updated_at
-                chat["title_revision"] = 1
-            elif (previous.get("title_source") == "native" and not previous.get("title_manual")
-                  and snapshot.title and snapshot.title != previous["title"]):
-                chat.update(title=snapshot.title, title_updated_at=snapshot.updated_at,
-                            title_revision=previous["title_revision"] + 1)
+                chat.update(title=snapshot.title or snapshot.cwd, title_source="native",
+                            title_updated_at=snapshot.title_observed_at or snapshot.updated_at,
+                            title_revision=1)
+            if merge_title:
+                merge_native_title(chat, snapshot.identity.provider, snapshot.title,
+                                   snapshot.title_observed_at or snapshot.updated_at,
+                                   explicit=snapshot.title_explicit)
             if chat == previous and not appended:
                 return None
             self._upsert_chat_conn(conn, chat)
@@ -788,6 +788,27 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             chat["turn_count"] = old_count + appended
             return chat
 
+    def apply_native_session_title(self, chat_id, scope, revision, provider, title, observed_at, *,
+                                   explicit=True, app_manual=False):
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (chat_id,),
+            ).fetchone()
+            generation = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+            if row is None or (int(generation[0]) if generation else 0) != revision:
+                return None
+            previous = self._summary_from_row(row)
+            if any(previous.get(field) != value for field, value in scope.items()):
+                return None
+            changed = previous.copy()
+            merge_native_title(changed, provider, title, observed_at, explicit=explicit, app_manual=app_manual)
+            if changed == previous:
+                return previous
+            self._upsert_chat_conn(conn, changed)
+            return changed
+
     @staticmethod
     def _native_turn_matches(stored: dict, replayed: dict) -> bool:
         for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id", "codex_turn_id"):
@@ -798,6 +819,14 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         old_answer = str(stored.get("answer_md") or "")
         new_answer = str(replayed.get("answer_md") or "")
         return old_answer == new_answer or (bool(new_answer) and old_answer.startswith(new_answer))
+
+    def load_chat_summary(self, chat_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (chat_id,),
+            ).fetchone()
+            return self._summary_from_row(row) if row else None
 
     def list_chat_summaries(self) -> list[dict[str, Any]]:
         with self._connect() as conn:

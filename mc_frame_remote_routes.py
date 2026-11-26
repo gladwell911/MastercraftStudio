@@ -2,8 +2,10 @@
 
 import asyncio
 import copy
+from concurrent.futures import TimeoutError
 import hashlib
 import json
+import sqlite3
 import uuid
 import wx
 from agy_acp import AGY_MODEL_ID, AgyError
@@ -330,7 +332,7 @@ class RemoteRoutesMixin:
         )
         return True
 
-    def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
+    def _push_remote_history_changed(self, chat_id: str | None = None, *, title_update=None) -> None:
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         payload = {
@@ -339,6 +341,8 @@ class RemoteRoutesMixin:
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": bindings.app.time.time(),
         }
+        if title_update is not None:
+            payload["title_update"] = title_update
         self._broadcast_remote_event(payload)
 
     def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
@@ -496,7 +500,8 @@ class RemoteRoutesMixin:
                if chat.get("native_identity") or is_codex_model(model) else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
-                "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
+                "agy_native_title": chat.get("native_title", ""),
+                "agy_native_title_revision": chat.get("native_title_revision", 0)} if model == AGY_MODEL_ID else {}),
             "created_at": created_at,
             "updated_at": updated_at,
             "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
@@ -578,7 +583,8 @@ class RemoteRoutesMixin:
                if chat.get("native_identity") or is_codex_model(model) else {}),
             **({"agy_workspace": chat.get("agy_workspace", ""),
                 "agy_history_status": chat.get("native_history_status", ""),
-                "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
+                "agy_native_title": chat.get("native_title", ""),
+                "agy_native_title_revision": chat.get("native_title_revision", 0)} if model == AGY_MODEL_ID else {}),
             "running": False,
             "request_kind": request_kind,
             "current": bool(chat_id) and chat_id == current_id,
@@ -1565,6 +1571,16 @@ class RemoteRoutesMixin:
         self._remote_state_cache = {"key": cache_key, "body": copy.deepcopy(body)}
         return 200, body
 
+    def _remote_api_rename_chat(self, payload: dict) -> tuple[int, dict]:
+        status, body = self._run_remote_ui_route(self._remote_api_rename_chat_ui, payload)
+        future = body.pop("_native_rename", None)
+        if future is None:
+            return status, body
+        try:
+            return future.result(timeout=20)
+        except TimeoutError:
+            return 503, {"accepted": False, "error": "原生改名尚未确认，请稍后刷新聊天。"}
+
     def _remote_api_rename_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         title = str(payload.get("title") or "").strip()
@@ -1576,6 +1592,16 @@ class RemoteRoutesMixin:
         if not isinstance(chat, dict):
             return 404, {"accepted": False, "error": "not_found"}
         incoming_source = str(payload.get("title_source") or "manual").strip() or "manual"
+        if incoming_source == "manual":
+            queued = self._queue_native_title_rename(chat, title)
+            if queued is False:
+                return 409, {"accepted": False, "error": "聊天已变更，请重新打开后改名。"}
+            if queued is not None:
+                return 202, {"_native_rename": queued}
+            if chat.get("model") == AGY_MODEL_ID:
+                return self._rename_agy_alias_ui(chat, title)
+        elif chat.get("title_manual"):
+            return 200, self._rename_title_response(chat)
         incoming_updated_at = float(payload.get("title_updated_at") or bindings.app.time.time())
         current_updated_at = float(chat.get("title_updated_at") or chat.get("updated_at") or 0.0)
         incoming_revision = int(payload.get("title_revision") or (int(chat.get("title_revision") or 0) + 1))
@@ -1601,7 +1627,7 @@ class RemoteRoutesMixin:
                 "title_updated_at": current_updated_at,
                 "title_revision": current_revision,
             }
-        resolved_revision = incoming_revision
+        resolved_revision = max(current_revision + 1, incoming_revision)
         if incoming_updated_at == current_updated_at and incoming_priority == current_priority:
             resolved_revision = max(current_revision, incoming_revision)
         chat["title"] = title
@@ -1612,7 +1638,7 @@ class RemoteRoutesMixin:
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         self._save_state()
-        self._refresh_history(chat_id)
+        self._upsert_history_row(chat_id, allow_reorder=False)
         self._push_remote_history_changed(chat_id)
         return 200, {
             "accepted": True,
@@ -1622,6 +1648,18 @@ class RemoteRoutesMixin:
             "title_updated_at": incoming_updated_at,
             "title_revision": resolved_revision,
         }
+
+    def _rename_agy_alias_ui(self, chat, title):
+        before = chat.copy()
+        self._bump_chat_title_revision(chat, "manual", title=title)
+        try:
+            self.chat_store.upsert_chat(self._slim_active_chat_state() if chat is self._current_chat_state else chat)
+        except (OSError, RuntimeError, sqlite3.Error):
+            chat.update(before)
+            return 503, {"accepted": False, "error": "无法保存 AGY 聊天显示名，请重试。"}
+        self._upsert_history_row(chat["id"], allow_reorder=False)
+        self._push_remote_title_changed(chat)
+        return 200, self._rename_title_response(chat)
 
     def _remote_api_update_settings_ui(self, payload: dict) -> tuple[int, dict]:
         if "codex_answer_english_filter_enabled" in payload:

@@ -748,7 +748,7 @@ class RemoteRuntimeMixin:
                     on_agy_configure=lambda payload: self._run_remote_ui_route(self._remote_api_agy_configure_ui, payload),
                     on_reply_request=lambda payload: self._run_remote_ui_route(self._remote_api_reply_request_ui, payload),
                     on_state=lambda payload: self._run_remote_ui_route(self._remote_api_state_ui, payload),
-                    on_rename_chat=lambda payload: self._run_remote_ui_route(self._remote_api_rename_chat_ui, payload),
+                    on_rename_chat=self._remote_api_rename_chat,
                     on_update_settings=lambda payload: self._run_remote_ui_route(self._remote_api_update_settings_ui, payload),
                     on_speed_options=lambda payload: self._run_remote_ui_route(self._remote_api_speed_options_ui, payload),
                     on_set_speed=lambda payload: self._run_remote_ui_route(self._remote_api_set_speed_ui, payload),

@@ -144,6 +144,9 @@ class CodexWorkerRuntime:
             terminal = self._terminal_threads.get((chat_id, model))
             if terminal and event.thread_id and event.thread_id != terminal["thread_id"]:
                 return
+            if event.type == "native_title":
+                self.emit("event", {"chat_id": chat_id, "model": model, "event": event_to_payload(event)})
+                return
             pending = self._startup_events.get((chat_id, model))
             if pending is not None:
                 turn_id = str(getattr(event, "turn_id", "") or "").strip()

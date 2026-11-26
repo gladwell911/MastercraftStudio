@@ -2101,6 +2101,10 @@ class ChatHistoryMixin:
         m.Bind(wx.EVT_MENU, lambda event: self._history_pin(event, chat_id=target_id), id=i_pin)
         m.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
         m.Bind(wx.EVT_MENU, lambda event: self._history_rename(event, chat_id=target_id), id=i_ren)
+        if c.get("agy_session_id") and c.get("native_title"):
+            native_title = m.Append(wx.ID_ANY, "查看 AGY 原生标题")
+            m.Bind(wx.EVT_MENU, lambda _event: wx.MessageBox(
+                str(c["native_title"]), "AGY 原生标题", wx.OK, self), native_title)
         if command := c.get("native_open_command"):
             copy_command = m.Append(wx.ID_ANY, "复制原生 Codex 打开命令")
             m.Bind(wx.EVT_MENU, lambda _event: self._copy_native_open_command(command), copy_command)
@@ -2261,6 +2265,11 @@ class ChatHistoryMixin:
         if d.ShowModal() == wx.ID_OK:
             name = d.get_value()
             if name:
+                queued = self._queue_native_title_rename(c, name, local=True)
+                if queued is not None:
+                    self.SetStatusText("正在确认原生聊天标题" if queued else "聊天已变更，请重新打开后改名。")
+                    d.Destroy()
+                    return
                 before = copy.deepcopy(c)
                 self._bump_chat_title_revision(c, "manual", title=name)
                 store = getattr(self, "chat_store", None)
@@ -2273,6 +2282,9 @@ class ChatHistoryMixin:
                     c.update(before)
                     d.Destroy()
                     return
-                self._upsert_history_row(c.get("id"))
-                self._push_remote_history_changed(c.get("id"))
+                self._upsert_history_row(c.get("id"), allow_reorder=False)
+                if c.get("agy_session_id"):
+                    self._push_remote_title_changed(c)
+                else:
+                    self._push_remote_history_changed(c.get("id"))
         d.Destroy()

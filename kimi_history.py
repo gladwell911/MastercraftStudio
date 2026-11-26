@@ -3,11 +3,12 @@ import getpass
 import json
 import os
 from pathlib import Path
+import time
 
 from kimi_server_client import DEFAULT_KIMI_MODEL, KimiServerError, kimi_code_home
 from kimi_server_events import _provider_origin_timestamp
 from kimi_transcript import Transcript
-from native_history import NativeSessionIdentity, NativeSessionSnapshot
+from native_history import NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
 
 
 def kimi_history_storage() -> str:
@@ -26,6 +27,29 @@ class KimiHistoryReader:
         self.is_user_prompt = is_user_prompt
         self.client = client
 
+    def rename_session(self, sid, cwd, storage, account, title):
+        original_storage = storage or os.path.normcase(str((Path.home() / ".kimi-code").resolve()))
+        if ((original_storage != kimi_history_storage())
+                or (account and account != kimi_history_account())):
+            raise NativeTitleRejected("Kimi Code 原会话归属已变化。")
+        try:
+            self.client.start(timeout=10)
+            row = self.client.get_session(sid)
+        except KimiServerError as exc:
+            raise NativeTitleRejected("无法连接 Kimi Code 或读取原会话，请检查后重试。") from exc
+        actual_cwd = (row.get("metadata") or {}).get("cwd")
+        if row.get("id") != sid or not actual_cwd or (cwd and Path(actual_cwd).resolve() != Path(cwd).resolve()):
+            raise NativeTitleRejected("无法在原工作目录找到 Kimi Code 会话。")
+        try:
+            self.client.set_session_title(sid, title)
+        except KimiServerError as exc:
+            if exc.status_code and not exc.result_unknown:
+                raise NativeTitleRejected("Kimi Code 拒绝更改原生标题，请检查原会话后重试。") from exc
+        row = self.client.get_session(sid)
+        if row.get("id") == sid and row.get("title") == title:
+            return title
+        return None
+
     def list_sessions(self):
         client = self.client
         try:
@@ -35,6 +59,7 @@ class KimiHistoryReader:
             before = None
             cursors = set()
             while True:
+                observed_at = time.time()
                 page = client.list_sessions(before_id=before)
                 items = page.get("items")
                 if not isinstance(items, list):
@@ -57,6 +82,7 @@ class KimiHistoryReader:
                         account, DEFAULT_KIMI_MODEL, cwd, str(row.get("title") or ""),
                         _provider_origin_timestamp({"timestamp": row.get("updated_at")}) or 0,
                         storage_fields, status=self.busy_status(row), legacy_fields=legacy,
+                        title_observed_at=observed_at, title_explicit=row.get("is_custom_title") is not False,
                     )
                 if not page.get("has_more"):
                     return
