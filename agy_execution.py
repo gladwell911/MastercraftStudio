@@ -16,10 +16,19 @@ def _text(content):
 
 
 def _tool_details(tool):
-    for field, label in (("rawInput", "输入"), ("rawOutput", "输出")):
-        value = tool.get(field)
-        if value is not None:
-            yield f"{label}\n{value if isinstance(value, str) else _json(value)}"
+    raw_input = tool.get("rawInput")
+    if raw_input is not None:
+        yield f"输入\n{raw_input if isinstance(raw_input, str) else _json(raw_input)}"
+    raw_output = tool.get("rawOutput")
+    output = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
+    if isinstance(output, str) and output:
+        yield "输出\n" + output
+        if isinstance(raw_output, dict):
+            raw_output = {key: value for key, value in raw_output.items() if key != "output"}
+        else:
+            raw_output = None
+    if raw_output is not None and raw_output != {}:
+        yield "输出字段\n" + _json(raw_output)
     for item in tool.get("content") or ():
         if not isinstance(item, dict):
             continue
@@ -28,16 +37,24 @@ def _tool_details(tool):
             old = str(item.get("oldText") or "").splitlines()
             new = str(item.get("newText") or "").splitlines()
             yield "\n".join(difflib.unified_diff(old, new, fromfile=path, tofile=path, lineterm=""))
-        elif text := _text(item.get("content")):
+        elif (text := _text(item.get("content"))) and text != output:
             yield text
 
 
 class AgyExecution:
     def __init__(self):
         self.tools = {}
+        self.snapshots = {}
         self.thought = ""
         self.thought_index = 0
         self.in_thought = False
+
+    def _changed(self, key, kind, label, details):
+        displayed = (kind, label, details)
+        if self.snapshots.get(key) == displayed:
+            return None
+        self.snapshots[key] = displayed
+        return key, *displayed
 
     def step(self, update):
         kind = update.get("sessionUpdate")
@@ -51,6 +68,12 @@ class AgyExecution:
                 return (f"thought:{self.thought_index}", "reasoning",
                         "AGY 思考：" + self.thought.strip()[:150], self.thought)
             return None
+        if kind == "usage_update":
+            used, size = update.get("used"), update.get("size")
+            if type(used) is int and type(size) is int and used >= 0 and size > 0:
+                text = f"AGY 上下文用量：{used} / {size} tokens"
+                return self._changed("usage", "usage", text, text)
+            return None
         self.in_thought = False
         if kind in {"tool_call", "tool_call_update"}:
             item_id = update.get("toolCallId")
@@ -63,13 +86,21 @@ class AgyExecution:
             status = {"pending": "等待", "in_progress": "执行中", "completed": "已完成", "failed": "失败"}
             title = str(tool.get("title") or tool.get("kind") or "工具")
             label = status.get(tool.get("status"))
+            raw_output = tool.get("rawOutput")
+            exit_code = raw_output.get("exit_code") if isinstance(raw_output, dict) else None
+            if label and type(exit_code) is int and exit_code != 0:
+                label += f"（退出码 {exit_code}）"
             summary = f"{label}：{title}" if label else title
-            return f"tool:{item_id}", "tool", summary, "\n\n".join((summary, *_tool_details(tool)))
+            return self._changed(f"tool:{item_id}", "tool", summary, "\n\n".join((summary, *_tool_details(tool))))
         if kind == "plan":
-            parts = [str(entry["content"]) for entry in update.get("entries") or ()
-                     if isinstance(entry, dict) and entry.get("content")]
+            status_names = {"pending": "等待", "in_progress": "执行中", "completed": "已完成"}
+            parts = []
+            for entry in update.get("entries") or ():
+                if isinstance(entry, dict) and isinstance(entry.get("content"), str) and entry["content"]:
+                    status = status_names.get(entry.get("status"))
+                    parts.append(f"{status}：{entry['content']}" if status else entry["content"])
             if parts:
-                return "plan", "plan", "AGY 计划", "\n".join(parts)
+                return self._changed("plan", "plan", "AGY 计划", "\n".join(parts))
         if kind == "steer_error":
             return (f"steer-error:{update['requestId']}", "error",
                     "AGY 追加失败，原请求继续执行", update["text"])

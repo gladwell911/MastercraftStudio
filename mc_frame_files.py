@@ -10,6 +10,7 @@ from remote_nats_protocol import build_file_command_event
 from urllib.parse import quote
 
 import mc_frame_bindings as bindings
+from agy_acp import AGY_MODEL_ID
 
 
 class FileManagerMixin:
@@ -977,7 +978,9 @@ class FileManagerMixin:
             return False
         self._pending_input_attachments = []
         self._queue_input_attachments(attachments, update_input=False)
-        ok, message = self._submit_question("", source="local")
+        chat, _, _ = self._chat_target_for_request(self._visible_clear_owner())
+        question = self.input_edit.GetValue() if (chat or {}).get("model") == AGY_MODEL_ID else ""
+        ok, message = self._submit_question(question, source="local")
         if not ok and message:
             wx.MessageBox(message, "提示", wx.OK | wx.ICON_WARNING)
         return ok

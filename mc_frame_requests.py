@@ -1020,7 +1020,9 @@ class ChatRequestsMixin:
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(owner_id, turn_idx, text, resolved_model)
             elif resolved_model == AGY_MODEL_ID:
-                started = self._start_agy_worker_for_turn(owner_id, turn_idx, text, resolved_model)
+                started = self._start_agy_worker_for_turn(
+                    owner_id, turn_idx, text, resolved_model, prepared_attachments=prepared_attachments,
+                )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     owner_id, turn_idx, text, str(chat.get("claudecode_session_id") or ""), resolved_model
@@ -1057,9 +1059,9 @@ class ChatRequestsMixin:
             self._schedule_first_question_auto_title(owner_id, text)
         return True, ""
 
-    def _preflight_claude_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
-                                           attachments) -> tuple[bool, str]:
-        if getattr(self, "_claude_attachment_preflight", None) is not None:
+    def _preflight_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
+                                    attachments, *, agy_context=None) -> tuple[bool, str]:
+        if getattr(self, "_attachment_preflight", None) is not None:
             return False, "正在检查附件，请稍候"
         expected_state = self._current_chat_state
         expected_owner = (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
@@ -1067,26 +1069,30 @@ class ChatRequestsMixin:
         expected_draft = self.input_edit.GetValue()
         attachments = copy.deepcopy(attachments)
         token = object()
-        self._claude_attachment_preflight = token
+        self._attachment_preflight = token
 
         def finish(files, prepared, error):
-            if self._claude_attachment_preflight is not token:
-                return
-            self._claude_attachment_preflight = None
-            if (getattr(self, "_closing", False) or self._current_chat_state is not expected_state
-                    or expected_owner != (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
-                    or self._resolve_current_model() != expected_model or self.input_edit.GetValue() != expected_draft
-                    or list(self._pending_input_attachments) != attachments):
-                return
-            if not error:
-                ok, error = self._submit_question(
-                    raw_question, source, model, chat_id, client_send_id=client_send_id,
-                    _verified_attachments=(files, prepared),
-                )
-                if ok:
+            try:
+                if self._attachment_preflight is not token:
                     return
-            if error:
-                wx.MessageBox(error, "附件发送失败", wx.OK | wx.ICON_WARNING)
+                self._attachment_preflight = None
+                if (getattr(self, "_closing", False) or self._current_chat_state is not expected_state
+                        or expected_owner != (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
+                        or self._resolve_current_model() != expected_model or self.input_edit.GetValue() != expected_draft
+                        or list(self._pending_input_attachments) != attachments):
+                    return
+                if not error:
+                    ok, error = self._submit_question(
+                        raw_question, source, model, chat_id, client_send_id=client_send_id,
+                        _verified_attachments=(files, prepared),
+                    )
+                    if ok:
+                        return
+                if error:
+                    wx.MessageBox(error, "附件发送失败", wx.OK | wx.ICON_WARNING)
+            finally:
+                if agy_context is not None and prepared is not None:
+                    prepared.close_unused()
 
         def worker():
             try:
@@ -1094,16 +1100,19 @@ class ChatRequestsMixin:
                 if failed:
                     names = "、".join(item["name"] for item in failed)
                     raise ValueError(f"以下附件无法读取，请移除或修复后重试：{names}")
-                prepared = read_openrouter_claude_attachments(model, files)
+                prepared = (self._prepare_agy_attachments(agy_context, files) if agy_context is not None
+                            else read_openrouter_claude_attachments(model, files))
             except Exception as exc:
-                self._call_after_if_alive(finish, [], [], str(exc) or "无法读取附件")
+                self._call_after_if_alive(finish, [], None, str(exc) or "无法读取附件")
                 return
-            self._call_after_if_alive(finish, files, prepared, "")
+            queued = self._call_after_if_alive(finish, files, prepared, "")
+            if queued is False and agy_context is not None:
+                prepared.close_unused()
 
         try:
-            bindings.app.threading.Thread(target=worker, daemon=True, name="claude-attachment-preflight").start()
+            bindings.app.threading.Thread(target=worker, daemon=True, name="attachment-preflight").start()
         except Exception:
-            self._claude_attachment_preflight = None
+            self._attachment_preflight = None
             return False, "无法开始检查附件"
         return True, ""
 
@@ -1118,14 +1127,12 @@ class ChatRequestsMixin:
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
-        candidate, _, _ = self._chat_target_for_request(chat_id or self._visible_clear_owner())
+        candidate, candidate_turns, _ = self._chat_target_for_request(chat_id or self._visible_clear_owner())
         if (candidate or {}).get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
-        if resolved_model == AGY_MODEL_ID and requested_attachments:
-            return False, "此版本的 AGY 聊天暂不支持附件"
         if resolved_model == AGY_MODEL_ID:
-            if source == "local" and q and isinstance(candidate, dict) and candidate.get("id"):
+            if source == "local" and q and not requested_attachments and isinstance(candidate, dict) and candidate.get("id"):
                 control = self._handle_agy_control(candidate, q, local=True)
                 if control is not None:
                     ok, message = control
@@ -1135,11 +1142,16 @@ class ChatRequestsMixin:
                             self.SetStatusText(message)
                     return control
             try:
+                if requested_attachments and _verified_attachments is None:
+                    return self._preflight_attachment_draft(
+                        raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
+                        agy_context=self._agy_attachment_context(candidate or {}, candidate_turns),
+                    )
                 self._validate_agy_submission(candidate or {})
             except AgyError as exc:
                 return False, str(exc)
         if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:
-            return self._preflight_claude_attachment_draft(
+            return self._preflight_attachment_draft(
                 raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
             )
         prepared_attachments = None
@@ -1499,7 +1511,8 @@ class ChatRequestsMixin:
                 started = self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
             elif resolved_model == AGY_MODEL_ID:
                 started = self._start_agy_worker_for_turn(
-                    chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model
+                    chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model,
+                    prepared_attachments=prepared_attachments,
                 )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(

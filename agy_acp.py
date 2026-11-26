@@ -2,6 +2,7 @@
 
 from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass, field
+import base64
 import hashlib
 import itertools
 import json
@@ -16,10 +17,65 @@ import uuid
 AGY_MODEL_ID = "agy/main"
 AGY_WORKSPACE_CAPABILITY = "agy-workspace-v1"
 AGY_CHAT_FIELDS = ("agy_workspace", "agy_session_id", "agy_native_owner", "agy_config", "agy_options")
+AGY_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+}
+AGY_TEXT_EXTENSIONS = {
+    ".txt", ".text", ".md", ".markdown", ".csv", ".tsv", ".log",
+    ".rst", ".json", ".yaml", ".yml", ".xml",
+}
+MAX_AGY_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
 
 class AgyError(RuntimeError):
     pass
+
+
+def read_prompt_attachments(capabilities: dict, attachments: list[dict]) -> list[dict]:
+    """Build ACP blocks from the selected files using the current handshake."""
+    prompt_capabilities = capabilities.get("promptCapabilities")
+    if not isinstance(prompt_capabilities, dict):
+        prompt_capabilities = {}
+    blocks = []
+    remaining = MAX_AGY_ATTACHMENT_BYTES
+    for attachment in attachments:
+        path = Path(attachment["path"])
+        name = attachment["name"]
+        extension = path.suffix.casefold()
+        image_mime = AGY_IMAGE_MIME.get(extension)
+        if image_mime:
+            if prompt_capabilities.get("image") is not True:
+                raise AgyError(f"此电脑的 AGY 未提供图片附件能力：{name}")
+        elif extension in AGY_TEXT_EXTENSIONS:
+            if prompt_capabilities.get("embeddedContext") is not True:
+                raise AgyError(f"此电脑的 AGY 未提供内嵌资源能力：{name}")
+        else:
+            raise AgyError(f"AGY 无法发送此类附件：{name}。请选择图片或 UTF-8 文本文件。")
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(remaining + 1)
+        except OSError as exc:
+            raise AgyError(f"无法读取附件：{name}") from exc
+        if len(data) > remaining:
+            raise AgyError(f"本次 AGY 附件总大小超出 32 MiB：{name}")
+        if not data:
+            raise AgyError(f"附件没有内容：{name}")
+        remaining -= len(data)
+        if image_mime:
+            blocks.append({"type": "image", "mimeType": image_mime, "data": base64.b64encode(data).decode("ascii")})
+            continue
+        try:
+            encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+            text = data.decode(encoding)
+            if "\x00" in text:
+                raise ValueError
+        except ValueError as exc:
+            raise AgyError(f"请将文本附件保存为 UTF-8 或带 BOM 的 UTF-16：{name}") from exc
+        blocks.append({"type": "resource", "resource": {
+            "uri": path.absolute().as_uri(), "mimeType": "text/plain", "text": text,
+        }})
+    return blocks
 
 
 @dataclass
@@ -341,22 +397,24 @@ class AgyAcpClient:
             result = self.request(method, params)
             self.options = configuration_options(result) or self.options
 
-    def begin_prompt(self, question, on_update, on_interaction) -> AgyPrompt:
+    def begin_prompt(self, question, on_update, on_interaction, *, attachments=()) -> AgyPrompt:
         with self._lock:
             if self._turn is not None:
                 raise AgyError("此 AGY 聊天正在执行")
             turn = self._turn = AgyPrompt(on_update, on_interaction)
             try:
-                self._send_prompt(turn, question)
+                self._send_prompt(turn, question, attachments=attachments)
             except AgyError:
                 self._turn = None
                 raise
             return turn
 
-    def _send_prompt(self, turn, question):
+    def _send_prompt(self, turn, question, *, attachments=()):
         request_id = next(self._ids)
+        prompt = [{"type": "text", "text": question}] if question else []
+        prompt.extend(attachments)
         self._send({"id": request_id, "method": "session/prompt", "params": {
-            "sessionId": self.session_id, "prompt": [{"type": "text", "text": question}],
+            "sessionId": self.session_id, "prompt": prompt,
         }})
         turn.request_ids.append(request_id)
 

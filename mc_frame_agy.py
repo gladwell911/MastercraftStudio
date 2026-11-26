@@ -7,7 +7,10 @@ import uuid
 
 import wx
 
-from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, find_agy_executable, selected_options, validate_workspace
+from agy_acp import (
+    AGY_MODEL_ID, AgyAcpClient, AgyError, find_agy_executable,
+    read_prompt_attachments, selected_options, validate_workspace,
+)
 from agy_execution import AgyExecution, interaction_questions, interaction_result
 
 
@@ -30,6 +33,29 @@ class AgyRun:
 
     def __post_init__(self):
         self.action_id = self.turn_id
+
+
+@dataclass
+class AgyPreparedAttachments:
+    scope: tuple
+    client: AgyAcpClient
+    blocks: list
+    fresh_client: bool
+    _available: bool = True
+    _lock: object = field(default_factory=threading.Lock)
+
+    def adopt(self, scope):
+        with self._lock:
+            if not self._available or scope != self.scope or not self.client.alive:
+                raise AgyError("AGY 会话已变化，请重新发送附件")
+            self._available = False
+
+    def close_unused(self):
+        with self._lock:
+            close = self._available and self.fresh_client
+            self._available = False
+        if close:
+            self.client.close()
 
 
 class AgySessionsMixin:
@@ -199,7 +225,26 @@ class AgySessionsMixin:
             raise AgyError("请先为 AGY 新建聊天并选择项目目录")
         return validate_workspace(str(chat.get("agy_workspace") or ""))
 
-    def _start_agy_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str) -> None:
+    def _agy_attachment_context(self, chat, turns):
+        cwd = self._validate_agy_submission(chat)
+        client = self._agy_clients.get(chat["id"]) if not turns else None
+        return cwd, self._agy_chat_scope(chat), client if client and client.alive else None
+
+    def _prepare_agy_attachments(self, context, files):
+        cwd, scope, client = context
+        _, session_id, owner, native_identity, _, _ = scope
+        fresh = client is None
+        if fresh:
+            client = self._open_agy_client(cwd, session_id=session_id, owner=owner, native_identity=native_identity)
+        try:
+            return AgyPreparedAttachments(scope, client, read_prompt_attachments(client.capabilities, files), fresh)
+        except BaseException:
+            if fresh:
+                client.close()
+            raise
+
+    def _start_agy_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str, *,
+                                   prepared_attachments=None) -> None:
         chat, turns, _ = self._chat_target_for_request(chat_id)
         cwd = str(chat["agy_workspace"])
         session_id = self._agy_session_id_for_chat(chat)
@@ -211,6 +256,8 @@ class AgySessionsMixin:
         turn["request_recoverable"] = False
         turn["request_resume_token"] = {"session_id": session_id}
         run = AgyRun(turn_idx, self._bind_provider_turn(chat_id, turn_idx), self._agy_chat_scope(chat))
+        if prepared_attachments is not None:
+            prepared_attachments.adopt(run.scope)
         self._agy_busy[chat_id] = run
         client = self._agy_clients.get(chat_id)
         full = []
@@ -273,15 +320,19 @@ class AgySessionsMixin:
                     self.SetStatusText(error)
 
         def work():
-            active_client = client
+            active_client = prepared_attachments.client if prepared_attachments is not None else client
             reason = error = ""
             try:
                 validate_workspace(cwd)
                 # Idle ACP processes do not see work accepted by a separate terminal.
-                if turn_idx > 0 and active_client is not None:
+                if prepared_attachments is not None and client is not None and client is not active_client:
+                    client.close()
+                elif prepared_attachments is None and turn_idx > 0 and active_client is not None:
                     active_client.close()
                     active_client = None
                 if active_client is None or not active_client.alive:
+                    if prepared_attachments is not None:
+                        raise AgyError("用于检查附件的 AGY 连接已退出，请重新发送")
                     active_client = self._open_agy_client(
                         cwd, session_id=session_id, owner=owner, native_identity=native_identity)
                 elif (active_client.session_id != session_id
@@ -291,7 +342,10 @@ class AgySessionsMixin:
                 active_client.configure(config, options)
                 if getattr(self, "_closing", False):
                     raise AgyError("MC 正在退出")
-                run.prompt = active_client.begin_prompt(question, on_update, on_interaction)
+                run.prompt = active_client.begin_prompt(
+                    question, on_update, on_interaction,
+                    attachments=prepared_attachments.blocks if prepared_attachments is not None else (),
+                )
                 run.client = active_client
                 reason = run.prompt.wait()
             except AgyError as exc:
@@ -309,7 +363,13 @@ class AgySessionsMixin:
                     if active_client is not None:
                         active_client.close()
 
-        threading.Thread(target=work, name="agy-prompt", daemon=True).start()
+        try:
+            threading.Thread(target=work, name="agy-prompt", daemon=True).start()
+        except Exception:
+            self._agy_busy.pop(chat_id, None)
+            if prepared_attachments is not None and prepared_attachments.fresh_client:
+                prepared_attachments.client.close()
+            raise
 
     def _deliver_agy_events(self, chat_id, run, batch):
         chat, _, _ = self._chat_target_for_request(chat_id)
@@ -390,8 +450,8 @@ class AgySessionsMixin:
         run.interactions[interaction_id] = (method, prompt, questions)
         self._push_remote_attention(chat_id, "action_required", interaction_id, "AGY 需要您的确认或输入")
         self._update_agy_remote_state(chat_id)
-        if self.IsShownOnScreen() and self._visible_clear_owner() == chat_id:
-            self._call_after_if_alive(self._show_agy_interaction, chat_id, interaction_id)
+        if self.IsShownOnScreen() and self._is_foreground_window() and self._visible_clear_owner() == chat_id:
+            self._call_after_if_alive(self._show_agy_interaction, chat_id, interaction_id, only_foreground=True)
 
     def _agy_interaction_payload(self, chat_id, run):
         if not run or not run.interactions:
@@ -431,7 +491,9 @@ class AgySessionsMixin:
         self._update_agy_remote_state(chat_id)
         return (True, "已回复 AGY。") if accepted else (False, "此 AGY 请求已处理或过期。")
 
-    def _show_agy_interaction(self, chat_id, interaction_id):
+    def _show_agy_interaction(self, chat_id, interaction_id, *, only_foreground=False):
+        if only_foreground and not self._is_foreground_window():
+            return
         chat, _, _ = self._chat_target_for_request(chat_id)
         run = self._agy_run_for_chat(chat)
         if (not run or run.dialog is not None or self._visible_clear_owner() != chat_id

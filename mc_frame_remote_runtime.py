@@ -743,7 +743,7 @@ class RemoteRuntimeMixin:
                     pair_id=self._read_pair_id(),
                     token=token,
                     desktop_password=config.desktop_password,
-                    on_message=lambda payload: self._run_remote_ui_route(self._remote_api_message_ui, payload),
+                    on_message=self._remote_api_message,
                     on_new_chat=self._remote_api_new_chat,
                     on_agy_configure=lambda payload: self._run_remote_ui_route(self._remote_api_agy_configure_ui, payload),
                     on_reply_request=lambda payload: self._run_remote_ui_route(self._remote_api_reply_request_ui, payload),

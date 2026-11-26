@@ -721,7 +721,31 @@ class RemoteRoutesMixin:
         chat.update(self._codex_speed_payload_for_chat(chat))
         return chat
 
-    def _remote_chat_attachment_message_ui(self, payload: dict) -> tuple[int, dict]:
+    def _remote_api_message(self, payload: dict) -> tuple[int, dict]:
+        if "attachment_file_ids" not in payload:
+            return self._run_remote_ui_route(self._remote_api_message_ui, payload)
+        preflight = []
+
+        def check_attachment_route(data):
+            return self._remote_chat_attachment_message_ui(data, agy_preflight=preflight)
+
+        response = self._run_remote_ui_route(check_attachment_route, payload)
+        if response[0] != 200 or not preflight:
+            return response
+        try:
+            prepared = self._prepare_agy_attachments(*preflight[0])
+        except AgyError as exc:
+            return 400, {"accepted": False, "error": str(exc)}
+        try:
+            return self._run_remote_ui_route(
+                lambda data: self._remote_chat_attachment_message_ui(data, agy_prepared=prepared), payload,
+            )
+        finally:
+            prepared.close_unused()
+
+    def _remote_chat_attachment_message_ui(
+        self, payload: dict, *, agy_preflight=None, agy_prepared=None,
+    ) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         send_id = str(payload.get("client_send_id") or "").strip()
         scope = self._remote_attachment_scope(payload, send_id)
@@ -765,7 +789,23 @@ class RemoteRoutesMixin:
         if error:
             return 400, {"accepted": False, "error": error}
         prepared_attachments = None
-        if is_openrouter_claude_model(model):
+        if isinstance(target, dict) and target.get("agy_workspace") and model != AGY_MODEL_ID:
+            return 400, {"accepted": False, "error": "请为其他提供方新建聊天"}
+        if model == AGY_MODEL_ID:
+            if not isinstance(target, dict):
+                return 404, {"accepted": False, "error": "找不到此电脑上的 AGY 聊天"}
+            if agy_preflight is not None:
+                _, turns, _ = self._chat_target_for_request(chat_id)
+                try:
+                    context = self._agy_attachment_context(target, turns)
+                except AgyError as exc:
+                    return 400, {"accepted": False, "error": str(exc)}
+                agy_preflight.append((context, attachments))
+                return 200, {}
+            if agy_prepared is None or agy_prepared.scope != self._agy_chat_scope(target):
+                return 409, {"accepted": False, "error": "AGY 会话已变化，请重新发送附件"}
+            prepared_attachments = agy_prepared
+        elif is_openrouter_claude_model(model):
             try:
                 prepared_attachments = read_openrouter_claude_attachments(model, attachments)
             except ValueError as exc:
@@ -855,7 +895,7 @@ class RemoteRoutesMixin:
             if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
-        if archived_target is None and bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
+        if model != AGY_MODEL_ID and archived_target is None and bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             self.input_edit.SetValue(text)
         title_revision_before = 0
         if isinstance(target_chat, dict):
@@ -863,7 +903,12 @@ class RemoteRoutesMixin:
                 title_revision_before = int(target_chat.get("title_revision") or 0)
             except Exception:
                 title_revision_before = 0
-        if archived_target is not None:
+        if model == AGY_MODEL_ID:
+            ok, message = self._submit_archived_remote_question(
+                target_chat, text, model, client_send_id=str(payload.get("client_send_id") or ""),
+                active=archived_target is None,
+            )
+        elif archived_target is not None:
             ok, message = self._submit_archived_remote_question(archived_target, text, model, client_send_id=str(payload.get("client_send_id") or ""))
         else:
             ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id, client_send_id=str(payload.get("client_send_id") or ""))
