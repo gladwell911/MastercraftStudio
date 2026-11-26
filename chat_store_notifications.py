@@ -7,6 +7,7 @@ import json
 import sqlite3
 import uuid
 from chat_store_execution import _DISCLOSABLE_EXECUTION_FACT
+from native_history import allows_final_notification
 from chat_store_schema import MAX_INT64
 from typing import Any
 
@@ -230,6 +231,8 @@ class ChatStoreNotificationsMixin:
                 conn.commit()
                 raise ValueError("EVENT_ID_CONFLICT")
             return original
+        if expected_role == "assistant" and not allows_final_notification(turn, normalized_pair):
+            raise ValueError("HISTORICAL_FINAL")
         canonical_title = str(row["title"] or "").strip()
         if not canonical_text.strip() or not canonical_title:
             raise ValueError("INCOMPLETE_CANONICAL_NOTIFICATION")
@@ -435,7 +438,16 @@ class ChatStoreNotificationsMixin:
         if chat_id is not None:
             sql = sql.replace("WHERE NOT EXISTS", "WHERE a.chat_id=? AND NOT EXISTS", 1)
             args = (chat_id, pair_id)
-        candidates = conn.execute(sql + " AND COALESCE(json_extract(t.payload_json,'$.native_history'),0)=0 AND json_extract(t.payload_json,'$.request_status')='done' AND length(trim(json_extract(t.payload_json,'$.answer_md')))>0 AND length(trim(c.title))>0 LIMIT 100", args).fetchall()
+        candidates = conn.execute(
+            sql + " AND (COALESCE(json_extract(t.payload_json,'$.native_history'),0)=0"
+            " OR json_extract(t.payload_json,'$.native_final_notify_pair')=?)"
+            " AND COALESCE(json_extract(t.payload_json,'$.terminal_final_pending'),0)=0"
+            " AND COALESCE(NULLIF(json_extract(t.payload_json,'$.terminal_notification_pair'),''),?)=?"
+            " AND json_extract(t.payload_json,'$.request_status')='done'"
+            " AND length(trim(json_extract(t.payload_json,'$.answer_md')))>0"
+            " AND length(trim(c.title))>0 LIMIT 100",
+            (*args, pair_id, pair_id, pair_id),
+        ).fetchall()
         for row in candidates:
             turn = self._json_dict(row["payload_json"])
             if turn.get("request_status") == "done" and str(turn.get("answer_md") or "").strip():

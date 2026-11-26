@@ -1009,6 +1009,8 @@ class ChatRequestsMixin:
             "question_origin": source,
             "client_send_id": client_send_id,
         }
+        if source == "terminal":
+            turn["terminal_notification_pair"] = self._read_pair_id()
         if expected_kimi_prompt_id:
             turn["kimi_expected_prompt_id"] = expected_kimi_prompt_id
         if attachments:

@@ -1,4 +1,4 @@
-﻿import os
+import os
 from pathlib import Path
 
 import pytest
@@ -205,12 +205,21 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
                         return status == 200 and any('NATIVE_TAIL_04' in row['list_text'] for row in page['rows'])
 
                     wait_for_wx(remote_has_step, 'RC execution projection before Codex completion')
+                    frame.chat_store.notification_sync(pair_id="default", device_id="private-device",
+                                                       baseline=0, incarnation="test", secret="test")
+                    assert not frame.chat_store.pending_outbox(pair_id="default", lane="notification")
                     assert observed_turn()['request_status'] in {'pending', 'running'}
                     release.set()
                     wait_for_wx(lambda: observed_turn()['request_status'] == 'done', 'terminal final in MC')
                     assert observed_turn()['codex_turn_id'] == turn_id
+                    assert frame._flush_execution_step_persists_sync()
+                    frame._flush_codex_background_updates()
                     status, body = remote._route_command({'type': 'history_read', 'chat_id': owner})
                     assert status == 200 and body['chat']['turns'][-1]['answer'] == text
+                    wait_for_wx(lambda: frame.chat_store.pending_outbox(pair_id="default", lane="notification"),
+                                "the durable Codex notification")
+                    fact, = frame.chat_store.pending_outbox(pair_id="default", lane="notification")
+                    assert body['chat']['turns'][-1]['message_id'] in fact["event_id"]
                     release.clear()
                     pty.close(force=True)
                     pty = spawn_tui('Second native question')
@@ -246,10 +255,13 @@ def test_native_tui_turn_is_visible_to_mc_and_remote_reader_before_completion(fr
                     wait_for_wx(lambda: pending_approval() is None and observed_turn()['request_status'] == 'done',
                                 'terminal approval and final reply')
                     assert remote._route_command(decision)[0] == 400
-                    status, projection = remote._route_command({'type': 'execution_page_v3', 'chat_id': owner})
-                    assert status == 200
-                    assert any('MC_APPROVAL_TEST_OUTPUT' in row.get('detail_text', '').splitlines()
-                               for row in projection['rows'])
+                    def approval_output_is_available():
+                        status, projection = remote._route_command({'type': 'execution_page_v3', 'chat_id': owner})
+                        assert status == 200 or projection.get("error") == "EXECUTION_SOURCE_PENDING", projection
+                        return any('MC_APPROVAL_TEST_OUTPUT' in row.get('detail_text', '').splitlines()
+                                   for row in projection.get('rows', []))
+
+                    wait_for_wx(approval_output_is_available, 'completed terminal approval output')
                     pty.close(force=True)
                     pty = spawn_tui('Synthetic structured question')
                     wait_for_wx(pending_approval, 'Codex TUI structured question on RC')

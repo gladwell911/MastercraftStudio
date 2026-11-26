@@ -127,6 +127,8 @@ class _AgyReplay:
             "model": AGY_MODEL_ID, "provider": "agy", "session_id": self.session_id,
             "turn_id": turn_id, "native_history": True,
         }
+        if isinstance(event.get("turnId"), str) and event["turnId"]:
+            self.turn["agy_native_turn_id"] = event["turnId"]
         message_id = event.get("messageId")
         if event.get("sessionUpdate") == "user_message_chunk" and isinstance(message_id, str):
             self.turn["provider_user_message_id"] = message_id

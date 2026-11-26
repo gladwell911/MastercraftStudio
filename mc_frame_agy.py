@@ -274,6 +274,7 @@ class AgySessionsMixin:
         self._agy_busy[chat_id] = run
         client = self._agy_clients.get(chat_id)
         full = []
+        native_final = {}
         batch = []
         lock = threading.Lock()
         timer = None
@@ -303,6 +304,9 @@ class AgySessionsMixin:
                 text = content.get("text") if isinstance(content, dict) else None
                 if isinstance(text, str) and text:
                     full.append(text)
+                    for source, target in (("turnId", "agy_native_turn_id"), ("messageId", "provider_message_id")):
+                        if isinstance(update.get(source), str) and update[source]:
+                            native_final[target] = update[source]
                     enqueue("delta", text)
             else:
                 enqueue("update", update)
@@ -327,6 +331,8 @@ class AgySessionsMixin:
                     error = "AGY 回合已停止。"
                 elif reason != "end_turn" and not error:
                     error = f"AGY 回合已结束：{reason or '缺少终态'}"
+                if not error and reason == "end_turn":
+                    current_turns[turn_idx].update(native_final)
                 self._invalidate_remote_state_cache()
                 self._on_done(turn_idx, answer, error, model, "", chat_id)
                 if error and self._visible_clear_owner() == chat_id:

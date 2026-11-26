@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -713,10 +714,13 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 return "", 0
             row = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (owner,)).fetchone()
             metadata = self._metadata_from_row(row) if row else {}
-            return owner, self._float_or(metadata.get("native_replayed_at"), 0)
+            # Existing archives get one successful observation after upgrade.
+            replayed_at = metadata.get("native_replayed_at") if metadata.get("native_notification_baseline") else 0
+            return owner, self._float_or(replayed_at, 0)
 
     def merge_native_history(self, snapshot: NativeSessionSnapshot, *, expected_chat_id: str,
-                             expected_revision: int = 0, merge_title: bool = True) -> dict | None:
+                             expected_revision: int = 0, merge_title: bool = True,
+                             observed_between: tuple[float, float] | None = None) -> dict | None:
         """Commit only an append-compatible replay to the chat that authorized it."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -751,17 +755,31 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             )
             old_count = int(previous.get("turn_count", 0))
             appended = 0
+            recovered = {}
+            accepted_replay = False
             if snapshot.turns is not None and len(snapshot.turns) >= old_count:
                 stored = (self._json_dict(entry[0]) for entry in conn.execute(
                     "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
                 ))
-                if all(self._native_turn_matches(old, new) for old, new in zip(stored, snapshot.turns)):
+                for index, (old, new) in enumerate(zip(stored, snapshot.turns)):
+                    if self._can_recover_terminal_final(snapshot.identity, old, new):
+                        recovered[index] = dict(old, answer_md=new["answer_md"], request_status="done",
+                                                request_error="", terminal_final_pending=False,
+                                                provider_message_id=new["provider_message_id"])
+                        if new.get("answer_at"):
+                            recovered[index]["answer_at"] = new["answer_at"]
+                    elif not self._native_turn_matches(old, new):
+                        recovered.clear()
+                        chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
+                        break
+                else:
                     chat["native_replayed_at"] = snapshot.updated_at
+                    accepted_replay = True
                     appended = len(snapshot.turns) - old_count
-                elif old_count:
-                    chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
             chat.setdefault("created_at", snapshot.updated_at)
-            if not previous or appended:
+            if snapshot.identity.provider == "codex" and old_count - 1 in recovered:
+                chat["codex_turn_active"] = False
+            if not previous or appended or recovered:
                 chat["updated_at"] = max(previous.get("updated_at", 0), snapshot.updated_at)
             if not previous:
                 chat.update(title=snapshot.title or snapshot.cwd, title_source="native",
@@ -771,11 +789,29 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 merge_native_title(chat, snapshot.identity.provider, snapshot.title,
                                    snapshot.title_observed_at or snapshot.updated_at,
                                    explicit=snapshot.title_explicit)
-            if chat == previous and not appended:
+            baseline = self._float_or(previous.get("native_notification_baseline"), 0)
+            observed_until = 0.0
+            if accepted_replay and not snapshot.status and observed_between:
+                started_at, finished_at = observed_between
+                if 0 < started_at <= finished_at and math.isfinite(finished_at):
+                    observed_until = finished_at
+                    if not baseline:
+                        chat["native_notification_baseline"] = finished_at
+            if chat == previous and not appended and not recovered:
                 return None
             self._upsert_chat_conn(conn, chat)
+            for index, turn in recovered.items():
+                conn.execute("UPDATE turns SET payload_json=? WHERE chat_id=? AND turn_index=?",
+                             (json.dumps(turn, ensure_ascii=False), owner, index))
+                self._backfill_canonical_turns_conn(conn, owner, [turn], index)
+            incoming = []
             if appended:
-                incoming = [dict(turn, native_history=True) for turn in snapshot.turns[old_count:]]
+                for replayed in snapshot.turns[old_count:]:
+                    turn = dict(replayed, native_history=True)
+                    turn.pop("native_final_notify_pair", None)
+                    if baseline and self._is_new_native_final(turn, baseline, observed_until):
+                        turn["native_final_notify_pair"] = snapshot.identity.pair_id
+                    incoming.append(turn)
                 conn.executemany(
                     "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?)",
                     [(owner, index, json.dumps(turn, ensure_ascii=False))
@@ -785,7 +821,11 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 for step in snapshot.execution_steps:
                     if old_count <= step["turn_idx"] < len(snapshot.turns):
                         self._append_execution_step_on_conn(conn, owner, step)
+            if (recovered or any(turn.get("native_final_notify_pair") for turn in incoming)) and self.v2_writes_enabled:
+                self._reconcile_notification_finals_conn(conn, snapshot.identity.pair_id, owner)
             chat["turn_count"] = old_count + appended
+            if recovered:
+                chat["_recovered_terminal_turns"] = list(recovered)
             return chat
 
     def apply_native_session_title(self, chat_id, scope, revision, provider, title, observed_at, *,
@@ -810,10 +850,44 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             return changed
 
     @staticmethod
+    def _can_recover_terminal_final(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
+        # Managed admission persisted the owner before the original process
+        # exited. A matching, settled provider turn may finish that same row.
+        keys = {"codex": ("codex_thread_id", "codex_turn_id"),
+                "kimi": ("kimi_session_id", "kimi_turn_id")}.get(identity.provider)
+        if not keys or stored.get("terminal_notification_pair") != identity.pair_id:
+            return False
+        session_key, turn_key = keys
+        return (stored.get("request_status") in {"pending", "running", "failed"}
+                and stored.get(session_key) == replayed.get(session_key) == identity.session_id
+                and bool(stored.get(turn_key)) and stored[turn_key] == replayed.get(turn_key)
+                and replayed.get("native_final_explicit") is True and replayed.get("request_status") == "done"
+                and bool(str(replayed.get("answer_md") or "").strip())
+                and bool(replayed.get("provider_message_id"))
+                and stored.get("provider_message_id") in (None, "", replayed["provider_message_id"]))
+
+    def _is_new_native_final(self, turn: dict, baseline: float, observed_until: float) -> bool:
+        # Provider turn times distinguish new replies from delayed indexing.
+        # Session mtime, list position and the time of discovery cannot do that.
+        started_at = self._float_or(turn.get("created_at"), 0)
+        finished_at = self._float_or(turn.get("answer_at"), 0)
+        return (turn.get("native_final_explicit") is True and turn.get("request_status") == "done"
+                and all(isinstance(turn.get(key), str) and turn[key].strip()
+                        for key in ("turn_id", "provider_message_id", "answer_md"))
+                and baseline < started_at <= finished_at <= observed_until)
+
+    @staticmethod
     def _native_turn_matches(stored: dict, replayed: dict) -> bool:
-        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id", "codex_turn_id"):
+        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id",
+                    "codex_turn_id", "kimi_turn_id", "agy_native_turn_id"):
             if stored.get(key) and replayed.get(key) and stored[key] != replayed[key]:
                 return False
+        provider_turn = {"codex": "codex_turn_id", "kimi": "kimi_turn_id",
+                         "agy": "agy_native_turn_id"}.get(replayed.get("provider"))
+        if (provider_turn and stored.get(provider_turn) and stored[provider_turn] == replayed.get(provider_turn)
+                and stored.get("provider_message_id")
+                and stored["provider_message_id"] == replayed.get("provider_message_id")):
+            return True
         if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question")):
             return False
         old_answer = str(stored.get("answer_md") or "")
@@ -1026,7 +1100,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 if payload.get(content_key) is None:
                     continue
                 conn.execute(
-                    "INSERT OR IGNORE INTO canonical_messages(message_id,turn_id,chat_id,role,provider_kind,provider_message_id,legacy_turn_index) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO canonical_messages(message_id,turn_id,chat_id,role,provider_kind,provider_message_id,legacy_turn_index) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id,legacy_turn_index,role) DO UPDATE SET "
+                    "provider_message_id=excluded.provider_message_id "
+                    "WHERE canonical_messages.provider_message_id='' AND excluded.provider_message_id<>''",
                     (f"message-{uuid.uuid4().hex}", str(canonical["turn_id"]), chat_id, role,
                      provider, str(payload.get(provider_key) or ""), start + offset),
                 )

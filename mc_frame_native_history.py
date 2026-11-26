@@ -249,15 +249,15 @@ class NativeHistoryMixin:
             return 409, {}
         chat = (self._current_chat_state if chat_id == self.active_chat_id
                 else self._chat_summary_by_id(chat_id)) or {}
-        if chat.get("codex_turn_active") or chat.get("kimi_turn_active"):
+        if ((chat.get("codex_turn_active") and chat_id in getattr(self, "_codex_clients", {}))
+                or chat.get("kimi_turn_active")):
             return 409, {}
-        # Replaying a just-completed managed turn ahead of its durable save
-        # would append a native copy without its app/terminal correlation.
-        if session.identity.provider == "kimi" and chat_id in self._chat_turn_dirty_from:
+        # A managed turn must reach its canonical row before history can compare it.
+        if chat_id in self._chat_turn_dirty_from:
             return 409, {}
         turns = chat.get("turns") or []
         latest = turns[-1] if turns else {}
-        if latest.get("request_status") == "pending":
+        if latest.get("request_status") == "pending" and not latest.get("terminal_notification_pair"):
             return 409, {}
         authority = (chat.get("id"), chat.get("updated_at"), chat.get("revision"), len(turns),
                      latest.get("request_generation"), latest.get("request_status"))
@@ -287,8 +287,11 @@ class NativeHistoryMixin:
                     if status != 200:
                         continue
                     revision = self.chat_store.get_clear_reconciliation_authority(owner)["revision"]
+                    observed_between = None
                     if not session.updated_at or session.updated_at > replayed_at:
+                        started_at = time.time()
                         read_session(session)
+                        observed_between = (started_at, time.time())
                     status, _ = self._run_remote_ui_route(
                         lambda: self._native_history_authority_ui(session, owner, reserve=True, expected=authority))
                     if status != 200:
@@ -298,7 +301,8 @@ class NativeHistoryMixin:
                     try:
                         changed = self.chat_store.merge_native_history(
                             session, expected_chat_id=owner, expected_revision=revision,
-                            merge_title=owner not in self._native_title_pending)
+                            merge_title=owner not in self._native_title_pending,
+                            observed_between=observed_between)
                         if changed is not None and session.turns:
                             turns = self.chat_store.load_turns(owner)
                     finally:
@@ -313,9 +317,10 @@ class NativeHistoryMixin:
         active = owner == self.active_chat_id
         target = self._current_chat_state if active else self._chat_summary_by_id(owner)
         prior_count = int((target or {}).get("turn_count") or len((target or {}).get("turns") or []))
-        title_only = bool(target) and changed["turn_count"] == prior_count and all(
+        recovered = changed.pop("_recovered_terminal_turns", [])
+        title_only = bool(target) and not recovered and changed["turn_count"] == prior_count and all(
             target.get(field) == changed.get(field) for field in NATIVE_CHAT_FIELDS
-            if field not in (*_NATIVE_TITLE_FIELDS, "native_updated_at", "native_replayed_at")
+            if field not in (*_NATIVE_TITLE_FIELDS, "native_updated_at", "native_replayed_at", "native_notification_baseline")
         )
         prior_titles = ((target or {}).get("title_revision"), (target or {}).get("native_title_revision"))
         if session.identity.provider == "agy" and changed["turn_count"] > prior_count:
@@ -332,16 +337,29 @@ class NativeHistoryMixin:
                            if field in changed and field not in _NATIVE_TITLE_FIELDS})
             target["updated_at"] = max(target.get("updated_at", 0), changed["updated_at"])
             target["turn_count"] = changed["turn_count"]
-            if turns is not None and isinstance(target.get("turns"), list) and len(turns) > len(target["turns"]):
-                target["turns"].extend(turns[len(target["turns"]):])
+            cached = target.get("turns")
+            if turns is not None and isinstance(cached, list):
+                for index in recovered:
+                    if index < len(cached):
+                        cached[index] = turns[index]
+                appended = len(turns) > len(cached)
+                cached.extend(turns[len(cached):])
+            else:
+                appended = False
+            if recovered or appended:
                 target.pop("execution_steps", None)
+                if recovered and session.identity.provider == "codex" and not changed.get("codex_turn_active"):
+                    target["codex_turn_active"] = False
+                    if active:
+                        self.active_codex_turn_active = False
                 if active:
                     self.active_turn_idx = len(self.active_session_turns) - 1
                 if (active and self.view_mode == "active") or self.view_history_id == owner:
                     if not self._navigation_quiet_active():
                         self._render_answer_list(preserve_panel=True)
         self._sort_archived_chats()
-        self._upsert_history_row(owner, allow_reorder=target is None or changed["turn_count"] > prior_count)
+        self._upsert_history_row(owner, allow_reorder=target is None or bool(recovered)
+                                 or changed["turn_count"] > prior_count)
         if title_only:
             if prior_titles != (target.get("title_revision"), target.get("native_title_revision")):
                 self._push_remote_title_changed(target)

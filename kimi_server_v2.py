@@ -16,7 +16,7 @@ from kimi_server_events import (
     _str,
     map_session_event,
 )
-from kimi_transcript import Transcript
+from kimi_transcript import Transcript, final_message_identity
 from typing import Any
 
 
@@ -452,7 +452,7 @@ class KimiServerV2Mixin:
                          origin_timestamp=_provider_origin_timestamp({"timestamp": turn.get("endedAt")}),
                          data={"prompt_id": turn["triggerPromptId"], "agent_id": "main", "agent_scope": "main",
                                "authoritative": True, "source_kind": source_kind, "terminal_verified": True,
-                               "stream_complete": True})
+                               "stream_complete": True, "provider_message_id": final_message_identity(turn)})
 
     def _consume_v2(self, message: dict, *, ws: Any = None, generation: int | None = None) -> None:
         body = _payload_of(message)
