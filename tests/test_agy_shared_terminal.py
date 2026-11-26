@@ -67,6 +67,8 @@ for line in sys.stdin:
     chat_id = created["chat_id"]
     session = next(chat["session_id"] for chat in listing["chats"] if chat["chat_id"] == chat_id)
     scope = {"provider": "agy", "chat_id": chat_id, "session_id": session, "request_id": uuid.uuid4().hex}
+    frame.chat_store.notification_sync(pair_id="default", device_id="private-device",
+                                       baseline=0, incarnation="test", secret="test")
     assert dispatch_terminal(frame, "send", {**scope, "text": "terminal task"})[0] == 200
 
     def watch():
@@ -83,6 +85,7 @@ for line in sys.stdin:
     frame._flush_chat_state_save()
     assert any("wait marker" in row["list_text"] for row in page()), page()
     assert watch()["state"] == "pending"
+    assert not frame.chat_store.pending_outbox(pair_id="default", lane="notification")
     assert any("wait marker" in step["text"] for step in watch()["steps"])
     before = next(row for row in page() if "wait marker" in row["list_text"])
     state = route("state", chat_id=chat_id)[1]
@@ -105,6 +108,11 @@ for line in sys.stdin:
     wait_for_wx(lambda: watch()["state"] == "done", "completed latest AGY request")
     assert watch()["answer"] == "完整中文回答 🧪 尾标"
     frame._flush_chat_state_save()
+    wait_for_wx(lambda: frame.chat_store.pending_outbox(pair_id="default", lane="notification"),
+                "the durable AGY notification")
+    fact, = frame.chat_store.pending_outbox(pair_id="default", lane="notification")
+    state = route("state", chat_id=chat_id)[1]
+    assert state["turns"][-1]["message_id"] in fact["event_id"]
     after = [row for row in page() if "wait marker" in row["list_text"]]
     assert len(after) == 1
     assert after[0]["row_id"] == before["row_id"]

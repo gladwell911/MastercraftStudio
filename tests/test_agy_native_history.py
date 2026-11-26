@@ -73,6 +73,9 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
         lambda executable: [executable, "-u", str(script)]))
 
+    frame.chat_store.notification_sync(pair_id="default", device_id="private-device",
+                                       baseline=0, incarnation="test", secret="test")
+
     def listed():
         return [row for row in frame._remote_api_history_list_ui()[1]["chats"]
                 if row.get("title") == "原生标题"]
@@ -83,6 +86,7 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     assert len(frame._remote_api_history_collection_ui({"collection_page": True})[1]["chats"]) >= 1
     history = frame._remote_api_history_read_ui({"chat_id": chat_id, "limit": 1})[1]
     assert history["has_more"]
+    assert not frame.chat_store.pending_outbox(pair_id="default", lane="notification")
     turn, = history["chat"]["turns"]
     assert (turn["question"], turn["answer"]) == ("同文问题", "完整正文和尾标")
     assert frame.chat_store.load_execution_steps(chat_id)[-1]["detail_text"] == "fixture output"
@@ -96,6 +100,7 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     assert status == 200, accepted
     wait_for_wx(lambda: frame._remote_api_state_ui({"chat_id": chat_id})[1]["turns"][-1]["answer"]
                 == "same native context", "continuation of the original native ID")
+    frame._flush_chat_state_save()
     live = frame._remote_api_history_read_ui({"chat_id": chat_id})[1]["chat"]
     assert (live["title"], live["agy_native_title"]) == ("共享显示名", "AGY title from live event")
     requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
@@ -120,6 +125,10 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     assert history["chat"]["agy_native_title"] == "新终端标题"
     assert frame.chat_store.load_chat_summary(chat_id)["title"] == "共享显示名"
     assert len(refreshed()) == 1
+    # The application continuation produced one live final. ACP replay gives
+    # neither a settled terminal event nor enough evidence to notify its tail.
+    fact, = frame.chat_store.pending_outbox(pair_id="default", lane="notification")
+    assert frame.chat_store.readable_answer(chat_id, turn_index=2)["message_id"] in fact["event_id"]
     requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     replay_pids = {item["fixturePid"] for item in requests if item["method"] == "session/load"}
     assert len(replay_pids) == 2
