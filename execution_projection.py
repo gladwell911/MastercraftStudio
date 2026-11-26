@@ -70,7 +70,7 @@ def should_show_execution_step(step) -> bool:
         return True
     if step.get("codex_terminal_step") and display_kind in {"command", "artifact", "thinking"}:
         return bool(list_text or detail_text)
-    if step.get("provider") == "agy" and display_kind in {"tool", "reasoning", "plan", "followup", "error"}:
+    if step.get("provider") == "agy" and display_kind in {"tool", "reasoning", "plan", "usage", "followup", "error"}:
         return bool(list_text or detail_text)
     if display_kind == "error":
         return False
