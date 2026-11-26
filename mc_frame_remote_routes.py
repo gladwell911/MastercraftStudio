@@ -36,6 +36,13 @@ class RemoteRoutesMixin:
             self._apply_shared_remote_state(snapshot, bool(run), run.action_id if run else "", pending,
                                             include_request=include_request)
             return
+        if is_kimi_model(chat.get("model", "")):
+            owner = self._kimi_active_control_owner(chat)
+            pending = self._kimi_remote_interaction_payload(owner)
+            self._apply_shared_remote_state(snapshot, bool(owner or chat.get("kimi_turn_active")),
+                                            owner.get("prompt_id", ""), pending,
+                                            include_request=include_request)
+            return
         thread = chat.get("codex_terminal_thread")
         if not thread or thread != chat.get("codex_thread_id"):
             return
@@ -881,6 +888,26 @@ class RemoteRoutesMixin:
             if expected_turn and (not preview_chat.get("codex_turn_active")
                                   or self._codex_turn_id_for_chat(preview_chat) != expected_turn):
                 return 409, {"accepted": False, "chat_id": target_owner, "message": "此 Codex 回合已结束或已更换。"}
+        if isinstance(preview_chat, dict) and is_kimi_model(self._model_for_chat_selection(preview_chat)):
+            expected_prompt = str(payload.get("expected_native_turn_id") or "")
+            target_owner = str(preview_chat.get("id") or "")
+            if expected_prompt or text == "/stop":
+                if not is_kimi_model(model):
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                elif text == "/stop":
+                    ok, message = self._stop_shared_kimi_turn(preview_chat, expected_prompt)
+                elif self._kimi_active_control_owner(preview_chat).get("prompt_id") != expected_prompt:
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                else:
+                    ok, message = self._submit_archived_remote_question(
+                        preview_chat, text, model, active=archived_target is None,
+                        client_send_id=str(payload.get("client_send_id") or ""),
+                        expected_kimi_prompt_id=expected_prompt,
+                    )
+                    if ok:
+                        self._push_remote_state(target_owner)
+                        self._push_remote_history_changed(target_owner)
+                return 200 if ok else 409, {"accepted": ok, "chat_id": target_owner, "message": message}
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
                 if archived_target is not None:
@@ -1138,7 +1165,10 @@ class RemoteRoutesMixin:
         text = str(payload.get("text") or "").strip()
         owner = str(payload.get("chat_id") or "").strip()
         interaction_id = str(payload.get("interaction_id") or "").strip()
-        if interaction_id.startswith("agy-"):
+        chat, _, _ = self._chat_target_for_request(owner) if owner else (None, [], False)
+        if interaction_id and chat and is_kimi_model(self._model_for_chat_selection(chat)):
+            ok, message = self._reply_remote_kimi_interaction(chat, interaction_id, text, payload.get("kimi_answers"))
+        elif interaction_id.startswith("agy-"):
             ok, message = self._reply_agy_interaction(owner, interaction_id, text=text, answers=payload.get("answers"))
         elif interaction_id or self._codex_terminal_pending(owner):
             ok, message = self._reply_codex_terminal_request(owner, interaction_id, text=text)
@@ -1508,9 +1538,9 @@ class RemoteRoutesMixin:
                     include_execution_steps=include_execution_steps,
                 ) or {}
                 chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
-        if chat.get("model") == AGY_MODEL_ID or (
+        if (chat.get("model") == AGY_MODEL_ID or is_kimi_model(chat.get("model", "")) or (
             source_chat.get("codex_terminal_thread") and source_chat.get("codex_terminal_thread") == source_chat.get("codex_thread_id")
-        ):
+        )):
             self._apply_native_runtime_remote_snapshot(source_chat, chat)
             status, request_kind = chat["status"], chat["request_kind"]
         else:

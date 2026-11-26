@@ -170,6 +170,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         self._v2_completed_order = deque()
         self._v2_started = set()
         self._v2_frame_texts = {}
+        self._v2_tool_frames = {}
         self._v2_ready_sessions = set()
         self._v2_ready_generations = {}
         self._v2_request_generations = {}
@@ -314,6 +315,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
             self._v2_completed_order.clear()
             self._v2_started.clear()
             self._v2_frame_texts.clear()
+            self._v2_tool_frames.clear()
             self._server_api_item_restrictions.clear()
             self._server_api_previous_turns.clear()
             proc = self.process

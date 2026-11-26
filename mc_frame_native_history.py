@@ -93,6 +93,10 @@ class NativeHistoryMixin:
                 else self._chat_summary_by_id(chat_id)) or {}
         if chat.get("codex_turn_active") or chat.get("kimi_turn_active"):
             return 409, {}
+        # Replaying a just-completed managed turn ahead of its durable save
+        # would append a native copy without its app/terminal correlation.
+        if session.identity.provider == "kimi" and chat_id in self._chat_turn_dirty_from:
+            return 409, {}
         turns = chat.get("turns") or []
         latest = turns[-1] if turns else {}
         if latest.get("request_status") == "pending":

@@ -578,7 +578,11 @@ class ExecutionPageMixin:
         tool_name = " ".join(
             str(tool.get(key) or "") for key in ("name", "kind", "toolKind")
         ).lower()
-        # Tool/action events never become F1 list rows — including failed or
+        if data.get("kimi_shared_tool"):
+            name = str(tool.get("name") or event.title or "工具").strip()
+            state = "失败" if failed else "已完成" if completed else "执行中"
+            return f"{name} · {state}"
+        # Ordinary tool/action events never become F1 list rows — including failed or
         # waiting ones (the generic 执行失败/正在等待 labels below must not
         # resurrect them). Turn-level errors and waiting states keep their
         # rows because those display kinds are not tool kinds. Thinking
@@ -620,6 +624,11 @@ class ExecutionPageMixin:
         elif self._kimi_protocol_event(event):
             original_raw = str(getattr(event, "raw_text", "") or "")
             detail_text = original_raw if original_raw else detail_text
+            if item.get("kimi_shared_tool"):
+                tool = item.get("tool") or {}
+                diff = tool.get("diff")
+                if diff:
+                    detail_text = "\n\n".join(part for part in (detail_text, str(diff)) if part)
             if not narrative:
                 detail_text = self._bounded_kimi_diagnostic(detail_text)
         if self._kimi_protocol_event(event) and not kimi_summary and not private_reasoning:
@@ -695,7 +704,7 @@ class ExecutionPageMixin:
             entry["kimi_summary"] = kimi_summary
         if item.get("codex_terminal_step") and display_kind in {"command", "artifact", "thinking"}:
             entry["codex_terminal_step"] = True
-        if item.get("codex_terminal_snapshot"):
+        if item.get("codex_terminal_snapshot") or item.get("kimi_shared_tool"):
             entry["narrative_snapshot"] = True
         if narrative:
             entry["narrative_snapshot"] = True

@@ -13,6 +13,9 @@ from shared_terminal_routes import dispatch_terminal
 
 def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(frame, monkeypatch, tmp_path, wait_for_wx):
     fake = FakeKimiServerClient(on_message=frame._on_kimi_client_message)
+    replies = []
+    fake.interaction_state = lambda *_args: "pending"
+    fake.answer_interaction = lambda *args: replies.append(args)
     fake.get_auth = lambda *, timeout: {"managed_provider": {"status": "authenticated"}}
     model = main.DEFAULT_KIMI_MODEL
     session = fake.create_session(cwd=str(tmp_path), model=model, title="Existing Kimi session")
@@ -61,6 +64,8 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
             assert "公开过程" in [step["text"] for step in pending["steps"]]
             remote_client = RemoteNatsTransport(
                 pair_id="default", token="synthetic", on_history_read=frame._remote_api_history_read_ui,
+                on_state=frame._remote_api_state_ui, on_message=frame._remote_api_message_ui,
+                on_reply_request=frame._remote_api_reply_request_ui,
                 on_execution_page=lambda payload: frame._remote_api_execution_page_ui(payload, secret="synthetic"),
             )
 
@@ -69,6 +74,38 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
                 return status == 200 and "公开过程" in [row["list_text"] for row in page["rows"]]
 
             wait_for_wx(remote_has_step, "RC projection before Kimi completion")
+
+            code, current = remote_client._route_command({"type": "state", "chat_id": "existing"})
+            assert code == 200 and current["running"]
+            scope_token = current["native_turn_id"]
+            assert scope_token
+            code, _ = remote_client._route_command({
+                "type": "message", "chat_id": "existing", "text": "/stop", "expected_native_turn_id": "old",
+            })
+            assert code == 409
+            assert len(fake.submitted) == 1
+
+            interaction = {"type": "interaction", "session_id": session, "agent_id": "main",
+                           "interaction_id": "approval-exact", "status": "pending", "kind": "approval",
+                           "request": {"tool_name": "Shell", "action": "Inspect temporary file"}}
+            def push_interaction():
+                kimi_wire._handle_ws_message(interaction)
+                for event in kimi_wire.drain_pending_messages():
+                    frame._on_kimi_client_message(event)
+
+            kimi_wire.protocol_version = 2
+            push_interaction()
+            wait_for_wx(lambda: remote_client._route_command({"type": "state", "chat_id": "existing"})[1]
+                        .get("pending_request"), "scoped remote approval", timeout=3)
+            request_body = {"type": "reply_request", "chat_id": "existing",
+                            "interaction_id": "approval-exact", "text": "rejected"}
+            assert remote_client._route_command({**request_body, "chat_id": "unrelated"})[0] == 400
+            assert remote_client._route_command(request_body)[0] == 200
+            assert remote_client._route_command(request_body)[0] == 400
+            wait_for_wx(lambda: len(replies) == 1, "one exact native rejection")
+            assert replies == [(session, "approval-exact", {"kind": "approval", "decision": "rejected"})]
+            push_interaction()
+            assert remote_client._route_command(request_body)[0] == 400
 
             native_turn = {"kind": "turn", "turnId": "1", "triggerPromptId": prompt, "ordinal": 0,
                            "origin": {"kind": "user"}, "state": "completed"}

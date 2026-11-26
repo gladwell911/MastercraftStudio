@@ -75,6 +75,36 @@ class KimiSessionsMixin:
             return str(self.active_kimi_turn_id or "").strip()
         return ""
 
+    def _kimi_active_control_owner(self, chat: dict) -> dict:
+        chat_id = str(chat.get("id") or "")
+        session_id = self._kimi_session_id_for_chat(chat)
+        with self._kimi_owner_lock:
+            owner = self._kimi_active_turns.get(chat_id) or {}
+            if (session_id and owner.get("session_id") == session_id and owner.get("role") == "active"
+                    and owner.get("turn_id") and owner.get("prompt_id")):
+                return dict(owner)
+        return {}
+
+    def _stop_shared_kimi_turn(self, chat: dict, expected_prompt: str) -> tuple[bool, str]:
+        owner = self._kimi_active_control_owner(chat)
+        if not expected_prompt or owner.get("prompt_id") != expected_prompt:
+            return False, "此 Kimi Code 回合已结束或已更换。"
+        chat_id = str(chat["id"])
+        client = self._kimi_client
+        if getattr(client, "protocol_version", 0) != 2:
+            return False, "当前 Kimi Code 连接不支持精确中断。"
+
+        def stop():
+            try:
+                self._handle_kimi_stop_command(client, chat, owner, chat_id)
+            except (KimiServerError, OSError) as exc:
+                self._call_after_if_alive(self._push_remote_attention, chat_id, "failed",
+                                          f"stop:{expected_prompt}", f"Kimi Code 中断未获确认：{exc}")
+                self._recover_kimi_pending_owners(session_ids={owner["session_id"]})
+
+        bindings.app.threading.Thread(target=stop, daemon=True, name="kimi-shared-stop").start()
+        return True, "已提交中断请求，等待 Kimi Code 确认。"
+
     def _workspace_dir_for_kimi(self) -> str:
         return str(Path(bindings.app.__file__).resolve().parent)
 
@@ -850,6 +880,7 @@ class KimiSessionsMixin:
                     or target_turns[turn_idx] is not startup_request[0]):
                 return
             turn = startup_request[0]
+            expected_prompt = turn.get("kimi_expected_prompt_id")
             with self._kimi_owner_lock:
                 known_active = self._kimi_active_turns.get(client_chat_id) or {}
                 session_id = str(self._kimi_submission_sessions.get(client_chat_id)
@@ -960,6 +991,8 @@ class KimiSessionsMixin:
             with self._kimi_owner_lock:
                 if self._kimi_submission_locks.get(client_chat_id) is not submission_lock:
                     return
+                if expected_prompt and self._kimi_active_control_owner(target_chat).get("prompt_id") != expected_prompt:
+                    raise RuntimeError("此 Kimi Code 回合已结束或已更换。")
                 if not should_steer and not existing_queue:
                     self._kimi_active_turns[client_chat_id] = {
                         "turn_idx": int(turn_idx), "session_id": session_id, "model": str(model or ""),
@@ -1028,7 +1061,12 @@ class KimiSessionsMixin:
                     "queued_at": bindings.app.time.time(),
                 }
             if should_steer and str(prompt_id or "").strip():
-                steer_result = client.steer_prompts(session_id, [prompt_id])
+                # The provider has already accepted this prompt. If its target ended
+                # during POST, leave the accepted prompt in its native queue.
+                still_targeted = not expected_prompt or (
+                    self._kimi_active_control_owner(target_chat).get("prompt_id") == expected_prompt
+                )
+                steer_result = client.steer_prompts(session_id, [prompt_id]) if still_targeted else False
                 if steer_result is True:
                     prompt_role = "alias"
                     owner_prompt_id = str(active_owner.get("owner_prompt_id") or active_owner.get("prompt_id") or "").strip()
