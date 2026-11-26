@@ -472,7 +472,9 @@ class RemoteRoutesMixin:
             "chat_id": chat_id,
             "title": title,
             "model": model,
-            **({"agy_workspace": chat.get("agy_workspace", "")} if model == AGY_MODEL_ID else {}),
+            **({"agy_workspace": chat.get("agy_workspace", ""),
+                "agy_history_status": chat.get("native_history_status", ""),
+                "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
             "created_at": created_at,
             "updated_at": updated_at,
             "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
@@ -548,7 +550,9 @@ class RemoteRoutesMixin:
             "title_updated_at": float(chat.get("title_updated_at") or updated_at),
             "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
-            **({"agy_workspace": chat.get("agy_workspace", "")} if model == AGY_MODEL_ID else {}),
+            **({"agy_workspace": chat.get("agy_workspace", ""),
+                "agy_history_status": chat.get("native_history_status", ""),
+                "agy_native_title": chat.get("native_title", "")} if model == AGY_MODEL_ID else {}),
             "running": False,
             "request_kind": request_kind,
             "current": bool(chat_id) and chat_id == current_id,
@@ -922,6 +926,15 @@ class RemoteRoutesMixin:
         model = bindings.app.normalize_model_id(payload.get("model"), default="")
         if model != AGY_MODEL_ID:
             return self._run_remote_ui_route(self._remote_api_new_chat_ui, payload)
+        with self._agy_creation_lock:
+            self._agy_remote_creations += 1
+        try:
+            return self._remote_create_agy_chat(payload)
+        finally:
+            with self._agy_creation_lock:
+                self._agy_remote_creations -= 1
+
+    def _remote_create_agy_chat(self, payload: dict) -> tuple[int, dict]:
         try:
             raw_cwd = payload.get("agy_workspace")
             client, fields = self._prepare_agy_workspace(raw_cwd if isinstance(raw_cwd, str) else "")
@@ -1072,6 +1085,7 @@ class RemoteRoutesMixin:
         }
 
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        self._request_native_history_refresh()
         if (_payload or {}).get("collection_page"):
             return self._remote_api_history_collection_ui(_payload)
         cached = getattr(self, "_remote_history_list_cache", None)
@@ -1176,6 +1190,7 @@ class RemoteRoutesMixin:
         # UI captures one live owner only. Indexed SQLite paging, hydration and
         # metadata authority stay on this worker rather than walking all archives.
         def capture(_payload=None):
+            self._request_native_history_refresh()
             live = dict(getattr(self, "_current_chat_state", {}) or {})
             live.update({"id": str(self.active_chat_id or self.current_chat_id or ""),
                          "turn_count": len(self.active_session_turns), "running": bool(self.is_running)})
@@ -1341,6 +1356,7 @@ class RemoteRoutesMixin:
             return 409, {"error": str(exc), "recovery": "SNAPSHOT_REQUIRED"}
 
     def _remote_api_history_read_ui(self, payload: dict) -> tuple[int, dict]:
+        self._request_native_history_refresh()
         chat_id = str(payload.get("chat_id") or "").strip()
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
             source_chat = dict(self._current_chat_state or {
