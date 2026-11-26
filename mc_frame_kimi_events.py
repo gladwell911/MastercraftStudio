@@ -107,7 +107,7 @@ class KimiEventsMixin:
         with self._kimi_owner_lock:
             current = self._kimi_prompt_owners.get(key)
         return (isinstance(current, dict) and int(current.get("generation") or 0) == generation
-                or not current and turn.get("request_status") in {"done", "failed"})
+                or not current and turn.get("request_status") in {"done", "failed", "cancelled"})
 
     def _resume_kimi_execution_boundaries(self, chat_id: str) -> None:
         if getattr(self, "_close_complete", False):
@@ -1307,10 +1307,11 @@ class KimiEventsMixin:
                 # partial assistant stream.
                 if status in {"cancelled", "interrupted", "aborted", "canceled"}:
                     error_text = "Kimi Code 已中断。"
+                    self._mark_turn_request_cancelled(turn, error_text)
                 else:
                     error_text = str(getattr(event, "text", "") or "").strip() or "Kimi Code 执行失败。"
+                    self._mark_turn_request_failed(turn, error_text)
                 turn["answer_md"] = error_text
-                self._mark_turn_request_failed(turn, error_text)
                 self._complete_clear_operation_turn(turn, failed=True)
             finalized.append(idx)
         if not accepted:

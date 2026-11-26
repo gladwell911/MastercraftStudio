@@ -1992,7 +1992,7 @@ class KimiSessionsMixin:
                                      parent_prompt_id: str) -> None:
         parent = next((row for row in turns if isinstance(row, dict) and row.get("kimi_session_id") == key[1]
                        and row.get("kimi_prompt_id") == parent_prompt_id), None)
-        if parent is None or parent.get("request_status") not in {"done", "failed"}:
+        if parent is None or parent.get("request_status") not in {"done", "failed", "cancelled"}:
             return
         if parent["request_status"] == "done":
             answer_identity = parent.get("answer_identity")
@@ -2004,7 +2004,10 @@ class KimiSessionsMixin:
         else:
             error = str(parent.get("request_error") or parent.get("answer_md") or "")
             turn["answer_md"] = error
-            self._mark_turn_request_failed(turn, error)
+            if parent["request_status"] == "cancelled":
+                self._mark_turn_request_cancelled(turn, error)
+            else:
+                self._mark_turn_request_failed(turn, error)
         with self._kimi_owner_lock:
             self._add_kimi_tombstone(key)
             self._kimi_prompt_owners.pop(key, None)

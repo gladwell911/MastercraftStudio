@@ -160,13 +160,17 @@ class KimiHistoryReader:
             turn_id = turn["turnId"]
             index = len(history)
             question = str(turn.get("prompt") or "")
-            completed = turn["state"] == "completed"
+            status = {"completed": "done", "cancelled": "cancelled", "failed": "failed"}[turn["state"]]
+            if status == "cancelled":
+                answer = "Kimi Code 已中断。"
+            elif status == "failed":
+                answer = str(turn.get("error") or "Kimi Code 回合已结束")
             row = {
                 "model": DEFAULT_KIMI_MODEL, "provider": "kimi", "session_id": sid,
                 "kimi_session_id": sid, "kimi_turn_id": turn_id, "kimi_prompt_id": pid,
                 "turn_id": turn_id, "provider_user_message_id": pid, "question": question,
-                "answer_md": answer if completed else str(turn.get("error") or "Kimi Code 回合已结束"),
-                "request_status": "done" if completed else "failed",
+                "answer_md": answer,
+                "request_status": status,
             }
             if message_id := final_message_identity(turn):
                 row.update(provider_message_id=message_id, native_final_explicit=True)

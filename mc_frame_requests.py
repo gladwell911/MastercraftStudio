@@ -95,6 +95,11 @@ class ChatRequestsMixin:
         turn["request_error"] = str(error or "")
         turn["request_recovered_after_restart"] = False
 
+    def _mark_turn_request_cancelled(self, turn: dict, detail: str) -> None:
+        turn["request_status"] = "cancelled"
+        turn["request_error"] = detail
+        turn["request_recovered_after_restart"] = False
+
     def _capture_model_startup_request(self, chat_id: str, turn_idx: int):
         _, turns, _ = self._chat_target_for_request(chat_id)
         if not isinstance(turns, list) or not 0 <= turn_idx < len(turns):

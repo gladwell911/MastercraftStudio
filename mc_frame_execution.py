@@ -1512,7 +1512,7 @@ class ExecutionPageMixin:
             turn_idx = self._kimi_event_turn_index(turns, event)
             if turn_idx < 0:
                 return
-            if (str(turns[turn_idx].get("request_status") or "") in {"done", "failed"}
+            if (str(turns[turn_idx].get("request_status") or "") in {"done", "failed", "cancelled"}
                     and not self._kimi_private_reasoning(event_data)):
                 return
         scope_values = [str(chat_id or "").strip(), revision, thread_scope, turn_scope, provider, agent_id, native_id]
