@@ -434,7 +434,7 @@ class ExecutionPageMixin:
         if not command:
             command = str(item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
         if event_type == "diff_updated":
-            return "已生成代码变更"
+            return raw_text or text or "已生成代码变更"
         if event_type == "turn_started":
             return raw_text or text or "开始处理本轮请求"
         if event_type == "turn_completed":
@@ -693,6 +693,10 @@ class ExecutionPageMixin:
         }
         if kimi_summary:
             entry["kimi_summary"] = kimi_summary
+        if item.get("codex_terminal_step") and display_kind in {"command", "artifact", "thinking"}:
+            entry["codex_terminal_step"] = True
+        if item.get("codex_terminal_snapshot"):
+            entry["narrative_snapshot"] = True
         if narrative:
             entry["narrative_snapshot"] = True
             entry["kimi_step_id"] = str(item.get("step_id") or "")

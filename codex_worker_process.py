@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import uuid
 from collections import OrderedDict
 import copy
 import traceback
+from pathlib import Path
 from typing import Any, Callable, TextIO
 
 from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL, _event_from_item, codex_approval_parameters
+from codex_native_terminal import CodexTerminalClient
 from codex_worker_protocol import (
     decode_worker_line,
     encode_worker_message,
@@ -18,6 +21,11 @@ from codex_worker_protocol import (
 
 
 ClientFactory = Callable[[Callable[[CodexEvent], None], str], CodexAppServerClient]
+TERMINAL_INTERACTIONS = {
+    "item/tool/requestUserInput",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+}
 
 
 class CodexWorkerRuntime:
@@ -42,6 +50,9 @@ class CodexWorkerRuntime:
         self._startup_events: dict[tuple[str, str], dict] = {}
         self._native_owners: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
         self._item_owners: OrderedDict[tuple[str, str, str, str], tuple[int, int, str]] = OrderedDict()
+        self._terminal_threads: dict[tuple[str, str], dict] = {}
+        self._terminal_turns: dict[tuple[str, str, str], dict] = {}
+        self._terminal_interactions: dict[tuple[str, str, str | int], dict] = {}
 
     def emit(self, message_type: str, payload: dict[str, Any] | None = None, request_id: str | None = None) -> None:
         line = encode_worker_message(make_worker_event(message_type, payload, request_id))
@@ -53,6 +64,14 @@ class CodexWorkerRuntime:
         message_type = str(message.get("type") or "")
         if message_type == "start_turn":
             self._handle_start_turn(message)
+        elif message_type == "open_terminal":
+            self._handle_open_terminal(message)
+        elif message_type == "bind_terminal_turn":
+            self._bind_terminal_turn(message)
+        elif message_type == "retire_terminal":
+            self._retire_terminal(message.get("payload") or {})
+        elif message_type == "reply_terminal_interaction":
+            self._reply_terminal_interaction(message.get("payload") or {})
         elif message_type == "reply_user_input":
             self._handle_reply_user_input(message)
         elif message_type == "reply_command_approval":
@@ -87,6 +106,9 @@ class CodexWorkerRuntime:
             self._startup_events.clear()
             self._native_owners.clear()
             self._item_owners.clear()
+            self._terminal_threads.clear()
+            self._terminal_turns.clear()
+            self._terminal_interactions.clear()
         for client in clients:
             client.close()
 
@@ -108,6 +130,9 @@ class CodexWorkerRuntime:
     def _on_event(self, chat_id: str, model: str, event: CodexEvent, source_client=None) -> None:
         with self._lock:
             if source_client is not None and self._clients.get((chat_id, model)) is not source_client:
+                return
+            terminal = self._terminal_threads.get((chat_id, model))
+            if terminal and event.thread_id and event.thread_id != terminal["thread_id"]:
                 return
             pending = self._startup_events.get((chat_id, model))
             if pending is not None:
@@ -177,7 +202,174 @@ class CodexWorkerRuntime:
                 pending["events"].append(event)
                 pending["bytes"] += size
                 return
+            if terminal and self._observe_terminal_turn(chat_id, model, terminal, event):
+                return
             self._dispatch_event(chat_id, model, event)
+
+    def _handle_open_terminal(self, message):
+        payload = dict(message.get("payload") or {})
+        chat_id = str(payload.get("chat_id") or "")
+        model = str(payload.get("model") or DEFAULT_CODEX_MODEL)
+        key = (chat_id, model)
+        expected_thread = str(payload.get("thread_id") or "")
+        generation = int(payload.get("context_generation") or 0)
+        options = codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox"))
+        try:
+            if not chat_id:
+                raise RuntimeError("缺少 Codex 聊天标识。")
+            with self._lock:
+                previous = self._clients.get(key)
+                binding = self._terminal_threads.get(key)
+                if binding and binding["thread_id"] != expected_thread:
+                    raise RuntimeError("Codex 聊天已更换线程。请重新选择聊天。")
+                if binding is None and key in self._active_command_owners:
+                    raise RuntimeError("此聊天正在使用原运行时。请等待当前回合结束后打开共享终端。")
+            if binding is not None:
+                endpoint = previous.terminal_endpoint()
+            else:
+                native_home = getattr(previous, "_codex_home_dir", None)
+                private_home = Path.cwd() / ".codex-home"
+                if native_home is None and private_home.is_dir():
+                    native_home = private_home
+                client = CodexTerminalClient(on_event=lambda event: self._on_event(chat_id, model, event, client),
+                                             codex_model=model, native_home=native_home)
+                try:
+                    endpoint = client.terminal_endpoint()
+                    cwd = str(payload.get("cwd") or "")
+                    if expected_thread:
+                        response = client.resume_thread(expected_thread, service_tier=payload.get("service_tier"), **options)
+                    else:
+                        response = client.start_thread(cwd, service_tier=payload.get("service_tier"), **options)
+                    thread = response.get("thread") or {}
+                    thread_id = str(thread.get("id") or "")
+                    if not thread_id or (expected_thread and thread_id != expected_thread):
+                        raise RuntimeError("Codex 未返回所选原生线程。")
+                    if not expected_thread:
+                        # Codex persists the empty rollout when a title is set. Resume can then attach
+                        # from a second client before any model request has been made.
+                        client.request("thread/name/set", {"threadId": thread_id, "name": payload.get("title") or "新聊天"})
+                    binding = {"thread_id": thread_id, "context_generation": generation,
+                               "cwd": str(thread.get("cwd") or cwd), "home": str(client._codex_home_dir),
+                               "thread_configuration": client.thread_configurations.get(thread_id, {})}
+                    with self._lock:
+                        self._clients[key] = client
+                        self._terminal_threads[key] = binding
+                except Exception:
+                    client.close()
+                    raise
+                if previous is not None:
+                    if getattr(previous, "_owns_codex_home_dir", False):
+                        previous._owns_codex_home_dir = False
+                        client._owns_codex_home_dir = True
+                    previous.close()
+            self.emit("terminal_endpoint", {**endpoint, **binding}, request_id=message.get("id"))
+        except Exception as exc:
+            self.emit("terminal_endpoint", {"error": str(exc)}, request_id=message.get("id"))
+
+    def _retire_terminal(self, payload):
+        chat_id = payload.get("chat_id")
+        thread_id = payload.get("thread_id")
+        clients = []
+        with self._lock:
+            for key, binding in tuple(self._terminal_threads.items()):
+                if key[0] != chat_id or binding["thread_id"] != thread_id:
+                    continue
+                self._terminal_threads.pop(key)
+                self._active_command_owners.pop(key, None)
+                clients.append(self._clients.pop(key))
+                for registry in (self._terminal_turns, self._terminal_interactions):
+                    for pending in tuple(registry):
+                        if pending[:2] == key:
+                            registry.pop(pending)
+        for client in clients:
+            client.close()
+
+    def _observe_terminal_turn(self, chat_id, model, binding, event):
+        if not event.turn_id or event.thread_id != binding["thread_id"]:
+            return False
+        key = (chat_id, model, event.turn_id)
+        if key in self._turn_id_scopes:
+            return False
+        pending = self._terminal_turns.get(key)
+        if pending is None:
+            if event.type != "turn_started":
+                return False
+            if len(self._terminal_turns) >= self.MAX_EVENT_SCOPES:
+                return True
+            pending = self._terminal_turns[key] = {"events": [], "question": "", "bytes": 0, "overflow": False}
+        size = len(json.dumps(event_to_payload(event), ensure_ascii=False).encode("utf-8"))
+        if (len(pending["events"]) >= self.MAX_STARTUP_EVENTS
+                or pending["bytes"] + size > self.MAX_STARTUP_EVENT_BYTES):
+            pending["overflow"] = True
+        else:
+            pending["events"].append(event)
+            pending["bytes"] += size
+        if not pending["question"] and (event.subtype == "userMessage" or event.type == "turn_completed"):
+            pending["question"] = self._user_item_text(event).strip() or "Codex 终端输入"
+            self.emit("terminal_turn", {"chat_id": chat_id, "model": model, "turn_id": event.turn_id,
+                                        "question": pending["question"], **binding})
+        return True
+
+    def _bind_terminal_turn(self, message):
+        payload = dict(message.get("payload") or {})
+        chat_id, model = str(payload.get("chat_id") or ""), str(payload.get("model") or DEFAULT_CODEX_MODEL)
+        thread_id, turn_id = str(payload.get("thread_id") or ""), str(payload.get("turn_id") or "")
+        generation, index = payload.get("context_generation"), payload.get("turn_idx")
+        key = (chat_id, model, turn_id)
+        with self._lock:
+            binding = self._terminal_threads.get(key[:2])
+            pending = self._terminal_turns.get(key)
+            if (not binding or pending is None or thread_id != binding["thread_id"]
+                    or generation != binding["context_generation"]):
+                return
+            self._terminal_turns.pop(key)
+            if type(index) is not int or index < 0:
+                self._remember_scope(self._turn_id_scopes, key, None)
+                return
+            value = (index, generation, thread_id)
+            self._turn_indices[key[:2]] = index
+            self._active_command_owners[key[:2]] = (thread_id, turn_id, index, generation)
+            self._remember_scope(self._thread_turn_scopes, (chat_id, model, thread_id), (index, generation))
+            self._remember_scope(self._turn_id_scopes, key, value)
+            self._remember_scope(self._native_owners, key, {"thread_id": thread_id, "current": value,
+                                 "owners": [value], "boundaries": [], "steer_boundary_seen": False})
+            for event in pending["events"]:
+                self._dispatch_event(chat_id, model, event)
+            if pending["overflow"]:
+                self._emit_scoped_error(message, "Codex 终端事件超过待处理上限。请检查原生线程。", chat_id, index, model)
+
+    def _reply_terminal_interaction(self, payload):
+        key = (payload.get("chat_id"), payload.get("model"), payload.get("request_id"))
+        with self._lock:
+            pending = self._terminal_interactions.get(key)
+            client = self._clients.get(key[:2])
+            if pending is None or client is not pending["client"] or pending["submitted"]:
+                return
+            if any(payload.get(field) != pending[field] for field in (
+                    "interaction_id", "thread_id", "turn_id", "turn_idx", "context_generation")):
+                return
+            current = self._active_command_owners.get(key[:2])
+            if current is None or current[:2] != (pending["thread_id"], pending["turn_id"]):
+                return
+            method = pending["method"]
+            if method == "item/tool/requestUserInput":
+                answers = payload.get("answers")
+                if not isinstance(answers, dict):
+                    return
+                respond, value = client.respond_tool_request_user_input, answers
+            else:
+                value = payload.get("decision")
+                if value not in pending["decisions"]:
+                    return
+                respond = (client.respond_file_change_approval if method == "item/fileChange/requestApproval"
+                           else client.respond_command_approval)
+            pending["submitted"] = True
+        try:
+            respond(key[2], value)
+        except (OSError, RuntimeError):
+            # A failed write can occur after the peer accepted it. Only the server's
+            # resolved notification or authoritative turn completion retires this request.
+            self.emit("terminal_control_unknown", {"chat_id": key[0], "interaction_id": pending["interaction_id"]})
 
     @staticmethod
     def _user_item_text(event: CodexEvent) -> str:
@@ -189,6 +381,17 @@ class CodexWorkerRuntime:
         return text or str(data.get("text") or event.text or "")
 
     def _dispatch_event(self, chat_id: str, model: str, event: CodexEvent) -> None:
+        terminal = self._terminal_threads.get((chat_id, model))
+        if terminal and event.thread_id == terminal["thread_id"]:
+            event = copy.copy(event)
+            event.data = dict(event.data or {}, codex_terminal_step=True)
+            if (event.type == "agent_message_delta" or
+                    (event.type == "item_completed" and event.subtype in {"agentMessage", "commandExecution"})):
+                event.data["codex_terminal_snapshot"] = True
+            # 0.171 sends ordered WebSocket deltas without a fragment ID. Give each
+            # received fragment an identity for the execution store.
+            if event.type == "agent_message_delta" and event.offset is None and not event.fragment_id:
+                event.fragment_id = uuid.uuid4().hex
         if event.type == "turn_completed" and isinstance(event.data, dict):
             for item in event.data.get("items") or []:
                 if isinstance(item, dict) and item.get("id"):
@@ -267,6 +470,33 @@ class CodexWorkerRuntime:
                     ]
             if scope is not None:
                 payload["turn_idx"], payload["context_generation"] = scope
+            terminal = self._terminal_threads.get((chat_id, model))
+            if terminal and terminal["thread_id"] == thread_id:
+                interaction_key = (chat_id, model, request_id)
+                if event_type == "server_request" and method in TERMINAL_INTERACTIONS and request_id is not None:
+                    if scope is None or not turn_id:
+                        return
+                    decisions = (event.params or {}).get("availableDecisions")
+                    if not isinstance(decisions, list):
+                        decisions = ["accept", "acceptForSession", "decline", "cancel"]
+                    pending = self._terminal_interactions.setdefault(interaction_key, {
+                        "client": self._clients.get((chat_id, model)), "interaction_id": uuid.uuid4().hex,
+                        "thread_id": thread_id, "turn_id": turn_id, "turn_idx": scope[0],
+                        "context_generation": scope[1], "method": method, "decisions": decisions, "submitted": False,
+                    })
+                    payload["interaction_id"] = pending["interaction_id"]
+                    self.emit("event", payload)
+                    return
+                if event_type == "server_request_resolved":
+                    pending = self._terminal_interactions.pop(interaction_key, None)
+                    if pending is not None:
+                        payload["interaction_id"] = pending["interaction_id"]
+                        self.emit("event", payload)
+                    return
+                if event_type == "turn_completed":
+                    for pending_key, pending in tuple(self._terminal_interactions.items()):
+                        if pending_key[:2] == (chat_id, model) and pending["turn_id"] == turn_id:
+                            self._terminal_interactions.pop(pending_key, None)
             if event_type == "server_request" and method == "item/commandExecution/requestApproval" and request_id is not None and scope is not None and thread_id and turn_id:
                 request_key = (chat_id, model, str(request_id))
                 params = event.params if isinstance(event.params, dict) else {}
@@ -322,6 +552,9 @@ class CodexWorkerRuntime:
                 self._turn_indices[(chat_id, model)] = turn_idx
 
             thread_id = str(payload.get("thread_id") or "").strip()
+            shared = self._terminal_threads.get((chat_id, model))
+            if shared is not None and shared["thread_id"] != thread_id:
+                raise RuntimeError("Codex 共享终端线程已改动，请重新打开聊天。")
             items = list(payload.get("input_items") or [])
             if not items and payload.get("question"):
                 items = [{"type": "text", "text": str(payload.get("question") or "")}]
@@ -349,6 +582,8 @@ class CodexWorkerRuntime:
                     )
                     resumed = True
                 except Exception as exc:
+                    if shared is not None:
+                        raise
                     if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
                         raise
                     should_steer = False
@@ -363,6 +598,8 @@ class CodexWorkerRuntime:
                     steered = True
                 except Exception as exc:
                     if self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc):
+                        if shared is not None:
+                            raise
                         recover_missing_thread = True
                     elif not self._is_no_active_turn_error(exc):
                         raise
@@ -375,7 +612,7 @@ class CodexWorkerRuntime:
                     items = self._recovery_input_items(payload, items)
                 elif not thread_id:
                     thread_id = self._start_thread(client, payload, service_tier_arg)
-                elif not resumed and hasattr(client, "resume_thread"):
+                elif not resumed and not shared and hasattr(client, "resume_thread"):
                     try:
                         client.resume_thread(
                             thread_id,
@@ -463,12 +700,16 @@ class CodexWorkerRuntime:
                         self._emit_scoped_error(message, "Codex startup event buffer exceeded its limit", chat_id, turn_idx, model)
                     else:
                         for event in pending["events"]:
-                            self._dispatch_event(chat_id, model, event)
+                            self._on_event(chat_id, model, event)
                 elif pending is not None:
                     for event in pending["prior_events"]:
                         self._dispatch_event(chat_id, model, event)
                     for event in pending["prior_completions"]:
                         self._dispatch_event(chat_id, model, event)
+                    shared = self._terminal_threads.get(startup_key)
+                    if shared is not None:
+                        for event in pending["events"]:
+                            self._observe_terminal_turn(chat_id, model, shared, event)
 
     def _remember_scope(self, scopes: OrderedDict, key: tuple, value: tuple | None) -> None:
         scopes.pop(key, None)
@@ -669,6 +910,11 @@ class CodexWorkerRuntime:
             return
         try:
             client = self._client_for(chat_id, model)
+            if (chat_id, model) in self._terminal_threads:
+                with self._lock:
+                    current = self._active_command_owners.get((chat_id, model))
+                    if current is None or current[:2] != (thread_id, turn_id):
+                        return
             if hasattr(client, "interrupt_turn"):
                 client.interrupt_turn(thread_id, turn_id)
             else:
@@ -731,6 +977,9 @@ class CodexWorkerRuntime:
 
 
 def main() -> int:
+    from worker_launcher import configure_utf8_stdio
+
+    configure_utf8_stdio()
     runtime = CodexWorkerRuntime()
     runtime.emit("ready")
     try:

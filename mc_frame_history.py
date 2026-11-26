@@ -215,7 +215,7 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id", "codex_terminal_thread",
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -1535,7 +1535,7 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation", "codex_terminal_thread",
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])

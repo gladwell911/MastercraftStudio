@@ -537,6 +537,8 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
 
     if item_type == "commandExecution":
         display_kind = "command"
+        if isinstance(item.get("aggregatedOutput"), str):
+            raw_text = item["aggregatedOutput"]
         text = _first_non_empty(raw_text, command, title)
     elif item_type == "agentMessage":
         display_kind = "commentary"
@@ -569,7 +571,7 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
         subtype=item_type,
         display_kind=display_kind,
         phase=str(item.get("phase") or ""),
-        status=item_type,
+        status=str(item.get("status") or item_type),
         data=item,
         event_id=str(item.get("id") or ""),
         session_id=str(params.get("threadId") or ""),
@@ -700,6 +702,9 @@ class CodexAppServerClient:
             self._stop_process()
             self._global_plugin_settings = settings
         self._ensure_started()
+        self._refresh_native_skills(cwd)
+
+    def _refresh_native_skills(self, cwd: str | None) -> None:
         roots = []
         seen = set()
         for root in (_user_home() / ".agents" / "skills", bundled_skill_root()):
@@ -1164,6 +1169,10 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
+        if method == "serverRequest/resolved":
+            self._emit_event(CodexEvent(type="server_request_resolved", thread_id=str(params.get("threadId") or ""),
+                                        request_id=params.get("requestId"), method=method))
+            return
         if method == "collab_waiting_end" or str(params.get("type") or "").strip() == "collab_waiting_end":
             text = _collab_waiting_end_text(params)
             if text:
@@ -1283,7 +1292,13 @@ class CodexAppServerClient:
                 )
             )
             return
-        if method == "item/agentMessage/delta":
+        delta_types = {
+            "item/agentMessage/delta": ("agentMessageDelta", "commentary"),
+            "item/commandExecution/outputDelta": ("commandExecution", "command"),
+            "item/reasoning/summaryTextDelta": ("reasoningSummary", "thinking"),
+        }
+        if method in delta_types:
+            subtype, kind = delta_types[method]
             self._emit_event(
                 CodexEvent(
                     type="agent_message_delta",
@@ -1292,8 +1307,8 @@ class CodexAppServerClient:
                     item_id=str(params.get("itemId") or ""),
                     text=str(params.get("delta") or ""),
                     raw_text=str(params.get("delta") or ""),
-                    subtype="agentMessageDelta",
-                    display_kind="commentary",
+                    subtype=subtype,
+                    display_kind=kind,
                     data=params,
                     event_id=str(params.get("eventId") or params.get("itemId") or ""),
                     fragment_id=str(params.get("fragmentId") or params.get("deltaId") or params.get("eventId") or ""),
