@@ -849,6 +849,8 @@ class RemoteRoutesMixin:
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
         requested_chat_id = str(payload.get("chat_id") or "").strip()
+        if requested_chat_id and self._chat_store_enabled and self.chat_store.get_meta(f"deleted-chat:{requested_chat_id}"):
+            return 404, {"accepted": False, "message": "该聊天已从历史移除，请新建聊天。"}
         previous_owner_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         if self._clear_pending_for(requested_chat_id or previous_owner_id):
             return 409, {"accepted": False, "error": "clear_context_pending"}
@@ -1032,6 +1034,9 @@ class RemoteRoutesMixin:
         return bindings.app.normalize_model_id(current_model or STARTUP_DEFAULT_MODEL_ID), ""
 
     def _remote_api_new_chat(self, payload: dict) -> tuple[int, dict]:
+        owner = str(payload.get("chat_id") or "").strip()
+        if owner and self._chat_store_enabled and self.chat_store.get_meta(f"deleted-chat:{owner}"):
+            return 409, {"accepted": False, "message": "请使用新的聊天 ID。"}
         model = bindings.app.normalize_model_id(payload.get("model"), default="")
         if model != AGY_MODEL_ID:
             return self._run_remote_ui_route(self._remote_api_new_chat_ui, payload)

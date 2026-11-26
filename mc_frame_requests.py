@@ -366,7 +366,7 @@ class ChatRequestsMixin:
         pending = getattr(self, "_shortcut_clear_pending", None)
         if pending is None:
             pending = self._shortcut_clear_pending = {}
-        if owner in pending:
+        if self._clear_pending_for(owner):
             return False
         target, turns, current = self._chat_target_for_request(owner)
         if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:

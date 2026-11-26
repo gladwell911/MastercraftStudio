@@ -110,11 +110,20 @@ class CodexHistoryReader:
         version = self.client.server_user_agent.split(" ", 1)[0].partition("/")[2]
         if version != "0.171.0":
             raise NativeDeletionRejected("当前 Codex 版本没有经验证的原生删除接口。")
+        latest = self.client.request("thread/turns/list", {
+            "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded",
+        }).get("data")
+        if not isinstance(latest, list) or any(
+                not isinstance(turn, dict) or turn.get("status") not in {"completed", "failed", "interrupted"}
+                for turn in latest):
+            raise NativeDeletionRejected("无法确认 Codex 原始会话已空闲，请等当前回合结束后重试。")
         try:
             if self.client.request("thread/delete", {"threadId": thread_id}) != {}:
                 return False
         except CodexRpcError as exc:
             raise NativeDeletionRejected("Codex 拒绝删除原始会话，请检查原生会话状态。") from exc
+        except (RuntimeError, OSError):
+            pass  # The write may have completed before a lost reply.
         proof = CodexAppServerClient(native_home=self.home, use_native_config=True, timeout=8)
         try:
             proof.read_thread(thread_id, include_turns=False)
