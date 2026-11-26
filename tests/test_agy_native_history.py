@@ -46,6 +46,7 @@ for line in sys.stdin:
         result = {"sessionId": session}
     elif method == "session/prompt":
         assert session == source["session"]["sessionId"]
+        update(session, "session_info_update", title="AGY title from live event")
         update(session, "agent_message_chunk", content={"type": "text", "text": "same native context"})
         result = {"stopReason": "end_turn"}
     else:
@@ -88,11 +89,15 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     assert "session/prompt" not in {item["method"] for item in requests}
     assert len({turn["turn_id"] for turn in frame.chat_store.load_turns(chat_id)}) == 2
+    status, alias = frame._remote_api_rename_chat_ui({"chat_id": chat_id, "title": "共享显示名"})
+    assert status == 200, alias
 
     status, accepted = frame._remote_api_message_ui({"chat_id": chat_id, "text": "续聊", "model": "agy/main"})
     assert status == 200, accepted
     wait_for_wx(lambda: frame._remote_api_state_ui({"chat_id": chat_id})[1]["turns"][-1]["answer"]
                 == "same native context", "continuation of the original native ID")
+    live = frame._remote_api_history_read_ui({"chat_id": chat_id})[1]["chat"]
+    assert (live["title"], live["agy_native_title"]) == ("共享显示名", "AGY title from live event")
     requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     resumed, = [item["params"] for item in requests if item["method"] == "session/resume"]
     assert (resumed["sessionId"], resumed["cwd"]) == ("terminal-id", str(project))
@@ -101,6 +106,7 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     # was already open. Refresh must use a fresh ACP process to replay it.
     source = json.loads(fixture.read_text(encoding="utf-8"))
     source["session"]["updatedAt"] = "2026-11-26T06:05:00Z"
+    source["session"]["title"] = "新终端标题"
     source["turns"].extend([["续聊", "same native context"], ["独立终端续聊", "新的已结算回答"]])
     fixture.write_text(json.dumps(source), encoding="utf-8")
     def refreshed():
@@ -110,6 +116,9 @@ def test_discovers_replays_and_resumes_native_history(frame, tmp_path, monkeypat
     wait_for_wx(refreshed, "new external history", timeout=6)
     history = frame._remote_api_history_read_ui({"chat_id": chat_id, "limit": 1})[1]
     assert history["chat"]["turns"][0]["answer"] == "新的已结算回答"
+    assert history["chat"]["title"] == "共享显示名"
+    assert history["chat"]["agy_native_title"] == "新终端标题"
+    assert frame.chat_store.load_chat_summary(chat_id)["title"] == "共享显示名"
     assert len(refreshed()) == 1
     requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     replay_pids = {item["fixturePid"] for item in requests if item["method"] == "session/load"}

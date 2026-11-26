@@ -446,6 +446,10 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
     def get_session(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         return self._request_data("GET", f"/api/v1/sessions/{session_id}", timeout=timeout)
 
+    def set_session_title(self, session_id: str, title: str) -> None:
+        sid = quote(session_id, safe="")
+        self._request_data("POST", f"/api/v1/sessions/{sid}/profile", json_body={"title": title})
+
     def list_messages(
         self,
         session_id: str,

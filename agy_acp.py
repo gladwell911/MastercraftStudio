@@ -181,6 +181,7 @@ class AgyAcpClient:
         self._pending = {}
         self._ids = itertools.count(1)
         self._on_update = None
+        self.on_session_info = None
         self._turn = None
         self._closed = False
         self._cwd = cwd
@@ -280,9 +281,13 @@ class AgyAcpClient:
                     self._handle_request(request_id, method, params)
                 elif method == "session/update":
                     with self._lock:
+                        update = params.get("update") or {}
                         callback = self._turn.on_update if self._turn is not None else self._on_update
-                        if callback and params.get("sessionId") == self.session_id:
-                            callback(params.get("update") or {})
+                        if params.get("sessionId") == self.session_id:
+                            if self.on_session_info and update.get("sessionUpdate") == "session_info_update":
+                                self.on_session_info(self.session_id, update)
+                            if callback:
+                                callback(update)
                 elif request_id is not None:
                     with self._lock:
                         turn = self._turn

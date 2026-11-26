@@ -1,6 +1,8 @@
 """Background native discovery and application history publication."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -9,15 +11,20 @@ import wx
 
 from agy_acp import AgyError, find_agy_executable
 from agy_history import list_agy_sessions, read_agy_session
+from codex_client import is_codex_model
 from codex_history import CodexHistoryReader, codex_history_homes
-from kimi_history import KimiHistoryReader
+from codex_worker_client import codex_worker_workspace
+from kimi_history import KimiHistoryReader, kimi_history_storage
+from kimi_server_client import is_kimi_model
 from kimi_runtime import runtime_path as kimi_runtime_path
 from kimi_server_client import KimiServerClient, KimiServerError
-from native_history import NATIVE_CHAT_FIELDS
+from native_history import NATIVE_CHAT_FIELDS, TITLE_FIELDS, NativeTitleRejected
 
 
 _LOG = logging.getLogger(__name__)
 _REFRESH_SECONDS = 60
+_NATIVE_TITLE_FIELDS = ("native_title", "native_title_revision", "native_title_observed_at")
+_RENAME_UNKNOWN = "原生改名结果尚未确认，已保留上次确认的标题，将重新读取。"
 
 
 class NativeHistoryMixin:
@@ -51,6 +58,9 @@ class NativeHistoryMixin:
         self._native_history_last_scan = 0.0
         self._native_history_reserved = set()
         self._native_history_timer = None
+        self._native_title_recheck = None
+        self._native_rename_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native-rename")
+        self._native_title_pending = {}
         self._poll_native_history()
 
     def _poll_native_history(self) -> None:
@@ -60,6 +70,10 @@ class NativeHistoryMixin:
         self._native_history_timer = wx.CallLater(_REFRESH_SECONDS * 1000, self._poll_native_history)
 
     def _stop_native_history_refresh(self) -> None:
+        self._native_rename_executor.shutdown(wait=False, cancel_futures=True)
+        if self._native_title_recheck is not None:
+            self._native_title_recheck.Stop()
+            self._native_title_recheck = None
         if self._native_history_timer is not None:
             self._native_history_timer.Stop()
             self._native_history_timer = None
@@ -80,6 +94,150 @@ class NativeHistoryMixin:
             target=self._scan_native_history, args=(discoverers,), name="native-history", daemon=True,
         )
         self._native_history_worker.start()
+
+    @staticmethod
+    def _native_title_scope(chat, provider):
+        fields = {
+            "codex": ("codex_thread_id", "codex_home", "codex_storage_id"),
+            "kimi": ("kimi_session_id", "kimi_storage_id"),
+            "agy": ("agy_session_id", "agy_native_owner"),
+        }[provider]
+        return {field: chat.get(field) for field in (*fields, "native_identity", "native_account", "native_cwd")}
+
+    def _queue_native_title_rename(self, chat, title, *, local=False):
+        model = chat.get("model")
+        provider = ("codex" if is_codex_model(model) and chat.get("codex_thread_id") else
+                    "kimi" if is_kimi_model(model) and chat.get("kimi_session_id") else "")
+        if not provider:
+            return None
+        owner = chat["id"]
+        scope = self._native_title_scope(chat, provider)
+        revision = self.chat_store.get_clear_reconciliation_authority(owner)["revision"]
+        snapshot = self.chat_store.load_chat_summary(owner)
+        if snapshot and all(snapshot.get(key) == value for key, value in scope.items()):
+            self._native_title_pending[owner] = self._native_title_pending.get(owner, 0) + 1
+            return self._native_rename_executor.submit(
+                self._rename_native_title, owner, provider, scope, revision, title, local, self._read_pair_id(),
+                self._kimi_client if provider == "kimi" else None,
+            )
+        return False
+
+    def _rename_native_title(self, owner, provider, scope, revision, title, local, pair, kimi_client):
+        status, body = 503, {"accepted": False, "error": _RENAME_UNKNOWN}
+        try:
+            current = self.chat_store.load_chat_summary(owner)
+            if (not current or self.chat_store.get_clear_reconciliation_authority(owner)["revision"] != revision
+                    or self._native_title_scope(current, provider) != scope):
+                raise NativeTitleRejected("聊天已变更，请重新打开后改名。")
+            cwd, account = scope["native_cwd"], scope["native_account"]
+            if provider == "codex":
+                home = Path(scope["codex_home"]) if scope["codex_home"] else codex_worker_workspace() / ".codex-home"
+                reader = CodexHistoryReader(home, not current.get("codex_user_home"), pair, lambda: [])
+                try:
+                    confirmed = reader.rename_session(scope["codex_thread_id"], cwd, account, title)
+                finally:
+                    reader.client.close()
+            else:
+                client = kimi_client or KimiServerClient()
+                try:
+                    reader = KimiHistoryReader(client, pair, self._kimi_is_user_prompt)
+                    confirmed = reader.rename_session(scope["kimi_session_id"], cwd, scope["kimi_storage_id"], account, title)
+                finally:
+                    if kimi_client is None:
+                        client.close()
+            if confirmed:
+                status, body = self._run_remote_ui_route(
+                    lambda: self._commit_native_rename_ui(owner, scope, revision, provider, confirmed, time.time()),
+                )
+        except NativeTitleRejected as exc:
+            status, body = 409, {"accepted": False, "error": str(exc)}
+        except (RuntimeError, TimeoutError, ValueError, OSError, sqlite3.Error) as exc:
+            _LOG.info("Native rename could not be confirmed (%s)", type(exc).__name__)
+        finally:
+            self._run_remote_ui_route(lambda: self._native_rename_finished_ui(owner, status == 200, body, local))
+        return status, body
+
+    def _commit_native_rename_ui(self, owner, scope, revision, provider, title, observed_at):
+        committed = self.chat_store.apply_native_session_title(
+            owner, scope, revision, provider, title, observed_at, app_manual=True,
+        )
+        if committed:
+            self._publish_title_update(owner, committed)
+            return 200, self._rename_title_response(committed)
+        return 409, {"accepted": False, "error": "聊天已变更，请重新打开确认原生标题。"}
+
+    def _observe_native_title_ui(self, owner, provider, sid, title, observed_at, *,
+                                 explicit=True, native_identity=None):
+        if not title or getattr(self, "_closing", False) or owner in self._native_title_pending:
+            return
+        chat = self._history_chat_for_id(owner)
+        if chat is None or chat.get("id") != owner:
+            return
+        scope = self._native_title_scope(chat, provider)
+        session_field = {"codex": "codex_thread_id", "kimi": "kimi_session_id", "agy": "agy_session_id"}[provider]
+        if (sid != scope[session_field]
+                or (native_identity is not None and native_identity != scope["native_identity"])
+                or (provider == "kimi" and scope["kimi_storage_id"]
+                    and scope["kimi_storage_id"] != kimi_history_storage())):
+            return
+        try:
+            revision = self.chat_store.get_clear_reconciliation_authority(owner)["revision"]
+            committed = self.chat_store.apply_native_session_title(
+                owner, scope, revision, provider, title, observed_at, explicit=explicit,
+            )
+        except (sqlite3.Error, OSError):
+            return
+        if committed:
+            self._publish_title_update(owner, committed)
+
+    @staticmethod
+    def _rename_title_response(chat):
+        return {"accepted": True, "chat_id": chat["id"], "title": chat["title"],
+                "title_source": chat["title_source"], "title_revision": chat["title_revision"],
+                "title_updated_at": chat["title_updated_at"]}
+
+    def _native_rename_finished_ui(self, owner, committed, body, local):
+        pending = self._native_title_pending.get(owner, 0)
+        if pending > 1:
+            self._native_title_pending[owner] = pending - 1
+        else:
+            self._native_title_pending.pop(owner, None)
+        if not committed:
+            if self._native_title_recheck is None:
+                self._native_title_recheck = wx.CallLater(3100, self._recheck_native_title)
+            else:
+                self._native_title_recheck.Restart()
+        if local and pending <= 1:
+            self.SetStatusText("聊天标题已更新" if committed else body.get("error", _RENAME_UNKNOWN))
+        return 200, {}
+
+    def _recheck_native_title(self):
+        self._native_title_recheck = None
+        self._request_native_history_refresh()
+
+    def _publish_title_update(self, owner, committed):
+        chat = self._history_chat_for_id(owner)
+        if chat is None or chat.get("id") != owner or getattr(self, "_closing", False):
+            return
+        before = (chat.get("title_revision"), chat.get("native_title_revision"))
+        self._merge_published_title(chat, committed)
+        if before != (chat.get("title_revision"), chat.get("native_title_revision")):
+            self._upsert_history_row(owner, allow_reorder=False)
+            self._push_remote_title_changed(chat)
+
+    def _push_remote_title_changed(self, chat):
+        body = self._rename_title_response(chat)
+        if chat.get("agy_session_id"):
+            body.update(agy_native_title=chat.get("native_title", ""),
+                        agy_native_title_revision=chat.get("native_title_revision", 0))
+        self._push_remote_history_changed(chat["id"], title_update=body)
+
+    @staticmethod
+    def _merge_published_title(chat, committed):
+        if int(committed.get("title_revision") or 0) > int(chat.get("title_revision") or 0):
+            chat.update({field: committed[field] for field in TITLE_FIELDS})
+        if int(committed.get("native_title_revision") or 0) > int(chat.get("native_title_revision") or 0):
+            chat.update({field: committed[field] for field in _NATIVE_TITLE_FIELDS})
 
     def _native_history_authority_ui(self, session, chat_id, *, reserve=False, expected=None):
         if getattr(self, "_closing", False) or chat_id in self._native_history_reserved:
@@ -139,7 +297,8 @@ class NativeHistoryMixin:
                     turns = None
                     try:
                         changed = self.chat_store.merge_native_history(
-                            session, expected_chat_id=owner, expected_revision=revision)
+                            session, expected_chat_id=owner, expected_revision=revision,
+                            merge_title=owner not in self._native_title_pending)
                         if changed is not None and session.turns:
                             turns = self.chat_store.load_turns(owner)
                     finally:
@@ -154,6 +313,11 @@ class NativeHistoryMixin:
         active = owner == self.active_chat_id
         target = self._current_chat_state if active else self._chat_summary_by_id(owner)
         prior_count = int((target or {}).get("turn_count") or len((target or {}).get("turns") or []))
+        title_only = bool(target) and changed["turn_count"] == prior_count and all(
+            target.get(field) == changed.get(field) for field in NATIVE_CHAT_FIELDS
+            if field not in (*_NATIVE_TITLE_FIELDS, "native_updated_at", "native_replayed_at")
+        )
+        prior_titles = ((target or {}).get("title_revision"), (target or {}).get("native_title_revision"))
         if session.identity.provider == "agy" and changed["turn_count"] > prior_count:
             client = self._agy_clients.pop(owner, None)
             if client is not None:
@@ -161,14 +325,11 @@ class NativeHistoryMixin:
         if target is None:
             self.archived_chats.append(dict(changed))
         else:
-            if (target.get("title_source") == "native" and not target.get("title_manual")
-                    and changed["title_revision"] > int(target.get("title_revision") or 1)):
-                target.update({field: changed[field] for field in (
-                    "title", "title_updated_at", "title_revision",
-                )})
+            self._merge_published_title(target, changed)
             for field in session.chat_fields:
                 target.setdefault(field, changed[field])
-            target.update({field: changed[field] for field in NATIVE_CHAT_FIELDS if field in changed})
+            target.update({field: changed[field] for field in NATIVE_CHAT_FIELDS
+                           if field in changed and field not in _NATIVE_TITLE_FIELDS})
             target["updated_at"] = max(target.get("updated_at", 0), changed["updated_at"])
             target["turn_count"] = changed["turn_count"]
             if turns is not None and isinstance(target.get("turns"), list) and len(turns) > len(target["turns"]):
@@ -180,6 +341,10 @@ class NativeHistoryMixin:
                     if not self._navigation_quiet_active():
                         self._render_answer_list(preserve_panel=True)
         self._sort_archived_chats()
-        self._mark_history_list_dirty()
-        self._push_remote_history_changed(owner)
+        self._upsert_history_row(owner, allow_reorder=target is None or changed["turn_count"] > prior_count)
+        if title_only:
+            if prior_titles != (target.get("title_revision"), target.get("native_title_revision")):
+                self._push_remote_title_changed(target)
+        else:
+            self._push_remote_history_changed(owner)
         return 200, {}

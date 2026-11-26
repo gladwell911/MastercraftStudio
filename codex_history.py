@@ -5,13 +5,14 @@ import getpass
 import hashlib
 import os
 from pathlib import Path
+import time
 
 from codex_client import (
-    CODEX_MODEL_CONFIGS, DEFAULT_CODEX_MODEL, CodexAppServerClient, _event_from_item,
+    CODEX_MODEL_CONFIGS, DEFAULT_CODEX_MODEL, CodexAppServerClient, CodexRpcError, _event_from_item,
     _provider_origin_timestamp, _user_home, resolve_codex_launch_command,
 )
 from codex_worker_client import codex_worker_workspace
-from native_history import NativeSessionIdentity, NativeSessionSnapshot
+from native_history import NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
 
 
 # The local App Server in 0.171.0 also writes threads with the vscode source.
@@ -53,15 +54,15 @@ def codex_history_account(client):
     return f"local:{getpass.getuser().casefold()}:{account.get('type') or 'provider'}"
 
 
-def require_codex_history_owner(client, thread_id, cwd, account):
+def require_codex_history_owner(client, thread_id, cwd, account, *, allow_active=False):
     if account and codex_history_account(client) != account:
         raise RuntimeError(_ACCOUNT_CHANGED)
     thread = client.read_thread(thread_id, include_turns=False).get("thread") or {}
     actual_cwd = thread.get("cwd")
     if (thread.get("id") != thread_id or not actual_cwd
-            or Path(actual_cwd).resolve() != Path(cwd).resolve()):
+            or (cwd and Path(actual_cwd).resolve() != Path(cwd).resolve())):
         raise RuntimeError(f"Codex 无法在原存储和项目目录找到所选线程：{cwd}")
-    if (thread.get("status") or {}).get("type") == "active":
+    if not allow_active and (thread.get("status") or {}).get("type") == "active":
         raise RuntimeError(_BUSY)
 
 
@@ -83,6 +84,23 @@ class CodexHistoryReader:
         self.known_chats = known_chats
         self.storage_id = os.path.normcase(str(home))
         self.client = CodexAppServerClient(native_home=home, use_native_config=True, timeout=8)
+
+    def rename_session(self, thread_id, cwd, account, title):
+        try:
+            require_codex_history_owner(self.client, thread_id, cwd, account, allow_active=True)
+        except (RuntimeError, OSError, ValueError) as exc:
+            raise NativeTitleRejected("无法确认 Codex 原会话及登录归属，请检查后重试。") from exc
+        try:
+            self.client.request("thread/name/set", {"threadId": thread_id, "name": title})
+        except CodexRpcError as exc:
+            raise NativeTitleRejected("Codex 拒绝更改原生标题，请检查原会话后重试。") from exc
+        except (RuntimeError, OSError, TimeoutError):
+            # A lost response can still be followed by an authoritative read.
+            pass
+        thread = self.client.read_thread(thread_id, include_turns=False).get("thread") or {}
+        if thread.get("id") == thread_id and thread.get("name") == title:
+            return title
+        return None
 
     def _known_snapshots(self):
         known = {}
@@ -115,6 +133,7 @@ class CodexHistoryReader:
             cursor = None
             cursors = set()
             while True:
+                observed_at = time.time()
                 page = self.client.request("thread/list", {
                     "cursor": cursor, "limit": 100, "sourceKinds": list(_SOURCES), "currentAccountOnly": True,
                     "modelProviders": [],
@@ -123,7 +142,7 @@ class CodexHistoryReader:
                 if not isinstance(rows, list):
                     raise RuntimeError("Codex thread/list response is missing data")
                 for row in rows:
-                    snapshot = self._snapshot(row, account)
+                    snapshot = self._snapshot(row, account, observed_at)
                     if snapshot and snapshot.identity.session_id not in seen:
                         seen.add(snapshot.identity.session_id)
                         yield snapshot
@@ -154,7 +173,7 @@ class CodexHistoryReader:
                 pass
         return updated
 
-    def _snapshot(self, row, account):
+    def _snapshot(self, row, account, observed_at):
         if not isinstance(row, dict) or row.get("source") not in _SOURCES or row.get("ephemeral"):
             return None
         thread_id, cwd = row.get("id"), row.get("cwd")
@@ -177,6 +196,7 @@ class CodexHistoryReader:
             legacy_fields={"codex_thread_id": thread_id} if self.private else {
                 "codex_thread_id": thread_id, "codex_storage_id": self.storage_id,
             },
+            title_observed_at=observed_at, title_explicit=bool(row.get("name")),
         )
 
     def read_session(self, session):

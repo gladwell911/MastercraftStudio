@@ -1308,6 +1308,19 @@ class KimiSessionsMixin:
         except Exception:
             return
         event = CodexEvent(**kimi_event_to_payload(kimi_event))
+        if event.subtype == "session.meta.updated":
+            protocol = (event.data or {}).get("protocol") or {}
+            patch = protocol.get("patch") or {}
+            if isinstance(patch, dict) and isinstance(patch.get("title"), str):
+                sid = self._event_thread_id(event)
+                candidates = {chat["id"] for chat in [self._current_chat_state, *self.archived_chats]
+                              if chat.get("kimi_session_id") == sid}
+                if len(candidates) == 1:
+                    self._call_after_if_alive(
+                        self._observe_native_title_ui, candidates.pop(), "kimi", sid, patch["title"],
+                        event.origin_timestamp or bindings.app.time.time(), explicit=patch.get("isCustomTitle") is True,
+                    )
+            return
         if event.type == "kimi_v2_usage":
             chat_id = self._known_kimi_event_chat_id(event)
             target = self._chat_information_owner_for_id(chat_id) if chat_id else None

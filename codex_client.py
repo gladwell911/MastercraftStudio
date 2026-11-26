@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 import tomllib
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,6 +21,12 @@ from remote_machine_config import resolve_onedrive_sj_root
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
+
+
+class CodexRpcError(RuntimeError):
+    """A JSON-RPC error response from the Codex App Server."""
+
+
 CODEX_MODEL_CONFIGS = {
     "codex/gpt-5.4-medium": {
         "model": "gpt-5.4",
@@ -1071,7 +1078,8 @@ class CodexAppServerClient:
         error = state.get("error")
         if error:
             message = str(error.get("message") or "unknown error")
-            raise RuntimeError(f"Codex app-server request failed: {method}: {message}")
+            error_type = CodexRpcError if isinstance(error.get("code"), int) else RuntimeError
+            raise error_type(f"Codex app-server request failed: {method}: {message}")
         result = state.get("result")
         return result if isinstance(result, dict) else {}
 
@@ -1190,6 +1198,10 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
+        if method == "thread/name/updated":
+            self._emit_event(CodexEvent(type="native_title", thread_id=str(params.get("threadId") or ""),
+                                        text=str(params.get("threadName") or ""), origin_timestamp=time.time()))
+            return
         if method == "serverRequest/resolved":
             self._emit_event(CodexEvent(type="server_request_resolved", thread_id=str(params.get("threadId") or ""),
                                         request_id=params.get("requestId"), method=method))

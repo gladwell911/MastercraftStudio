@@ -106,7 +106,7 @@ class AgySessionsMixin:
         return NativeSessionIdentity(self._read_pair_id(), "agy", client.native_storage(), session_id).chat_id
 
     def _open_agy_client(self, cwd: str, *, session_id: str = "", owner: str = "",
-                         native_identity: str = "") -> AgyAcpClient:
+                         native_identity: str = "", chat_id: str = "") -> AgyAcpClient:
         executable = find_agy_executable()
         if not executable:
             raise AgyError("此电脑尚未安装 AGY，请安装或设置 MC_AGY_EXECUTABLE")
@@ -118,13 +118,26 @@ class AgySessionsMixin:
                 or (native_identity and self._agy_native_identity(client, session_id) != native_identity)
             ):
                 raise AgyError("此聊天属于原运行电脑或 AGY 登录账号，请恢复原来的账号")
+            if chat_id:
+                self._watch_agy_title(client, chat_id)
             client.open_session(session_id)
             return client
         except BaseException:
             client.close()
             raise
 
+    def _watch_agy_title(self, client, chat_id):
+        def receive(session_id, update):
+            title = update.get("title")
+            if isinstance(title, str):
+                self._call_after_if_alive(
+                    self._observe_native_title_ui, chat_id, "agy", session_id, title,
+                    time.time(), native_identity=self._agy_native_identity(client, session_id),
+                )
+        client.on_session_info = receive
+
     def _remember_agy_workspace(self, client: AgyAcpClient, chat_id: str, cwd: str) -> None:
+        self._watch_agy_title(client, chat_id)
         self.chat_store.set_meta(self._agy_workspace_preference_key(), cwd)
         self._agy_clients[chat_id] = client
 
@@ -334,11 +347,12 @@ class AgySessionsMixin:
                     if prepared_attachments is not None:
                         raise AgyError("用于检查附件的 AGY 连接已退出，请重新发送")
                     active_client = self._open_agy_client(
-                        cwd, session_id=session_id, owner=owner, native_identity=native_identity)
+                        cwd, session_id=session_id, owner=owner, native_identity=native_identity, chat_id=chat_id)
                 elif (active_client.session_id != session_id
                       or active_client.native_owner(self._read_pair_id()) != owner
                       or (native_identity and self._agy_native_identity(active_client, session_id) != native_identity)):
                     raise AgyError("AGY 原会话归属已变化，请重新打开聊天")
+                self._watch_agy_title(active_client, chat_id)
                 active_client.configure(config, options)
                 if getattr(self, "_closing", False):
                     raise AgyError("MC 正在退出")

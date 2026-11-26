@@ -1903,6 +1903,10 @@ class CodexSessionsMixin:
                 event = codex_worker_protocol.event_from_payload(event_payload)
             except Exception:
                 return
+            if event.type == "native_title":
+                self._call_after_if_alive(self._observe_native_title_ui, chat_id, "codex",
+                                          event.thread_id, event.text, event.origin_timestamp)
+                return
             self._apply_codex_worker_event_scope(event, payload)
             if client is None:
                 self._dispatch_codex_event_to_ui(chat_id, event)
