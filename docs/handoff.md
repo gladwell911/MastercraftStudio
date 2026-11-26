@@ -14,6 +14,7 @@
 - T13 随后从真实 AGY 1.5.17 发现 Windows ACP 清单的 /D:/ 盘符形式，修复提交 b234cf482ebce304fed366f7b0ee5098a4c8489f。21 项定向通过，固定 AGY 输入路径能读原答并用同一 ID 续聊，真实终端 F2 改名、F4 取消及确认删除由独立原生读回验证。已重建隔离 Windows 包，冻结版本通过 /D:/ 原生历史、单进程冷启复用及 NATS 实时工具行，证据位于 candidate-final/mc-agy-cwd-rebuild/。真实 Codex App Server 和原生终端也在同一云端线程续聊通过，详见工作区 T13 自动化续验。
 
 - AGY 1.5.18 的真实原生 F4 删除及精确原生回读与 1.5.17 一致，MC 候选 84dbe97 纳入这一版本，保留原账号、目录、来源和双重缺失门槛。18 项定向通过，BuildOnly 冻结包经 NATS 同一目标在仍存在时拒绝、确认缺失后移除。实际 Windows 文件选择器发送 PNG 和 UTF-8 文本到真实 AGY，独立 SQLite 回读同一终答。真实 Kimi 2.6.3 原生 CLI、共享 PowerShell 与本机 NATS 同 ID 续聊和精确停止通过。两路正式 WSS 的 TLS、mobile 认证 PING/PONG 与不同 server ID 已验证，同批实际双机部署仍待。
+- MC 候选 `fea9a35` 在实时结算和原生历史回读中区分 Kimi `cancelled` 与 `failed`。普通账户冻结包验证 Kimi 2.6.3 精确停止、前一轮终答和 AGY 1.5.18 缺失确认。隔离 Android 使用 RC `8b9c92f` 一键停止，MC 与同一 Kimi 服务实例都记录 `cancelled`。桌面云端 PowerShell 同 ID 续问后通过 NATS 核对同样终态。正式双机应用链路仍待。
 
 ## 2026-11-23 聊天切换与争渡播报
 
