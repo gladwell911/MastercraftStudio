@@ -973,7 +973,8 @@ class ChatRequestsMixin:
         if getattr(self, "_chat_store_enabled", False) and store is not None:
             if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
                 return False, "Clear/resend recovery is still pending for this chat."
-            has_live_turns = active or (attachments and isinstance(chat.get("turns"), list))
+            has_live_turns = active or ((attachments or chat.get("codex_terminal_thread"))
+                                        and isinstance(chat.get("turns"), list))
             loaded = None if has_live_turns else store.load_chat(owner_id, include_execution_steps=False)
             if isinstance(loaded, dict):
                 # Preserve the object held by archived_chats while replacing
@@ -1235,6 +1236,20 @@ class ChatRequestsMixin:
         if codex_local_command:
             command_name = str(codex_local_command.get("name") or "").strip()
             command_args = str(codex_local_command.get("args") or "").strip()
+            if source == "local" and self._current_chat_state.get("codex_terminal_thread"):
+                if command_name == "stop":
+                    ok, message = self._stop_shared_codex_turn(self._current_chat_state, self.active_codex_turn_id)
+                    if ok:
+                        self.input_edit.SetValue("")
+                        self.SetStatusText(message)
+                    return ok, message
+                if command_name == "reply":
+                    pending = self._codex_terminal_pending(chat_id)
+                    if pending:
+                        self.input_edit.SetValue("")
+                        self._show_codex_terminal_request(chat_id, pending["interaction_id"])
+                        return True, ""
+                    return False, "此聊天没有待处理的 Codex 请求。"
             now = bindings.app.time.time()
             turn_idx = len(self.active_session_turns)
             turn = {

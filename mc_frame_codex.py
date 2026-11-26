@@ -21,6 +21,7 @@ from codex_client import (
     normalize_codex_service_tier,
 )
 from context_usage import context_usage_from_dict, format_context_usage_label
+from remote_protocol import format_remote_approval_request, format_remote_user_input_request, parse_remote_approval_reply, parse_remote_user_input_reply
 from mc_frame_settings import (
     CODEX_UI_EVENT_BATCH_DELAY_MS,
     CODEX_UI_EVENT_BATCH_SIZE,
@@ -33,6 +34,121 @@ import mc_frame_bindings as bindings
 
 
 class CodexSessionsMixin:
+    def _prepare_codex_terminal_open(self, payload):
+        chat_id, thread_id = payload.get("chat_id"), payload.get("session_id")
+        if (not isinstance(chat_id, str) or not chat_id or len(chat_id) > 512
+                or not isinstance(thread_id, str) or len(thread_id) > 512):
+            return 400, {"error": "invalid_chat_scope"}
+        chat, turns, _ = self._chat_target_for_request(chat_id)
+        if not chat or chat.get("id") != chat_id or getattr(self, "_closing", False):
+            return 404, {"error": "chat_not_found"}
+        model = self._model_for_chat_selection(chat)
+        if not is_codex_model(model) or self._clear_pending_for(chat_id):
+            return 409, {"error": "chat_changed"}
+        if self._codex_thread_id_for_chat(chat) != thread_id:
+            return 409, {"error": "chat_changed"}
+        if self._codex_active_request_turn_count(turns) and chat.get("codex_terminal_thread") != thread_id:
+            return 409, {"message": "此聊天正在使用原运行时。请等待当前回合结束后打开共享终端。"}
+        return 200, {
+            "client": self._get_or_create_codex_client(chat_id, model),
+            "chat_id": chat_id, "model": model, "thread_id": thread_id,
+            "context_generation": int(chat.get("codex_context_generation") or 0),
+            "cwd": self._workspace_dir_for_codex(), "title": str(chat.get("title") or "新聊天"),
+            "service_tier": self._codex_service_tier_for_chat(chat),
+            "approval_policy": self.codex_approval_policy, "sandbox": self.codex_sandbox,
+        }
+
+    def _confirm_codex_terminal_open(self, client, scope, result):
+        chat_id = scope["chat_id"]
+        chat, _, current = self._chat_target_for_request(chat_id)
+        thread_id = result["thread_id"]
+        if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
+                or not self._codex_source_client_is_current(chat_id, client)
+                or self._model_for_chat_selection(chat) != scope["model"]
+                or int(chat.get("codex_context_generation") or 0) != scope["context_generation"]
+                or self._codex_thread_id_for_chat(chat) not in {scope["thread_id"], thread_id}):
+            return 409, {"error": "chat_changed"}
+        if current:
+            self.active_codex_thread_id = thread_id
+        chat["codex_thread_id"] = thread_id
+        chat["codex_terminal_thread"] = thread_id
+        chat["codex_thread_configuration"] = result.get("thread_configuration", {})
+        chat["codex_thread_configuration_thread_id"] = thread_id
+        self._defer_codex_state_save()
+        self._push_remote_history_changed(chat_id)
+        return 200, {key: result[key] for key in ("thread_id", "cwd", "home", "url", "executable", "credential")}
+
+    def _accept_codex_terminal_turn(self, client, payload):
+        chat_id, model = payload["chat_id"], payload["model"]
+        thread_id, turn_id = payload["thread_id"], payload["turn_id"]
+        generation = payload["context_generation"]
+        chat, turns, current = self._chat_target_for_request(chat_id)
+        index = None
+        if (chat and chat.get("id") == chat_id and self._model_for_chat_selection(chat) == model
+                and self._codex_thread_id_for_chat(chat) == thread_id and not self._clear_pending_for(chat_id)
+                and int(chat.get("codex_context_generation") or 0) == generation):
+            if not current and not isinstance(chat.get("turns"), list) and self.chat_store is not None:
+                loaded = self.chat_store.load_chat(chat_id, include_execution_steps=False)
+                if isinstance(loaded, dict):
+                    turns = list(loaded.get("turns") or [])
+            for existing_index, existing in enumerate(turns):
+                if existing.get("codex_turn_id") == turn_id and existing.get("codex_thread_id") == thread_id:
+                    index = existing_index
+                    break
+            if index is None:
+                index = len(turns)
+                question = payload["question"]
+                turn = {"question": question, "answer_md": REQUESTING_TEXT, "question_origin": "terminal",
+                        "model": model, "created_at": bindings.app.time.time(), "codex_context_generation": generation}
+                self._mark_turn_request_pending(turn, model, question)
+                # The TUI already submitted this native request. A restart must never replay its input.
+                turn["request_recoverable"] = False
+                turns.append(turn)
+                chat["turns"] = turns
+                chat["turn_count"] = len(turns)
+                self._apply_codex_worker_thread_state(chat_id, {**payload, "turn_idx": index, "active": True})
+                if current:
+                    self.active_turn_idx = index
+                    self.is_running = True
+                    self._active_request_count = self._codex_active_request_turn_count(turns)
+                    if self.view_mode == "active" and not self._append_submitted_question_to_answer_list(index, turn):
+                        self._refresh_answer_list_preserving_selection(refresh_execution=False)
+                self._record_chat_activity(chat, turn["created_at"])
+                self._defer_chat_state_save()
+                self._push_remote_state(chat_id)
+                self._push_remote_history_changed(chat_id)
+        client.bind_terminal_turn(chat_id=chat_id, model=model, thread_id=thread_id, turn_id=turn_id,
+                                  turn_idx=index, context_generation=generation)
+
+    def _stop_shared_codex_turn(self, chat, expected_turn):
+        chat_id = str(chat.get("id") or "")
+        turn_id = self._codex_turn_id_for_chat(chat)
+        thread_id = self._codex_thread_id_for_chat(chat)
+        live = chat.get("codex_turn_active")
+        if (not live or not turn_id or expected_turn != turn_id
+                or not thread_id or chat.get("codex_terminal_thread") != thread_id):
+            return False, "此 Codex 回合已结束或已更换。"
+        client = self._codex_clients.get(chat_id)
+        if client is None:
+            return False, "Codex 终端已断开。请先从终端重新打开此聊天。"
+        try:
+            client.interrupt_turn(thread_id, turn_id, chat_id=chat_id, model=self._model_for_chat_selection(chat))
+        except (OSError, RuntimeError):
+            return False, "停止结果未知。请检查当前回合状态。"
+        return True, "已发送 Codex 停止请求。"
+
+    @staticmethod
+    def _apply_codex_terminal_status(chat, turn, event):
+        if chat.get("codex_terminal_thread") != event.thread_id or event.status in {"", "completed"}:
+            return True
+        cancelled = event.status == "interrupted"
+        detail = str(event.text or ("Codex 回合已停止。" if cancelled else "Codex 回合失败。"))
+        turn["request_status"] = "cancelled" if cancelled else "failed"
+        turn["request_error"] = detail
+        if str(turn.get("answer_md") or "") in {"", REQUESTING_TEXT}:
+            turn["answer_md"] = detail
+        return False
+
     @staticmethod
     def _parse_codex_local_command(question: str) -> dict | None:
         text = str(question or "").strip()
@@ -658,7 +774,7 @@ class CodexSessionsMixin:
             normalized_command = str(command or "").strip().lower()
             client = None
             if normalized_command in {"status", "compact", "stop"}:
-                if is_current_target:
+                if is_current_target and not target_chat.get("codex_terminal_thread"):
                     client = self._ensure_codex_client(model) if model != DEFAULT_CODEX_MODEL else self._ensure_codex_client()
                 else:
                     client = self._get_or_create_codex_client(chat_id, model) if model != DEFAULT_CODEX_MODEL else self._get_or_create_codex_client(chat_id)
@@ -765,6 +881,14 @@ class CodexSessionsMixin:
             chat["codex_context_retired_threads"] = retired[-16:]
         chat["context_usage"] = None
         chat_id = str(chat.get("id") or "").strip()
+        if chat.pop("codex_terminal_thread", None) and chat_id:
+            getattr(self, "_codex_terminal_requests", {}).pop(chat_id, None)
+            client = self._codex_clients.get(chat_id)
+            if client is not None:
+                try:
+                    client.retire_terminal(chat_id=chat_id, thread_id=retired_thread)
+                except (OSError, RuntimeError):
+                    pass
         preserve_total = bool(preserve and chat_id and self._codex_early_context_usage_owner.get((chat_id, preserve[0])) == preserve[1:])
         if not preserve_total:
             chat["codex_session_total_tokens"] = None
@@ -1040,12 +1164,19 @@ class CodexSessionsMixin:
             self._codex_ui_batch_depth += 1
             self._background_ui_update_depth += 1
             try:
+                live_deltas = set()
                 for queued_entry in batch:
                     queued_chat_id, queued_event = queued_entry[:2]
                     source_client = queued_entry[2] if len(queued_entry) > 2 else None
                     if source_client is not None and not self._codex_source_client_is_current(queued_chat_id, source_client):
                         continue
                     self._on_codex_event_for_chat(queued_chat_id, queued_event)
+                    if queued_event.type == "agent_message_delta":
+                        target, _ = self._codex_worker_target_chat(queued_chat_id)
+                        if target and target.get("codex_terminal_thread") == queued_event.thread_id:
+                            live_deltas.add((queued_chat_id, queued_event.turn_id))
+                for owner, turn_id in live_deltas:
+                    self._flush_execution_delta(owner, turn_id, retain=True)
             finally:
                 self._background_ui_update_depth = max(0, self._background_ui_update_depth - 1)
                 self._codex_ui_batch_depth = max(0, self._codex_ui_batch_depth - 1)
@@ -1171,6 +1302,122 @@ class CodexSessionsMixin:
             "params": event.params,
         }
 
+    def _codex_terminal_pending(self, chat_id):
+        requests = getattr(self, "_codex_terminal_requests", {})
+        owned = requests.get(chat_id, {})
+        return next(iter(owned.values()), None)
+
+    def _codex_terminal_interaction_payload(self, chat_id):
+        pending = self._codex_terminal_pending(chat_id)
+        if pending is None:
+            return None
+        method, params = pending["method"], pending["params"]
+        user_input = method == "item/tool/requestUserInput"
+        prompt = format_remote_user_input_request(params) if user_input else format_remote_approval_request(method, params)
+        native_id = pending["request_id"]
+        return {
+            "type": "request", "chat_id": chat_id, "request_kind": "user_input" if user_input else "approval",
+            "prompt": prompt, "event_id": "codex-interaction-" + pending["interaction_id"],
+            "body": {"request_id": native_id if type(native_id) is int else 0, "method": method,
+                     "params": params, "interaction_id": pending["interaction_id"]},
+            "ts": bindings.app.time.time(),
+        }
+
+    def _update_codex_terminal_interaction(self, chat_id, event, chat):
+        registry = self.__dict__.setdefault("_codex_terminal_requests", {})
+        owned = registry.setdefault(chat_id, {})
+        data = event.data if isinstance(event.data, dict) else {}
+        interaction_id = data.get("interaction_id")
+        if event.type == "server_request":
+            requests = self._codex_pending_request_from_event(chat_id, chat, event)
+            requests.update({"interaction_id": interaction_id, "method": event.method,
+                             "thread_id": event.thread_id, "turn_id": event.turn_id,
+                             "turn_idx": data.get("turn_idx"), "context_generation": data.get("context_generation")})
+            if interaction_id in owned:
+                return
+            owned[interaction_id] = requests
+            self._push_remote_attention(chat_id, "action_required", interaction_id, "需要您的确认或输入")
+        elif event.type == "server_request_resolved":
+            if owned.pop(interaction_id, None) is None:
+                return
+        else:
+            for key, request in tuple(owned.items()):
+                if request["thread_id"] == event.thread_id and request["turn_id"] == event.turn_id:
+                    owned.pop(key)
+        if not owned:
+            registry.pop(chat_id, None)
+        self._invalidate_remote_state_cache()
+        self._push_remote_state(chat_id)
+        if (event.type == "server_request" and chat_id in {self.active_chat_id, self.current_chat_id}
+                and self._codex_terminal_pending(chat_id) is requests):
+            self._call_after_if_alive(self._show_codex_terminal_request, chat_id, interaction_id)
+
+    def _show_codex_terminal_request(self, chat_id, interaction_id):
+        pending = self._codex_terminal_pending(chat_id)
+        if (not pending or pending["interaction_id"] != interaction_id
+                or chat_id not in {self.active_chat_id, self.current_chat_id}):
+            return
+        params, method = pending["params"], pending["method"]
+        if method == "item/tool/requestUserInput":
+            questions = params.get("questions") or []
+        else:
+            allowed = params.get("availableDecisions")
+            if not isinstance(allowed, list):
+                allowed = ["accept", "acceptForSession", "decline", "cancel"]
+            labels = {"accept": "允许本次", "acceptForSession": "允许本会话", "decline": "拒绝", "cancel": "取消"}
+            questions = [{"id": "approval", "header": "Codex 审批",
+                          "question": format_remote_approval_request(method, params),
+                          "options": [{"value": value, "label": label} for value, label in labels.items() if value in allowed]}]
+        dialog = bindings.app.CodexUserInputDialog(self, questions)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            answers = dialog.get_answers()
+        finally:
+            dialog.Destroy()
+        if method == "item/tool/requestUserInput":
+            self._reply_codex_terminal_request(chat_id, interaction_id, answers=answers)
+        else:
+            values = answers.get("approval") or []
+            if values:
+                self._reply_codex_terminal_request(chat_id, interaction_id, text=values[0])
+
+    def _reply_codex_terminal_request(self, chat_id, interaction_id, *, text="", answers=None):
+        pending = self._codex_terminal_pending(chat_id)
+        chat, turns, _ = self._chat_target_for_request(chat_id)
+        client = self._codex_clients.get(chat_id)
+        if (not pending or pending.get("submitted") or pending["interaction_id"] != interaction_id
+                or not chat or client is None):
+            return False, "此 Codex 请求已处理或过期。"
+        index = pending["turn_idx"]
+        if (type(index) is not int or not 0 <= index < len(turns)
+                or self._model_for_chat_selection(chat) != pending["model"]
+                or self._codex_thread_id_for_chat(chat) != pending["thread_id"]
+                or self._codex_turn_id_for_chat(chat) != pending["turn_id"]
+                or int(chat.get("codex_context_generation") or 0) != pending["context_generation"]):
+            return False, "此 Codex 请求已处理或过期。"
+        method, params = pending["method"], pending["params"]
+        if method == "item/tool/requestUserInput":
+            if answers is None:
+                answers, error = parse_remote_user_input_reply(params, text)
+                if answers is None:
+                    return False, error
+            response = {"answers": answers}
+        else:
+            decision = parse_remote_approval_reply(method, text) or (text if text == "cancel" else None)
+            allowed = params.get("availableDecisions")
+            if decision is None or (isinstance(allowed, list) and decision not in allowed):
+                return False, "请选择此 Codex 请求提供的审批决定。"
+            response = {"decision": decision}
+        pending["submitted"] = True
+        try:
+            client.reply_terminal_interaction(**{k: pending[k] for k in (
+                "chat_id", "model", "thread_id", "turn_id", "turn_idx", "context_generation", "request_id", "interaction_id",
+            )}, **response)
+        except (OSError, RuntimeError):
+            return False, "Codex 回复结果未知，请等待原生请求状态更新。"
+        return True, "已提交，等待 Codex 确认。"
+
     def _on_codex_event_for_chat(self, chat_id: str, event: CodexEvent) -> None:
         if not isinstance(event, CodexEvent):
             return
@@ -1188,7 +1435,17 @@ class CodexSessionsMixin:
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        data = event.data if isinstance(event.data, dict) else {}
+        if data.get("interaction_id"):
+            if (isinstance(identity_chat, dict) and self._codex_thread_id_for_chat(identity_chat) == event_thread_id
+                    and (event_type == "server_request_resolved" or (
+                        self._codex_turn_id_for_chat(identity_chat) == event_turn_id
+                        and int(identity_chat.get("codex_context_generation") or 0) == data.get("context_generation")))):
+                self._update_codex_terminal_interaction(chat_id, event, identity_chat)
+            return
         if event_type == "turn_completed":
+            if self._codex_terminal_pending(chat_id):
+                self._update_codex_terminal_interaction(chat_id, event, identity_chat)
             event_data = event.data if isinstance(event.data, dict) else {}
             completion_owners = event_data.get("completion_owners")
             if isinstance(completion_owners, list):
@@ -1250,6 +1507,9 @@ class CodexSessionsMixin:
                         (not turn.get("request_status") and turn.get("answer_md") == REQUESTING_TEXT))]
                     self.is_running = bool(inflight)
                     self._active_request_count = len(inflight)
+                if identity_chat.get("codex_terminal_thread") == event_thread_id:
+                    self._invalidate_remote_state_cache()
+                    self._push_remote_state(chat_id)
                 self._defer_codex_state_save()
                 return
         if self._codex_event_requires_known_turn(event):
@@ -1401,7 +1661,8 @@ class CodexSessionsMixin:
                     self._refresh_context_usage_after_done(target_chat, target_turns, target_idx, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._request_codex_chat_information(target_chat, str(turn.get("model") or DEFAULT_CODEX_MODEL))
                     self._complete_clear_operation_turn(turn, failed=False)
-                    self._queue_remote_final(chat_id, target_idx)
+                    if self._apply_codex_terminal_status(target_chat, turn, event):
+                        self._queue_remote_final(chat_id, target_idx)
                     self._play_finish_sound()
                 self._mark_chat_turns_dirty(chat_id, target_idx)
                 self._refresh_visible_history_chat(chat_id)
@@ -1486,7 +1747,8 @@ class CodexSessionsMixin:
                 else:
                     self._update_active_answer_row(target_idx)
                 self._mark_chat_turns_dirty(start_index=target_idx)
-                self._queue_remote_final(chat_id or self.active_chat_id or self.current_chat_id or "", target_idx)
+                if self._apply_codex_terminal_status(self._current_chat_state, turn, event):
+                    self._queue_remote_final(chat_id or self.active_chat_id or self.current_chat_id or "", target_idx)
                 self._request_execution_list_sync(self._current_chat_state)
             if is_current_chat:
                 self.is_running = False
@@ -1578,7 +1840,7 @@ class CodexSessionsMixin:
             return
         message_type = str(message.get("type") or "").strip()
         if (
-            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error", "chat_information"}
+            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error", "chat_information", "terminal_turn"}
             and bindings.app.threading.current_thread() is not bindings.app.threading.main_thread()
         ):
             self._call_after_if_alive(self._on_codex_worker_message, default_chat_id, message, client)
@@ -1588,6 +1850,10 @@ class CodexSessionsMixin:
             return
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         chat_id = str(payload.get("chat_id") or default_chat_id or "").strip()
+        if message_type == "terminal_turn":
+            if client is not None and not getattr(self, "_closing", False):
+                self._accept_codex_terminal_turn(client, payload)
+            return
         if message_type == "chat_information":
             subscriptions = getattr(self, "_scoped_chat_information", None)
             if subscriptions is not None and subscriptions.apply_codex(chat_id, message, payload):
@@ -1638,6 +1904,8 @@ class CodexSessionsMixin:
             data["context_generation"] = payload.get("context_generation")
         if "completion_owners" in payload:
             data["completion_owners"] = payload.get("completion_owners")
+        if "interaction_id" in payload:
+            data["interaction_id"] = payload["interaction_id"]
         model = str(payload.get("model") or "").strip()
         if model and "model" not in data:
             data["model"] = model

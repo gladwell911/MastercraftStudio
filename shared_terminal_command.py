@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hashlib
 import json
 import msvcrt
 import os
+import re
 import subprocess
 import sys
 import time
@@ -276,6 +278,38 @@ def _send(client, scope, prompt):
         _watch(client, {**scope, "turn_index": body["turn_index"]})
 
 
+def _open_codex(client, scope, prompt):
+    status, result = client.request("open_native", scope, timeout=40)
+    _show_response(status, result)
+    command, env = _codex_tui_command(result, prompt)
+    return subprocess.call(command, cwd=result["cwd"], env=env)
+
+
+def _codex_tui_command(result, prompt):
+    from codex_native_terminal import TOKEN_ENV
+    from remote_machine_config import _dpapi_unprotect
+
+    endpoint = result["url"]
+    if not re.fullmatch(r"ws://127\.0\.0\.1:[1-9][0-9]{0,4}", endpoint):
+        raise TerminalError("MC 返回的 Codex 终端端点无效。")
+    protected = base64.b64decode(result["credential"], validate=True)
+    token = _dpapi_unprotect(protected)
+    if not token or not re.fullmatch(rb"[A-Za-z0-9_-]{43}", token):
+        raise TerminalError("无法读取当前 Windows 用户的 Codex 终端凭据。")
+    env = dict(os.environ, CODEX_HOME=result["home"])
+    if env.get("TERM") in (None, "", "dumb"):
+        env["TERM"] = "xterm-256color"
+    env[TOKEN_ENV] = token.decode("ascii")
+    executable = Path(result["executable"])
+    if executable.suffix.lower() != ".exe" or not executable.is_absolute() or not executable.is_file():
+        raise TerminalError("找不到 MC 使用的 Codex 可执行文件。请重新启动 MC 并重试。")
+    command = [str(executable), "resume", "--remote", endpoint,
+               "--remote-auth-token-env", TOKEN_ENV, "--", result["thread_id"]]
+    if prompt is not None:
+        command.append(prompt)
+    return command, env
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="mc-" + str((argv or [""])[0]))
     parser.add_argument("provider", choices=PROVIDERS, help=argparse.SUPPRESS)
@@ -318,6 +352,8 @@ def main(argv=None) -> int:
                 selection = matches[0]
         scope = {"provider": args.provider, "chat_id": selection["chat_id"], "session_id": selection["session_id"]}
         print(_terminal_text(f'本机 {body["pair_id"]} · {selection["title"]}'))
+        if args.provider == "codex":
+            return _open_codex(client, scope, args.send)
         if args.send is not None:
             _send(client, scope, args.send)
             return 0

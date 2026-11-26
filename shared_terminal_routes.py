@@ -4,11 +4,15 @@ from __future__ import annotations
 import re
 from functools import partial
 
+from codex_client import is_codex_model
 from kimi_server_client import is_kimi_model
 from shared_terminal_command import MAX_PROMPT_LENGTH
 
 # Each enabled provider supplies a model predicate and its native session resolver.
-PROVIDER_ROUTES = {"kimi": (is_kimi_model, "_kimi_session_id_for_chat")}
+PROVIDER_ROUTES = {
+    "codex": (is_codex_model, "_codex_thread_id_for_chat"),
+    "kimi": (is_kimi_model, "_kimi_session_id_for_chat"),
+}
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
 
 
@@ -18,12 +22,16 @@ def dispatch_terminal(frame, operation: str, payload: dict) -> tuple[int, dict]:
             lambda: ((503, {"error": "ui_unavailable"}) if getattr(frame, "_closing", False)
                      else (200, {"ready": True, "pair_id": frame._read_pair_id()}))
         )
+    if operation == "open_native" and payload.get("provider") == "codex":
+        return _open_codex(frame, payload)
     if operation not in {"list", "send", "watch"}:
         return 400, {"error": "invalid_operation"}
     provider = payload.get("provider")
     route = PROVIDER_ROUTES.get(provider) if isinstance(provider, str) else None
     if route is None:
         return 409, {"error": "provider_unavailable"}
+    if provider == "codex" and operation != "list":
+        return 400, {"error": "invalid_operation"}
     status, body = frame._run_remote_ui_route(partial(_dispatch_ui, frame, route, operation), payload)
     if operation == "watch" and status == 200 and frame.chat_store is not None:
         _, rows = frame.chat_store.load_recent_execution_steps(
@@ -42,6 +50,18 @@ def dispatch_terminal(frame, operation: str, payload: dict) -> tuple[int, dict]:
     return status, body
 
 
+def _open_codex(frame, payload):
+    status, scope = frame._run_remote_ui_route(frame._prepare_codex_terminal_open, payload)
+    if status != 200:
+        return status, scope
+    client = scope.pop("client")
+    try:
+        result = client.open_terminal(**scope)
+    except (RuntimeError, OSError) as exc:
+        return 503, {"error": "provider_unavailable", "message": str(exc)}
+    return frame._run_remote_ui_route(lambda: frame._confirm_codex_terminal_open(client, scope, result))
+
+
 def _dispatch_ui(frame, route, operation, payload):
     if getattr(frame, "_closing", False):
         return 503, {"error": "ui_unavailable"}
@@ -54,7 +74,7 @@ def _dispatch_ui(frame, route, operation, payload):
             owner = str(chat.get("id") or "")
             if owner and owner not in seen and model_matches(frame._model_for_chat_selection(chat)):
                 session_id = native_id(chat)
-                if session_id:
+                if session_id or payload.get("provider") == "codex":
                     chats.append({"chat_id": owner, "title": str(chat.get("title") or "新聊天"),
                                   "session_id": session_id})
                 seen.add(owner)
