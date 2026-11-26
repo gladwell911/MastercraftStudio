@@ -1122,7 +1122,8 @@ class ChatRequestsMixin:
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
-        if self._current_chat_state.get("agy_workspace") and not model:
+        candidate, _, _ = self._chat_target_for_request(chat_id or self._visible_clear_owner())
+        if (candidate or {}).get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
         if is_kimi_model(resolved_model) and (chat_id or self.active_chat_id) in self._native_history_reserved:
@@ -1130,8 +1131,17 @@ class ChatRequestsMixin:
         if resolved_model == AGY_MODEL_ID and requested_attachments:
             return False, "此版本的 AGY 聊天暂不支持附件"
         if resolved_model == AGY_MODEL_ID:
+            if source == "local" and q and isinstance(candidate, dict) and candidate.get("id"):
+                control = self._handle_agy_control(candidate, q, local=True)
+                if control is not None:
+                    ok, message = control
+                    if ok:
+                        self.input_edit.ChangeValue("")
+                        if message:
+                            self.SetStatusText(message)
+                    return control
             try:
-                self._validate_agy_submission(self._current_chat_state)
+                self._validate_agy_submission(candidate or {})
             except AgyError as exc:
                 return False, str(exc)
         if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:

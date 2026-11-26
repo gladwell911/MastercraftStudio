@@ -29,31 +29,38 @@ import mc_frame_bindings as bindings
 
 
 class RemoteRoutesMixin:
-    def _apply_codex_terminal_remote_snapshot(self, chat, snapshot, *, include_request=True):
+    def _apply_native_runtime_remote_snapshot(self, chat, snapshot, *, include_request=True):
+        if chat.get("model") == AGY_MODEL_ID:
+            run = self._agy_run_for_chat(chat)
+            pending = self._agy_interaction_payload(snapshot["chat_id"], run)
+            self._apply_shared_remote_state(snapshot, bool(run), run.action_id if run else "", pending,
+                                            include_request=include_request)
+            return
+        if is_kimi_model(chat.get("model", "")):
+            owner = self._kimi_active_control_owner(chat)
+            pending = self._kimi_remote_interaction_payload(owner)
+            self._apply_shared_remote_state(snapshot, bool(owner or chat.get("kimi_turn_active")),
+                                            owner.get("prompt_id", ""), pending,
+                                            include_request=include_request)
+            return
         thread = chat.get("codex_terminal_thread")
         if not thread or thread != chat.get("codex_thread_id"):
             return
         pending = self._codex_terminal_interaction_payload(snapshot["chat_id"])
         running = bool(chat.get("codex_turn_active"))
+        self._apply_shared_remote_state(snapshot, running, self._codex_turn_id_for_chat(chat), pending,
+                                        include_request=include_request)
+
+    @staticmethod
+    def _apply_shared_remote_state(snapshot, running, turn_id, pending, *, include_request):
         snapshot["active_turn"] = snapshot["running"] = running
-        snapshot["native_turn_id"] = self._codex_turn_id_for_chat(chat) if running else ""
+        snapshot["native_turn_id"] = turn_id if running else ""
         request_kind = pending["request_kind"] if pending else ""
         snapshot["request_kind"] = request_kind
         snapshot["status"] = f"waiting_{request_kind}" if request_kind else "running" if running else "idle"
         if pending and include_request:
             snapshot["pending_request"] = pending
             snapshot["prompt"] = pending["prompt"]
-
-    def _apply_kimi_remote_snapshot(self, chat, snapshot, *, include_request=True):
-        owner = self._kimi_active_control_owner(chat)
-        running = bool(owner or chat.get("kimi_turn_active"))
-        pending = self._kimi_remote_interaction_payload(owner)
-        kind = pending["request_kind"] if pending else ""
-        snapshot.update(active_turn=running, running=running,
-                        native_turn_id=owner.get("prompt_id", ""),
-                        status=f"waiting_{kind}" if kind else "running" if running else "idle", request_kind=kind)
-        if pending and include_request:
-            snapshot.update(pending_request=pending, prompt=pending["prompt"])
 
     def _remote_session_usage(self, chat: dict, revision: int = 0) -> dict | None:
         chat_id = str(chat.get("id") or "").strip()
@@ -504,9 +511,7 @@ class RemoteRoutesMixin:
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
             **self._codex_speed_payload_for_chat(chat),
         }
-        self._apply_codex_terminal_remote_snapshot(chat, snapshot, include_request=False)
-        if is_kimi_model(model):
-            self._apply_kimi_remote_snapshot(chat, snapshot, include_request=False)
+        self._apply_native_runtime_remote_snapshot(chat, snapshot, include_request=False)
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
@@ -586,7 +591,7 @@ class RemoteRoutesMixin:
                       for index, turn in enumerate(turns) if isinstance(turn, dict)],
             **self._codex_speed_payload_for_chat(chat),
         }
-        self._apply_codex_terminal_remote_snapshot(chat, snapshot)
+        self._apply_native_runtime_remote_snapshot(chat, snapshot)
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
@@ -826,6 +831,14 @@ class RemoteRoutesMixin:
             return 400, {"accepted": False, "message": "请先为 AGY 新建聊天并选择项目目录"}
         if isinstance(preview_chat, dict) and preview_chat.get("agy_workspace") and model != AGY_MODEL_ID:
             return 400, {"accepted": False, "message": "请为其他提供方新建聊天"}
+        if model == AGY_MODEL_ID:
+            control = self._handle_agy_control(
+                preview_chat, text, expected=str(payload.get("expected_native_turn_id") or ""),
+                send_id=str(payload.get("client_send_id") or ""),
+            )
+            if control is not None:
+                ok, message = control
+                return 200 if ok else 409, {"accepted": ok, "chat_id": preview_chat["id"], "message": message}
         if isinstance(preview_chat, dict) and preview_chat.get("codex_terminal_thread"):
             expected_turn = str(payload.get("expected_native_turn_id") or "")
             target_owner = str(preview_chat.get("id") or "")
@@ -1108,6 +1121,8 @@ class RemoteRoutesMixin:
         chat, _, _ = self._chat_target_for_request(owner) if owner else (None, [], False)
         if interaction_id and chat and is_kimi_model(self._model_for_chat_selection(chat)):
             ok, message = self._reply_remote_kimi_interaction(chat, interaction_id, text, payload.get("kimi_answers"))
+        elif interaction_id.startswith("agy-"):
+            ok, message = self._reply_agy_interaction(owner, interaction_id, text=text, answers=payload.get("answers"))
         elif interaction_id or self._codex_terminal_pending(owner):
             ok, message = self._reply_codex_terminal_request(owner, interaction_id, text=text)
         elif owner and owner not in {self.active_chat_id, self.current_chat_id}:
@@ -1147,7 +1162,7 @@ class RemoteRoutesMixin:
             current_summary = self._remote_chat_summary(current)
             current_summary["running"] = bool(self.is_running)
             current_summary["request_kind"] = "user_input" if self.active_codex_pending_request else ""
-            self._apply_codex_terminal_remote_snapshot(current, current_summary, include_request=False)
+            self._apply_native_runtime_remote_snapshot(current, current_summary, include_request=False)
             chats.append(current_summary)
         for chat in self.archived_chats:
             chats.append(self._remote_chat_summary(chat))
@@ -1476,15 +1491,10 @@ class RemoteRoutesMixin:
                     include_execution_steps=include_execution_steps,
                 ) or {}
                 chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
-        if chat.get("model") == AGY_MODEL_ID:
-            running = chat_id in self._agy_busy
-            chat["active_turn"] = chat["running"] = running
-            status, request_kind = ("running" if running else "idle"), ""
-        elif is_kimi_model(chat.get("model", "")):
-            self._apply_kimi_remote_snapshot(source_chat, chat)
-            status, request_kind = chat["status"], chat["request_kind"]
-        elif source_chat.get("codex_terminal_thread") == source_chat.get("codex_thread_id") and source_chat.get("codex_terminal_thread"):
-            self._apply_codex_terminal_remote_snapshot(source_chat, chat)
+        if (chat.get("model") == AGY_MODEL_ID or is_kimi_model(chat.get("model", "")) or (
+            source_chat.get("codex_terminal_thread") and source_chat.get("codex_terminal_thread") == source_chat.get("codex_thread_id")
+        )):
+            self._apply_native_runtime_remote_snapshot(source_chat, chat)
             status, request_kind = chat["status"], chat["request_kind"]
         else:
             status = "waiting_user_input" if self.active_codex_pending_request else "idle"

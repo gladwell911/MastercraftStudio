@@ -557,7 +557,7 @@ class ChatStoreExecutionMixin:
 
     @staticmethod
     def _execution_scope_retired(conn, chat_id: str, scope: dict) -> bool:
-        if scope.get("provider") != "kimi":
+        if scope.get("provider") not in {"kimi", "agy"}:
             return False
         current = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
         return current is not None and current["revision"] > int(scope["revision"])
