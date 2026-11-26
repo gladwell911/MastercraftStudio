@@ -10,7 +10,7 @@ import sys
 import uuid
 import wx
 from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
-from native_history import NATIVE_CHAT_FIELDS
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
@@ -217,7 +217,7 @@ class ChatHistoryMixin:
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
         for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
-                      "codex_terminal_thread",
+                      "codex_terminal_thread", *CODEX_STORAGE_FIELDS,
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -1540,7 +1540,7 @@ class ChatHistoryMixin:
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
         for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
-                      "codex_terminal_thread",
+                      "codex_terminal_thread", *CODEX_STORAGE_FIELDS,
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation", "kimi_storage_id"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
@@ -2100,10 +2100,21 @@ class ChatHistoryMixin:
         m.Bind(wx.EVT_MENU, lambda event: self._history_pin(event, chat_id=target_id), id=i_pin)
         m.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
         m.Bind(wx.EVT_MENU, lambda event: self._history_rename(event, chat_id=target_id), id=i_ren)
+        if command := c.get("native_open_command"):
+            copy_command = m.Append(wx.ID_ANY, "复制原生 Codex 打开命令")
+            m.Bind(wx.EVT_MENU, lambda _event: self._copy_native_open_command(command), copy_command)
         try:
             self.PopupMenu(m)
         finally:
             m.Destroy()
+
+    def _copy_native_open_command(self, command: str) -> None:
+        if wx.TheClipboard.Open():
+            try:
+                wx.TheClipboard.SetData(wx.TextDataObject(command))
+            finally:
+                wx.TheClipboard.Close()
+            self.SetStatusText("已复制原生 Codex 打开命令")
 
     def _history_chat_for_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()

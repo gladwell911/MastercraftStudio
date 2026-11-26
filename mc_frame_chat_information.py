@@ -268,13 +268,14 @@ class ChatInformationMixin:
             self._fail_codex_chat_information_request(generation, identity)
             return
         self._chat_information_request = (None, generation, identity)
+        native_scope = self._codex_native_scope(chat)
 
         def _read() -> None:
             try:
                 client.start()
                 client.read_chat_information(chat_id=identity[0], model=model,
                                              identity=list(identity), generation=generation,
-                                             context_only=context_only)
+                                             context_only=context_only, **native_scope)
             except Exception:
                 self._call_after_if_alive(self._fail_codex_chat_information_request, generation, identity)
 

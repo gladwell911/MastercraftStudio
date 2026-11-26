@@ -12,6 +12,7 @@ from typing import Any, Callable, TextIO
 
 from codex_client import CodexAppServerClient, CodexEvent, DEFAULT_CODEX_MODEL, _event_from_item, codex_approval_parameters
 from codex_native_terminal import CodexTerminalClient
+from codex_history import codex_history_account, require_codex_history_owner
 from codex_worker_protocol import (
     decode_worker_line,
     encode_worker_message,
@@ -38,6 +39,7 @@ class CodexWorkerRuntime:
         self.client_factory = client_factory or self._default_client_factory
         self.output = output or sys.stdout
         self._lock = threading.RLock()
+        self._client_operation_lock = threading.Lock()
         self._clients: dict[tuple[str, str], Any] = {}
         self._turn_indices: dict[tuple[str, str], Any] = {}
         self._thread_turn_scopes: OrderedDict[tuple[str, str, str], tuple[int, int]] = OrderedDict()
@@ -62,10 +64,15 @@ class CodexWorkerRuntime:
 
     def handle_message(self, message: dict[str, Any]) -> bool:
         message_type = str(message.get("type") or "")
-        if message_type == "start_turn":
-            self._handle_start_turn(message)
-        elif message_type == "open_terminal":
-            self._handle_open_terminal(message)
+        if message_type in {"start_turn", "open_terminal", "compact_thread", "read_chat_information"}:
+            with self._client_operation_lock:
+                handler = {
+                    "start_turn": self._handle_start_turn,
+                    "open_terminal": self._handle_open_terminal,
+                    "compact_thread": self._handle_compact_thread,
+                    "read_chat_information": self._handle_read_chat_information,
+                }[message_type]
+                handler(message)
         elif message_type == "bind_terminal_turn":
             self._bind_terminal_turn(message)
         elif message_type == "retire_terminal":
@@ -76,16 +83,13 @@ class CodexWorkerRuntime:
             self._handle_reply_user_input(message)
         elif message_type == "reply_command_approval":
             self._handle_reply_command_approval(message)
-        elif message_type == "compact_thread":
-            self._handle_compact_thread(message)
         elif message_type == "cancel_turn":
             self._handle_cancel_turn(message)
-        elif message_type == "read_chat_information":
-            self._handle_read_chat_information(message)
         elif message_type == "ping":
             self.emit("pong", request_id=message.get("id"))
         elif message_type == "shutdown":
-            self.close()
+            with self._client_operation_lock:
+                self.close()
             return False
         else:
             self._emit_protocol_error(message, f"unsupported worker message type: {message_type}")
@@ -112,10 +116,12 @@ class CodexWorkerRuntime:
         for client in clients:
             client.close()
 
-    def _client_for(self, chat_id: str, model: str) -> Any:
+    def _client_for(self, chat_id: str, model: str, scope: dict | None = None) -> Any:
         normalized_chat_id = str(chat_id or "").strip()
         normalized_model = str(model or "").strip() or DEFAULT_CODEX_MODEL
         key = (normalized_chat_id, normalized_model)
+        scope = scope or {}
+        home = Path(scope["native_home"]) if scope.get("native_home") else None
         with self._lock:
             if key not in self._clients:
                 client = self.client_factory(
@@ -123,9 +129,13 @@ class CodexWorkerRuntime:
                         chat_id, model, event, client
                     ),
                     normalized_model,
+                    **({"native_home": home, "use_native_config": bool(scope.get("native_user_home"))} if home else {}),
                 )
                 self._clients[key] = client
-            return self._clients[key]
+            client = self._clients[key]
+            if home and getattr(client, "_codex_home_dir", None) != home:
+                raise RuntimeError("Codex 聊天的原存储已变更，请重新打开该聊天")
+            return client
 
     def _on_event(self, chat_id: str, model: str, event: CodexEvent, source_client=None) -> None:
         with self._lock:
@@ -213,7 +223,8 @@ class CodexWorkerRuntime:
         key = (chat_id, model)
         expected_thread = str(payload.get("thread_id") or "")
         generation = int(payload.get("context_generation") or 0)
-        options = codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox"))
+        options = self._approval_options(payload)
+        scoped_home = Path(payload["native_home"]) if payload.get("native_home") else None
         try:
             if not chat_id:
                 raise RuntimeError("缺少 Codex 聊天标识。")
@@ -224,26 +235,37 @@ class CodexWorkerRuntime:
                     raise RuntimeError("Codex 聊天已更换线程。请重新选择聊天。")
                 if binding is None and key in self._active_command_owners:
                     raise RuntimeError("此聊天正在使用原运行时。请等待当前回合结束后打开共享终端。")
+            if scoped_home is not None:
+                self._check_native_paths(payload)
             if binding is not None:
+                if scoped_home is not None and Path(binding["home"]) != scoped_home:
+                    raise RuntimeError("Codex 聊天的原存储已变更，请重新打开该聊天")
+                self._check_native_account(previous, payload)
                 endpoint = previous.terminal_endpoint()
             else:
-                native_home = getattr(previous, "_codex_home_dir", None)
+                native_home = scoped_home or getattr(previous, "_codex_home_dir", None)
                 private_home = Path.cwd() / ".codex-home"
                 if native_home is None and private_home.is_dir():
                     native_home = private_home
                 client = CodexTerminalClient(on_event=lambda event: self._on_event(chat_id, model, event, client),
-                                             codex_model=model, native_home=native_home)
+                                             codex_model=model, native_home=native_home,
+                                             use_native_config=bool(payload.get("native_user_home")))
                 try:
                     endpoint = client.terminal_endpoint()
                     cwd = str(payload.get("cwd") or "")
                     if expected_thread:
-                        response = client.resume_thread(expected_thread, service_tier=payload.get("service_tier"), **options)
+                        if scoped_home is not None:
+                            require_codex_history_owner(client, expected_thread, cwd, payload.get("native_account"))
+                        response = client.resume_thread(expected_thread, service_tier=payload.get("service_tier"),
+                                                        cwd=cwd if scoped_home else None, **options)
                     else:
                         response = client.start_thread(cwd, service_tier=payload.get("service_tier"), **options)
                     thread = response.get("thread") or {}
                     thread_id = str(thread.get("id") or "")
                     if not thread_id or (expected_thread and thread_id != expected_thread):
                         raise RuntimeError("Codex 未返回所选原生线程。")
+                    if scoped_home is not None and (not thread.get("cwd") or Path(thread["cwd"]).resolve() != Path(cwd).resolve()):
+                        raise RuntimeError("Codex 未恢复到原工作目录。")
                     if not expected_thread:
                         # Codex persists the empty rollout when a title is set. Resume can then attach
                         # from a second client before any model request has been made.
@@ -518,6 +540,29 @@ class CodexWorkerRuntime:
                 active_owner = self._active_command_owners.get((chat_id, model))
                 if active_owner is not None and active_owner[:2] == (thread_id, turn_id):
                     self._active_command_owners.pop((chat_id, model), None)
+                    client = self._clients.get((chat_id, model))
+                    if terminal is None and hasattr(client, "release_idle_thread"):
+                        # The app server response arrives through the reader
+                        # that dispatched this event. Let that reader run.
+                        threading.Thread(
+                            target=self._release_completed_thread, args=(key, client, thread_id, payload),
+                            daemon=True, name="codex-idle-thread-release",
+                        ).start()
+                        return
+        self.emit("event", payload)
+
+    def _release_completed_thread(self, key, client, thread_id, payload):
+        with self._client_operation_lock:
+            with self._lock:
+                idle = (self._clients.get(key) is client and key not in self._terminal_threads
+                        and key not in self._active_command_owners)
+            if idle:
+                try:
+                    client.release_idle_thread(thread_id)
+                except (RuntimeError, OSError):
+                    # Older app servers may not implement unload. This is the
+                    # private stdio process for this chat, with no other client.
+                    client._stop_process()
         self.emit("event", payload)
 
     def _handle_start_turn(self, message: dict[str, Any]) -> None:
@@ -547,12 +592,15 @@ class CodexWorkerRuntime:
             }
         accepted = False
         try:
-            client = self._client_for(chat_id, model)
+            self._check_native_paths(payload)
+            client = self._client_for(chat_id, model, payload)
             with self._lock:
                 self._turn_indices[(chat_id, model)] = turn_idx
 
             thread_id = str(payload.get("thread_id") or "").strip()
             shared = self._terminal_threads.get((chat_id, model))
+            exact_resume = bool(payload.get("native_home"))
+            options = self._approval_options(payload)
             if shared is not None and shared["thread_id"] != thread_id:
                 raise RuntimeError("Codex 共享终端线程已改动，请重新打开聊天。")
             items = list(payload.get("input_items") or [])
@@ -561,6 +609,13 @@ class CodexWorkerRuntime:
             should_steer = (bool(payload.get("should_steer")) and bool(thread_id)
                             and bool(str(payload.get("turn_id") or "").strip())
                             and hasattr(client, "steer_turn_items"))
+            if exact_resume:
+                if not thread_id:
+                    raise RuntimeError("缺少要继续的原生 Codex 线程。")
+                if should_steer or shared:
+                    self._check_native_account(client, payload)
+                else:
+                    require_codex_history_owner(client, thread_id, payload["cwd"], payload.get("native_account"))
             steered = False
             prepared = False
             resumed = False
@@ -573,16 +628,16 @@ class CodexWorkerRuntime:
                     client.prepare_task(payload.get("cwd") or "")
                 prepared = True
                 try:
-                    client.resume_thread(
-                        thread_id,
-                        **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")),
+                    self._resume_selected_thread(
+                        client, thread_id, exact_resume,
+                        **options,
                         personality="pragmatic",
                         cwd=payload.get("cwd") or "",
                         service_tier=service_tier_arg,
                     )
                     resumed = True
                 except Exception as exc:
-                    if shared is not None:
+                    if shared is not None or exact_resume:
                         raise
                     if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
                         raise
@@ -598,7 +653,7 @@ class CodexWorkerRuntime:
                     steered = True
                 except Exception as exc:
                     if self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc):
-                        if shared is not None:
+                        if shared is not None or exact_resume:
                             raise
                         recover_missing_thread = True
                     elif not self._is_no_active_turn_error(exc):
@@ -614,20 +669,20 @@ class CodexWorkerRuntime:
                     thread_id = self._start_thread(client, payload, service_tier_arg)
                 elif not resumed and not shared and hasattr(client, "resume_thread"):
                     try:
-                        client.resume_thread(
-                            thread_id,
-                            **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")),
+                        self._resume_selected_thread(
+                            client, thread_id, exact_resume,
+                            **options,
                             personality="pragmatic",
                             cwd=payload.get("cwd") or "",
                             service_tier=service_tier_arg,
                         )
                     except Exception as exc:
-                        if not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
+                        if exact_resume or not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
                             raise
                         thread_id = self._start_thread(client, payload, service_tier_arg)
                         items = self._recovery_input_items(payload, items)
                 turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg,
-                    **codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox")))
+                    **options)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
             if steered and not turn_id:
                 turn_id = str(payload.get("turn_id") or "").strip()
@@ -662,6 +717,8 @@ class CodexWorkerRuntime:
                     "turn_idx": turn_idx,
                     "model": model,
                     "thread_id": thread_id,
+                    "codex_home": str(getattr(client, "_codex_home_dir", "") or ""),
+                    "cwd": str(payload.get("cwd") or ""),
                     "thread_configuration": dict(getattr(client, "thread_configurations", {}).get(thread_id, {})),
                     "turn_id": turn_id,
                     "context_generation": context_generation,
@@ -720,6 +777,38 @@ class CodexWorkerRuntime:
                 for item_key in list(self._item_owners):
                     if item_key[:3] == retired_key:
                         self._item_owners.pop(item_key, None)
+
+    @staticmethod
+    def _approval_options(payload):
+        if payload.get("native_user_home"):
+            return {}
+        return codex_approval_parameters(payload.get("approval_policy"), payload.get("sandbox"))
+
+    @staticmethod
+    def _check_native_paths(payload):
+        home = payload.get("native_home")
+        if not home:
+            return
+        if not Path(home).is_dir():
+            raise RuntimeError(f"Codex 原会话存储目录不可用：{home}")
+        cwd = payload.get("cwd") or ""
+        if not cwd or not Path(cwd).is_dir():
+            raise RuntimeError(f"Codex 原会话工作目录不可用：{cwd}")
+
+    @staticmethod
+    def _check_native_account(client, payload):
+        account = payload.get("native_account")
+        if account and codex_history_account(client) != account:
+            raise RuntimeError("Codex 原生会话属于之前的账号，请切回该账号后刷新")
+
+    @staticmethod
+    def _resume_selected_thread(client, thread_id, exact_resume, **options):
+        result = client.resume_thread(thread_id, **options)
+        if exact_resume:
+            thread = result.get("thread") or {}
+            if (thread.get("id") != thread_id or not thread.get("cwd")
+                    or Path(thread["cwd"]).resolve() != Path(options["cwd"]).resolve()):
+                raise RuntimeError("Codex 未返回原会话线程与工作目录。")
 
     def _start_thread(self, client: Any, payload: dict[str, Any], service_tier_arg: str | None) -> str:
         thread_response = client.start_thread(
@@ -855,7 +944,11 @@ class CodexWorkerRuntime:
             self._emit_scoped_error(message, "compact_thread requires payload.thread_id", chat_id, None, model)
             return
         try:
-            client = self._client_for(chat_id, model)
+            self._check_native_paths(payload)
+            client = self._client_for(chat_id, model, payload)
+            if payload.get("native_home"):
+                require_codex_history_owner(client, thread_id, payload["cwd"], payload.get("native_account"))
+                client.resume_thread(thread_id, cwd=payload["cwd"], **self._approval_options(payload))
             client.compact_thread(thread_id)
         except Exception as exc:
             self._emit_scoped_error(message, str(exc), chat_id, None, model)
@@ -871,7 +964,8 @@ class CodexWorkerRuntime:
                                   "generation": payload.get("generation"),
                                   "context_only": bool(payload.get("context_only"))}
         try:
-            client = self._client_for(chat_id, model)
+            client = self._client_for(chat_id, model, payload)
+            self._check_native_account(client, payload)
         except Exception as exc:
             result["usage_error"] = str(exc)
             result["account_error"] = str(exc)
@@ -923,8 +1017,8 @@ class CodexWorkerRuntime:
             self._emit_scoped_error(message, str(exc), chat_id, None, model)
 
     @staticmethod
-    def _default_client_factory(on_event: Callable[[CodexEvent], None], codex_model: str) -> CodexAppServerClient:
-        return CodexAppServerClient(on_event=on_event, codex_model=codex_model)
+    def _default_client_factory(on_event: Callable[[CodexEvent], None], codex_model: str, **options) -> CodexAppServerClient:
+        return CodexAppServerClient(on_event=on_event, codex_model=codex_model, unload_idle_threads=True, **options)
 
     @staticmethod
     def _extract_id(response: dict[str, Any], object_key: str, flat_key: str) -> str:

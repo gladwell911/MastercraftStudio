@@ -1,4 +1,4 @@
-﻿"""Identity and snapshots shared by native-session discovery adapters."""
+"""Identity and snapshots shared by native-session discovery adapters."""
 
 from dataclasses import dataclass, field
 import hashlib
@@ -35,7 +35,10 @@ class NativeSessionSnapshot:
     legacy_fields: dict = field(default_factory=dict)
 
 
+CODEX_STORAGE_FIELDS = ("codex_home", "codex_storage_id", "codex_user_home")
+
+
 NATIVE_CHAT_FIELDS = (
     "native_identity", "native_account", "native_cwd", "native_title",
-    "native_updated_at", "native_replayed_at", "native_history_status",
+    "native_updated_at", "native_replayed_at", "native_history_status", "native_open_command",
 )

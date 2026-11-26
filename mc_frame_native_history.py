@@ -9,6 +9,7 @@ import wx
 
 from agy_acp import AgyError, find_agy_executable
 from agy_history import list_agy_sessions, read_agy_session
+from codex_history import CodexHistoryReader, codex_history_homes
 from kimi_history import KimiHistoryReader
 from kimi_runtime import runtime_path as kimi_runtime_path
 from kimi_server_client import KimiServerClient, KimiServerError
@@ -21,6 +22,10 @@ _REFRESH_SECONDS = 60
 
 class NativeHistoryMixin:
     def _native_history_discoverers(self):
+        for home, private in codex_history_homes():
+            reader = CodexHistoryReader(home, private, self._read_pair_id(), self.chat_store.list_chat_summaries)
+            yield reader.list_sessions, reader.read_session
+
         executable = find_agy_executable()
         if executable:
             pair = self._read_pair_id()
