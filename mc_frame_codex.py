@@ -36,6 +36,9 @@ from pathlib import Path
 import mc_frame_bindings as bindings
 
 
+_CODEX_TERMINAL_RESULT_UNKNOWN = "原 Codex 共享 App Server 已退出。请重新打开原线程核对回合结果。"
+
+
 class CodexSessionsMixin:
     @staticmethod
     def _codex_native_scope(chat):
@@ -103,12 +106,65 @@ class CodexSessionsMixin:
             self.active_codex_thread_id = thread_id
         chat["codex_thread_id"] = thread_id
         chat["codex_terminal_thread"] = thread_id
+        chat["codex_terminal_host_id"] = result["terminal_host_id"]
         self._remember_codex_storage(chat, thread_id, result["home"], result["cwd"])
         chat["codex_thread_configuration"] = result.get("thread_configuration", {})
         chat["codex_thread_configuration_thread_id"] = thread_id
         self._defer_codex_state_save()
         self._push_remote_history_changed(chat_id)
         return 200, {key: result[key] for key in ("thread_id", "cwd", "home", "url", "executable", "credential")}
+
+    def _settle_codex_terminal_host_exit(self, chat_id, payload):
+        chat, turns, active = self._chat_target_for_request(chat_id)
+        thread_id = payload.get("thread_id")
+        generation = payload.get("context_generation")
+        if (not chat or not thread_id or chat.get("codex_terminal_thread") != thread_id
+                or chat.get("codex_terminal_host_id") != payload.get("terminal_host_id")
+                or self._model_for_chat_selection(chat) != payload.get("model")
+                or int(chat.get("codex_context_generation") or 0) != generation):
+            return
+        turn_id = payload.get("turn_id") or self._codex_turn_id_for_chat(chat)
+        chat.pop("codex_terminal_thread", None)
+        chat.pop("codex_terminal_host_id", None)
+        chat.update(codex_turn_active=False, codex_turn_id="", codex_pending_request=None,
+                    codex_pending_prompt="", codex_thread_flags=[])
+        getattr(self, "_codex_terminal_requests", {}).pop(chat_id, None)
+        self._clear_codex_worker_active_turn(chat_id)
+        first_changed = None
+        if turn_id:
+            for index in range(len(turns) - 1, -1, -1):
+                turn = turns[index]
+                if (turn.get("codex_thread_id") != thread_id or turn.get("codex_turn_id") != turn_id
+                        or int(turn.get("codex_context_generation") or 0) != generation
+                        or turn.get("request_status") not in {"pending", "running"}):
+                    continue
+                turn.update(request_status="unknown", request_error=_CODEX_TERMINAL_RESULT_UNKNOWN,
+                            request_recoverable=False, answer_md="")
+                first_changed = index
+        if first_changed is not None:
+            chat["native_history_status"] = _CODEX_TERMINAL_RESULT_UNKNOWN
+            chat["native_unresolved_turn"] = {
+                "index": payload.get("turn_idx") if type(payload.get("turn_idx")) is int else first_changed,
+                "message": _CODEX_TERMINAL_RESULT_UNKNOWN,
+            }
+            self._mark_chat_turns_dirty(chat_id, first_changed)
+        if active:
+            self.active_codex_turn_active = self.is_running = False
+            self.active_codex_turn_id = self.active_codex_pending_prompt = ""
+            self.active_codex_pending_request = None
+            self.active_codex_thread_flags = []
+            self._active_request_count = 0
+            self.new_chat_button.Enable()
+            self._set_input_hint_idle()
+            if self.view_mode == "active":
+                self._refresh_answer_list_preserving_selection()
+        if first_changed is not None and self._visible_clear_owner() == chat_id:
+            self.SetStatusText(_CODEX_TERMINAL_RESULT_UNKNOWN)
+        self._defer_codex_state_save()
+        self._invalidate_remote_state_cache()
+        self._push_remote_state(chat_id)
+        self._push_remote_history_changed(chat_id)
+        self._request_native_history_refresh()
 
     def _accept_codex_terminal_turn(self, client, payload):
         chat_id, model = payload["chat_id"], payload["model"]
@@ -935,6 +991,7 @@ class CodexSessionsMixin:
             chat["codex_context_retired_threads"] = retired[-16:]
         chat["context_usage"] = None
         chat_id = str(chat.get("id") or "").strip()
+        chat.pop("codex_terminal_host_id", None)
         if chat.pop("codex_terminal_thread", None) and chat_id:
             getattr(self, "_codex_terminal_requests", {}).pop(chat_id, None)
             client = self._codex_clients.get(chat_id)
@@ -1897,7 +1954,8 @@ class CodexSessionsMixin:
             return
         message_type = str(message.get("type") or "").strip()
         if (
-            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error", "chat_information", "terminal_turn"}
+            message_type in {"thread_state", "turn_started_ack", "error", "fatal", "protocol_error",
+                             "chat_information", "terminal_turn", "terminal_host_exited"}
             and bindings.app.threading.current_thread() is not bindings.app.threading.main_thread()
         ):
             self._call_after_if_alive(self._on_codex_worker_message, default_chat_id, message, client)
@@ -1907,6 +1965,9 @@ class CodexSessionsMixin:
             return
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         chat_id = str(payload.get("chat_id") or default_chat_id or "").strip()
+        if message_type == "terminal_host_exited":
+            self._settle_codex_terminal_host_exit(chat_id, payload)
+            return
         if message_type == "terminal_turn":
             if client is not None and not getattr(self, "_closing", False):
                 self._accept_codex_terminal_turn(client, payload)
@@ -2178,7 +2239,7 @@ class CodexSessionsMixin:
                 return
         except (TypeError, ValueError):
             return
-        if str(turn.get("request_status") or "") in {"done", "failed"}:
+        if str(turn.get("request_status") or "") in {"done", "failed", "unknown"}:
             return
         self._mark_turn_request_failed(turn, message)
         active_count = self._codex_active_request_turn_count(target_turns)

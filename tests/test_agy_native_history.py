@@ -171,3 +171,105 @@ def test_native_history_scope_and_revision_preserve_existing_cache(tmp_path):
     assert store.load_turns(owner)[0]["answer_md"] == "full answer"
     store.delete_chat(owner)
     assert store.native_history_target(entry) == ("", 0)
+
+
+def test_provider_busy_blocks_an_original_agy_session_until_a_fresh_check(
+        frame, tmp_path, monkeypatch, wait_for_wx):
+    script = tmp_path / "agy_fixture.py"
+    script.write_text(FAKE_AGY, encoding="utf-8")
+    trace = tmp_path / "trace.jsonl"
+    source_path = tmp_path / "source.json"
+    source = {"session": {"sessionId": "busy-original", "cwd": str(tmp_path),
+                          "title": "External busy", "isRunning": True}, "turns": []}
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    monkeypatch.setenv("AGY_TRACE", str(trace))
+    monkeypatch.setenv("AGY_SOURCE", str(source_path))
+    monkeypatch.setenv("MC_AGY_EXECUTABLE", sys._base_executable)
+    monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
+        lambda executable: [executable, "-u", str(script)]))
+
+    def row():
+        return next((chat for chat in frame._remote_api_history_list_ui()[1]["chats"]
+                     if chat["title"] == "External busy"), None)
+
+    wait_for_wx(row, "discovered externally busy AGY session")
+    chat_id = row()["chat_id"]
+
+    def send(text):
+        return frame._remote_api_message_ui({"chat_id": chat_id, "text": text, "model": "agy/main"})
+
+    def turn():
+        return frame._remote_api_state_ui({"chat_id": chat_id})[1]["turns"][-1]
+
+    assert send("do not submit while busy")[0] == 200
+    wait_for_wx(lambda: turn().get("request_status") != "pending", "busy result")
+    assert "另一进程" in turn()["request_error"]
+    assert not any(json.loads(line)["method"] == "session/prompt"
+                   for line in trace.read_text(encoding="utf-8").splitlines())
+
+    source["session"]["isRunning"] = False
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    assert send("explicitly retry after idle")[0] == 200
+    wait_for_wx(lambda: turn().get("request_status") == "done", "same session becomes available")
+    sent, = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+             if json.loads(line)["method"] == "session/prompt"]
+    assert sent["params"]["sessionId"] == "busy-original"
+
+
+def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
+        frame, tmp_path, monkeypatch, wait_for_wx_main_loop):
+    from chat_store import ChatStore
+    from shared_terminal_routes import dispatch_terminal
+
+    script = tmp_path / "agy_interrupted.py"
+    script.write_text(FAKE_AGY.replace(
+        'update(session, "agent_message_chunk", content={"type": "text", "text": "same native context"})',
+        r'''update(session, "user_message_chunk", turnId="native-turn", messageId="native-user",
+               content={"type": "text", "text": "interrupted question"})
+        update(session, "agent_message_chunk", turnId="native-turn", messageId="native-part",
+               content={"type": "text", "text": "unfinished content"})
+        while not Path("exit-provider").exists():
+            __import__("time").sleep(.01)
+        sys.exit(3)''',
+    ), encoding="utf-8")
+    trace = tmp_path / "trace.jsonl"
+    source_path = tmp_path / "source.json"
+    source_path.write_text(json.dumps({
+        "session": {"sessionId": "original", "cwd": str(tmp_path), "title": "Original AGY"},
+        "turns": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("AGY_TRACE", str(trace))
+    monkeypatch.setenv("AGY_SOURCE", str(source_path))
+    monkeypatch.setenv("MC_AGY_EXECUTABLE", sys._base_executable)
+    monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
+        lambda executable: [executable, "-u", str(script)]))
+    db = ChatStore(frame.chat_store.db_path)
+    db.notification_sync(pair_id="default", device_id="private-device", baseline=0,
+                         incarnation="test", secret="test")
+    rows = lambda: [row for row in frame._remote_api_history_list_ui()[1]["chats"]
+                    if row["title"] == "Original AGY"]
+    wait_for_wx_main_loop(rows, "original AGY history")
+    owner = rows()[0]["chat_id"]
+    scope = {"provider": "agy", "chat_id": owner, "session_id": "original", "request_id": "b" * 32}
+    assert dispatch_terminal(frame, "send", {**scope, "text": "interrupted question"})[0] == 200
+
+    def has_native_id():
+        return any(turn.get("agy_native_turn_id") == "native-turn" for turn in db.load_turns(owner))
+
+    try:
+        wait_for_wx_main_loop(has_native_id, "durable AGY identity before EOF")
+    finally:
+        (tmp_path / "exit-provider").touch()
+    wait_for_wx_main_loop(lambda: dispatch_terminal(frame, "watch", scope)[1].get("state") == "unknown",
+                "typed unknown AGY outcome")
+    frame._flush_chat_state_save()
+    stored, = db.load_turns(owner)
+    assert stored["agy_native_turn_id"] == "native-turn"
+    assert stored["provider_user_message_id"] == "native-user"
+    assert stored["agy_observed_message_id"] == "native-part"
+    assert not stored["answer_md"] and stored["request_recoverable"] is False
+    assert not db.pending_outbox(pair_id="default", lane="notification")
+    assert dispatch_terminal(frame, "send", {**scope, "text": "interrupted question"})[0] == 200
+    sent = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["method"] == "session/prompt"]
+    assert len(sent) == 1

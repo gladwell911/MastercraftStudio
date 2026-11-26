@@ -16,7 +16,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_native_history_is_discovered_and_resumed(loopback_kimi_home, frame, monkeypatch, wait_for_wx):
+def test_native_history_is_discovered_and_resumed(loopback_kimi_home, frame, monkeypatch, wait_for_wx,
+                                                wait_for_wx_main_loop):
     workspace, requests = loopback_kimi_home
 
     def native(*args):
@@ -73,7 +74,7 @@ def test_native_history_is_discovered_and_resumed(loopback_kimi_home, frame, mon
         assert "QA_RUNTIME_OK" in native("--session", terminal["id"], "-p", "Advanced from the CLI")
         assert any("Continue using the recorded context" in str(message["content"])
                    for message in requests[5]["messages"])
-        wait_for_wx(lambda: listed(4), "updated native history after external indexing", timeout=15)
+        wait_for_wx_main_loop(lambda: listed(4), "updated native history after external indexing", timeout=15)
         assert listed(4)[0]["chat_id"] == chat_id
         history = frame._remote_api_history_read_ui({"chat_id": chat_id, "limit": 1})[1]
         assert history["chat"]["turns"][0]["question"] == "Advanced from the CLI"

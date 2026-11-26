@@ -519,8 +519,19 @@ def test_native_observer_recovers_same_turn_after_socket_loss(tmp_path, monkeypa
                 app_server.terminate()
                 app_server.wait(timeout=5)
                 wait_for(lambda event: event.type == 'shared_transport_lost')
+                wait_for(lambda event: event.type == 'shared_host_exited')
+                exited, = messages('terminal_host_exited')
+                assert exited['thread_id'] == thread_id
+                assert exited['terminal_host_id'] == imported['terminal_host_id']
                 assert 'error' in reopen()
                 assert client._proc is app_server
+                reopened = reopen(require_existing_terminal=False)
+                assert reopened.get('thread_id') == thread_id, reopened.get('error')
+                assert reopened['terminal_host_id'] != imported['terminal_host_id']
+                assert client.read_thread(thread_id)['thread']['turns'][-1]['id'] == turn_id
+                assert len(prompts) == 1
+                assert not messages('terminal_turn')
+                assert not projected('turn_completed')
         finally:
             allow_connect.set()
             release.set()
@@ -528,3 +539,42 @@ def test_native_observer_recovers_same_turn_after_socket_loss(tmp_path, monkeypa
                 peer.close()
             worker.close()
             http.shutdown()
+
+
+def test_confirmed_terminal_host_exit_preserves_pending_codex_turn_as_unknown(frame, tmp_path):
+    from remote_nats import RemoteNatsTransport
+
+    owner, thread, turn_id = "codex-host-owner", "original-thread", "observed-turn"
+    chat = {
+        "id": owner, "title": "Shared", "model": "codex/main", "native_cwd": str(tmp_path),
+        "codex_thread_id": thread, "codex_terminal_thread": thread, "codex_terminal_host_id": "current",
+        "codex_turn_id": turn_id, "codex_turn_active": True, "codex_context_generation": 3,
+        "turns": [{"question": "Pending", "answer_md": "Partial answer", "model": "codex/main",
+                   "request_status": "pending", "codex_thread_id": thread, "codex_turn_id": turn_id,
+                   "codex_context_generation": 3, "terminal_notification_pair": "default",
+                   "terminal_final_pending": True}],
+    }
+    frame.archived_chats.append(chat)
+    frame.chat_store.upsert_chat(chat)
+    frame.chat_store.replace_turns(owner, chat["turns"])
+    remote = RemoteNatsTransport(pair_id="default", token="fixture", on_state=frame._remote_api_state_ui)
+    state = lambda: remote._route_command({"type": "state", "chat_id": owner})[1]
+
+    def worker_exit(host):
+        frame._on_codex_worker_message(owner, {"type": "terminal_host_exited", "payload": {
+            "chat_id": owner, "model": "codex/main", "thread_id": thread, "turn_id": turn_id,
+            "turn_idx": 0, "context_generation": 3, "terminal_host_id": host,
+        }})
+
+    assert state()["native_turn_id"] == turn_id
+    worker_exit("obsolete")
+    assert state()["native_turn_id"] == turn_id
+    worker_exit("current")
+    assert state()["status"] == "idle" and not state().get("pending_request")
+    status, scope = frame._prepare_codex_terminal_open({"chat_id": owner, "session_id": thread})
+    assert status == 200 and scope["thread_id"] == thread and not scope["require_existing_terminal"]
+    frame._flush_codex_background_updates()
+    saved, = frame.chat_store.load_turns(owner)
+    assert saved["request_status"] == "unknown"
+    assert saved["codex_turn_id"] == turn_id and not saved["answer_md"]
+    assert saved["request_recoverable"] is False

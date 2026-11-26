@@ -109,6 +109,8 @@ class NativeHistoryMixin:
         return 200, {"target": reference, "description": detail, "manual": provider == "agy"}
 
     def _queue_native_delete_ui(self, owner, target, confirmed, *, local=False):
+        if getattr(self, "_closing", False):
+            return 503, {"accepted": False, "error": "ui_unavailable"}
         chat = self._history_chat_for_id(owner)
         reference = self._native_history_reference(chat or {})
         if confirmed is not True or not reference or target != reference:
@@ -238,7 +240,7 @@ class NativeHistoryMixin:
         self._native_history_timer = wx.CallLater(_REFRESH_SECONDS * 1000, self._poll_native_history)
 
     def _stop_native_history_refresh(self) -> None:
-        self._native_rename_executor.shutdown(wait=False, cancel_futures=True)
+        self._native_rename_executor.shutdown(wait=False)
         if self._native_title_recheck is not None:
             self._native_title_recheck.Stop()
             self._native_title_recheck = None
@@ -273,6 +275,8 @@ class NativeHistoryMixin:
         return {field: chat.get(field) for field in (*fields, "native_identity", "native_account", "native_cwd")}
 
     def _queue_native_title_rename(self, chat, title, *, local=False):
+        if getattr(self, "_closing", False):
+            return False
         model = chat.get("model")
         provider = ("codex" if is_codex_model(model) and chat.get("codex_thread_id") else
                     "kimi" if is_kimi_model(model) and chat.get("kimi_session_id") else "")
@@ -370,7 +374,7 @@ class NativeHistoryMixin:
             self._native_title_pending[owner] = pending - 1
         else:
             self._native_title_pending.pop(owner, None)
-        if not committed:
+        if not committed and not getattr(self, "_closing", False):
             if self._native_title_recheck is None:
                 self._native_title_recheck = wx.CallLater(3100, self._recheck_native_title)
             else:
@@ -385,10 +389,12 @@ class NativeHistoryMixin:
 
     def _publish_title_update(self, owner, committed):
         chat = self._history_chat_for_id(owner)
-        if chat is None or chat.get("id") != owner or getattr(self, "_closing", False):
+        if chat is None or chat.get("id") != owner:
             return
         before = (chat.get("title_revision"), chat.get("native_title_revision"))
         self._merge_published_title(chat, committed)
+        if getattr(self, "_closing", False):
+            return
         if before != (chat.get("title_revision"), chat.get("native_title_revision")):
             self._upsert_history_row(owner, allow_reorder=False)
             self._push_remote_title_changed(chat)

@@ -1516,9 +1516,13 @@ class ChatFrame(
                 logging.getLogger(__name__).exception("Close task failed")
 
         def close_producers():
-            deadline = self._close_started + 3.0
             notes = threading.Thread(target=close_task, args=(notes_close,), daemon=True)
             notes.start()
+            # Native mutations can wait for a wx settlement callback and use
+            # the live Kimi client. Drain them off wx before stopping clients
+            # or fencing callbacks from accepted producers.
+            self._native_rename_executor.shutdown(wait=True)
+            deadline = time.monotonic() + 3.0
             workers = [threading.Thread(target=close_task, args=(task,), daemon=True) for task in close_tasks]
             for worker in workers:
                 worker.start()

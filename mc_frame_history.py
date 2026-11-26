@@ -217,7 +217,7 @@ class ChatHistoryMixin:
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
         for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
-                      "codex_terminal_thread", *CODEX_STORAGE_FIELDS,
+                      "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -1541,7 +1541,7 @@ class ChatHistoryMixin:
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
         for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
-                      "codex_terminal_thread", *CODEX_STORAGE_FIELDS,
+                      "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation", "kimi_storage_id"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])

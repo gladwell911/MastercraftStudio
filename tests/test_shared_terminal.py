@@ -133,3 +133,51 @@ def test_cold_start_failure_has_recovery_guidance(tmp_path):
 
     with pytest.raises(TerminalError, match="手动运行一次 mc.exe"):
         ensure_terminal(tmp_path / "endpoint.json", missing_executable, timeout=1)
+
+
+def test_terminal_archived_watch_reads_off_wx_and_rechecks_native_scope(frame, monkeypatch, wait_for_wx):
+    from shared_terminal_routes import dispatch_terminal
+
+    request_id = uuid.uuid4().hex
+    owner = "archived-kimi"
+    turn = {"client_send_id": f"terminal:{request_id}", "question": "same prompt",
+            "answer_md": "", "answer_alias_of": "shared", "request_status": "done"}
+    chat = {"id": owner, "model": "kimi/main", "title": "Archived",
+            "kimi_session_id": "native", "turns": [turn, {
+                "answer_identity": "shared", "answer_md": "original answer", "request_status": "done",
+            }]}
+    frame.chat_store.upsert_chat(chat)
+    frame.chat_store.replace_turns(owner, chat["turns"])
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    scope = {"provider": "kimi", "chat_id": owner, "session_id": "native", "request_id": request_id}
+    lookup = frame.chat_store.find_turn_by_client_send_id
+    on_wx = []
+    retire = False
+
+    def read(*args):
+        on_wx.append(threading.current_thread() is threading.main_thread())
+        if retire:
+            wx_done = threading.Event()
+
+            def replace_session():
+                frame.archived_chats[0]["kimi_session_id"] = "replacement"
+                wx_done.set()
+
+            frame._call_after_if_alive(replace_session)
+            assert wx_done.wait(1)
+        return lookup(*args)
+
+    monkeypatch.setattr(frame.chat_store, "find_turn_by_client_send_id", read)
+    with concurrent.futures.ThreadPoolExecutor() as client:
+        watched = client.submit(dispatch_terminal, frame, "watch", scope)
+        wait_for_wx(watched.done, "archived turn read through terminal")
+        status, body = watched.result()
+        assert status == 200 and body["answer"] == "original answer"
+        assert on_wx == [False]
+        replay = client.submit(dispatch_terminal, frame, "send", {**scope, "text": "same prompt"})
+        wait_for_wx(replay.done, "terminal retries the archived request")
+        assert replay.result() == (200, {"accepted": True, "turn_index": 0})
+        retire = True
+        watched = client.submit(dispatch_terminal, frame, "watch", scope)
+        wait_for_wx(watched.done, "original session is replaced while reading")
+        assert watched.result() == (409, {"error": "chat_changed"})

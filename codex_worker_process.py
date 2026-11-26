@@ -144,6 +144,22 @@ class CodexWorkerRuntime:
             terminal = self._terminal_threads.get((chat_id, model))
             if terminal and event.thread_id and event.thread_id != terminal["thread_id"]:
                 return
+            if event.type == "shared_host_exited":
+                if terminal and event.thread_id == terminal["thread_id"]:
+                    key = (chat_id, model)
+                    active = self._active_command_owners.pop(key, None)
+                    self._terminal_threads.pop(key, None)
+                    for registry in (self._terminal_turns, self._terminal_interactions, self._command_requests):
+                        for pending_key in tuple(registry):
+                            if pending_key[:2] == key:
+                                registry.pop(pending_key)
+                    self.emit("terminal_host_exited", {
+                        **terminal, "chat_id": chat_id, "model": model,
+                        "turn_id": active[1] if active else "",
+                        "turn_idx": active[2] if active else None,
+                        "message": event.text,
+                    })
+                return
             if event.type == "native_title":
                 self.emit("event", {"chat_id": chat_id, "model": model, "event": event_to_payload(event)})
                 return
@@ -276,6 +292,7 @@ class CodexWorkerRuntime:
                         # from a second client before any model request has been made.
                         client.request("thread/name/set", {"threadId": thread_id, "name": payload.get("title") or "新聊天"})
                     binding = {"thread_id": thread_id, "context_generation": generation,
+                               "terminal_host_id": uuid.uuid4().hex,
                                "cwd": str(thread.get("cwd") or cwd), "home": str(client._codex_home_dir),
                                "thread_configuration": client.thread_configurations.get(thread_id, {})}
                     with self._lock:

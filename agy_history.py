@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import time
 
-from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, validate_workspace
+from agy_acp import AGY_MODEL_ID, AgyAcpClient, AgyError, agy_session_is_busy, validate_workspace
 from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot
 
 
@@ -41,7 +41,7 @@ def list_agy_sessions(executable: str, pair_id: str):
                 account = client.native_account()
                 legacy = {"agy_session_id": session_id, "agy_native_owner": client.native_owner(pair_id)}
                 status = ("AGY 原生终端正在执行，结束后可刷新历史"
-                          if info.get("isRunning") is True or info.get("status") in ("running", "busy") else "")
+                          if agy_session_is_busy(info) else "")
                 yield NativeSessionSnapshot(
                     identity, account, AGY_MODEL_ID, cwd, str(info.get("title") or ""),
                     _timestamp(info.get("updatedAt")), {"agy_workspace": cwd, **legacy},
