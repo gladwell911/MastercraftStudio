@@ -40,6 +40,8 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
             assert code == 200
             assert listing["chats"][0]["session_id"] == session
             assert request("send", {**scope, "session_id": "wrong", "text": "unwanted"})[0] == 409
+            frame.chat_store.notification_sync(pair_id="default", device_id="private-device",
+                                               baseline=0, incarnation="test", secret="test")
             payload = {**scope, "text": "terminal question"}
             assert request("send", payload)[0] == 200
             assert request("send", payload)[0] == 200
@@ -77,6 +79,7 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
 
             code, current = remote_client._route_command({"type": "state", "chat_id": "existing"})
             assert code == 200 and current["running"]
+            assert not frame.chat_store.pending_outbox(pair_id="default", lane="notification")
             scope_token = current["native_turn_id"]
             assert scope_token
             code, _ = remote_client._route_command({
@@ -113,8 +116,15 @@ def test_terminal_reuses_kimi_session_and_the_remote_chat_observes_its_turn(fram
             wait_for_wx(lambda: frame._find_archived_chat("existing")["turns"][-1]["request_status"] == "done",
                         "the authoritative Kimi answer")
             assert request("watch", scope)[1]["answer"] == "完整回答 尾标"
+            assert frame._flush_execution_step_persists_sync()
+            frame._flush_chat_state_save()
             status, remote = remote_client._route_command({"type": "history_read", "chat_id": "existing"})
             assert status == 200
+            wait_for_wx(lambda: frame.chat_store.pending_outbox(pair_id="default", lane="notification"),
+                        "the durable Kimi notification")
+            message = remote["chat"]["turns"][-1]
+            fact, = frame.chat_store.pending_outbox(pair_id="default", lane="notification")
+            assert message["message_id"] in fact["event_id"]
             assert remote["chat"]["turns"][-1]["answer"] == "完整回答 尾标"
 
 

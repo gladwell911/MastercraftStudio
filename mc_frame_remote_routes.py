@@ -18,6 +18,7 @@ from codex_client import (
 )
 from execution_projection import project_execution_rows
 from kimi_server_client import is_kimi_model
+from native_history import allows_final_notification
 from mc_frame_presentation import _finite_timestamp, execution_answer_to_plain
 from mc_frame_settings import (
     DEFAULT_MODEL_ID,
@@ -268,7 +269,8 @@ class RemoteRoutesMixin:
             if turn_index < 0 or turn_index >= len(turns):
                 return False
             persisted = turns[turn_index]
-            if str(persisted.get("request_status") or "").strip() != "done":
+            if (persisted.get("request_status") != "done"
+                    or not allows_final_notification(persisted, self._read_pair_id())):
                 return False
             final_text = str(persisted.get("answer_md") or "").strip()
             if not final_text or final_text == REQUESTING_TEXT:
@@ -313,7 +315,7 @@ class RemoteRoutesMixin:
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
                 return True
             except ValueError as exc:
-                if str(exc) != "EVENT_ID_CONFLICT":
+                if str(exc) not in {"EVENT_ID_CONFLICT", "HISTORICAL_FINAL"}:
                     try:
                         store.quarantine(
                             str(exc), {"chat_id": resolved_chat_id, "role": "assistant"}
@@ -1825,6 +1827,9 @@ class RemoteRoutesMixin:
                     continue
                 turn = turns[turn_index]
                 if str(turn.get("request_status") or "") != "done":
+                    continue
+                if not allows_final_notification(turn, self._read_pair_id()):
+                    pending.discard((chat_id, turn_index))
                     continue
                 answer = str(turn.get("answer_md") or "").strip()
                 if not answer or answer == REQUESTING_TEXT:

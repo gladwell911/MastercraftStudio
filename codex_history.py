@@ -260,6 +260,7 @@ def _thread_history(thread, model):
         )
         messages = [item for item in items if item.get("type") == "agentMessage" and item.get("text")]
         finals = [item for item in messages if item.get("phase") in ("finalAnswer", "final_answer")]
+        explicit_final = bool(finals)
         if not finals:
             finals = [item for item in messages if not item.get("phase")]
         final = finals[-1] if finals and status == "completed" else {}
@@ -269,6 +270,7 @@ def _thread_history(thread, model):
             "codex_thread_id": sid, "codex_turn_id": turn_id, "turn_id": turn_id,
             "provider_user_message_id": user_items[0].get("id"),
             "provider_message_id": final.get("id"), "question": question, "answer_md": final.get("text") or "",
+            "native_final_explicit": bool(final and explicit_final),
             "request_status": {"completed": "done", "failed": "failed", "interrupted": "cancelled"}[status],
             "request_error": error.get("message") or "",
         }

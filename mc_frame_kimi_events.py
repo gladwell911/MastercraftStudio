@@ -1289,6 +1289,8 @@ class KimiEventsMixin:
                 was_done = str(turn.get("request_status") or "") == "done"
                 turn["answer_identity"] = answer_identity
                 if idx == primary_idx:
+                    if message_id := event_data.get("provider_message_id"):
+                        turn["provider_message_id"] = message_id
                     self._apply_kimi_final_answer_to_turn(turn, final_text)
                 else:
                     turn["answer_md"] = ""

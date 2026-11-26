@@ -10,7 +10,7 @@ import sys
 import uuid
 import wx
 from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
-from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, allows_final_notification
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
@@ -303,7 +303,7 @@ class ChatHistoryMixin:
                     store.quarantine(str(exc), {"chat_id": owner, "turn_index": index, "role": role})
                     continue
             notification = ("assistant_final" if role == "assistant" and turn.get("request_status") == "done"
-                            else "user_message" if role == "user" and turn.get("question_origin") == "mc" else "")
+                            and allows_final_notification(turn, pair) else "user_message" if role == "user" and turn.get("question_origin") == "mc" else "")
             if notification:
                 try:
                     store.commit_message_notification_fact(pair_id=pair, domain="events", chat_id=owner,
@@ -455,7 +455,8 @@ class ChatHistoryMixin:
                             pair_id=transport.subjects.pair_id, domain="events",
                             chat_id=normalized, message_id=message_id,
                             projection_kind=kind)
-                        if role == "assistant" and str(turn.get("request_status") or "").strip() == "done":
+                        if (role == "assistant" and turn.get("request_status") == "done"
+                                and allows_final_notification(turn, transport.subjects.pair_id)):
                             store.commit_message_notification_fact(
                                 pair_id=transport.subjects.pair_id, domain="events",
                                 chat_id=normalized, message_id=message_id,

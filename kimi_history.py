@@ -7,7 +7,7 @@ import time
 
 from kimi_server_client import DEFAULT_KIMI_MODEL, KimiServerError, kimi_code_home
 from kimi_server_events import _provider_origin_timestamp
-from kimi_transcript import Transcript
+from kimi_transcript import Transcript, final_message_identity
 from native_history import NativeDeletionRejected, NativeSessionIdentity, NativeSessionSnapshot, NativeTitleRejected
 
 
@@ -168,6 +168,8 @@ class KimiHistoryReader:
                 "answer_md": answer if completed else str(turn.get("error") or "Kimi Code 回合已结束"),
                 "request_status": "done" if completed else "failed",
             }
+            if message_id := final_message_identity(turn):
+                row.update(provider_message_id=message_id, native_final_explicit=True)
             for field, key in (("created_at", "startedAt"), ("answer_at", "endedAt")):
                 if at := _provider_origin_timestamp({"timestamp": turn.get(key)}):
                     row[field] = at

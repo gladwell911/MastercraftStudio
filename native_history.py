@@ -52,6 +52,7 @@ NATIVE_CHAT_FIELDS = (
     "native_identity", "native_account", "native_cwd", "native_title",
     "native_updated_at", "native_replayed_at", "native_history_status", "native_open_command",
     "native_title_revision", "native_title_observed_at", "kimi_storage_id",
+    "native_notification_baseline",
 )
 
 TITLE_FIELDS = ("title", "title_source", "title_manual", "title_updated_at", "title_revision")
@@ -77,3 +78,10 @@ def merge_native_title(chat, provider, title, observed_at, *, explicit=True, app
                     title_manual=app_manual or bool(chat.get("title_manual")),
                     title_updated_at=observed_at, title_revision=int(chat.get("title_revision") or 0) + 1,
                     native_title_observed_at=observed_at)
+
+
+def allows_final_notification(turn: dict, pair_id: str) -> bool:
+    owner_pair = turn.get("terminal_notification_pair")
+    return (not turn.get("terminal_final_pending")
+            and (not owner_pair or owner_pair == pair_id)
+            and (not turn.get("native_history") or turn.get("native_final_notify_pair") == pair_id))

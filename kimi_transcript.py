@@ -3,6 +3,8 @@
 Fields verified against packages/transcript schema and kap-server routes in
 the 2.5.3 executable. Only main-agent, completed, complete text is publishable.
 """
+
+import json
 from copy import deepcopy
 
 
@@ -108,30 +110,39 @@ class Transcript:
             if turn['state'] != 'completed':
                 results.append((turn, ''))
                 continue
-            steps = sorted(turn.get('steps', []), key=lambda s: s.get('ordinal', 0))
-            # The final model step is distinct from tool-confirmed intermediate
-            # assistant commentary. Never publish an earlier assistant frame.
-            if not steps:
-                continue
-            last = steps[-1]
-            steered = last.get('state') == 'interrupted' and last.get('endReason') == 'steered'
-            if last.get('state') != 'completed' and not steered:
-                continue
-            frames = last.get('frames', [])
-            if any(f.get('kind') == 'tool' for f in frames):
-                continue
-            if steered:
-                # A steer can retain pre-follow-up partial output in this step.
-                # Only structured user frames delimit the final response.
-                boundary = max((i for i, frame in enumerate(frames)
-                                if frame.get('kind') == 'text' and frame.get('role') == 'user'), default=-1)
-                frames = frames[boundary + 1:]
-            texts = [f.get('text', '') for f in frames
-                     if f.get('kind') == 'text' and f.get('role') == 'assistant'
-                     and not any(f.get(k) for k in ('private', 'hidden', 'non_disclosable'))
-                     and f.get('disclosable', True) is not False]
-            text = ''.join(texts)
-            if turn['state'] == 'completed' and not text.strip():
-                continue
-            results.append((turn, text))
+            text = ''.join(frame.get('text', '') for frame in _final_assistant_frames(turn))
+            if text.strip():
+                results.append((turn, text))
         return results
+
+
+def _final_assistant_frames(turn):
+    if turn.get('state') != 'completed':
+        return []
+    steps = sorted(turn.get('steps', []), key=lambda step: step.get('ordinal', 0))
+    # The last model step is distinct from tool-confirmed intermediate commentary.
+    if not steps:
+        return []
+    last = steps[-1]
+    steered = last.get('state') == 'interrupted' and last.get('endReason') == 'steered'
+    if last.get('state') != 'completed' and not steered:
+        return []
+    frames = last.get('frames', [])
+    if any(frame.get('kind') == 'tool' for frame in frames):
+        return []
+    if steered:
+        boundary = max((i for i, frame in enumerate(frames)
+                        if frame.get('kind') == 'text' and frame.get('role') == 'user'), default=-1)
+        frames = frames[boundary + 1:]
+    return [frame for frame in frames
+            if frame.get('kind') == 'text' and frame.get('role') == 'assistant'
+            and not any(frame.get(key) for key in ('private', 'hidden', 'non_disclosable'))
+            and frame.get('disclosable', True) is not False]
+
+
+def final_message_identity(turn):
+    # A public final can consist of multiple text frames in the same model step.
+    frame_ids = [frame.get('frameId') for frame in _final_assistant_frames(turn) if frame.get('text')]
+    if not frame_ids or not all(isinstance(value, str) and value.strip() for value in frame_ids):
+        return ""
+    return json.dumps(frame_ids, ensure_ascii=False, separators=(",", ":"))

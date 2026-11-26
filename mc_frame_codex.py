@@ -114,6 +114,11 @@ class CodexSessionsMixin:
         chat_id, model = payload["chat_id"], payload["model"]
         thread_id, turn_id = payload["thread_id"], payload["turn_id"]
         generation = payload["context_generation"]
+        if chat_id in getattr(self, "_native_history_reserved", ()):
+            # The worker retains the native events until we bind its turn. Wait
+            # for the in-flight replay to publish so both paths use the same row.
+            self._call_later_if_alive(25, self._accept_codex_terminal_turn, client, payload)
+            return
         chat, turns, current = self._chat_target_for_request(chat_id)
         index = None
         if (chat and chat.get("id") == chat_id and self._model_for_chat_selection(chat) == model
@@ -126,12 +131,23 @@ class CodexSessionsMixin:
             for existing_index, existing in enumerate(turns):
                 if existing.get("codex_turn_id") == turn_id and existing.get("codex_thread_id") == thread_id:
                     index = existing_index
+                    # The worker observed a live turn start. A completed replay
+                    # with this identity can already own the canonical answer.
+                    if (existing.get("native_history") and existing.get("native_final_explicit")
+                            and existing.get("provider_message_id") and existing.get("request_status") == "done"
+                            and not existing.get("native_final_notify_pair")):
+                        existing["native_final_notify_pair"] = self._read_pair_id()
+                        chat["turns"] = turns
+                        self._mark_chat_turns_dirty(chat_id, index)
+                        self._defer_chat_state_save()
                     break
             if index is None:
                 index = len(turns)
                 question = payload["question"]
                 turn = {"question": question, "answer_md": REQUESTING_TEXT, "question_origin": "terminal",
-                        "model": model, "created_at": bindings.app.time.time(), "codex_context_generation": generation}
+                        "model": model, "created_at": bindings.app.time.time(),
+                        "codex_context_generation": generation, "terminal_final_pending": True,
+                        "terminal_notification_pair": self._read_pair_id()}
                 self._mark_turn_request_pending(turn, model, question)
                 # The TUI already submitted this native request. A restart must never replay its input.
                 turn["request_recoverable"] = False
@@ -708,6 +724,10 @@ class CodexSessionsMixin:
         if not answer.strip() or str(turn.get("request_status") or "") == "failed":
             return False
         item_id = str(event.item_id or "").strip()
+        if (event.type == "item_completed" and event.phase == "final_answer" and item_id
+                and turn.get("request_status") != "done"):
+            turn["provider_message_id"] = item_id
+            turn.pop("terminal_final_pending", None)
         completed = turn.setdefault("codex_completed_answers", [])
         if any((item_id and item.get("item_id") == item_id) or item.get("text") == answer
                for item in completed if isinstance(item, dict)):
