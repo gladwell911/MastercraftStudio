@@ -756,6 +756,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 native_updated_at=max(previous.get("native_updated_at", 0), snapshot.updated_at),
                 native_history_status=snapshot.status,
             )
+            unresolved = previous.get("native_unresolved_turn")
+            if unresolved and not snapshot.status:
+                chat["native_history_status"] = unresolved["message"]
             old_count = int(previous.get("turn_count", 0))
             appended = 0
             recovered = {}
@@ -773,12 +776,16 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                             recovered[index]["answer_at"] = new["answer_at"]
                     elif not self._native_turn_matches(old, new):
                         recovered.clear()
-                        chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
+                        if not unresolved:
+                            chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
                         break
                 else:
                     chat["native_replayed_at"] = snapshot.updated_at
                     accepted_replay = True
                     appended = len(snapshot.turns) - old_count
+            if unresolved and unresolved["index"] in recovered:
+                chat["native_history_status"] = snapshot.status
+                chat["native_unresolved_turn"] = None
             chat.setdefault("created_at", snapshot.updated_at)
             if snapshot.identity.provider == "codex" and old_count - 1 in recovered:
                 chat["codex_turn_active"] = False
@@ -861,7 +868,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if not keys or stored.get("terminal_notification_pair") != identity.pair_id:
             return False
         session_key, turn_key = keys
-        return (stored.get("request_status") in {"pending", "running", "failed"}
+        return (stored.get("request_status") in {"pending", "running", "failed", "unknown"}
                 and stored.get(session_key) == replayed.get(session_key) == identity.session_id
                 and bool(stored.get(turn_key)) and stored[turn_key] == replayed.get(turn_key)
                 and replayed.get("native_final_explicit") is True and replayed.get("request_status") == "done"
@@ -1175,6 +1182,17 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if row is not None:
             return int(row["turn_index"]), self._json_dict(row["payload_json"])
         return None
+
+    def find_answer_by_identity(self, chat_id: str, identity: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT json_extract(payload_json, '$.answer_md') AS answer FROM turns
+                WHERE chat_id=? AND json_extract(payload_json, '$.answer_identity')=?
+                AND length(json_extract(payload_json, '$.answer_md')) > 0
+                ORDER BY turn_index DESC LIMIT 1""",
+                (self.normalize_chat_id(chat_id), identity),
+            ).fetchone()
+        return str(row["answer"]) if row is not None else ""
 
     def load_turns_page(
         self,

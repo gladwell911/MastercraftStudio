@@ -8,7 +8,7 @@ import uuid
 import wx
 
 from agy_acp import (
-    AGY_MODEL_ID, AgyAcpClient, AgyError, find_agy_executable,
+    AGY_MODEL_ID, AgyAcpClient, AgyError, AgyResultUnknown, find_agy_executable,
     read_prompt_attachments, selected_options, validate_workspace,
 )
 from agy_execution import AgyExecution, interaction_questions, interaction_result
@@ -26,6 +26,7 @@ class AgyRun:
     action_id: str = ""
     client: AgyAcpClient | None = None
     prompt: object = None
+    worker: threading.Thread | None = None
     execution: AgyExecution = field(default_factory=AgyExecution)
     interactions: dict = field(default_factory=dict)
     accepted_actions: dict = field(default_factory=dict)
@@ -118,6 +119,8 @@ class AgySessionsMixin:
                 or (native_identity and self._agy_native_identity(client, session_id) != native_identity)
             ):
                 raise AgyError("此聊天属于原运行电脑或 AGY 登录账号，请恢复原来的账号")
+            if session_id:
+                client.check_original_session_busy(session_id)
             if chat_id:
                 self._watch_agy_title(client, chat_id)
             client.open_session(session_id)
@@ -274,7 +277,6 @@ class AgySessionsMixin:
         self._agy_busy[chat_id] = run
         client = self._agy_clients.get(chat_id)
         full = []
-        native_final = {}
         batch = []
         lock = threading.Lock()
         timer = None
@@ -299,14 +301,25 @@ class AgySessionsMixin:
         def on_update(update):
             if not isinstance(update, dict):
                 return
-            if update.get("sessionUpdate") == "agent_message_chunk":
+            kind = update.get("sessionUpdate")
+            native_ids = {}
+            turn_id, message_id = update.get("turnId"), update.get("messageId")
+            if isinstance(turn_id, str) and turn_id and kind in {
+                "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
+            }:
+                native_ids["agy_native_turn_id"] = turn_id
+            if isinstance(message_id, str) and message_id:
+                if kind == "user_message_chunk":
+                    native_ids["provider_user_message_id"] = message_id
+                elif kind == "agent_message_chunk":
+                    native_ids["agy_observed_message_id"] = message_id
+            if native_ids:
+                enqueue("native_ids", native_ids)
+            if kind == "agent_message_chunk":
                 content = update.get("content") or {}
                 text = content.get("text") if isinstance(content, dict) else None
                 if isinstance(text, str) and text:
                     full.append(text)
-                    for source, target in (("turnId", "agy_native_turn_id"), ("messageId", "provider_message_id")):
-                        if isinstance(update.get(source), str) and update[source]:
-                            native_final[target] = update[source]
                     enqueue("delta", text)
             else:
                 enqueue("update", update)
@@ -314,7 +327,7 @@ class AgySessionsMixin:
         def on_interaction(interaction_id, method, params):
             enqueue("interaction", ("agy-" + interaction_id, method, params))
 
-        def finish(active_client, answer, reason, error):
+        def finish(active_client, answer, reason, error, result_unknown):
             current_chat, current_turns, _ = self._chat_target_for_request(chat_id)
             owns = self._agy_run_for_chat(current_chat) is run
             if self._agy_busy.get(chat_id) is run:
@@ -331,16 +344,21 @@ class AgySessionsMixin:
                     error = "AGY 回合已停止。"
                 elif reason != "end_turn" and not error:
                     error = f"AGY 回合已结束：{reason or '缺少终态'}"
-                if not error and reason == "end_turn":
-                    current_turns[turn_idx].update(native_final)
+                turn = current_turns[turn_idx]
+                if not error and reason == "end_turn" and turn.get("agy_observed_message_id"):
+                    turn["provider_message_id"] = turn["agy_observed_message_id"]
+                if result_unknown:
+                    current_chat["native_history_status"] = error
+                    current_chat["native_unresolved_turn"] = {"index": turn_idx, "message": error}
                 self._invalidate_remote_state_cache()
-                self._on_done(turn_idx, answer, error, model, "", chat_id)
+                self._on_done(turn_idx, answer, error, model, "", chat_id, result_unknown=result_unknown)
                 if error and self._visible_clear_owner() == chat_id:
                     self.SetStatusText(error)
 
         def work():
             active_client = prepared_attachments.client if prepared_attachments is not None else client
             reason = error = ""
+            result_unknown = False
             try:
                 validate_workspace(cwd)
                 # Idle ACP processes do not see work accepted by a separate terminal.
@@ -358,6 +376,9 @@ class AgySessionsMixin:
                       or active_client.native_owner(self._read_pair_id()) != owner
                       or (native_identity and self._agy_native_identity(active_client, session_id) != native_identity)):
                     raise AgyError("AGY 原会话归属已变化，请重新打开聊天")
+                else:
+                    active_client.check_original_session_busy(session_id)
+                run.client = active_client
                 self._watch_agy_title(active_client, chat_id)
                 active_client.configure(config, options)
                 if getattr(self, "_closing", False):
@@ -366,9 +387,9 @@ class AgySessionsMixin:
                     question, on_update, on_interaction,
                     attachments=prepared_attachments.blocks if prepared_attachments is not None else (),
                 )
-                run.client = active_client
                 reason = run.prompt.wait()
             except AgyError as exc:
+                result_unknown = isinstance(exc, AgyResultUnknown)
                 error = str(exc)
                 if active_client is not None:
                     active_client.close()
@@ -379,12 +400,13 @@ class AgySessionsMixin:
                 if pending_timer is not None:
                     pending_timer.cancel()
                 flush()
-                if not self._call_after_if_alive(finish, active_client, "".join(full), reason, error):
+                if not self._call_after_if_alive(finish, active_client, "".join(full), reason, error, result_unknown):
                     if active_client is not None:
                         active_client.close()
 
         try:
-            threading.Thread(target=work, name="agy-prompt", daemon=True).start()
+            run.worker = threading.Thread(target=work, name="agy-prompt", daemon=True)
+            run.worker.start()
         except Exception:
             self._agy_busy.pop(chat_id, None)
             if prepared_attachments is not None and prepared_attachments.fresh_client:
@@ -392,16 +414,24 @@ class AgySessionsMixin:
             raise
 
     def _deliver_agy_events(self, chat_id, run, batch):
-        chat, _, _ = self._chat_target_for_request(chat_id)
+        chat, turns, _ = self._chat_target_for_request(chat_id)
         if self._agy_run_for_chat(chat) is not run:
             return
         delta = "".join(value for kind, value in batch if kind == "delta")
         steps = {}
+        native_ids = {}
         for kind, value in batch:
             if kind == "interaction":
                 self._receive_agy_interaction(chat_id, run, *value)
+            elif kind == "native_ids":
+                native_ids.update(value)
             elif kind == "update" and (step := run.execution.step(value)):
                 steps[step[0]] = step
+        turn = turns[run.turn_idx]
+        if any(turn.get(key) != value for key, value in native_ids.items()):
+            turn.update(native_ids)
+            self._mark_chat_turns_dirty(chat_id, run.turn_idx)
+            self._defer_chat_state_save()
         for step in steps.values():
             self._append_agy_step(chat_id, run, *step)
         if delta:
@@ -582,8 +612,14 @@ class AgySessionsMixin:
         self._push_remote_state(chat_id)
 
     def _close_agy_clients(self) -> None:
+        runs = tuple(self._agy_busy.values())
         clients = set(self._agy_clients.values())
-        clients.update(run.client for run in self._agy_busy.values() if run.client is not None)
+        clients.update(run.client for run in runs if run.client is not None)
         self._agy_clients.clear()
         for client in clients:
             client.close()
+        for run in runs:
+            if run.prompt is not None and run.worker is not None:
+                # Close can end an admitted prompt. Give its final identity
+                # batch and typed result time to cross the callback boundary.
+                run.worker.join(timeout=.5)

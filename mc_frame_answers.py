@@ -897,7 +897,8 @@ class AnswersMixin:
         # 流式阶段不刷新回答列表；待完成后一次性展示完整回答。
         self._defer_chat_state_save()
 
-    def _on_done(self, turn_idx: int, full: str, err: str, used_model: str, fallback_msg: str, chat_id: str = ""):
+    def _on_done(self, turn_idx: int, full: str, err: str, used_model: str, fallback_msg: str,
+                 chat_id: str = "", *, result_unknown: bool = False):
         target_chat, target_turns, is_current_chat = self._chat_target_for_request(chat_id)
         if target_chat is None:
             return
@@ -930,7 +931,10 @@ class AnswersMixin:
                 self._record_chat_activity(target_chat, bindings.app.time.time())
             if used_model:
                 target_turns[turn_idx]["model"] = used_model
-            if err:
+            if result_unknown:
+                target_turns[turn_idx].update(answer_md="", request_status="unknown",
+                                             request_error=err, request_recoverable=False)
+            elif err:
                 target_turns[turn_idx]["answer_md"] = err
             else:
                 if is_openclaw_model(used_model):
@@ -988,6 +992,8 @@ class AnswersMixin:
         elif is_current_chat:
             if is_openclaw_model(used_model) and not err:
                 self.SetStatusText("已发送，等待 OpenClaw 同步回复")
+            elif result_unknown:
+                self.SetStatusText(err)
             else:
                 self.SetStatusText("答复完成")
         resolved_chat_id = chat_id or self.active_chat_id or self.current_chat_id or ""
@@ -1008,7 +1014,7 @@ class AnswersMixin:
             else:
                 self._refresh_history(None)
 
-        should_play_finish_sound = (not is_openclaw_model(used_model)) or err
+        should_play_finish_sound = not result_unknown and ((not is_openclaw_model(used_model)) or err)
         if should_play_finish_sound:
             self._play_finish_sound()
         if should_render and self.view_mode == "active":
@@ -1017,7 +1023,7 @@ class AnswersMixin:
             if self._navigation_quiet_active():
                 self._mark_background_answer_list_dirty()
                 return
-            if self._append_completed_answer_to_answer_list(turn_idx, turn):
+            if not result_unknown and self._append_completed_answer_to_answer_list(turn_idx, turn):
                 self._focus_latest_answer()
             else:
                 self._refresh_answer_list_preserving_selection()

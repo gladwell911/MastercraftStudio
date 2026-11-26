@@ -52,7 +52,7 @@ NATIVE_CHAT_FIELDS = (
     "native_identity", "native_account", "native_cwd", "native_title",
     "native_updated_at", "native_replayed_at", "native_history_status", "native_open_command",
     "native_title_revision", "native_title_observed_at", "kimi_storage_id",
-    "native_notification_baseline",
+    "native_notification_baseline", "native_unresolved_turn",
 )
 
 TITLE_FIELDS = ("title", "title_source", "title_manual", "title_updated_at", "title_revision")
@@ -62,12 +62,15 @@ def merge_native_title(chat, provider, title, observed_at, *, explicit=True, app
     """Keep native title evidence and the application display title independently."""
     if not title or observed_at < chat.get("native_title_observed_at", 0):
         return
-    if provider != "agy" and not explicit and chat.get("title_manual"):
-        return
     previous_native = chat.get("native_title")
     if previous_native != title:
         chat.update(native_title=title, native_title_observed_at=observed_at,
                     native_title_revision=int(chat.get("native_title_revision") or 0) + 1)
+    if provider == "codex" and not explicit and not app_manual:
+        if chat.get("title_manual") or (chat.get("title") and chat["title"] != previous_native):
+            return
+    if provider != "agy" and not explicit and chat.get("title_manual") and not app_manual:
+        return
     if chat.get("title_manual") and not app_manual and (
             provider == "agy" or not previous_native or previous_native == title):
         return

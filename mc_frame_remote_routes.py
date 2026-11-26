@@ -62,7 +62,7 @@ class RemoteRoutesMixin:
         snapshot["request_kind"] = request_kind
         snapshot["status"] = f"waiting_{request_kind}" if request_kind else "running" if running else "idle"
         if pending and include_request:
-            snapshot["pending_request"] = pending
+            snapshot["pending_request"] = {**pending, "native_turn_id": snapshot["native_turn_id"]}
             snapshot["prompt"] = pending["prompt"]
 
     def _remote_session_usage(self, chat: dict, revision: int = 0) -> dict | None:

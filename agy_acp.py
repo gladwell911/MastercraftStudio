@@ -35,6 +35,14 @@ class AgyError(RuntimeError):
         self.rpc_message = rpc_message
 
 
+class AgyResultUnknown(AgyError):
+    """ACP may have accepted the prompt, but its terminal result is unavailable."""
+
+
+def agy_session_is_busy(info: dict) -> bool:
+    return info.get("isRunning") is True or info.get("status") in ("running", "busy")
+
+
 def read_prompt_attachments(capabilities: dict, attachments: list[dict]) -> list[dict]:
     """Build ACP blocks from the selected files using the current handshake."""
     prompt_capabilities = capabilities.get("promptCapabilities")
@@ -94,7 +102,7 @@ class AgyPrompt:
         try:
             return self.completion.result(30 * 60)
         except TimeoutError as exc:
-            raise AgyError("AGY 回合结果未知：等待原生终态超时，请查看原会话后再试") from exc
+            raise AgyResultUnknown("AGY 回合结果未知：等待原生终态超时，请查看原会话后再试") from exc
 
 
 def find_agy_executable() -> str:
@@ -305,7 +313,7 @@ class AgyAcpClient:
         finally:
             with self._lock:
                 if self._turn is not None:
-                    self._turn.completion.set_exception(AgyError("AGY 运行进程已退出，回合结果未知，请检查原会话和本机登录状态"))
+                    self._turn.completion.set_exception(AgyResultUnknown("AGY 运行进程已退出，回合结果未知，请检查原会话。"))
                     self._turn = None
                 for future in self._pending.values():
                     if not future.done():
@@ -328,7 +336,11 @@ class AgyAcpClient:
             return
         self._turn = None
         result = payload.get("result")
-        turn.completion.set_result(str(result.get("stopReason") or "") if isinstance(result, dict) else "")
+        reason = result.get("stopReason") if isinstance(result, dict) else None
+        if isinstance(reason, str) and reason:
+            turn.completion.set_result(reason)
+        else:
+            turn.completion.set_exception(AgyResultUnknown("AGY 没有返回原生终态，回合结果未知，请检查原会话。"))
 
     def _handle_request(self, request_id, method: str, params: dict) -> None:
         if method not in {"session/request_permission", "elicitation/create"}:
@@ -358,6 +370,27 @@ class AgyAcpClient:
         if self.initialization.get("protocolVersion") != 1:
             raise AgyError("此电脑上的 AGY 不支持 ACP v1")
         return self.initialization
+
+    def check_original_session_busy(self, session_id: str) -> None:
+        session_capabilities = self.capabilities.get("sessionCapabilities") or {}
+        if not isinstance(session_capabilities.get("list"), dict):
+            return
+        cursor = ""
+        seen = set()
+        while True:
+            try:
+                page = self.request("session/list", {"cursor": cursor} if cursor else {})
+            except AgyError:
+                return  # The provider still enforces its own resume/prompt result.
+            for info in page.get("sessions") or []:
+                if isinstance(info, dict) and info.get("sessionId") == session_id:
+                    if agy_session_is_busy(info):
+                        raise AgyError("AGY 原会话正在另一进程中使用，请等终端结束后重试")
+                    return
+            cursor = page.get("nextCursor")
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                return
+            seen.add(cursor)
 
     def open_session(self, session_id: str = "", *, replay: bool = False, on_update=None) -> dict:
         params = {"cwd": self._cwd, "mcpServers": []}
@@ -413,9 +446,9 @@ class AgyAcpClient:
             turn = self._turn = AgyPrompt(on_update, on_interaction)
             try:
                 self._send_prompt(turn, question, attachments=attachments)
-            except AgyError:
+            except AgyError as exc:
                 self._turn = None
-                raise
+                raise AgyResultUnknown("AGY 提交结果未知，请检查原会话后再试。") from exc
             return turn
 
     def _send_prompt(self, turn, question, *, attachments=()):

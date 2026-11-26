@@ -969,7 +969,7 @@ class ChatRequestsMixin:
                                          client_send_id: str = "", attachments=None,
                                          attachment_scope: tuple = (), active: bool = False,
                                          prepared_attachments=None, source: str = "rc",
-                                         expected_kimi_prompt_id: str = "") -> tuple[bool, str]:
+                                         expected_kimi_prompt_id: str = "", prepared_chat=None) -> tuple[bool, str]:
         """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
         if self._clear_pending_for(owner_id):
@@ -984,10 +984,14 @@ class ChatRequestsMixin:
         if getattr(self, "_chat_store_enabled", False) and store is not None:
             if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
                 return False, "Clear/resend recovery is still pending for this chat."
-            has_live_turns = active or ((attachments or chat.get("codex_terminal_thread")
+            has_live_turns = active or ((source == "terminal" or attachments or chat.get("codex_terminal_thread")
                                          or (is_kimi_model(resolved_model) and self._kimi_should_steer_turn(chat, active)))
                                         and isinstance(chat.get("turns"), list))
-            loaded = None if has_live_turns else store.load_chat(owner_id, include_execution_steps=False)
+            loaded = prepared_chat
+            if not has_live_turns and source != "terminal":
+                loaded = store.load_chat(owner_id, include_execution_steps=False)
+            if source == "terminal" and not has_live_turns and not isinstance(loaded, dict):
+                return False, "找不到原生聊天的已保存状态。"
             if isinstance(loaded, dict):
                 # Preserve the object held by archived_chats while replacing
                 # summary-only metadata with this owner's complete durable state.

@@ -55,6 +55,7 @@ class CodexTerminalClient(CodexAppServerClient):
         self._observer_stop = threading.Event()
         self._observer_retry = None
         self._observer_thread_id = ""
+        self._observer_host_exit_reported = False
         self._last_seen_turn_id = None
         self._observed_turns = OrderedDict()
         self._reconnect_events = None
@@ -242,7 +243,8 @@ class CodexTerminalClient(CodexAppServerClient):
         super()._emit_event(event)
 
     def _start_observer_retry(self):
-        if self._observer_thread_id and self._observer_retry is None and not self._observer_stop.is_set():
+        if (self._observer_thread_id and self._observer_retry is None
+                and not self._observer_host_exit_reported and not self._observer_stop.is_set()):
             self._observer_retry = threading.Thread(target=self._retry_observer, daemon=True,
                                                     name="codex-terminal-observer")
             self._observer_retry.start()
@@ -255,7 +257,17 @@ class CodexTerminalClient(CodexAppServerClient):
                     self._ensure_started()
                     return
                 except (RuntimeError, OSError, websocket.WebSocketException):
-                    if self._proc is None or self._proc.poll() is not None:
+                    process = self._proc
+                    if process is None:
+                        return
+                    if process.poll() is not None:
+                        with self._observer_lock:
+                            if self._observer_stop.is_set() or self._observer_host_exit_reported:
+                                return
+                            self._observer_host_exit_reported = True
+                            thread_id = self._observer_thread_id
+                        super()._emit_event(CodexEvent(type="shared_host_exited", thread_id=thread_id,
+                            text="原 Codex 共享 App Server 已退出，回合结果待核对。"))
                         return
                     delay = min(delay * 2, 5)
         finally:

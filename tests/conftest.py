@@ -34,6 +34,35 @@ def wait_for_wx(wx_app):
     return wait
 
 
+@pytest.fixture
+def wait_for_wx_main_loop(wx_app):
+    def wait(predicate, description, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        error = []
+
+        def poll():
+            try:
+                if predicate() or time.monotonic() >= deadline:
+                    wx_app.ExitMainLoop()
+            except BaseException as exc:
+                error.append(exc)
+                wx_app.ExitMainLoop()
+
+        timer = wx.Timer(wx_app)
+        wx_app.Bind(wx.EVT_TIMER, lambda _event: poll(), timer)
+        timer.Start(15)
+        try:
+            wx_app.MainLoop()
+        finally:
+            timer.Stop()
+            wx_app.Unbind(wx.EVT_TIMER, source=timer)
+        if error:
+            raise error[0]
+        assert predicate(), f"Timed out waiting for {description}"
+
+    return wait
+
+
 @pytest.fixture(autouse=True)
 def disable_system_hooks(monkeypatch):
     monkeypatch.setattr(main.GlobalCtrlTapHook, "start", lambda self: None)
