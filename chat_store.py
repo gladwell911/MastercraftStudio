@@ -14,7 +14,7 @@ from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
 from context_usage import NATIVE_USAGE_FIELDS
 from execution_projection import canonical_answer_timestamp, should_show_execution_step
-from native_history import NativeSessionSnapshot
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, NativeSessionIdentity, NativeSessionSnapshot
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -225,6 +225,17 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("UPDATE v2_chat_state SET revision=?,execution_sequence=0 WHERE chat_id=?", (revision, owner))
             conn.execute("INSERT INTO read_generations(chat_id,generation) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET generation=excluded.generation", (owner, uuid.uuid4().hex))
             metadata = self._json_dict(chat["metadata_json"])
+            if metadata.get("codex_thread_id"):
+                identity = metadata.get("native_identity")
+                if not identity and (storage := metadata.get("codex_storage_id")):
+                    identity = NativeSessionIdentity(pair, "codex", storage, metadata["codex_thread_id"]).chat_id
+                if identity:
+                    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                                 (f"retired-native-history:{identity}",))
+                    conn.execute("DELETE FROM native_history_owners WHERE native_chat_id=? AND chat_id=?",
+                                 (identity, owner))
+                for field in (*CODEX_STORAGE_FIELDS, *NATIVE_CHAT_FIELDS):
+                    metadata.pop(field, None)
             metadata.update(dict.fromkeys(NATIVE_USAGE_FIELDS))
             metadata.update({
                 "openclaw_session_key": "openclaw/main", "openclaw_session_id": "", "openclaw_session_file": "",
@@ -657,6 +668,8 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
         native_id = snapshot.identity.chat_id
+        if conn.execute("SELECT 1 FROM meta WHERE key=?", (f"retired-native-history:{native_id}",)).fetchone():
+            return native_id, False
         row = conn.execute(
             "SELECT chat_id,account FROM native_history_owners WHERE native_chat_id=?", (native_id,)
         ).fetchone()
@@ -676,12 +689,13 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 if not field.isidentifier():
                     raise ValueError("Invalid legacy storage field")
                 predicates += f" AND COALESCE(json_extract(metadata_json,'$.{field}'),?)=?"
+            model_filter, model = ("c.model LIKE ?", "codex/%") if snapshot.identity.provider == "codex" else ("c.model=?", snapshot.model)
             legacy = conn.execute(
                 f"SELECT c.id FROM chats c LEFT JOIN native_history_owners n ON n.chat_id=c.id "
-                f"WHERE n.chat_id IS NULL AND c.model=? AND {predicates} "
+                f"WHERE n.chat_id IS NULL AND {model_filter} AND {predicates} "
                 "AND COALESCE(json_extract(metadata_json,'$.native_identity'),?)=? "
                 "ORDER BY c.created_at,c.id LIMIT 1",
-                (snapshot.model, *snapshot.legacy_fields.values(),
+                (model, *snapshot.legacy_fields.values(),
                  *(value for value in compatible.values() for _ in range(2)), native_id, native_id),
             ).fetchone()
             if legacy is not None:
@@ -727,7 +741,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             for field, value in snapshot.chat_fields.items():
                 chat.setdefault(field, value)
             chat.update(
-                id=owner, model=snapshot.model,
+                id=owner, model=previous.get("model") or snapshot.model,
                 native_identity=snapshot.identity.chat_id, native_account=snapshot.account,
                 native_cwd=previous.get("native_cwd") or snapshot.cwd,
                 native_title=snapshot.title or previous.get("native_title", ""),
@@ -776,7 +790,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     @staticmethod
     def _native_turn_matches(stored: dict, replayed: dict) -> bool:
-        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id"):
+        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id", "codex_turn_id"):
             if stored.get(key) and replayed.get(key) and stored[key] != replayed[key]:
                 return False
         if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question")):

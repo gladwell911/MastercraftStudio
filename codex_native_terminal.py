@@ -1,4 +1,4 @@
-﻿"""Authenticated loopback transport for Codex's native remote TUI."""
+"""Authenticated loopback transport for Codex's native remote TUI."""
 from __future__ import annotations
 
 import base64
@@ -15,7 +15,7 @@ import websocket
 
 from codex_client import (
     CodexAppServerClient, CodexEvent, _link_user_codex_directories, _user_home, _windows_popen_kwargs,
-    build_codex_app_server_command, resolve_codex_launch_command,
+    resolve_codex_launch_command,
 )
 from remote_machine_config import _dpapi_protect
 
@@ -42,9 +42,8 @@ def native_codex_executable() -> str:
 
 
 class CodexTerminalClient(CodexAppServerClient):
-    def __init__(self, *, native_home=None, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._codex_home_dir = native_home
         self._socket = None
         self._endpoint = None
         self._executable = None
@@ -65,7 +64,7 @@ class CodexTerminalClient(CodexAppServerClient):
         # Updating plugin configuration restarts a stdio process. A terminal TUI
         # can stay connected here while a new turn refreshes native skill discovery.
         self._ensure_started()
-        if self._codex_home_dir != _user_home() / ".codex":
+        if not self.use_native_config and self._codex_home_dir != _user_home() / ".codex":
             _link_user_codex_directories(_user_home() / ".codex", self._codex_home_dir)
         self._refresh_native_skills(cwd)
 
@@ -78,7 +77,7 @@ class CodexTerminalClient(CodexAppServerClient):
             if self._proc is None or self._proc.poll() is not None:
                 self._listener_ready.clear()
                 self._endpoint = None
-                argv = build_codex_app_server_command(codex_model=self.codex_model)
+                argv = self._app_server_command()
                 self._executable = native_codex_executable()
                 argv = [self._executable, *argv[argv.index("app-server"):]]
                 argv[argv.index("--listen") + 1] = "ws://127.0.0.1:0"
