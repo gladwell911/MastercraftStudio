@@ -250,6 +250,10 @@ def _watch(client, scope, *, timeout=0):
             if seen.get(identity) != label:
                 print(_terminal_text(label), flush=True)
                 seen[identity] = label
+        interaction_id = body.get("interaction_id")
+        if interaction_id and interaction_id not in seen:
+            seen[interaction_id] = ""
+            print("AGY 等待输入，请在 MC 或 RC 的此聊天处理。", flush=True)
         if body["state"] == "done":
             print(_terminal_text(body["answer"]), flush=True)
             return

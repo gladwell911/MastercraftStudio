@@ -1214,6 +1214,9 @@ class ExecutionPageMixin:
                 on_persisted,
             )
             return True
+        if step.get("provider") == "agy" and broadcast:
+            self._queue_execution_step_persist(chat_id, step)
+            return True
         if str(step.get("logical_key") or "").strip():
             try:
                 self._persist_execution_step(self.chat_store, chat_id, step)
@@ -1372,7 +1375,7 @@ class ExecutionPageMixin:
                         continue
                     chat_id, step = work
                     try:
-                        self._persist_execution_step(store, chat_id, step)
+                        self._persist_queued_execution_step(store, chat_id, step)
                     except Exception:
                         continue
         finally:
@@ -1424,10 +1427,17 @@ class ExecutionPageMixin:
             return True
         for chat_id, step in batch:
             try:
-                self._persist_execution_step(store, chat_id, step)
+                self._persist_queued_execution_step(store, chat_id, step)
             except Exception:
                 continue
         return True
+
+    def _persist_queued_execution_step(self, store, chat_id: str, step: dict) -> None:
+        persisted = self._persist_execution_step(store, chat_id, step)
+        if persisted and step.get("provider") == "agy":
+            payload = self._remote_execution_entry_payload(chat_id, persisted)
+            payload["_source_revision"] = step["revision"]
+            self._broadcast_remote_event(payload, retry_on_failure=False)
 
     def _prune_cached_execution_steps_for_turn(self, chat: dict, latest_step: dict) -> None:
         if not isinstance(chat, dict) or not isinstance(latest_step, dict):

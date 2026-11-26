@@ -23,7 +23,9 @@ MC 使用当前用户安装的 Kimi CLI，默认查找用户目录下的 `.kimi-
 
 每台电脑独立连接本机 MC。MC 关闭时，命令启动当前注册的安装并等待服务就绪。换安装目录后，先手动打开新目录的 MC 一次。若命令被 Windows PowerShell 的别名、函数或已有程序占用，可用 `Get-Command mc-kimi -All` 查看来源，调整冲突后重开 MC，再新开 PowerShell。MC 在当前用户目录注册命令并更新用户 Path。
 
-同一安装还注册 `mc-codex` 和 `mc-agy`。当前开发构建开放 Kimi Code 已有会话入口，另两个命令会在相应提供方可用后启用。测试副本可在启动前设置 `MC_SHARED_TERMINAL_REGISTER=0`，保留本机服务并跳过用户命令注册。
+同一安装还注册 `mc-codex` 和 `mc-agy`。从 MC 或 RC 创建 AGY 聊天并选择运行电脑上的项目目录后，可以从 `mc-agy` 按同一个原生会话 ID 进入。AGY 使用当前 Windows 账号和 Windows 访问权限，默认跳过逐次工具审批。AGY 补充问题仍可在 MC 或 RC 回答。在 MC 的同一聊天输入 `/reply` 可以重新打开等待中的提问，输入 `/stop` 可以请求停止。RC 在任务状态处提供停止按钮。执行期间在两端正常发送文本可追加指令。
+
+测试副本可在启动前设置 `MC_SHARED_TERMINAL_REGISTER=0`，保留本机服务并跳过用户命令注册。
 
 ## 语音输入
 

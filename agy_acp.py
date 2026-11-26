@@ -1,6 +1,7 @@
 """Antigravity ACP v1 stdio transport and session configuration."""
 
 from concurrent.futures import Future, TimeoutError
+from dataclasses import dataclass, field
 import hashlib
 import itertools
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import threading
+import uuid
 
 
 AGY_MODEL_ID = "agy/main"
@@ -18,6 +20,22 @@ AGY_CHAT_FIELDS = ("agy_workspace", "agy_session_id", "agy_native_owner", "agy_c
 
 class AgyError(RuntimeError):
     pass
+
+
+@dataclass
+class AgyPrompt:
+    on_update: object
+    on_interaction: object
+    completion: Future = field(default_factory=Future)
+    request_ids: list[int] = field(default_factory=list)
+    pending: dict = field(default_factory=dict)
+    cancelling: bool = False
+
+    def wait(self) -> str:
+        try:
+            return self.completion.result(30 * 60)
+        except TimeoutError as exc:
+            raise AgyError("AGY 回合结果未知：等待原生终态超时，请查看原会话后再试") from exc
 
 
 def find_agy_executable() -> str:
@@ -103,10 +121,11 @@ class AgyAcpClient:
         return [executable, "acp", "--dangerously-skip-permissions"]
 
     def __init__(self, executable: str, cwd: str):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._pending = {}
         self._ids = itertools.count(1)
         self._on_update = None
+        self._turn = None
         self._closed = False
         self._cwd = cwd
         self.session_id = ""
@@ -171,18 +190,22 @@ class AgyAcpClient:
                 self._pending.pop(request_id, None)
         error = response.get("error")
         if isinstance(error, dict):
-            message = str(error.get("message") or "").strip()
-            if method in {"session/load", "session/resume", "session/prompt"} and any(
-                term in message.lower() for term in ("already in use", "session is busy", "session is locked")
-            ):
-                raise AgyError("AGY 原会话正在另一进程中使用，请等终端结束后重试")
-            if any(term in message.lower() for term in ("auth_required", "authentication required", "not logged in", "sign in", "unauthenticated")):
-                raise AgyError("请先在运行电脑上登录 AGY，再重新打开聊天")
-            if error.get("code") == -32601:
-                raise AgyError(f"此电脑上的 AGY 不支持 {method}，请检查安装版本")
-            raise AgyError(f"AGY {method} 失败：{message or error.get('code')}")
+            raise self._request_error(method, error)
         result = response.get("result")
         return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _request_error(method, error):
+        message = str(error.get("message") or "").strip()
+        if method in {"session/load", "session/resume", "session/prompt"} and any(
+            term in message.lower() for term in ("already in use", "session is busy", "session is locked")
+        ):
+            return AgyError("AGY 原会话正在另一进程中使用，请等终端结束后重试")
+        if any(term in message.lower() for term in ("auth_required", "authentication required", "not logged in", "sign in", "unauthenticated")):
+            return AgyError("请先在运行电脑上登录 AGY，再重新打开聊天")
+        if error.get("code") == -32601:
+            return AgyError(f"此电脑上的 AGY 不支持 {method}，请检查安装版本")
+        return AgyError(f"AGY {method} 失败：{message or error.get('code')}")
 
     def _read(self) -> None:
         try:
@@ -195,14 +218,20 @@ class AgyAcpClient:
                     continue
                 request_id = payload.get("id")
                 method = payload.get("method")
+                params = payload.get("params")
+                params = params if isinstance(params, dict) else {}
                 if method and request_id is not None:
-                    self._handle_request(request_id, method)
-                elif method == "session/update" and self._on_update:
-                    params = payload.get("params") or {}
-                    if params.get("sessionId") == self.session_id:
-                        self._on_update(params.get("update") or {})
+                    self._handle_request(request_id, method, params)
+                elif method == "session/update":
+                    with self._lock:
+                        callback = self._turn.on_update if self._turn is not None else self._on_update
+                        if callback and params.get("sessionId") == self.session_id:
+                            callback(params.get("update") or {})
                 elif request_id is not None:
                     with self._lock:
+                        turn = self._turn
+                        if turn is not None and request_id in turn.request_ids:
+                            self._settle_prompt_request(turn, request_id, payload)
                         future = self._pending.get(request_id)
                         if future is not None and not future.done():
                             future.set_result(payload)
@@ -210,19 +239,57 @@ class AgyAcpClient:
             pass
         finally:
             with self._lock:
+                if self._turn is not None:
+                    self._turn.completion.set_exception(AgyError("AGY 运行进程已退出，回合结果未知，请检查原会话和本机登录状态"))
+                    self._turn = None
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(AgyError("AGY 运行进程已退出，请检查本机安装和登录状态"))
             self._process.stdout.close()
 
-    def _handle_request(self, request_id, method: str) -> None:
-        if method == "session/request_permission":
-            self._send({"id": request_id, "result": {"outcome": {"outcome": "cancelled"}}})
-        else:
+    def _settle_prompt_request(self, turn, request_id, payload):
+        latest = turn.request_ids[-1] == request_id
+        turn.request_ids.remove(request_id)
+        if not latest:
+            return
+        error = payload.get("error")
+        if isinstance(error, dict):
+            failure = self._request_error("session/prompt", error)
+            if turn.request_ids:
+                turn.on_update({"sessionUpdate": "steer_error", "requestId": request_id, "text": str(failure)})
+                return
+            self._turn = None
+            turn.completion.set_exception(failure)
+            return
+        self._turn = None
+        result = payload.get("result")
+        turn.completion.set_result(str(result.get("stopReason") or "") if isinstance(result, dict) else "")
+
+    def _handle_request(self, request_id, method: str, params: dict) -> None:
+        if method not in {"session/request_permission", "elicitation/create"}:
             self._send({"id": request_id, "error": {"code": -32601, "message": "Client capability unavailable"}})
+            return
+        with self._lock:
+            turn = self._turn
+            if turn is None or turn.cancelling or params.get("sessionId") != self.session_id:
+                self._send({"id": request_id, "result": self._cancel_interaction(method)})
+                return
+            if any(request_id == request[0] for request in turn.pending.values()):
+                return
+            interaction_id = uuid.uuid4().hex
+            turn.pending[interaction_id] = (request_id, method)
+            turn.on_interaction(interaction_id, method, params)
+
+    @staticmethod
+    def _cancel_interaction(method):
+        if method == "session/request_permission":
+            return {"outcome": {"outcome": "cancelled"}}
+        return {"action": "cancel"}
 
     def initialize(self) -> dict:
-        self.initialization = self.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        self.initialization = self.request("initialize", {
+            "protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}},
+        })
         if self.initialization.get("protocolVersion") != 1:
             raise AgyError("此电脑上的 AGY 不支持 ACP v1")
         return self.initialization
@@ -274,15 +341,64 @@ class AgyAcpClient:
             result = self.request(method, params)
             self.options = configuration_options(result) or self.options
 
-    def prompt(self, question: str, on_update) -> str:
-        self._on_update = on_update
-        try:
-            result = self.request("session/prompt", {
-                "sessionId": self.session_id, "prompt": [{"type": "text", "text": question}],
-            }, timeout=30 * 60)
-        finally:
-            self._on_update = None
-        return str(result.get("stopReason") or "")
+    def begin_prompt(self, question, on_update, on_interaction) -> AgyPrompt:
+        with self._lock:
+            if self._turn is not None:
+                raise AgyError("此 AGY 聊天正在执行")
+            turn = self._turn = AgyPrompt(on_update, on_interaction)
+            try:
+                self._send_prompt(turn, question)
+            except AgyError:
+                self._turn = None
+                raise
+            return turn
+
+    def _send_prompt(self, turn, question):
+        request_id = next(self._ids)
+        self._send({"id": request_id, "method": "session/prompt", "params": {
+            "sessionId": self.session_id, "prompt": [{"type": "text", "text": question}],
+        }})
+        turn.request_ids.append(request_id)
+
+    def steer_prompt(self, turn, question) -> bool:
+        with self._lock:
+            if self._turn is not turn or turn.cancelling:
+                return False
+            self._send_prompt(turn, question)
+            self._cancel_pending(turn)
+            return True
+
+    def cancel_prompt(self, turn) -> bool:
+        with self._lock:
+            if self._turn is not turn or turn.cancelling:
+                return False
+            self._send({"method": "session/cancel", "params": {"sessionId": self.session_id}})
+            turn.cancelling = True
+            self._cancel_pending(turn)
+            return True
+
+    def _cancel_pending(self, turn):
+        for request_id, method in turn.pending.values():
+            self._send({"id": request_id, "result": self._cancel_interaction(method)})
+        turn.pending.clear()
+
+    def reply_interaction(self, turn, interaction_id, result) -> bool:
+        with self._lock:
+            if self._turn is not turn or turn.cancelling:
+                return False
+            request = turn.pending.pop(interaction_id, None)
+            if request is None:
+                return False
+            self._send({"id": request[0], "result": result})
+            return True
+
+    def interaction_active(self, turn, interaction_id) -> bool:
+        with self._lock:
+            return self._turn is turn and interaction_id in turn.pending
+
+    def decline_interaction(self, turn, interaction_id, method) -> bool:
+        result = self._cancel_interaction(method) if method == "session/request_permission" else {"action": "decline"}
+        return self.reply_interaction(turn, interaction_id, result)
 
     def close(self) -> None:
         with self._lock:

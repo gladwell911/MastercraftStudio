@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from functools import partial
 
+from agy_acp import AGY_MODEL_ID
 from codex_client import is_codex_model
 from kimi_server_client import is_kimi_model
 from shared_terminal_command import MAX_PROMPT_LENGTH
@@ -12,6 +13,7 @@ from shared_terminal_command import MAX_PROMPT_LENGTH
 PROVIDER_ROUTES = {
     "codex": (is_codex_model, "_codex_thread_id_for_chat"),
     "kimi": (is_kimi_model, "_kimi_session_id_for_chat"),
+    "agy": (lambda model: model == AGY_MODEL_ID, "_agy_session_id_for_chat"),
 }
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
 
@@ -116,9 +118,16 @@ def _dispatch_ui(frame, route, operation, payload):
             originals = turns if turns else frame.chat_store.load_turns(owner) if frame.chat_store is not None else []
             answer = next((str(row["answer_md"]) for row in reversed(originals)
                            if row.get("answer_identity") == alias and row.get("answer_md")), answer)
-        return 200, {"state": "pending" if status == "running" else status, "chat_id": owner,
-                     "turn_index": index, "answer": answer if status == "done" else "",
-                     "message": str(turn.get("request_error") or "")}
+        body = {"state": "pending" if status == "running" else status, "chat_id": owner,
+                "turn_index": index, "answer": answer if status == "done" else "",
+                "message": str(turn.get("request_error") or "")}
+        if payload.get("provider") == "agy" and body["state"] == "pending":
+            run = frame._agy_run_for_chat(chat)
+            if run and run.turn_idx == index:
+                pending = frame._agy_interaction_payload(owner, run)
+                if pending:
+                    body["interaction_id"] = pending["event_id"]
+        return 200, body
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_PROMPT_LENGTH:
         return 400, {"error": "invalid_prompt"}
