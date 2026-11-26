@@ -75,12 +75,14 @@ class CodexSessionsMixin:
             return 409, {"error": "chat_changed"}
         if self._codex_thread_id_for_chat(chat) != thread_id:
             return 409, {"error": "chat_changed"}
-        if self._codex_active_request_turn_count(turns) and chat.get("codex_terminal_thread") != thread_id:
+        active = bool(self._codex_active_request_turn_count(turns) or chat.get("codex_turn_active"))
+        if active and chat.get("codex_terminal_thread") != thread_id:
             return 409, {"message": "此聊天正在使用原运行时。请等待当前回合结束后打开共享终端。"}
         return 200, {
             "client": self._get_or_create_codex_client(chat_id, model),
             "chat_id": chat_id, "model": model, "thread_id": thread_id,
             "context_generation": int(chat.get("codex_context_generation") or 0),
+            "require_existing_terminal": active,
             "cwd": self._workspace_dir_for_codex(), "title": str(chat.get("title") or "新聊天"),
             **self._codex_native_scope(chat),
             "service_tier": self._codex_service_tier_for_chat(chat),
@@ -1081,6 +1083,8 @@ class CodexSessionsMixin:
                 attachments=turn_attachments,
                 service_tier=service_tier,
                 should_steer=should_steer,
+                require_existing_terminal=bool(thread_id and thread_id == target_chat.get("codex_terminal_thread")
+                                               and self._codex_should_steer_turn(target_chat, is_current_target)),
                 approval_policy=getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE),
                 sandbox=getattr(self, "codex_sandbox", DEFAULT_CODEX_SANDBOX),
                 history_turns=history_turns,
@@ -2188,6 +2192,12 @@ class CodexSessionsMixin:
             return
         metadata = self._codex_worker_active_turns.get(str(chat_id or "").strip())
         if not isinstance(metadata, dict):
+            return
+        chat, _, _ = self._chat_target_for_request(chat_id)
+        if (chat and chat.get("codex_terminal_thread") == self._codex_thread_id_for_chat(chat)
+                and chat.get("codex_terminal_thread") and metadata.get("turn_id") == self._codex_turn_id_for_chat(chat)):
+            # The child App Server and its terminal peer can outlive the worker.
+            # Leave the native result pending until there is authoritative evidence.
             return
         self._apply_codex_worker_error(
             chat_id,
