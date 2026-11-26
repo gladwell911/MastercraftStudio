@@ -118,7 +118,9 @@ def test_close_drains_a_confirmed_native_delete_before_the_write_fence(
     assert ChatStore(db_path).load_chat_summary(owner) is None
 
 
-def test_agy_confirmation_reads_original_directory_and_never_sends_delete(frame, tmp_path, monkeypatch, wait_for_wx):
+@pytest.mark.parametrize(("version", "supported"), [("1.5.17", True), ("1.5.18", True), ("1.5.99", False)])
+def test_agy_confirmation_reads_original_directory_and_never_sends_delete(
+        frame, tmp_path, monkeypatch, wait_for_wx, version, supported):
     import agy_history
     import mc_frame_native_history
     from agy_acp import AGY_MODEL_ID, AgyError
@@ -136,7 +138,7 @@ def test_agy_confirmation_reads_original_directory_and_never_sends_delete(frame,
 
     class Authority:
         capabilities = {"loadSession": True, "sessionCapabilities": {"list": {}}}
-        initialization = {"agentInfo": {"version": "1.5.17"}}
+        initialization = {"agentInfo": {"version": version}}
 
         def native_storage(self):
             return storage
@@ -163,11 +165,15 @@ def test_agy_confirmation_reads_original_directory_and_never_sends_delete(frame,
     assert status == 200
     assert detail["manual"] is True
     assert "F4" in detail["description"]
-    _confirm_remote_removal(frame, owner, wait_for_wx)
-    assert [method for method, _ in requests] == ["session/list", "session/load"]
+    response = _confirm_remote_removal(frame, owner, wait_for_wx, expected_status=200 if supported else 409)
+    if supported:
+        assert [method for method, _ in requests] == ["session/list", "session/load"]
+    else:
+        assert "当前 AGY 版本" in response["message"]
+        assert requests == []
 
 
-def _confirm_remote_removal(frame, owner, wait_for_wx):
+def _confirm_remote_removal(frame, owner, wait_for_wx, *, expected_status=200):
     transport = RemoteNatsTransport(pair_id="default", token="synthetic",
                                     on_history_mutation=frame._remote_api_history_mutation)
     status, detail = transport._route_command({"type": "native_delete_target", "chat_id": owner})
@@ -179,8 +185,9 @@ def _confirm_remote_removal(frame, owner, wait_for_wx):
         })
         wait_for_wx(pending.done, "provider confirmed removal", timeout=35)
         status, response = pending.result()
-    assert status == 200, response
-    assert frame.chat_store.load_chat_summary(owner) is None
+    assert status == expected_status, response
+    assert (frame.chat_store.load_chat_summary(owner) is None) == (expected_status == 200)
+    return response
 
 
 @real_codex

@@ -81,7 +81,8 @@ def verify_agy_session_absent(executable, pair, session_id, identity, account, c
         if actual.chat_id != identity or client.native_account() != account:
             raise NativeDeletionRejected("AGY 原始账号或存储已变更，请切回后刷新。")
         capabilities = client.capabilities.get("sessionCapabilities") or {}
-        if ((client.initialization.get("agentInfo") or {}).get("version") != "1.5.17"
+        version = (client.initialization.get("agentInfo") or {}).get("version")
+        if (version not in ("1.5.17", "1.5.18")
                 or client.capabilities.get("loadSession") is not True
                 or not isinstance(capabilities.get("list"), dict)):
             raise NativeDeletionRejected("当前 AGY 版本无法读取原始会话清单。")
