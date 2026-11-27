@@ -1,8 +1,26 @@
 # 当前交接
 
-更新日期 2026-11-26。日常源码工作树为 `D:/code/sj/mc`，主分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。本批功能与交接位于独立的 `feat/mc-rc-three-cli-shared-sessions` 候选分支。
+更新日期 2026-11-27。日常源码工作树为 `D:/code/sj/mc`，主分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。本批功能与交接位于独立的 `feat/mc-rc-three-cli-shared-sessions` 候选分支。
 
 ## 2026-11-26 三家 CLI 共享会话
+
+### T13 下一步
+
+当前候选从 MC `1ba49dd`（应用源码 `fea9a35`）与 RC `b5f1381` 接续。原失败证据对应 RC `8b9c92f`。使用隔离 MC 数据、NATS、真实账号及合成会话。专用 Android 35 模拟器通过原生桥运行 `arm64-v8a` RC。复验记录两仓提交与 APK SHA-256。
+
+#### 已验收
+
+1. **Codex 新建首发已通过。** RC 候选 `4b066dd` 配对 MC `fea9a35`，真实账号单击首发提交一次，RC 显示首答，桌面在同一原生 ID 续聊。见 [RC 实施及验收记录](../../rc-integration/_bmad-output/implementation-artifacts/plan-t13-codex-first-send.md)。
+2. **通知定位已通过。** RC 候选 `b5f1381` 在真实账号上验证 Codex、Kimi Code 和 AGY 的后台及锁屏点击。三家都打开新到的对应终答、确认同一序号已读并清除通知。锁屏保持正文遮罩直到解锁。见 [通知验收记录](../../rc-integration/_bmad-output/implementation-artifacts/plan-t13-notification-tap.md)。
+
+#### 2026-11-27 本机续验
+
+- Codex 审批卡按原生提供的常规决定显示按钮。默认 420 dpi 的 ARM64 候选对同一真实请求返回 200，原生拒绝路径取消了原回合。真实 Plan 选择并提交 Yellow 后，同一回合的方案由 MC 持久保存并在 RC 显示。
+- AGY 原回合追加已在 RC 显示终答，停止控件随终结撤下。本机 `default` 的真实会话按稳定聊天 ID 改名，重开后的来源、原生 ID 和原正文一致。应用改名更新 MC 显示名。
+- Kimi Code 2.6.3 待确认原回合续接。420 dpi 已通过同一审批的点按和追加提交。两种队列追加顺序和直接追加均回读到新的原生回合，试验性源码已撤回。接续按原生回合及结构化 prompt 归属核对，MC 受理回执与终答归属各自取证。
+- 较早离屏通知仍在原延期项。点击旧通知只应打开该终答，较新的终答应保持未读。
+
+[本机续验证据、两仓提交、APK 哈希和未通过条件](../../candidate-final/automated-t13/t13-local-20261127.md)。本节限定在隔离本机候选与 ARM64 模拟器。实体笔记本和物理双机改名回读已经移出本机 T13。正式 NATS 整体验收及 TalkBack 发音专项沿用此前范围。下文较早批次只记录当时状态。
 
 - T01–T12 已合入本地双仓候选，整体验收 T13 进行中。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
 - 本机工作区 `D:/code/sj` 下，`_bmad-output/implementation-artifacts/mc-rc-three-cli-shared-sessions-acceptance.md` 逐项记录 A-01 至 A-12 和复现指令，`.build-work/mc-rc-three-cli-shared-sessions/candidate-final` 保存构建脚本、产物哈希、冻结演练和隔离证据。文档提交后重建该批产物仍使用上述源码提交。
