@@ -487,6 +487,7 @@ class ChatHistoryMixin:
                 asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
         self._chat_turn_dirty_from.pop(normalized, None)
         self._call_after_if_alive(self._refresh_chat_read_row, normalized)
+        self._schedule_next_agy_tool_turn(normalized, turns)
 
     def _refresh_chat_read_row(self, owner):
         self._invalidate_remote_history_list_cache()
@@ -716,6 +717,7 @@ class ChatHistoryMixin:
         if self.active_chat_id:
             self._schedule_next_kimi_tool_turn(self.active_chat_id)
             self._schedule_next_codex_tool_turn(self.active_chat_id)
+            self._schedule_next_agy_tool_turn(self.active_chat_id, self.active_session_turns)
         self._sort_archived_chats()
         if changed:
             self._defer_chat_state_save()
@@ -1884,6 +1886,7 @@ class ChatHistoryMixin:
             if sync_history_selection and not self._select_history_row_if_present(selected_id):
                 self._mark_history_list_dirty(selected_id)
             self._defer_chat_state_save()
+            self._schedule_next_agy_tool_turn(selected_id, self.active_session_turns)
             if focus_answer_list:
                 if not self._focus_latest_answer_immediately():
                     self.answer_list.SetFocus()
@@ -1906,6 +1909,7 @@ class ChatHistoryMixin:
         self._defer_chat_state_save()
         self.SetStatusText(str(chat.get("native_history_status") or "已切换到历史聊天"))
         self._schedule_next_codex_tool_turn(selected_id)
+        self._schedule_next_agy_tool_turn(selected_id, chat.get("turns") or [])
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()
@@ -2087,6 +2091,7 @@ class ChatHistoryMixin:
         self._rebuild_kimi_runtime_state()
         self._schedule_next_kimi_tool_turn(chat_id)
         self._schedule_next_codex_tool_turn(chat_id)
+        self._schedule_next_agy_tool_turn(chat_id, self.active_session_turns)
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1

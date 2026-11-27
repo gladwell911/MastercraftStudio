@@ -440,7 +440,8 @@ class NativeHistoryMixin:
             return 409, {}
         turns = chat.get("turns") or []
         latest = turns[-1] if turns else {}
-        if latest.get("request_status") == "pending" and not latest.get("terminal_notification_pair"):
+        if (latest.get("request_status") == "pending" and not latest.get("terminal_notification_pair")
+                and not (session.identity.provider == "agy" and latest.get("agy_queue_claimed"))):
             return 409, {}
         authority = (chat.get("id"), chat.get("updated_at"), chat.get("revision"), len(turns),
                      latest.get("request_generation"), latest.get("request_status"))
@@ -549,4 +550,8 @@ class NativeHistoryMixin:
                 self._push_remote_title_changed(target)
         else:
             self._push_remote_history_changed(owner)
+        if session.identity.provider == "agy" and recovered and turns is not None and target:
+            if not isinstance(target.get("turns"), list):
+                target["turns"] = turns
+            self._schedule_next_agy_tool_turn(owner, turns)
         return 200, {}

@@ -330,6 +330,59 @@ def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
         assert steps[1]["status"] == tool_status
 
 
+@pytest.mark.parametrize("evidence", ["explicit", "ambiguous", "extra", "other request", "stale revision"])
+def test_agy_replay_reconciles_only_exact_sent_prefix_with_queued_tail(tmp_path, evidence):
+    store = ChatStore(tmp_path / "chat.db")
+    store.initialize()
+    identity = NativeSessionIdentity("default", "agy", "fixture-store", "session")
+    owner = "managed-agy"
+    predecessor = {
+        "model": "agy/main", "question": "Sent question", "request_status": "unknown",
+        "agy_session_id": identity.session_id, "agy_native_turn_id": "turn",
+        "provider_user_message_id": "user", "agy_observed_message_id": "answer",
+        "terminal_notification_pair": identity.pair_id, "agy_partial_answer_md": "partial",
+    }
+    tail = [
+        {"model": "agy/main", "question": "First queued", "request_status": "queued",
+         "tool_settings": {"tool": "agy", "model": "gemini-4-carbon", "effort": "low"}},
+        {"model": "system", "question": "", "answer_md": "MC marker"},
+        {"model": "agy/main", "question": "Second queued", "request_status": "queued",
+         "tool_settings": {"tool": "agy", "model": "gemini-4-neon", "effort": "high"}},
+    ]
+    store.upsert_chat({
+        "id": owner, "model": "agy/main", "native_identity": identity.chat_id, "agy_session_id": identity.session_id,
+        "native_account": "account", "native_unresolved_turn": {"index": 0, "message": "unknown"},
+    })
+    store.replace_turns(owner, [predecessor, *tail])
+    matched = {
+        "provider": "agy", "session_id": identity.session_id, "question": "Sent question",
+        "agy_native_turn_id": "turn", "provider_user_message_id": "user", "provider_message_id": "answer",
+        "answer_md": "Verified native answer", "request_status": "done",
+        "native_final_explicit": evidence != "ambiguous",
+    }
+    if evidence == "other request":
+        matched["provider_user_message_id"] = "other-user"
+    replayed = [matched]
+    if evidence == "extra":
+        replayed.append(dict(matched, agy_native_turn_id="additional native turn"))
+    snapshot = NativeSessionSnapshot(identity, "account", "agy/main", str(tmp_path), "AGY",
+                                     updated_at=100, turns=replayed,
+                                     legacy_fields={"agy_session_id": identity.session_id})
+    assert store.native_history_target(snapshot)[0] == owner
+    revision = store.get_clear_reconciliation_authority(owner)["revision"]
+    store.merge_native_history(snapshot, expected_chat_id=owner,
+                               expected_revision=revision + (evidence == "stale revision"))
+    saved = store.load_chat(owner)
+    assert saved["turns"][1:] == tail
+    if evidence == "explicit":
+        assert saved["native_unresolved_turn"] is None
+        assert saved["turns"][0]["request_status"] == "done"
+        assert saved["turns"][0]["answer_md"] == "Verified native answer"
+    else:
+        assert saved["native_unresolved_turn"]["index"] == 0
+        assert saved["turns"][0] == predecessor
+
+
 @pytest.mark.parametrize(("evidence", "expected"), [
     ("explicit", "done"),
     ("no terminal", "unknown"),
