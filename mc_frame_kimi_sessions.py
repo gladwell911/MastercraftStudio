@@ -113,6 +113,7 @@ class KimiSessionsMixin:
         with self._kimi_owner_lock:
             if self._kimi_submission_locks.get(chat_id) is submission_lock:
                 self._finish_model_startup_failure(chat_id, turn_idx, request, message, model)
+        self._schedule_next_kimi_tool_turn(chat_id)
 
     def _apply_kimi_final_answer_to_turn(self, turn: dict, text: str) -> bool:
         return self._apply_codex_final_answer_to_turn(turn, text)
@@ -596,10 +597,70 @@ class KimiSessionsMixin:
             self._kimi_active_turns.pop(normalized, None)
 
     def _start_kimi_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str) -> None:
+        _chat, turns, is_current = self._chat_target_for_request(chat_id)
+        if 0 <= turn_idx < len(turns):
+            turn = turns[turn_idx]
+            prior = turns[:turn_idx]
+            settings = turn.get("tool_settings") or {}
+            if not turn.get("kimi_expected_prompt_id") and (
+                    any(self._is_kimi_tool_turn_queued(row) for row in prior)
+                    or (settings.get("tool") == "kimi" and self._kimi_tool_settings_changed(settings, prior))):
+                # Both supported servers apply prompt settings to the currently
+                # running main agent, even when they accept the prompt as queued.
+                turn["request_status"] = "queued"
+                turn["request_resume_token"] = {}
+                if is_current:
+                    self.SetStatusText("已排队，将在当前回合结束后发送")
+                return
         def _worker() -> None:
             self._run_kimi_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
 
         bindings.app.threading.Thread(target=_worker, daemon=True).start()
+
+    @staticmethod
+    def _is_kimi_tool_turn_queued(turn):
+        return (isinstance(turn, dict) and turn.get("request_status") == "queued"
+                and is_kimi_model(turn.get("model")))
+
+    @staticmethod
+    def _kimi_tool_settings_changed(settings, prior):
+        for turn in prior:
+            if not (isinstance(turn, dict) and is_kimi_model(turn.get("model"))
+                    and turn.get("request_status") in {"pending", "running"} and not turn.get("local_command")
+                    and not turn.get("kimi_expected_prompt_id")):
+                continue
+            before = turn.get("tool_settings") or {}
+            if before.get("tool") != "kimi":
+                before = {"model": "", "effort": "", "mode": "default", "permission": "auto"}
+            if any(settings.get(key) != before.get(key) for key in ("model", "effort", "mode", "permission")):
+                return True
+        return False
+
+    def _schedule_next_kimi_tool_turn(self, chat_id):
+        _chat, turns, _current = self._chat_target_for_request(chat_id)
+        if any(self._is_kimi_tool_turn_queued(turn) for turn in turns):
+            self._call_after_if_alive(self._launch_next_kimi_tool_turn, chat_id)
+
+    def _launch_next_kimi_tool_turn(self, chat_id):
+        chat, turns, is_current = self._chat_target_for_request(chat_id)
+        if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
+                or self._kimi_should_steer_turn(chat, is_current)
+                or any(isinstance(turn, dict) and is_kimi_model(turn.get("model"))
+                       and turn.get("request_status") in {"pending", "running"} and not turn.get("local_command")
+                       for turn in turns)):
+            return
+        for index, turn in enumerate(turns):
+            if not self._is_kimi_tool_turn_queued(turn):
+                continue
+            turn["request_status"] = "pending"
+            self._mark_chat_turns_dirty(None if is_current else chat_id, index)
+            if is_current:
+                self.is_running = True
+                self._active_request_count = 1
+                self.SetStatusText("正在发送排队的问题")
+            self._start_kimi_worker_for_turn(chat_id, index, turn["request_question"], turn["model"])
+            self._defer_chat_state_save()
+            return
 
     def _start_kimi_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
         normalized_command = str(command or "").strip().lower()
@@ -667,7 +728,7 @@ class KimiSessionsMixin:
             for turn in earlier_turns:
                 if isinstance(turn, dict):
                     if (is_kimi_model(turn.get("model")) and not turn.get("local_command")
-                            and turn.get("request_status") in {"pending", "running"}):
+                            and turn.get("request_status") in {"pending", "running", "queued"}):
                         self._mark_turn_request_failed(turn, "Kimi Code 会话已清理。")
                         if turn.get("answer_md") == REQUESTING_TEXT:
                             turn["answer_md"] = turn["request_error"]
@@ -881,6 +942,7 @@ class KimiSessionsMixin:
                 return
             turn = startup_request[0]
             expected_prompt = turn.get("kimi_expected_prompt_id")
+            settings = turn.get("tool_settings") or {}
             with self._kimi_owner_lock:
                 known_active = self._kimi_active_turns.get(client_chat_id) or {}
                 session_id = str(self._kimi_submission_sessions.get(client_chat_id)
@@ -895,6 +957,7 @@ class KimiSessionsMixin:
             history_turns = target_turns[:turn_idx]
             client = self._ensure_kimi_client()
             self._start_kimi_client_with_retry(client)
+            desktop_settings = settings.get("tool") == "kimi" and bool(getattr(client, "runtime_version", ""))
             terminal_resume = turn.get("question_origin") == "terminal"
             if terminal_resume:
                 auth = client.get_auth(timeout=5)
@@ -924,6 +987,7 @@ class KimiSessionsMixin:
                 if not actual_cwd or Path(actual_cwd).resolve() != Path(native_cwd).resolve():
                     raise RuntimeError("Kimi Code 原会话工作目录已变化。请检查原会话后重试。")
             if session_id:
+                previous_session = session_id
                 exists_error: Exception | None = None
                 for attempt in range(max(1, int(self._kimi_reconcile_attempts))):
                     try:
@@ -938,6 +1002,8 @@ class KimiSessionsMixin:
                             bindings.app.time.sleep(min(float(self._kimi_reconcile_backoff) * (2 ** attempt), 2.0))
                 if exists_error is not None:
                     raise exists_error
+                if session_id != previous_session and settings.get("model"):
+                    raise RuntimeError("Kimi Code 原会话不可用，无法在原会话中应用发送设置。")
             if (terminal_resume or native_cwd) and not session_id:
                 raise RuntimeError("Kimi Code 无法打开原生会话。请检查当前账号和会话，再重试。")
             if session_id:
@@ -950,10 +1016,13 @@ class KimiSessionsMixin:
                 send_question = str(question or "")
             else:
                 send_question = self._build_kimi_history_recovery_prompt(history_turns, question) if history_turns else str(question or "")
+                defaults = ({"permission_mode": settings["permission"], "plan_mode": settings["mode"] == "plan"}
+                            if desktop_settings else {})
                 session_id = client.create_session(
                     cwd=self._workspace_dir_for_kimi(),
-                    model=model,
+                    model="" if desktop_settings else model,
                     title=str((target_chat.get("title") if isinstance(target_chat, dict) else "") or "kimi chat"),
+                    **defaults,
                 )
             if not self._model_startup_request_is_current(chat_id, turn_idx, startup_request):
                 return
@@ -1003,10 +1072,13 @@ class KimiSessionsMixin:
                 self._kimi_pending_submissions.setdefault(session_id, []).append(submission_intent)
                 target_chat["kimi_idle_verified"] = None
             try:
+                options = {}
                 if exact_prompt_id:
-                    prompt_id = client.submit_prompt(session_id, content_blocks, prompt_id=exact_prompt_id)
-                else:
-                    prompt_id = client.submit_prompt(session_id, content_blocks)
+                    options["prompt_id"] = exact_prompt_id
+                if desktop_settings and not (should_steer or existing_queue or expected_prompt):
+                    options.update(model=settings.get("model", ""), thinking=settings.get("effort", ""),
+                                   plan_mode=settings["mode"] == "plan", permission_mode=settings["permission"])
+                prompt_id = client.submit_prompt(session_id, content_blocks, **options)
             except Exception as exc:
                 if not bool(getattr(exc, "result_unknown", False)):
                     raise

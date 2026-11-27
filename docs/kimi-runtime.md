@@ -8,7 +8,9 @@ $env:KIMI_BIN = 'C:/path/to/verified/kimi.exe'
 
 `kimi_runtime.py` 按 SHA-256 识别已验证构建，然后执行 `--version` 确认版本。受支持的 Windows 2.5.3 构建 SHA-256 为 `3fe337ab7aa742ba0b72cc87fcc9a267756e609a54358c0d85bbe200da9bec8d`。未知哈希会在执行前被拒绝。版本探针和服务进程均设置 `KIMI_CODE_NO_AUTO_UPDATE=1`，CLI 安装和升级由用户自行管理。
 
-受支持的 Windows x64 2.6.3 构建 SHA-256 为 `b50c7ce3bed69e9be58f9a29aa090c0e7c61f7a1887503c4943267384a71ef30`。新版 API 使用带 Bearer 子协议的 WebSocket、当前连接的逐会话订阅确认，以及 `ping/pong`。MC 使用主代理 REST turn 的明确 opener prompt 身份、终态和最后完整步骤发布回答。断线后重新订阅并只读核对旧 prompt，不重新提交。新版新建会话默认逐次审批。活动中的后续输入进入独立队列；同轮追问沿用旧版本经确认的协议。
+受支持的 Windows x64 2.6.3 构建 SHA-256 为 `b50c7ce3bed69e9be58f9a29aa090c0e7c61f7a1887503c4943267384a71ef30`。新版 API 使用带 Bearer 子协议的 WebSocket、当前连接的逐会话订阅确认，以及 `ping/pong`。MC 使用主代理 REST turn 的明确 opener prompt 身份、终态和最后完整步骤发布回答。断线后重新订阅并只读核对旧 prompt，不重新提交。2.6.3 活动中的后续输入进入独立队列。2.5.3 的同轮追问沿用该版本经确认的协议。
+
+MC 桌面新聊天关闭计划模式，默认选择自动审批。工具菜单分别设置计划和审批，模型及推理强度取自原生服务目录。两个版本都会在接收后续提问时更新实时设置，MC 先保留改过设置的提问及提交快照，待原生回合结束后按顺序在同一会话发送。
 
 2.6.3 已在隔离环境实测真实模型连续两问、窗口审批允许和拒绝、精确取消与活动断线后恢复。旧会话跨构建迁移和降级可读性仍待验证。
 

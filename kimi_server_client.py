@@ -354,6 +354,11 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
     # ------------------------------------------------------------------
     # REST API
 
+    def read_tool_settings_catalog(self) -> dict[str, Any]:
+        models = self._request_data("GET", "/api/v1/models").get("items", [])
+        config = self._request_data("GET", "/api/v1/config")
+        return {"models": models, "default_model": _str(config.get("default_model"))}
+
     def create_session(
         self,
         *,
@@ -362,6 +367,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         title: str = "",
         permission_mode: str | None = None,
         goal_objective: str = "",
+        plan_mode: bool | None = None,
     ) -> str:
         if permission_mode is None:
             permission_mode = "manual" if self._server_api else "auto"
@@ -371,6 +377,8 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
             agent_config["model"] = alias
         if goal_objective:
             agent_config["goal_objective"] = goal_objective
+        if plan_mode is not None:
+            agent_config["plan_mode"] = plan_mode
         body: dict[str, Any] = {
             "title": title or "kimi chat",
             "metadata": {"cwd": str(cwd)},
@@ -397,8 +405,17 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         return session_id
 
     def submit_prompt(self, session_id: str, content_blocks: list[dict[str, Any]], *,
-                      prompt_id: str = "") -> str:
+                      prompt_id: str = "", model: str = "", thinking: str = "",
+                      plan_mode: bool | None = None, permission_mode: str = "") -> str:
         body: dict[str, Any] = {"content": list(content_blocks)}
+        if model:
+            body["model"] = model
+        if thinking:
+            body["thinking"] = thinking
+        if plan_mode is not None:
+            body["plan_mode"] = plan_mode
+        if permission_mode:
+            body["permission_mode"] = permission_mode
         if self.protocol_version == 2:
             self._require_v2_ready(session_id)
             if prompt_id:
