@@ -67,6 +67,9 @@ def merge_native_title(chat, provider, title, observed_at, *, explicit=True, app
     if previous_native != title:
         chat.update(native_title=title,
                     native_title_revision=int(chat.get("native_title_revision") or 0) + 1)
+    if (provider == "agy" and chat.get("agy_desktop_settings")
+            and chat.get("title_source") == "default" and not app_manual):
+        return
     if provider == "codex" and not explicit and not app_manual:
         if chat.get("title_manual") or (chat.get("title") and chat["title"] != previous_native):
             return

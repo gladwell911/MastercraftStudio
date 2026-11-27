@@ -529,12 +529,9 @@ class AgySessionsMixin:
     def _start_desktop_agy_chat(self, title: str, title_manual: bool) -> bool:
         if self._agy_new_chat_pending:
             return False
-        if not find_agy_executable():
-            self.SetStatusText("此电脑尚未安装 AGY，请安装或设置 MC_AGY_EXECUTABLE")
-            return False
-        cwd = self._workspace_dir_for_codex()
         prior = self._visible_clear_owner()
         self._agy_new_chat_pending = True
+        self.input_edit.SetFocus()
         self.SetStatusText("正在打开 AGY 项目")
 
         def finish(result, error):
@@ -568,8 +565,8 @@ class AgySessionsMixin:
 
         def prepare():
             try:
-                result = self._prepare_agy_workspace(cwd)
-            except AgyError as exc:
+                result = self._prepare_agy_workspace(self._workspace_dir_for_codex())
+            except (AgyError, OSError) as exc:
                 self._call_after_if_alive(finish, None, str(exc))
             else:
                 if not self._call_after_if_alive(finish, result, ""):

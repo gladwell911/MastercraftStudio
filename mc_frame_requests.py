@@ -381,6 +381,9 @@ class ChatRequestsMixin:
             return False
         if not self.input_edit.IsEnabled() or not self.send_button.IsEnabled():
             return False
+        if getattr(self, "_agy_new_chat_pending", False) and self._current_tool() == "agy":
+            self.SetStatusText("正在打开 AGY 项目，请稍候发送")
+            return False
         raw_value = str(self.input_edit.GetValue() or "")
         if not raw_value.strip() and not list(getattr(self, "_pending_input_attachments", []) or []):
             if show_empty_warning:
@@ -1982,7 +1985,8 @@ class ChatRequestsMixin:
         self._upsert_history_row(self.active_chat_id)
         self._select_history_row_if_present(self.active_chat_id)
         self._render_answer_list()
-        self.input_edit.SetFocus()
+        if agy_workspace is None:
+            self.input_edit.SetFocus()
         self.SetStatusText("已开始新聊天")
         self._defer_chat_state_save()
         self._mark_openclaw_lifecycle_dirty()
