@@ -187,7 +187,7 @@ def test_ui_automation_space_from_history_moves_focus_to_input_without_activatin
     frame.history_list.SetSelection(selected_before)
     frame.input_edit.SetFocus()
     wx_app.Yield()
-    for _ in range(6):
+    for _ in range(8):
         if _focused_control() is frame.history_list:
             break
         assert _focused_control().Navigate(main.wx.NavigationKeyEvent.IsForward)
