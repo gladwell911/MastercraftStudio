@@ -715,6 +715,7 @@ class ChatHistoryMixin:
             self._recover_kimi_pending_owners()
         if self.active_chat_id:
             self._schedule_next_kimi_tool_turn(self.active_chat_id)
+            self._schedule_next_codex_tool_turn(self.active_chat_id)
         self._sort_archived_chats()
         if changed:
             self._defer_chat_state_save()
@@ -1904,6 +1905,7 @@ class ChatHistoryMixin:
             self._mark_history_list_dirty(selected_id)
         self._defer_chat_state_save()
         self.SetStatusText(str(chat.get("native_history_status") or "已切换到历史聊天"))
+        self._schedule_next_codex_tool_turn(selected_id)
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()
@@ -2084,6 +2086,7 @@ class ChatHistoryMixin:
         self._prune_kimi_interaction_errors(self._current_chat_state)
         self._rebuild_kimi_runtime_state()
         self._schedule_next_kimi_tool_turn(chat_id)
+        self._schedule_next_codex_tool_turn(chat_id)
         if (not self.active_openclaw_session_id) and any(is_openclaw_model(str(turn.get("model") or "")) for turn in self.active_session_turns):
             self.active_openclaw_session_id = self._make_openclaw_session_id(self.active_chat_id)
         self.active_turn_idx = len(self.active_session_turns) - 1

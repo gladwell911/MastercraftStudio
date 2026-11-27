@@ -127,9 +127,8 @@ class ChatRequestsMixin:
         if is_kimi_model(model):
             self._clear_kimi_active_turn(chat_id, turn_idx)
         self._on_done(turn_idx, "", message, model, "", chat_id)
-        if is_codex_model(model) and any(isinstance(turn, dict) and turn.get("request_status") == "queued"
-                                        for turn in self._chat_target_for_request(chat_id)[1]):
-            self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
+        if is_codex_model(model):
+            self._schedule_next_codex_tool_turn(chat_id)
 
     def _set_active_claudecode_client(self, client, chat_id: str) -> None:
         with self._active_claudecode_client_lock:
@@ -1155,6 +1154,10 @@ class ChatRequestsMixin:
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
         candidate, candidate_turns, _ = self._chat_target_for_request(chat_id or self._visible_clear_owner())
+        selected_tool = (tool_settings or {}).get("tool")
+        if (source == "local" and selected_tool and selected_tool != "agy"
+                and ((candidate or {}).get("model") == AGY_MODEL_ID or (candidate or {}).get("agy_workspace"))):
+            return False, "此聊天使用 AGY。请选回 AGY，或新建聊天后使用所选工具。"
         if (candidate or {}).get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")

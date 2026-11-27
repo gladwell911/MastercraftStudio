@@ -1,7 +1,12 @@
+import json
 import threading
 
 import pytest
 import wx
+
+from agy_acp import AGY_MODEL_ID
+from codex_client import CodexEvent, DEFAULT_CODEX_MODEL
+from mc_frame_settings import REQUESTING_TEXT
 from test_codex_native_history import codex_homes, real_codex
 
 
@@ -138,3 +143,126 @@ def test_explicit_config_queues_behind_turn_started_with_native_defaults(
     assert first["codex_turn_id"] != last["codex_turn_id"]
     assert len(calls) == 2
     assert (calls[-1]["model"], calls[-1]["reasoning"]["effort"]) == ("gpt-6.2-astra", "high")
+
+@pytest.fixture
+def codex_queue(frame, monkeypatch):
+    chat_id = "queued-codex-chat"
+    thread_id = "019d36ab-804a-73a2-a2dd-7a17e181628f"
+    turn_id = "019d36b3-0a1c-7c61-aed9-387f6afbb9f9"
+    turns = [
+        {"question": "Previous question", "answer_md": "Previous answer",
+         "model": DEFAULT_CODEX_MODEL, "request_status": "done",
+         "codex_thread_id": thread_id, "codex_turn_id": turn_id},
+        {"question": "First queued question", "request_question": "First queued question",
+         "model": DEFAULT_CODEX_MODEL, "request_status": "queued", "codex_settings_force_new": True,
+         "tool_settings": {"tool": "codex", "model": "gpt-6.2-astra", "effort": "low"}},
+        {"question": "Second queued question", "request_question": "Second queued question",
+         "model": DEFAULT_CODEX_MODEL, "request_status": "queued", "codex_settings_force_new": True,
+         "tool_settings": {"tool": "codex", "model": "gpt-6.2-sol", "effort": "high"}},
+    ]
+    chat = {"id": chat_id, "title": "Codex queue", "model": DEFAULT_CODEX_MODEL,
+            "codex_thread_id": thread_id, "codex_turn_id": turn_id, "turns": turns}
+    frame.chat_store.upsert_chat(chat)
+    frame.chat_store.replace_turns(chat_id, turns)
+    started = []
+    submitted = threading.Event()
+
+    def record_start(*args, **kwargs):
+        started.append(args)
+        submitted.set()
+
+    monkeypatch.setattr(frame, "_run_codex_turn_worker", record_start)
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_: None)
+    return chat, started, submitted
+
+
+def test_codex_queue_starts_while_status_is_pending(frame, codex_queue, monkeypatch, wx_app):
+    chat, started, submitted = codex_queue
+    frame.active_chat_id = frame.current_chat_id = chat["id"]
+    frame.active_session_turns = chat["turns"]
+    frame._current_chat_state = chat
+    chat["codex_turn_active"] = frame.active_codex_turn_active = True
+    chat["turns"][0].update(request_status="pending", answer_md=REQUESTING_TEXT)
+    monkeypatch.setattr(frame, "_start_codex_local_command_worker_for_turn", lambda *_: None)
+    send(frame, "/status")
+    assert chat["turns"][3]["local_command"] == "status"
+    frame._on_codex_event_for_chat(chat["id"], CodexEvent(
+        type="turn_completed", status="completed", text="Previous answer",
+        thread_id=chat["codex_thread_id"], turn_id=chat["codex_turn_id"],
+        data={"turn_idx": 0, "completion_owners": [{"turn_idx": 0, "context_generation": 0}]},
+    ))
+    wx_app.ProcessPendingEvents()
+    assert submitted.wait(timeout=1)
+    assert len(started) == 1
+    assert started[0][0:3] == (chat["id"], 1, "First queued question")
+    assert [turn["request_status"] for turn in chat["turns"]] == ["done", "pending", "queued", "pending"]
+
+
+@pytest.mark.parametrize("restore", ["startup", "history"])
+def test_persisted_codex_queue_resumes_in_order(frame, codex_queue, wx_app, restore):
+    chat, started, submitted = codex_queue
+    # Old builds could persist the status command as active Codex work.
+    frame.chat_store.upsert_chat({**chat, "codex_turn_active": True})
+    if restore == "startup":
+        state = {"active_chat_id": chat["id"], "active_codex_turn_active": True}
+        frame.state_path.write_text(json.dumps(state), encoding="utf-8")
+        frame._load_state()
+    else:
+        frame.archived_chats = frame.chat_store.list_chat_summaries()
+        assert frame._show_history_chat(chat["id"], focus_answer_list=False)
+
+    wx_app.ProcessPendingEvents()
+    assert submitted.wait(timeout=1)
+    assert len(started) == 1
+    assert started[0][0:3] == (chat["id"], 1, "First queued question")
+    _, turns, _ = frame._chat_target_for_request(chat["id"])
+    assert [turn["request_status"] for turn in turns] == ["done", "pending", "queued"]
+    assert turns[1]["tool_settings"]["model"] == "gpt-6.2-astra"
+
+
+def test_codex_clear_cancels_previous_settings_queue(frame, codex_queue, monkeypatch, wx_app):
+    chat, started, _ = codex_queue
+    frame.active_chat_id = frame.current_chat_id = chat["id"]
+    frame.active_session_turns = chat["turns"]
+    frame._current_chat_state = chat
+    commands = []
+    monkeypatch.setattr(frame, "_start_codex_local_command_worker_for_turn", lambda *args: commands.append(args))
+    frame._schedule_next_codex_tool_turn(chat["id"])
+    send(frame, "/clear")
+    wx_app.ProcessPendingEvents()
+    assert [turn["request_status"] for turn in chat["turns"]] == ["done", "queued", "queued", "pending"]
+
+    frame._run_codex_local_command_worker(*commands[0])
+    wx_app.ProcessPendingEvents()
+
+    assert not started
+    assert [turn["request_status"] for turn in chat["turns"]] == ["done", "cancelled", "cancelled", "done"]
+
+
+def test_agy_chat_rejects_codex_selection_and_keeps_draft(frame, monkeypatch, tmp_path):
+    assert frame._on_new_chat_clicked(None)
+    chat = frame._current_chat_state
+    chat.update(model=AGY_MODEL_ID, agy_workspace=str(tmp_path), agy_session_id="agy-existing")
+    original_turns = list(frame.active_session_turns)
+    frame._apply_selected_chat_model_to_combo(chat)
+    choose(frame.tool_combo, "Codex")
+    messages = []
+    monkeypatch.setattr(wx, "MessageBox", lambda message, *_: messages.append(message))
+    started = []
+    monkeypatch.setattr(frame, "_start_agy_worker_for_turn", lambda *args, **kwargs: started.append(args))
+    source = frame.active_chat_id
+    draft = "  保留原聊天里的提问  "
+    frame.input_edit.ChangeValue(draft)
+    frame.input_edit.SetSelection(2, 5)
+
+    event = wx.CommandEvent(wx.wxEVT_BUTTON, frame.send_button.GetId())
+    event.SetEventObject(frame.send_button)
+    frame.send_button.GetEventHandler().ProcessEvent(event)
+
+    assert messages == ["此聊天使用 AGY。请选回 AGY，或新建聊天后使用所选工具。"]
+    assert frame.input_edit.GetValue() == draft
+    assert frame.input_edit.GetSelection() == (2, 5)
+    assert frame.active_chat_id == source
+    assert frame.active_session_turns == original_turns
+    assert not started
