@@ -41,7 +41,7 @@ def isolated_agy(frame, monkeypatch, tmp_path):
 
 
 def test_agy_new_chat_settings_and_fifo_keep_a_single_native_session(
-    frame, isolated_agy, monkeypatch, wait_for_wx,
+    frame, isolated_agy, monkeypatch, wait_for_wx_main_loop,
 ):
     workspace = isolated_agy
     marker = workspace / "input.txt"
@@ -74,8 +74,10 @@ def test_agy_new_chat_settings_and_fifo_keep_a_single_native_session(
     click = wx.CommandEvent(wx.wxEVT_BUTTON, frame.new_chat_button.GetId())
     click.SetEventObject(frame.new_chat_button)
     frame.new_chat_button.GetEventHandler().ProcessEvent(click)
-    wait_for_wx(lambda: frame.active_chat_id != before and bool(frame._current_chat_state.get("agy_session_id")),
-                "new desktop AGY chat", timeout=25)
+    wait_for_wx_main_loop(
+        lambda: frame.active_chat_id != before and bool(frame._current_chat_state.get("agy_session_id")),
+        "new desktop AGY chat", timeout=25,
+    )
     owner = frame.active_chat_id
     native_id = frame._current_chat_state["agy_session_id"]
     assert frame._current_chat_state["agy_workspace"] == str(workspace)
@@ -91,9 +93,12 @@ def test_agy_new_chat_settings_and_fifo_keep_a_single_native_session(
     frame._tool_mode_menu.ProcessEvent(auto)
 
     def completed(index):
-        wait_for_wx(lambda: len(frame.active_session_turns) > index
-                    and frame.active_session_turns[index].get("request_status") in {"done", "failed", "unknown"},
-                    f"AGY result at index {index}", timeout=70)
+        # The queue resumes after the deferred chat save runs on the wx timer.
+        wait_for_wx_main_loop(
+            lambda: len(frame.active_session_turns) > index
+            and frame.active_session_turns[index].get("request_status") in {"done", "failed", "unknown"},
+            f"AGY result at index {index}", timeout=70,
+        )
         turn = frame.active_session_turns[index]
         assert turn["request_status"] == "done", turn.get("request_error")
         return turn["answer_md"]
@@ -118,7 +123,7 @@ def test_agy_new_chat_settings_and_fifo_keep_a_single_native_session(
     send(frame, recall + "BOTH_835.")
     assert all(value in completed(4) for value in ("NATIVE_TOOL_READ_831", "NATIVE_SEED_832", "BOTH_835"))
     send(frame, recall + "HOLD_836.")
-    wait_for_wx(started.is_set, "a live AGY prompt", timeout=30)
+    wait_for_wx_main_loop(started.is_set, "a live AGY prompt", timeout=30)
     choose(frame.model_combo, "Gemini 4 Carbon")
     choose(frame.reasoning_combo, "低")
     send(frame, recall + "FIRST_837.")
