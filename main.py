@@ -859,6 +859,7 @@ class ChatFrame(
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
         self._codex_answer_filter_menu_id = wx.NewIdRef()
+        self._terminal_history_filter_menu_id = wx.NewIdRef()
         self._codex_sandbox_menu_id = wx.NewIdRef()
         self._codex_approval_policy_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
@@ -881,6 +882,7 @@ class ChatFrame(
         self._migrate_legacy_state_if_needed()
         self._migrate_legacy_chat_json_if_needed()
         self._load_state()
+        self._terminal_history_filter_item.Check(self.hide_terminal_chats)
         self.notes_controller.restore_state(self._current_notes_state)
         if (str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit"
                 and self._notes_guard_embedded_edit_view(
@@ -932,6 +934,7 @@ class ChatFrame(
         app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
         filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
         filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
+        self._terminal_history_filter_item = self._append_terminal_history_filter_item(app_menu)
         app_menu.Append(int(self._codex_sandbox_menu_id), "Codex 访问权限")
         app_menu.Append(int(self._codex_approval_policy_menu_id), "Codex 执行审批")
         self._tool_mode_menu = wx.Menu()
@@ -1129,6 +1132,7 @@ class ChatFrame(
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
+        self.Bind(wx.EVT_MENU, self._toggle_terminal_history_filter, id=int(self._terminal_history_filter_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_sandbox(), id=int(self._codex_sandbox_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_approval_policy(), id=int(self._codex_approval_policy_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))

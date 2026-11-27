@@ -35,6 +35,7 @@ class ChatNavigationMixin:
         self._append_tool_modes(menu, mode_ids)
         filter_item = menu.AppendCheckItem(filter_id, "过滤英文内容")
         filter_item.Check(bool(self.codex_answer_english_filter_enabled))
+        self._append_terminal_history_filter_item(menu)
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=voice_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=attach_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=filter_id)
