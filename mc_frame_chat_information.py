@@ -3,14 +3,13 @@
 import logging
 import math
 import wx
-from chat_information import ChatInformationSubscriptions
+from chat_information import ChatInformationSubscriptions, format_quota_reset_time
 from claudecode_client import is_claudecode_model
 from codex_client import codex_model_label_for_model, is_codex_model
 from context_usage import (
     context_usage_from_dict, format_cache_hit, format_context_usage_label,
     format_session_total_tokens, native_token_count,
 )
-from datetime import timezone
 from kimi_server_client import KimiServerError, is_kimi_model, kimi_snapshot_total_tokens
 from kimi_server_v2 import KimiUsageQueryError
 from mc_frame_dialogs import ChatInformationDialog
@@ -108,7 +107,14 @@ class ChatInformationMixin:
             owner_id = str(chat.get("codex_account_id") or "").strip()
             if str(chat.get("codex_chat_information_account_owner") or "").strip() == owner_id:
                 rows.append(str(chat.get("codex_account_label") or "Codex 账号：未查询"))
-                rows.append(str(chat.get("codex_weekly_quota_label") or "Codex 周额度：暂不可用"))
+                status = chat.get("codex_weekly_quota_status")
+                quota = chat.get("codex_weekly_quota")
+                if status is not None:
+                    rows.append(f"Codex 周额度：{status}")
+                elif quota is not None:
+                    rows.append(self._codex_weekly_quota_label(quota))
+                else:
+                    rows.append("Codex 周额度：暂不可用")
             else:
                 rows.extend(["Codex 账号：未查询", "Codex 周额度：暂不可用"])
         else:
@@ -169,19 +175,9 @@ class ChatInformationMixin:
                 result.append(f"{name}：使用比例暂不可用")
                 continue
             label = f"{name}：已用 {ratio * 100:.1f}%"
-            reset = window.get("resetAt")
-            try:
-                reset_time = bindings.app.datetime.fromisoformat(str(reset).replace("Z", "+00:00"))
-                if reset_time.tzinfo is None:
-                    raise ValueError("timezone missing")
-                if key == "limit5h":
-                    label += f"，本地重置 {reset_time.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
-                else:
-                    seconds = max(0, int((reset_time - bindings.app.datetime.now(timezone.utc)).total_seconds()))
-                    hours, minutes = divmod((seconds + 59) // 60, 60)
-                    label += f"，距重置 {hours} 小时 {minutes} 分钟"
-            except (TypeError, ValueError, OverflowError):
-                label += "，重置时间暂不可用"
+            raw_reset = window.get("resetAt")
+            reset = format_quota_reset_time(raw_reset) if isinstance(raw_reset, str) else None
+            label += f"，本地重置 {reset}" if reset is not None else "，重置时间暂不可用"
             result.append(label)
         return result
 
@@ -302,7 +298,8 @@ class ChatInformationMixin:
         chat["codex_snapshot_error"] = True
         if not getattr(self, "_codex_information_context_only", False):
             chat["codex_account_label"] = "Codex 账号：查询失败"
-            chat["codex_weekly_quota_label"] = "Codex 周额度：查询失败"
+            chat["codex_weekly_quota_status"] = "查询失败"
+            chat.pop("codex_weekly_quota", None)
             chat["codex_chat_information_account_owner"] = identity[3]
         self._chat_information_request = None
         self._refresh_chat_information(chat)
@@ -373,18 +370,20 @@ class ChatInformationMixin:
         else:
             account_label = f"Codex 账号：{self._format_codex_account_status(account_resp)}"
         account_type = str((account or {}).get("type") or "").lower()
+        rate_limits = payload.get("rate_limits")
+        weekly_quota = None
         if account is None and not payload.get("account_error"):
-            quota_label = "Codex 周额度：未登录"
+            quota_status = "未登录"
         elif account_type in {"apikey", "api_key", "api-key"}:
-            quota_label = "Codex 周额度：API key 账号不适用"
-        elif payload.get("rate_limits_error") or payload.get("account_error"):
-            quota_label = "Codex 周额度：查询失败"
+            quota_status = "API key 账号不适用"
+        elif payload.get("rate_limits_error") or payload.get("account_error") or not isinstance(rate_limits, dict):
+            quota_status = "查询失败"
         else:
-            quota_label = self._codex_weekly_quota_label(payload.get("rate_limits"))
+            weekly_quota = self._codex_weekly_quota_window(rate_limits)
+            quota_status = None if weekly_quota is not None else "周窗口暂不可用"
         new_account_id = str((account or {}).get("id") or (account or {}).get("email") or "").strip()
         account_identity_changed = bool(not payload.get("account_error") and new_account_id != identity[3])
         changed = (chat.get("codex_account_label") != account_label
-                   or chat.get("codex_weekly_quota_label") != quota_label
                    or str(chat.get("codex_chat_information_account_owner") or "").strip() != identity[3]
                    or account_identity_changed)
         if changed:
@@ -404,10 +403,10 @@ class ChatInformationMixin:
                 if dialog is not None and not dialog.IsBeingDeleted() and dialog.identity[0] == chat_id:
                     dialog.identity = self._chat_information_identity(chat, model)
             chat["codex_account_label"] = account_label
-            chat["codex_weekly_quota_label"] = quota_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
-            self._refresh_chat_information(chat)
             self._defer_codex_state_save()
+        chat["codex_weekly_quota_status"] = quota_status
+        chat["codex_weekly_quota"] = weekly_quota
         self._refresh_chat_information(chat)
 
     def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False,
@@ -784,34 +783,33 @@ class ChatInformationMixin:
         return name or "未知"
 
     @staticmethod
-    def _codex_weekly_quota_label(response) -> str:
-        if not isinstance(response, dict):
-            return "Codex 周额度：查询失败"
+    def _codex_weekly_quota_window(response: dict) -> dict | None:
         limits = response.get("rateLimits")
         by_id = response.get("rateLimitsByLimitId")
         if isinstance(by_id, dict) and isinstance(by_id.get("codex"), dict):
             limits = by_id["codex"]
         if not isinstance(limits, dict):
-            return "Codex 周额度：周窗口暂不可用"
+            return None
         limit_id = str(limits.get("limitId") or limits.get("limitName") or "codex").lower()
         if limit_id != "codex":
-            return "Codex 周额度：周窗口暂不可用"
+            return None
         windows = [limits.get("primary"), limits.get("secondary")]
         weekly = next((item for item in windows if isinstance(item, dict)
                        and item.get("windowDurationMins") == 10080), None)
         if weekly is None:
-            return "Codex 周额度：周窗口暂不可用"
+            return None
+        return {"usedPercent": weekly.get("usedPercent"), "resetsAt": weekly.get("resetsAt")}
+
+    @staticmethod
+    def _codex_weekly_quota_label(weekly: dict) -> str:
         used = weekly.get("usedPercent")
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
             remaining = "剩余比例暂不可用"
         else:
             remaining = f"剩余 {100 - used:.1f}%"
-        reset = weekly.get("resetsAt")
-        try:
-            reset_text = bindings.app.datetime.fromtimestamp(float(reset)).strftime("%Y-%m-%d %H:%M:%S") if reset is not None else "重置时间暂不可用"
-        except (TypeError, ValueError, OverflowError, OSError):
-            reset_text = "重置时间暂不可用"
-        return f"Codex 周额度：{remaining}，本地重置 {reset_text}"
+        reset = format_quota_reset_time(weekly.get("resetsAt"))
+        reset_text = f"本地重置 {reset}" if reset is not None else "重置时间暂不可用"
+        return f"Codex 周额度：{remaining}，{reset_text}"
 
     @staticmethod
     def _codex_thread_status_from_response(thread_resp: dict) -> tuple[str, list[str]]:

@@ -48,7 +48,7 @@ def information_owner(frame, monkeypatch):
     desktop = {"id": "desktop-b", "model": "codex/main"}
     target = {"id": "qa-a", "model": "codex/main", "codex_thread_id": "native-a",
         "codex_account_id": "account-a", "codex_chat_information_account_owner": "account-a",
-        "codex_account_label": "Codex 账号：测试账号", "codex_weekly_quota_label": "Codex 周额度：剩余 75.0%"}
+        "codex_account_label": "Codex 账号：测试账号", "codex_weekly_quota": {"usedPercent": 25}}
     frame._current_chat_state = desktop
     frame.active_chat_id = frame.current_chat_id = "desktop-b"
     monkeypatch.setattr(frame, "_find_archived_chat", lambda key: target if key == "qa-a" else None)
