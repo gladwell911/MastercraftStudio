@@ -37,6 +37,10 @@ from realtime_call import DEFAULT_REALTIME_CALL_ROLE, DEFAULT_REALTIME_CALL_SPEE
 import mc_frame_bindings as bindings
 
 
+def _unfinished_agy_answer(turn: dict) -> bool:
+    return turn.get("model") == AGY_MODEL_ID and turn.get("request_status") in ("pending", "unknown")
+
+
 class ChatHistoryMixin:
     def _migrate_legacy_state_if_needed(self) -> None:
         if self.state_path.exists():
@@ -287,7 +291,7 @@ class ChatHistoryMixin:
                 pass
         for role, kind, field in (("user", "question", "question"), ("assistant", "final", "answer_md")):
             text = str(turn.get(field) or "").strip()
-            if not text or (role == "assistant" and text == REQUESTING_TEXT):
+            if not text or (role == "assistant" and (text == REQUESTING_TEXT or _unfinished_agy_answer(turn))):
                 continue
             try:
                 message_id = store.resolve_canonical_message_by_turn(owner, role=role, turn_index=index)
@@ -446,7 +450,7 @@ class ChatHistoryMixin:
                 for role, kind, content_key in (("user", "question", "question"),
                                                 ("assistant", "final", "answer_md")):
                     content = str(turn.get(content_key) or "")
-                    if not content or (role == "assistant" and content == REQUESTING_TEXT):
+                    if not content or (role == "assistant" and (content == REQUESTING_TEXT or _unfinished_agy_answer(turn))):
                         continue
                     try:
                         message_id = store.resolve_canonical_message_by_turn(
@@ -1893,7 +1897,7 @@ class ChatHistoryMixin:
             return False
         metas = getattr(self, "answer_meta", []) or []
         index = self._latest_answer_message_row(metas) if include_question else next(
-            (i for i in range(len(metas) - 1, -1, -1) if metas[i][0] == "answer"), None
+            (i for i in range(len(metas) - 1, -1, -1) if metas[i][0] in {"answer", "partial_answer"}), None
         )
         if index is not None:
             try:

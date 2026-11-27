@@ -377,6 +377,8 @@ class AgySessionsMixin:
                 if not error and reason == "end_turn" and turn.get("agy_observed_message_id"):
                     turn["provider_message_id"] = turn["agy_observed_message_id"]
                 if result_unknown:
+                    if not reason and answer.strip():
+                        turn["agy_partial_answer_md"] = answer
                     current_chat["native_history_status"] = error
                     current_chat["native_unresolved_turn"] = {"index": turn_idx, "message": error}
                 self._invalidate_remote_state_cache()

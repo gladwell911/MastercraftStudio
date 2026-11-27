@@ -98,6 +98,7 @@ def test_known_agy_terminal_is_durable_before_reported(
     watch = wait_terminal(frame, agy_terminal, wait_for_wx_main_loop, expected)
     persisted, = reopened.load_turns(owner)
     assert persisted["request_status"] == expected
+    assert "agy_partial_answer_md" not in persisted
     if reason == "end_turn":
         assert watch["answer"] == persisted["answer_md"] == "synthetic verified result"
     else:
@@ -163,6 +164,8 @@ def test_agy_retries_a_write_without_resending_prompt(
     assert (tmp_path / "prompt-count.txt").read_text(encoding="utf-8").splitlines() == ["prompt"]
     if failures == 2:
         assert "本地保存未确认" in watch["message"]
+        _, turns, _ = frame._chat_target_for_request(agy_terminal["chat_id"])
+        assert "agy_partial_answer_md" not in turns[0]
         assert frame.chat_store.readable_answer(agy_terminal["chat_id"], turn_index=0) is None
 
 

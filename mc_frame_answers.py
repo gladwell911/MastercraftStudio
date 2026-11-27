@@ -30,6 +30,18 @@ from pathlib import Path
 import mc_frame_bindings as bindings
 
 
+PARTIAL_ANSWER_TITLE = "部分回答（结果未知）"
+PARTIAL_ANSWER_LABEL = f"{PARTIAL_ANSWER_TITLE}，按 Enter 查看"
+
+
+def _agy_partial_answer_text(turn: dict) -> str:
+    if turn.get("model") == AGY_MODEL_ID and turn.get("request_status") == "unknown":
+        text = turn.get("agy_partial_answer_md")
+        if isinstance(text, str) and text.strip():
+            return text
+    return ""
+
+
 class AnswersMixin:
     def _selected_answer_source_text(self) -> str:
         if getattr(self, "_chat_navigation_answer_rows_deferred", False):
@@ -47,6 +59,9 @@ class AnswersMixin:
         return str(turn.get("answer_md") or detail or plain or "")
 
     def _show_answer_menu(self) -> None:
+        idx = self.answer_list.GetSelection()
+        if 0 <= idx < len(self.answer_meta) and self.answer_meta[idx][0] == "partial_answer":
+            return
         menu = wx.Menu()
         extract_id = wx.NewIdRef()
         menu.Append(int(extract_id), "提取文件")
@@ -162,7 +177,9 @@ class AnswersMixin:
             roles = []
             if str(turn.get("question") or "").strip() or turn.get("attachments"):
                 roles.append("user")
-            if (raw != REQUESTING_TEXT and not (turn.get("suppress_empty_answer_row") and not raw.strip())) or turn.get("received_attachments"):
+            if (_agy_partial_answer_text(turn)
+                    or (raw != REQUESTING_TEXT and not (turn.get("suppress_empty_answer_row") and not raw.strip()))
+                    or turn.get("received_attachments")):
                 roles.append("assistant")
             for role in roles:
                 sequence = turn.get("answer_order" if role == "assistant" else "question_order")
@@ -199,7 +216,7 @@ class AnswersMixin:
         for row, meta in zip(content_rows, content_metas):
             if meta[0] == "time":
                 continue
-            role = "assistant" if meta[0] in {"ai", "answer"} else "user" if meta[0] in {"user", "question"} else (current[1] if current else "user")
+            role = "assistant" if meta[0] in {"ai", "answer", "partial_answer"} else "user" if meta[0] in {"user", "question"} else (current[1] if current else "user")
             key = (meta[1], role)
             if current != key:
                 groups.append([key, []])
@@ -233,7 +250,7 @@ class AnswersMixin:
                 index = meta[1]
                 if meta[0] in {"user", "question"}:
                     role = "user"
-                elif meta[0] in {"ai", "answer"}:
+                elif meta[0] in {"ai", "answer", "partial_answer"}:
                     role = "assistant"
                 key = (index, role)
                 if index >= 0 and key not in emitted:
@@ -281,7 +298,7 @@ class AnswersMixin:
             turn_idx = -1
         if kind == "time":
             return f"time:{turn_idx}:assistant" if len(meta) > 3 and meta[3] == "assistant" else f"time:{turn_idx}"
-        if kind in {"user", "question", "ai", "answer", "attachment"}:
+        if kind in {"user", "question", "ai", "answer", "partial_answer", "attachment"}:
             detail = str(meta[3] if len(meta) > 3 else "")
             if kind == "attachment":
                 return f"answer:{turn_idx}:attachment:{detail}"
@@ -345,7 +362,7 @@ class AnswersMixin:
     def _latest_answer_message_row(metas: list[tuple]) -> int | None:
         for index in range(len(metas) - 1, -1, -1):
             kind, _, body, markdown = metas[index]
-            if kind == "question" and str(body or "").strip():
+            if kind in {"question", "partial_answer"} and str(body or "").strip():
                 return index
             if (
                 kind == "answer"
@@ -408,13 +425,14 @@ class AnswersMixin:
         for i, t in visible_turns:
             q = str(t.get("question") or "")
             a_md, a = self._turn_answer_markdown(t)
+            partial = bool(_agy_partial_answer_text(t))
             attachments = t.get("attachments") if isinstance(t.get("attachments"), list) else []
             received_attachments = t.get("received_attachments") if isinstance(t.get("received_attachments"), list) else []
             suppress_empty_answer_row = bool(t.get("suppress_empty_answer_row")) and (not str(a_md or "").strip())
             attachment_only_summary = bool(attachments) and suppress_empty_answer_row and any(
                 token in q for token in ("上传成功", "已成功上传", "上传失败", "已部分上传")
             )
-            show_pending_placeholder = (a_md != REQUESTING_TEXT) and (not suppress_empty_answer_row)
+            show_pending_placeholder = partial or (a_md != REQUESTING_TEXT and not suppress_empty_answer_row)
             show_user_rows = bool(attachments) or not (
                 (is_openclaw_model(str(t.get("model") or "")) or is_codex_model(str(t.get("model") or "")) or is_claudecode_model(str(t.get("model") or "")))
                 and (not q.strip())
@@ -443,8 +461,12 @@ class AnswersMixin:
             if show_pending_placeholder:
                 rows.append("小诸葛")
                 metas.append(("ai", i, "小诸葛", ""))
-                rows.append(a)
-                metas.append(("answer", i, a, a_md))
+                if partial:
+                    rows.append(PARTIAL_ANSWER_LABEL)
+                    metas.append(("partial_answer", i, PARTIAL_ANSWER_LABEL, ""))
+                else:
+                    rows.append(a)
+                    metas.append(("answer", i, a, a_md))
                 for label, meta in self._turn_attachment_rows(i, received_attachments, incoming=True):
                     rows.append(label)
                     metas.append(meta)
@@ -1196,10 +1218,13 @@ class AnswersMixin:
         if idx == wx.NOT_FOUND or idx >= len(self.answer_meta):
             return None
         item_type, turn_idx, plain, detail = self.answer_meta[idx]
-        if item_type not in ("question", "answer"):
+        if item_type not in ("question", "answer", "partial_answer"):
             return None
         turns = self._get_view_turns()
         turn = turns[turn_idx] if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict) else {}
+        if item_type == "partial_answer":
+            text = _agy_partial_answer_text(turn)
+            return (PARTIAL_ANSWER_TITLE, text) if text else None
         if item_type == "question":
             source = str((turn or {}).get("question") or detail or plain or "")
             title = "回答详情"
@@ -1218,6 +1243,8 @@ class AnswersMixin:
         self, title: str, text: str, payload: AnswerViewerPayload | None = None,
         _answer_markdown: bool = False,
         _read_target: dict | None = None,
+        *,
+        preserve_leading_newlines: bool = False,
     ) -> bool:
         if bool(getattr(self, "_answer_viewer_open", False)):
             return False
@@ -1227,6 +1254,7 @@ class AnswersMixin:
             text,
             payload=payload,
             on_continue=self._continue_from_answer_text_viewer if payload is not None else None,
+            preserve_leading_newlines=preserve_leading_newlines,
         )
         self._answer_viewer_open = True
         self._active_answer_text_viewer = dlg
@@ -1272,6 +1300,8 @@ class AnswersMixin:
         if not content:
             return False
         title, text = content
+        if self.answer_meta[idx][0] == "partial_answer":
+            return self._open_answer_text_viewer(title, text, preserve_leading_newlines=True)
         payload = self._selected_answer_viewer_payload()
         return self._open_answer_text_viewer(title, text, payload, self.answer_meta[idx][0] == "answer", self._selected_read_target(idx))
 
@@ -1521,6 +1551,8 @@ class AnswersMixin:
                 wx.MessageBox("打开附件失败。", "提示", wx.OK | wx.ICON_WARNING)
                 return False
             return True
+        if item_type == "partial_answer":
+            return self._open_selected_answer_text_viewer()
         if item_type not in ("question", "answer"):
             return False
         turns = self._get_view_turns()

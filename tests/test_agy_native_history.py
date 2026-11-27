@@ -1,7 +1,11 @@
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
+import wx
+
+import main
 
 from agy_acp import AgyAcpClient
 from agy_history import _AgyReplay
@@ -262,6 +266,7 @@ def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
         "question": "first", "answer_md": "partial", "request_status": stored_status,
         "provider_user_message_id": "user1", "agy_native_turn_id": "turn1",
         "agy_observed_message_id": "answer1", "terminal_notification_pair": identity.pair_id,
+        **({"agy_partial_answer_md": "raw partial"} if stored_status == "unknown" else {}),
     }
     if mismatch == "session":
         stored["session_id"] = "other-session"
@@ -307,6 +312,11 @@ def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
     assert replay(with_successor=True) == expected
     assert store.load_chat_summary(owner)["native_history_status"] == ("" if affirmative and not mismatch else error)
     assert replay(with_successor=True) == expected
+    first = store.load_turns(owner)[0]
+    if stored_status == "unknown" and not (affirmative and not mismatch):
+        assert first["agy_partial_answer_md"] == "raw partial"
+    else:
+        assert "agy_partial_answer_md" not in first
     steps = store.load_execution_steps(owner, 0)
     assert [step["item_id"] for step in steps] == (
         ["tool:observed"] if mismatch else ["tool:observed", "tool:replay-only"]
@@ -315,9 +325,9 @@ def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
         assert steps[1]["status"] == tool_status
 
 
+@pytest.mark.parametrize("with_partial", [True, False])
 def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
-        frame, tmp_path, monkeypatch, wait_for_wx_main_loop):
-    from chat_store import ChatStore
+        frame, tmp_path, monkeypatch, wait_for_wx_main_loop, with_partial):
     from shared_terminal_routes import dispatch_terminal
 
     script = tmp_path / "agy_interrupted.py"
@@ -325,12 +335,18 @@ def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
         'update(session, "agent_message_chunk", content={"type": "text", "text": "same native context"})',
         r'''update(session, "user_message_chunk", turnId="native-turn", messageId="native-user",
                content={"type": "text", "text": "interrupted question"})
-        update(session, "agent_message_chunk", turnId="native-turn", messageId="native-part",
-               content={"type": "text", "text": "unfinished content"})
+        if os.environ["AGY_SEND_PARTIAL"] == "yes":
+            update(session, "agent_message_chunk", turnId="native-turn", messageId="native-part",
+                   content={"type": "text", "text": "\n\n unfinished content"})
+            while not Path("second-part").exists():
+                __import__("time").sleep(.01)
+            update(session, "agent_message_chunk", turnId="native-turn", messageId="native-part",
+                   content={"type": "text", "text": "\n\n  第二段 **原文**  "})
         while not Path("exit-provider").exists():
             __import__("time").sleep(.01)
         sys.exit(3)''',
     ), encoding="utf-8")
+    monkeypatch.setenv("AGY_SEND_PARTIAL", "yes" if with_partial else "no")
     trace = tmp_path / "trace.jsonl"
     source_path = tmp_path / "source.json"
     source_path.write_text(json.dumps({
@@ -357,18 +373,103 @@ def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
 
     try:
         wait_for_wx_main_loop(has_native_id, "durable AGY identity before EOF")
+        if with_partial:
+            (tmp_path / "second-part").touch()
+            wait_for_wx_main_loop(
+                lambda: any("第二段" in turn.get("answer_md", "") for turn in db.load_turns(owner)),
+                "second partial chunk saved before EOF",
+            )
+            saved_pending, = db.load_turns(owner)
+            assert saved_pending["request_status"] == "pending"
+            assert db.v2_writes_enabled
+            frame._mark_chat_turns_dirty(owner, 0)
+            with monkeypatch.context() as persistence:
+                persistence.setattr(frame, "_remote_nats_transport",
+                                    SimpleNamespace(protocol_version=2, subjects=SimpleNamespace(pair_id="default")))
+                frame._persist_dirty_chat_turns(db, owner, [saved_pending])
+            frame._persist_close_turn_facts(db, "default", owner, "Original AGY", 0, saved_pending)
+            events = [json.loads(row["payload"]) for row in db.pending_outbox(pair_id="default", domain="events")]
+            assert [event["body"]["kind"] for event in events if event["kind"] == "execution_entry"] == ["question"]
     finally:
         (tmp_path / "exit-provider").touch()
     wait_for_wx_main_loop(lambda: dispatch_terminal(frame, "watch", scope)[1].get("state") == "unknown",
                 "typed unknown AGY outcome")
-    frame._flush_chat_state_save()
-    stored, = db.load_turns(owner)
-    assert stored["agy_native_turn_id"] == "native-turn"
-    assert stored["provider_user_message_id"] == "native-user"
-    assert stored["agy_observed_message_id"] == "native-part"
-    assert not stored["answer_md"] and stored["request_recoverable"] is False
-    assert not db.pending_outbox(pair_id="default", lane="notification")
     assert dispatch_terminal(frame, "send", {**scope, "text": "interrupted question"})[0] == 200
     sent = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
             if json.loads(line)["method"] == "session/prompt"]
     assert len(sent) == 1
+    frame.Close()
+    wait_for_wx_main_loop(lambda: getattr(frame, "_close_complete", False), "graceful partial save")
+    db = ChatStore(db.db_path)
+    stored, = db.load_turns(owner)
+    assert stored["agy_native_turn_id"] == "native-turn"
+    assert stored["provider_user_message_id"] == "native-user"
+    assert stored["request_status"] == "unknown"
+    assert not stored["answer_md"] and stored["request_recoverable"] is False
+    expected_text = "\n\n unfinished content\n\n  第二段 **原文**  "
+    if with_partial:
+        assert stored["agy_observed_message_id"] == "native-part"
+        assert stored["agy_partial_answer_md"] == expected_text
+    else:
+        assert "agy_partial_answer_md" not in stored
+    assert not db.pending_outbox(pair_id="default", lane="notification")
+    assert db.readable_answer(owner, turn_index=0) is None
+
+    db.upsert_chat({"id": "unrelated", "title": "Unrelated"})
+    reopened = main.ChatFrame()
+    reopened.Hide()
+    try:
+        assert reopened._show_history_chat("unrelated", focus_answer_list=False)
+        assert not any(row[0] == "partial_answer" for row in reopened.answer_meta)
+        assert reopened._show_history_chat(owner, focus_answer_list=False)
+        rows = [index for index, row in enumerate(reopened.answer_meta) if row[0] == "partial_answer"]
+        if not with_partial:
+            assert not rows
+            return
+        index, = rows
+        assert reopened.answer_list.GetString(index) == "部分回答（结果未知），按 Enter 查看"
+        reopened.answer_list.SetSelection(index)
+        assert reopened._selected_read_target() is None
+        assert reopened._selected_answer_viewer_payload() is None
+        assert reopened._selected_answer_source_text() == ""
+        viewed = []
+
+        def observe_viewer(dialog):
+            dialog.Show()
+            viewed.append((dialog.GetTitle(), dialog.text_ctrl.GetValue(),
+                           dialog._scratch_copy_text(), dialog.payload))
+            return wx.ID_CLOSE
+
+        monkeypatch.setattr(main.AnswerTextViewerDialog, "ShowModal", observe_viewer)
+        activation = wx.CommandEvent(wx.wxEVT_LISTBOX_DCLICK, reopened.answer_list.GetId())
+        activation.SetEventObject(reopened.answer_list)
+        reopened.answer_list.GetEventHandler().ProcessEvent(activation)
+        reopened._on_answer_key_down(SimpleNamespace(GetKeyCode=lambda: wx.WXK_RETURN,
+                                                       Skip=lambda: None))
+        assert viewed == [("部分回答（结果未知）", "\n" + expected_text, expected_text, None)] * 2
+        assert db.readable_answer(owner, turn_index=0) is None
+        status, response = reopened._remote_api_history_read_ui({"chat_id": owner})
+        assert status == 200
+        assert "agy_partial_answer_md" not in json.dumps(response, ensure_ascii=False)
+        assert "第二段" not in json.dumps(response, ensure_ascii=False)
+    finally:
+        reopened.Close()
+        wait_for_wx_main_loop(lambda: getattr(reopened, "_close_complete", False), "reloaded frame close")
+
+
+
+def test_open_history_selects_latest_partial_answer_without_reading_an_older_final(frame):
+    owner = "partial-following-final"
+    frame.chat_store.upsert_chat({"id": owner, "title": "Two AGY turns", "model": "agy/main"})
+    frame.chat_store.replace_turns(owner, [
+        {"model": "agy/main", "question": "First question", "answer_md": "Older final",
+         "request_status": "done"},
+        {"model": "agy/main", "question": "Second question", "answer_md": "",
+         "request_status": "unknown", "agy_partial_answer_md": "Newest partial"},
+    ])
+    frame.archived_chats.append(frame.chat_store.load_chat_summary(owner))
+    assert frame._show_history_chat(owner)
+    selected = frame.answer_meta[frame.answer_list.GetSelection()]
+    assert selected[:2] == ("partial_answer", 1)
+    assert frame.chat_store.get_chat_read_state(owner)["latest_readable_seq"] > 0
+    assert frame.chat_store.get_chat_read_state(owner)["read_seq"] == 0

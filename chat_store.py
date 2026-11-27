@@ -822,6 +822,8 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                                                 provider_message_id=new["provider_message_id"])
                         if new.get("answer_at"):
                             recovered[index]["answer_at"] = new["answer_at"]
+                        if snapshot.identity.provider == "agy":
+                            recovered[index].pop("agy_partial_answer_md", None)
                     elif (snapshot.identity.provider == "agy" and old.get("request_status") in
                           {"unknown", "cancelled", "failed"} and self._agy_replay_matches(snapshot.identity, old, new)
                           and new.get("agy_replay_followed")):
