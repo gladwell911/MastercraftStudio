@@ -13,6 +13,7 @@ from agy_acp import (
     read_prompt_attachments, selected_options, validate_workspace,
 )
 from agy_execution import AgyExecution, interaction_questions, interaction_result
+from agy_information import agy_context_tokens, agy_usage_owner
 
 
 from native_history import NativeSessionIdentity
@@ -291,6 +292,8 @@ class AgySessionsMixin:
         pair_id = self._read_pair_id()
         submitted_turn = dict(turn)
         observed_ids = {}
+        context = None
+        usage_owner = agy_usage_owner(chat)
         client = self._agy_clients.get(chat_id)
         full = []
         batch = []
@@ -315,9 +318,12 @@ class AgySessionsMixin:
                     timer.start()
 
         def on_update(update):
+            nonlocal context
             if not isinstance(update, dict):
                 return
             kind = update.get("sessionUpdate")
+            if kind == "usage_update":
+                context = agy_context_tokens(update) or context
             native_ids = {}
             turn_id, message_id = update.get("turnId"), update.get("messageId")
             if isinstance(turn_id, str) and turn_id and kind in {
@@ -374,6 +380,13 @@ class AgySessionsMixin:
                 elif reason != "end_turn" and not error:
                     error = f"AGY 回合已结束：{reason or '缺少终态'}"
                 turn = current_turns[turn_idx]
+                if terminal:
+                    turn.update({key: terminal[key] for key in (
+                        "agy_usage_owner", "agy_context_tokens", "agy_prompt_usage", "agy_usage_partial",
+                    ) if key in terminal})
+                elif reason and run.prompt is not None:
+                    turn.update(agy_usage_owner=usage_owner, agy_prompt_usage=run.prompt.usage,
+                                agy_usage_partial=run.prompt.request_count > 1)
                 if not error and reason == "end_turn" and turn.get("agy_observed_message_id"):
                     turn["provider_message_id"] = turn["agy_observed_message_id"]
                 if result_unknown:
@@ -383,6 +396,7 @@ class AgySessionsMixin:
                     current_chat["native_unresolved_turn"] = {"index": turn_idx, "message": error}
                 self._invalidate_remote_state_cache()
                 self._on_done(turn_idx, answer, error, model, "", chat_id, result_unknown=result_unknown)
+                self._refresh_agy_chat_information(current_chat)
                 if error and self._visible_clear_owner() == chat_id:
                     self.SetStatusText(error)
 
@@ -421,9 +435,13 @@ class AgySessionsMixin:
                 )
                 reason = run.prompt.wait()
                 if reason in ("end_turn", "cancelled"):
+                    statistics = {"agy_usage_owner": usage_owner, "agy_prompt_usage": run.prompt.usage,
+                                  "agy_usage_partial": run.prompt.request_count > 1}
+                    if context is not None:
+                        statistics["agy_context_tokens"] = context
                     terminal = self._commit_agy_terminal(
                         store, chat_id, run, durable_scope, revision,
-                        submitted_turn, observed_ids, "".join(full), reason, pair_id,
+                        submitted_turn, observed_ids, "".join(full), reason, pair_id, statistics,
                     )
             except AgyError as exc:
                 result_unknown = isinstance(exc, AgyResultUnknown)
@@ -475,13 +493,15 @@ class AgySessionsMixin:
             self._render_answer_list()
             self.SetStatusText("原聊天已变更，请查看已保存的记录。")
 
-    def _commit_agy_terminal(self, store, chat_id, run, scope, revision, turn, native_ids, answer, reason, pair_id):
+    def _commit_agy_terminal(self, store, chat_id, run, scope, revision, turn, native_ids, answer, reason, pair_id,
+                             statistics):
         cancelled = reason == "cancelled"
         error = "AGY 回合已停止。" if cancelled else ""
         terminal = dict(native_ids, agy_native_terminal_reason=reason, terminal_notification_pair=pair_id,
                         request_status="cancelled" if cancelled else "done",
                         request_error=error, request_recovered_after_restart=False,
                         answer_md=error if cancelled else (answer if answer.strip() else "未返回任何内容。"))
+        terminal.update(statistics)
         if not cancelled:
             terminal["answer_at"] = time.time()
             if native_ids.get("agy_observed_message_id"):
@@ -515,18 +535,27 @@ class AgySessionsMixin:
         delta = "".join(value for kind, value in batch if kind == "delta")
         steps = {}
         native_ids = {}
+        context = None
         for kind, value in batch:
             if kind == "interaction":
                 self._receive_agy_interaction(chat_id, run, *value)
             elif kind == "native_ids":
                 native_ids.update(value)
-            elif kind == "update" and (step := run.execution.step(value)):
-                steps[step[0]] = step
+            elif kind == "update":
+                if value.get("sessionUpdate") == "usage_update":
+                    context = agy_context_tokens(value) or context
+                if step := run.execution.step(value):
+                    steps[step[0]] = step
         turn = turns[run.turn_idx]
-        if any(turn.get(key) != value for key, value in native_ids.items()):
-            turn.update(native_ids)
+        changes = dict(native_ids)
+        if context is not None:
+            changes.update(agy_usage_owner=agy_usage_owner(chat), agy_context_tokens=context)
+        if any(turn.get(key) != value for key, value in changes.items()):
+            turn.update(changes)
             self._mark_chat_turns_dirty(chat_id, run.turn_idx)
             self._defer_chat_state_save()
+            if context is not None:
+                self._refresh_agy_chat_information(chat)
         for step in steps.values():
             self._append_agy_step(chat_id, run, *step)
         if delta:

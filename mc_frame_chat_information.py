@@ -3,6 +3,8 @@
 import logging
 import math
 import wx
+from agy_acp import AGY_MODEL_ID
+from agy_information import agy_quota_rows, agy_session_rows, read_agy_quota
 from chat_information import ChatInformationSubscriptions, format_quota_reset_time
 from claudecode_client import is_claudecode_model
 from codex_client import codex_model_label_for_model, is_codex_model
@@ -29,7 +31,7 @@ class ChatInformationMixin:
             return None
         turn_owner = chat if self.view_mode == "history" else {**chat, "turns": self.active_session_turns}
         model = self._model_for_chat_selection(turn_owner) or bindings.app.normalize_model_id(self.selected_model, default="")
-        if not (is_codex_model(model) or is_kimi_model(model)):
+        if not (is_codex_model(model) or is_kimi_model(model) or model == AGY_MODEL_ID):
             return None
         return chat, model
 
@@ -53,6 +55,9 @@ class ChatInformationMixin:
         return self._information_subscriptions().command(payload)
 
     def _chat_information_identity(self, chat: dict, model: str) -> tuple[str, str, str, str]:
+        if model == AGY_MODEL_ID:
+            return (str(chat.get("id") or ""), model, self._agy_session_id_for_chat(chat),
+                    str(chat.get("native_account") or chat.get("agy_native_owner") or ""))
         native_id = self._codex_thread_id_for_chat(chat) if is_codex_model(model) else self._kimi_session_id_for_chat(chat)
         account_id = str(chat.get("codex_account_id") or "").strip() if is_codex_model(model) else ""
         return (str(chat.get("id") or ""), model, native_id, account_id)
@@ -69,6 +74,13 @@ class ChatInformationMixin:
         event.Skip()
 
     def _chat_information_rows(self, chat: dict, model: str) -> list[str]:
+        if model == AGY_MODEL_ID:
+            turns = self.active_session_turns if chat is self._current_chat_state else chat.get("turns") or []
+            dialog = self._chat_information_dialog
+            scope = (self._chat_information_identity(chat, model), self._read_pair_id())
+            result = (getattr(dialog, "agy_quota_result", None)
+                      if dialog is not None and getattr(dialog, "agy_quota_scope", None) == scope else None)
+            return agy_session_rows(chat, turns) + agy_quota_rows(result)
         self._validate_information_cache_owner(chat, "codex" if is_codex_model(model) else "kimi")
         usage = context_usage_from_dict(chat.get("context_usage"))
         turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
@@ -231,7 +243,48 @@ class ChatInformationMixin:
         elif is_kimi_model(model):
             self._request_kimi_chat_information(chat, model, visible_only=True)
             self._request_kimi_quota(chat, model)
+        elif model == AGY_MODEL_ID:
+            self._request_agy_quota(chat)
         return True
+
+    def _refresh_agy_chat_information(self, chat: dict) -> None:
+        dialog = self._chat_information_dialog
+        owner = self._visible_chat_information_owner()
+        if (dialog is not None and not dialog.IsBeingDeleted()
+                and owner is not None and owner[0] is chat
+                and dialog.identity == self._chat_information_identity(*owner)):
+            dialog.set_rows(self._chat_information_rows(chat, AGY_MODEL_ID))
+
+    def _request_agy_quota(self, chat: dict) -> None:
+        dialog = self._chat_information_dialog
+        identity = self._chat_information_identity(chat, AGY_MODEL_ID)
+        pair_id = self._read_pair_id()
+        scope = (identity, pair_id)
+        if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
+                or (getattr(dialog, "agy_quota_request", None) is not None
+                    and getattr(dialog, "agy_quota_scope", None) == scope)):
+            return
+        request = dialog.agy_quota_request = object()
+        dialog.agy_quota_scope = scope
+        dialog.agy_quota_result = None
+        self._refresh_agy_chat_information(chat)
+
+        def apply(result):
+            if (self._chat_information_dialog is not dialog or dialog.IsBeingDeleted()
+                    or dialog.agy_quota_request is not request):
+                return
+            dialog.agy_quota_request = None
+            owner = self._visible_chat_information_owner()
+            if (owner is None or self._chat_information_identity(*owner) != identity
+                    or dialog.identity != identity or self._read_pair_id() != pair_id):
+                return
+            dialog.agy_quota_result = result
+            self._refresh_agy_chat_information(owner[0])
+
+        def read():
+            self._call_after_if_alive(apply, read_agy_quota())
+
+        bindings.app.threading.Thread(target=read, daemon=True, name="agy-chat-quota").start()
 
     def _request_codex_chat_information(self, chat: dict, model: str, *, context_only: bool = False) -> None:
         scoped = getattr(self, "_scoped_chat_information", None)
@@ -938,7 +991,7 @@ class ChatInformationMixin:
 
     def _answer_usage_header_label(self) -> str:
         owner = self._visible_chat_information_owner()
-        if owner is None:
+        if owner is None or owner[1] == AGY_MODEL_ID:
             return format_context_usage_label(self._active_chat_context_usage())
         return format_session_total_tokens(self._session_total_tokens(*owner))
 
@@ -950,7 +1003,8 @@ class ChatInformationMixin:
         return native_token_count(chat.get(f"{provider}_session_total_tokens"))
 
     def _should_show_context_usage_row(self, label: str | None = None, turns: list[dict] | None = None) -> bool:
-        if self._visible_chat_information_owner() is not None:
+        owner = self._visible_chat_information_owner()
+        if owner is not None and owner[1] != AGY_MODEL_ID:
             return True
         usage_label = str(label if label is not None else format_context_usage_label(self._active_chat_context_usage()) or "")
         if usage_label != "暂无":

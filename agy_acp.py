@@ -98,6 +98,8 @@ class AgyPrompt:
     request_ids: list[int] = field(default_factory=list)
     pending: dict = field(default_factory=dict)
     cancelling: bool = False
+    usage: dict = field(default_factory=dict)
+    request_count: int = 0
 
     def wait(self) -> str:
         try:
@@ -347,6 +349,14 @@ class AgyAcpClient:
         result = payload.get("result")
         reason = result.get("stopReason") if isinstance(result, dict) else None
         if isinstance(reason, str) and reason:
+            usage = result.get("usage")
+            if isinstance(usage, dict):
+                turn.usage = {
+                    key: usage[key] for key in (
+                        "inputTokens", "outputTokens", "cachedReadTokens",
+                        "cachedWriteTokens", "thoughtTokens", "totalTokens",
+                    ) if type(usage.get(key)) is int and usage[key] >= 0
+                }
             turn.completion.set_result(reason)
         else:
             turn.completion.set_exception(AgyResultUnknown("AGY 没有返回原生终态，回合结果未知，请检查原会话。"))
@@ -468,6 +478,7 @@ class AgyAcpClient:
             "sessionId": self.session_id, "prompt": prompt,
         }})
         turn.request_ids.append(request_id)
+        turn.request_count += 1
 
     def steer_prompt(self, turn, question) -> bool:
         with self._lock:

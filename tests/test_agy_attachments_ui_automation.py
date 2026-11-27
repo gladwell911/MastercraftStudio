@@ -73,6 +73,11 @@ for line in sys.stdin:
         else:
             update("agent_message_chunk", content={"type": "text", "text": "Received"})
         result = {"stopReason": "end_turn"}
+        if params["prompt"][0].get("text") == "execution probe":
+            result["usage"] = {"inputTokens": 90, "outputTokens": 21, "cachedReadTokens": 43,
+                               "cachedWriteTokens": 0, "thoughtTokens": 9, "totalTokens": 120}
+        elif params["prompt"][0].get("text") == "usage second turn":
+            result["usage"] = {"cachedReadTokens": 0, "totalTokens": 17}
     print(json.dumps({"id": request_id, "result": result}), flush=True)
 """, encoding="utf-8")
     monkeypatch.setenv("MC_AGY_EXECUTABLE", sys._base_executable)
@@ -82,6 +87,105 @@ for line in sys.stdin:
     monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *args: None)
     monkeypatch.setattr(frame, "_schedule_async_archive_rename", lambda *args: None)
     return tmp_path / "prompts.jsonl"
+
+
+def test_agy_chat_information_reads_and_reopens_provider_usage(
+    frame, tmp_path, wx_app, wait_for_wx, agy_attachment_runtime, monkeypatch,
+):
+    import mc_frame_chat_information
+
+    monkeypatch.setattr(mc_frame_chat_information, "read_agy_quota", lambda: ("未登录", {}, 0))
+    (tmp_path / "finish-execution").touch()
+    status, first = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
+    assert status == 200, first
+    assert frame._switch_current_chat(first["chat_id"])
+    frame.input_edit.ChangeValue("execution probe")
+    assert frame._on_send_clicked(None)
+    wait_for_wx(lambda: any(turn.get("request_status") == "done" for turn in frame.active_session_turns),
+                "settled AGY turn")
+
+    def open_information():
+        event = wx.CommandEvent(wx.EVT_MENU.typeId, int(frame._chat_information_menu_id))
+        frame.ProcessWindowEvent(event)
+        wx_app.Yield()
+        return frame._chat_information_dialog
+
+    expected = [
+        "当前上下文：145 / 2,048 token",
+        "会话累计 token：120",
+        "当前缓存命中：43 token",
+        "累计缓存命中：43 token",
+    ]
+    dialog = open_information()
+    assert list(dialog.information_list.GetStrings())[:4] == expected
+    dialog.Close()
+    wx_app.Yield()
+    frame.input_edit.ChangeValue("usage second turn")
+    assert frame._on_send_clicked(None)
+    wait_for_wx(lambda: len(frame.active_session_turns) == 2
+                and frame.active_session_turns[1].get("request_status") == "done", "second settled AGY turn")
+    expected[1:3] = ["会话累计 token：137", "当前缓存命中：0 token"]
+    status, second = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
+    assert status == 200, second
+    assert frame._switch_current_chat(second["chat_id"])
+    dialog = open_information()
+    assert list(dialog.information_list.GetStrings())[:4] == [
+        "当前上下文：暂不可用", "会话累计 token：暂不可用",
+        "当前缓存命中：暂不可用", "累计缓存命中：暂不可用",
+    ]
+    dialog.Close()
+    wx_app.Yield()
+    frame._flush_chat_state_save()
+    archived = frame._find_archived_chat(first["chat_id"])
+    archived.pop("turns", None)
+    assert frame._show_history_chat(first["chat_id"])
+    dialog = open_information()
+    assert list(dialog.information_list.GetStrings())[:4] == expected
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_agy_quota_late_result_cannot_replace_other_chat_or_steal_focus(
+    frame, tmp_path, wx_app, wait_for_wx, agy_attachment_runtime, monkeypatch,
+):
+    import time
+    import mc_frame_chat_information
+
+    first_started = threading.Event()
+    first_ready = threading.Event()
+    first_finished = threading.Event()
+
+    def read_quota():
+        if not first_started.is_set():
+            first_started.set()
+            first_ready.wait(5)
+            first_finished.set()
+            return "", {"周限额": ("93%", None)}, time.monotonic()
+        return "未登录", {}, time.monotonic()
+
+    monkeypatch.setattr(mc_frame_chat_information, "read_agy_quota", read_quota)
+    frame.Show()
+    status, first = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
+    assert status == 200, first
+    assert frame._show_chat_information()
+    first_dialog = frame._chat_information_dialog
+    assert first_started.wait(2)
+    first_dialog.Close()
+    wx_app.Yield()
+    status, second = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
+    assert status == 200, second
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    dialog.information_list.SetSelection(3)
+    wait_for_wx(lambda: "周限额：未登录" in dialog.information_list.GetStrings(), "new account status")
+    assert dialog.information_list.GetSelection() == 3
+    assert wx.Window.FindFocus() == dialog.information_list
+    first_ready.set()
+    assert first_finished.wait(2)
+    wx_app.Yield()
+    assert "周限额：未登录" in dialog.information_list.GetStrings()
+    dialog.Close()
+    wx_app.Yield()
 
 
 @pytest.mark.parametrize("supports_image", [True, False])

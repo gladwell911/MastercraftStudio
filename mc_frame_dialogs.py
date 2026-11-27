@@ -3,6 +3,7 @@
 import wx
 
 import mc_frame_bindings as bindings
+from agy_acp import AGY_MODEL_ID
 from codex_client import is_codex_model
 from dataclasses import dataclass
 from kimi_server_client import is_kimi_model
@@ -650,6 +651,8 @@ class ChatInformationDialog(wx.Dialog):
             self.owner._request_codex_chat_information(chat, model, context_only=True)
         elif is_kimi_model(model):
             self.owner._request_kimi_chat_information(chat, model, visible_only=True, context_only=True)
+        elif model == AGY_MODEL_ID:
+            self.owner._refresh_agy_chat_information(chat)
 
     def _on_refresh_timer(self, _event) -> None:
         current = self.owner._visible_chat_information_owner()
@@ -668,6 +671,8 @@ class ChatInformationDialog(wx.Dialog):
             if self.identity[2]:
                 self.owner._request_kimi_chat_information(chat, model, visible_only=True)
             self.owner._request_kimi_quota(chat, model)
+        elif model == AGY_MODEL_ID:
+            self.owner._request_agy_quota(chat)
 
     def set_rows(self, rows: list[str]) -> None:
         if list(self.information_list.GetStrings()) == rows:
