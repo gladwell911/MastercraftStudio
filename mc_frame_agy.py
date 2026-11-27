@@ -2,11 +2,13 @@
 
 from dataclasses import dataclass, field
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
 
 import wx
+import agy_settings
 
 from agy_acp import (
     AGY_MODEL_ID, AgyAcpClient, AgyError, AgyResultUnknown, find_agy_executable,
@@ -14,6 +16,7 @@ from agy_acp import (
 )
 from agy_execution import AgyExecution, interaction_questions, interaction_result
 from agy_information import agy_context_tokens, agy_usage_owner
+from mc_frame_tool_settings import EFFORT_NAMES
 
 
 from native_history import NativeSessionIdentity
@@ -28,6 +31,7 @@ class AgyRun:
     turn_idx: int
     owns_turn: object
     scope: tuple
+    settings: dict | None = None
     turn_id: str = field(default_factory=lambda: "agy-" + uuid.uuid4().hex)
     action_id: str = ""
     client: AgyAcpClient | None = None
@@ -155,18 +159,60 @@ class AgySessionsMixin:
         self.chat_store.set_meta(self._agy_workspace_preference_key(), cwd)
         self._agy_clients[chat_id] = client
 
-    def _choose_agy_workspace(self, title: str, title_manual: bool) -> bool:
+    def _agy_tool_settings_options(self):
+        chat = self._visible_codex_speed_chat()
+        options = chat.get("agy_options") or getattr(self, "_agy_settings_catalog", ())
+        return agy_settings.control_options(options, EFFORT_NAMES)
+
+    def _request_agy_settings_catalog(self):
+        if getattr(self, "_agy_settings_catalog", None) or getattr(self, "_agy_catalog_pending", False):
+            return
+        executable = find_agy_executable()
+        if not executable:
+            return
+        self._agy_catalog_pending = True
+
+        def finish(options, error):
+            self._agy_catalog_pending = False
+            if getattr(self, "_agy_settings_catalog", None):
+                return
+            self._agy_settings_catalog = options
+            if self._current_tool() == "agy":
+                if error:
+                    self.SetStatusText(f"无法读取 AGY 模型目录：{error}")
+                else:
+                    self._refresh_tool_setting_choices({key: value for key, value in self._pending_tool_settings().items()
+                                                        if value})
+
+        def read():
+            try:
+                options = agy_settings.read_models(executable, EFFORT_NAMES)
+            except (OSError, subprocess.SubprocessError, AgyError) as exc:
+                self._call_after_if_alive(finish, [], str(exc))
+            else:
+                self._call_after_if_alive(finish, options, "")
+
+        threading.Thread(target=read, name="agy-models", daemon=True).start()
+
+    def _agy_config_for_tool_settings(self, options, settings):
+        return agy_settings.native_config(options, settings, EFFORT_NAMES)
+
+    @staticmethod
+    def _agy_prior_tool_settings(chat):
+        if not chat or chat.get("agy_desktop_settings"):
+            return {}
+        config = chat.get("agy_config") or {}
+        return {agy_settings.FIELDS[option["category"]]: config.get(option["id"], option["current"])
+                for option in chat.get("agy_options") or () if option["category"] in agy_settings.FIELDS}
+
+    def _start_desktop_agy_chat(self, title: str, title_manual: bool) -> bool:
         if self._agy_new_chat_pending:
             return False
         if not find_agy_executable():
             self.SetStatusText("此电脑尚未安装 AGY，请安装或设置 MC_AGY_EXECUTABLE")
             return False
-        descriptor = self._agy_workspace_descriptor()
-        with wx.DirDialog(self, "选择 AGY 项目目录", defaultPath=descriptor["cwd"],
-                          style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST) as dialog:
-            if dialog.ShowModal() != wx.ID_OK:
-                return False
-            cwd = dialog.GetPath()
+        cwd = self._workspace_dir_for_codex()
+        prior = self._visible_clear_owner()
         self._agy_new_chat_pending = True
         self.SetStatusText("正在打开 AGY 项目")
 
@@ -178,15 +224,23 @@ class AgySessionsMixin:
             client, fields = result
             committed = False
             try:
-                fields["agy_config"] = self._choose_agy_configuration(fields["agy_options"])
-                if fields["agy_config"] is None:
+                if self._visible_clear_owner() != prior or self._current_tool() != "agy":
                     return
+                settings = {key: value for key, value in self._pending_tool_settings().items() if value}
+                self._agy_settings_catalog = fields["agy_options"]
+                fields["agy_desktop_settings"] = True
                 committed = self._on_new_chat_clicked(None, title=title, title_manual=title_manual,
                                                       agy_workspace=fields)
                 if committed:
                     cwd = fields["agy_workspace"]
                     self._remember_agy_workspace(client, self.active_chat_id, cwd)
-                    self.SetStatusText(f"已开始 AGY 聊天，项目目录：{cwd}")
+                    self._refresh_tool_setting_choices(settings)
+                    try:
+                        self._agy_config_for_tool_settings(fields["agy_options"], settings)
+                    except AgyError as exc:
+                        self.SetStatusText(str(exc))
+                    else:
+                        self.SetStatusText(f"已开始 AGY 聊天，项目目录：{cwd}")
             finally:
                 if not committed:
                     client.close()
@@ -203,30 +257,6 @@ class AgySessionsMixin:
         threading.Thread(target=prepare, name="agy-new-chat", daemon=True).start()
         return True
 
-    def _choose_agy_configuration(self, options: list) -> dict | None:
-        if not options:
-            return {}
-        choices = []
-        with wx.Dialog(self, title="AGY 会话配置") as dialog:
-            layout = wx.BoxSizer(wx.VERTICAL)
-            for field in options:
-                layout.Add(wx.StaticText(dialog, label=field["label"]), 0, wx.ALL, 5)
-                selection = wx.Choice(dialog, choices=[value["label"] for value in field["options"]])
-                selection.SetName(field["label"])
-                values = [value["value"] for value in field["options"]]
-                if field["current"] in values:
-                    selection.SetSelection(values.index(field["current"]))
-                layout.Add(selection, 0, wx.EXPAND | wx.ALL, 5)
-                choices.append((field, selection))
-            layout.Add(dialog.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL), 0, wx.EXPAND | wx.ALL, 10)
-            dialog.SetSizerAndFit(layout)
-            choices[0][1].SetFocus()
-            if dialog.ShowModal() != wx.ID_OK:
-                return None
-            return {field["id"]: field["options"][choice.GetSelection()]["value"]
-                    for field, choice in choices if choice.GetSelection() != wx.NOT_FOUND
-                    and field["options"][choice.GetSelection()]["value"] != field["current"]}
-
     def _remote_api_agy_configure_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "")
         chat, turns, _ = self._chat_target_for_request(chat_id)
@@ -242,15 +272,53 @@ class AgySessionsMixin:
         self.chat_store.upsert_chat(chat)
         return 200, {"accepted": True, "chat_id": chat_id}
 
-    def _validate_agy_submission(self, chat: dict) -> str:
+    def _validate_agy_submission(self, chat: dict, *, queued=False) -> str:
         chat_id = str(chat.get("id") or "")
         if chat_id in self._native_history_reserved:
             raise AgyError("此 AGY 聊天正在更新原生历史，请稍后重试")
-        if chat_id in self._agy_busy:
+        if not queued and chat_id in self._agy_busy:
             raise AgyError("此 AGY 聊天正在执行，请等待当前回答完成")
         if not chat.get("agy_session_id"):
-            raise AgyError("请先为 AGY 新建聊天并选择项目目录")
+            raise AgyError("请先新建 AGY 聊天")
         return validate_workspace(str(chat.get("agy_workspace") or ""))
+
+    def _agy_desktop_submission(self, chat, turns, settings):
+        options = chat.get("agy_options") or []
+        categories = {option["category"] for option in options}
+        if not chat.get("agy_desktop_settings") and not agy_settings.FIELDS.keys() <= categories:
+            return None, False
+        self._agy_config_for_tool_settings(options, settings)
+        run = self._agy_run_for_chat(chat)
+        previous = run.settings if run and run.settings is not None else self._agy_prior_tool_settings(chat)
+        agy_turns = [turn for turn in turns if isinstance(turn, dict) and turn.get("model") == AGY_MODEL_ID]
+        queued = bool(agy_turns and agy_turns[-1].get("request_status") == "queued")
+        if queued and not run:
+            previous_turn = next((turn for turn in reversed(agy_turns) if turn.get("request_status") != "queued"), {})
+            if previous_turn.get("request_status") in {"pending", "running", "unknown"}:
+                raise AgyError("原 AGY 回合的结果待确认，已排队的问题保留。请先同步原生历史。")
+        changed = any(settings.get(key) != previous.get(key) for key in ("model", "effort"))
+        return settings, queued or bool(run and changed)
+
+    def _launch_next_agy_tool_turn(self, chat_id):
+        chat, turns, current = self._chat_target_for_request(chat_id)
+        if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
+                or chat_id in self._agy_busy):
+            return
+        for index, turn in enumerate(turns):
+            if turn.get("model") != AGY_MODEL_ID or turn.get("request_status") != "queued":
+                continue
+            turn["request_status"] = "pending"
+            self._mark_chat_turns_dirty(chat_id, index)
+            if current:
+                self.is_running = True
+                self._active_request_count = 1
+                self.SetStatusText("正在发送排队的问题")
+            try:
+                self._start_agy_worker_for_turn(chat_id, index, turn["request_question"], AGY_MODEL_ID)
+            except (AgyError, RuntimeError) as exc:
+                self._on_done(index, "", str(exc), AGY_MODEL_ID, "", chat_id)
+            self._defer_chat_state_save()
+            return
 
     def _agy_attachment_context(self, chat, turns):
         cwd = self._validate_agy_submission(chat)
@@ -280,9 +348,11 @@ class AgySessionsMixin:
         options = chat.get("agy_options") or []
         config = dict(chat.get("agy_config") or {})
         turn = turns[turn_idx]
+        settings = turn.get("tool_settings")
         turn["request_recoverable"] = False
         turn["request_resume_token"] = {"session_id": session_id}
-        run = AgyRun(turn_idx, self._bind_provider_turn(chat_id, turn_idx), self._agy_chat_scope(chat))
+        run = AgyRun(turn_idx, self._bind_provider_turn(chat_id, turn_idx), self._agy_chat_scope(chat),
+                     settings or self._agy_prior_tool_settings(chat))
         if prepared_attachments is not None:
             prepared_attachments.adopt(run.scope)
         self._agy_busy[chat_id] = run
@@ -399,6 +469,8 @@ class AgySessionsMixin:
                 self._refresh_agy_chat_information(current_chat)
                 if error and self._visible_clear_owner() == chat_id:
                     self.SetStatusText(error)
+                if not result_unknown:
+                    self._launch_next_agy_tool_turn(chat_id)
 
         def work():
             active_client = prepared_attachments.client if prepared_attachments is not None else client
@@ -426,12 +498,19 @@ class AgySessionsMixin:
                     active_client.check_original_session_busy(session_id)
                 run.client = active_client
                 self._watch_agy_title(active_client, chat_id)
-                active_client.configure(config, options)
+                if settings:
+                    active_options = active_client.options or options
+                    active_client.configure_desktop(self._agy_config_for_tool_settings(active_options, settings),
+                                                    active_options)
+                else:
+                    active_client.configure(config, options)
                 if getattr(self, "_closing", False):
                     raise AgyError("MC 正在退出")
+                attachments = (prepared_attachments.blocks if prepared_attachments is not None else
+                               read_prompt_attachments(active_client.capabilities, turn["attachments"])
+                               if settings and turn.get("attachments") else ())
                 run.prompt = active_client.begin_prompt(
-                    question, on_update, on_interaction,
-                    attachments=prepared_attachments.blocks if prepared_attachments is not None else (),
+                    question, on_update, on_interaction, attachments=attachments,
                 )
                 reason = run.prompt.wait()
                 if reason in ("end_turn", "cancelled"):

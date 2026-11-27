@@ -89,7 +89,9 @@ class ChatToolSettingsMixin:
                 "modes": [("default", MODE_NAMES["default"])],
                 "defaults": {"model": model, "effort": effort, "speed": "standard", "mode": "default"},
             }
-        if tool in {"agy", "kimi"}:
+        if tool == "agy":
+            return self._agy_tool_settings_options()
+        if tool == "kimi":
             return {"models": [(self._tool_route, bindings.app.model_display_name(self._tool_route))],
                     "defaults": {"speed": "standard"}}
         return {"models": [(model, bindings.app.model_display_name(model))
@@ -169,6 +171,8 @@ class ChatToolSettingsMixin:
             for key, value in codex_cli_config_for_model(route).items():
                 selected.setdefault("effort" if key == "model_reasoning_effort" else key, value)
             selected.setdefault("speed", self._codex_service_tier_for_chat(chat) or "standard")
+        elif route == AGY_MODEL_ID and not selected:
+            selected = self._agy_prior_tool_settings(chat)
         self._refresh_tool_setting_choices(selected)
 
     def _on_tool_changed(self, _event):
@@ -185,6 +189,8 @@ class ChatToolSettingsMixin:
         self._on_model_changed(None)
         if tool == "codex":
             self._request_codex_settings_catalog()
+        elif tool == "agy":
+            self._request_agy_settings_catalog()
 
     def _on_tool_model_changed(self, event):
         self._on_tool_setting_changed(event)
@@ -199,6 +205,8 @@ class ChatToolSettingsMixin:
         event.Skip()
         if self._current_tool() == "codex":
             self._request_codex_settings_catalog()
+        elif self._current_tool() == "agy":
+            self._request_agy_settings_catalog()
 
     def _request_codex_settings_catalog(self):
         if self._codex_settings_catalog or self._codex_settings_loading:
