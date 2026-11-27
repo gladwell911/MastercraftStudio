@@ -152,7 +152,8 @@ class AgySessionsMixin:
                                if turn.get("request_status") in (None, "", "done")
                                and not turn.get("terminal_final_pending"))
                      if visible_turns or isinstance(source.get("turns"), list) else None)
-        pending = AgyHandoff(source_id, self.input_edit.GetValue(), attachments, now, completed)
+        pending = AgyHandoff(source_id, self.input_edit.GetValue(), [dict(item) for item in attachments],
+                             now, completed)
         source_scope = {key: source.get(key) for key in ("model", "native_cwd", "codex_thread_id")}
         chat = {
             "id": str(uuid.uuid4()), "model": AGY_MODEL_ID,
@@ -225,9 +226,9 @@ class AgySessionsMixin:
             if event.get("sessionUpdate") == "usage_update":
                 context = agy_context_tokens(event) or context
             elif event.get("sessionUpdate") == "agent_message_chunk":
-                text = (event.get("content") or {}).get("text")
-                if isinstance(text, str):
-                    answer.append(text)
+                content = event.get("content")
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    answer.append(content["text"])
 
         try:
             cwd, turn["agy_handoff_prompt"] = self._read_agy_handoff_source(pending, source, turn["question"])
@@ -315,20 +316,29 @@ class AgySessionsMixin:
                 saved = None
                 error = HANDOFF_UNKNOWN if staged else "无法保存 AGY 接续，本次未发送。"
             finally:
+                accepted_client = client if saved is chat else None
                 try:
-                    if client is not None:
+                    if client is not None and accepted_client is None:
                         client.close()
                 finally:
-                    self._call_after_if_alive(self._finish_agy_handoff, pending, saved, error)
+                    posted = self._call_after_if_alive(self._finish_agy_handoff, pending, saved, error,
+                                                      accepted_client)
+                    if not posted and accepted_client is not None:
+                        accepted_client.close()
 
-    def _finish_agy_handoff(self, pending, saved, error):
+    def _finish_agy_handoff(self, pending, saved, error, client):
         if self._agy_handoff is not pending:
+            if client is not None:
+                client.close()
             return
         self._agy_handoff = None
         if pending.run:
             self._dismiss_agy_dialog(pending.run)
         if saved:
             chat_id = saved["id"]
+            if client is not None:
+                self._watch_agy_title(client, chat_id)
+                self._agy_clients[chat_id] = client
             self.archived_chats.append(saved)
             if (self._visible_clear_owner() == pending.source_id and self._current_tool() == "agy"
                     and self.input_edit.GetValue() == pending.draft
