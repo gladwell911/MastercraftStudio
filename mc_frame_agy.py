@@ -17,9 +17,8 @@ from agy_acp import (
 )
 from agy_execution import AgyExecution, interaction_questions, interaction_result
 from agy_information import agy_context_tokens, agy_usage_owner
-from codex_client import is_codex_model
 from mc_frame_settings import REQUESTING_TEXT
-from mc_frame_tool_settings import EFFORT_NAMES
+from mc_frame_tool_settings import EFFORT_NAMES, TOOLS, tool_for_route
 
 
 from native_history import NativeSessionIdentity
@@ -37,7 +36,7 @@ class AgyHandoff:
     draft: str
     attachments: list
     cutoff: float
-    completed_indexes: frozenset | None
+    completed_turns: dict | None
     cancel: threading.Event = field(default_factory=threading.Event)
     preparing: bool = True
     run: object = None
@@ -148,9 +147,9 @@ class AgySessionsMixin:
         if source_id in self._native_history_reserved:
             return False, "正在同步原生 Codex 历史，请稍后重试"
         now = time.time()
-        completed = (frozenset(index for index, turn in enumerate(visible_turns)
-                               if turn.get("request_status") in (None, "", "done")
-                               and not turn.get("terminal_final_pending"))
+        completed = ({index: dict(turn) for index, turn in enumerate(visible_turns)
+                      if turn.get("request_status") in (None, "", "done")
+                      and not turn.get("terminal_final_pending")}
                      if visible_turns or isinstance(source.get("turns"), list) else None)
         pending = AgyHandoff(source_id, self.input_edit.GetValue(), [dict(item) for item in attachments],
                              now, completed)
@@ -179,8 +178,9 @@ class AgySessionsMixin:
     def _read_agy_handoff_source(self, pending, source, question):
         if self.chat_store.unresolved_agy_handoff(pending.source_id):
             raise AgyError(HANDOFF_UNKNOWN)
-        durable = self.chat_store.load_chat(pending.source_id, include_execution_steps=False)
-        if not durable or (source["codex_thread_id"] and source["codex_thread_id"] != durable.get("codex_thread_id")):
+        durable = self.chat_store.load_chat(pending.source_id, include_execution_steps=False) or {}
+        saved_thread = durable.get("codex_thread_id")
+        if saved_thread and source["codex_thread_id"] and source["codex_thread_id"] != saved_thread:
             raise AgyError("原 Codex 聊天已变更，本次未发送。")
         cwd = str(durable.get("native_cwd") or source["native_cwd"] or "")
         if not cwd or not Path(cwd).is_absolute():
@@ -189,24 +189,48 @@ class AgySessionsMixin:
             cwd = validate_workspace(cwd)
         except AgyError as exc:
             raise AgyError(f"原 Codex 项目目录不可用，本次未发送。{exc}") from exc
+        saved_turns = durable.get("turns", ())
+        source_turns = saved_turns
+        if pending.completed_turns is not None:
+            # The deferred save can trail content already visible when Send was pressed.
+            # Only indexes completed at that instant are eligible for the transcript.
+            source_turns = []
+            for index, visible in pending.completed_turns.items():
+                saved = saved_turns[index] if index < len(saved_turns) else {}
+                if saved and all(saved.get(key) == visible.get(key) for key in (
+                    "question", "answer_md", "request_status", "question_order", "answer_order",
+                    "attachments", "received_attachments",
+                )):
+                    source_turns.append(saved)
+                else:
+                    source_turns.append(visible)
         turns = []
-        for index, turn in enumerate(durable.get("turns", ())):
-            if pending.completed_indexes is not None and index not in pending.completed_indexes:
-                continue
+        for turn in source_turns:
             answer_at = turn.get("answer_at")
             if isinstance(answer_at, (int, float)) and answer_at > pending.cutoff:
                 continue
-            if (is_codex_model(turn.get("model") or source["model"]) and not turn.get("local_command")
-                    and turn.get("request_status") in (None, "", "done")
+            if (not turn.get("local_command") and turn.get("request_status") in (None, "", "done")
                     and not turn.get("terminal_final_pending") and not turn.get("request_error")
-                    and str(turn.get("question") or "").strip()
-                    and str(turn.get("answer_md") or "").strip()
-                    and turn["answer_md"] != REQUESTING_TEXT):
+                    and turn.get("answer_md") != REQUESTING_TEXT):
                 turns.append(turn)
         sections = ["以下是已完成的 Codex 历史对话。"]
+        tool_labels = dict(TOOLS)
         for index, role in self._ordered_answer_message_keys(turns):
-            label, key = ("用户", "question") if role == "user" else ("Codex", "answer_md")
-            sections.append(f"{label}：\n{turns[index][key]}")
+            turn = turns[index]
+            model = turn.get("model") or source["model"]
+            tool = tool_for_route(model)
+            label = "用户" if role == "user" else (tool_labels[tool] if tool != "other" else model)
+            text = turn.get("question" if role == "user" else "answer_md") or ""
+            attachments = turn.get("attachments" if role == "user" else "received_attachments") or ()
+            names = [file.get("name") for file in attachments if isinstance(file, dict) and file.get("name")]
+            if role == "user" and names and turn.get("suppress_empty_answer_row") and not str(
+                turn.get("answer_md") or ""
+            ).strip() and any(token in text for token in ("上传成功", "已成功上传", "上传失败", "已部分上传")):
+                text = ""
+            content = [text] if text.strip() else []
+            content.extend(f"附件：{name}" for name in names)
+            if content:
+                sections.append(f"{label}：\n" + "\n".join(content))
         sections.append(f"本次提问：\n{question}")
         return cwd, "\n\n".join(sections)
 

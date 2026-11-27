@@ -330,6 +330,57 @@ def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
         assert steps[1]["status"] == tool_status
 
 
+@pytest.mark.parametrize(("evidence", "expected"), [
+    ("explicit", "done"),
+    ("no terminal", "unknown"),
+    ("duplicate prompt", "unknown"),
+    ("different prompt", "unknown"),
+])
+def test_handoff_replay_can_recover_the_unique_exact_first_prompt_without_live_ids(tmp_path, evidence, expected):
+    from uuid import uuid4
+
+    store = ChatStore(tmp_path / "chat.db")
+    store.initialize()
+    identity = NativeSessionIdentity("default", "agy", "fixture-store", "dedicated-session")
+    owner = str(uuid4())
+    prompt = "过去对话\r\n本次提问：原文"
+    chat = {
+        "id": owner, "model": "agy/main", "native_identity": identity.chat_id,
+        "native_account": "fixture-account", "agy_session_id": identity.session_id,
+        "agy_handoff_source_id": "original-codex", "native_unresolved_turn": {"index": 0, "message": "未知"},
+    }
+    turn = {
+        "question": "原文", "agy_handoff_prompt": prompt, "request_status": "unknown",
+        "agy_session_id": identity.session_id, "terminal_notification_pair": identity.pair_id,
+    }
+    store.stage_agy_handoff(chat, turn)
+    assert store.load_chat(owner) is None
+    store.recover_agy_handoffs()
+    assert store.unresolved_agy_handoff("original-codex")
+    first = {
+        "provider": "agy", "session_id": identity.session_id, "agy_native_turn_id": "native-turn",
+        "provider_user_message_id": "native-user", "provider_message_id": "native-answer",
+        "question": prompt if evidence != "different prompt" else "其他提问", "answer_md": "已核对原回复",
+        "request_status": "done", "native_final_explicit": evidence != "no terminal",
+    }
+    turns = [first]
+    if evidence == "duplicate prompt":
+        turns.append(dict(first, agy_native_turn_id="another-turn"))
+    snapshot = NativeSessionSnapshot(
+        identity, "fixture-account", "agy/main", str(tmp_path), "AGY",
+        updated_at=100, chat_fields={"agy_session_id": identity.session_id}, turns=turns,
+    )
+    assert store.native_history_target(snapshot)[0] == owner
+    store.merge_native_history(snapshot, expected_chat_id=owner)
+    recovered, = store.load_turns(owner)
+    assert recovered["request_status"] == expected
+    assert recovered["question"] == "原文"
+    assert store.unresolved_agy_handoff("original-codex") is (expected == "unknown")
+    if expected == "done":
+        assert recovered["answer_md"] == "已核对原回复"
+        assert recovered["provider_message_id"] == "native-answer"
+
+
 @pytest.mark.parametrize("with_partial", [True, False])
 def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
         frame, tmp_path, monkeypatch, wait_for_wx_main_loop, with_partial):
