@@ -881,6 +881,7 @@ class ChatFrame(
         self._global_ctrl_hook.start()
         self._migrate_legacy_state_if_needed()
         self._migrate_legacy_chat_json_if_needed()
+        self.chat_store.recover_agy_handoffs()
         self._load_state()
         self._terminal_history_filter_item.Check(self.hide_terminal_chats)
         self.notes_controller.restore_state(self._current_notes_state)

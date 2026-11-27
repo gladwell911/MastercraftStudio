@@ -621,6 +621,49 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("BEGIN IMMEDIATE")
             self._upsert_chat_conn(conn, chat)
 
+    def stage_agy_handoff(self, chat, turn):
+        """Reserve this native session without exposing an unfinished chat."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO meta(key, value) VALUES (?, ?)", (
+                f"agy-handoff:{chat['native_identity']}", json.dumps((chat, turn), ensure_ascii=False),
+            ))
+
+    def settle_agy_handoff(self, chat, turn):
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settle_agy_handoff_conn(conn, chat, turn)
+
+    def _settle_agy_handoff_conn(self, conn, chat, turn):
+        identity = chat["native_identity"]
+        if turn is None:
+            conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES (?, '1')",
+                         (f"retired-native-history:{identity}",))
+        else:
+            self._upsert_chat_conn(conn, chat)
+            self._replace_turns_conn(conn, chat["id"], [turn])
+            conn.execute("INSERT INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
+                         (identity, chat["id"], chat["native_account"]))
+        conn.execute("DELETE FROM meta WHERE key=?", (f"agy-handoff:{identity}",))
+
+    def recover_agy_handoffs(self):
+        """A process interruption may have occurred after ACP accepted the prompt."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for entry in conn.execute("SELECT value FROM meta WHERE key LIKE 'agy-handoff:%'").fetchall():
+                chat, turn = json.loads(entry["value"])
+                self._settle_agy_handoff_conn(conn, chat, turn)
+
+    def unresolved_agy_handoff(self, source_id):
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM chats WHERE json_extract(metadata_json,'$.agy_handoff_source_id')=? "
+                "AND json_extract(metadata_json,'$.native_unresolved_turn') IS NOT NULL "
+                "UNION ALL SELECT 1 FROM meta WHERE key LIKE 'agy-handoff:%' "
+                "AND json_extract(value,'$[0].agy_handoff_source_id')=? LIMIT 1",
+                (source_id, source_id),
+            ).fetchone() is not None
+
     def _upsert_chat_conn(self, conn, chat):
         if not isinstance(chat, dict):
             return
@@ -676,9 +719,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
         native_id = snapshot.identity.chat_id
-        if conn.execute("SELECT 1 FROM meta WHERE key IN (?,?,?)", (
+        if conn.execute("SELECT 1 FROM meta WHERE key IN (?,?,?,?)", (
             f"retired-native-history:{native_id}", f"hidden-native-history:{native_id}",
-            f"deleted-native-history:{native_id}",
+            f"deleted-native-history:{native_id}", f"agy-handoff:{native_id}",
         )).fetchone():
             return native_id, False
         row = conn.execute(
@@ -1029,7 +1072,8 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 and stored.get("provider_message_id")
                 and stored["provider_message_id"] == replayed.get("provider_message_id")):
             return True
-        if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question")):
+        if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question"),
+                                                 stored.get("agy_handoff_prompt")):
             return False
         old_answer = str(stored.get("answer_md") or "")
         new_answer = str(replayed.get("answer_md") or "")

@@ -18,7 +18,7 @@ import uuid
 AGY_MODEL_ID = "agy/main"
 AGY_WORKSPACE_CAPABILITY = "agy-workspace-v1"
 AGY_CHAT_FIELDS = ("agy_workspace", "agy_session_id", "agy_native_owner", "agy_config", "agy_options",
-                   "agy_desktop_settings")
+                   "agy_desktop_settings", "agy_handoff_source_id")
 AGY_IMAGE_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",

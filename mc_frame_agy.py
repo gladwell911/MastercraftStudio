@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import wx
 import agy_settings
@@ -16,6 +17,8 @@ from agy_acp import (
 )
 from agy_execution import AgyExecution, interaction_questions, interaction_result
 from agy_information import agy_context_tokens, agy_usage_owner
+from codex_client import is_codex_model
+from mc_frame_settings import REQUESTING_TEXT
 from mc_frame_tool_settings import EFFORT_NAMES
 
 
@@ -24,6 +27,50 @@ from native_history import NativeSessionIdentity
 
 AGY_CHAT_SCOPE_FIELDS = ("model", "agy_session_id", "agy_native_owner", "native_identity",
                          "native_account", "agy_workspace")
+HANDOFF_UNKNOWN = "AGY 首次提交的结果待确认。请同步原 AGY 会话以核对这次提问。"
+HANDOFF_OVERFLOW = "完整交接内容超出 AGY 的输入上限，本次未发送。原聊天、草稿和附件已保留。"
+
+
+@dataclass
+class AgyHandoff:
+    source_id: str
+    draft: str
+    attachments: list
+    cancel: threading.Event = field(default_factory=threading.Event)
+    preparing: bool = True
+    run: object = None
+    worker: threading.Thread | None = None
+
+
+def _agy_update_ids(update):
+    ids = {}
+    kind = update.get("sessionUpdate")
+    turn_id, message_id = update.get("turnId"), update.get("messageId")
+    if isinstance(turn_id, str) and turn_id and kind in {
+        "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
+    }:
+        ids["agy_native_turn_id"] = turn_id
+    if isinstance(message_id, str) and message_id:
+        if kind == "user_message_chunk":
+            ids["provider_user_message_id"] = message_id
+        elif kind == "agent_message_chunk":
+            ids["agy_observed_message_id"] = message_id
+    return ids
+
+
+def _agy_terminal_values(native_ids, answer, reason, pair_id, statistics):
+    cancelled = reason == "cancelled"
+    error = "AGY 回合已停止。" if cancelled else ""
+    terminal = dict(native_ids, agy_native_terminal_reason=reason, terminal_notification_pair=pair_id,
+                    request_status="cancelled" if cancelled else "done",
+                    request_error=error, request_recovered_after_restart=False,
+                    answer_md=error if cancelled else (answer if answer.strip() else "未返回任何内容。"))
+    terminal.update(statistics)
+    if not cancelled:
+        terminal["answer_at"] = time.time()
+        if native_ids.get("agy_observed_message_id"):
+            terminal["provider_message_id"] = native_ids["agy_observed_message_id"]
+    return terminal
 
 
 @dataclass
@@ -72,6 +119,229 @@ class AgyPreparedAttachments:
 
 
 class AgySessionsMixin:
+    def _start_agy_handoff(self, source, question, settings, attachments):
+        source_id = source["id"]
+        pending = getattr(self, "_agy_handoff", None)
+        if pending is not None:
+            if pending.source_id == source_id and question in {"/stop", "/reply"}:
+                run = pending.run
+                if question == "/reply":
+                    interaction_id = next(iter(run.interactions), None) if run else None
+                    if not interaction_id:
+                        return False, "此 AGY 接续没有待处理的请求。"
+                    self._show_agy_interaction(source_id, interaction_id, handoff=run)
+                else:
+                    pending.cancel.set()
+                    if run and run.prompt:
+                        try:
+                            run.client.cancel_prompt(run.prompt)
+                        except AgyError as exc:
+                            return False, f"AGY 停止结果待确认：{exc}"
+                    self.SetStatusText("已请求停止 AGY 接续")
+                self.input_edit.ChangeValue(pending.draft)
+                return True, ""
+            return False, "正在确认 AGY 首次提问，请等待结果。需要停止时可输入 /stop。"
+        if not question and not attachments:
+            return False, "请输入问题，输入框内容为空"
+        if source_id in self._native_history_reserved:
+            return False, "正在同步原生 Codex 历史，请稍后重试"
+        if self.chat_store.unresolved_agy_handoff(source_id):
+            return False, HANDOFF_UNKNOWN
+        durable = self.chat_store.load_chat(source_id, include_execution_steps=False)
+        cwd = str((durable or {}).get("native_cwd") or source.get("native_cwd") or "")
+        if not cwd or not Path(cwd).is_absolute():
+            return False, "找不到原 Codex 聊天的实际项目目录，本次未发送。"
+        try:
+            cwd = validate_workspace(cwd)
+        except AgyError as exc:
+            return False, f"原 Codex 项目目录不可用，本次未发送。{exc}"
+        turns = []
+        for turn in (durable or {}).get("turns", ()):
+            if (is_codex_model(turn.get("model") or source["model"]) and not turn.get("local_command")
+                    and turn.get("request_status") in (None, "", "done")
+                    and not turn.get("terminal_final_pending") and not turn.get("request_error")
+                    and str(turn.get("question") or "").strip()
+                    and str(turn.get("answer_md") or "").strip()
+                    and turn["answer_md"] != REQUESTING_TEXT):
+                turns.append(turn)
+        sections = ["以下是已完成的 Codex 历史对话。"]
+        for index, role in self._ordered_answer_message_keys(turns):
+            label, key = ("用户", "question") if role == "user" else ("Codex", "answer_md")
+            sections.append(f"{label}：\n{turns[index][key]}")
+        sections.append(f"本次提问：\n{question}")
+        prompt = "\n\n".join(sections)
+        pending = AgyHandoff(source_id, self.input_edit.GetValue(), attachments)
+        now = time.time()
+        chat = {
+            "id": str(uuid.uuid4()), "model": AGY_MODEL_ID, "title": self._next_default_chat_title(),
+            "title_source": "default", "title_revision": 1, "title_updated_at": now,
+            "created_at": now, "updated_at": now, "agy_desktop_settings": True,
+            "agy_handoff_source_id": source_id,
+        }
+        turn = {"question": question, "answer_md": REQUESTING_TEXT, "model": AGY_MODEL_ID,
+                "created_at": now, "tool_settings": dict(settings), "question_origin": "mc"}
+        self._mark_turn_request_pending(turn, AGY_MODEL_ID, question)
+        turn.update(_provider_request_id=uuid.uuid4().hex, request_recoverable=False,
+                    agy_handoff_prompt=prompt)
+        self._agy_handoff = pending
+        self.SetStatusText("正在提交 AGY 接续，等待首次提问结果")
+        try:
+            pending.worker = threading.Thread(target=self._submit_agy_handoff,
+                                              args=(pending, chat, turn, cwd), name="agy-handoff", daemon=True)
+            pending.worker.start()
+        except RuntimeError as exc:
+            self._agy_handoff = None
+            return False, f"无法开始 AGY 接续：{exc}"
+        return True, ""
+
+    def _submit_agy_handoff(self, pending, chat, turn, cwd):
+        client = None
+        saved = settled_turn = None
+        staged = False
+        error = ""
+        answer = []
+        ids = {}
+        context = None
+        pair_id = self._read_pair_id()
+
+        def update(event):
+            nonlocal context
+            ids.update(_agy_update_ids(event))
+            if event.get("sessionUpdate") == "usage_update":
+                context = agy_context_tokens(event) or context
+            elif event.get("sessionUpdate") == "agent_message_chunk":
+                text = (event.get("content") or {}).get("text")
+                if isinstance(text, str):
+                    answer.append(text)
+
+        try:
+            files, failed = self._normalize_outgoing_attachments(pending.attachments)
+            if failed:
+                names = "、".join(item["name"] for item in failed)
+                raise AgyError(f"以下附件无法读取，本次未发送：{names}")
+            client, fields = self._prepare_agy_workspace(cwd)
+            chat.update(fields)
+            options = fields["agy_options"]
+            config = self._agy_config_for_tool_settings(options, turn["tool_settings"])
+            client.configure_desktop(config, options)
+            chat.update(agy_config=config, agy_options=client.options)
+            effective = self._agy_prior_tool_settings(dict(chat, agy_desktop_settings=False))
+            turn["tool_settings"].update(effective)
+            turn["attachments"] = files
+            blocks = read_prompt_attachments(client.capabilities, files)
+            if pending.cancel.is_set() or getattr(self, "_closing", False):
+                raise AgyError("已取消 AGY 接续，原草稿和附件已保留。")
+            unknown_chat = dict(chat, native_history_status=HANDOFF_UNKNOWN,
+                                native_unresolved_turn={"index": 0, "message": HANDOFF_UNKNOWN})
+            turn.update(request_resume_token={"session_id": client.session_id}, agy_session_id=client.session_id)
+            unknown_turn = dict(turn, answer_md="", request_status="unknown", request_error=HANDOFF_UNKNOWN,
+                                terminal_notification_pair=pair_id)
+            self.chat_store.stage_agy_handoff(unknown_chat, unknown_turn)
+            staged = True
+            pending.preparing = False
+            run = AgyRun(0, lambda: True, self._agy_chat_scope(chat), turn["tool_settings"], client=client)
+            run.worker = pending.worker
+            pending.run = run
+            interaction_lock = threading.Lock()
+            early_interactions = []
+
+            def interact(*args):
+                with interaction_lock:
+                    if run.prompt is None:
+                        early_interactions.append(args)
+                        return
+                self._call_after_if_alive(self._receive_agy_handoff_interaction, pending, run, *args)
+
+            if pending.cancel.is_set() or getattr(self, "_closing", False):
+                raise AgyError("已取消 AGY 接续，原草稿和附件已保留。")
+            native_prompt = client.begin_prompt(turn["agy_handoff_prompt"], update, interact, attachments=blocks)
+            with interaction_lock:
+                run.prompt = native_prompt
+                for args in early_interactions:
+                    self._call_after_if_alive(self._receive_agy_handoff_interaction, pending, run, *args)
+                early_interactions.clear()
+            if pending.cancel.is_set():
+                try:
+                    client.cancel_prompt(run.prompt)
+                except AgyError as exc:
+                    raise AgyResultUnknown(HANDOFF_UNKNOWN) from exc
+            reason = run.prompt.wait()
+            if reason in {"context_length_exceeded", "prompt_too_long", "input_too_long"}:
+                raise AgyError(HANDOFF_OVERFLOW)
+            if reason in {"cancelled", "refusal"}:
+                raise AgyError("AGY 首次提问已取消或被拒绝，原草稿和附件已保留。")
+            if reason != "end_turn":
+                raise AgyResultUnknown(f"{HANDOFF_UNKNOWN} 原生结束原因：{reason}")
+            statistics = {"agy_usage_owner": agy_usage_owner(chat), "agy_prompt_usage": run.prompt.usage,
+                          "agy_usage_partial": False}
+            if context is not None:
+                statistics["agy_context_tokens"] = context
+            turn.update(_agy_terminal_values(ids, "".join(answer), reason, pair_id, statistics))
+            saved, settled_turn = chat, turn
+        except AgyResultUnknown as exc:
+            unknown_turn.update(ids, agy_partial_answer_md="".join(answer))
+            error = f"{HANDOFF_UNKNOWN} {exc}" if str(exc) != HANDOFF_UNKNOWN else HANDOFF_UNKNOWN
+            unknown_chat.update(native_history_status=error)
+            saved, settled_turn = unknown_chat, unknown_turn
+        except (OSError, sqlite3.Error, AgyError) as exc:
+            detail = str(getattr(exc, "rpc_message", "")).casefold()
+            if any(marker in detail for marker in ("context length", "context window", "context_length_exceeded",
+                                                   "input token count", "prompt is too long", "request too large")):
+                error = HANDOFF_OVERFLOW
+            else:
+                error = str(exc)
+        finally:
+            try:
+                if client is not None:
+                    self.chat_store.settle_agy_handoff(saved or chat, settled_turn)
+            except sqlite3.Error:
+                saved = None
+                error = HANDOFF_UNKNOWN if staged else "无法保存 AGY 接续，本次未发送。"
+            finally:
+                try:
+                    if client is not None:
+                        client.close()
+                finally:
+                    self._call_after_if_alive(self._finish_agy_handoff, pending, saved, error)
+
+    def _finish_agy_handoff(self, pending, saved, error):
+        if self._agy_handoff is not pending:
+            return
+        self._agy_handoff = None
+        if pending.run:
+            self._dismiss_agy_dialog(pending.run)
+        if saved:
+            chat_id = saved["id"]
+            self.archived_chats.append(saved)
+            if (self._visible_clear_owner() == pending.source_id and self._current_tool() == "agy"
+                    and self.input_edit.GetValue() == pending.draft
+                    and self._pending_input_attachments == pending.attachments):
+                self.view_mode = "active"
+                self.view_history_id = None
+                if self._switch_current_chat(chat_id):
+                    self.input_edit.ChangeValue("")
+                    self.input_edit.SetFocus()
+                    self._pending_input_attachments = []
+            self._upsert_history_row(chat_id)
+            self._invalidate_remote_state_cache()
+            self._push_remote_history_changed(chat_id)
+            self._play_send_sound()
+        self.SetStatusText(error or "已完成 AGY 接续")
+
+    def _receive_agy_handoff_interaction(self, pending, run, interaction_id, method, params):
+        if self._agy_handoff is not pending or not run.client.interaction_active(run.prompt, interaction_id):
+            return
+        prompt, questions = interaction_questions(method, params)
+        if not questions:
+            try:
+                run.client.decline_interaction(run.prompt, interaction_id, method)
+            except AgyError as exc:
+                self.SetStatusText(str(exc))
+            return
+        interaction_id = "agy-" + interaction_id
+        run.interactions[interaction_id] = (method, prompt, questions)
+        self._show_agy_interaction(pending.source_id, interaction_id, handoff=run)
+
     @staticmethod
     def _agy_session_id_for_chat(chat):
         return str(chat.get("agy_session_id") or "")
@@ -273,6 +543,8 @@ class AgySessionsMixin:
         return 200, {"accepted": True, "chat_id": chat_id}
 
     def _validate_agy_submission(self, chat: dict, *, queued=False) -> str:
+        if chat.get("agy_handoff_source_id") and chat.get("native_unresolved_turn"):
+            raise AgyError(HANDOFF_UNKNOWN)
         chat_id = str(chat.get("id") or "")
         if chat_id in self._native_history_reserved:
             raise AgyError("此 AGY 聊天正在更新原生历史，请稍后重试")
@@ -394,17 +666,7 @@ class AgySessionsMixin:
             kind = update.get("sessionUpdate")
             if kind == "usage_update":
                 context = agy_context_tokens(update) or context
-            native_ids = {}
-            turn_id, message_id = update.get("turnId"), update.get("messageId")
-            if isinstance(turn_id, str) and turn_id and kind in {
-                "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
-            }:
-                native_ids["agy_native_turn_id"] = turn_id
-            if isinstance(message_id, str) and message_id:
-                if kind == "user_message_chunk":
-                    native_ids["provider_user_message_id"] = message_id
-                elif kind == "agent_message_chunk":
-                    native_ids["agy_observed_message_id"] = message_id
+            native_ids = _agy_update_ids(update)
             if native_ids:
                 observed_ids.update(native_ids)
                 enqueue("native_ids", native_ids)
@@ -574,17 +836,7 @@ class AgySessionsMixin:
 
     def _commit_agy_terminal(self, store, chat_id, run, scope, revision, turn, native_ids, answer, reason, pair_id,
                              statistics):
-        cancelled = reason == "cancelled"
-        error = "AGY 回合已停止。" if cancelled else ""
-        terminal = dict(native_ids, agy_native_terminal_reason=reason, terminal_notification_pair=pair_id,
-                        request_status="cancelled" if cancelled else "done",
-                        request_error=error, request_recovered_after_restart=False,
-                        answer_md=error if cancelled else (answer if answer.strip() else "未返回任何内容。"))
-        terminal.update(statistics)
-        if not cancelled:
-            terminal["answer_at"] = time.time()
-            if native_ids.get("agy_observed_message_id"):
-                terminal["provider_message_id"] = native_ids["agy_observed_message_id"]
+        terminal = _agy_terminal_values(native_ids, answer, reason, pair_id, statistics)
         with self._close_admission_lock:
             if getattr(self, "_close_producer_fenced", False):
                 return None
@@ -721,9 +973,9 @@ class AgySessionsMixin:
                                 else public_questions[0]["options"]}},
         }
 
-    def _reply_agy_interaction(self, chat_id, interaction_id, *, text="", answers=None):
+    def _reply_agy_interaction(self, chat_id, interaction_id, *, text="", answers=None, handoff=None):
         chat, _, _ = self._chat_target_for_request(chat_id)
-        run = self._agy_run_for_chat(chat)
+        run = handoff or self._agy_run_for_chat(chat)
         request = run.interactions.get(interaction_id) if run else None
         if not request or interaction_id != next(iter(run.interactions)):
             return False, "此 AGY 请求已处理或过期。"
@@ -737,18 +989,20 @@ class AgySessionsMixin:
         except AgyError as exc:
             run.interactions.pop(interaction_id, None)
             self._dismiss_agy_dialog(run)
-            self._update_agy_remote_state(chat_id)
+            if handoff is None:
+                self._update_agy_remote_state(chat_id)
             return False, f"AGY 回复结果未知：{exc}"
         run.interactions.pop(interaction_id, None)
         self._dismiss_agy_dialog(run)
-        self._update_agy_remote_state(chat_id)
+        if handoff is None:
+            self._update_agy_remote_state(chat_id)
         return (True, "已回复 AGY。") if accepted else (False, "此 AGY 请求已处理或过期。")
 
-    def _show_agy_interaction(self, chat_id, interaction_id, *, only_foreground=False):
+    def _show_agy_interaction(self, chat_id, interaction_id, *, only_foreground=False, handoff=None):
         if only_foreground and not self._is_foreground_window():
             return
         chat, _, _ = self._chat_target_for_request(chat_id)
-        run = self._agy_run_for_chat(chat)
+        run = handoff or self._agy_run_for_chat(chat)
         if (not run or run.dialog is not None or self._visible_clear_owner() != chat_id
                 or interaction_id != next(iter(run.interactions), None)):
             return
@@ -786,7 +1040,7 @@ class AgySessionsMixin:
                         elif (index := control.GetSelection()) != wx.NOT_FOUND:
                             answers[key] = options[index]["value"]
                     ok, message = self._reply_agy_interaction(
-                        chat_id, interaction_id, text=answers.get("approval", ""), answers=answers,
+                        chat_id, interaction_id, text=answers.get("approval", ""), answers=answers, handoff=handoff,
                     )
                     self.SetStatusText(message)
                     if ok or interaction_id not in run.interactions:
@@ -796,7 +1050,12 @@ class AgySessionsMixin:
                 run.dialog = None
                 next_request = next(iter(run.interactions), None)
                 if next_request and next_request != interaction_id:
-                    self._call_after_if_alive(self._show_agy_interaction, chat_id, next_request)
+                    self._call_after_if_alive(self._show_agy_interaction, chat_id, next_request, handoff=handoff)
+                elif handoff and next_request == interaction_id:
+                    try:
+                        run.client.cancel_prompt(run.prompt)
+                    except AgyError as exc:
+                        self.SetStatusText(f"AGY 停止结果待确认：{exc}")
 
     @staticmethod
     def _dismiss_agy_dialog(run):
@@ -816,6 +1075,11 @@ class AgySessionsMixin:
 
     def _close_agy_clients(self) -> None:
         runs = tuple(self._agy_busy.values())
+        pending = getattr(self, "_agy_handoff", None)
+        if pending:
+            pending.cancel.set()
+            if pending.run:
+                runs += (pending.run,)
         clients = set(self._agy_clients.values())
         clients.update(run.client for run in runs if run.client is not None)
         self._agy_clients.clear()

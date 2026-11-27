@@ -422,6 +422,9 @@ class NativeHistoryMixin:
     def _native_history_authority_ui(self, session, chat_id, *, reserve=False, expected=None):
         if getattr(self, "_closing", False) or chat_id in self._native_history_reserved:
             return 409, {}
+        handoff = getattr(self, "_agy_handoff", None)
+        if session.identity.provider == "agy" and handoff and handoff.preparing:
+            return 409, {}
         if session.identity.provider == "agy" and (
                 chat_id in self._agy_busy or self._agy_new_chat_pending or self._agy_remote_creations):
             return 409, {}
