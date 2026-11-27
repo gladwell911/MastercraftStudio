@@ -4,7 +4,9 @@
 
 **前置工单**　无，可以立即开始
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　聊天信息回归 117 项通过。Codex 只显示周额度，Kimi 显示实际返回的窗口。定向独立验证覆盖重置日期和焦点。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 

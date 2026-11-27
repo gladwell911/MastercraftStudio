@@ -4,7 +4,9 @@
 
 **前置工单**　04 AGY 直接新建并应用每次提问的设置
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　真实桌面组合测试通过。Codex 原生 App Server 连接回环模型，AGY 1.5.18 使用真实账号完成首次交接与后续问答，原 Codex 原生线程可继续。模拟与历史对账用例覆盖超限、失败、结果未知和完整原文。AGY 不公布输入窗口的预检字段，超限根据原生明确拒绝处理。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 

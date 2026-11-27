@@ -4,7 +4,9 @@
 
 **前置工单**　无，可以立即开始
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　Codex 0.171.0 的真实 App Server 配合回环模型端点通过桌面端到端，核对两个已完成回合、三类配置变更、两条排队快照和原生线程。另有五轮云端原生记录确认逐轮模型和强度。已复验执行中与 `/status`、重开、清空的队列边界。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 

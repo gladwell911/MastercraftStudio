@@ -4,7 +4,9 @@
 
 **前置工单**　03 统一 Codex 与 Kimi 的额度重置时间
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　真实 ACP 返回当前上下文和终态用量，原生 `/usage` 提供三组额度。Claude/GPT 周额度返回的 Unix 纪元重置值显示为暂不可用。额度面板注明本机查询时的登录账号，供应商未返回可核对的账号 ID。真实 wx 定时器验证过期标识、刷新和焦点。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 

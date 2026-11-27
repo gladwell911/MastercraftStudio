@@ -4,7 +4,9 @@
 
 **前置工单**　01 Codex 的四个组合框与新回合设置
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　真实 Kimi 2.5.3、2.6.3 原生 Server 都经回环模型端点完成八轮桌面验收，包括模型、强度、FIFO 和原生会话。另有隔离云端 2.6.3 验证模型及自动工具执行。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 

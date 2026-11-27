@@ -4,7 +4,9 @@
 
 **前置工单**　01 Codex 的四个组合框与新回合设置
 
-**状态**　ready-for-agent
+**状态**　resolved
+
+**验证记录**　AGY 1.5.18 在真实 wx 主事件循环下完成八轮，核对三个设置变更组合、同一原生会话、两条排队快照和自动审批。重开后已持久化认领但无可靠终态的旧问题保留待确认，避免重复发送。
 
 [完整规格](../../../_bmad-output/specs/spec-mc-chat-tool-settings/SPEC.md)
 
