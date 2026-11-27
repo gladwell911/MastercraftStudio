@@ -608,8 +608,12 @@ class AgySessionsMixin:
     def _agy_desktop_submission(self, chat, turns, settings):
         options = chat.get("agy_options") or []
         categories = {option["category"] for option in options}
-        if not chat.get("agy_desktop_settings") and not agy_settings.FIELDS.keys() <= categories:
-            return None, False
+        if not chat.get("agy_desktop_settings"):
+            prior = self._agy_prior_tool_settings(chat)
+            if "model" not in categories or all(
+                    not settings.get(key) or settings[key] == prior.get(key)
+                    for category, key in agy_settings.FIELDS.items() if category in categories):
+                return None, False
         self._agy_config_for_tool_settings(options, settings)
         run = self._agy_run_for_chat(chat)
         previous = run.settings if run and run.settings is not None else self._agy_prior_tool_settings(chat)

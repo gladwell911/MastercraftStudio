@@ -170,9 +170,11 @@ def configuration_options(result: dict) -> list[dict]:
                 model_ids = {value["value"] for value in values}
                 for value in values:
                     prefix = value["value"] + "-"
-                    value["efforts"] = [variant_id.removeprefix(prefix) for entry in variants
+                    efforts = [variant_id.removeprefix(prefix) for entry in variants
                                         if isinstance(entry, dict) and isinstance(variant_id := entry.get("modelId"), str)
                                         and variant_id.startswith(prefix) and variant_id not in model_ids]
+                    if efforts:
+                        value["efforts"] = efforts
             options.append({"id": item["id"], "label": item.get("name") or item["id"],
                             "category": item.get("category", ""), "current": item.get("currentValue", ""),
                             "options": values})

@@ -125,6 +125,8 @@ def test_agy_chat_information_reads_and_reopens_provider_usage(
     wait_for_wx(lambda: len(frame.active_session_turns) == 2
                 and frame.active_session_turns[1].get("request_status") == "done", "second settled AGY turn")
     expected[1:3] = ["会话累计 token：137", "当前缓存命中：0 token"]
+    frame.active_session_turns.append({"model": "system", "question": "载入文件夹", "request_status": "done"})
+    frame._mark_chat_turns_dirty(start_index=2)
     status, second = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
     assert status == 200, second
     assert frame._switch_current_chat(second["chat_id"])

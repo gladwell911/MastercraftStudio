@@ -420,7 +420,8 @@ class NativeHistoryMixin:
             chat["native_title_observed_at"] = committed["native_title_observed_at"]
 
     def _native_history_authority_ui(self, session, chat_id, *, reserve=False, expected=None):
-        if getattr(self, "_closing", False) or chat_id in self._native_history_reserved:
+        if (getattr(self, "_closing", False) or chat_id in self._native_history_reserved
+                or chat_id in getattr(self, "_native_tool_queue_claims", ())):
             return 409, {}
         handoff = getattr(self, "_agy_handoff", None)
         if session.identity.provider == "agy" and handoff and handoff.preparing:
@@ -496,8 +497,13 @@ class NativeHistoryMixin:
 
     def _publish_native_history_ui(self, owner, changed, turns, session) -> tuple[int, dict]:
         self._native_history_reserved.discard(owner)
-        if (changed is None or getattr(self, "_closing", False)
-                or self.chat_store.get_meta(f"deleted-chat:{owner}")):
+        if getattr(self, "_closing", False):
+            return 200, {}
+        if changed is None:
+            self._schedule_next_codex_tool_turn(owner)
+            self._schedule_next_kimi_tool_turn(owner)
+            return 200, {}
+        if self.chat_store.get_meta(f"deleted-chat:{owner}"):
             return 200, {}
         active = owner == self.active_chat_id
         target = self._current_chat_state if active else self._chat_summary_by_id(owner)
@@ -550,6 +556,10 @@ class NativeHistoryMixin:
                 self._push_remote_title_changed(target)
         else:
             self._push_remote_history_changed(owner)
+        if session.identity.provider == "codex":
+            self._schedule_next_codex_tool_turn(owner)
+        elif session.identity.provider == "kimi":
+            self._schedule_next_kimi_tool_turn(owner)
         if session.identity.provider == "agy" and recovered and turns is not None and target:
             if not isinstance(target.get("turns"), list):
                 target["turns"] = turns

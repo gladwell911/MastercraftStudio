@@ -5,7 +5,7 @@ import math
 import wx
 from agy_acp import AGY_MODEL_ID
 from agy_information import agy_quota_rows, agy_session_rows, agy_usage_owner, read_agy_quota
-from chat_information import ChatInformationSubscriptions, format_quota_reset_time
+from chat_information import ChatInformationSubscriptions, format_quota_reset_time, quota_reset_passed
 from claudecode_client import is_claudecode_model
 from codex_client import codex_model_label_for_model, is_codex_model
 from context_usage import (
@@ -183,12 +183,15 @@ class ChatInformationMixin:
             if not isinstance(window, dict):
                 result.append(f"{name}：服务端未提供")
                 continue
+            raw_reset = window.get("resetAt")
+            if isinstance(raw_reset, str) and quota_reset_passed(raw_reset):
+                result.append(f"{name}：已过期")
+                continue
             ratio = window.get("usedRatio")
             if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
                 result.append(f"{name}：使用比例暂不可用")
                 continue
             label = f"{name}：已用 {ratio * 100:.1f}%"
-            raw_reset = window.get("resetAt")
             reset = format_quota_reset_time(raw_reset) if isinstance(raw_reset, str) else None
             label += f"，本地重置 {reset}" if reset is not None else "，重置时间暂不可用"
             result.append(label)
@@ -358,6 +361,7 @@ class ChatInformationMixin:
             chat["codex_weekly_quota_status"] = "查询失败"
             chat.pop("codex_weekly_quota", None)
             chat["codex_chat_information_account_owner"] = identity[3]
+            self._defer_codex_state_save()
         self._chat_information_request = None
         self._refresh_chat_information(chat)
         self._resume_codex_information_full_refresh(chat, identity)
@@ -442,7 +446,11 @@ class ChatInformationMixin:
         account_identity_changed = bool(not payload.get("account_error") and new_account_id != identity[3])
         changed = (chat.get("codex_account_label") != account_label
                    or str(chat.get("codex_chat_information_account_owner") or "").strip() != identity[3]
-                   or account_identity_changed)
+                   or account_identity_changed
+                   or chat.get("codex_weekly_quota_status") != quota_status
+                   or chat.get("codex_weekly_quota") != weekly_quota)
+        chat["codex_weekly_quota_status"] = quota_status
+        chat["codex_weekly_quota"] = weekly_quota
         if changed:
             if account_identity_changed:
                 if identity[3]:
@@ -462,8 +470,6 @@ class ChatInformationMixin:
             chat["codex_account_label"] = account_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
             self._defer_codex_state_save()
-        chat["codex_weekly_quota_status"] = quota_status
-        chat["codex_weekly_quota"] = weekly_quota
         self._refresh_chat_information(chat)
 
     def _request_kimi_chat_information(self, chat: dict, model: str, *, visible_only: bool = False,
@@ -859,6 +865,8 @@ class ChatInformationMixin:
 
     @staticmethod
     def _codex_weekly_quota_label(weekly: dict) -> str:
+        if quota_reset_passed(weekly.get("resetsAt")):
+            return "Codex 周额度：已过期"
         used = weekly.get("usedPercent")
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
             remaining = "剩余比例暂不可用"

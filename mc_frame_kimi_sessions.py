@@ -652,14 +652,10 @@ class KimiSessionsMixin:
         for index, turn in enumerate(turns):
             if not self._is_kimi_tool_turn_queued(turn):
                 continue
-            turn["request_status"] = "pending"
-            self._mark_chat_turns_dirty(None if is_current else chat_id, index)
-            if is_current:
-                self.is_running = True
-                self._active_request_count = 1
-                self.SetStatusText("正在发送排队的问题")
-            self._start_kimi_worker_for_turn(chat_id, index, turn["request_question"], turn["model"])
-            self._defer_chat_state_save()
+            self._claim_native_tool_turn(
+                chat, turns, index, "kimi_session_id", self._kimi_session_id_for_chat,
+                self._start_kimi_worker_for_turn, self._defer_chat_state_save,
+            )
             return
 
     def _start_kimi_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:

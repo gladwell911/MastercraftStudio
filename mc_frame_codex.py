@@ -447,6 +447,7 @@ class CodexSessionsMixin:
     def _on_codex_speed_changed(self, _):
         if self._current_tool() != "codex":
             return
+        self._unavailable_tool_settings.discard("speed")
         chat = self._visible_codex_speed_chat()
         previous_tier = self._codex_service_tier_for_chat(chat)
         requested_tier = normalize_codex_service_tier(self.codex_speed_combo.GetValue())
@@ -895,21 +896,17 @@ class CodexSessionsMixin:
             self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
 
     def _launch_next_codex_tool_turn(self, chat_id):
-        chat, turns, is_current = self._chat_target_for_request(chat_id)
+        chat, turns, _current = self._chat_target_for_request(chat_id)
         if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
                 or self._codex_tool_queue_blocked(chat_id, turns)):
             return
         for index, turn in enumerate(turns):
             if not self._is_codex_tool_turn_queued(turn):
                 continue
-            turn["request_status"] = "pending"
-            self._mark_chat_turns_dirty(None if is_current else chat_id, index)
-            if is_current:
-                self.is_running = True
-                self._active_request_count = 1
-                self.SetStatusText("正在发送排队的问题")
-            self._start_codex_worker_for_turn(chat_id, index, turn["request_question"], turn["model"])
-            self._defer_codex_state_save()
+            self._claim_native_tool_turn(
+                chat, turns, index, "codex_thread_id", self._codex_thread_id_for_chat,
+                self._start_codex_worker_for_turn, self._defer_codex_state_save,
+            )
             return
 
     def _start_codex_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:

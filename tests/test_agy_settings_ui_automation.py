@@ -153,3 +153,39 @@ def test_agy_new_chat_settings_and_fifo_keep_a_single_native_session(
     assert [turn["tool_settings"]["model"] for turn in saved["turns"]] == [
         settings["model"] for _session, settings, _question in prompts
     ]
+
+
+def test_agy_partial_options_and_unavailable_default(frame):
+    import agy_settings
+    from agy_acp import AgyError, configuration_options
+    from mc_frame_tool_settings import EFFORT_NAMES
+
+    def option(category, *values):
+        return {"type": "select", "id": category, "category": category, "currentValue": values[0],
+                "options": [{"value": value} for value in values]}
+
+    neon = agy_settings.DEFAULTS["model"]
+    options = configuration_options({"models": {}, "configOptions": [
+        option("model", neon, "alternate"), option("thought_level", "high"), option("mode", "auto"),
+    ]})
+    assert agy_settings.native_config(options, {}, EFFORT_NAMES)["thought_level"] == "high"
+
+    partial = configuration_options({"configOptions": [option("model", neon, "alternate")]})
+    chat = {"id": "legacy", "agy_options": partial}
+    assert frame._agy_desktop_submission(chat, [], {"model": neon}) == (None, False)
+    changed, queued = frame._agy_desktop_submission(chat, [], {"model": "alternate"})
+    assert not queued
+    assert agy_settings.native_config(partial, changed, EFFORT_NAMES) == {"model": "alternate"}
+
+    low_only = configuration_options({"configOptions": [
+        option("model", neon), option("thought_level", "low"), option("mode", "auto"),
+    ]})
+    frame._current_chat_state = {"model": "agy/main", "agy_options": low_only, "agy_desktop_settings": True}
+    frame._apply_selected_chat_model_to_combo(frame._current_chat_state)
+    settings = frame._pending_tool_settings()
+    assert not settings["effort"]
+    with pytest.raises(AgyError, match="高"):
+        frame._agy_desktop_submission(frame._current_chat_state, [], settings)
+    assert frame.reasoning_combo.SetStringSelection("低")
+    settings = frame._pending_tool_settings()
+    assert agy_settings.native_config(low_only, settings, EFFORT_NAMES)["thought_level"] == "low"

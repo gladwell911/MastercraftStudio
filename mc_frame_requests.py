@@ -1,6 +1,7 @@
 """Chat submission, provider dispatch, and clear operations."""
 
 import copy
+import sqlite3
 import uuid
 import wx
 from agy_acp import AGY_MODEL_ID, AgyError
@@ -256,6 +257,63 @@ class ChatRequestsMixin:
                     self._clear_active_claudecode_client(client)
 
         bindings.app.threading.Thread(target=_worker, daemon=True).start()
+
+    def _claim_native_tool_turn(self, chat, turns, index, session_key, session_for_chat, start, defer_save):
+        chat_id = str(chat.get("id") or "")
+        store = self.chat_store if self._chat_store_enabled else None
+        if store is None or not chat_id:
+            self.SetStatusText("无法确认排队问题的保存状态，请重新打开聊天。")
+            return
+        if chat_id in self._chat_turn_dirty_from or chat_id in self._native_history_reserved:
+            return
+        claims = getattr(self, "_native_tool_queue_claims", None)
+        if claims is None:
+            claims = self._native_tool_queue_claims = set()
+        if chat_id in claims:
+            return
+        claims.add(chat_id)
+        queued = copy.deepcopy(turns[index])
+        pending = dict(queued, request_status="pending", tool_queue_claimed=True, request_recoverable=False)
+        revision = max(1, int(chat.get("revision") or 1))
+        session_id = session_for_chat(chat)
+        scope = {key: chat[key] for key in
+                 ("model", "native_identity", "native_account", "codex_account_id", "kimi_account_id")
+                 if key in chat}
+        clear_generation = getattr(self, "_shortcut_clear_revisions", {}).get(chat_id)
+
+        def apply(claimed):
+            claims.discard(chat_id)
+            owner, current_turns, is_current = self._chat_target_for_request(chat_id)
+            if (getattr(self, "_closing", False) or not owner or owner.get("id") != chat_id
+                    or index >= len(current_turns)
+                    or current_turns[index] != queued or session_for_chat(owner) != session_id
+                    or max(1, int(owner.get("revision") or 1)) != revision
+                    or any(owner.get(key) != value for key, value in scope.items())
+                    or self._clear_pending_for(chat_id) or chat_id in self._native_history_reserved
+                    or getattr(self, "_shortcut_clear_revisions", {}).get(chat_id) != clear_generation):
+                return
+            if not claimed:
+                if is_current or self.view_history_id == chat_id:
+                    self.SetStatusText("无法确认排队问题的保存状态，请重新打开聊天。")
+                return
+            current_turns[index].update(pending)
+            self._mark_chat_turns_dirty(None if is_current else chat_id, index)
+            if is_current:
+                self.is_running = True
+                self._active_request_count = 1
+                self.SetStatusText("正在发送排队的问题")
+            start(chat_id, index, pending["request_question"], pending["model"])
+            defer_save()
+
+        def claim():
+            try:
+                claimed = store.claim_native_tool_turn(chat_id, index, scope, revision, session_key,
+                                                       session_id, queued, pending)
+            except (sqlite3.Error, OSError):
+                claimed = False
+            self._call_after_if_alive(apply, claimed)
+
+        bindings.app.threading.Thread(target=claim, daemon=True, name="claim-native-tool-turn").start()
 
     def _bind_provider_turn(self, owner, index):
         chat, turns, _current = self._chat_target_for_request(owner)
@@ -1210,10 +1268,11 @@ class ChatRequestsMixin:
             return False, f"以下附件无法读取，本次未发送，请移除或修复后重试：{failed_names}"
         if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
-        if (is_kimi_model(resolved_model) and tool_settings and self._kimi_settings_catalog
-                and not tool_settings.get("model")
-                and (outgoing_attachments or not self._parse_kimi_local_command(q))):
-            return False, "Kimi Code 没有可用的默认模型，请选择模型或检查 Kimi CLI 配置"
+        if tool_settings and (is_codex_model(resolved_model) or is_kimi_model(resolved_model)):
+            parse_command = self._parse_codex_local_command if is_codex_model(resolved_model) else self._parse_kimi_local_command
+            if outgoing_attachments or not parse_command(q):
+                if error := self._desktop_tool_settings_error(tool_settings):
+                    return False, error
         self._answer_list_tail_notice = ""
         self._answer_list_tail_notice_chat_id = ""
 

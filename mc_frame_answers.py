@@ -1457,6 +1457,8 @@ class AnswersMixin:
             "model_value": self.model_combo.GetValue(),
             "tool_route": self._tool_route,
             "tool_settings": self._pending_tool_settings(),
+            "restored_tool_settings": dict(self._restored_tool_settings),
+            "unavailable_tool_settings": set(self._unavailable_tool_settings),
             "answer_strings": list(self.answer_list.GetStrings()),
             "answer_meta": copy.deepcopy(self.answer_meta),
             "answer_visible_ids": list(self.answer_list_model.visible_ids),
@@ -1492,6 +1494,8 @@ class AnswersMixin:
         self._select_tool_route(snapshot["tool_route"])
         self._refresh_tool_setting_choices(snapshot["tool_settings"])
         self._codex_settings_explicit = snapshot["tool_settings"].get("explicit", False)
+        self._restored_tool_settings = snapshot["restored_tool_settings"]
+        self._unavailable_tool_settings = snapshot["unavailable_tool_settings"]
         self.answer_meta = snapshot["answer_meta"]
         self.answer_list.Set(snapshot["answer_strings"])
         self.answer_list_model.visible_ids = list(snapshot["answer_visible_ids"])

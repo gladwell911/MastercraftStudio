@@ -7,7 +7,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 import time
 
-from agy_acp import find_agy_executable
+from agy_acp import AGY_MODEL_ID, find_agy_executable
 from chat_information import format_quota_reset_time
 
 
@@ -35,7 +35,9 @@ def agy_session_rows(chat: dict, turns: list[dict]) -> list[str]:
     context = None
     settled = {}
     for index, turn in enumerate(turns if owner[0] and owner[1] else ()):
-        if turn.get("session_id") not in (None, "", owner[0]):
+        if (turn.get("model") != AGY_MODEL_ID or turn.get("local_command")
+                or turn.get("session_id") not in (None, "", owner[0])
+                or turn.get("agy_session_id") not in (None, "", owner[0])):
             continue
         owned = turn.get("agy_usage_owner") == owner
         if owned and turn.get("agy_context_tokens") is not None:

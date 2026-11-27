@@ -63,6 +63,8 @@ class ChatToolSettingsMixin:
     def _build_tool_settings_controls(self, panel, row):
         self._tool_mode = ""
         self._codex_settings_explicit = False
+        self._restored_tool_settings = {}
+        self._unavailable_tool_settings = set()
         self._tool_mode_menu_ids = []
         self._tool_route = DEFAULT_CODEX_MODEL
         self._codex_settings_catalog = {}
@@ -164,11 +166,41 @@ class ChatToolSettingsMixin:
             self._kimi_permission = permission if permission in dict(KIMI_PERMISSIONS) else "auto"
         self._refresh_tool_mode_menu()
 
+    def _desktop_tool_settings_error(self, settings):
+        tool = settings.get("tool")
+        if tool == "codex" and not self._codex_settings_catalog and self._restored_tool_settings:
+            self._request_codex_settings_catalog()
+            return "正在确认此聊天的 Codex 模型设置，请稍后重试。"
+        if tool == "kimi" and not self._kimi_settings_catalog:
+            self._request_kimi_settings_catalog()
+            return "正在读取 Kimi Code 模型目录，请稍后重试。"
+        if self._unavailable_tool_settings:
+            return "此聊天保存的工具设置不再可用，请重新选择后发送。"
+        if tool == "codex" and self._codex_settings_catalog and not settings.get("model"):
+            return "Codex 没有可用的默认模型，请选择模型或检查 Codex 配置。"
+        if tool == "kimi" and not settings.get("model"):
+            return "Kimi Code 没有可用的默认模型，请选择模型或检查 Kimi CLI 配置。"
+        return ""
+
+    def _restore_tool_setting_choices(self, selected):
+        self._refresh_tool_setting_choices(selected)
+        visible = self._pending_tool_settings()
+        self._unavailable_tool_settings = {
+            key for key in ("model", "effort", "mode", "speed", "permission")
+            if selected.get(key) and selected[key] != visible.get(key)
+        }
+        if "model" in self._unavailable_tool_settings:
+            choices = self._tool_settings_options(visible["tool"])["models"]
+            self._set_tool_choices(self.model_combo, [("", "请选择模型"), *(row for row in choices if row[0])], "")
+            self._set_tool_choices(self.reasoning_combo, (), "")
+
     def _select_tool_route(self, route):
         tool = tool_for_route(route)
         if self._current_tool() == tool and self._tool_route == route:
             return
         self._tool_route = route
+        self._restored_tool_settings = {}
+        self._unavailable_tool_settings.clear()
         self._codex_settings_explicit = False
         self._set_tool_choices(self.tool_combo, TOOLS, tool)
         self._refresh_tool_setting_choices()
@@ -180,17 +212,30 @@ class ChatToolSettingsMixin:
                          if isinstance(turn, dict) and isinstance(turn.get("tool_settings"), dict)
                          and turn["tool_settings"].get("tool") == self._current_tool()), None)
         selected = dict(selected or {})
+        self._restored_tool_settings = {}
+        self._unavailable_tool_settings.clear()
         if is_codex_model(route):
             for key, value in codex_cli_config_for_model(route).items():
                 selected.setdefault("effort" if key == "model_reasoning_effort" else key, value)
             selected.setdefault("speed", self._codex_service_tier_for_chat(chat) or "standard")
+            if not self._codex_settings_catalog and (selected.get("model") or selected.get("effort")
+                                                     or selected.get("mode") not in (None, "", "default")):
+                self._restored_tool_settings = dict(selected)
+                self._request_codex_settings_catalog()
         elif route == AGY_MODEL_ID and not selected:
             selected = self._agy_prior_tool_settings(chat)
         elif is_kimi_model(route):
             if route != "kimi/main":
                 selected.setdefault("model", kimi_model_to_server_alias(route))
+            if not self._kimi_settings_catalog:
+                self._restored_tool_settings = dict(selected)
             self._request_kimi_settings_catalog()
-        self._refresh_tool_setting_choices(selected)
+        tool = self._current_tool()
+        if ((tool == "codex" and self._codex_settings_catalog)
+                or (tool == "kimi" and self._kimi_settings_catalog)):
+            self._restore_tool_setting_choices(selected)
+        else:
+            self._refresh_tool_setting_choices(selected)
 
     def _on_tool_changed(self, _event):
         tool = self._current_tool()
@@ -202,6 +247,8 @@ class ChatToolSettingsMixin:
             self._tool_route = {"codex": DEFAULT_CODEX_MODEL, "agy": AGY_MODEL_ID,
                                 "kimi": "kimi/main", "other": "claudecode/default"}[tool]
             self._codex_settings_explicit = False
+            self._restored_tool_settings = {}
+            self._unavailable_tool_settings.clear()
             self._refresh_tool_setting_choices()
         self._on_model_changed(None)
         if tool == "codex":
@@ -212,6 +259,7 @@ class ChatToolSettingsMixin:
             self._request_kimi_settings_catalog()
 
     def _on_tool_model_changed(self, event):
+        self._unavailable_tool_settings.difference_update(("model", "effort", "speed"))
         self._on_tool_setting_changed(event)
         self._refresh_tool_setting_choices(self._pending_tool_settings())
         self._on_model_changed(event)
@@ -223,7 +271,9 @@ class ChatToolSettingsMixin:
             elif choice == "k3.1-pro-highspeed" and "K3.1" in label:
                 self.SetStatusText("K3.1 Pro Highspeed 约消耗 2 倍用量")
 
-    def _on_tool_setting_changed(self, _event):
+    def _on_tool_setting_changed(self, event):
+        if event is not None and event.GetEventObject() is self.reasoning_combo:
+            self._unavailable_tool_settings.discard("effort")
         if self._current_tool() == "codex":
             self._codex_settings_explicit = True
 
@@ -291,16 +341,14 @@ class ChatToolSettingsMixin:
             "defaults": {"model": default, "speed": "standard", "mode": "default"},
         }
         if visible:
-            selected = self._pending_tool_settings()
-            chat = self._visible_codex_speed_chat()
-            turns = (chat or {}).get("turns") or ()
-            prior = next((turn["tool_settings"] for turn in reversed(turns)
-                          if isinstance(turn, dict) and isinstance(turn.get("tool_settings"), dict)
-                          and turn["tool_settings"].get("tool") == "kimi"), {})
-            selected["model"] = prior.get("model") or (
-                kimi_model_to_server_alias(self._tool_route) if self._tool_route != "kimi/main" else default)
-            selected["effort"] = prior.get("effort")
-            self._refresh_tool_setting_choices(selected)
+            selection = self._pending_tool_settings()
+            for key in ("model", "effort"):
+                selection.pop(key)
+            if self._tool_route != "kimi/main":
+                selection["model"] = kimi_model_to_server_alias(self._tool_route)
+            restored = self._restored_tool_settings
+            self._restored_tool_settings = {}
+            self._restore_tool_setting_choices(dict(selection, **restored))
             if not default:
                 self.SetStatusText("Kimi Code 没有可用的默认模型，请选择模型或检查 Kimi CLI 配置")
 
@@ -355,17 +403,19 @@ class ChatToolSettingsMixin:
         modes = [("default", MODE_NAMES["default"])]
         modes.extend((mode, MODE_NAMES.get(mode, entry.get("name") or mode))
                      for entry in result["modes"] if (mode := entry.get("mode")) and mode != "default")
+        default = result["default_model"]
+        if default not in model_options:
+            default = ""
+            models.insert(0, ("", "请选择模型" if model_options else UNAVAILABLE))
         self._codex_settings_catalog = {
             "models": models, "model_options": model_options, "modes": modes,
-            "defaults": {"model": result["default_model"], "speed": "standard", "mode": "default"},
+            "defaults": {"model": default, "speed": "standard", "mode": "default"},
         }
         if self._current_tool() == "codex":
-            current = self._pending_tool_settings()
-            if not current["model"]:
-                current.pop("model")
-            if not current["effort"]:
-                current.pop("effort")
-            self._refresh_tool_setting_choices(current)
+            restored = self._restored_tool_settings
+            self._restored_tool_settings = {}
+            current = {key: value for key, value in self._pending_tool_settings().items() if value}
+            self._restore_tool_setting_choices(dict(current, **restored))
 
     def _append_tool_modes(self, menu, id_refs):
         options = self._tool_settings_options(self._current_tool())
@@ -409,6 +459,9 @@ class ChatToolSettingsMixin:
                       id=menu_id)
 
     def _select_tool_mode(self, mode, label):
+        self._unavailable_tool_settings.discard("mode")
+        if self._restored_tool_settings:
+            self._restored_tool_settings["mode"] = mode
         self._tool_mode = mode
         self._refresh_tool_mode_menu()
         self.SetStatusText(f"下一回合的工具模式：{label}")
@@ -428,6 +481,9 @@ class ChatToolSettingsMixin:
         return items
 
     def _select_kimi_permission(self, mode, label):
+        self._unavailable_tool_settings.discard("permission")
+        if self._restored_tool_settings:
+            self._restored_tool_settings["permission"] = mode
         self._kimi_permission = mode
         self._refresh_tool_mode_menu()
         self.SetStatusText(f"下一回合的 Kimi 执行审批：{label}")
