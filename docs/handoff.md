@@ -1,6 +1,20 @@
 # 当前交接
 
-更新日期 2026-11-23。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。
+更新日期 2026-11-27。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。
+
+## 2026-11-27 T13 本机验收
+
+本机验收使用隔离候选和专用 ARM64 模拟器。实体笔记本及物理双机改名、历史回读已从 T13 验收范围移除。正式 NATS 整体验收和 TalkBack 发音专项沿用此前范围决定。T13 候选尚未切换到日常安装。
+
+本机 T13 已通过 Codex 首发、审批拒绝与真实 Plan 问答，以及 AGY 原回合追加、改名和重开回读。此前的新到终答通知点击验收继续有效。Kimi Code 2.6.3 已完成真实审批和追加提交，原生记录仍落到下一回合。详见 [MC 候选交接](../../.build-work/mc-rc-three-cli-shared-sessions/mc-integration/docs/handoff.md#t13-本机验收)。
+
+**Kimi Code 2.6.3 同回合追加延期。** 固定版本接受直接追加和排队后 Steer，原生转录均将追加记为新回合的 `opener`。真实账号审批场景结果一致。候选继续按下一轮排队，旧 2.5.3 沿用原协议。[原生复验与裁决](../../.build-work/mc-rc-three-cli-shared-sessions/candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md#kimi-code-同回合追加裁决)
+
+**较早离屏通知已通过本机候选验收。** RC `037f9fd` 配对 MC `48fb873`。同一长聊天中，点击第 4 条终答的通知后，RC 显示对应消息，MC 确认已读到第 4 条，系统清除旧通知，第 24 条终答保持未读，系统通知仍保留。见 [候选结果和 APK 校验](../../.build-work/mc-rc-three-cli-shared-sessions/candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md)。
+
+### 本机验收结论
+
+按用户决定，Kimi 同回合追加延期，本机 T13 按其余范围验收完成。较早终答通知的实装配对为 MC `48fb873`、RC `037f9fd`，QA ARM64 APK SHA-256 为 `EF92C41EDC56545529223B44148D0D763744D79505F2540632C4B3D947606783`。其他通过场景各自使用其证据所列的候选。重启该延期项前，先取得追加属于同一原生回合的证据，再做真实账号审批和 RC 终答的跨端验收。
 
 ## 2026-11-23 聊天切换与争渡播报
 
