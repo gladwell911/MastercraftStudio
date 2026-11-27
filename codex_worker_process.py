@@ -625,6 +625,7 @@ class CodexWorkerRuntime:
             thread_id = str(payload.get("thread_id") or "").strip()
             exact_resume = bool(payload.get("native_home"))
             options = self._approval_options(payload)
+            settings = payload.get("tool_settings") or {}
             if shared is not None and shared["thread_id"] != thread_id:
                 raise RuntimeError("Codex 共享终端线程已改动，请重新打开聊天。")
             items = list(payload.get("input_items") or [])
@@ -701,12 +702,14 @@ class CodexWorkerRuntime:
                             service_tier=service_tier_arg,
                         )
                     except Exception as exc:
-                        if exact_resume or not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
+                        if exact_resume or payload.get("settings_force_new") or not (self._is_thread_missing_error(exc) or self._is_rollout_missing_error(exc)):
                             raise
                         thread_id = self._start_thread(client, payload, service_tier_arg)
                         items = self._recovery_input_items(payload, items)
-                turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg,
-                    **options)
+                if settings.get("model"):
+                    options.update(model=settings["model"], effort=settings.get("effort"),
+                                   collaboration_mode=settings.get("mode"), turn_speed=settings.get("speed"))
+                turn_response = client.start_turn_items(thread_id, items, service_tier=service_tier_arg, **options)
             turn_id = self._extract_id(turn_response, "turn", "turn_id")
             if steered and not turn_id:
                 turn_id = str(payload.get("turn_id") or "").strip()

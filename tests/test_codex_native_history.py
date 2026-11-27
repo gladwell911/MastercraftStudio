@@ -17,19 +17,27 @@ real_codex = pytest.mark.skipif(
 
 
 @pytest.fixture
-def codex_homes(tmp_path, monkeypatch):
+def codex_homes(tmp_path, monkeypatch, request):
     import codex_history
     import main
     from codex_worker_client import CodexWorkerClient
 
     calls = []
+    hold = request.getfixturevalue("codex_model_request_gate") if (
+        request is not None and "codex_model_request_gate" in request.fixturenames) else None
 
     class Model(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_POST(self):
-            calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(payload)
+            if hold and "MC_SETTINGS_HOLD" in str(payload["input"][-1]):
+                started, release = hold
+                started.set()
+                if not release.wait(20):
+                    return
             item = {"id": "msg_fixture", "type": "message", "status": "completed", "role": "assistant",
                     "phase": "final_answer", "content": [{"type": "output_text", "text": "CODX_08_FULL_TAIL",
                                                            "annotations": []}]}

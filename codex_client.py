@@ -50,6 +50,7 @@ DEFAULT_INITIALIZE_TIMEOUT = 45
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_CODEX_TURN_TIMEOUT = 300
 DEFAULT_CODEX_APPROVAL_MODE = "auto-review"
+DESKTOP_DEFAULT_CODEX_APPROVAL_MODE = "never"
 DEFAULT_CODEX_APPROVAL_POLICY = "on-request"
 DEFAULT_CODEX_SANDBOX = "danger-full-access"
 DEFAULT_CODEX_APPROVALS_REVIEWER = "auto_review"
@@ -806,6 +807,26 @@ class CodexAppServerClient:
     def read_account(self, refresh_token: bool = False) -> dict:
         return self.request("account/read", {"refreshToken": bool(refresh_token)})
 
+    def read_tool_settings_catalog(self) -> dict:
+        rows = []
+        cursor = None
+        while True:
+            page = self.request("model/list", {"cursor": cursor, "includeHidden": False})
+            rows.extend(item for item in page.get("data", ()) if item.get("model") and not item.get("hidden"))
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        if not rows:
+            raise CodexRpcError("供应商未返回可用模型")
+        try:
+            modes = self.request("collaborationMode/list", {}).get("data", ())
+        except CodexRpcError as exc:
+            if exc.code != -32601:
+                raise
+            modes = ()
+        default = next((item for item in rows if item.get("isDefault")), rows[0])
+        return {"models": rows, "modes": modes, "default_model": default["model"]}
+
     def read_native_usage(self, thread_id: str) -> dict:
         """Read only this thread's authoritative, complete rollout token record."""
         response = self.read_thread(thread_id, include_turns=False)
@@ -895,6 +916,10 @@ class CodexAppServerClient:
         approval_policy: str | None = None,
         sandbox: str | None = None,
         approvals_reviewer: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        collaboration_mode: str | None = None,
+        turn_speed: str | None = None,
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
@@ -902,6 +927,17 @@ class CodexAppServerClient:
             "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
         configuration = getattr(self, "thread_configurations", {}).get(params["threadId"], {})
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
+        if turn_speed:
+            params["serviceTierForTurn"] = {"standard": "default", "fast": "priority"}.get(turn_speed, turn_speed)
+        if collaboration_mode and model:
+            params["collaborationMode"] = {
+                "mode": collaboration_mode,
+                "settings": {"model": model, "reasoning_effort": effort or None},
+            }
         if approval_policy is not None:
             params["approvalPolicy"] = approval_policy
         if approvals_reviewer is not None:

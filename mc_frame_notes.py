@@ -159,6 +159,8 @@ class NotesMixin:
                 "send_button",
                 "new_chat_button",
                 "model_combo",
+                "tool_combo",
+                "reasoning_combo",
                 "codex_speed_combo",
                 "history_list",
                 "notes_notebook_list",
@@ -175,7 +177,9 @@ class NotesMixin:
         ordered_controls = [
             self.input_edit,
             self.new_chat_button,
+            self.tool_combo,
             self.model_combo,
+            self.reasoning_combo,
             self.codex_speed_combo,
             self.send_button,
             primary_notes_ctrl,
@@ -195,7 +199,7 @@ class NotesMixin:
             seen.add(marker)
             root_tab_order.append(ctrl)
         self.root_tab_order = root_tab_order
-        self.chat_tab_order = root_tab_order[:8]
+        self.chat_tab_order = root_tab_order[:10]
         self.notes_tab_order = [primary_notes_ctrl] + [
             ctrl
             for ctrl in (self.notes_notebook_list, self.notes_entry_list, self.notes_editor)

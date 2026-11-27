@@ -400,21 +400,10 @@ class CodexSessionsMixin:
             return normalize_codex_service_tier(self.codex_speed_combo.GetValue())
         return self._codex_service_tier_for_chat(self._visible_codex_speed_chat())
 
-    def _sync_codex_speed_combo_enabled_for_model(self, model: str | None = None) -> None:
-        combo = getattr(self, "codex_speed_combo", None)
-        if combo is None:
-            return
-        resolved_model = bindings.app.model_id_from_display_name(str(model or self.selected_model or ""))
-        combo.Enable(is_codex_model(resolved_model))
-
     def _sync_codex_speed_combo_from_chat(self, chat: dict | None) -> None:
         combo = getattr(self, "codex_speed_combo", None)
         if combo is None:
             return
-        tier = self._codex_service_tier_for_chat(chat)
-        label = codex_service_tier_label(tier)
-        if combo.GetValue() != label:
-            combo.SetValue(label)
         model = str((chat or {}).get("model") or self.selected_model or "").strip()
         if not model and isinstance(chat, dict):
             turns = chat.get("turns") if isinstance(chat.get("turns"), list) else []
@@ -422,7 +411,7 @@ class CodexSessionsMixin:
                 if isinstance(turn, dict) and str(turn.get("model") or "").strip():
                     model = str(turn.get("model") or "").strip()
                     break
-        self._sync_codex_speed_combo_enabled_for_model(model)
+        self._sync_tool_settings_from_chat(chat, model or DEFAULT_CODEX_MODEL)
 
     def _set_codex_service_tier_for_chat(self, chat: dict | None, service_tier: str | None) -> str:
         tier = normalize_codex_service_tier(service_tier)
@@ -456,6 +445,8 @@ class CodexSessionsMixin:
         return str(self.active_chat_id or self.current_chat_id or "").strip()
 
     def _on_codex_speed_changed(self, _):
+        if self._current_tool() != "codex":
+            return
         chat = self._visible_codex_speed_chat()
         previous_tier = self._codex_service_tier_for_chat(chat)
         requested_tier = normalize_codex_service_tier(self.codex_speed_combo.GetValue())
@@ -849,15 +840,58 @@ class CodexSessionsMixin:
         )
 
     def _start_codex_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str) -> None:
-        target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id, ""} else self._find_archived_chat(chat_id)
-        turns = target_chat.get("turns") if isinstance(target_chat, dict) and isinstance(target_chat.get("turns"), list) else []
+        target_chat, turns, is_current = self._chat_target_for_request(chat_id)
         if 0 <= turn_idx < len(turns) and isinstance(turns[turn_idx], dict):
-            turns[turn_idx]["codex_context_generation"] = int(target_chat.get("codex_context_generation") or 0)
-            turns[turn_idx]["codex_start_generation"] = turns[turn_idx]["codex_context_generation"]
+            turn = turns[turn_idx]
+            turn["codex_context_generation"] = int(target_chat.get("codex_context_generation") or 0)
+            turn["codex_start_generation"] = turn["codex_context_generation"]
+            self._prepare_codex_tool_turn(turn, turns[:turn_idx])
+            if turn.get("codex_settings_force_new") and (
+                    self._codex_should_steer_turn(target_chat, is_current)
+                    or self._codex_active_request_turn_count(turns[:turn_idx])
+                    or any(row.get("request_status") == "queued" for row in turns[:turn_idx] if isinstance(row, dict))):
+                turn["request_status"] = "queued"
+                if is_current:
+                    self.SetStatusText("已排队，将在当前回合结束后发送")
+                return
         def _worker() -> None:
             self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
 
         bindings.app.threading.Thread(target=_worker, daemon=True).start()
+
+    @staticmethod
+    def _prepare_codex_tool_turn(turn, prior_turns):
+        settings = turn.get("tool_settings")
+        if not settings or not settings.get("model"):
+            return
+        previous = next((row for row in reversed(prior_turns) if isinstance(row, dict)
+                         and is_codex_model(row.get("model")) and row.get("request_question")), None)
+        if previous is None:
+            return
+        before = previous.get("tool_settings") or {}
+        if previous.get("request_status") == "queued" or (
+                before.get("model") and any(settings.get(key) != before.get(key)
+                                            for key in ("model", "effort", "speed", "mode"))):
+            turn["codex_settings_force_new"] = True
+
+    def _launch_next_codex_tool_turn(self, chat_id):
+        chat, turns, is_current = self._chat_target_for_request(chat_id)
+        if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
+                or self._codex_should_steer_turn(chat, is_current)
+                or self._codex_active_request_turn_count(turns)):
+            return
+        for index, turn in enumerate(turns):
+            if not isinstance(turn, dict) or turn.get("request_status") != "queued":
+                continue
+            turn["request_status"] = "pending"
+            self._mark_chat_turns_dirty(None if is_current else chat_id, index)
+            if is_current:
+                self.is_running = True
+                self._active_request_count = 1
+                self.SetStatusText("正在发送排队的问题")
+            self._start_codex_worker_for_turn(chat_id, index, turn["request_question"], turn["model"])
+            self._defer_codex_state_save()
+            return
 
     def _start_codex_local_command_worker_for_turn(self, chat_id: str, turn_idx: int, command: str, args: str, model: str) -> None:
         bindings.app.threading.Thread(
@@ -1125,8 +1159,14 @@ class CodexSessionsMixin:
                     return
                 target_turns = self.active_session_turns
             service_tier = self._codex_service_tier_for_chat(target_chat)
+            tool_settings = {}
+            settings_force_new = False
             if 0 <= turn_idx < len(target_turns) and isinstance(target_turns[turn_idx], dict):
-                service_tier = normalize_codex_service_tier(target_turns[turn_idx].get("codex_service_tier")) or service_tier
+                turn = target_turns[turn_idx]
+                tool_settings = turn.get("tool_settings") or {}
+                settings_force_new = bool(turn.get("codex_settings_force_new"))
+                if "codex_service_tier" in turn:
+                    service_tier = normalize_codex_service_tier(turn["codex_service_tier"])
             turn_attachments = []
             if 0 <= turn_idx < len(target_turns):
                 maybe_attachments = target_turns[turn_idx].get("attachments") if isinstance(target_turns[turn_idx], dict) else []
@@ -1134,7 +1174,8 @@ class CodexSessionsMixin:
                     turn_attachments = [item for item in maybe_attachments if str((item or {}).get("status") or "") == "success"]
             send_question = question
             input_items = self._build_codex_input_items(send_question, turn_attachments)
-            should_steer = self._codex_should_steer_turn(target_chat, is_current_target) and bool(turn_id)
+            should_steer = (not settings_force_new and self._codex_should_steer_turn(target_chat, is_current_target)
+                            and bool(turn_id))
             history_turns = target_turns[:turn_idx] if turn_idx > 0 else []
             if (should_steer and history_turns and isinstance(history_turns[-1], dict)
                     and str(history_turns[-1].get("request_status") or "") == "failed"
@@ -1160,6 +1201,8 @@ class CodexSessionsMixin:
                 attachments=turn_attachments,
                 service_tier=service_tier,
                 should_steer=should_steer,
+                tool_settings=tool_settings,
+                settings_force_new=settings_force_new,
                 require_existing_terminal=bool(thread_id and thread_id == target_chat.get("codex_terminal_thread")
                                                and self._codex_should_steer_turn(target_chat, is_current_target)),
                 approval_policy=getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE),
@@ -1549,6 +1592,9 @@ class CodexSessionsMixin:
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
+        if event_type == "turn_completed" and isinstance(identity_chat, dict):
+            owner = str(identity_chat.get("id") or chat_id or "")
+            self._call_after_if_alive(self._launch_next_codex_tool_turn, owner)
         data = event.data if isinstance(event.data, dict) else {}
         if data.get("interaction_id"):
             if (isinstance(identity_chat, dict) and self._codex_thread_id_for_chat(identity_chat) == event_thread_id
@@ -2189,7 +2235,7 @@ class CodexSessionsMixin:
             if not isinstance(turn, dict):
                 continue
             status = str(turn.get("request_status") or "").strip()
-            if status in {"done", "failed"}:
+            if status in {"done", "failed", "queued"}:
                 continue
             answer_md = str(turn.get("answer_md") or "").strip()
             if status in {"pending", "running"} or answer_md == REQUESTING_TEXT:
@@ -2259,10 +2305,16 @@ class CodexSessionsMixin:
             target_chat["codex_pending_prompt"] = ""
             target_chat["codex_thread_flags"] = []
         self._clear_codex_worker_active_turn(chat_id, target_idx, turn.get("codex_turn_id"))
+        if turn.get("codex_settings_force_new"):
+            turn["answer_md"] = message
+            if is_current_target:
+                self.SetStatusText(f"Codex 设置应用失败：{message}")
+                self._update_active_answer_row(target_idx)
         self._mark_chat_turns_dirty(None if is_current_target else chat_id, target_idx)
         if not is_current_target:
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
+        self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
 
     def _on_codex_worker_exit(self, chat_id: str, returncode, source_client=None) -> None:
         if bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():

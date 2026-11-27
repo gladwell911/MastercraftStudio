@@ -13,6 +13,7 @@ from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
 from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, allows_final_notification
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
+    DESKTOP_DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
     codex_approval_parameters,
     normalize_codex_approval_mode,
@@ -563,7 +564,10 @@ class ChatHistoryMixin:
         version = data.get("codex_approval_defaults_version")
         version = version if type(version) is int and version >= 1 else 0
         self.codex_approval_defaults_version = max(1, version)
-        self.codex_approval_policy = normalize_codex_approval_mode(data.get("codex_approval_policy")) if version else DEFAULT_CODEX_APPROVAL_MODE
+        self.codex_approval_policy = normalize_codex_approval_mode(
+            data.get("codex_approval_policy") if version and data.get("codex_approval_policy")
+            else DESKTOP_DEFAULT_CODEX_APPROVAL_MODE
+        )
         approval_changed = not version or data.get("codex_approval_policy") != self.codex_approval_policy
         self.codex_sandbox = normalize_codex_sandbox(data["codex_sandbox"]) if "codex_sandbox" in data else codex_approval_parameters(self.codex_approval_policy)["sandbox"]
         approval_changed = approval_changed or data.get("codex_sandbox") != self.codex_sandbox

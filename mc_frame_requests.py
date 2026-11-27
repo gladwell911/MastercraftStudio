@@ -25,6 +25,8 @@ class ChatRequestsMixin:
         if bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():
             cached = str(self.selected_model or "").strip()
             return bindings.app.normalize_model_id(cached)
+        if self._current_tool() in {"codex", "agy", "kimi"}:
+            return self._tool_route
         current = (self.model_combo.GetStringSelection() or "").strip()
         resolved = bindings.app.normalize_model_id(current, default="")
         if resolved:
@@ -125,6 +127,8 @@ class ChatRequestsMixin:
         if is_kimi_model(model):
             self._clear_kimi_active_turn(chat_id, turn_idx)
         self._on_done(turn_idx, "", message, model, "", chat_id)
+        if is_codex_model(model):
+            self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
 
     def _set_active_claudecode_client(self, client, chat_id: str) -> None:
         with self._active_claudecode_client_lock:
@@ -1141,6 +1145,7 @@ class ChatRequestsMixin:
         if self._clear_pending_for(chat_id or self._visible_clear_owner()):
             return False, "正在清空此聊天的上下文"
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
+        tool_settings = self._pending_tool_settings() if source == "local" and model is None else None
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
@@ -1266,6 +1271,8 @@ class ChatRequestsMixin:
             self.active_session_started_at = bindings.app.time.time()
         self.selected_model = resolved_model
         self.model_combo.SetValue(bindings.app.model_display_name(resolved_model))
+        if tool_settings:
+            self._refresh_tool_setting_choices(tool_settings)
         self._current_chat_state["id"] = self.active_chat_id or self.current_chat_id or ""
         self._current_chat_state["model"] = resolved_model
         self._current_chat_state["turns"] = self.active_session_turns
@@ -1277,7 +1284,8 @@ class ChatRequestsMixin:
         codex_service_tier = self._current_codex_service_tier() if is_codex_model(resolved_model) else ""
         if is_codex_model(resolved_model):
             self._current_chat_state["codex_service_tier"] = codex_service_tier
-            self._sync_codex_speed_combo_from_chat(self._current_chat_state)
+            if tool_settings is None:
+                self._sync_codex_speed_combo_from_chat(self._current_chat_state)
         worker_question = q
         if (success_attachments and prepared_attachments is None
                 and not is_codex_model(resolved_model) and not is_kimi_model(resolved_model)):
@@ -1495,6 +1503,8 @@ class ChatRequestsMixin:
             turn["clear_revision"] = getattr(self, "_clear_resend_revision", None)
         if is_codex_model(resolved_model):
             turn["codex_service_tier"] = codex_service_tier
+        if tool_settings and tool_settings["tool"] != "other":
+            turn["tool_settings"] = tool_settings
         self.active_session_turns.append(turn)
         self.active_turn_idx = turn_idx
         self._mark_chat_turns_dirty(start_index=turn_idx)
