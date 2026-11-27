@@ -24,6 +24,10 @@ REAL_USERPROFILE = os.environ.get("USERPROFILE", "")
 @pytest.fixture
 def handoff_runtime(frame, tmp_path, monkeypatch, request):
     request.addfinalizer(frame._close_agy_clients)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    monkeypatch.setenv("CODEX_BIN", str(tmp_path / "unavailable-codex.exe"))
     project = tmp_path / "source-project"
     project.mkdir()
     log = project / "requests.jsonl"
