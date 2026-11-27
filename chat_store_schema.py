@@ -31,6 +31,11 @@ class ChatStoreSchemaMixin:
                     detail_panel_mode TEXT NOT NULL DEFAULT 'answers',
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS native_history_owners (
+                    native_chat_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL UNIQUE,
+                    account TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS turns (
                     chat_id TEXT NOT NULL,
                     turn_index INTEGER NOT NULL,

@@ -3,12 +3,19 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import threading
 
 import pytest
 import wx
 
+from kimi_runtime import child_environment
+from remote_nats import RemoteNatsTransport
+from shared_terminal import TerminalServer
+from shared_terminal_command import terminal_endpoint
+from shared_terminal_routes import dispatch_terminal
 from test_voice_input_ui_automation import _pump_until
 
 
@@ -19,7 +26,12 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def loopback_kimi_home(tmp_path, monkeypatch):
+def gated_reply():
+    return threading.Event()
+
+
+@pytest.fixture
+def loopback_kimi_home(tmp_path, monkeypatch, gated_reply):
     requests = []
 
     class Model(BaseHTTPRequestHandler):
@@ -38,6 +50,24 @@ def loopback_kimi_home(tmp_path, monkeypatch):
                 {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10,
                                           "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 20}}},
             ]
+            last = next((message for message in reversed(body["messages"])
+                         if message.get("role") == "tool" or any(marker in str(message.get("content"))
+                            for marker in ("QA_NATIVE_TOOL_CALL", "QA_SHARED_TOOL_GATE"))), {})
+            if last.get("role") == "user":
+                chunks[:2] = [
+                    {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+                        {"index": 0, "id": "call_qa_native_glob", "type": "function", "function": {
+                            "name": "Glob", "arguments": '{"pattern":"qa-native-*.txt"}',
+                        }},
+                    ]}, "finish_reason": None}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                ]
+            if (last.get("role") == "tool" and "qa-native-gated-tool.txt" in str(last.get("content"))
+                    and any("QA_SHARED_TOOL_GATE" in str(message.get("content")) for message in body["messages"])):
+                if not gated_reply.wait(25):
+                    self.send_error(503)
+                    return
+                chunks[0]["choices"][0]["delta"]["content"] = "完整回复。" * 350 + " QA_SHARED_FINAL_TAIL"
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -86,7 +116,7 @@ max_context_size = 32768
 
 
 def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
-    frame, wx_app, monkeypatch, loopback_kimi_home, caplog
+    loopback_kimi_home, frame, wx_app, monkeypatch, caplog
 ):
     caplog.set_level("DEBUG", logger="kimi_server_v2")
     workspace, requests = loopback_kimi_home
@@ -156,5 +186,152 @@ def test_reopened_kimi_chat_displays_nonempty_usage_in_alt_y(
     finally:
         if frame._chat_information_dialog is not None:
             frame._chat_information_dialog.Close()
+        if frame._kimi_client is not None:
+            frame._kimi_client.close()
+
+
+@pytest.mark.parametrize("stop_remotely", [False, True], ids=["complete", "stop"])
+def test_powershell_uses_the_real_shared_kimi_turn_before_its_final(
+    loopback_kimi_home, frame, wx_app, monkeypatch, wait_for_wx, gated_reply, stop_remotely,
+):
+    workspace, requests = loopback_kimi_home
+    seed = subprocess.run([os.environ["KIMI_BIN"], "-p", "QA_SHARED_SEED"], cwd=workspace,
+                          env=child_environment(), timeout=20, capture_output=True, check=True, encoding="utf-8")
+    assert "QA_RUNTIME_OK" in seed.stdout
+    native = subprocess.run([os.environ["KIMI_BIN"], "session", "list", "--json"], cwd=workspace,
+                            env=child_environment(), timeout=20, capture_output=True, check=True, encoding="utf-8")
+    native_session, = json.loads(native.stdout)
+    (workspace / "qa-native-gated-tool.txt").write_text("synthetic fixture", encoding="utf-8")
+    monkeypatch.setattr(frame, "_play_send_sound", lambda: None)
+    monkeypatch.setattr(frame, "_play_finish_sound", lambda: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_args, **_kwargs: None)
+
+    def current_chats():
+        return [chat for chat in frame._remote_api_history_list_ui()[1]["chats"]
+                if chat["model"] == "kimi/main" and chat["turn_count"] == 1]
+
+    def remote():
+        return RemoteNatsTransport(
+            pair_id="default", token="synthetic", durable_store=frame.chat_store, on_state=frame._remote_api_state_ui,
+            on_history_read=frame._remote_api_history_read_ui, on_message=frame._remote_api_message_ui,
+            on_execution_page=lambda payload: frame._remote_api_execution_page_ui(payload, secret="synthetic"),
+        )
+
+    output_path = workspace / "terminal-stdout.log"
+    errors_path = workspace / "terminal-stderr.log"
+
+    def run_power_shell(prompt):
+        env = dict(os.environ, MC_QA_TERMINAL_PYTHON=sys.executable,
+                   MC_QA_TERMINAL_SOURCE=str(Path(__file__).resolve().parents[1] / "worker_launcher.py"),
+                   MC_QA_TERMINAL_SESSION=native_session["id"], MC_QA_TERMINAL_PROMPT=prompt)
+        with output_path.open("wb") as stdout, errors_path.open("wb") as stderr:
+            return subprocess.Popen([
+                "powershell.exe", "-NoProfile", "-Command", "& $env:MC_QA_TERMINAL_PYTHON "
+                "$env:MC_QA_TERMINAL_SOURCE --shared-terminal kimi --chat "
+                "$env:MC_QA_TERMINAL_SESSION --send $env:MC_QA_TERMINAL_PROMPT",
+            ], cwd=workspace, env=env, stdout=stdout, stderr=stderr)
+
+    command = None
+    try:
+        wait_for_wx(current_chats, "discovered Kimi native session", timeout=15)
+        owner, = current_chats()
+        chat_id = owner["chat_id"]
+        endpoint = terminal_endpoint(Path(sys.executable).resolve().with_name("mc.exe"))
+        assert endpoint.is_relative_to(Path(os.environ["LOCALAPPDATA"]))
+        with TerminalServer(endpoint, lambda op, body: dispatch_terminal(frame, op, body)):
+            command = run_power_shell("QA_SHARED_TOOL_GATE")
+            first = remote()
+
+            def remote_command(reader, command_type):
+                status, body = reader._route_command({"type": command_type, "chat_id": chat_id})
+                assert status == 200, body
+                return body
+
+            def observed_tool(reader):
+                status, body = reader._route_command({"type": "execution_page_v3", "chat_id": chat_id})
+                if status == 409 and body.get("error") == "EXECUTION_SOURCE_PENDING":
+                    return None
+                assert status == 200, body
+                return next((row for row in body["rows"] if row["list_text"].startswith("Glob")), None)
+
+            wait_for_wx(lambda: observed_tool(first) and len(requests) == 3,
+                        "real runtime executed Glob and blocked in the model", timeout=18)
+            state = remote_command(first, "state")
+            assert state["running"] and state["native_turn_id"]
+            assert command.poll() is None
+            assert frame._show_history_chat(chat_id)
+            assert frame.view_history_id == chat_id
+            reconnect = remote()
+            assert remote_command(reconnect, "state")["native_turn_id"] == state["native_turn_id"]
+            row_id = observed_tool(first)["row_id"]
+            assert observed_tool(reconnect)["row_id"] == row_id
+            desktop_rows, _ = frame._execution_page_projection()
+            assert row_id in {identity for identity, _ in desktop_rows}
+            wait_for_wx(lambda: any("qa-native-gated-tool.txt" in row["detail_text"]
+                                   for row in frame.chat_store.load_execution_steps(chat_id)),
+                        "tool output replaces the in-progress row")
+            wait_for_wx(lambda: observed_tool(reconnect) and observed_tool(reconnect)["row_id"] == row_id,
+                        "reconnected execution updates the same row")
+            if stop_remotely:
+                stop = {"type": "message", "chat_id": chat_id, "text": "/stop",
+                        "expected_native_turn_id": state["native_turn_id"]}
+                assert reconnect._route_command({**stop, "expected_native_turn_id": "expired"})[0] == 409
+                assert reconnect._route_command(stop)[0] == 200
+                wait_for_wx(lambda: command.poll() is not None, "PowerShell receives native cancellation", timeout=15)
+                assert command.returncode != 0
+                assert "已中断" in errors_path.read_text(encoding="utf-8", errors="replace")
+                assert not gated_reply.is_set()
+                assert not remote_command(reconnect, "state")["running"]
+                assert reconnect._route_command(stop)[0] == 409
+                assert len(requests) == 3
+                return
+            gated_reply.set()
+            wait_for_wx(lambda: command.poll() is not None, "PowerShell final answer", timeout=20)
+            assert command.returncode == 0, errors_path.read_text(encoding="utf-8", errors="replace")
+            assert "QA_SHARED_FINAL_TAIL" in output_path.read_text(encoding="utf-8")
+            history = remote_command(reconnect, "history_read")["chat"]["turns"]
+            assert [turn["question"] for turn in history] == ["QA_SHARED_SEED", "QA_SHARED_TOOL_GATE"]
+            assert history[-1]["client_send_id"].startswith("terminal:")
+            def remote_final():
+                status, page = reconnect._route_command({"type": "execution_page_v3", "chat_id": chat_id})
+                if status != 200:
+                    return None
+                return next((row for row in page["rows"] if row.get("kind") == "final"
+                             and row.get("turn_index") == 1), None)
+
+            # wx timers which persist the accepted turn run in the native main loop.
+            def check_durable(_event):
+                if remote_final() is not None:
+                    wx_app.ExitMainLoop()
+
+            poll = wx.Timer(frame)
+            frame.Bind(wx.EVT_TIMER, check_durable, poll)
+            poll.Start(30)
+            timeout = wx.CallLater(5000, wx_app.ExitMainLoop)
+            try:
+                wx_app.MainLoop()
+            finally:
+                timeout.Stop()
+                poll.Stop()
+                frame.Unbind(wx.EVT_TIMER, source=poll)
+            answer = remote_final()
+            assert answer is not None, "durable execution includes final answer"
+            text = answer["answer_text"]
+            cursor = answer["answer_text_continuation"]
+            assert cursor
+            while cursor:
+                status, chunk = reconnect._route_command({"type": "content_page", "chat_id": chat_id,
+                                                           "body": {"cursor": cursor}})
+                assert status == 200, chunk
+                text += chunk["text"]
+                cursor = chunk["cursor"]
+            assert text == "完整回复。" * 350 + " QA_SHARED_FINAL_TAIL"
+            assert not remote_command(reconnect, "state")["running"]
+            assert len(requests) == 3
+    finally:
+        gated_reply.set()
+        if command is not None and command.poll() is None:
+            command.kill()
+            command.wait(timeout=5)
         if frame._kimi_client is not None:
             frame._kimi_client.close()

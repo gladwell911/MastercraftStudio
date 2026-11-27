@@ -107,7 +107,7 @@ class KimiEventsMixin:
         with self._kimi_owner_lock:
             current = self._kimi_prompt_owners.get(key)
         return (isinstance(current, dict) and int(current.get("generation") or 0) == generation
-                or not current and turn.get("request_status") in {"done", "failed"})
+                or not current and turn.get("request_status") in {"done", "failed", "cancelled"})
 
     def _resume_kimi_execution_boundaries(self, chat_id: str) -> None:
         if getattr(self, "_close_complete", False):
@@ -1139,6 +1139,9 @@ class KimiEventsMixin:
                 self._mark_chat_turns_dirty(None if is_current_target else normalized, turn_idx)
         if prompt_id:
             self._register_kimi_prompt_owner(metadata)
+        if event_turn_id and (existing_active or {}).get("turn_id") != event_turn_id:
+            self._invalidate_remote_state_cache()
+            self._push_remote_state(chat_id)
 
     def _finalize_kimi_turn_state(self, chat_id: str, target_chat: dict, target_turns: list, target_idx: int, event: CodexEvent) -> list[int]:
         if not self._kimi_event_is_authoritative(event):
@@ -1286,6 +1289,8 @@ class KimiEventsMixin:
                 was_done = str(turn.get("request_status") or "") == "done"
                 turn["answer_identity"] = answer_identity
                 if idx == primary_idx:
+                    if message_id := event_data.get("provider_message_id"):
+                        turn["provider_message_id"] = message_id
                     self._apply_kimi_final_answer_to_turn(turn, final_text)
                 else:
                     turn["answer_md"] = ""
@@ -1302,10 +1307,11 @@ class KimiEventsMixin:
                 # partial assistant stream.
                 if status in {"cancelled", "interrupted", "aborted", "canceled"}:
                     error_text = "Kimi Code 已中断。"
+                    self._mark_turn_request_cancelled(turn, error_text)
                 else:
                     error_text = str(getattr(event, "text", "") or "").strip() or "Kimi Code 执行失败。"
+                    self._mark_turn_request_failed(turn, error_text)
                 turn["answer_md"] = error_text
-                self._mark_turn_request_failed(turn, error_text)
                 self._complete_clear_operation_turn(turn, failed=True)
             finalized.append(idx)
         if not accepted:
@@ -1360,6 +1366,8 @@ class KimiEventsMixin:
         # Accepted state and notification survive failures in either foreground
         # or background presentation below this common boundary.
         self._mark_chat_turns_dirty(chat_id, min(finalized))
+        self._invalidate_remote_state_cache()
+        self._push_remote_state(chat_id)
         self._defer_chat_state_save()
         if status == "completed" and any(str(target_turns[i].get("answer_md") or "").strip() for i in finalized):
             self._notify_kimi_answer_completed(answer_identity)
@@ -1596,6 +1604,7 @@ class KimiEventsMixin:
                     "agent_id": self._kimi_event_agent_id(event),
                 }
             elif (previous["state"] == "uncertain" and previous["chat_id"] == chat_id
+                  and not previous.get("control_prompt_id")
                   and (event.origin_timestamp or 0) > previous["uncertain_since"]):
                 # The server generated another pending frame after the lost
                 # response. This enables a manual retry without resending.
@@ -1623,8 +1632,112 @@ class KimiEventsMixin:
             if not request or request["state"] != "pending":
                 return
             chat_id = request["chat_id"]
+            chat, _, _ = self._chat_target_for_request(chat_id)
+            owner = self._kimi_active_control_owner(chat) if chat else {}
+            if owner.get("session_id") == key[0]:
+                request["control_prompt_id"] = owner["prompt_id"]
+        self._publish_kimi_interaction_state(chat_id)
         self._push_remote_attention(chat_id, "action_required", "/".join(key), "Kimi Code 需要您的确认或输入")
         self._show_pending_kimi_interaction()
+
+    def _publish_kimi_interaction_state(self, chat_id: str) -> None:
+        self._invalidate_remote_state_cache()
+        self._push_remote_state(chat_id)
+
+    def _kimi_remote_interaction_payload(self, owner: dict) -> dict | None:
+        session = owner.get("session_id")
+        prompt_id = owner.get("prompt_id")
+        chat_id = owner.get("chat_id")
+        if not session or not prompt_id or not chat_id:
+            return None
+        with self._kimi_owner_lock:
+            item = next(((key, request) for key, request in self._kimi_interactions.items()
+                         if key[0] == session and request.get("control_prompt_id") == prompt_id
+                         and request.get("chat_id") == chat_id and request["state"] in {"pending", "showing", "retryable"}
+                         and not self._kimi_interaction_expired(request)), None)
+            if item is None:
+                return None
+            (_, identity), request = item
+            params = request["params"]
+            approval = request["kind"] == "approval"
+            if approval:
+                details = params.get("tool_input_display")
+                if details is not None and not isinstance(details, str):
+                    details = json.dumps(details, ensure_ascii=False)
+                prompt = "\n".join(str(part) for part in (params.get("tool_name"), params.get("action"), details) if part)
+            else:
+                prompt = "Kimi Code 需要您的输入。"
+            return {"type": "request", "chat_id": chat_id,
+                    "request_kind": "approval" if approval else "user_input", "prompt": prompt,
+                    "event_id": f"kimi-interaction-{prompt_id}-{identity}",
+                    "body": {"method": "kimi/approval" if approval else "kimi/question",
+                             "params": params, "interaction_id": identity},
+                    "ts": bindings.app.time.time()}
+
+    @staticmethod
+    def _kimi_remote_question_response(params: dict, answers) -> dict | None:
+        questions = {q["id"]: q for q in params.get("questions") or []
+                     if isinstance(q, dict) and isinstance(q.get("id"), str)}
+        if not questions or not isinstance(answers, dict) or answers.keys() != questions.keys():
+            return None
+        result = {}
+        for identity, question in questions.items():
+            answer = answers[identity]
+            if not isinstance(answer, dict):
+                return None
+            selected, other = answer.get("option_ids", []), answer.get("other_text", "")
+            options = {option["id"] for option in question.get("options") or []
+                       if isinstance(option, dict) and isinstance(option.get("id"), str)}
+            if (not isinstance(selected, list) or any(not isinstance(value, str) or value not in options for value in selected)
+                    or len(set(selected)) != len(selected) or not isinstance(other, str)
+                    or len(other) > 20000 or (other and not question.get("allow_other"))):
+                return None
+            if question.get("multi_select"):
+                if other:
+                    result[identity] = {"kind": "multi_with_other", "option_ids": selected, "other_text": other}
+                elif selected:
+                    result[identity] = {"kind": "multi", "option_ids": selected}
+                else:
+                    result[identity] = {"kind": "skipped"}
+            elif len(selected) + bool(other) > 1:
+                return None
+            elif selected:
+                result[identity] = {"kind": "single", "option_id": selected[0]}
+            elif other:
+                result[identity] = {"kind": "other", "text": other}
+            else:
+                result[identity] = {"kind": "skipped"}
+        return {"kind": "question", "answers": result}
+
+    def _reply_remote_kimi_interaction(self, chat: dict, interaction_id: str, text: str, answers) -> tuple[bool, str]:
+        chat_id = str(chat["id"])
+        owner = self._kimi_active_control_owner(chat)
+        key = (owner.get("session_id"), interaction_id)
+        with self._kimi_owner_lock:
+            request = self._kimi_interactions.get(key)
+            if (not request or request.get("chat_id") != chat_id or not owner.get("prompt_id")
+                    or request.get("control_prompt_id") != owner["prompt_id"]
+                    or request["state"] not in {"pending", "showing", "retryable"}
+                    or self._kimi_interaction_expired(request)):
+                return False, "此 Kimi Code 请求已处理或过期。"
+            if request["kind"] == "approval":
+                response = {"kind": "approval", "decision": text} if text in {"approved", "rejected", "cancelled"} else None
+            else:
+                response = self._kimi_remote_question_response(request["params"], answers)
+            if response is None:
+                return False, "Kimi Code 请求的回复无效。"
+            self._reserve_kimi_interaction_response(request, response)
+        self._close_ended_kimi_dialog(key)
+        self._publish_kimi_interaction_state(chat_id)
+        bindings.app.threading.Thread(target=self._answer_kimi_interaction_worker, args=(key, request, response),
+                                      daemon=True).start()
+        return True, "已提交，等待 Kimi Code 确认。"
+
+    @staticmethod
+    def _reserve_kimi_interaction_response(request: dict, response: dict) -> None:
+        request["state"] = "responding"
+        request["intended_outcome"] = (response.get("decision") if response["kind"] == "approval"
+                                       else "dismissed" if response.get("dismissed") else "answered")
 
     def _close_ended_kimi_dialog(self, key: tuple[str, str]) -> None:
         active = self._kimi_interaction_dialog
@@ -1632,10 +1745,21 @@ class KimiEventsMixin:
             active[1].EndModal(wx.ID_CANCEL)
 
     def _visible_kimi_interaction(self, *states: str):
-        chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
-        session_id = self._kimi_session_id_for_chat(self._current_chat_state)
+        visible_history = self.view_history_id if self.view_mode == "history" else ""
+        if visible_history:
+            chat = self._find_archived_chat(visible_history) or {}
+            owner = self._kimi_active_control_owner(chat)
+            if not owner:
+                return None
+            session_id, chat_id = owner["session_id"], owner["chat_id"]
+        else:
+            chat_id = str(self.active_chat_id or self.current_chat_id or "").strip()
+            session_id = self._kimi_session_id_for_chat(self._current_chat_state)
+            owner = self._kimi_active_control_owner(self._current_chat_state)
         return next(((key, request) for key, request in self._kimi_interactions.items()
-                     if key[0] == session_id and request["state"] in states and request["chat_id"] == chat_id), None)
+                     if key[0] == session_id and request["state"] in states and request["chat_id"] == chat_id
+                     and (not request.get("control_prompt_id") and not visible_history
+                          or request.get("control_prompt_id") == owner.get("prompt_id"))), None)
 
     def _show_pending_kimi_interaction(self, *, retry: bool = False) -> None:
         if self._kimi_interaction_dialog:
@@ -1703,12 +1827,12 @@ class KimiEventsMixin:
             if expired:
                 self._end_kimi_interaction(key, request)
             elif should_send:
-                request["state"] = "responding"
-                request["intended_outcome"] = (response.get("decision") if kind == "approval"
-                                               else ("dismissed" if response.get("dismissed") else "answered"))
+                self._reserve_kimi_interaction_response(request, response)
         if expired:
             self._finish_kimi_interaction_feedback(key, request["chat_id"], False)
         elif should_send:
+            if request.get("control_prompt_id"):
+                self._publish_kimi_interaction_state(request["chat_id"])
             bindings.app.threading.Thread(target=self._answer_kimi_interaction_worker, args=(key, request, response),
                              daemon=True).start()
         self._call_after_if_alive(self._show_pending_kimi_interaction)
@@ -1726,6 +1850,25 @@ class KimiEventsMixin:
                 if self._kimi_interactions.get(key) is not request or request["state"] != "responding":
                     return
                 expired = self._kimi_interaction_expired(request)
+            control_id = request.get("control_prompt_id")
+            if not expired and control_id:
+                try:
+                    if getattr(client, "_server_api", False):
+                        client.subscribe([key[0]])
+                    observed = client.interaction_state(*key, request["agent_id"])
+                except (KimiServerError, OSError):
+                    observed = ""
+                if observed != "pending":
+                    state = "ended" if observed else "uncertain"
+                    self._complete_kimi_interaction_attempt(key, request, "responding", state,
+                                                           error="未确认当前连接的原生交互请求")
+                    return
+                with self._kimi_owner_lock:
+                    current = self._kimi_active_turns.get(request["chat_id"]) or {}
+                    if self._kimi_interactions.get(key) is not request or request["state"] != "responding":
+                        return
+                    expired = (current.get("prompt_id") != control_id or current.get("session_id") != key[0]
+                               or self._kimi_interaction_expired(request))
             if not expired:
                 client.answer_interaction(*key, response)
         except Exception as exc:
@@ -1795,8 +1938,10 @@ class KimiEventsMixin:
                 return
             self._push_remote_attention(chat_id, "action_required", "/".join(key) + "/error", message)
             self._set_kimi_interaction_feedback(key, chat_id, error=message)
+        self._publish_kimi_interaction_state(chat_id)
 
     def _finish_kimi_interaction_feedback(self, key: tuple[str, str], chat_id: str, success: bool) -> None:
+        self._publish_kimi_interaction_state(chat_id)
         self._set_kimi_interaction_feedback(key, chat_id, status="已回复 Kimi Code 请求。" if success else "Kimi Code 请求已结束。")
 
     def _set_kimi_interaction_feedback(self, key: tuple[str, str], chat_id: str, *,
@@ -2137,6 +2282,15 @@ class KimiEventsMixin:
         )
         execution_entry = None
         if event_type not in {"agent_message_delta", "thread_status_changed"} and not silent_notification:
+            public_tool = (event.data or {}).get("source_kind") in {"tool.call.started", "tool.result"}
+            if authoritative and public_tool:
+                owner = self._kimi_owner_for_event(event)
+                _, turns, _ = self._chat_target_for_request(chat_id)
+                index = (owner or {}).get("turn_idx")
+                if (type(index) is int and 0 <= index < len(turns)
+                        and turns[index].get("question_origin") == "terminal"):
+                    event = copy.copy(event)
+                    event.data = {**event.data, "kimi_shared_tool": True}
             execution_entry = self._build_execution_entry(event)
         delta_kind = str(getattr(event, "display_kind", "") or "").strip()
         if event_type == "agent_message_delta" and delta_kind == "assistant" and authoritative:

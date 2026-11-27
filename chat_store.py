@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -14,6 +15,9 @@ from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
 from context_usage import NATIVE_USAGE_FIELDS
 from execution_projection import canonical_answer_timestamp, should_show_execution_step
+from native_history import (
+    CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, NativeSessionIdentity, NativeSessionSnapshot, merge_native_title,
+)
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
@@ -30,6 +34,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
     def __init__(self, db_path: Path, *, max_execution_steps_per_turn: int = 500) -> None:
         self.db_path = Path(db_path)
         self.max_execution_steps_per_turn = int(max_execution_steps_per_turn)
+        self._native_title_observations = {}
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +229,17 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("UPDATE v2_chat_state SET revision=?,execution_sequence=0 WHERE chat_id=?", (revision, owner))
             conn.execute("INSERT INTO read_generations(chat_id,generation) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET generation=excluded.generation", (owner, uuid.uuid4().hex))
             metadata = self._json_dict(chat["metadata_json"])
+            if metadata.get("codex_thread_id"):
+                identity = metadata.get("native_identity")
+                if not identity and (storage := metadata.get("codex_storage_id")):
+                    identity = NativeSessionIdentity(pair, "codex", storage, metadata["codex_thread_id"]).chat_id
+                if identity:
+                    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                                 (f"retired-native-history:{identity}",))
+                    conn.execute("DELETE FROM native_history_owners WHERE native_chat_id=? AND chat_id=?",
+                                 (identity, owner))
+                for field in (*CODEX_STORAGE_FIELDS, *NATIVE_CHAT_FIELDS):
+                    metadata.pop(field, None)
             metadata.update(dict.fromkeys(NATIVE_USAGE_FIELDS))
             metadata.update({
                 "openclaw_session_key": "openclaw/main", "openclaw_session_id": "", "openclaw_session_file": "",
@@ -602,14 +618,18 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def upsert_chat(self, chat: dict[str, Any]) -> None:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._upsert_chat_conn(conn, chat)
 
     def _upsert_chat_conn(self, conn, chat):
         if not isinstance(chat, dict):
             return
         chat_id = str(chat.get("id") or "").strip()
-        if not chat_id:
+        if not chat_id or conn.execute("SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{chat_id}",)).fetchone():
             return
+        if chat.get("native_identity") or any(chat.get(field) for field in
+                                              ("agy_session_id", "kimi_session_id", "codex_thread_id")):
+            chat = self._retain_committed_native_title(conn, chat_id, chat)
         created = self._float_or(chat.get("created_at"), 0.0)
         updated = self._float_or(chat.get("updated_at"), created)
         title_manual = self._bool_value(chat.get("title_manual"))
@@ -653,6 +673,375 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 json.dumps(metadata, ensure_ascii=False),
             ),
         )
+
+    def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
+        native_id = snapshot.identity.chat_id
+        if conn.execute("SELECT 1 FROM meta WHERE key IN (?,?,?)", (
+            f"retired-native-history:{native_id}", f"hidden-native-history:{native_id}",
+            f"deleted-native-history:{native_id}",
+        )).fetchone():
+            return native_id, False
+        row = conn.execute(
+            "SELECT chat_id,account FROM native_history_owners WHERE native_chat_id=?", (native_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row["chat_id"]), row["account"] == snapshot.account
+
+        # Existing provider-created application chats may predate discovery.
+        # The adapter supplies its complete legacy owner identity.
+        for field in snapshot.legacy_fields:
+            if not field.isidentifier():
+                raise ValueError("Invalid legacy history field")
+        if snapshot.legacy_fields:
+            predicates = " AND ".join(f"json_extract(metadata_json,'$.{field}')=?" for field in snapshot.legacy_fields)
+            compatible = {field: value for field, value in snapshot.chat_fields.items()
+                          if field.endswith("_storage_id") and field not in snapshot.legacy_fields}
+            for field in compatible:
+                if not field.isidentifier():
+                    raise ValueError("Invalid legacy storage field")
+                predicates += f" AND COALESCE(json_extract(metadata_json,'$.{field}'),?)=?"
+            model_filter, model = ("c.model LIKE ?", "codex/%") if snapshot.identity.provider == "codex" else ("c.model=?", snapshot.model)
+            legacy = conn.execute(
+                f"SELECT c.id FROM chats c LEFT JOIN native_history_owners n ON n.chat_id=c.id "
+                f"WHERE n.chat_id IS NULL AND {model_filter} AND {predicates} "
+                "AND COALESCE(json_extract(metadata_json,'$.native_identity'),?)=? "
+                "ORDER BY c.created_at,c.id LIMIT 1",
+                (model, *snapshot.legacy_fields.values(),
+                 *(value for value in compatible.values() for _ in range(2)), native_id, native_id),
+            ).fetchone()
+            if legacy is not None:
+                return str(legacy["id"]), True
+        return native_id, True
+
+    def _retain_committed_native_title(self, conn, chat_id, incoming):
+        saved = conn.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if saved is None:
+            return incoming
+        metadata = self._metadata_from_row(saved)
+        if not metadata.get("native_identity"):
+            return incoming
+        if incoming.get("native_identity"):
+            if any(metadata.get(key) != incoming.get(key) for key in ("native_identity", "native_account")):
+                return incoming
+            adopted = False
+        else:
+            provider = str(incoming.get("model") or "").split("/", 1)[0]
+            scope = {
+                "agy": ("agy_session_id", ("agy_native_owner",)),
+                "codex": ("codex_thread_id", CODEX_STORAGE_FIELDS),
+                "kimi": ("kimi_session_id", ("kimi_storage_id",)),
+            }.get(provider)
+            if scope is None or str(saved["model"]).split("/", 1)[0] != provider:
+                return incoming
+            session, fields = scope
+            if (not incoming.get(session) or incoming[session] != metadata.get(session)
+                    or (provider == "agy" and not incoming.get("agy_native_owner"))
+                    or any(incoming.get(field) not in (None, "", metadata.get(field))
+                           for field in (*fields, "native_account"))):
+                return incoming
+            adopted = True
+        chat = incoming.copy()
+        if adopted:
+            for field in (*NATIVE_CHAT_FIELDS, *fields):
+                if field in metadata:
+                    chat[field] = metadata[field]
+        if self._int_or(metadata.get("native_title_revision"), 0) > self._int_or(chat.get("native_title_revision"), 0):
+            for field in ("native_title", "native_title_revision"):
+                chat[field] = metadata[field]
+        if self._float_or(metadata.get("native_title_observed_at"), 0) > self._float_or(chat.get("native_title_observed_at"), 0):
+            chat["native_title_observed_at"] = metadata["native_title_observed_at"]
+        if saved["title_revision"] > self._int_or(chat.get("title_revision"), 1):
+            for field in ("title", "title_source", "title_manual", "title_updated_at", "title_revision"):
+                chat[field] = saved[field]
+        return chat
+
+    def native_history_target(self, snapshot: NativeSessionSnapshot) -> tuple[str, float]:
+        with self._connect() as conn:
+            owner, matches = self._native_history_target(conn, snapshot)
+            if not matches or conn.execute(
+                "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",)
+            ).fetchone():
+                return "", 0
+            row = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (owner,)).fetchone()
+            metadata = self._metadata_from_row(row) if row else {}
+            # Existing archives get one successful observation after upgrade.
+            replayed_at = metadata.get("native_replayed_at") if metadata.get("native_notification_baseline") else 0
+            return owner, self._float_or(replayed_at, 0)
+
+    def merge_native_history(self, snapshot: NativeSessionSnapshot, *, expected_chat_id: str,
+                             expected_revision: int = 0, merge_title: bool = True,
+                             observed_between: tuple[float, float] | None = None) -> dict | None:
+        """Commit only an append-compatible replay to the chat that authorized it."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner, matches = self._native_history_target(conn, snapshot)
+            revision = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
+            if (int(revision[0]) if revision else 0) != expected_revision:
+                return None
+            if not matches or owner != expected_chat_id or conn.execute(
+                "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",)
+            ).fetchone():
+                return None
+            row = conn.execute(
+                "SELECT c.*,(SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (owner,),
+            ).fetchone()
+            previous = self._summary_from_row(row) if row else {}
+            if snapshot.updated_at and snapshot.updated_at < previous.get("native_updated_at", 0):
+                return None
+            conn.execute(
+                "INSERT OR IGNORE INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
+                (snapshot.identity.chat_id, owner, snapshot.account),
+            )
+            chat = previous.copy()
+            for field, value in snapshot.chat_fields.items():
+                chat.setdefault(field, value)
+            chat.update(
+                id=owner, model=previous.get("model") or snapshot.model,
+                native_identity=snapshot.identity.chat_id, native_account=snapshot.account,
+                native_cwd=previous.get("native_cwd") or snapshot.cwd,
+                native_updated_at=max(previous.get("native_updated_at", 0), snapshot.updated_at),
+                native_history_status=snapshot.status,
+            )
+            unresolved = previous.get("native_unresolved_turn")
+            if unresolved and not snapshot.status:
+                chat["native_history_status"] = unresolved["message"]
+            old_count = int(previous.get("turn_count", 0))
+            appended = 0
+            recovered = {}
+            matched_agy_rows = set()
+            accepted_replay = False
+            if snapshot.turns is not None and len(snapshot.turns) >= old_count:
+                stored = (self._json_dict(entry[0]) for entry in conn.execute(
+                    "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
+                ))
+                for index, (old, new) in enumerate(zip(stored, snapshot.turns)):
+                    if self._can_recover_terminal_final(snapshot.identity, old, new):
+                        recovered[index] = dict(old, answer_md=new["answer_md"], request_status="done",
+                                                request_error="", terminal_final_pending=False,
+                                                provider_message_id=new["provider_message_id"])
+                        if new.get("answer_at"):
+                            recovered[index]["answer_at"] = new["answer_at"]
+                        if snapshot.identity.provider == "agy":
+                            recovered[index].pop("agy_partial_answer_md", None)
+                    elif (snapshot.identity.provider == "agy" and old.get("request_status") in
+                          {"unknown", "cancelled", "failed"} and self._agy_replay_matches(snapshot.identity, old, new)
+                          and new.get("agy_replay_followed")):
+                        matched_agy_rows.add(index)
+                    elif ((snapshot.identity.provider == "agy" and old.get("request_status") == "unknown")
+                          or not self._native_turn_matches(old, new)):
+                        recovered.clear()
+                        matched_agy_rows.clear()
+                        if not unresolved:
+                            chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
+                        break
+                else:
+                    chat["native_replayed_at"] = snapshot.updated_at
+                    accepted_replay = True
+                    appended = len(snapshot.turns) - old_count
+            if unresolved and unresolved["index"] in recovered:
+                chat["native_history_status"] = snapshot.status
+                chat["native_unresolved_turn"] = None
+            chat.setdefault("created_at", snapshot.updated_at)
+            if snapshot.identity.provider == "codex" and old_count - 1 in recovered:
+                chat["codex_turn_active"] = False
+            if not previous or appended or recovered:
+                chat["updated_at"] = max(previous.get("updated_at", 0), snapshot.updated_at)
+            if not previous:
+                chat.update(title=snapshot.title or snapshot.cwd, title_source="native",
+                            title_updated_at=snapshot.title_observed_at or snapshot.updated_at,
+                            title_revision=1)
+            if merge_title:
+                self._merge_observed_native_title(
+                    chat, previous, snapshot.identity.provider, snapshot.title,
+                    snapshot.title_observed_at or snapshot.updated_at, explicit=snapshot.title_explicit,
+                )
+            baseline = self._float_or(previous.get("native_notification_baseline"), 0)
+            observed_until = 0.0
+            if accepted_replay and not snapshot.status and observed_between:
+                started_at, finished_at = observed_between
+                if 0 < started_at <= finished_at and math.isfinite(finished_at):
+                    observed_until = finished_at
+                    if not baseline:
+                        chat["native_notification_baseline"] = finished_at
+            if accepted_replay and snapshot.identity.provider == "agy":
+                for step in snapshot.execution_steps:
+                    if step["turn_idx"] in matched_agy_rows or step["turn_idx"] in recovered:
+                        self._merge_recovered_agy_step(conn, owner, snapshot.identity.session_id, step)
+            if chat == previous and not appended and not recovered:
+                return None
+            self._upsert_chat_conn(conn, chat)
+            for index, turn in recovered.items():
+                conn.execute("UPDATE turns SET payload_json=? WHERE chat_id=? AND turn_index=?",
+                             (json.dumps(turn, ensure_ascii=False), owner, index))
+                self._backfill_canonical_turns_conn(conn, owner, [turn], index)
+            incoming = []
+            if appended:
+                for replayed in snapshot.turns[old_count:]:
+                    turn = dict(replayed, native_history=True)
+                    turn.pop("native_final_notify_pair", None)
+                    if baseline and self._is_new_native_final(turn, baseline, observed_until):
+                        turn["native_final_notify_pair"] = snapshot.identity.pair_id
+                    incoming.append(turn)
+                conn.executemany(
+                    "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?)",
+                    [(owner, index, json.dumps(turn, ensure_ascii=False))
+                     for index, turn in enumerate(incoming, old_count)],
+                )
+                self._backfill_canonical_turns_conn(conn, owner, incoming, old_count)
+                for step in snapshot.execution_steps:
+                    if old_count <= step["turn_idx"] < len(snapshot.turns):
+                        self._append_execution_step_on_conn(conn, owner, step)
+            if (recovered or any(turn.get("native_final_notify_pair") for turn in incoming)) and self.v2_writes_enabled:
+                self._reconcile_notification_finals_conn(conn, snapshot.identity.pair_id, owner)
+            chat["turn_count"] = old_count + appended
+            if recovered:
+                chat["_recovered_terminal_turns"] = list(recovered)
+            return chat
+
+    def apply_native_session_title(self, chat_id, scope, revision, provider, title, observed_at, *,
+                                   explicit=True, app_manual=False):
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (chat_id,),
+            ).fetchone()
+            generation = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+            if row is None or (int(generation[0]) if generation else 0) != revision:
+                return None
+            previous = self._summary_from_row(row)
+            if any(previous.get(field) != value for field, value in scope.items()):
+                return None
+            changed = previous.copy()
+            effective_at = self._merge_observed_native_title(
+                changed, previous, provider, title, observed_at, explicit=explicit, app_manual=app_manual,
+            )
+            if changed == previous:
+                if effective_at:
+                    changed["native_title_observed_at"] = effective_at
+                return changed
+            self._upsert_chat_conn(conn, changed)
+            return changed
+
+    def _merge_observed_native_title(self, chat, previous, provider, title, observed_at, **options):
+        # Callers hold a SQLite write transaction so both title entry points
+        # compare against the same process-local observation.
+        session_key = {"agy": "agy_session_id", "codex": "codex_thread_id", "kimi": "kimi_session_id"}[provider]
+        scope = (chat["id"], provider, chat.get(session_key), chat.get("native_identity"), chat.get("native_account"))
+        persisted_at = self._float_or(previous.get("native_title_observed_at"), 0)
+        legacy_at = 0
+        if not previous.get("native_identity") and previous.get(session_key) == chat.get(session_key):
+            legacy_scope = (*scope[:3], previous.get("native_identity"), previous.get("native_account"))
+            legacy_at = self._native_title_observations.get(legacy_scope, 0)
+        chat["native_title_observed_at"] = max(persisted_at, legacy_at, self._native_title_observations.get(scope, 0))
+        merge_native_title(chat, provider, title, observed_at, **options)
+        effective_at = chat.pop("native_title_observed_at")
+        titles_changed = any(chat.get(field) != previous.get(field) for field in
+                             ("native_title_revision", "title_revision"))
+        if titles_changed:
+            chat["native_title_observed_at"] = effective_at
+        elif "native_title_observed_at" in previous:
+            chat["native_title_observed_at"] = persisted_at
+        if effective_at:
+            self._native_title_observations[scope] = effective_at
+        return effective_at
+
+    @staticmethod
+    def _agy_replay_matches(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
+        observed_answer = stored.get("agy_observed_message_id") or stored.get("provider_message_id")
+        return (
+            stored.get("terminal_notification_pair") in (None, "", identity.pair_id)
+            and stored.get("session_id") in (None, "", identity.session_id)
+            and stored.get("agy_session_id") in (None, "", identity.session_id)
+            and replayed.get("session_id") == identity.session_id
+            and all(stored.get(field) and stored[field] == replayed.get(field)
+                    for field in ("agy_native_turn_id", "provider_user_message_id"))
+            and bool(observed_answer) and observed_answer == replayed.get("provider_message_id")
+            and stored.get("provider_message_id") in (None, "", observed_answer)
+        )
+
+    def _merge_recovered_agy_step(self, conn, owner, session_id, step):
+        for entry in conn.execute("SELECT payload_json FROM execution_steps WHERE chat_id=? AND turn_idx=?",
+                                  (owner, step["turn_idx"])):
+            saved = self._json_dict(entry[0])
+            if saved.get("step_id") == step["step_id"]:
+                return
+            if saved.get("provider") == "agy" and saved.get("thread_id") == session_id:
+                if (step.get("item_id") and saved.get("item_id") == step["item_id"]) or (
+                    step.get("raw_kind") == "thinking" and saved.get("display_kind") in {"thinking", "reasoning"}
+                ):
+                    return
+        self._append_execution_step_on_conn(conn, owner, step)
+
+    @staticmethod
+    def _can_recover_terminal_final(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
+        # Managed admission persisted the owner before the original process
+        # exited. A matching, settled provider turn may finish that same row.
+        if identity.provider == "agy":
+            return (
+                stored.get("request_status") == "unknown"
+                and ChatStore._agy_replay_matches(identity, stored, replayed)
+                and replayed.get("native_final_explicit") is True
+                and replayed.get("request_status") == "done"
+                and bool(str(replayed.get("answer_md") or "").strip())
+            )
+        keys = {"codex": ("codex_thread_id", "codex_turn_id"),
+                "kimi": ("kimi_session_id", "kimi_turn_id")}.get(identity.provider)
+        if not keys or stored.get("terminal_notification_pair") != identity.pair_id:
+            return False
+        session_key, turn_key = keys
+        status = stored.get("request_status")
+        # Older Codex builds could settle a Plan turn before storing its public answer.
+        missing_codex_final = (
+            identity.provider == "codex" and status == "done"
+            and stored.get("terminal_final_pending") is True
+            and not stored.get("provider_message_id")
+            and str(stored.get("answer_md") or "").strip() in {"", "正在请求..."}
+        )
+        return ((missing_codex_final or status in {"pending", "running", "failed", "unknown"})
+                and stored.get(session_key) == replayed.get(session_key) == identity.session_id
+                and bool(stored.get(turn_key)) and stored[turn_key] == replayed.get(turn_key)
+                and replayed.get("native_final_explicit") is True and replayed.get("request_status") == "done"
+                and bool(str(replayed.get("answer_md") or "").strip())
+                and bool(replayed.get("provider_message_id"))
+                and stored.get("provider_message_id") in (None, "", replayed["provider_message_id"]))
+
+    def _is_new_native_final(self, turn: dict, baseline: float, observed_until: float) -> bool:
+        # Provider turn times distinguish new replies from delayed indexing.
+        # Session mtime, list position and the time of discovery cannot do that.
+        started_at = self._float_or(turn.get("created_at"), 0)
+        finished_at = self._float_or(turn.get("answer_at"), 0)
+        return (turn.get("native_final_explicit") is True and turn.get("request_status") == "done"
+                and all(isinstance(turn.get(key), str) and turn[key].strip()
+                        for key in ("turn_id", "provider_message_id", "answer_md"))
+                and baseline < started_at <= finished_at <= observed_until)
+
+    @staticmethod
+    def _native_turn_matches(stored: dict, replayed: dict) -> bool:
+        for key in ("provider_user_message_id", "provider_message_id", "kimi_prompt_id",
+                    "codex_turn_id", "kimi_turn_id", "agy_native_turn_id"):
+            if stored.get(key) and replayed.get(key) and stored[key] != replayed[key]:
+                return False
+        provider_turn = {"codex": "codex_turn_id", "kimi": "kimi_turn_id",
+                         "agy": "agy_native_turn_id"}.get(replayed.get("provider"))
+        if (provider_turn and stored.get(provider_turn) and stored[provider_turn] == replayed.get(provider_turn)
+                and stored.get("provider_message_id")
+                and stored["provider_message_id"] == replayed.get("provider_message_id")):
+            return True
+        if replayed.get("question", "") not in (stored.get("question", ""), stored.get("kimi_prompt_question")):
+            return False
+        old_answer = str(stored.get("answer_md") or "")
+        new_answer = str(replayed.get("answer_md") or "")
+        return old_answer == new_answer or (bool(new_answer) and old_answer.startswith(new_answer))
+
+    def load_chat_summary(self, chat_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM turns WHERE chat_id=c.id) turn_count FROM chats c WHERE id=?",
+                (chat_id,),
+            ).fetchone()
+            return self._summary_from_row(row) if row else None
 
     def list_chat_summaries(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -701,11 +1090,17 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             chat["execution_steps"] = self.load_execution_steps(normalized)
         return chat
 
-    def delete_chat(self, chat_id: str) -> None:
+    def delete_chat(self, chat_id: str, *, native_id: str = "", native_deleted: bool = False) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
         with self._connect() as conn:
+            if native_id:
+                disposition = "deleted" if native_deleted else "hidden"
+                conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                             (f"{disposition}-native-history:{native_id}",))
+                if native_deleted:
+                    conn.execute("DELETE FROM meta WHERE key=?", (f"hidden-native-history:{native_id}",))
             self._commit_chat_delete_conn(conn, normalized)
             conn.execute("DELETE FROM canonical_messages WHERE chat_id=?", (normalized,))
             conn.execute("DELETE FROM canonical_turns WHERE chat_id=?", (normalized,))
@@ -714,13 +1109,16 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             conn.execute("DELETE FROM turns WHERE chat_id = ?", (normalized,))
             conn.execute("DELETE FROM chats WHERE id = ?", (normalized,))
 
-    def delete_chats(self, chat_ids: list[str]) -> None:
+    def delete_chats(self, chat_ids: list[str], *, native_ids: dict[str, str] | None = None) -> None:
         normalized_ids = [str(chat_id or "").strip() for chat_id in chat_ids or []]
         normalized_ids = [chat_id for chat_id in normalized_ids if chat_id]
         if not normalized_ids:
             return
         with self._connect() as conn:
             for chat_id in normalized_ids:
+                if native_id := (native_ids or {}).get(chat_id):
+                    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')",
+                                 (f"hidden-native-history:{native_id}",))
                 self._commit_chat_delete_conn(conn, chat_id)
             conn.executemany("DELETE FROM canonical_messages WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
             conn.executemany("DELETE FROM canonical_turns WHERE chat_id=?", [(chat_id,) for chat_id in normalized_ids])
@@ -731,8 +1129,15 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def _commit_chat_delete_conn(self, conn: sqlite3.Connection, chat_id: str) -> None:
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?, '1')", (f"deleted-chat:{chat_id}",))
-        if conn.execute("SELECT 1 FROM chats WHERE id=?", (chat_id,)).fetchone() is None:
+        record = conn.execute("SELECT metadata_json FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if record is None:
             return
+        native = self._metadata_from_row(record)
+        if native.get("native_identity") and native.get("native_account"):
+            conn.execute(
+                "INSERT OR IGNORE INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
+                (native["native_identity"], chat_id, native["native_account"]),
+            )
         row = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (chat_id,)).fetchone()
         revision = int(row[0]) + 1 if row else 1
         pairs = conn.execute("SELECT DISTINCT pair_id FROM notification_devices UNION SELECT pair_id FROM notification_feed_devices UNION SELECT pair_id FROM v2_feed_state WHERE domain='__pair__'").fetchall()
@@ -740,11 +1145,55 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
                 revision, "deleted", kind="chat_deleted")
 
+    def commit_agy_terminal(self, chat_id, index, scope, revision, turn, terminal):
+        """Commit the original accepted turn before reporting a known AGY result."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            chat = conn.execute(
+                "SELECT c.model,c.metadata_json,COALESCE(s.revision,1) AS revision "
+                "FROM chats c LEFT JOIN v2_chat_state s ON s.chat_id=c.id "
+                "WHERE c.id=? AND NOT EXISTS (SELECT 1 FROM meta WHERE key=?)",
+                (chat_id, f"deleted-chat:{chat_id}"),
+            ).fetchone()
+            if chat is None or chat["revision"] != revision:
+                return False
+            saved_scope = dict(self._metadata_from_row(chat), model=chat["model"])
+            if any(saved_scope.get(key) != value for key, value in scope.items()):
+                return False
+            row = conn.execute("SELECT payload_json FROM turns WHERE chat_id=? AND turn_index=?",
+                               (chat_id, index)).fetchone()
+            existing = self._json_dict(row["payload_json"]) if row is not None else {}
+            token = turn.get("_provider_request_id")
+            if not token or (row is not None and existing.get("_provider_request_id") != token):
+                return False
+            if row is None and conn.execute(
+                "SELECT COALESCE(MAX(turn_index)+1,0) FROM turns WHERE chat_id=?", (chat_id,),
+            ).fetchone()[0] != index:
+                return False
+            if existing.get("request_status") not in (None, "", "pending"):
+                return all(existing.get(key) == value for key, value in terminal.items())
+            settled = dict(turn, **existing)
+            settled.update(terminal)
+            conn.execute(
+                "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id,turn_index) DO UPDATE SET payload_json=excluded.payload_json",
+                (chat_id, index, json.dumps(settled, ensure_ascii=False)),
+            )
+            self._backfill_canonical_turns_conn(conn, chat_id, [settled], index)
+            return True
+
+    @staticmethod
+    def _keep_agy_terminal(old, new):
+        return (isinstance(new, dict) and old.get("agy_native_terminal_reason") in ("end_turn", "cancelled")
+                and new.get("request_status") == "pending"
+                and old.get("_provider_request_id") == new.get("_provider_request_id"))
+
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._replace_turns_conn(conn, normalized, turns)
 
     def _replace_turns_conn(self, conn, normalized, turns):
@@ -753,7 +1202,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
         for index, turn in enumerate(incoming):
             old = existing.get(index)
-            if old is not None and not self._same_canonical_turn(old, turn):
+            if old is not None and self._keep_agy_terminal(old, turn):
+                incoming[index] = old
+            elif old is not None and not self._same_canonical_turn(old, turn):
                 conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
                 conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
         conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
@@ -774,8 +1225,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if not normalized:
             return
         start = max(0, self._int_or(start_index, 0))
-        suffix = turns or []
+        suffix = list(turns or [])
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if attachment_scope:
                 updated = conn.execute(
                     "UPDATE remote_attachment_sends SET state='accepted' "
@@ -791,7 +1243,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             for offset, turn in enumerate(suffix):
                 index = start + offset
                 old = existing.get(index)
-                if isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
+                if old is not None and self._keep_agy_terminal(old, turn):
+                    suffix[offset] = old
+                elif isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
                     conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
                     conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
             end = start + len(suffix)
@@ -845,7 +1299,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 if payload.get(content_key) is None:
                     continue
                 conn.execute(
-                    "INSERT OR IGNORE INTO canonical_messages(message_id,turn_id,chat_id,role,provider_kind,provider_message_id,legacy_turn_index) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO canonical_messages(message_id,turn_id,chat_id,role,provider_kind,provider_message_id,legacy_turn_index) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id,legacy_turn_index,role) DO UPDATE SET "
+                    "provider_message_id=excluded.provider_message_id "
+                    "WHERE canonical_messages.provider_message_id='' AND excluded.provider_message_id<>''",
                     (f"message-{uuid.uuid4().hex}", str(canonical["turn_id"]), chat_id, role,
                      provider, str(payload.get(provider_key) or ""), start + offset),
                 )
@@ -893,6 +1350,29 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             if timestamp is not None:
                 turn["answer_at"] = timestamp
         return turns
+
+    def find_turn_by_client_send_id(self, chat_id: str, client_send_id: str) -> tuple[int, dict] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT turn_index, payload_json FROM turns
+                WHERE chat_id=? AND json_extract(payload_json, '$.client_send_id')=?
+                ORDER BY turn_index DESC LIMIT 1""",
+                (self.normalize_chat_id(chat_id), client_send_id),
+            ).fetchone()
+        if row is not None:
+            return int(row["turn_index"]), self._json_dict(row["payload_json"])
+        return None
+
+    def find_answer_by_identity(self, chat_id: str, identity: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT json_extract(payload_json, '$.answer_md') AS answer FROM turns
+                WHERE chat_id=? AND json_extract(payload_json, '$.answer_identity')=?
+                AND length(json_extract(payload_json, '$.answer_md')) > 0
+                ORDER BY turn_index DESC LIMIT 1""",
+                (self.normalize_chat_id(chat_id), identity),
+            ).fetchone()
+        return str(row["answer"]) if row is not None else ""
 
     def load_turns_page(
         self,

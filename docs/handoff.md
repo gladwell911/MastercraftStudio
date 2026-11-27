@@ -1,26 +1,66 @@
 # 当前交接
 
-更新日期 2026-11-27。源码位于 `D:/code/sj/mc`，分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。
+更新日期 2026-11-27。日常源码工作树为 `D:/code/sj/mc`，主分支 `main` 跟踪 `origin/main`。本机日常进程的可执行文件为 `D:/code/cx/mc/mc.exe`。三家 CLI 共享会话及本轮修补已合入本地主分支。日常安装沿用现有版本。
 
-## 2026-11-27 T13 本机验收
+## 2026-11-26 三家 CLI 共享会话
 
-本机验收使用隔离候选和专用 ARM64 模拟器。实体笔记本及物理双机改名、历史回读已从 T13 验收范围移除。正式 NATS 整体验收和 TalkBack 发音专项沿用此前范围决定。T13 候选尚未切换到日常安装。
+### T13 本机验收
 
-本机 T13 已通过 Codex 首发、审批拒绝与真实 Plan 问答，以及 AGY 原回合追加、改名和重开回读。此前的新到终答通知点击验收继续有效。Kimi Code 2.6.3 已完成真实审批和追加提交，原生记录仍落到下一回合。详见 [MC 候选交接](../../.build-work/mc-rc-three-cli-shared-sessions/mc-integration/docs/handoff.md#t13-本机验收)。
+该轮候选从 MC `1ba49dd`（应用源码 `fea9a35`）与 RC `b5f1381` 接续。原失败证据对应 RC `8b9c92f`。使用隔离 MC 数据、NATS、真实账号及合成会话。专用 Android 35 模拟器通过原生桥运行 `arm64-v8a` RC。复验记录两仓提交与 APK SHA-256。
+
+#### 已验收
+
+1. **Codex 新建首发已通过。** RC 候选 `4b066dd` 配对 MC `fea9a35`，真实账号单击首发提交一次，RC 显示首答，桌面在同一原生 ID 续聊。见 [RC 实施及验收记录](../../rc/_bmad-output/implementation-artifacts/plan-t13-codex-first-send.md)。
+2. **通知定位已通过。** RC 候选 `b5f1381` 在真实账号上验证 Codex、Kimi Code 和 AGY 的后台及锁屏点击。三家都打开新到的对应终答、确认同一序号已读并清除通知。锁屏保持正文遮罩直到解锁。见 [通知验收记录](../../rc/_bmad-output/implementation-artifacts/plan-t13-notification-tap.md)。
+
+#### 2026-11-27 本机续验
+
+- Codex 审批卡按原生提供的常规决定显示按钮。默认 420 dpi 的 ARM64 候选对同一真实请求返回 200，原生拒绝路径取消了原回合。真实 Plan 选择并提交 Yellow 后，同一回合的方案由 MC 持久保存并在 RC 显示。
+- AGY 原回合追加已在 RC 显示终答，停止控件随终结撤下。本机 `default` 的真实会话按稳定聊天 ID 改名，重开后的来源、原生 ID 和原正文一致。应用改名更新 MC 显示名。
+- Kimi Code 2.6.3 在默认 420 dpi 下通过真实审批点按和追加提交。两种队列顺序和直接追加均回读到新的原生回合。试验性源码已撤回。
+
+[本机续验证据、两仓提交、APK 哈希和未通过条件](../../.build-work/mc-rc-three-cli-shared-sessions/candidate-final/automated-t13/t13-local-20261127.md)。本节限定在隔离本机候选与 ARM64 模拟器。实体笔记本和物理双机改名回读已经移出本机 T13。正式 NATS 整体验收及 TalkBack 发音专项沿用此前范围。下文较早批次只记录当时状态。
 
 **Kimi Code 2.6.3 同回合追加延期。** 固定版本接受直接追加和排队后 Steer，原生转录均将追加记为新回合的 `opener`。真实账号审批场景结果一致。候选继续按下一轮排队，旧 2.5.3 沿用原协议。[原生复验与裁决](../../.build-work/mc-rc-three-cli-shared-sessions/candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md#kimi-code-同回合追加裁决)
 
 **较早离屏通知已通过本机候选验收。** RC `037f9fd` 配对 MC `48fb873`。同一长聊天中，点击第 4 条终答的通知后，RC 显示对应消息，MC 确认已读到第 4 条，系统清除旧通知，第 24 条终答保持未读，系统通知仍保留。见 [候选结果和 APK 校验](../../.build-work/mc-rc-three-cli-shared-sessions/candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md)。
 
-### 本机验收结论
+#### 本机验收结论
 
 按用户决定，Kimi 同回合追加延期，本机 T13 按其余范围验收完成。较早终答通知的实装配对为 MC `48fb873`、RC `037f9fd`，QA ARM64 APK SHA-256 为 `EF92C41EDC56545529223B44148D0D763744D79505F2540632C4B3D947606783`。其他通过场景各自使用其证据所列的候选。重启该延期项前，先取得追加属于同一原生回合的证据，再做真实账号审批和 RC 终答的跨端验收。
 
-### T00–T13 深度审查与修补
+#### T00–T13 深度审查与修补
 
-2026-11-27 完成 MC、RC 候选深度审查，确认 10 项产品问题和 2 项验证缺口。MC 六文件定向 93 项通过、4 项可选用例跳过。 AGY `session/load` 当前缺乏明确成功终态的证据，匹配原生会话、回合和消息身份的后续正文与步骤可回读，原回合仍保留为 unknown。AGY 同回合追加的重放形态另待原生证据。候选修补尚未进入默认分支或日常安装。
+2026-11-27 逐项审查完成，确认 10 项产品问题和 2 项验证缺口。 [实施计划](../../_bmad-output/implementation-artifacts/plan-t00-t13-shared-cli-review-fixes.md#auto-run-result)
 
-[本仓候选交接](../../.build-work/mc-rc-three-cli-shared-sessions/mc-integration/docs/handoff.md#t00t13-深度审查与修补) · [审查和回归记录](../../_bmad-output/implementation-artifacts/plan-t00-t13-shared-cli-review-fixes.md#auto-run-result)
+- MC 修复 PowerShell 参数边界、忙碌会话隐藏及标题持久化顺序。AGY 以同一原生身份合并后续历史与执行步骤。旧 Codex App Server 释放回退通过 worker 子进程测试。
+- MC 在候选根目录串行复跑下列六个文件，93 项通过，4 项依赖供应商环境的可选用例跳过。较早的 Windows 冻结包证据仍对应原构建。
+
+```powershell
+D:/code/sj/mc/.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_shared_terminal.py tests/test_agy_native_history.py tests/test_native_session_removal.py tests/test_native_title_sync.py tests/test_terminal_reply_notifications.py tests/test_codex_worker_process.py
+```
+
+AGY 1.5.18 的实测历史回放能读回正文，缺少用于区别正常完成和取消的终态。MC 收到明确终态时先保存再发布；没有明确终态时保留「未知」，桌面可查看此前收到的部分正文。AGY 同回合追加的重放形态另待原生证据。
+
+#### AGY 终态保存与部分回答
+
+候选提交 b15d78c 包含 AGY 两轮修补。MC 先把明确终态写入 SQLite，再更新界面及共享终端。AGY 中断后已收到的正文可在正常退出、重开原聊天后查看，部分回答不计为终答、已读或完成通知。写入前强制结束 MC 及实体读屏未验证。
+
+[终态持久化验证](../_bmad-output/implementation-artifacts/plan-agy-terminal-durability.md) · [部分回答验证](../_bmad-output/implementation-artifacts/plan-agy-partial-answer.md)
+
+#### 早期候选记录
+
+- T01–T12 已合入本地双仓候选。历史首批候选记录如下。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
+- 本机工作区 `D:/code/sj` 下，`_bmad-output/implementation-artifacts/mc-rc-three-cli-shared-sessions-acceptance.md` 逐项记录 A-01 至 A-12 和复现指令，`.build-work/mc-rc-three-cli-shared-sessions/candidate-final` 保存构建脚本、产物哈希、冻结演练和隔离证据。文档提交后重建该批产物仍使用上述源码提交。
+- 从候选工作树用 `package_mc.ps1 -BuildOnly`，并为 `-DistPath`、`-WorkPath` 指定隔离目录。最终包并发运行三家 `--list` 只启动一个 MC，热态复用。用包内 NATS 和 ACP 替身读到了同工具行的执行中、完成与终答。冒烟使用隔离目录并关闭真实 HKCU 注册。
+- 最终源码以实际 Codex 0.171.0 和 Kimi 2.5.3、2.6.3 CLI 配合本地模型替身验证原生历史、继续和适用控制。实际 AGY 1.5.17 通过隔离本地 NATS 验证了同原生 ID 的工具进度、跨临时目录免逐次工具审批和补充问题。此处手机角色的协议探针与 RC 界面验收分别计入。2026-11-26 文档核对另跑 `python -m pytest tests/test_shared_terminal.py tests/test_agy_workspace.py -q -p no:cacheprovider -p no:faulthandler`，使用 `PYTHONUTF8=1`，7 项通过。
+- 同批 RC 的隔离 ARM64 QA 包已读到 AGY 种子终答。第二个终端回合的用户问题进入手机执行页，实际工具和终答待复现，重试遇到供应商新建超时和模拟器未恢复连接。先确认 RC 到隔离 NATS 及业务握手就绪，再按同一来源、原生 ID、回合、工具身份和最终答复逐段比对宿主与界面证据。固定夹具用于复现，真实 AGY 用于复验。
+- 待办还包括两台真实电脑、干净 Windows 用户实际注册和升级、真实 NATS 与供应商、Windows 物理键盘和争渡、实体 ARM64 手机和 TalkBack、同批附件与通知的完整验收。使用合成数据，避免让空 Android 配置命中既有默认来源。隔离 APK 的细节和阻塞见 RC 的交接、测试说明与工作区验收报告。
+
+- T13 随后从真实 AGY 1.5.17 发现 Windows ACP 清单的 /D:/ 盘符形式，修复提交 b234cf482ebce304fed366f7b0ee5098a4c8489f。21 项定向通过，固定 AGY 输入路径能读原答并用同一 ID 续聊，真实终端 F2 改名、F4 取消及确认删除由独立原生读回验证。已重建隔离 Windows 包，冻结版本通过 /D:/ 原生历史、单进程冷启复用及 NATS 实时工具行，证据位于 candidate-final/mc-agy-cwd-rebuild/。真实 Codex App Server 和原生终端也在同一云端线程续聊通过，详见工作区 T13 自动化续验。
+
+- AGY 1.5.18 的真实原生 F4 删除及精确原生回读与 1.5.17 一致，MC 候选 84dbe97 纳入这一版本，保留原账号、目录、来源和双重缺失门槛。18 项定向通过，BuildOnly 冻结包经 NATS 同一目标在仍存在时拒绝、确认缺失后移除。实际 Windows 文件选择器发送 PNG 和 UTF-8 文本到真实 AGY，独立 SQLite 回读同一终答。真实 Kimi 2.6.3 原生 CLI、共享 PowerShell 与本机 NATS 同 ID 续聊和精确停止通过。两路正式 WSS 的 TLS、mobile 认证 PING/PONG 与不同 server ID 已验证，同批实际双机部署仍待。
+- MC 候选 `fea9a35` 在实时结算和原生历史回读中区分 Kimi `cancelled` 与 `failed`。普通账户冻结包验证 Kimi 2.6.3 精确停止、前一轮终答和 AGY 1.5.18 缺失确认。隔离 Android 使用 RC `8b9c92f` 一键停止，MC 与同一 Kimi 服务实例都记录 `cancelled`。桌面云端 PowerShell 同 ID 续问后通过 NATS 核对同样终态。正式双机应用链路仍待。
 
 ## 2026-11-23 聊天切换与争渡播报
 

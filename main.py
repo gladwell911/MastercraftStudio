@@ -457,6 +457,8 @@ def model_display_name(model_id: str) -> str:
         return "codex"
     if model_id.startswith("claudecode/"):
         return "claudeCode"
+    if model_id == AGY_MODEL_ID:
+        return "AGY"
     if model_id.startswith("kimi/"):
         return "Kimi Code"
     if model_id.startswith("openclaw/"):
@@ -476,6 +478,8 @@ def model_id_from_display_name(display_name: str) -> str:
         return "codex/gpt-5.3-codex-spark-high"
     if display_name == "claudeCode":
         return "claudecode/default"
+    if display_name.lower() == "agy":
+        return AGY_MODEL_ID
     if display_name == "Kimi Code":
         return "kimi/main"
     if display_name == "openclaw":
@@ -545,6 +549,9 @@ from mc_frame_presentation import (
 from mc_frame_remote_proxy import CloudflaredOriginProxy
 from mc_frame_remote_routes import RemoteRoutesMixin
 from mc_frame_remote_runtime import RemoteRuntimeMixin
+from agy_acp import AGY_MODEL_ID
+from mc_frame_agy import AgySessionsMixin
+from mc_frame_native_history import NativeHistoryMixin
 from mc_frame_requests import ChatRequestsMixin
 from mc_frame_voice import VoiceInputMixin
 
@@ -565,6 +572,8 @@ class ChatFrame(
     KimiSessionsMixin,
     KimiEventsMixin,
     ChatRequestsMixin,
+    NativeHistoryMixin,
+    AgySessionsMixin,
     ChatNavigationMixin,
     wx.Frame,
 ):
@@ -575,6 +584,11 @@ class ChatFrame(
 
         self.app_data_dir = resolve_app_data_dir()
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self._agy_clients = {}
+        self._agy_busy = {}
+        self._agy_new_chat_pending = False
+        self._agy_remote_creations = 0
+        self._agy_creation_lock = threading.Lock()
         self.state_path = self.app_data_dir / APP_STATE_FILE
         self.detail_pages_dir = self.app_data_dir / "detail_pages"
         self.detail_pages_dir.mkdir(parents=True, exist_ok=True)
@@ -703,6 +717,7 @@ class ChatFrame(
         self._codex_ui_event_lock = threading.Lock()
         self._close_admission_lock = threading.Lock()
         self._accepted_background_callbacks = 0
+        self._agy_terminal_writes = 0
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
         self._pending_kimi_ui_events: list[tuple[str, CodexEvent]] = []
@@ -898,6 +913,7 @@ class ChatFrame(
         self._set_input_hint_idle()
         if self._kimi_pending_owners() and self._kimi_client is None:
             self._recover_kimi_pending_owners()
+        self._start_native_history_refresh()
         wx_call_after_if_alive(self.input_edit.SetFocus)
 
     def _build_ui(self):
@@ -1434,6 +1450,7 @@ class ChatFrame(
                 if transport is not None and int(getattr(transport, "protocol_version", 1) or 1) >= 2 else "")
             self._close_pair_id = self._read_pair_id()
             self._closing = True
+            self._stop_native_history_refresh()
             self.Hide()
             self._close_hidden_at = time.monotonic()
             self._cancel_chat_navigation_focus()
@@ -1474,14 +1491,15 @@ class ChatFrame(
 
     def _start_close_producers(self) -> None:
         clients = list(getattr(self, "_codex_clients", {}).values())
-        clients.extend((getattr(self, "_codex_client", None), getattr(self, "_kimi_client", None)))
+        clients.extend((getattr(self, "_codex_client", None), getattr(self, "_kimi_client", None),
+                        getattr(self, "_native_history_kimi_client", None)))
         clients = list({id(client): client for client in clients if client is not None}.values())
         self._close_producers_done = threading.Event()
         self._close_write_done = threading.Event()
         self._close_write_started = False
         self._close_write_error = None
         close_tasks = [client.close for client in clients]
-        close_tasks.extend((self.notes_sync.close, self._stop_remote_servers,
+        close_tasks.extend((self.notes_sync.close, self._close_agy_clients, self._stop_remote_servers,
                             self._global_ctrl_hook.stop, self._realtime_call.shutdown,
                             self._stop_openclaw_sync))
         service = getattr(self, "file_service", None)
@@ -1499,9 +1517,13 @@ class ChatFrame(
                 logging.getLogger(__name__).exception("Close task failed")
 
         def close_producers():
-            deadline = self._close_started + 3.0
             notes = threading.Thread(target=close_task, args=(notes_close,), daemon=True)
             notes.start()
+            # Native mutations can wait for a wx settlement callback and use
+            # the live Kimi client. Drain them off wx before stopping clients
+            # or fencing callbacks from accepted producers.
+            self._native_rename_executor.shutdown(wait=True)
+            deadline = time.monotonic() + 3.0
             workers = [threading.Thread(target=close_task, args=(task,), daemon=True) for task in close_tasks]
             for worker in workers:
                 worker.start()
@@ -1551,7 +1573,7 @@ class ChatFrame(
             execution_pending = (self._execution_step_persist_worker_running
                                  or bool(self._pending_execution_step_persists))
         with self._close_admission_lock:
-            background_pending = self._accepted_background_callbacks
+            background_pending = self._accepted_background_callbacks or self._agy_terminal_writes
         pending = (background_pending or execution_pending or getattr(self, "_pending_kimi_ui_events", None)
                    or getattr(self, "_pending_codex_ui_events", None)
                    or getattr(self, "_kimi_execution_write_counts", None)
@@ -1626,9 +1648,11 @@ def app_instance_key() -> str:
 
 class ChatApp(wx.App):
     def OnInit(self):
+        terminal_start = "--shared-terminal-start" in sys.argv[1:]
         self._checker = wx.SingleInstanceChecker(app_instance_key())
         if self._checker.IsAnotherRunning():
-            self._activate_existing_window()
+            if not terminal_start:
+                self._activate_existing_window()
             return False
         try:
             resolve_common_commands_path()
@@ -1636,9 +1660,47 @@ class ChatApp(wx.App):
         except RuntimeError as exc:
             wx.MessageBox(str(exc), "启动数据不可用", wx.OK | wx.ICON_ERROR)
             return False
-        f = ChatFrame()
-        f.Show()
+        frame = ChatFrame()
+        if terminal_start:
+            frame.ShowWithoutActivating()
+        else:
+            frame.Show()
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            self._start_shared_terminal(frame, report_dialog=not terminal_start)
         return True
+
+    def _start_shared_terminal(self, frame, *, report_dialog):
+        from shared_terminal import TerminalError, TerminalServer
+        from shared_terminal_command import register_commands, terminal_endpoint
+        from shared_terminal_routes import dispatch_terminal
+
+        gui = Path(sys.executable)
+        try:
+            self._shared_terminal = TerminalServer(
+                terminal_endpoint(gui), lambda op, body: dispatch_terminal(frame, op, body),
+            )
+            self._shared_terminal.__enter__()
+            conflicts = []
+            if os.getenv("MC_SHARED_TERMINAL_REGISTER", "1") != "0":
+                conflicts = register_commands(gui.with_name("mc_worker.exe"))
+            if conflicts:
+                message = "\n".join(conflicts)
+                logging.getLogger(__name__).warning("PowerShell command registration conflicts: %s", message)
+                if report_dialog:
+                    wx.CallAfter(frame._show_ok_dialog,
+                                 message + "\n如需使用 MC 命令，请先调整这些同名命令，再重启 MC。", "PowerShell 命令冲突")
+        except (OSError, TerminalError) as exc:
+            logging.getLogger(__name__).warning("MC terminal setup failed: %s", exc)
+            if report_dialog:
+                wx.CallAfter(frame._show_ok_dialog,
+                             "无法设置 PowerShell 命令。请检查当前用户的本机应用目录和 Path 设置，再重启 MC。",
+                             "PowerShell 命令设置失败")
+
+    def OnExit(self):
+        service = getattr(self, "_shared_terminal", None)
+        if service is not None:
+            service.close()
+        return super().OnExit()
 
     def _activate_existing_window(self):
         user32 = ctypes.windll.user32

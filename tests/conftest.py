@@ -12,6 +12,7 @@ for path in (ROOT, ROOT / "tests"):
         sys.path.insert(0, str(path))
 
 import main
+import mc_frame_native_history
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -33,6 +34,35 @@ def wait_for_wx(wx_app):
     return wait
 
 
+@pytest.fixture
+def wait_for_wx_main_loop(wx_app):
+    def wait(predicate, description, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        error = []
+
+        def poll():
+            try:
+                if predicate() or time.monotonic() >= deadline:
+                    wx_app.ExitMainLoop()
+            except BaseException as exc:
+                error.append(exc)
+                wx_app.ExitMainLoop()
+
+        timer = wx.Timer(wx_app)
+        wx_app.Bind(wx.EVT_TIMER, lambda _event: poll(), timer)
+        timer.Start(15)
+        try:
+            wx_app.MainLoop()
+        finally:
+            timer.Stop()
+            wx_app.Unbind(wx.EVT_TIMER, source=timer)
+        if error:
+            raise error[0]
+        assert predicate(), f"Timed out waiting for {description}"
+
+    return wait
+
+
 @pytest.fixture(autouse=True)
 def disable_system_hooks(monkeypatch):
     monkeypatch.setattr(main.GlobalCtrlTapHook, "start", lambda self: None)
@@ -42,6 +72,7 @@ def disable_system_hooks(monkeypatch):
     monkeypatch.setenv("AUTO_START_QUICK_TUNNEL", "0")
     monkeypatch.setenv("REMOTE_CONTROL_AUTOSTART", "0")
     monkeypatch.setenv("DESKTOP_FILE_SERVICE_AUTOSTART", "0")
+    monkeypatch.setenv("MC_AGY_EXECUTABLE", str(Path(__file__).resolve().parent / "no-agy-runtime"))
     monkeypatch.delenv("REMOTE_CONTROL_TUNNEL_MODE", raising=False)
     monkeypatch.delenv("CLAUDECODE_REMOTE_CONTROL_TUNNEL_MODE", raising=False)
     monkeypatch.delenv("REMOTE_CONTROL_TOKEN", raising=False)
@@ -64,6 +95,10 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     monkeypatch.setattr(main, "resolve_app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main.ChatFrame, "_legacy_state_paths", lambda self: [self.state_path])
     assert Path(main.resolve_notes_data_dir()).resolve() != Path(r"D:\code\note").resolve()
+    if "loopback_kimi_home" not in request.fixturenames:
+        monkeypatch.setattr(mc_frame_native_history, "kimi_runtime_path", lambda: tmp_path / "no-kimi")
+    if "codex_homes" not in request.fixturenames:
+        monkeypatch.setattr(mc_frame_native_history, "codex_history_homes", lambda: ())
     f = main.ChatFrame()
     f.Hide()
     yield f
@@ -71,6 +106,12 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     # Still honor its persistence barrier before destroying wx/native state so
     # no daemon SQLite worker survives the fixture that owns its ChatStore.
     f._closing = True
+    f._stop_native_history_refresh()
+    if "codex_homes" in request.fixturenames:
+        for client in tuple(f._codex_clients.values()):
+            client.close()
+    if f._native_history_kimi_client is not None:
+        f._native_history_kimi_client.close()
     f._flush_execution_step_persists_sync()
     try:
         f.Hide()

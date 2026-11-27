@@ -3,6 +3,7 @@
 import copy
 import uuid
 import wx
+from agy_acp import AGY_MODEL_ID, AgyError
 from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from chat_store import ChatStore
 from claudecode_client import DEFAULT_CLAUDECODE_MODEL, is_claudecode_model
@@ -12,6 +13,8 @@ from mc_frame_presentation import _finite_timestamp
 from mc_frame_settings import DEFAULT_MODEL_ID, MODEL_IDS, REQUESTING_TEXT, STARTUP_DEFAULT_MODEL_ID
 from openclaw_client import DEFAULT_OPENCLAW_SESSION_KEY, is_openclaw_model
 from pathlib import Path
+
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS
 
 import mc_frame_bindings as bindings
 
@@ -90,6 +93,11 @@ class ChatRequestsMixin:
     def _mark_turn_request_failed(self, turn: dict, error: str) -> None:
         turn["request_status"] = "failed"
         turn["request_error"] = str(error or "")
+        turn["request_recovered_after_restart"] = False
+
+    def _mark_turn_request_cancelled(self, turn: dict, detail: str) -> None:
+        turn["request_status"] = "cancelled"
+        turn["request_error"] = detail
         turn["request_recovered_after_restart"] = False
 
     def _capture_model_startup_request(self, chat_id: str, turn_idx: int):
@@ -353,7 +361,8 @@ class ChatRequestsMixin:
         return str(getattr(self, "active_chat_id", "") or getattr(self, "current_chat_id", "") or "").strip()
 
     def _clear_pending_for(self, owner: str) -> bool:
-        return str(owner or "").strip() in getattr(self, "_shortcut_clear_pending", {})
+        owner = str(owner or "").strip()
+        return owner in getattr(self, "_shortcut_clear_pending", {}) or owner in getattr(self, "_native_delete_pending", ())
 
     def _trigger_shortcut_clear(self) -> bool:
         if getattr(self, "_closing", False) or not self.new_chat_button.IsEnabled():
@@ -362,9 +371,12 @@ class ChatRequestsMixin:
         pending = getattr(self, "_shortcut_clear_pending", None)
         if pending is None:
             pending = self._shortcut_clear_pending = {}
-        if owner in pending:
+        if self._clear_pending_for(owner):
             return False
         target, turns, current = self._chat_target_for_request(owner)
+        if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:
+            self.SetStatusText("请新建 AGY 聊天以开始新的上下文")
+            return False
         store = getattr(self, "chat_store", None)
         if (not isinstance(target, dict) or store is None
                 or not callable(getattr(store, "begin_clear_operation", None))):
@@ -851,8 +863,13 @@ class ChatRequestsMixin:
         target_id = str(chat_id or "").strip()
         if not target_id:
             return "missing"
+        if target_id in getattr(self, "_native_delete_pending", ()):
+            return "unavailable"
         current_ids = {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}
         current_ids.discard("")
+        target, _, _ = self._chat_target_for_request(target_id)
+        if isinstance(target, dict) and target.get("model") == AGY_MODEL_ID:
+            return "unavailable"
         if target_id in current_ids:
             try:
                 cleared = self._clear_context_and_start_new_chat(
@@ -904,6 +921,9 @@ class ChatRequestsMixin:
             self._invalidate_answer_mouse_gesture()
         self._retire_kimi_chat_runtime(chat, str(chat.get("kimi_session_id") or "").strip())
         self._clear_codex_context_usage_for_thread_change(chat)
+        if chat.get("codex_thread_id"):
+            for field in (*CODEX_STORAGE_FIELDS, *NATIVE_CHAT_FIELDS):
+                chat.pop(field, None)
         chat["id"] = str(chat.get("id") or chat_id or "").strip()
         chat["turns"] = []
         chat["updated_at"] = updated_at
@@ -953,12 +973,15 @@ class ChatRequestsMixin:
     def _submit_archived_remote_question(self, chat: dict, question: str, model: str, *,
                                          client_send_id: str = "", attachments=None,
                                          attachment_scope: tuple = (), active: bool = False,
-                                         prepared_attachments=None) -> tuple[bool, str]:
+                                         prepared_attachments=None, source: str = "rc",
+                                         expected_kimi_prompt_id: str = "", prepared_chat=None) -> tuple[bool, str]:
         """Accept a remote turn for the resolved chat without changing the local draft."""
         owner_id = str((chat or {}).get("id") or "").strip()
         if self._clear_pending_for(owner_id):
             return False, "正在清空此聊天的上下文"
         resolved_model = bindings.app.normalize_model_id(model or "", default="")
+        if (is_codex_model(resolved_model) or is_kimi_model(resolved_model)) and owner_id in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生聊天历史，请稍后重试"
         text = str(question or "").strip()
         if not owner_id or not resolved_model or not text:
             return False, "invalid archived chat submission"
@@ -966,13 +989,24 @@ class ChatRequestsMixin:
         if getattr(self, "_chat_store_enabled", False) and store is not None:
             if self._reconcile_clear_operation_for_owner(owner_id, surface_recovery=False) is not None:
                 return False, "Clear/resend recovery is still pending for this chat."
-            has_live_turns = active or (attachments and isinstance(chat.get("turns"), list))
-            loaded = None if has_live_turns else store.load_chat(owner_id, include_execution_steps=False)
+            has_live_turns = active or ((source == "terminal" or attachments or chat.get("codex_terminal_thread")
+                                         or (is_kimi_model(resolved_model) and self._kimi_should_steer_turn(chat, active)))
+                                        and isinstance(chat.get("turns"), list))
+            loaded = prepared_chat
+            if not has_live_turns and source != "terminal":
+                loaded = store.load_chat(owner_id, include_execution_steps=False)
+            if source == "terminal" and not has_live_turns and not isinstance(loaded, dict):
+                return False, "找不到原生聊天的已保存状态。"
             if isinstance(loaded, dict):
                 # Preserve the object held by archived_chats while replacing
                 # summary-only metadata with this owner's complete durable state.
                 chat.clear()
                 chat.update(loaded)
+        if resolved_model == AGY_MODEL_ID:
+            try:
+                self._validate_agy_submission(chat)
+            except AgyError as exc:
+                return False, str(exc)
         turns = self.active_session_turns if active else chat.get("turns")
         if not isinstance(turns, list):
             turns = []
@@ -984,9 +1018,13 @@ class ChatRequestsMixin:
             "answer_md": REQUESTING_TEXT,
             "model": resolved_model,
             "created_at": bindings.app.time.time(),
-            "question_origin": "rc",
+            "question_origin": source,
             "client_send_id": client_send_id,
         }
+        if source == "terminal":
+            turn["terminal_notification_pair"] = self._read_pair_id()
+        if expected_kimi_prompt_id:
+            turn["kimi_expected_prompt_id"] = expected_kimi_prompt_id
         if attachments:
             turn["attachments"] = attachments
             turn["remote_attachment_source"] = list(attachment_scope[:2])
@@ -999,6 +1037,10 @@ class ChatRequestsMixin:
                 started = self._start_codex_worker_for_turn(owner_id, turn_idx, text, resolved_model)
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(owner_id, turn_idx, text, resolved_model)
+            elif resolved_model == AGY_MODEL_ID:
+                started = self._start_agy_worker_for_turn(
+                    owner_id, turn_idx, text, resolved_model, prepared_attachments=prepared_attachments,
+                )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     owner_id, turn_idx, text, str(chat.get("claudecode_session_id") or ""), resolved_model
@@ -1035,9 +1077,9 @@ class ChatRequestsMixin:
             self._schedule_first_question_auto_title(owner_id, text)
         return True, ""
 
-    def _preflight_claude_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
-                                           attachments) -> tuple[bool, str]:
-        if getattr(self, "_claude_attachment_preflight", None) is not None:
+    def _preflight_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
+                                    attachments, *, agy_context=None) -> tuple[bool, str]:
+        if getattr(self, "_attachment_preflight", None) is not None:
             return False, "正在检查附件，请稍候"
         expected_state = self._current_chat_state
         expected_owner = (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
@@ -1045,26 +1087,30 @@ class ChatRequestsMixin:
         expected_draft = self.input_edit.GetValue()
         attachments = copy.deepcopy(attachments)
         token = object()
-        self._claude_attachment_preflight = token
+        self._attachment_preflight = token
 
         def finish(files, prepared, error):
-            if self._claude_attachment_preflight is not token:
-                return
-            self._claude_attachment_preflight = None
-            if (getattr(self, "_closing", False) or self._current_chat_state is not expected_state
-                    or expected_owner != (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
-                    or self._resolve_current_model() != expected_model or self.input_edit.GetValue() != expected_draft
-                    or list(self._pending_input_attachments) != attachments):
-                return
-            if not error:
-                ok, error = self._submit_question(
-                    raw_question, source, model, chat_id, client_send_id=client_send_id,
-                    _verified_attachments=(files, prepared),
-                )
-                if ok:
+            try:
+                if self._attachment_preflight is not token:
                     return
-            if error:
-                wx.MessageBox(error, "附件发送失败", wx.OK | wx.ICON_WARNING)
+                self._attachment_preflight = None
+                if (getattr(self, "_closing", False) or self._current_chat_state is not expected_state
+                        or expected_owner != (self.active_chat_id, self.current_chat_id, self.view_mode, self.view_history_id)
+                        or self._resolve_current_model() != expected_model or self.input_edit.GetValue() != expected_draft
+                        or list(self._pending_input_attachments) != attachments):
+                    return
+                if not error:
+                    ok, error = self._submit_question(
+                        raw_question, source, model, chat_id, client_send_id=client_send_id,
+                        _verified_attachments=(files, prepared),
+                    )
+                    if ok:
+                        return
+                if error:
+                    wx.MessageBox(error, "附件发送失败", wx.OK | wx.ICON_WARNING)
+            finally:
+                if agy_context is not None and prepared is not None:
+                    prepared.close_unused()
 
         def worker():
             try:
@@ -1072,16 +1118,19 @@ class ChatRequestsMixin:
                 if failed:
                     names = "、".join(item["name"] for item in failed)
                     raise ValueError(f"以下附件无法读取，请移除或修复后重试：{names}")
-                prepared = read_openrouter_claude_attachments(model, files)
+                prepared = (self._prepare_agy_attachments(agy_context, files) if agy_context is not None
+                            else read_openrouter_claude_attachments(model, files))
             except Exception as exc:
-                self._call_after_if_alive(finish, [], [], str(exc) or "无法读取附件")
+                self._call_after_if_alive(finish, [], None, str(exc) or "无法读取附件")
                 return
-            self._call_after_if_alive(finish, files, prepared, "")
+            queued = self._call_after_if_alive(finish, files, prepared, "")
+            if queued is False and agy_context is not None:
+                prepared.close_unused()
 
         try:
-            bindings.app.threading.Thread(target=worker, daemon=True, name="claude-attachment-preflight").start()
+            bindings.app.threading.Thread(target=worker, daemon=True, name="attachment-preflight").start()
         except Exception:
-            self._claude_attachment_preflight = None
+            self._attachment_preflight = None
             return False, "无法开始检查附件"
         return True, ""
 
@@ -1096,9 +1145,31 @@ class ChatRequestsMixin:
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
         requested_attachments = list(getattr(self, "_pending_input_attachments", []) or [])
+        candidate, candidate_turns, _ = self._chat_target_for_request(chat_id or self._visible_clear_owner())
+        if (candidate or {}).get("agy_workspace") and not model:
+            model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
+        if resolved_model == AGY_MODEL_ID:
+            if source == "local" and q and not requested_attachments and isinstance(candidate, dict) and candidate.get("id"):
+                control = self._handle_agy_control(candidate, q, local=True)
+                if control is not None:
+                    ok, message = control
+                    if ok:
+                        self.input_edit.ChangeValue("")
+                        if message:
+                            self.SetStatusText(message)
+                    return control
+            try:
+                if requested_attachments and _verified_attachments is None:
+                    return self._preflight_attachment_draft(
+                        raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
+                        agy_context=self._agy_attachment_context(candidate or {}, candidate_turns),
+                    )
+                self._validate_agy_submission(candidate or {})
+            except AgyError as exc:
+                return False, str(exc)
         if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:
-            return self._preflight_claude_attachment_draft(
+            return self._preflight_attachment_draft(
                 raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
             )
         prepared_attachments = None
@@ -1128,6 +1199,10 @@ class ChatRequestsMixin:
         submit_owner = str(
             chat_id or selected_history_id or self.active_chat_id or self.current_chat_id or ""
         ).strip()
+        if is_codex_model(resolved_model) and submit_owner in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生 Codex 历史，请稍后重试"
+        if is_kimi_model(resolved_model) and submit_owner in getattr(self, "_native_history_reserved", ()):
+            return False, "正在同步原生 Kimi Code 历史，请稍后重试"
         if not submit_owner:
             self._ensure_active_chat_id()
             submit_owner = str(self.active_chat_id or self.current_chat_id or "").strip()
@@ -1212,6 +1287,20 @@ class ChatRequestsMixin:
         if codex_local_command:
             command_name = str(codex_local_command.get("name") or "").strip()
             command_args = str(codex_local_command.get("args") or "").strip()
+            if source == "local" and self._current_chat_state.get("codex_terminal_thread"):
+                if command_name == "stop":
+                    ok, message = self._stop_shared_codex_turn(self._current_chat_state, self.active_codex_turn_id)
+                    if ok:
+                        self.input_edit.SetValue("")
+                        self.SetStatusText(message)
+                    return ok, message
+                if command_name == "reply":
+                    pending = self._codex_terminal_pending(chat_id)
+                    if pending:
+                        self.input_edit.SetValue("")
+                        self._show_codex_terminal_request(chat_id, pending["interaction_id"])
+                        return True, ""
+                    return False, "此聊天没有待处理的 Codex 请求。"
             now = bindings.app.time.time()
             turn_idx = len(self.active_session_turns)
             turn = {
@@ -1440,6 +1529,11 @@ class ChatRequestsMixin:
                 started = self._start_codex_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
+            elif resolved_model == AGY_MODEL_ID:
+                started = self._start_agy_worker_for_turn(
+                    chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model,
+                    prepared_attachments=prepared_attachments,
+                )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     chat_id or self.active_chat_id or self.current_chat_id or "",
@@ -1654,9 +1748,11 @@ class ChatRequestsMixin:
         self._render_answer_list()
         self.SetStatusText(f"已载入项目：{folder_name}")
 
-    def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False):
+    def _on_new_chat_clicked(self, _, title: str = "", title_manual: bool = False, *, agy_workspace=None):
         if getattr(self, "_closing", False):
             return False
+        if agy_workspace is None and self._resolve_current_model() == AGY_MODEL_ID:
+            return self._choose_agy_workspace(title, title_manual)
         manual_title = str(title or "").strip()
         manual = bool(title_manual and manual_title)
         store = getattr(self, "chat_store", None)
@@ -1754,7 +1850,10 @@ class ChatRequestsMixin:
         self.active_chat_id = self._ensure_active_chat_id()
         self.current_chat_id = self.active_chat_id
         self._current_chat_state["id"] = self.active_chat_id
-        model = bindings.app.normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
+        model = AGY_MODEL_ID if agy_workspace else bindings.app.normalize_model_id(self._resolve_current_model() or DEFAULT_MODEL_ID)
+        if agy_workspace:
+            self._current_chat_state.update(agy_workspace)
+            self.model_combo.SetValue(bindings.app.model_display_name(model))
         self.selected_model = model
         self._current_chat_state["model"] = model
         self._write_active_codex_session_state_to_chat(self._current_chat_state)

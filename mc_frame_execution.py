@@ -434,7 +434,7 @@ class ExecutionPageMixin:
         if not command:
             command = str(item.get("command") or item.get("commandLine") or item.get("cmd") or "").strip()
         if event_type == "diff_updated":
-            return "已生成代码变更"
+            return raw_text or text or "已生成代码变更"
         if event_type == "turn_started":
             return raw_text or text or "开始处理本轮请求"
         if event_type == "turn_completed":
@@ -578,7 +578,11 @@ class ExecutionPageMixin:
         tool_name = " ".join(
             str(tool.get(key) or "") for key in ("name", "kind", "toolKind")
         ).lower()
-        # Tool/action events never become F1 list rows — including failed or
+        if data.get("kimi_shared_tool"):
+            name = str(tool.get("name") or event.title or "工具").strip()
+            state = "失败" if failed else "已完成" if completed else "执行中"
+            return f"{name} · {state}"
+        # Ordinary tool/action events never become F1 list rows — including failed or
         # waiting ones (the generic 执行失败/正在等待 labels below must not
         # resurrect them). Turn-level errors and waiting states keep their
         # rows because those display kinds are not tool kinds. Thinking
@@ -620,6 +624,11 @@ class ExecutionPageMixin:
         elif self._kimi_protocol_event(event):
             original_raw = str(getattr(event, "raw_text", "") or "")
             detail_text = original_raw if original_raw else detail_text
+            if item.get("kimi_shared_tool"):
+                tool = item.get("tool") or {}
+                diff = tool.get("diff")
+                if diff:
+                    detail_text = "\n\n".join(part for part in (detail_text, str(diff)) if part)
             if not narrative:
                 detail_text = self._bounded_kimi_diagnostic(detail_text)
         if self._kimi_protocol_event(event) and not kimi_summary and not private_reasoning:
@@ -693,6 +702,10 @@ class ExecutionPageMixin:
         }
         if kimi_summary:
             entry["kimi_summary"] = kimi_summary
+        if item.get("codex_terminal_step") and display_kind in {"command", "artifact", "thinking"}:
+            entry["codex_terminal_step"] = True
+        if item.get("codex_terminal_snapshot") or item.get("kimi_shared_tool"):
+            entry["narrative_snapshot"] = True
         if narrative:
             entry["narrative_snapshot"] = True
             entry["kimi_step_id"] = str(item.get("step_id") or "")
@@ -1210,6 +1223,9 @@ class ExecutionPageMixin:
                 on_persisted,
             )
             return True
+        if step.get("provider") == "agy" and broadcast:
+            self._queue_execution_step_persist(chat_id, step)
+            return True
         if str(step.get("logical_key") or "").strip():
             try:
                 self._persist_execution_step(self.chat_store, chat_id, step)
@@ -1368,7 +1384,7 @@ class ExecutionPageMixin:
                         continue
                     chat_id, step = work
                     try:
-                        self._persist_execution_step(store, chat_id, step)
+                        self._persist_queued_execution_step(store, chat_id, step)
                     except Exception:
                         continue
         finally:
@@ -1420,10 +1436,17 @@ class ExecutionPageMixin:
             return True
         for chat_id, step in batch:
             try:
-                self._persist_execution_step(store, chat_id, step)
+                self._persist_queued_execution_step(store, chat_id, step)
             except Exception:
                 continue
         return True
+
+    def _persist_queued_execution_step(self, store, chat_id: str, step: dict) -> None:
+        persisted = self._persist_execution_step(store, chat_id, step)
+        if persisted and step.get("provider") == "agy":
+            payload = self._remote_execution_entry_payload(chat_id, persisted)
+            payload["_source_revision"] = step["revision"]
+            self._broadcast_remote_event(payload, retry_on_failure=False)
 
     def _prune_cached_execution_steps_for_turn(self, chat: dict, latest_step: dict) -> None:
         if not isinstance(chat, dict) or not isinstance(latest_step, dict):
@@ -1489,7 +1512,7 @@ class ExecutionPageMixin:
             turn_idx = self._kimi_event_turn_index(turns, event)
             if turn_idx < 0:
                 return
-            if (str(turns[turn_idx].get("request_status") or "") in {"done", "failed"}
+            if (str(turns[turn_idx].get("request_status") or "") in {"done", "failed", "cancelled"}
                     and not self._kimi_private_reasoning(event_data)):
                 return
         scope_values = [str(chat_id or "").strip(), revision, thread_scope, turn_scope, provider, agent_id, native_id]

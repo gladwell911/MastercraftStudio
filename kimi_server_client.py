@@ -170,6 +170,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         self._v2_completed_order = deque()
         self._v2_started = set()
         self._v2_frame_texts = {}
+        self._v2_tool_frames = {}
         self._v2_ready_sessions = set()
         self._v2_ready_generations = {}
         self._v2_request_generations = {}
@@ -183,6 +184,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
         self.http_session_factory = http_session_factory
         self.ws_factory = ws_factory
         self.launch_command = list(launch_command) if launch_command else None
+        self.runtime_version = ""
         self.port = int(port) if port else None
         self._configured_token = str(token) if token is not None else None
         self.token = self._configured_token
@@ -261,6 +263,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
                         command = list(self.launch_command)
                     else:
                         command, runtime_version = _resolve_kimi_runtime()
+                        self.runtime_version = runtime_version
                         self._server_api = runtime_version == "2.6.3"
                     args = command + ["web", "--no-open", "--port", str(port)]
                     if self.process_factory is not None:
@@ -314,6 +317,7 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
             self._v2_completed_order.clear()
             self._v2_started.clear()
             self._v2_frame_texts.clear()
+            self._v2_tool_frames.clear()
             self._server_api_item_restrictions.clear()
             self._server_api_previous_turns.clear()
             proc = self.process
@@ -434,6 +438,23 @@ class KimiServerClient(KimiServerApiMixin, KimiServerV2Mixin, KimiServerWebSocke
             if isinstance(status, int) and (400 <= status < 500 or status >= 40000):
                 return False
             raise
+
+    def list_sessions(self, *, before_id: str | None = None) -> dict[str, Any]:
+        params = {"page_size": 100}
+        if before_id:
+            params["before_id"] = before_id
+        return self._request_data("GET", "/api/v1/sessions", params=params)
+
+    def get_session(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request_data("GET", f"/api/v1/sessions/{session_id}", timeout=timeout)
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        sid = quote(session_id, safe="")
+        self._request_data("POST", f"/api/v1/sessions/{sid}/profile", json_body={"title": title})
+
+    def delete_session(self, session_id: str) -> None:
+        sid = quote(session_id, safe="")
+        self._request_data("POST", f"/api/v1/sessions/{sid}:delete", json_body={})
 
     def list_messages(
         self,

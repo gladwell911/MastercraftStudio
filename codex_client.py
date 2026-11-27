@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 import tomllib
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,6 +21,17 @@ from remote_machine_config import resolve_onedrive_sj_root
 
 CODEX_MODEL_PREFIX = "codex/"
 DEFAULT_CODEX_MODEL = "codex/main"
+
+
+class CodexRpcError(RuntimeError):
+    """A JSON-RPC error response from the Codex App Server."""
+
+    def __init__(self, message, *, code=None, rpc_message=""):
+        super().__init__(message)
+        self.code = code
+        self.rpc_message = rpc_message
+
+
 CODEX_MODEL_CONFIGS = {
     "codex/gpt-5.4-medium": {
         "model": "gpt-5.4",
@@ -533,14 +545,21 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
     command = _item_command(item)
     exit_code = _item_exit_code(item)
     display_kind = "status"
+    phase = str(item.get("phase") or "")
     text = _first_non_empty(raw_text, title)
 
     if item_type == "commandExecution":
         display_kind = "command"
+        if isinstance(item.get("aggregatedOutput"), str):
+            raw_text = item["aggregatedOutput"]
         text = _first_non_empty(raw_text, command, title)
     elif item_type == "agentMessage":
         display_kind = "commentary"
         text = raw_text
+    elif item_type == "plan":
+        display_kind = "plan"
+        if method == "item/completed" and raw_text.strip():
+            phase = "final_answer"
     elif item_type == "fileChange":
         display_kind = "artifact"
         text = _first_non_empty(raw_text, title, _item_file_change_summary(item))
@@ -568,8 +587,8 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
         exit_code=exit_code,
         subtype=item_type,
         display_kind=display_kind,
-        phase=str(item.get("phase") or ""),
-        status=item_type,
+        phase=phase,
+        status=str(item.get("status") or item_type),
         data=item,
         event_id=str(item.get("id") or ""),
         session_id=str(params.get("threadId") or ""),
@@ -633,6 +652,9 @@ class CodexAppServerClient:
         on_event: Callable[[CodexEvent], None] | None = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT,
         codex_model: str = DEFAULT_CODEX_MODEL,
+        native_home: Path | None = None,
+        use_native_config: bool = False,
+        unload_idle_threads: bool = False,
     ) -> None:
         self.on_event = on_event
         self.timeout = max(int(timeout or DEFAULT_REQUEST_TIMEOUT), 1)
@@ -646,9 +668,12 @@ class CodexAppServerClient:
         self._pending_requests: dict[str | int, dict] = {}
         self.last_context_usage = None
         self._initialized = False
+        self.server_user_agent = ""
         self._initializing = False
         self._closed = False
-        self._codex_home_dir: Path | None = None
+        self._codex_home_dir = native_home
+        self.use_native_config = use_native_config
+        self._unload_idle_threads = unload_idle_threads
         self._owns_codex_home_dir = False
         self._global_plugin_settings: dict | None = None
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -690,6 +715,10 @@ class CodexAppServerClient:
 
     def prepare_task(self, cwd: str | None = None) -> None:
         """Refresh native skill discovery before starting or resuming a new task."""
+        if self.use_native_config:
+            self._ensure_started()
+            self._refresh_native_skills(cwd)
+            return
         source_home = _user_home() / ".codex"
         settings = _plugin_settings(source_home)
         if self._codex_home_dir is None:
@@ -700,6 +729,9 @@ class CodexAppServerClient:
             self._stop_process()
             self._global_plugin_settings = settings
         self._ensure_started()
+        self._refresh_native_skills(cwd)
+
+    def _refresh_native_skills(self, cwd: str | None) -> None:
         roots = []
         seen = set()
         for root in (_user_home() / ".agents" / "skills", bundled_skill_root()):
@@ -742,10 +774,10 @@ class CodexAppServerClient:
     ) -> dict:
         params = {
             "threadId": str(thread_id or "").strip(),
-            **resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
-            "personality": personality,
-            "serviceTier": normalize_codex_service_tier(service_tier) or None,
         }
+        if not self.use_native_config:
+            params.update(resolve_native_approval_parameters(approval_policy, sandbox, approvals_reviewer),
+                          personality=personality, serviceTier=normalize_codex_service_tier(service_tier) or None)
         if cwd:
             params["cwd"] = str(cwd).strip()
         return self._request_thread_configuration("thread/resume", params)
@@ -830,6 +862,9 @@ class CodexAppServerClient:
 
     def read_rate_limits(self) -> dict:
         return self.request("account/rateLimits/read")
+
+    def release_idle_thread(self, thread_id: str) -> None:
+        self.request("thread/unsubscribe", {"threadId": thread_id}, timeout=4)
 
     def compact_thread(self, thread_id: str) -> dict:
         return self.request("thread/compact/start", {"threadId": str(thread_id or "").strip()})
@@ -962,8 +997,11 @@ class CodexAppServerClient:
                 self._initialize()
             return
 
+        command = self._app_server_command()
+        if self._unload_idle_threads:
+            command.extend(("-c", "thread_unload_delay_secs=0"))
         self._proc = subprocess.Popen(
-            build_codex_app_server_command(codex_model=self.codex_model),
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -982,6 +1020,11 @@ class CodexAppServerClient:
         self._initialized = False
         self._initialize()
 
+    def _app_server_command(self) -> list[str]:
+        if self.use_native_config:
+            return [*resolve_codex_launch_command(), "app-server", "--listen", "stdio://"]
+        return build_codex_app_server_command(codex_model=self.codex_model)
+
     def _build_launch_env(self) -> dict[str, str]:
         if self._codex_home_dir is None:
             env, codex_home_dir = build_codex_app_server_env()
@@ -991,7 +1034,8 @@ class CodexAppServerClient:
         else:
             env = os.environ.copy()
             env["CODEX_HOME"] = str(self._codex_home_dir)
-        _load_onedrive_codex_proxy(env)
+        if not self.use_native_config:
+            _load_onedrive_codex_proxy(env)
         # These inherited compatibility flags break restricted Windows process
         # creation together even with an elevated Codex token (native A/B).
         for key in list(env):
@@ -1010,7 +1054,7 @@ class CodexAppServerClient:
             return
         self._initializing = True
         try:
-            self._request_internal(
+            response = self._request_internal(
                 "initialize",
                 {
                     "clientInfo": {"name": "zgwd", "version": "1.0"},
@@ -1018,6 +1062,7 @@ class CodexAppServerClient:
                 },
                 timeout=DEFAULT_INITIALIZE_TIMEOUT,
             )
+            self.server_user_agent = str(response.get("userAgent") or "")
             self._send_json({"method": "initialized"})
             self._initialized = True
         finally:
@@ -1045,7 +1090,10 @@ class CodexAppServerClient:
         error = state.get("error")
         if error:
             message = str(error.get("message") or "unknown error")
-            raise RuntimeError(f"Codex app-server request failed: {method}: {message}")
+            detail = f"Codex app-server request failed: {method}: {message}"
+            if isinstance(error.get("code"), int):
+                raise CodexRpcError(detail, code=error["code"], rpc_message=message)
+            raise RuntimeError(detail)
         result = state.get("result")
         return result if isinstance(result, dict) else {}
 
@@ -1164,6 +1212,14 @@ class CodexAppServerClient:
             event.set()
 
     def _emit_protocol_event(self, method: str, params: dict, raw: dict) -> None:
+        if method == "thread/name/updated":
+            self._emit_event(CodexEvent(type="native_title", thread_id=str(params.get("threadId") or ""),
+                                        text=str(params.get("threadName") or ""), origin_timestamp=time.time()))
+            return
+        if method == "serverRequest/resolved":
+            self._emit_event(CodexEvent(type="server_request_resolved", thread_id=str(params.get("threadId") or ""),
+                                        request_id=params.get("requestId"), method=method))
+            return
         if method == "collab_waiting_end" or str(params.get("type") or "").strip() == "collab_waiting_end":
             text = _collab_waiting_end_text(params)
             if text:
@@ -1283,7 +1339,13 @@ class CodexAppServerClient:
                 )
             )
             return
-        if method == "item/agentMessage/delta":
+        delta_types = {
+            "item/agentMessage/delta": ("agentMessageDelta", "commentary"),
+            "item/commandExecution/outputDelta": ("commandExecution", "command"),
+            "item/reasoning/summaryTextDelta": ("reasoningSummary", "thinking"),
+        }
+        if method in delta_types:
+            subtype, kind = delta_types[method]
             self._emit_event(
                 CodexEvent(
                     type="agent_message_delta",
@@ -1292,8 +1354,8 @@ class CodexAppServerClient:
                     item_id=str(params.get("itemId") or ""),
                     text=str(params.get("delta") or ""),
                     raw_text=str(params.get("delta") or ""),
-                    subtype="agentMessageDelta",
-                    display_kind="commentary",
+                    subtype=subtype,
+                    display_kind=kind,
                     data=params,
                     event_id=str(params.get("eventId") or params.get("itemId") or ""),
                     fragment_id=str(params.get("fragmentId") or params.get("deltaId") or params.get("eventId") or ""),

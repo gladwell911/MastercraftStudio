@@ -1,9 +1,10 @@
 import io
+import sys
 import threading
 import time
 import pytest
 
-from codex_client import CodexEvent, _event_from_item
+from codex_client import CodexAppServerClient, CodexEvent, _event_from_item
 from codex_worker_process import CodexWorkerRuntime
 from codex_worker_protocol import decode_worker_line, encode_worker_message, make_ui_request, validate_chat_scoped_message
 
@@ -342,6 +343,79 @@ def test_worker_runtime_start_turn_emits_active_thread_state_and_turn_started_ac
     assert created[0].started_threads[0]["sandbox"] == "danger-full-access"
     assert created[0].started_threads[0]["personality"] == "pragmatic"
     assert created[0].started_turns[0][2] == "fast"
+
+
+def test_worker_completion_releases_private_process_when_unsubscribe_is_unsupported(tmp_path, monkeypatch):
+    script = tmp_path / "old_app_server.py"
+    ready = tmp_path / "finish"
+    unsubscribed = tmp_path / "unsubscribed"
+    script.write_text("""
+import json
+from pathlib import Path
+import sys
+import time
+
+finish, unsubscribed = map(Path, sys.argv[1:3])
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if "id" not in request:
+        continue
+    response = {"id": request["id"]}
+    if method in {"thread/read", "thread/resume"}:
+        response["result"] = {"thread": {"id": "thread-old", "cwd": str(finish.parent)}}
+    elif method == "turn/start":
+        response["result"] = {"turn": {"id": "turn-old"}}
+    elif method == "thread/unsubscribe":
+        unsubscribed.write_text(request["params"]["threadId"], encoding="utf-8")
+        response["error"] = {"code": -32601, "message": "Method not found"}
+    else:
+        response["result"] = {}
+    print(json.dumps(response), flush=True)
+    if method == "turn/start":
+        deadline = time.monotonic() + 10
+        while not finish.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        print(json.dumps({"method": "turn/completed", "params": {
+            "threadId": "thread-old", "turn": {"id": "turn-old", "status": "completed"},
+        }}), flush=True)
+""", encoding="utf-8")
+    monkeypatch.setattr(CodexAppServerClient, "_app_server_command",
+                        lambda _: [sys.executable, "-u", str(script), str(ready), str(unsubscribed)])
+
+    completed = threading.Event()
+
+    class WorkerOutput(io.StringIO):
+        def write(self, line):
+            result = super().write(line)
+            message = decode_worker_line(line)
+            if message["type"] == "event" and message["payload"]["event"]["type"] == "turn_completed":
+                completed.set()
+            return result
+
+    output = WorkerOutput()
+    runtime = CodexWorkerRuntime(output=output)
+    chat_id, model = "original-chat", "codex/main"
+    try:
+        runtime.handle_message(make_ui_request("request", "start_turn", {
+            "chat_id": chat_id, "turn_idx": 0, "context_generation": 9, "model": model,
+            "cwd": str(tmp_path), "native_home": str(tmp_path), "native_user_home": True, "thread_id": "thread-old",
+            "input_items": [{"type": "text", "text": "hello"}],
+        }))
+        client = runtime._clients[(chat_id, model)]
+        process = client._proc
+        assert process is not None and process.poll() is None, output.getvalue()
+        ready.touch()
+        assert completed.wait(10), output.getvalue()
+        assert unsubscribed.read_text(encoding="utf-8") == "thread-old"
+        assert process.poll() is not None and client._proc is None
+        messages = [decode_worker_line(line + "\n") for line in output.getvalue().splitlines()]
+        turn, = [message["payload"] for message in messages
+                 if message["type"] == "event" and message["payload"]["event"]["type"] == "turn_completed"]
+        assert turn["chat_id"] == chat_id and turn["turn_idx"] == 0
+        assert turn["event"]["turn_id"] == "turn-old" and turn["context_generation"] == 9
+    finally:
+        runtime.close()
 
 
 def test_worker_events_keep_thread_scope_when_new_turn_or_model_starts():

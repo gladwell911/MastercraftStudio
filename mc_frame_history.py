@@ -9,6 +9,8 @@ import sqlite3
 import sys
 import uuid
 import wx
+from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
+from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, allows_final_notification
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
     DEFAULT_CODEX_SANDBOX,
@@ -33,6 +35,10 @@ from pathlib import Path
 from realtime_call import DEFAULT_REALTIME_CALL_ROLE, DEFAULT_REALTIME_CALL_SPEECH_RATE
 
 import mc_frame_bindings as bindings
+
+
+def _unfinished_agy_answer(turn: dict) -> bool:
+    return turn.get("model") == AGY_MODEL_ID and turn.get("request_status") in ("pending", "unknown")
 
 
 class ChatHistoryMixin:
@@ -214,7 +220,8 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        for field in (*NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+                      "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
             if field in state:
@@ -232,7 +239,7 @@ class ChatHistoryMixin:
         if self.active_chat_id or self.current_chat_id or self.active_session_turns:
             active = self._slim_active_chat_state() if active_snapshot is None else active_snapshot
             active_id = str(active.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-            if active_id and active_id not in pending_clear:
+            if active_id and active_id not in pending_clear and not self._agy_terminal_write_rejected(active_id):
                 active["id"] = active_id
                 active["turns"] = self.active_session_turns if isinstance(self.active_session_turns, list) else []
                 state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
@@ -245,7 +252,7 @@ class ChatHistoryMixin:
             if not isinstance(chat, dict):
                 continue
             chat_id = str(chat.get("id") or "").strip()
-            if not chat_id or chat_id in pending_clear:
+            if not chat_id or chat_id in pending_clear or self._agy_terminal_write_rejected(chat_id):
                 continue
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
@@ -262,7 +269,7 @@ class ChatHistoryMixin:
                       "turns": self.active_session_turns,
                       "execution_steps": self._current_chat_state.get("execution_steps", [])}
         rows = [chat for chat in ([active] if active else []) + list(self.archived_chats)
-                if isinstance(chat, dict) and chat.get("id")]
+                if isinstance(chat, dict) and chat.get("id") and not self._agy_terminal_write_rejected(chat["id"])]
         return (
             self.chat_store if self._chat_store_enabled else None,
             self.state_path, data, copy.deepcopy(tuple(rows)), dict(self._chat_turn_dirty_from),
@@ -284,7 +291,7 @@ class ChatHistoryMixin:
                 pass
         for role, kind, field in (("user", "question", "question"), ("assistant", "final", "answer_md")):
             text = str(turn.get(field) or "").strip()
-            if not text or (role == "assistant" and text == REQUESTING_TEXT):
+            if not text or (role == "assistant" and (text == REQUESTING_TEXT or _unfinished_agy_answer(turn))):
                 continue
             try:
                 message_id = store.resolve_canonical_message_by_turn(owner, role=role, turn_index=index)
@@ -300,7 +307,7 @@ class ChatHistoryMixin:
                     store.quarantine(str(exc), {"chat_id": owner, "turn_index": index, "role": role})
                     continue
             notification = ("assistant_final" if role == "assistant" and turn.get("request_status") == "done"
-                            else "user_message" if role == "user" and turn.get("question_origin") == "mc" else "")
+                            and allows_final_notification(turn, pair) else "user_message" if role == "user" and turn.get("question_origin") == "mc" else "")
             if notification:
                 try:
                     store.commit_message_notification_fact(pair_id=pair, domain="events", chat_id=owner,
@@ -443,7 +450,7 @@ class ChatHistoryMixin:
                 for role, kind, content_key in (("user", "question", "question"),
                                                 ("assistant", "final", "answer_md")):
                     content = str(turn.get(content_key) or "")
-                    if not content or (role == "assistant" and content == REQUESTING_TEXT):
+                    if not content or (role == "assistant" and (content == REQUESTING_TEXT or _unfinished_agy_answer(turn))):
                         continue
                     try:
                         message_id = store.resolve_canonical_message_by_turn(
@@ -452,7 +459,8 @@ class ChatHistoryMixin:
                             pair_id=transport.subjects.pair_id, domain="events",
                             chat_id=normalized, message_id=message_id,
                             projection_kind=kind)
-                        if role == "assistant" and str(turn.get("request_status") or "").strip() == "done":
+                        if (role == "assistant" and turn.get("request_status") == "done"
+                                and allows_final_notification(turn, transport.subjects.pair_id)):
                             store.commit_message_notification_fact(
                                 pair_id=transport.subjects.pair_id, domain="events",
                                 chat_id=normalized, message_id=message_id,
@@ -541,6 +549,8 @@ class ChatHistoryMixin:
 
     def _load_state(self):
         if not self.state_path.exists():
+            if getattr(self, "_chat_store_enabled", False):
+                self.archived_chats = self.chat_store.list_chat_summaries()
             return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -596,7 +606,7 @@ class ChatHistoryMixin:
                 current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
                 merged = copy.deepcopy(summary)
                 merged.update(current)
-                for field in NATIVE_USAGE_FIELDS:
+                for field in (*NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS):
                     if field in summary:
                         merged[field] = copy.deepcopy(summary[field])
                 merged["id"] = self.active_chat_id
@@ -1102,6 +1112,13 @@ class ChatHistoryMixin:
         if not self._is_default_chat_title(str(chat.get("title") or "")):
             return
         expected_title_revision = int(chat.get("title_revision") or 0)
+        if chat.get("model") == AGY_MODEL_ID:
+            title = self._compact_first_question_title(normalized_question, 18)
+            if title:
+                self._apply_generated_first_question_title(
+                    resolved_chat_id, normalized_question, title, expected_title_revision
+                )
+            return
         command_title = self._cd_command_title(normalized_question)
         if command_title:
             self._apply_generated_first_question_title(
@@ -1349,7 +1366,7 @@ class ChatHistoryMixin:
             return
         if not getattr(self, "_chat_state_flush_dirty", False):
             return
-        if getattr(self, "_kimi_execution_write_counts", None):
+        if getattr(self, "_kimi_execution_write_counts", None) or getattr(self, "_agy_terminal_writes", 0):
             return
         self._chat_state_flush_dirty = False
         self._save_state()
@@ -1527,8 +1544,9 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        for field in (*NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
-                      "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation"):
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+                      "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
+                      "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation", "kimi_storage_id"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
         existing_matches = [
@@ -1802,6 +1820,7 @@ class ChatHistoryMixin:
 
     def _show_history_chat(self, chat_id: str, *, focus_answer_list: bool = True,
                            preserve_panel=False, sync_history_selection=True) -> bool:
+        self._request_native_history_refresh()
         selected_id = str(chat_id or "").strip()
         if not selected_id:
             return False
@@ -1824,6 +1843,8 @@ class ChatHistoryMixin:
             self.view_mode = "active"
             self.view_history_id = None
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
+            if native_status := self._current_chat_state.get("native_history_status"):
+                self.SetStatusText(native_status)
             if preserve_panel:
                 self._render_answer_list(preserve_panel=True)
             else:
@@ -1851,10 +1872,11 @@ class ChatHistoryMixin:
         if sync_history_selection and not self._select_history_row_if_present(selected_id):
             self._mark_history_list_dirty(selected_id)
         self._defer_chat_state_save()
-        self.SetStatusText("已切换到历史聊天")
+        self.SetStatusText(str(chat.get("native_history_status") or "已切换到历史聊天"))
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():
                 self.answer_list.SetFocus()
+        self._call_after_if_alive(self._show_pending_kimi_interaction)
         return True
 
     def _enter_history_view(self, chat_id: str, *, focus_answer_list: bool = True) -> bool:
@@ -1875,7 +1897,7 @@ class ChatHistoryMixin:
             return False
         metas = getattr(self, "answer_meta", []) or []
         index = self._latest_answer_message_row(metas) if include_question else next(
-            (i for i in range(len(metas) - 1, -1, -1) if metas[i][0] == "answer"), None
+            (i for i in range(len(metas) - 1, -1, -1) if metas[i][0] in {"answer", "partial_answer"}), None
         )
         if index is not None:
             try:
@@ -2076,18 +2098,36 @@ class ChatHistoryMixin:
         i_pin = wx.NewIdRef()
         i_clr = wx.NewIdRef()
         i_ren = wx.NewIdRef()
-        m.Append(i_del, "删除聊天")
+        m.Append(i_del, "从历史隐藏聊天")
         m.Append(i_pin, "取消置顶" if c.get("pinned") else "置顶聊天")
-        m.Append(i_clr, "清空所有非置顶聊天")
+        m.Append(i_clr, "隐藏所有非置顶聊天")
         m.Append(i_ren, "重命名聊天")
         m.Bind(wx.EVT_MENU, lambda event: self._history_delete(event, chat_id=target_id), id=i_del)
         m.Bind(wx.EVT_MENU, lambda event: self._history_pin(event, chat_id=target_id), id=i_pin)
         m.Bind(wx.EVT_MENU, self._history_clear_non_pinned, id=i_clr)
         m.Bind(wx.EVT_MENU, lambda event: self._history_rename(event, chat_id=target_id), id=i_ren)
+        if self._native_history_reference(c):
+            native_delete = m.Append(wx.ID_ANY, "删除原始会话")
+            m.Bind(wx.EVT_MENU, lambda _event: self._history_delete_native(target_id), native_delete)
+        if c.get("agy_session_id") and c.get("native_title"):
+            native_title = m.Append(wx.ID_ANY, "查看 AGY 原生标题")
+            m.Bind(wx.EVT_MENU, lambda _event: wx.MessageBox(
+                str(c["native_title"]), "AGY 原生标题", wx.OK, self), native_title)
+        if command := c.get("native_open_command"):
+            copy_command = m.Append(wx.ID_ANY, "复制原生 Codex 打开命令")
+            m.Bind(wx.EVT_MENU, lambda _event: self._copy_native_open_command(command), copy_command)
         try:
             self.PopupMenu(m)
         finally:
             m.Destroy()
+
+    def _copy_native_open_command(self, command: str) -> None:
+        if wx.TheClipboard.Open():
+            try:
+                wx.TheClipboard.SetData(wx.TextDataObject(command))
+            finally:
+                wx.TheClipboard.Close()
+            self.SetStatusText("已复制原生 Codex 打开命令")
 
     def _history_chat_for_id(self, chat_id: str) -> dict | None:
         normalized = str(chat_id or "").strip()
@@ -2098,26 +2138,16 @@ class ChatHistoryMixin:
                 return self._current_chat_state
         return self._find_archived_chat(normalized)
 
-    def _delete_chat_from_store(self, chat_id: str) -> None:
+    def _delete_chat_from_store(self, chat_id: str, *, native_id: str = "") -> None:
         store = getattr(self, "chat_store", None)
         if not (getattr(self, "_chat_store_enabled", False) and store is not None):
             return
         delete = getattr(store, "delete_chat", None)
         if callable(delete):
-            delete(chat_id)
-
-    def _delete_chats_from_store(self, chat_ids: list[str]) -> None:
-        store = getattr(self, "chat_store", None)
-        if not (getattr(self, "_chat_store_enabled", False) and store is not None):
-            return
-        delete_many = getattr(store, "delete_chats", None)
-        if callable(delete_many):
-            delete_many(chat_ids)
-            return
-        delete_one = getattr(store, "delete_chat", None)
-        if callable(delete_one):
-            for chat_id in chat_ids:
-                delete_one(chat_id)
+            if native_id:
+                delete(chat_id, native_id=native_id)
+            else:
+                delete(chat_id)
 
     def _handle_ctrl_history_navigation(self, event) -> bool:
         key = event.GetKeyCode()
@@ -2148,17 +2178,27 @@ class ChatHistoryMixin:
             self.SetStatusText("正在清空此聊天的上下文，请稍后删除")
             return
         self._flush_chat_state_save()
-        if not self._confirm("确定删除该聊天吗？") or self._clear_pending_for(cid):
+        if not self._confirm("确定从历史隐藏该聊天吗？原始会话将保留。") or self._clear_pending_for(cid):
             return
-        target_chat = self._history_chat_for_id(cid)
-        if target_chat:
-            self._cleanup_chat_detail_pages(target_chat)
-        self._delete_chat_from_store(str((target_chat or {}).get("id") or cid))
-        self._discard_deleted_chat_view(cid)
-        self._save_state()
-        self._refresh_history()
-        self._push_remote_history_changed(cid)
-        self._render_answer_list()
+        status, result = self._hide_history_chat_ui(cid)
+        if status != 200:
+            self.SetStatusText(result["message"])
+
+    def _history_delete_native(self, owner):
+        status, detail = self._native_delete_target_ui(owner)
+        if status != 200:
+            self.SetStatusText(detail["message"])
+            return
+        title = "刷新确认原始会话删除" if detail["manual"] else "删除原始会话"
+        dialog = wx.MessageDialog(self, detail["description"], title, wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING)
+        dialog.SetYesNoLabels("刷新确认" if detail["manual"] else "永久删除", "取消")
+        try:
+            confirmed = dialog.ShowModal() == wx.ID_YES
+        finally:
+            dialog.Destroy()
+        if confirmed:
+            status, result = self._queue_native_delete_ui(owner, detail["target"], True, local=True)
+            self.SetStatusText("正在确认原始会话删除" if status == 202 else result["message"])
 
     def _discard_deleted_chat_view(self, cid):
         normalized_cid = str(cid or "").strip()
@@ -2209,21 +2249,28 @@ class ChatHistoryMixin:
 
     def _history_clear_non_pinned(self, _):
         self._flush_chat_state_save()
-        if not self._confirm("确定清空所有非置顶聊天吗？"):
+        if not self._confirm("确定隐藏所有非置顶聊天吗？原始会话将保留。"):
             return
-        removed_ids = [str(c.get("id") or "").strip() for c in self.archived_chats
-                       if not c.get("pinned") and not self._clear_pending_for(c.get("id"))]
-        self.archived_chats = [c for c in self.archived_chats if str(c.get("id") or "").strip() not in removed_ids]
-        self._delete_chats_from_store(removed_ids)
-        if self.view_mode == "history" and str(self.view_history_id or "").strip() not in {
-            str(c.get("id") or "").strip() for c in self.archived_chats
-        }:
+        candidates = {str(c["id"]).strip(): self._history_hide_identity(c)
+                      for c in self.archived_chats if not c.get("pinned") and c.get("id")}
+        removed = {owner: identity for owner, identity in candidates.items() if identity is not None}
+        if getattr(self, "_chat_store_enabled", False):
+            try:
+                self.chat_store.delete_chats(list(removed), native_ids=removed)
+            except (OSError, sqlite3.Error):
+                self.SetStatusText("无法保存聊天隐藏状态，请稍后重试。")
+                return
+        self.archived_chats = [c for c in self.archived_chats if str(c.get("id") or "").strip() not in removed]
+        if str(self.view_history_id or "").strip() in removed:
             self.view_mode = "active"
             self.view_history_id = None
         self._save_state()
         self._refresh_history()
-        self._push_remote_history_changed()
+        for owner in removed:
+            self._push_remote_history_changed(owner, removed=True)
         self._render_answer_list()
+        if len(removed) != len(candidates):
+            self.SetStatusText("部分聊天仍在处理，请稍后隐藏。")
 
     def _history_rename(self, _, *, chat_id=None):
         c = self._history_chat_for_id(chat_id or self._selected_history_chat_id())
@@ -2233,6 +2280,11 @@ class ChatHistoryMixin:
         if d.ShowModal() == wx.ID_OK:
             name = d.get_value()
             if name:
+                queued = self._queue_native_title_rename(c, name, local=True)
+                if queued is not None:
+                    self.SetStatusText("正在确认原生聊天标题" if queued else "聊天已变更，请重新打开后改名。")
+                    d.Destroy()
+                    return
                 before = copy.deepcopy(c)
                 self._bump_chat_title_revision(c, "manual", title=name)
                 store = getattr(self, "chat_store", None)
@@ -2245,6 +2297,9 @@ class ChatHistoryMixin:
                     c.update(before)
                     d.Destroy()
                     return
-                self._upsert_history_row(c.get("id"))
-                self._push_remote_history_changed(c.get("id"))
+                self._upsert_history_row(c.get("id"), allow_reorder=False)
+                if c.get("agy_session_id"):
+                    self._push_remote_title_changed(c)
+                else:
+                    self._push_remote_history_changed(c.get("id"))
         d.Destroy()

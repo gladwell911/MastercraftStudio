@@ -41,6 +41,20 @@ Kimi 流式片段、执行投影和隐私撤回按序在后台写入。2.6.3 用
 
 源码测试已经在 SQLite 写锁持有期间和长 REST 快照的实际 wx 定时器续批之间记录 Tab 焦点与方向键选中事件。争渡声学出声与日常构建仍待现场验收。测试和审查证据见 [实施计划](../_bmad-output/implementation-artifacts/plan-kimi-keyboard-responsiveness.md)。
 
+## PowerShell 共享执行
+
+`mc-kimi --list` 查看本机会话。`mc-kimi --chat <ID> --send "问题"` 在本机 MC 的 Kimi Server 继续该会话。MC 和 RC 的对应聊天会显示供应方公开的工具步骤、状态和输出。在执行页打开步骤可查看详情。
+
+`mc-kimi`、`mc-codex` 和 `mc-agy` 由 MC 注册为本地 PowerShell 脚本。如果 PowerShell 提示禁止执行脚本或要求数字签名，可用 `Get-ExecutionPolicy -List` 查看生效策略。保留现有策略，按组织流程签名启动脚本，或直接在 PowerShell 运行安装目录中的 `mc_worker.exe --shared-terminal kimi` 进入交互。Codex 和 AGY 分别传入 `codex` 和 `agy`。
+
+MC 和 RC 可中断共享回合。待处理的审批和结构化问题在原聊天中处理。运行中发送追问时，2.5.3 根据原生回执追加当前回合或排队，2.6.3 由服务端安排下一轮。
+
+## 原生终端历史
+
+MC 通过当前支持的 Kimi Server 分页读取同一 Windows 账号和 Kimi Home 的会话及主代理记录。RC 在对应电脑的历史中查看原工作目录、正文和可恢复的执行步骤。旧历史首次读入不会触发回复通知。已发现会话按原生 ID 续问，工作目录变化、会话占用和暂时不可读时保留缓存。
+
+用 `kimi --session <ID>` 在原目录继续应用创建的会话。Kimi 2.6.3 可能在 Server 退出前持有会话锁。若终端提示会话已被使用，等待原任务完成并正常关闭持有该会话的 MC 或 Kimi Web 实例，再重试。MC 的后台历史读取使用独立的短时 Server，扫描结束后关闭该 Server。
+
 ## 兼容与验收
 
 固定版本不能保证云端 API 永远兼容。回退前必须验证升级后的会话格式可读，不能直接让旧程序写日常库。物理声音、新版 MC 日常切换与长期运行仍待验收。

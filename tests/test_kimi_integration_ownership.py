@@ -1,6 +1,8 @@
 import main
 import pytest
+from types import SimpleNamespace
 from codex_client import CodexEvent
+from kimi_history import KimiHistoryReader
 from kimi_server_client import KimiEvent, KimiServerClient, KimiServerError
 from kimi_test_support import (
     TEST_TURN_ID,
@@ -9,6 +11,7 @@ from kimi_test_support import (
     _submit,
     running_kimi_control_server,
 )
+from native_history import NativeSessionIdentity, NativeSessionSnapshot
 
 
 def test_interleaved_same_turn_id_routes_by_session(frame, monkeypatch):
@@ -305,10 +308,28 @@ def test_interrupt_via_stop_command(frame, monkeypatch):
         KimiEvent(type="turn_completed", thread_id=session_id, turn_id=TEST_TURN_ID, status="interrupted")
     )
     interrupted_turn = frame.active_session_turns[0]
-    assert interrupted_turn["request_status"] == "failed"
+    assert interrupted_turn["request_status"] == "cancelled"
     assert "已中断" in str(interrupted_turn["answer_md"] or "")
     assert frame.is_running is False
     assert frame.new_chat_button.IsEnabled()
+
+
+def test_native_history_distinguishes_cancelled_from_failed():
+    items = [
+        {"kind": "turn", "turnId": "1", "triggerPromptId": "prompt-1", "state": "cancelled"},
+        {"kind": "turn", "turnId": "2", "triggerPromptId": "prompt-2", "state": "failed",
+         "error": "tool failed"},
+    ]
+    client = SimpleNamespace(get_transcript=lambda *_args, **_kwargs: {"items": items})
+    reader = KimiHistoryReader(client, "default", lambda _item: True)
+    identity = NativeSessionIdentity("default", "kimi", "qa-home", "qa-session")
+    snapshot = NativeSessionSnapshot(identity, "qa-account", "kimi/main", "qa-cwd", "qa-title")
+
+    reader.read_session(snapshot)
+
+    assert [(row["request_status"], row["answer_md"]) for row in snapshot.turns] == [
+        ("cancelled", "Kimi Code 已中断。"), ("failed", "tool failed"),
+    ]
 
 
 def test_prompt_during_active_turn_steers(frame, monkeypatch):
@@ -779,8 +800,14 @@ def test_v2_stop_exact_prompt_http_and_cancelled_terminal(frame, monkeypatch, ru
                               text="" if aborted else expected_answer,
                               data={"prompt_id": pid, "source_kind": "transcript.terminal", "stream_complete": True}))
     assert frame.active_session_turns[0]["answer_md"] == expected_answer
-    if not aborted:
-        assert frame.active_session_turns[0]["request_status"] == "done"
+    expected_status = "cancelled" if aborted else "done"
+    assert frame.active_session_turns[0]["request_status"] == expected_status
+    owner = _active_chat_id(frame)
+    frame._persist_chat_history_to_store()
+    assert frame.chat_store.load_turns(owner)[0]["request_status"] == expected_status
+    status, history = frame._remote_api_history_read_ui({"chat_id": owner, "limit": 10})
+    assert status == 200
+    assert history["chat"]["turns"][0]["request_status"] == expected_status
     fake.push_event(KimiEvent(type="turn_completed", thread_id=sid, turn_id="t1", status="completed",
                               text="late duplicate", data={"prompt_id": pid}))
     _submit(frame, "/stop")

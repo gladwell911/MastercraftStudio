@@ -2,10 +2,13 @@
 
 import asyncio
 import copy
+from concurrent.futures import TimeoutError
 import hashlib
 import json
+import sqlite3
 import uuid
 import wx
+from agy_acp import AGY_MODEL_ID, AgyError
 from chat_client import is_openrouter_claude_model, read_openrouter_claude_attachments
 from codex_client import (
     DEFAULT_CODEX_MODEL,
@@ -15,6 +18,7 @@ from codex_client import (
 )
 from execution_projection import project_execution_rows
 from kimi_server_client import is_kimi_model
+from native_history import allows_final_notification
 from mc_frame_presentation import _finite_timestamp, execution_answer_to_plain
 from mc_frame_settings import (
     DEFAULT_MODEL_ID,
@@ -28,6 +32,39 @@ import mc_frame_bindings as bindings
 
 
 class RemoteRoutesMixin:
+    def _apply_native_runtime_remote_snapshot(self, chat, snapshot, *, include_request=True):
+        if chat.get("model") == AGY_MODEL_ID:
+            run = self._agy_run_for_chat(chat)
+            pending = self._agy_interaction_payload(snapshot["chat_id"], run)
+            self._apply_shared_remote_state(snapshot, bool(run), run.action_id if run else "", pending,
+                                            include_request=include_request)
+            return
+        if is_kimi_model(chat.get("model", "")):
+            owner = self._kimi_active_control_owner(chat)
+            pending = self._kimi_remote_interaction_payload(owner)
+            self._apply_shared_remote_state(snapshot, bool(owner or chat.get("kimi_turn_active")),
+                                            owner.get("prompt_id", ""), pending,
+                                            include_request=include_request)
+            return
+        thread = chat.get("codex_terminal_thread")
+        if not thread or thread != chat.get("codex_thread_id"):
+            return
+        pending = self._codex_terminal_interaction_payload(snapshot["chat_id"])
+        running = bool(chat.get("codex_turn_active"))
+        self._apply_shared_remote_state(snapshot, running, self._codex_turn_id_for_chat(chat), pending,
+                                        include_request=include_request)
+
+    @staticmethod
+    def _apply_shared_remote_state(snapshot, running, turn_id, pending, *, include_request):
+        snapshot["active_turn"] = snapshot["running"] = running
+        snapshot["native_turn_id"] = turn_id if running else ""
+        request_kind = pending["request_kind"] if pending else ""
+        snapshot["request_kind"] = request_kind
+        snapshot["status"] = f"waiting_{request_kind}" if request_kind else "running" if running else "idle"
+        if pending and include_request:
+            snapshot["pending_request"] = {**pending, "native_turn_id": snapshot["native_turn_id"]}
+            snapshot["prompt"] = pending["prompt"]
+
     def _remote_session_usage(self, chat: dict, revision: int = 0) -> dict | None:
         chat_id = str(chat.get("id") or "").strip()
         if not chat_id:
@@ -232,7 +269,8 @@ class RemoteRoutesMixin:
             if turn_index < 0 or turn_index >= len(turns):
                 return False
             persisted = turns[turn_index]
-            if str(persisted.get("request_status") or "").strip() != "done":
+            if (persisted.get("request_status") != "done"
+                    or not allows_final_notification(persisted, self._read_pair_id())):
                 return False
             final_text = str(persisted.get("answer_md") or "").strip()
             if not final_text or final_text == REQUESTING_TEXT:
@@ -277,7 +315,7 @@ class RemoteRoutesMixin:
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
                 return True
             except ValueError as exc:
-                if str(exc) != "EVENT_ID_CONFLICT":
+                if str(exc) not in {"EVENT_ID_CONFLICT", "HISTORICAL_FINAL"}:
                     try:
                         store.quarantine(
                             str(exc), {"chat_id": resolved_chat_id, "role": "assistant"}
@@ -296,7 +334,7 @@ class RemoteRoutesMixin:
         )
         return True
 
-    def _push_remote_history_changed(self, chat_id: str | None = None) -> None:
+    def _push_remote_history_changed(self, chat_id: str | None = None, *, title_update=None, removed=False) -> None:
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         payload = {
@@ -305,6 +343,10 @@ class RemoteRoutesMixin:
             "event_id": f"evt-{uuid.uuid4().hex[:8]}",
             "ts": bindings.app.time.time(),
         }
+        if title_update is not None:
+            payload["title_update"] = title_update
+        if removed:
+            payload["removed"] = True
         self._broadcast_remote_event(payload)
 
     def _push_remote_notes_changed(self, cursor: str | None = None) -> None:
@@ -393,7 +435,7 @@ class RemoteRoutesMixin:
         cached = cache.get(cache_key)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
             return dict(cached[1])
-        answer = answer_md
+        answer = "" if model == AGY_MODEL_ID and answer_md == REQUESTING_TEXT else answer_md
         payload = {
             "question": question,
             "client_send_id": str(turn.get("client_send_id") or ""),
@@ -456,6 +498,14 @@ class RemoteRoutesMixin:
             "chat_id": chat_id,
             "title": title,
             "model": model,
+            **({"native_workspace": chat.get("native_cwd", ""),
+                "native_history_status": chat.get("native_history_status", ""),
+                "native_open_command": chat.get("native_open_command", "")}
+               if chat.get("native_identity") or is_codex_model(model) else {}),
+            **({"agy_workspace": chat.get("agy_workspace", ""),
+                "agy_history_status": chat.get("native_history_status", ""),
+                "agy_native_title": chat.get("native_title", ""),
+                "agy_native_title_revision": chat.get("native_title_revision", 0)} if model == AGY_MODEL_ID else {}),
             "created_at": created_at,
             "updated_at": updated_at,
             "title_source": str(chat.get("title_source") or ("manual" if chat.get("title_manual") else "default")),
@@ -470,6 +520,7 @@ class RemoteRoutesMixin:
             "detail_panel_mode": str(chat.get("detail_panel_mode") or "answers").strip() or "answers",
             **self._codex_speed_payload_for_chat(chat),
         }
+        self._apply_native_runtime_remote_snapshot(chat, snapshot, include_request=False)
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
@@ -530,6 +581,14 @@ class RemoteRoutesMixin:
             "title_updated_at": float(chat.get("title_updated_at") or updated_at),
             "title_revision": int(chat.get("title_revision") or 1),
             "turn_count": len(turns),
+            **({"native_workspace": chat.get("native_cwd", ""),
+                "native_history_status": chat.get("native_history_status", ""),
+                "native_open_command": chat.get("native_open_command", "")}
+               if chat.get("native_identity") or is_codex_model(model) else {}),
+            **({"agy_workspace": chat.get("agy_workspace", ""),
+                "agy_history_status": chat.get("native_history_status", ""),
+                "agy_native_title": chat.get("native_title", ""),
+                "agy_native_title_revision": chat.get("native_title_revision", 0)} if model == AGY_MODEL_ID else {}),
             "running": False,
             "request_kind": request_kind,
             "current": bool(chat_id) and chat_id == current_id,
@@ -542,6 +601,7 @@ class RemoteRoutesMixin:
                       for index, turn in enumerate(turns) if isinstance(turn, dict)],
             **self._codex_speed_payload_for_chat(chat),
         }
+        self._apply_native_runtime_remote_snapshot(chat, snapshot)
         store = getattr(self, "chat_store", None)
         if chat_id and getattr(self, "_chat_store_enabled", False) and store is not None and hasattr(store, "get_clear_reconciliation_authority"):
             try:
@@ -678,7 +738,31 @@ class RemoteRoutesMixin:
         chat.update(self._codex_speed_payload_for_chat(chat))
         return chat
 
-    def _remote_chat_attachment_message_ui(self, payload: dict) -> tuple[int, dict]:
+    def _remote_api_message(self, payload: dict) -> tuple[int, dict]:
+        if "attachment_file_ids" not in payload:
+            return self._run_remote_ui_route(self._remote_api_message_ui, payload)
+        preflight = []
+
+        def check_attachment_route(data):
+            return self._remote_chat_attachment_message_ui(data, agy_preflight=preflight)
+
+        response = self._run_remote_ui_route(check_attachment_route, payload)
+        if response[0] != 200 or not preflight:
+            return response
+        try:
+            prepared = self._prepare_agy_attachments(*preflight[0])
+        except AgyError as exc:
+            return 400, {"accepted": False, "error": str(exc)}
+        try:
+            return self._run_remote_ui_route(
+                lambda data: self._remote_chat_attachment_message_ui(data, agy_prepared=prepared), payload,
+            )
+        finally:
+            prepared.close_unused()
+
+    def _remote_chat_attachment_message_ui(
+        self, payload: dict, *, agy_preflight=None, agy_prepared=None,
+    ) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         send_id = str(payload.get("client_send_id") or "").strip()
         scope = self._remote_attachment_scope(payload, send_id)
@@ -722,7 +806,23 @@ class RemoteRoutesMixin:
         if error:
             return 400, {"accepted": False, "error": error}
         prepared_attachments = None
-        if is_openrouter_claude_model(model):
+        if isinstance(target, dict) and target.get("agy_workspace") and model != AGY_MODEL_ID:
+            return 400, {"accepted": False, "error": "请为其他提供方新建聊天"}
+        if model == AGY_MODEL_ID:
+            if not isinstance(target, dict):
+                return 404, {"accepted": False, "error": "找不到此电脑上的 AGY 聊天"}
+            if agy_preflight is not None:
+                _, turns, _ = self._chat_target_for_request(chat_id)
+                try:
+                    context = self._agy_attachment_context(target, turns)
+                except AgyError as exc:
+                    return 400, {"accepted": False, "error": str(exc)}
+                agy_preflight.append((context, attachments))
+                return 200, {}
+            if agy_prepared is None or agy_prepared.scope != self._agy_chat_scope(target):
+                return 409, {"accepted": False, "error": "AGY 会话已变化，请重新发送附件"}
+            prepared_attachments = agy_prepared
+        elif is_openrouter_claude_model(model):
             try:
                 prepared_attachments = read_openrouter_claude_attachments(model, attachments)
             except ValueError as exc:
@@ -749,6 +849,8 @@ class RemoteRoutesMixin:
         if not text:
             return 400, {"accepted": False, "error": "empty_text"}
         requested_chat_id = str(payload.get("chat_id") or "").strip()
+        if requested_chat_id and self._chat_store_enabled and self.chat_store.get_meta(f"deleted-chat:{requested_chat_id}"):
+            return 404, {"accepted": False, "message": "该聊天已从历史移除，请新建聊天。"}
         previous_owner_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         if self._clear_pending_for(requested_chat_id or previous_owner_id):
             return 409, {"accepted": False, "error": "clear_context_pending"}
@@ -763,7 +865,7 @@ class RemoteRoutesMixin:
         if requested_chat_id and requested_chat_id not in current_ids:
             archived_target = self._find_archived_chat(requested_chat_id)
             is_new_chat = archived_target is None
-        preview_chat = self._current_chat_state if requested_chat_id in current_ids else archived_target
+        preview_chat = self._current_chat_state if not requested_chat_id or requested_chat_id in current_ids else archived_target
         if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             current_model = self._resolve_current_model()
         else:
@@ -777,6 +879,47 @@ class RemoteRoutesMixin:
         if model_error:
             error = "missing_explicit_model" if model_error == "missing_explicit_model" else "invalid_explicit_model"
             return 400, {"accepted": False, "error": error, "chat_id": requested_chat_id or str(self.active_chat_id or self.current_chat_id or "").strip()}
+        if model == AGY_MODEL_ID and (not isinstance(preview_chat, dict) or not preview_chat.get("agy_workspace")):
+            return 400, {"accepted": False, "message": "请先为 AGY 新建聊天并选择项目目录"}
+        if isinstance(preview_chat, dict) and preview_chat.get("agy_workspace") and model != AGY_MODEL_ID:
+            return 400, {"accepted": False, "message": "请为其他提供方新建聊天"}
+        if model == AGY_MODEL_ID:
+            control = self._handle_agy_control(
+                preview_chat, text, expected=str(payload.get("expected_native_turn_id") or ""),
+                send_id=str(payload.get("client_send_id") or ""),
+            )
+            if control is not None:
+                ok, message = control
+                return 200 if ok else 409, {"accepted": ok, "chat_id": preview_chat["id"], "message": message}
+        if isinstance(preview_chat, dict) and preview_chat.get("codex_terminal_thread"):
+            expected_turn = str(payload.get("expected_native_turn_id") or "")
+            target_owner = str(preview_chat.get("id") or "")
+            if text == "/stop" and is_codex_model(model):
+                ok, message = self._stop_shared_codex_turn(preview_chat, expected_turn)
+                return 200 if ok else 409, {"accepted": ok, "chat_id": target_owner, "message": message}
+            if expected_turn and (not preview_chat.get("codex_turn_active")
+                                  or self._codex_turn_id_for_chat(preview_chat) != expected_turn):
+                return 409, {"accepted": False, "chat_id": target_owner, "message": "此 Codex 回合已结束或已更换。"}
+        if isinstance(preview_chat, dict) and is_kimi_model(self._model_for_chat_selection(preview_chat)):
+            expected_prompt = str(payload.get("expected_native_turn_id") or "")
+            target_owner = str(preview_chat.get("id") or "")
+            if expected_prompt or text == "/stop":
+                if not is_kimi_model(model):
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                elif text == "/stop":
+                    ok, message = self._stop_shared_kimi_turn(preview_chat, expected_prompt)
+                elif self._kimi_active_control_owner(preview_chat).get("prompt_id") != expected_prompt:
+                    ok, message = False, "此 Kimi Code 回合已结束或已更换。"
+                else:
+                    ok, message = self._submit_archived_remote_question(
+                        preview_chat, text, model, active=archived_target is None,
+                        client_send_id=str(payload.get("client_send_id") or ""),
+                        expected_kimi_prompt_id=expected_prompt,
+                    )
+                    if ok:
+                        self._push_remote_state(target_owner)
+                        self._push_remote_history_changed(target_owner)
+                return 200 if ok else 409, {"accepted": ok, "chat_id": target_owner, "message": message}
         if requested_chat_id:
             if requested_chat_id != self.active_chat_id:
                 if archived_target is not None:
@@ -791,7 +934,7 @@ class RemoteRoutesMixin:
             if not self._current_chat_state.get("id"):
                 self._current_chat_state["id"] = chat_id
         target_chat = self._current_chat_state if chat_id in {self.active_chat_id, self.current_chat_id} else self._find_archived_chat(chat_id)
-        if archived_target is None and bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
+        if model != AGY_MODEL_ID and archived_target is None and bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             self.input_edit.SetValue(text)
         title_revision_before = 0
         if isinstance(target_chat, dict):
@@ -799,7 +942,12 @@ class RemoteRoutesMixin:
                 title_revision_before = int(target_chat.get("title_revision") or 0)
             except Exception:
                 title_revision_before = 0
-        if archived_target is not None:
+        if model == AGY_MODEL_ID:
+            ok, message = self._submit_archived_remote_question(
+                target_chat, text, model, client_send_id=str(payload.get("client_send_id") or ""),
+                active=archived_target is None,
+            )
+        elif archived_target is not None:
             ok, message = self._submit_archived_remote_question(archived_target, text, model, client_send_id=str(payload.get("client_send_id") or ""))
         else:
             ok, message = self._submit_question(text, source="remote-ws", model=model, chat_id=chat_id, client_send_id=str(payload.get("client_send_id") or ""))
@@ -885,11 +1033,54 @@ class RemoteRoutesMixin:
             return chat_model or STARTUP_DEFAULT_MODEL_ID, ""
         return bindings.app.normalize_model_id(current_model or STARTUP_DEFAULT_MODEL_ID), ""
 
-    def _remote_api_new_chat_ui(self, payload: dict) -> tuple[int, dict]:
-        chat = self._start_remote_new_chat(payload)
+    def _remote_api_new_chat(self, payload: dict) -> tuple[int, dict]:
+        owner = str(payload.get("chat_id") or "").strip()
+        if owner and self._chat_store_enabled and self.chat_store.get_meta(f"deleted-chat:{owner}"):
+            return 409, {"accepted": False, "message": "请使用新的聊天 ID。"}
+        model = bindings.app.normalize_model_id(payload.get("model"), default="")
+        if model != AGY_MODEL_ID:
+            return self._run_remote_ui_route(self._remote_api_new_chat_ui, payload)
+        with self._agy_creation_lock:
+            self._agy_remote_creations += 1
+        try:
+            return self._remote_create_agy_chat(payload)
+        finally:
+            with self._agy_creation_lock:
+                self._agy_remote_creations -= 1
+
+    def _remote_create_agy_chat(self, payload: dict) -> tuple[int, dict]:
+        try:
+            raw_cwd = payload.get("agy_workspace")
+            client, fields = self._prepare_agy_workspace(raw_cwd if isinstance(raw_cwd, str) else "")
+        except AgyError as exc:
+            return 400, {"accepted": False, "message": str(exc)}
+        committed = False
+        try:
+            status, body = self._run_remote_ui_route(
+                lambda data: self._remote_api_new_chat_ui(data, agy_workspace=(client, fields)), payload
+            )
+            committed = status == 200
+            return status, body
+        finally:
+            if not committed:
+                client.close()
+
+    def _remote_api_new_chat_ui(self, payload: dict, *, agy_workspace=None) -> tuple[int, dict]:
+        model = bindings.app.normalize_model_id(payload.get("model"), default="")
+        if getattr(self, "_closing", False):
+            return 503, {"accepted": False, "message": "电脑端正在关闭"}
+        if model == AGY_MODEL_ID and agy_workspace is None:
+            return 400, {"accepted": False, "message": "请选择运行电脑上的 AGY 项目目录"}
+        if not model and self._resolve_current_model() == AGY_MODEL_ID:
+            payload = {**payload, "model": STARTUP_DEFAULT_MODEL_ID}
+        fields = agy_workspace[1] if agy_workspace else None
+        chat = self._start_remote_new_chat(payload, agy_fields=fields)
+        if agy_workspace:
+            self._remember_agy_workspace(agy_workspace[0], chat["chat_id"], fields["agy_workspace"])
+            chat.update(agy_workspace=fields["agy_workspace"], agy_options=fields["agy_options"])
         return 200, {"accepted": True, **chat}
 
-    def _start_remote_new_chat(self, payload: dict | None = None) -> dict:
+    def _start_remote_new_chat(self, payload: dict | None = None, *, agy_fields=None) -> dict:
         navigation_deferred = (
             getattr(self, "_chat_navigation_answer_rows_deferred", False)
             or getattr(self, "_chat_navigation_history_selection_deferred", False)
@@ -938,6 +1129,8 @@ class RemoteRoutesMixin:
             model = bindings.app.normalize_model_id((payload or {}).get("model") or self._resolve_current_model() or DEFAULT_MODEL_ID)
             self.selected_model = model
             self._current_chat_state["model"] = model
+            if agy_fields:
+                self._current_chat_state.update(agy_fields)
             self._write_active_codex_session_state_to_chat(self._current_chat_state)
             self._write_active_kimi_session_state_to_chat(self._current_chat_state)
             if is_codex_model(model):
@@ -985,19 +1178,33 @@ class RemoteRoutesMixin:
 
     def _remote_api_reply_request_ui(self, payload: dict) -> tuple[int, dict]:
         text = str(payload.get("text") or "").strip()
-        ok, message = self._handle_remote_pending_request_reply(text)
+        owner = str(payload.get("chat_id") or "").strip()
+        interaction_id = str(payload.get("interaction_id") or "").strip()
+        chat, _, _ = self._chat_target_for_request(owner) if owner else (None, [], False)
+        if interaction_id and chat and is_kimi_model(self._model_for_chat_selection(chat)):
+            ok, message = self._reply_remote_kimi_interaction(chat, interaction_id, text, payload.get("kimi_answers"))
+        elif interaction_id.startswith("agy-"):
+            ok, message = self._reply_agy_interaction(owner, interaction_id, text=text, answers=payload.get("answers"))
+        elif interaction_id or self._codex_terminal_pending(owner):
+            ok, message = self._reply_codex_terminal_request(owner, interaction_id, text=text)
+        elif owner and owner not in {self.active_chat_id, self.current_chat_id}:
+            ok, message = False, "当前聊天没有待回复的请求。"
+        else:
+            ok, message = self._handle_remote_pending_request_reply(text)
         return 200 if ok else 400, {"accepted": ok, "message": message}
 
     def _remote_api_model_list_ui(self) -> tuple[int, dict]:
         return 200, {
             "accepted": True,
             "models": [
-                {"id": model_id, "label": bindings.app.model_display_name(model_id)}
+                {"id": model_id, "label": bindings.app.model_display_name(model_id),
+                 **({"agy_workspace": self._agy_workspace_descriptor()} if model_id == AGY_MODEL_ID else {})}
                 for model_id in VISIBLE_MODEL_IDS
             ],
         }
 
     def _remote_api_history_list_ui(self, _payload: dict | None = None) -> tuple[int, dict]:
+        self._request_native_history_refresh()
         if (_payload or {}).get("collection_page"):
             return self._remote_api_history_collection_ui(_payload)
         cached = getattr(self, "_remote_history_list_cache", None)
@@ -1017,6 +1224,7 @@ class RemoteRoutesMixin:
             current_summary = self._remote_chat_summary(current)
             current_summary["running"] = bool(self.is_running)
             current_summary["request_kind"] = "user_input" if self.active_codex_pending_request else ""
+            self._apply_native_runtime_remote_snapshot(current, current_summary, include_request=False)
             chats.append(current_summary)
         for chat in self.archived_chats:
             chats.append(self._remote_chat_summary(chat))
@@ -1101,6 +1309,7 @@ class RemoteRoutesMixin:
         # UI captures one live owner only. Indexed SQLite paging, hydration and
         # metadata authority stay on this worker rather than walking all archives.
         def capture(_payload=None):
+            self._request_native_history_refresh()
             live = dict(getattr(self, "_current_chat_state", {}) or {})
             live.update({"id": str(self.active_chat_id or self.current_chat_id or ""),
                          "turn_count": len(self.active_session_turns), "running": bool(self.is_running)})
@@ -1159,8 +1368,8 @@ class RemoteRoutesMixin:
         active = owner in {str(getattr(self, "active_chat_id", "") or ""),
                            str(getattr(self, "current_chat_id", "") or "")}
         state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
-        steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else []
-        turns = state.get("turns") if isinstance(state.get("turns"), list) else []
+        steps = state.get("execution_steps") if isinstance(state.get("execution_steps"), list) else ()
+        turns = state.get("turns") if isinstance(state.get("turns"), list) else ()
         with self._execution_step_persist_lock:
             dirty = bool(self._pending_execution_step_persists) or bool(self._execution_step_persist_worker_running)
         dirty = dirty or bool(getattr(self, "_codex_ui_batch_depth", 0)) or bool(self._kimi_execution_write_counts.get(owner))
@@ -1266,6 +1475,7 @@ class RemoteRoutesMixin:
             return 409, {"error": str(exc), "recovery": "SNAPSHOT_REQUIRED"}
 
     def _remote_api_history_read_ui(self, payload: dict) -> tuple[int, dict]:
+        self._request_native_history_refresh()
         chat_id = str(payload.get("chat_id") or "").strip()
         if chat_id in {self.active_chat_id, self.current_chat_id, ""}:
             source_chat = dict(self._current_chat_state or {
@@ -1343,8 +1553,14 @@ class RemoteRoutesMixin:
                     include_execution_steps=include_execution_steps,
                 ) or {}
                 chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, state_payload)
-        status = "waiting_user_input" if self.active_codex_pending_request else "idle"
-        request_kind = "user_input" if self.active_codex_pending_request else ""
+        if (chat.get("model") == AGY_MODEL_ID or is_kimi_model(chat.get("model", "")) or (
+            source_chat.get("codex_terminal_thread") and source_chat.get("codex_terminal_thread") == source_chat.get("codex_thread_id")
+        )):
+            self._apply_native_runtime_remote_snapshot(source_chat, chat)
+            status, request_kind = chat["status"], chat["request_kind"]
+        else:
+            status = "waiting_user_input" if self.active_codex_pending_request else "idle"
+            request_kind = "user_input" if self.active_codex_pending_request else ""
         chat.update(
             {
                 "chat_id": chat.get("chat_id") or chat_id,
@@ -1364,6 +1580,36 @@ class RemoteRoutesMixin:
         self._remote_state_cache = {"key": cache_key, "body": copy.deepcopy(body)}
         return 200, body
 
+    def _remote_api_rename_chat(self, payload: dict) -> tuple[int, dict]:
+        status, body = self._run_remote_ui_route(self._remote_api_rename_chat_ui, payload)
+        future = body.pop("_native_rename", None)
+        if future is None:
+            return status, body
+        try:
+            return future.result(timeout=20)
+        except TimeoutError:
+            return 503, {"accepted": False, "error": "原生改名尚未确认，请稍后刷新聊天。"}
+
+    def _remote_api_history_mutation(self, payload: dict) -> tuple[int, dict]:
+        owner = payload.get("chat_id")
+        if not isinstance(owner, str) or not owner.strip() or len(owner) > 512:
+            return 400, {"accepted": False, "message": "缺少要操作的聊天。"}
+        owner = owner.strip()
+        action = payload.get("type")
+        if action == "hide_history_chat":
+            return self._run_remote_ui_route(self._hide_history_chat_ui, owner)
+        if action == "native_delete_target":
+            return self._run_remote_ui_route(self._native_delete_target_ui, owner)
+        status, body = self._run_remote_ui_route(
+            lambda: self._queue_native_delete_ui(owner, payload.get("target"), payload.get("confirmed")))
+        future = body.pop("_native_delete", None)
+        if future is None:
+            return status, body
+        try:
+            return future.result(timeout=42)
+        except TimeoutError:
+            return 503, {"accepted": False, "message": "原始会话删除仍待确认，请稍后刷新。"}
+
     def _remote_api_rename_chat_ui(self, payload: dict) -> tuple[int, dict]:
         chat_id = str(payload.get("chat_id") or "").strip()
         title = str(payload.get("title") or "").strip()
@@ -1375,6 +1621,16 @@ class RemoteRoutesMixin:
         if not isinstance(chat, dict):
             return 404, {"accepted": False, "error": "not_found"}
         incoming_source = str(payload.get("title_source") or "manual").strip() or "manual"
+        if incoming_source == "manual":
+            queued = self._queue_native_title_rename(chat, title)
+            if queued is False:
+                return 409, {"accepted": False, "error": "聊天已变更，请重新打开后改名。"}
+            if queued is not None:
+                return 202, {"_native_rename": queued}
+            if chat.get("model") == AGY_MODEL_ID:
+                return self._rename_agy_alias_ui(chat, title)
+        elif chat.get("title_manual"):
+            return 200, self._rename_title_response(chat)
         incoming_updated_at = float(payload.get("title_updated_at") or bindings.app.time.time())
         current_updated_at = float(chat.get("title_updated_at") or chat.get("updated_at") or 0.0)
         incoming_revision = int(payload.get("title_revision") or (int(chat.get("title_revision") or 0) + 1))
@@ -1400,7 +1656,7 @@ class RemoteRoutesMixin:
                 "title_updated_at": current_updated_at,
                 "title_revision": current_revision,
             }
-        resolved_revision = incoming_revision
+        resolved_revision = max(current_revision + 1, incoming_revision)
         if incoming_updated_at == current_updated_at and incoming_priority == current_priority:
             resolved_revision = max(current_revision, incoming_revision)
         chat["title"] = title
@@ -1411,7 +1667,7 @@ class RemoteRoutesMixin:
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         self._save_state()
-        self._refresh_history(chat_id)
+        self._upsert_history_row(chat_id, allow_reorder=False)
         self._push_remote_history_changed(chat_id)
         return 200, {
             "accepted": True,
@@ -1421,6 +1677,18 @@ class RemoteRoutesMixin:
             "title_updated_at": incoming_updated_at,
             "title_revision": resolved_revision,
         }
+
+    def _rename_agy_alias_ui(self, chat, title):
+        before = chat.copy()
+        self._bump_chat_title_revision(chat, "manual", title=title)
+        try:
+            self.chat_store.upsert_chat(self._slim_active_chat_state() if chat is self._current_chat_state else chat)
+        except (OSError, RuntimeError, sqlite3.Error):
+            chat.update(before)
+            return 503, {"accepted": False, "error": "无法保存 AGY 聊天显示名，请重试。"}
+        self._upsert_history_row(chat["id"], allow_reorder=False)
+        self._push_remote_title_changed(chat)
+        return 200, self._rename_title_response(chat)
 
     def _remote_api_update_settings_ui(self, payload: dict) -> tuple[int, dict]:
         if "codex_answer_english_filter_enabled" in payload:
@@ -1564,6 +1832,9 @@ class RemoteRoutesMixin:
                     continue
                 turn = turns[turn_index]
                 if str(turn.get("request_status") or "") != "done":
+                    continue
+                if not allows_final_notification(turn, self._read_pair_id()):
+                    pending.discard((chat_id, turn_index))
                     continue
                 answer = str(turn.get("answer_md") or "").strip()
                 if not answer or answer == REQUESTING_TEXT:

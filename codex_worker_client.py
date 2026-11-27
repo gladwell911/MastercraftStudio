@@ -19,6 +19,10 @@ from codex_worker_protocol import (
 )
 
 
+def codex_worker_workspace() -> Path:
+    return Path(__file__).resolve().parent
+
+
 class CodexWorkerClient:
     def __init__(
         self,
@@ -46,6 +50,7 @@ class CodexWorkerClient:
         self._ready_event = threading.Event()
         self._closed = False
         self._pending_notification = False
+        self._terminal_requests: dict[str, tuple[threading.Event, dict]] = {}
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -61,7 +66,7 @@ class CodexWorkerClient:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    cwd=str(Path(__file__).resolve().parent),
+                    cwd=str(codex_worker_workspace()),
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -134,13 +139,41 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(request_id, "start_turn", payload))
         return request_id
 
+    def open_terminal(self, **payload: Any) -> dict:
+        self.start()
+        request_id = self._next_id()
+        done, result = threading.Event(), {}
+        with self._lock:
+            self._terminal_requests[request_id] = (done, result)
+        try:
+            self._send_message(make_ui_request(request_id, "open_terminal", payload))
+            if not done.wait(25):
+                raise RuntimeError("等待 Codex 本机终端就绪超时。请检查对应聊天后重试。")
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            if not result:
+                raise RuntimeError("Codex 工作进程已退出。请重新打开该聊天。")
+            return result
+        finally:
+            with self._lock:
+                self._terminal_requests.pop(request_id, None)
+
+    def bind_terminal_turn(self, **payload: Any) -> None:
+        self._send_message(make_ui_request(self._next_id(), "bind_terminal_turn", payload))
+
+    def retire_terminal(self, **payload: Any) -> None:
+        self._send_message(make_ui_request(self._next_id(), "retire_terminal", payload))
+
+    def reply_terminal_interaction(self, **payload: Any) -> None:
+        self._send_message(make_ui_request(self._next_id(), "reply_terminal_interaction", payload))
+
     def read_chat_information(self, *, chat_id: str, model: str, identity: list[str], generation: int,
-                              context_only: bool = False) -> str:
+                              context_only: bool = False, **scope) -> str:
         request_id = self._next_id()
         self._send_message(make_ui_request(request_id, "read_chat_information", {
             "chat_id": str(chat_id or ""), "model": str(model or ""), "identity": list(identity),
             "generation": int(generation),
-            "context_only": bool(context_only),
+            "context_only": bool(context_only), **scope,
         }))
         return request_id
 
@@ -155,9 +188,10 @@ class CodexWorkerClient:
         self._send_message(make_ui_request(message_id, "reply_command_approval", payload))
         return message_id
 
-    def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "") -> str:
+    def compact_thread(self, thread_id: str, *, chat_id: str, model: str = "", **scope) -> str:
         request_id = self._next_id()
-        payload = {"chat_id": str(chat_id or ""), "model": str(model or ""), "thread_id": str(thread_id or "")}
+        payload = {"chat_id": str(chat_id or ""), "model": str(model or ""),
+                   "thread_id": str(thread_id or ""), **scope}
         self._send_message(make_ui_request(request_id, "compact_thread", payload))
         return request_id
 
@@ -236,12 +270,24 @@ class CodexWorkerClient:
                     message = decode_worker_line(line)
                     if message.get("type") == "ready":
                         self._ready_event.set()
+                    if message.get("type") == "terminal_endpoint":
+                        with self._lock:
+                            waiter = self._terminal_requests.get(message.get("id"))
+                            if waiter is not None:
+                                done, result = waiter
+                                result.update(message["payload"])
+                                done.set()
+                        continue
                     self._enqueue_worker_message(message)
                 except CodexWorkerProtocolError:
                     continue
                 except Exception:
                     continue
         finally:
+            with self._lock:
+                if self.process is proc:
+                    for done, _ in self._terminal_requests.values():
+                        done.set()
             self._notify_exit(proc)
 
     def _stderr_loop(self) -> None:
@@ -342,7 +388,7 @@ class CodexWorkerClient:
             turn_key = "" if turn_idx is None else str(turn_idx)
         item_id = self._event_item_id(event)
         if item_id:
-            return str(payload.get("chat_id") or ""), turn_key, item_id
+            return str(payload.get("chat_id") or ""), turn_key, item_id, str(event.get("display_kind") or "")
         return str(payload.get("chat_id") or ""), turn_key
 
     def _enforce_queue_limit_locked(self) -> None:

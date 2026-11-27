@@ -92,6 +92,7 @@ class AnswerTextViewerDialog(wx.Dialog):
         *,
         payload: AnswerViewerPayload | None = None,
         on_continue: Callable[[AnswerViewerPayload], bool] | None = None,
+        preserve_leading_newlines: bool = False,
     ):
         super().__init__(
             parent,
@@ -106,7 +107,8 @@ class AnswerTextViewerDialog(wx.Dialog):
         self._continue_requested = False
         self._closing = False
         self._display_prefix = "\n"
-        display_text = self._display_prefix + self.canonical_text.lstrip("\r\n")
+        visible_text = self.canonical_text if preserve_leading_newlines else self.canonical_text.lstrip("\r\n")
+        display_text = self._display_prefix + visible_text
         self._display_marker_offset: int | None = 0
         self._scratch_previous_text = display_text
         self._scratch_non_edit_key_pending = False

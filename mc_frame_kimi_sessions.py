@@ -12,6 +12,7 @@ from kimi_server_client import (
     event_to_payload as kimi_event_to_payload,
     is_kimi_model,
 )
+from kimi_history import KimiHistoryReader, kimi_history_account, kimi_history_storage
 from mc_frame_settings import REQUESTING_TEXT
 from pathlib import Path
 
@@ -73,6 +74,36 @@ class KimiSessionsMixin:
         if chat is self._current_chat_state:
             return str(self.active_kimi_turn_id or "").strip()
         return ""
+
+    def _kimi_active_control_owner(self, chat: dict) -> dict:
+        chat_id = str(chat.get("id") or "")
+        session_id = self._kimi_session_id_for_chat(chat)
+        with self._kimi_owner_lock:
+            owner = self._kimi_active_turns.get(chat_id) or {}
+            if (session_id and owner.get("session_id") == session_id and owner.get("role") == "active"
+                    and owner.get("turn_id") and owner.get("prompt_id")):
+                return dict(owner)
+        return {}
+
+    def _stop_shared_kimi_turn(self, chat: dict, expected_prompt: str) -> tuple[bool, str]:
+        owner = self._kimi_active_control_owner(chat)
+        if not expected_prompt or owner.get("prompt_id") != expected_prompt:
+            return False, "此 Kimi Code 回合已结束或已更换。"
+        chat_id = str(chat["id"])
+        client = self._kimi_client
+        if getattr(client, "protocol_version", 0) != 2:
+            return False, "当前 Kimi Code 连接不支持精确中断。"
+
+        def stop():
+            try:
+                self._handle_kimi_stop_command(client, chat, owner, chat_id)
+            except (KimiServerError, OSError) as exc:
+                self._call_after_if_alive(self._push_remote_attention, chat_id, "failed",
+                                          f"stop:{expected_prompt}", f"Kimi Code 中断未获确认：{exc}")
+                self._recover_kimi_pending_owners(session_ids={owner["session_id"]})
+
+        bindings.app.threading.Thread(target=stop, daemon=True, name="kimi-shared-stop").start()
+        return True, "已提交中断请求，等待 Kimi Code 确认。"
 
     def _workspace_dir_for_kimi(self) -> str:
         return str(Path(bindings.app.__file__).resolve().parent)
@@ -849,6 +880,7 @@ class KimiSessionsMixin:
                     or target_turns[turn_idx] is not startup_request[0]):
                 return
             turn = startup_request[0]
+            expected_prompt = turn.get("kimi_expected_prompt_id")
             with self._kimi_owner_lock:
                 known_active = self._kimi_active_turns.get(client_chat_id) or {}
                 session_id = str(self._kimi_submission_sessions.get(client_chat_id)
@@ -863,8 +895,34 @@ class KimiSessionsMixin:
             history_turns = target_turns[:turn_idx]
             client = self._ensure_kimi_client()
             self._start_kimi_client_with_retry(client)
+            terminal_resume = turn.get("question_origin") == "terminal"
+            if terminal_resume:
+                auth = client.get_auth(timeout=5)
+                provider = auth.get("managed_provider")
+                ready = auth.get("models_ready")
+                managed_unavailable = (isinstance(provider, dict)
+                                       and provider.get("status") in {"unauthenticated", "expired", "revoked"})
+                if ready is False or (ready is not True and (managed_unavailable or auth.get("providers_count") == 0)):
+                    raise RuntimeError("Kimi Code 登录或模型配置不可用。请在官方 Kimi CLI 登录或配置提供方后重试。")
             if discard_stale_submission():
                 return
+            storage = kimi_history_storage()
+            expected_storage = target_chat.get("kimi_storage_id")
+            if session_id and expected_storage and expected_storage != storage:
+                raise RuntimeError("Kimi Code 会话属于其他 Kimi Home。请恢复原 Kimi Home 再重试。")
+            native_cwd = str(target_chat.get("native_cwd") or "") if session_id else ""
+            if native_cwd:
+                if target_chat.get("native_account") != kimi_history_account():
+                    raise RuntimeError("Kimi Code 会话属于其他系统账号。")
+                if not Path(native_cwd).is_dir():
+                    raise RuntimeError(f"Kimi Code 原会话工作目录不可用：{native_cwd}")
+                info = client.get_session(session_id)
+                if (status := KimiHistoryReader.busy_status(info)) and not self._kimi_should_steer_turn(target_chat, target_chat is self._current_chat_state):
+                    raise RuntimeError(status)
+                metadata = info.get("metadata")
+                actual_cwd = metadata.get("cwd") if isinstance(metadata, dict) else None
+                if not actual_cwd or Path(actual_cwd).resolve() != Path(native_cwd).resolve():
+                    raise RuntimeError("Kimi Code 原会话工作目录已变化。请检查原会话后重试。")
             if session_id:
                 exists_error: Exception | None = None
                 for attempt in range(max(1, int(self._kimi_reconcile_attempts))):
@@ -880,6 +938,8 @@ class KimiSessionsMixin:
                             bindings.app.time.sleep(min(float(self._kimi_reconcile_backoff) * (2 ** attempt), 2.0))
                 if exists_error is not None:
                     raise exists_error
+            if (terminal_resume or native_cwd) and not session_id:
+                raise RuntimeError("Kimi Code 无法打开原生会话。请检查当前账号和会话，再重试。")
             if session_id:
                 try:
                     client.subscribe([session_id])
@@ -931,6 +991,8 @@ class KimiSessionsMixin:
             with self._kimi_owner_lock:
                 if self._kimi_submission_locks.get(client_chat_id) is not submission_lock:
                     return
+                if expected_prompt and self._kimi_active_control_owner(target_chat).get("prompt_id") != expected_prompt:
+                    raise RuntimeError("此 Kimi Code 回合已结束或已更换。")
                 if not should_steer and not existing_queue:
                     self._kimi_active_turns[client_chat_id] = {
                         "turn_idx": int(turn_idx), "session_id": session_id, "model": str(model or ""),
@@ -973,6 +1035,7 @@ class KimiSessionsMixin:
                     submission_lock,
                     {
                         **unresolved_owner,
+                        "kimi_storage_id": storage,
                         "active": True,
                         "prompt_role": "unresolved",
                         "unresolved": True,
@@ -998,7 +1061,12 @@ class KimiSessionsMixin:
                     "queued_at": bindings.app.time.time(),
                 }
             if should_steer and str(prompt_id or "").strip():
-                steer_result = client.steer_prompts(session_id, [prompt_id])
+                # The provider has already accepted this prompt. If its target ended
+                # during POST, leave the accepted prompt in its native queue.
+                still_targeted = not expected_prompt or (
+                    self._kimi_active_control_owner(target_chat).get("prompt_id") == expected_prompt
+                )
+                steer_result = client.steer_prompts(session_id, [prompt_id]) if still_targeted else False
                 if steer_result is True:
                     prompt_role = "alias"
                     owner_prompt_id = str(active_owner.get("owner_prompt_id") or active_owner.get("prompt_id") or "").strip()
@@ -1056,6 +1124,7 @@ class KimiSessionsMixin:
                 submission_lock,
                 {
                     "session_id": session_id,
+                    "kimi_storage_id": storage,
                     "prompt_id": str(prompt_id or "").strip(),
                     "question": str(question or "").strip(),
                     "turn_idx": int(turn_idx),
@@ -1103,6 +1172,8 @@ class KimiSessionsMixin:
                 if session_changed:
                     self._clear_kimi_information_for_session_change(target_chat, refresh=False)
                 target_chat["kimi_session_id"] = session_id
+                if payload.get("kimi_storage_id"):
+                    target_chat["kimi_storage_id"] = payload["kimi_storage_id"]
                 if is_current_target:
                     self.active_kimi_session_id = session_id
             if "turn_id" in payload:
@@ -1237,6 +1308,19 @@ class KimiSessionsMixin:
         except Exception:
             return
         event = CodexEvent(**kimi_event_to_payload(kimi_event))
+        if event.subtype == "session.meta.updated":
+            protocol = (event.data or {}).get("protocol") or {}
+            patch = protocol.get("patch") or {}
+            if isinstance(patch, dict) and isinstance(patch.get("title"), str):
+                sid = self._event_thread_id(event)
+                candidates = {chat["id"] for chat in [self._current_chat_state, *self.archived_chats]
+                              if chat.get("kimi_session_id") == sid}
+                if len(candidates) == 1:
+                    self._call_after_if_alive(
+                        self._observe_native_title_ui, candidates.pop(), "kimi", sid, patch["title"],
+                        event.origin_timestamp or bindings.app.time.time(), explicit=patch.get("isCustomTitle") is True,
+                    )
+            return
         if event.type == "kimi_v2_usage":
             chat_id = self._known_kimi_event_chat_id(event)
             target = self._chat_information_owner_for_id(chat_id) if chat_id else None
@@ -1908,7 +1992,7 @@ class KimiSessionsMixin:
                                      parent_prompt_id: str) -> None:
         parent = next((row for row in turns if isinstance(row, dict) and row.get("kimi_session_id") == key[1]
                        and row.get("kimi_prompt_id") == parent_prompt_id), None)
-        if parent is None or parent.get("request_status") not in {"done", "failed"}:
+        if parent is None or parent.get("request_status") not in {"done", "failed", "cancelled"}:
             return
         if parent["request_status"] == "done":
             answer_identity = parent.get("answer_identity")
@@ -1920,7 +2004,10 @@ class KimiSessionsMixin:
         else:
             error = str(parent.get("request_error") or parent.get("answer_md") or "")
             turn["answer_md"] = error
-            self._mark_turn_request_failed(turn, error)
+            if parent["request_status"] == "cancelled":
+                self._mark_turn_request_cancelled(turn, error)
+            else:
+                self._mark_turn_request_failed(turn, error)
         with self._kimi_owner_lock:
             self._add_kimi_tombstone(key)
             self._kimi_prompt_owners.pop(key, None)
