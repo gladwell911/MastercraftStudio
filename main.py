@@ -70,6 +70,7 @@ from codex_client import (
     CODEX_SANDBOX_MODES,
     DEFAULT_CODEX_SANDBOX,
     DEFAULT_CODEX_APPROVAL_MODE,
+    DESKTOP_DEFAULT_CODEX_APPROVAL_MODE,
     codex_approval_parameters,
     DEFAULT_CODEX_MODEL,
     codex_model_label_for_model,
@@ -523,6 +524,7 @@ from mc_frame_history import ChatHistoryMixin
 from mc_frame_kimi_events import KimiEventsMixin
 from mc_frame_kimi_sessions import KimiSessionsMixin
 from mc_frame_navigation import ChatNavigationMixin
+from mc_frame_tool_settings import ChatToolSettingsMixin
 from mc_frame_notes import NotesMixin
 from mc_frame_openclaw import OpenClawSessionsMixin
 from mc_frame_presentation import (
@@ -575,6 +577,7 @@ class ChatFrame(
     NativeHistoryMixin,
     AgySessionsMixin,
     ChatNavigationMixin,
+    ChatToolSettingsMixin,
     wx.Frame,
 ):
     def __init__(self):
@@ -646,7 +649,7 @@ class ChatFrame(
         self.active_openclaw_last_synced_at = 0.0
         self.codex_answer_english_filter_enabled = False
         self.codex_sandbox = DEFAULT_CODEX_SANDBOX
-        self.codex_approval_policy = DEFAULT_CODEX_APPROVAL_MODE
+        self.codex_approval_policy = DESKTOP_DEFAULT_CODEX_APPROVAL_MODE
         self.codex_approval_defaults_version = 1
         self.active_codex_thread_id = ""
         self.active_codex_turn_id = ""
@@ -856,6 +859,7 @@ class ChatFrame(
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
         self._codex_answer_filter_menu_id = wx.NewIdRef()
+        self._terminal_history_filter_menu_id = wx.NewIdRef()
         self._codex_sandbox_menu_id = wx.NewIdRef()
         self._codex_approval_policy_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
@@ -878,6 +882,7 @@ class ChatFrame(
         self._migrate_legacy_state_if_needed()
         self._migrate_legacy_chat_json_if_needed()
         self._load_state()
+        self._terminal_history_filter_item.Check(self.hide_terminal_chats)
         self.notes_controller.restore_state(self._current_notes_state)
         if (str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit"
                 and self._notes_guard_embedded_edit_view(
@@ -929,8 +934,11 @@ class ChatFrame(
         app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
         filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
         filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
+        self._terminal_history_filter_item = self._append_terminal_history_filter_item(app_menu)
         app_menu.Append(int(self._codex_sandbox_menu_id), "Codex 访问权限")
         app_menu.Append(int(self._codex_approval_policy_menu_id), "Codex 执行审批")
+        self._tool_mode_menu = wx.Menu()
+        app_menu.AppendSubMenu(self._tool_mode_menu, "工具模式")
         menu_bar = wx.MenuBar()
         menu_bar.Append(app_menu, "应用(&A)")
         self.SetMenuBar(menu_bar)
@@ -965,19 +973,7 @@ class ChatFrame(
         self.new_chat_button = wx.Button(panel, label="新聊天(&N)")
         row.Add(self.send_button, 0, wx.RIGHT, 8)
         row.Add(self.new_chat_button, 0, wx.RIGHT, 16)
-        row.Add(wx.StaticText(panel, label="模型："), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        model_choices = []
-        for choice in VISIBLE_MODEL_IDS:
-            display_choice = model_display_name(choice)
-            if display_choice not in model_choices:
-                model_choices.append(display_choice)
-        self.model_combo = wx.ComboBox(panel, choices=model_choices, style=wx.CB_READONLY, size=(320, -1))
-        row.Add(self.model_combo, 0, wx.ALIGN_CENTER_VERTICAL)
-        row.Add(wx.StaticText(panel, label="速度："), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 6)
-        self.codex_speed_combo = wx.ComboBox(panel, choices=["标准", "快速"], style=wx.CB_READONLY, size=(96, -1))
-        self.codex_speed_combo.SetName("速度")
-        self.codex_speed_combo.SetValue("标准")
-        row.Add(self.codex_speed_combo, 0, wx.ALIGN_CENTER_VERTICAL)
+        self._build_tool_settings_controls(panel, row)
         right.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         self.detail_title_label = wx.StaticText(panel, label="回答：")
@@ -1038,8 +1034,10 @@ class ChatFrame(
         right.Add(self.notes_detail_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         right.Add(self.notes_edit_panel, 2, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.new_chat_button.MoveAfterInTabOrder(self.input_edit)
-        self.model_combo.MoveAfterInTabOrder(self.new_chat_button)
-        self.codex_speed_combo.MoveAfterInTabOrder(self.model_combo)
+        self.tool_combo.MoveAfterInTabOrder(self.new_chat_button)
+        self.model_combo.MoveAfterInTabOrder(self.tool_combo)
+        self.reasoning_combo.MoveAfterInTabOrder(self.model_combo)
+        self.codex_speed_combo.MoveAfterInTabOrder(self.reasoning_combo)
         self.send_button.MoveAfterInTabOrder(self.codex_speed_combo)
         self.notes_list_panel.MoveAfterInTabOrder(self.send_button)
         self.history_list.MoveAfterInTabOrder(self.notes_list_panel)
@@ -1065,7 +1063,9 @@ class ChatFrame(
     def _bind_events(self):
         self.send_button.Bind(wx.EVT_BUTTON, self._on_send_clicked)
         self.new_chat_button.Bind(wx.EVT_BUTTON, self._on_new_chat_clicked)
-        self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_model_changed)
+        self.tool_combo.Bind(wx.EVT_COMBOBOX, self._on_tool_changed)
+        self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_tool_model_changed)
+        self.model_combo.Bind(wx.EVT_SET_FOCUS, self._on_tool_model_focus)
         self.codex_speed_combo.Bind(wx.EVT_COMBOBOX, self._on_codex_speed_changed)
         self.input_edit.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("input_key_down", self._on_input_key_down))
         self.input_edit.Bind(wx.EVT_TEXT, self._monitored_ui_handler("input_text", self._on_input_text_changed))
@@ -1073,6 +1073,8 @@ class ChatFrame(
         self.send_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.new_chat_button.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.model_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
+        self.tool_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
+        self.reasoning_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.codex_speed_combo.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.answer_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
         self.history_list.Bind(wx.EVT_KEY_UP, self._on_input_key_up)
@@ -1112,6 +1114,8 @@ class ChatFrame(
         self.history_list.Bind(wx.EVT_LISTBOX, self._on_history_selected)
         self.history_list.Bind(wx.EVT_CONTEXT_MENU, self._on_history_context)
         self.model_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
+        self.tool_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
+        self.reasoning_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
         self.codex_speed_combo.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
         self.send_button.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
         self.new_chat_button.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("generic_key_down", self._on_generic_key_down))
@@ -1128,6 +1132,7 @@ class ChatFrame(
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
+        self.Bind(wx.EVT_MENU, self._toggle_terminal_history_filter, id=int(self._terminal_history_filter_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_sandbox(), id=int(self._codex_sandbox_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_approval_policy(), id=int(self._codex_approval_policy_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
@@ -1329,6 +1334,8 @@ class ChatFrame(
                 getattr(self, "execution_list", None),
                 getattr(self, "history_list", None),
                 getattr(self, "model_combo", None),
+                getattr(self, "tool_combo", None),
+                getattr(self, "reasoning_combo", None),
                 getattr(self, "codex_speed_combo", None),
                 getattr(self, "notes_notebook_list", None),
                 getattr(self, "notes_entry_list", None),

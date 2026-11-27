@@ -22,17 +22,7 @@ class ChatNavigationMixin:
         # the active chat or produce a misleading remote state event.
         if not bindings.app.is_visible_model_id(model):
             return
-        if self.selected_model == model:
-            try:
-                self._sync_codex_speed_combo_enabled_for_model(model)
-            except Exception:
-                pass
-            return
         self.selected_model = model
-        try:
-            self._sync_codex_speed_combo_enabled_for_model(model)
-        except Exception:
-            pass
 
     def _show_tools_menu(self) -> None:
         menu = wx.Menu()
@@ -41,8 +31,11 @@ class ChatNavigationMixin:
         attach_id = wx.NewIdRef()
         menu.Append(voice_id, "语音通话设置")
         menu.Append(attach_id, "载入图片或文件")
+        mode_ids = []
+        self._append_tool_modes(menu, mode_ids)
         filter_item = menu.AppendCheckItem(filter_id, "过滤英文内容")
         filter_item.Check(bool(self.codex_answer_english_filter_enabled))
+        self._append_terminal_history_filter_item(menu)
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=voice_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=attach_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=filter_id)
@@ -167,6 +160,8 @@ class ChatNavigationMixin:
             getattr(self, "history_list", None),
             getattr(self, "input_edit", None),
             getattr(self, "model_combo", None),
+            getattr(self, "tool_combo", None),
+            getattr(self, "reasoning_combo", None),
             getattr(self, "codex_speed_combo", None),
             getattr(self, "notes_notebook_list", None),
             getattr(self, "notes_entry_list", None),
@@ -813,6 +808,13 @@ class ChatNavigationMixin:
         backwards = bool(shift_down()) if callable(shift_down) else False
 
         focus = wx.Window.FindFocus()
+        settings_order = (self.new_chat_button, self.tool_combo, self.model_combo,
+                          self.reasoning_combo, self.codex_speed_combo, self.send_button)
+        if focus in settings_order:
+            next_index = settings_order.index(focus) + (-1 if backwards else 1)
+            if 0 <= next_index < len(settings_order):
+                settings_order[next_index].SetFocus()
+                return True
         detail_target = self._current_detail_tab_target()
         detail_controls = {ctrl for ctrl in (getattr(self, "answer_list", None), getattr(self, "execution_list", None)) if ctrl is not None}
         if backwards:

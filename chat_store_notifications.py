@@ -540,6 +540,27 @@ class ChatStoreNotificationsMixin:
         with self._connect() as conn:
             return self._read_state_conn(conn, self.normalize_chat_id(chat_id), str(pair_id))
 
+    def list_unread_chat_ids(self, chat_ids: list[str], *, pair_id: str = "default") -> set[str]:
+        """Project unread badges for the requested chats without creating read generations."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT g.chat_id
+                FROM json_each(?) AS requested
+                JOIN read_generations g ON g.chat_id = requested.value
+                LEFT JOIN chat_read_state r
+                    ON r.pair_id = ? AND r.chat_id = g.chat_id AND r.generation = g.generation
+                WHERE (
+                    SELECT a.answer_seq
+                    FROM readable_answers a JOIN canonical_messages m ON m.message_id = a.message_id
+                    WHERE a.chat_id = g.chat_id AND a.generation = g.generation
+                    ORDER BY a.answer_seq DESC LIMIT 1
+                ) > MAX(COALESCE(r.read_seq, 0), COALESCE((
+                    SELECT MAX(b.answer_seq) FROM readable_answers b
+                    WHERE b.chat_id = g.chat_id AND b.generation = g.generation AND b.baseline = 1
+                ), 0))
+                """, (json.dumps(chat_ids), str(pair_id)))
+            return {row[0] for row in rows}
+
     def readable_answer(self, chat_id: str, *, turn_index: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute("SELECT a.message_id,a.answer_seq,a.generation FROM readable_answers a JOIN canonical_messages m ON m.message_id=a.message_id JOIN read_generations g ON g.chat_id=a.chat_id AND g.generation=a.generation WHERE a.chat_id=? AND m.legacy_turn_index=? AND m.role='assistant'", (chat_id,int(turn_index))).fetchone()

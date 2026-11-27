@@ -684,6 +684,92 @@ def test_ui_automation_large_sqlite_history_keeps_history_list_responsive(frame,
     assert frame.history_list.GetSelection() == 1
 
 
+def test_terminal_history_filter_shares_menu_state_and_preserves_active_chat(frame, wx_app, monkeypatch):
+    from native_history import NativeSessionIdentity, NativeSessionSnapshot
+
+    store = frame.chat_store
+    native = NativeSessionSnapshot(
+        NativeSessionIdentity("default", "codex", "storage", "same-session"),
+        "account", main.DEFAULT_CODEX_MODEL, "", "终端聊天", 20,
+    )
+    imported_id, _ = store.native_history_target(native)
+    store.merge_native_history(native, expected_chat_id=imported_id)
+    imported = store.load_chat_summary(imported_id)
+    imported["pinned"] = True
+    store.upsert_chat(imported)
+    # Native replay adds its mapping to the existing MC owner.
+    continued = NativeSessionSnapshot(
+        NativeSessionIdentity("default", "codex", "storage", "continued-session"),
+        "account", main.DEFAULT_CODEX_MODEL, "", "MC 续接", 10,
+        chat_fields={"codex_thread_id": "continued-session"},
+        legacy_fields={"codex_thread_id": "continued-session"},
+    )
+    store.upsert_chat({"id": "mc-continued", "title": "MC 续接", "model": main.DEFAULT_CODEX_MODEL,
+                       "codex_thread_id": "continued-session", "updated_at": 10})
+    continuing_id, _ = store.native_history_target(continued)
+    assert continuing_id == "mc-continued"
+    store.merge_native_history(continued, expected_chat_id=continuing_id)
+    managed = {"id": "mc-local", "title": "MC 本地", "updated_at": 5}
+    store.upsert_chat(managed)
+    frame.archived_chats = store.list_chat_summaries()
+    frame.active_chat_id = frame.current_chat_id = imported_id
+    frame._current_chat_state = imported
+    frame.active_codex_turn_active = True
+    frame._refresh_history(imported_id)
+    frame.Show()
+    wx_app.Yield()
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+
+    def filter_item(menu):
+        return next(item for item in menu.GetMenuItems() if item.GetItemLabelText() == "隐藏终端聊天")
+
+    def activate(item, handler):
+        event = main.wx.CommandEvent(main.wx.EVT_MENU.typeId, item.GetId())
+        event.SetInt(int(not item.IsChecked()))
+        handler.ProcessEvent(event)
+
+    app_menu = frame.GetMenuBar().GetMenu(0)
+    assert not filter_item(app_menu).IsChecked()
+    activate(filter_item(app_menu), frame)
+    assert frame.history_ids == ["mc-continued", "mc-local"]
+    assert frame.history_list.GetSelection() == 0
+    assert _focused_control() is frame.history_list
+    assert frame.active_chat_id == imported_id and frame.active_codex_turn_active
+    assert store.load_chat_summary(imported_id)["pinned"]
+    monkeypatch.setattr(frame, "_announce_chat_navigation", lambda *_args: None)
+    frame.ProcessEvent(main.wx.CommandEvent(main.wx.EVT_MENU.typeId, int(frame._chat_navigation_right_id)))
+    assert frame.view_history_id == "mc-local"
+    assert _focused_control() is frame.history_list
+    assert frame.active_chat_id == imported_id and frame.active_codex_turn_active
+
+    new = NativeSessionSnapshot(
+        NativeSessionIdentity("default", "codex", "storage", "new-session"),
+        "account", main.DEFAULT_CODEX_MODEL, "", "同步终端聊天", 30,
+    )
+    new_id, _ = store.native_history_target(new)
+    frame._publish_native_history_ui(new_id, store.merge_native_history(new, expected_chat_id=new_id), None, new)
+    assert frame.history_ids == ["mc-continued", "mc-local"]
+
+    reopened = main.ChatFrame()
+    try:
+        assert filter_item(reopened.GetMenuBar().GetMenu(0)).IsChecked()
+        assert reopened.history_ids == ["mc-continued", "mc-local"]
+    finally:
+        reopened._stop_native_history_refresh()
+        reopened.Destroy()
+
+    def popup(menu, *_args):
+        item = filter_item(menu)
+        assert item.IsChecked()
+        activate(item, frame)
+
+    monkeypatch.setattr(frame, "PopupMenu", popup)
+    frame._show_tools_menu()
+    assert not filter_item(app_menu).IsChecked()
+    assert frame.history_ids == [imported_id, new_id, "mc-continued", "mc-local"]
+
+
 def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):
     frame.Show()
     frame.active_chat_id = "chat-new"

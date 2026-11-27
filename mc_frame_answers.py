@@ -1455,6 +1455,8 @@ class AnswersMixin:
             "input_value": self.input_edit.GetValue(),
             "input_selection": self.input_edit.GetSelection(),
             "model_value": self.model_combo.GetValue(),
+            "tool_route": self._tool_route,
+            "tool_settings": self._pending_tool_settings(),
             "answer_strings": list(self.answer_list.GetStrings()),
             "answer_meta": copy.deepcopy(self.answer_meta),
             "answer_visible_ids": list(self.answer_list_model.visible_ids),
@@ -1487,6 +1489,8 @@ class AnswersMixin:
         self.input_edit.ChangeValue(snapshot["input_value"])
         self.input_edit.SetSelection(*snapshot.get("input_selection", (0, 0)))
         self.model_combo.SetValue(snapshot["model_value"])
+        self._select_tool_route(snapshot["tool_route"])
+        self._refresh_tool_setting_choices(snapshot["tool_settings"])
         self.answer_meta = snapshot["answer_meta"]
         self.answer_list.Set(snapshot["answer_strings"])
         self.answer_list_model.visible_ids = list(snapshot["answer_visible_ids"])
