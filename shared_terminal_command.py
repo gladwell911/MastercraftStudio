@@ -22,7 +22,8 @@ from remote_machine_config import _write_json_atomic
 from shared_terminal import TerminalClient, TerminalError, TerminalOutcomeUnknown, TerminalUnavailable
 
 PROVIDERS = ("codex", "kimi", "agy")
-COMMAND_MARKER = "@rem MC shared terminal launcher"
+COMMAND_MARKER = "# MC shared terminal launcher"
+LEGACY_COMMAND_MARKER = b"@rem MC shared terminal launcher\r\n"
 START_ARGUMENT = "--shared-terminal-start"
 MAX_PROMPT_LENGTH = 32_768
 
@@ -68,23 +69,31 @@ def _search_command(name: str, own: Path, paths: list[str]) -> Path | None:
             if candidate.is_file():
                 return candidate
     # An executable or script in the managed folder still belongs to its owner.
-    return next((own / (name + ext) for ext in (".ps1", ".exe", ".bat", ".com")
+    return next((own / (name + ext) for ext in (".exe", ".bat", ".com")
                  if (own / (name + ext)).is_file()), None)
 
 
 def _shim_contents(worker: Path, provider: str) -> bytes:
-    path = str(worker).replace("%", "%%")
-    lines = [COMMAND_MARKER, "@echo off", "setlocal DisableDelayedExpansion"]
-    if not path.isascii():
-        lines += [
-            'for /f "tokens=2 delims=:" %%C in (\'chcp\') do set "previousCp=%%C"',
-            "chcp 65001 >nul",
-        ]
-    lines += [f'"{path}" --shared-terminal {provider}', 'set "workerExit=%ERRORLEVEL%"']
-    if not path.isascii():
-        lines.append("if defined previousCp chcp %previousCp% >nul")
-    lines.append("exit /b %workerExit%")
-    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+    path = str(worker).replace("'", "''")
+    # Windows PowerShell's native invocation drops or reshapes some arguments.
+    # Pass the Windows CRT command line directly and keep the console streams.
+    source = COMMAND_MARKER + "\n" + rf"""
+$info = New-Object System.Diagnostics.ProcessStartInfo
+$info.FileName = '{path}'
+$info.UseShellExecute = $false
+$quoted = foreach ($argument in @('--shared-terminal', '{provider}') + $args) {{
+    '"' + ([string]$argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}}
+$info.Arguments = $quoted -join ' '
+$process = [System.Diagnostics.Process]::Start($info)
+try {{
+    $process.WaitForExit()
+    exit $process.ExitCode
+}} finally {{
+    $process.Dispose()
+}}
+"""
+    return source.replace("\n", "\r\n").encode("utf-8-sig")
 
 
 def _notify_environment_changed() -> None:
@@ -109,23 +118,29 @@ def register_commands(worker: Path, *, user_environment="Environment") -> list[s
             has_managed_command = False
             for provider in PROVIDERS:
                 name = f"mc-{provider}"
-                shim = directory / (name + ".cmd")
+                shim = directory / (name + ".ps1")
+                legacy = directory / (name + ".cmd")
                 conflicting = _search_command(name, directory, paths)
                 previous = shim.read_bytes() if shim.is_file() else b""
+                legacy_owned = legacy.is_file() and legacy.read_bytes().startswith(LEGACY_COMMAND_MARKER)
+                if legacy.exists() and not legacy_owned:
+                    conflicting = conflicting or legacy
                 if conflicting is not None or (shim.exists() and not previous.startswith(
-                    (COMMAND_MARKER + "\r\n").encode("ascii")
+                    (COMMAND_MARKER + "\r\n").encode("utf-8-sig")
                 )):
                     conflicts.append(f"{name} 已由 {conflicting or shim} 提供")
                     continue
                 current = _shim_contents(worker.resolve(), provider)
                 if current != previous:
-                    with NamedTemporaryFile(dir=directory, suffix=".cmd.tmp", delete=False) as stream:
+                    with NamedTemporaryFile(dir=directory, suffix=".ps1.tmp", delete=False) as stream:
                         temporary = Path(stream.name)
                     try:
                         temporary.write_bytes(current)
                         temporary.replace(shim)
                     finally:
                         temporary.unlink(missing_ok=True)
+                if legacy_owned:
+                    legacy.unlink()
                 has_managed_command = True
             if has_managed_command and not any(
                 item.strip() and Path(os.path.expandvars(item.strip().strip('"'))).resolve() == directory.resolve()

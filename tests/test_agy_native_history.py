@@ -4,6 +4,9 @@ import sys
 import pytest
 
 from agy_acp import AgyAcpClient
+from agy_history import _AgyReplay
+from chat_store import ChatStore
+from native_history import NativeSessionIdentity, NativeSessionSnapshot
 
 
 FAKE_AGY = r"""
@@ -231,6 +234,85 @@ def test_provider_busy_blocks_an_original_agy_session_until_a_fresh_check(
     sent, = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
              if json.loads(line)["method"] == "session/prompt"]
     assert sent["params"]["sessionId"] == "busy-original"
+
+
+@pytest.mark.parametrize(("mismatch", "stored_status", "tool_status", "affirmative"), [
+    ("", "unknown", "completed", False),
+    ("", "unknown", "in_progress", False),
+    ("", "cancelled", "completed", False),
+    ("", "failed", "failed", False),
+    ("", "unknown", "completed", True),
+    *((mismatch, "unknown", "completed", True) for mismatch in ("session", "turn", "user", "answer")),
+])
+def test_native_replay_requires_affirmative_evidence_for_unknown_agy_turn(
+        tmp_path, mismatch, stored_status, tool_status, affirmative):
+    store = ChatStore(tmp_path / "chat.db")
+    store.initialize()
+    identity = NativeSessionIdentity("default", "agy", "fixture-store", "session")
+    owner = identity.chat_id
+    snapshot = NativeSessionSnapshot(
+        identity, "fixture-account", "agy/main", str(tmp_path), "AGY",
+        updated_at=100, chat_fields={"agy_session_id": identity.session_id},
+    )
+    chat = store.merge_native_history(snapshot, expected_chat_id=owner)
+    error = "ACP disconnected before confirmation"
+    chat.update(native_unresolved_turn={"index": 0, "message": error}, native_history_status=error)
+    store.upsert_chat(chat)
+    stored = {
+        "question": "first", "answer_md": "partial", "request_status": stored_status,
+        "provider_user_message_id": "user1", "agy_native_turn_id": "turn1",
+        "agy_observed_message_id": "answer1", "terminal_notification_pair": identity.pair_id,
+    }
+    if mismatch == "session":
+        stored["session_id"] = "other-session"
+    elif field := {"turn": "agy_native_turn_id", "user": "provider_user_message_id",
+                   "answer": "agy_observed_message_id"}.get(mismatch):
+        stored[field] = "other-id"
+    store.replace_turns(owner, [stored])
+    store.append_execution_step(owner, {
+        "turn_idx": 0, "thread_id": identity.session_id, "provider": "agy",
+        "item_id": "tool:observed", "display_kind": "tool", "list_text": "Saved live tool",
+    })
+
+    def replay(*, with_successor):
+        history = _AgyReplay(identity.session_id)
+        rows = [("user", "turn1", "user1", "first"),
+                ("agent", "turn1", "answer1", "partial then complete")]
+        if with_successor:
+            rows += [("user", "turn2", "user2", "second"),
+                     ("agent", "turn2", "answer2", "second final")]
+        for role, turn, message, body in rows:
+            history.update({"sessionUpdate": f"{role}_message_chunk", "turnId": turn,
+                            "messageId": message, "content": {"type": "text", "text": body}})
+            if message == "answer1":
+                for tool in ("observed", "replay-only"):
+                    history.update({"sessionUpdate": "tool_call", "turnId": turn,
+                                    "toolCallId": tool, "status": tool_status})
+        snapshot.turns, snapshot.execution_steps = history.completed_history()
+        if affirmative and with_successor:
+            # Normalized evidence from a trusted adapter. Ordinary ACP replay
+            # in this fixture emits neither a completion nor a stop reason.
+            snapshot.turns[0]["native_final_explicit"] = True
+        snapshot.updated_at += 100
+        store.merge_native_history(snapshot, expected_chat_id=owner)
+        return [(row["request_status"], row["answer_md"]) for row in store.load_turns(owner)]
+
+    assert replay(with_successor=False) == [(stored_status, "partial")]
+    assert store.load_chat_summary(owner)["native_history_status"] == error
+    expected = [(stored_status, "partial")]
+    if not mismatch:
+        if affirmative:
+            expected = [("done", "partial then complete")]
+        expected.append(("done", "second final"))
+    assert replay(with_successor=True) == expected
+    assert store.load_chat_summary(owner)["native_history_status"] == ("" if affirmative and not mismatch else error)
+    assert replay(with_successor=True) == expected
+    steps = store.load_execution_steps(owner, 0)
+    assert [step["item_id"] for step in steps] == (
+        ["tool:observed"] if mismatch else ["tool:observed", "tool:replay-only"]
+    )
+    if not mismatch:
+        assert steps[1]["status"] == tool_status
 
 
 def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(

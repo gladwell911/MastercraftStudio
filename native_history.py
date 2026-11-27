@@ -60,11 +60,12 @@ TITLE_FIELDS = ("title", "title_source", "title_manual", "title_updated_at", "ti
 
 def merge_native_title(chat, provider, title, observed_at, *, explicit=True, app_manual=False):
     """Keep native title evidence and the application display title independently."""
-    if not title or observed_at < chat.get("native_title_observed_at", 0):
+    if not title or observed_at < (chat.get("native_title_observed_at") or 0):
         return
+    chat["native_title_observed_at"] = observed_at
     previous_native = chat.get("native_title")
     if previous_native != title:
-        chat.update(native_title=title, native_title_observed_at=observed_at,
+        chat.update(native_title=title,
                     native_title_revision=int(chat.get("native_title_revision") or 0) + 1)
     if provider == "codex" and not explicit and not app_manual:
         if chat.get("title_manual") or (chat.get("title") and chat["title"] != previous_native):
@@ -79,8 +80,7 @@ def merge_native_title(chat, provider, title, observed_at, *, explicit=True, app
     if app_manual or chat.get("title") != title:
         chat.update(title=title, title_source="manual" if app_manual or chat.get("title_manual") else "native",
                     title_manual=app_manual or bool(chat.get("title_manual")),
-                    title_updated_at=observed_at, title_revision=int(chat.get("title_revision") or 0) + 1,
-                    native_title_observed_at=observed_at)
+                    title_updated_at=observed_at, title_revision=int(chat.get("title_revision") or 0) + 1)
 
 
 def allows_final_notification(turn: dict, pair_id: str) -> bool:

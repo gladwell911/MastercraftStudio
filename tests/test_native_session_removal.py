@@ -42,6 +42,31 @@ def test_history_hide_before_first_discovery_preserves_other_sources(provider, m
         assert target == ("" if pair == "default" else session.identity.chat_id)
 
 
+def test_busy_native_session_survives_remote_and_bulk_hide(frame, monkeypatch, tmp_path):
+    native_id = NativeSessionIdentity("default", "agy", str(tmp_path), "original").chat_id
+    busy = {"id": "busy-agy", "model": "agy/main", "title": "Waiting for input",
+            "agy_session_id": "original", "native_identity": native_id}
+    idle = {"id": "idle-chat", "model": "test/model", "title": "Idle"}
+    for chat in (busy, idle):
+        frame.chat_store.upsert_chat(chat)
+    frame.archived_chats = frame.chat_store.list_chat_summaries()
+    frame._refresh_history()
+    frame._agy_busy[busy["id"]] = {"interaction_id": "synthetic-input"}
+    monkeypatch.setattr(frame, "_confirm", lambda *_: True)
+    try:
+        transport = RemoteNatsTransport(pair_id="default", token="synthetic",
+                                        on_history_mutation=frame._remote_api_history_mutation)
+        status, response = transport._route_command({"type": "hide_history_chat", "chat_id": busy["id"]})
+        assert status == 409 and response["accepted"] is False
+        frame._history_clear_non_pinned(None)
+        assert busy["id"] in frame.history_ids and idle["id"] not in frame.history_ids
+        assert frame.chat_store.load_chat_summary(busy["id"])["native_identity"] == native_id
+        assert not frame.chat_store.get_meta(f"hidden-native-history:{native_id}")
+        assert frame._agy_busy[busy["id"]]["interaction_id"] == "synthetic-input"
+    finally:
+        frame._agy_busy.pop(busy["id"], None)
+
+
 def test_remote_native_delete_requires_exact_confirmation_and_authority(frame, monkeypatch, tmp_path, wait_for_wx):
     chat = {"id": "delete-kimi", "title": "Synthetic session", "model": "kimi/main",
             "kimi_session_id": "synthetic-target", "kimi_storage_id": str(tmp_path)}

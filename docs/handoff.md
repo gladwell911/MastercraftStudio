@@ -6,7 +6,7 @@
 
 ### T13 本机验收
 
-当前候选从 MC `1ba49dd`（应用源码 `fea9a35`）与 RC `b5f1381` 接续。原失败证据对应 RC `8b9c92f`。使用隔离 MC 数据、NATS、真实账号及合成会话。专用 Android 35 模拟器通过原生桥运行 `arm64-v8a` RC。复验记录两仓提交与 APK SHA-256。
+该轮候选从 MC `1ba49dd`（应用源码 `fea9a35`）与 RC `b5f1381` 接续。原失败证据对应 RC `8b9c92f`。使用隔离 MC 数据、NATS、真实账号及合成会话。专用 Android 35 模拟器通过原生桥运行 `arm64-v8a` RC。复验记录两仓提交与 APK SHA-256。
 
 #### 已验收
 
@@ -28,6 +28,21 @@
 #### 本机验收结论
 
 按用户决定，Kimi 同回合追加延期，本机 T13 按其余范围验收完成。较早终答通知的实装配对为 MC `48fb873`、RC `037f9fd`，QA ARM64 APK SHA-256 为 `EF92C41EDC56545529223B44148D0D763744D79505F2540632C4B3D947606783`。其他通过场景各自使用其证据所列的候选。重启该延期项前，先取得追加属于同一原生回合的证据，再做真实账号审批和 RC 终答的跨端验收。
+
+#### T00–T13 深度审查与修补
+
+2026-11-27 逐项审查完成，确认 10 项产品问题和 2 项验证缺口。 [实施计划](../../../../_bmad-output/implementation-artifacts/plan-t00-t13-shared-cli-review-fixes.md#auto-run-result)
+
+- MC 修复 PowerShell 参数边界、忙碌会话隐藏及标题持久化顺序。AGY 以同一原生身份合并后续历史与执行步骤。旧 Codex App Server 释放回退通过 worker 子进程测试。
+- MC 在候选根目录串行复跑下列六个文件，93 项通过，4 项依赖供应商环境的可选用例跳过。较早的 Windows 冻结包证据仍对应原构建。
+
+```powershell
+D:/code/sj/mc/.venv/Scripts/python.exe -m pytest -q -p no:faulthandler tests/test_shared_terminal.py tests/test_agy_native_history.py tests/test_native_session_removal.py tests/test_native_title_sync.py tests/test_terminal_reply_notifications.py tests/test_codex_worker_process.py
+```
+
+AGY `session/load` 当前缺乏明确成功终态的证据，匹配原生会话、回合和消息身份的后续正文与步骤可回读，原回合仍保留为 unknown。AGY 同回合追加的重放形态另待原生证据。候选修补尚未进入默认分支或日常安装。
+
+#### 早期候选记录
 
 - T01–T12 已合入本地双仓候选。历史首批候选记录如下。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
 - 本机工作区 `D:/code/sj` 下，`_bmad-output/implementation-artifacts/mc-rc-three-cli-shared-sessions-acceptance.md` 逐项记录 A-01 至 A-12 和复现指令，`.build-work/mc-rc-three-cli-shared-sessions/candidate-final` 保存构建脚本、产物哈希、冻结演练和隔离证据。文档提交后重建该批产物仍使用上述源码提交。

@@ -34,6 +34,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
     def __init__(self, db_path: Path, *, max_execution_steps_per_turn: int = 500) -> None:
         self.db_path = Path(db_path)
         self.max_execution_steps_per_turn = int(max_execution_steps_per_turn)
+        self._native_title_observations = {}
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -617,6 +618,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def upsert_chat(self, chat: dict[str, Any]) -> None:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._upsert_chat_conn(conn, chat)
 
     def _upsert_chat_conn(self, conn, chat):
@@ -625,6 +627,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         chat_id = str(chat.get("id") or "").strip()
         if not chat_id or conn.execute("SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{chat_id}",)).fetchone():
             return
+        if chat.get("native_identity") or any(chat.get(field) for field in
+                                              ("agy_session_id", "kimi_session_id", "codex_thread_id")):
+            chat = self._retain_committed_native_title(conn, chat_id, chat)
         created = self._float_or(chat.get("created_at"), 0.0)
         updated = self._float_or(chat.get("updated_at"), created)
         title_manual = self._bool_value(chat.get("title_manual"))
@@ -708,6 +713,48 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 return str(legacy["id"]), True
         return native_id, True
 
+    def _retain_committed_native_title(self, conn, chat_id, incoming):
+        saved = conn.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if saved is None:
+            return incoming
+        metadata = self._metadata_from_row(saved)
+        if not metadata.get("native_identity"):
+            return incoming
+        if incoming.get("native_identity"):
+            if any(metadata.get(key) != incoming.get(key) for key in ("native_identity", "native_account")):
+                return incoming
+            adopted = False
+        else:
+            provider = str(incoming.get("model") or "").split("/", 1)[0]
+            scope = {
+                "agy": ("agy_session_id", ("agy_native_owner",)),
+                "codex": ("codex_thread_id", CODEX_STORAGE_FIELDS),
+                "kimi": ("kimi_session_id", ("kimi_storage_id",)),
+            }.get(provider)
+            if scope is None or str(saved["model"]).split("/", 1)[0] != provider:
+                return incoming
+            session, fields = scope
+            if (not incoming.get(session) or incoming[session] != metadata.get(session)
+                    or (provider == "agy" and not incoming.get("agy_native_owner"))
+                    or any(incoming.get(field) not in (None, "", metadata.get(field))
+                           for field in (*fields, "native_account"))):
+                return incoming
+            adopted = True
+        chat = incoming.copy()
+        if adopted:
+            for field in (*NATIVE_CHAT_FIELDS, *fields):
+                if field in metadata:
+                    chat[field] = metadata[field]
+        if self._int_or(metadata.get("native_title_revision"), 0) > self._int_or(chat.get("native_title_revision"), 0):
+            for field in ("native_title", "native_title_revision"):
+                chat[field] = metadata[field]
+        if self._float_or(metadata.get("native_title_observed_at"), 0) > self._float_or(chat.get("native_title_observed_at"), 0):
+            chat["native_title_observed_at"] = metadata["native_title_observed_at"]
+        if saved["title_revision"] > self._int_or(chat.get("title_revision"), 1):
+            for field in ("title", "title_source", "title_manual", "title_updated_at", "title_revision"):
+                chat[field] = saved[field]
+        return chat
+
     def native_history_target(self, snapshot: NativeSessionSnapshot) -> tuple[str, float]:
         with self._connect() as conn:
             owner, matches = self._native_history_target(conn, snapshot)
@@ -762,6 +809,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             old_count = int(previous.get("turn_count", 0))
             appended = 0
             recovered = {}
+            matched_agy_rows = set()
             accepted_replay = False
             if snapshot.turns is not None and len(snapshot.turns) >= old_count:
                 stored = (self._json_dict(entry[0]) for entry in conn.execute(
@@ -774,8 +822,14 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                                                 provider_message_id=new["provider_message_id"])
                         if new.get("answer_at"):
                             recovered[index]["answer_at"] = new["answer_at"]
-                    elif not self._native_turn_matches(old, new):
+                    elif (snapshot.identity.provider == "agy" and old.get("request_status") in
+                          {"unknown", "cancelled", "failed"} and self._agy_replay_matches(snapshot.identity, old, new)
+                          and new.get("agy_replay_followed")):
+                        matched_agy_rows.add(index)
+                    elif ((snapshot.identity.provider == "agy" and old.get("request_status") == "unknown")
+                          or not self._native_turn_matches(old, new)):
                         recovered.clear()
+                        matched_agy_rows.clear()
                         if not unresolved:
                             chat["native_history_status"] = "原生历史与已保存内容不一致，已保留现有记录"
                         break
@@ -796,9 +850,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                             title_updated_at=snapshot.title_observed_at or snapshot.updated_at,
                             title_revision=1)
             if merge_title:
-                merge_native_title(chat, snapshot.identity.provider, snapshot.title,
-                                   snapshot.title_observed_at or snapshot.updated_at,
-                                   explicit=snapshot.title_explicit)
+                self._merge_observed_native_title(
+                    chat, previous, snapshot.identity.provider, snapshot.title,
+                    snapshot.title_observed_at or snapshot.updated_at, explicit=snapshot.title_explicit,
+                )
             baseline = self._float_or(previous.get("native_notification_baseline"), 0)
             observed_until = 0.0
             if accepted_replay and not snapshot.status and observed_between:
@@ -807,6 +862,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     observed_until = finished_at
                     if not baseline:
                         chat["native_notification_baseline"] = finished_at
+            if accepted_replay and snapshot.identity.provider == "agy":
+                for step in snapshot.execution_steps:
+                    if step["turn_idx"] in matched_agy_rows or step["turn_idx"] in recovered:
+                        self._merge_recovered_agy_step(conn, owner, snapshot.identity.session_id, step)
             if chat == previous and not appended and not recovered:
                 return None
             self._upsert_chat_conn(conn, chat)
@@ -853,16 +912,78 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             if any(previous.get(field) != value for field, value in scope.items()):
                 return None
             changed = previous.copy()
-            merge_native_title(changed, provider, title, observed_at, explicit=explicit, app_manual=app_manual)
+            effective_at = self._merge_observed_native_title(
+                changed, previous, provider, title, observed_at, explicit=explicit, app_manual=app_manual,
+            )
             if changed == previous:
-                return previous
+                if effective_at:
+                    changed["native_title_observed_at"] = effective_at
+                return changed
             self._upsert_chat_conn(conn, changed)
             return changed
+
+    def _merge_observed_native_title(self, chat, previous, provider, title, observed_at, **options):
+        # Callers hold a SQLite write transaction so both title entry points
+        # compare against the same process-local observation.
+        session_key = {"agy": "agy_session_id", "codex": "codex_thread_id", "kimi": "kimi_session_id"}[provider]
+        scope = (chat["id"], provider, chat.get(session_key), chat.get("native_identity"), chat.get("native_account"))
+        persisted_at = self._float_or(previous.get("native_title_observed_at"), 0)
+        legacy_at = 0
+        if not previous.get("native_identity") and previous.get(session_key) == chat.get(session_key):
+            legacy_scope = (*scope[:3], previous.get("native_identity"), previous.get("native_account"))
+            legacy_at = self._native_title_observations.get(legacy_scope, 0)
+        chat["native_title_observed_at"] = max(persisted_at, legacy_at, self._native_title_observations.get(scope, 0))
+        merge_native_title(chat, provider, title, observed_at, **options)
+        effective_at = chat.pop("native_title_observed_at")
+        titles_changed = any(chat.get(field) != previous.get(field) for field in
+                             ("native_title_revision", "title_revision"))
+        if titles_changed:
+            chat["native_title_observed_at"] = effective_at
+        elif "native_title_observed_at" in previous:
+            chat["native_title_observed_at"] = persisted_at
+        if effective_at:
+            self._native_title_observations[scope] = effective_at
+        return effective_at
+
+    @staticmethod
+    def _agy_replay_matches(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
+        observed_answer = stored.get("agy_observed_message_id") or stored.get("provider_message_id")
+        return (
+            stored.get("terminal_notification_pair") in (None, "", identity.pair_id)
+            and stored.get("session_id") in (None, "", identity.session_id)
+            and stored.get("agy_session_id") in (None, "", identity.session_id)
+            and replayed.get("session_id") == identity.session_id
+            and all(stored.get(field) and stored[field] == replayed.get(field)
+                    for field in ("agy_native_turn_id", "provider_user_message_id"))
+            and bool(observed_answer) and observed_answer == replayed.get("provider_message_id")
+            and stored.get("provider_message_id") in (None, "", observed_answer)
+        )
+
+    def _merge_recovered_agy_step(self, conn, owner, session_id, step):
+        for entry in conn.execute("SELECT payload_json FROM execution_steps WHERE chat_id=? AND turn_idx=?",
+                                  (owner, step["turn_idx"])):
+            saved = self._json_dict(entry[0])
+            if saved.get("step_id") == step["step_id"]:
+                return
+            if saved.get("provider") == "agy" and saved.get("thread_id") == session_id:
+                if (step.get("item_id") and saved.get("item_id") == step["item_id"]) or (
+                    step.get("raw_kind") == "thinking" and saved.get("display_kind") in {"thinking", "reasoning"}
+                ):
+                    return
+        self._append_execution_step_on_conn(conn, owner, step)
 
     @staticmethod
     def _can_recover_terminal_final(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
         # Managed admission persisted the owner before the original process
         # exited. A matching, settled provider turn may finish that same row.
+        if identity.provider == "agy":
+            return (
+                stored.get("request_status") == "unknown"
+                and ChatStore._agy_replay_matches(identity, stored, replayed)
+                and replayed.get("native_final_explicit") is True
+                and replayed.get("request_status") == "done"
+                and bool(str(replayed.get("answer_md") or "").strip())
+            )
         keys = {"codex": ("codex_thread_id", "codex_turn_id"),
                 "kimi": ("kimi_session_id", "kimi_turn_id")}.get(identity.provider)
         if not keys or stored.get("terminal_notification_pair") != identity.pair_id:

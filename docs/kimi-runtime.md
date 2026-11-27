@@ -45,6 +45,8 @@ Kimi 流式片段、执行投影和隐私撤回按序在后台写入。2.6.3 用
 
 `mc-kimi --list` 查看本机会话。`mc-kimi --chat <ID> --send "问题"` 在本机 MC 的 Kimi Server 继续该会话。MC 和 RC 的对应聊天会显示供应方公开的工具步骤、状态和输出。在执行页打开步骤可查看详情。
 
+`mc-kimi`、`mc-codex` 和 `mc-agy` 由 MC 注册为本地 PowerShell 脚本。如果 PowerShell 提示禁止执行脚本或要求数字签名，可用 `Get-ExecutionPolicy -List` 查看生效策略。保留现有策略，按组织流程签名启动脚本，或直接在 PowerShell 运行安装目录中的 `mc_worker.exe --shared-terminal kimi` 进入交互。Codex 和 AGY 分别传入 `codex` 和 `agy`。
+
 MC 和 RC 可中断共享回合。待处理的审批和结构化问题在原聊天中处理。运行中发送追问时，2.5.3 根据原生回执追加当前回合或排队，2.6.3 由服务端安排下一轮。
 
 ## 原生终端历史

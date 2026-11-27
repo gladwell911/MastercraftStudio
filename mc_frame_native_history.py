@@ -78,16 +78,23 @@ class NativeHistoryMixin:
         if self._clear_pending_for(owner):
             return None
         reference = self._native_history_reference(chat)
+        if self._native_session_busy(chat, owner):
+            return None
         if reference:
             return reference["identity"]
-        if (any(chat.get(field) for field in ("codex_thread_id", "kimi_session_id", "agy_session_id",
-                                              "codex_turn_active", "kimi_turn_active"))
-                or owner in self._agy_busy):
-            return None
-        if (is_codex_model(chat.get("model")) or is_kimi_model(chat.get("model"))) and any(
-                turn.get("request_status") == "pending" for turn in chat.get("turns", ())):
+        if any(chat.get(field) for field in ("codex_thread_id", "kimi_session_id", "agy_session_id")):
             return None
         return ""
+
+    def _native_session_busy(self, chat, owner):
+        if (owner in getattr(self, "_native_title_pending", {})
+                or owner in getattr(self, "_native_history_reserved", ())
+                or owner in self._agy_busy
+                or chat.get("codex_turn_active") or chat.get("kimi_turn_active")):
+            return True
+        model = chat.get("model")
+        return (bool(chat.get("agy_session_id")) or is_codex_model(model) or is_kimi_model(model)) and any(
+            turn.get("request_status") == "pending" for turn in chat.get("turns", ()))
 
     def _native_delete_target_ui(self, owner):
         chat = self._history_chat_for_id(owner)
@@ -117,10 +124,7 @@ class NativeHistoryMixin:
             return 409, {"accepted": False, "message": "原始会话身份未确认，请重新打开删除操作。"}
         provider = reference["provider"]
         if (not getattr(self, "_chat_store_enabled", False) or self._clear_pending_for(owner)
-                or owner in self._native_title_pending or owner in self._agy_busy
-                or owner in self._native_history_reserved
-                or chat.get("codex_turn_active") or chat.get("kimi_turn_active")
-                or any(turn.get("request_status") == "pending" for turn in chat.get("turns", ()))):
+                or self._native_session_busy(chat, owner)):
             return 409, {"accepted": False, "message": "原始会话正在使用，请在当前回合结束后重试。"}
         self._flush_chat_state_save()
         stored = self.chat_store.load_chat_summary(owner)
@@ -411,7 +415,9 @@ class NativeHistoryMixin:
         if int(committed.get("title_revision") or 0) > int(chat.get("title_revision") or 0):
             chat.update({field: committed[field] for field in TITLE_FIELDS})
         if int(committed.get("native_title_revision") or 0) > int(chat.get("native_title_revision") or 0):
-            chat.update({field: committed[field] for field in _NATIVE_TITLE_FIELDS})
+            chat.update(native_title=committed["native_title"], native_title_revision=committed["native_title_revision"])
+        if (committed.get("native_title_observed_at") or 0) > (chat.get("native_title_observed_at") or 0):
+            chat["native_title_observed_at"] = committed["native_title_observed_at"]
 
     def _native_history_authority_ui(self, session, chat_id, *, reserve=False, expected=None):
         if getattr(self, "_closing", False) or chat_id in self._native_history_reserved:

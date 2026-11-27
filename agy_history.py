@@ -140,7 +140,7 @@ class _AgyReplay:
         if kind == "user_message_chunk" and isinstance(text, str):
             previous = self.turn.get("provider_user_message_id") if self.turn else ""
             if self.turn is None or self.answers or self.tools or self.thoughts or (previous and message_id and previous != message_id):
-                self._finish_turn()
+                self._finish_turn(next_turn_id=event.get("turnId"))
                 self._start_turn(event)
             self.questions.append(text)
         elif kind in ("agent_message_chunk", "agent_thought_chunk") and isinstance(text, str):
@@ -176,12 +176,17 @@ class _AgyReplay:
         if created_at:
             self.turn["created_at"] = created_at
 
-    def _finish_turn(self):
+    def _finish_turn(self, *, next_turn_id=None):
         if self.turn is None:
             return
         self.turn.update(question="".join(self.questions), answer_md="".join(self.answers),
                          request_status="done",
                          assistant_only=not bool(self.questions))
+        # A later distinct turn establishes ordering, without proving the
+        # outcome of an earlier prompt whose ACP response was lost.
+        turn_id = self.turn.get("agy_native_turn_id")
+        if turn_id and isinstance(next_turn_id, str) and next_turn_id and next_turn_id != turn_id:
+            self.turn["agy_replay_followed"] = True
         index = len(self.turns)
         self.turns.append(self.turn)
         if self.thoughts:
@@ -208,6 +213,7 @@ class _AgyReplay:
             self.steps.append({
                 "turn_idx": index, "raw_kind": "tool", "display_kind": "tool",
                 "step_id": f"agy-history-tool-{index}-{tool_id}", "list_text": title,
+                "item_id": f"tool:{tool_id}",
                 "detail_text": "\n".join(details) or title, "status": str(event.get("status") or ""),
             })
         self.turn = None

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from shared_terminal import PROTOCOL_VERSION, TerminalClient, TerminalError, TerminalServer
-from shared_terminal_command import ensure_terminal, register_commands, terminal_directory
+from shared_terminal_command import LEGACY_COMMAND_MARKER, ensure_terminal, register_commands, terminal_directory
 
 
 def test_local_service_authenticates_both_ends_before_dispatch(tmp_path):
@@ -86,12 +86,15 @@ def test_registered_powershell_command_follows_a_moved_installation_and_preserve
     source = """
 param([string]$File, [string]$Result)
 $escaped = $Result.Replace('\\', '\\\\')
-$code = 'public class FakeWorker { public static int Main(string[] a) { System.IO.File.WriteAllText("' +
-        $escaped + '", string.Join("|", a)); return 0; } }'
+$code = 'public class FakeWorker { public static int Main(string[] a) { System.IO.File.WriteAllLines("' +
+        $escaped + '", a); return System.Array.IndexOf(a, "--send") >= 0 ? 37 : 0; } }'
 Add-Type -TypeDefinition $code -Language CSharp -OutputAssembly $File -OutputType ConsoleApplication
 """
     build = tmp_path / "build-test-worker.ps1"
     build.write_text(source, encoding="utf-8")
+    managed_bin = terminal_directory() / "bin"
+    managed_bin.mkdir(parents=True)
+    (managed_bin / "mc-kimi.cmd").write_bytes(LEGACY_COMMAND_MARKER + b"@exit /b 51\r\n")
     try:
         for install in ("first install", "新安装 %100!"):
             directory = tmp_path / install
@@ -107,9 +110,23 @@ Add-Type -TypeDefinition $code -Language CSharp -OutputAssembly $File -OutputTyp
                 user_path, _ = winreg.QueryValueEx(key, "Path")
             assert user_path == str(terminal_directory() / "bin")
             child_env = {**os.environ, "PATH": os.environ["PATH"] + ";" + user_path}
-            available = subprocess.run([str(system_ps), "-NoProfile", "-Command", "mc-kimi"],
-                                       env=child_env, check=True, capture_output=True)
-            assert invocation.read_text(encoding="utf-8") == "--shared-terminal|kimi", available.stdout
+            assert sorted(path.suffix for path in managed_bin.glob("mc-kimi.*")) == [".ps1"]
+            for command, args, exit_code in (
+                ("mc-kimi", [], 0),
+                ("mc-kimi --list", ["--list"], 0),
+                ("mc-kimi --chat '会话 42'", ["--chat", "会话 42"], 0),
+                ("mc-kimi --chat '会话 42' --send '请保留 & 这段文字！'",
+                 ["--chat", "会话 42", "--send", "请保留 & 这段文字！"], 37),
+                (r"""mc-kimi --chat 'C:\path with space\' --send 'say "yes" & keep this' ''""",
+                 ["--chat", "C:\\path with space\\", "--send", 'say "yes" & keep this', ""], 37),
+            ):
+                completed = subprocess.run(
+                    [str(system_ps), "-NoProfile", "-ExecutionPolicy", "RemoteSigned",
+                     "-Command", f"{command}; exit $LASTEXITCODE"],
+                    env=child_env, capture_output=True, timeout=15,
+                )
+                assert completed.returncode == exit_code, completed.stderr
+                assert invocation.read_text(encoding="utf-8").splitlines() == ["--shared-terminal", "kimi", *args]
     finally:
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_name)
 
