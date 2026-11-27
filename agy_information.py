@@ -114,7 +114,7 @@ def read_agy_quota() -> tuple[str, dict, float]:
 
 
 def agy_quota_rows(result: tuple[str, dict, float] | None) -> list[str]:
-    rows = ["AGY 额度账号：当前电脑上登录的 AGY 账号"]
+    rows = ["AGY 额度来源：查询时的本机 AGY 账号"]
     error, quota, observed_at = result if result is not None else ("查询中", {}, time.monotonic())
     if time.monotonic() - observed_at >= AGY_QUOTA_MAX_AGE_SECONDS:
         error = "已过期"

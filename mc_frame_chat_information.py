@@ -262,13 +262,15 @@ class ChatInformationMixin:
         identity = self._chat_information_identity(chat, AGY_MODEL_ID)
         pair_id = self._read_pair_id()
         scope = (identity, pair_id)
-        if (dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity
-                or (getattr(dialog, "agy_quota_request", None) is not None
-                    and getattr(dialog, "agy_quota_scope", None) == scope)):
+        if dialog is None or dialog.IsBeingDeleted() or dialog.identity != identity:
+            return
+        same_scope = getattr(dialog, "agy_quota_scope", None) == scope
+        if same_scope and getattr(dialog, "agy_quota_request", None) is not None:
             return
         request = dialog.agy_quota_request = object()
         dialog.agy_quota_scope = scope
-        dialog.agy_quota_result = None
+        if not same_scope:
+            dialog.agy_quota_result = None
         self._refresh_agy_chat_information(chat)
 
         def apply(result):

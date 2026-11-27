@@ -64,6 +64,7 @@
 - 每台 MC 的 `remote_machine.json` 保存本机 pair/domain/token；显式 pair 环境变量优先，其后已知计算机名 `emperorComputer`→`default`、`emperorLaptop`→`laptop`，未知名回退持久值/default。地址与 token 的显式环境值优先，笔记本没有台式机凭据回退。2026-11-21 起增加 OneDrive `mc-private/` 机器配置恢复资料（显式环境变量 > 本机配置 > 身份匹配恢复资料 > 身份默认值，实现见 `remote_machine_config.py`）。手机未读标签按成功收到的通知消息计数，而不是未读聊天数。OneDrive 同步本次不改，用户保证共享数据不并发写入。
 - 问题/答案按独立question_order/answer_order排序并在格式化前选择消息尾页；created_at/answer_at只用于时间标签，时间行累计300秒。终结重放保留顺序和时间；旧记录仅合并可信时间，不填当前时间。Kimi steer alias共用answer_identity，alias正文为空并引用answer_alias_of；旧手机忽略新增排序字段的显示边界保留。
 - Codex 和 KimiCode 的回答列表以整数千位显示会话累计 token，Alt+Y 显示原生上下文、累计 token、按输入 token 加权的缓存命中率及各自额度。Kimi V2 的上下文与累计来源见 [Kimi 运行时](kimi-runtime.md)。
+- AGY 的 Alt+Y 从本机查询时登录的账号读取周限额、5 小时限额和 Claude 与 GPT 共用周限额。面板打开后每分钟复查，超过有效期的观测显示为已过期。AGY 1.5.18 的 `/usage` 响应只有额度信息，查询期间在 AGY 外部切换账号时，MC 无法确认该次响应对应切换前还是切换后的账号。
 - RC 的累计、六行聊天信息和执行页最终回答使用 MC 提供的会话数据。协议字段和兼容边界见 [远程协议](remote-slim-protocol.md#usage-and-final-answers)。
 - 回答列表与 Enter 详情缩短网址和文件路径。Shift+Enter 的网页、文件提取、跨端正文和继续提问使用完整回答。详情编辑仅保存在临时缓冲区，关闭窗口即丢弃。
 - 普通 OpenRouter Claude 附件经过有界后台读取，提交时重验草稿归属。当前选中文件按模态编码，后续请求重放同一会话内可读取的附件，无法读取的历史附件用具名提示表示。

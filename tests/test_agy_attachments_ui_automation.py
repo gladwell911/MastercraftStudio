@@ -188,6 +188,55 @@ def test_agy_quota_late_result_cannot_replace_other_chat_or_steal_focus(
     wx_app.Yield()
 
 
+def test_agy_quota_timer_keeps_recent_observation_then_shows_expiry_and_refreshes(
+    frame, tmp_path, wx_app, wait_for_wx, agy_attachment_runtime, monkeypatch,
+):
+    import agy_information
+    import mc_frame_chat_information
+
+    clock = SimpleNamespace(now=100)
+    monkeypatch.setattr(agy_information, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    first_read = threading.Event()
+    refresh_started = threading.Event()
+    refresh_ready = threading.Event()
+
+    def read_quota():
+        if not first_read.is_set():
+            first_read.set()
+            return "", {"周限额": ("93%", None)}, clock.now
+        refresh_started.set()
+        refresh_ready.wait(5)
+        return "", {"周限额": ("94%", None)}, clock.now
+
+    monkeypatch.setattr(mc_frame_chat_information, "read_agy_quota", read_quota)
+    frame.Show()
+    status, created = frame._remote_api_new_chat({"model": "agy/main", "agy_workspace": str(tmp_path)})
+    assert status == 200, created
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    rows = dialog.information_list.GetStrings
+    try:
+        wait_for_wx(lambda: "周限额：剩余 93%，重置时间暂不可用" in rows(), "first account quota")
+        dialog.information_list.SetSelection(5)
+        previous = list(rows())
+        dialog.refresh_timer.StartOnce(20)
+        wait_for_wx(refresh_started.is_set, "periodic AGY quota query")
+        assert list(rows()) == previous
+        clock.now += 61
+        dialog.context_timer.StartOnce(20)
+        wait_for_wx(lambda: "周限额：已过期" in rows(), "expired observation during query")
+        assert dialog.information_list.GetSelection() == 5
+        assert wx.Window.FindFocus() == dialog.information_list
+        refresh_ready.set()
+        wait_for_wx(lambda: "周限额：剩余 94%，重置时间暂不可用" in rows(), "refreshed account quota")
+        assert dialog.information_list.GetSelection() == 5
+        assert wx.Window.FindFocus() == dialog.information_list
+    finally:
+        refresh_ready.set()
+        dialog.Close()
+        wx_app.Yield()
+
+
 @pytest.mark.parametrize("supports_image", [True, False])
 def test_agy_desktop_file_picker_preserves_input_on_missing_capability(
     frame, tmp_path, monkeypatch, wait_for_wx, supports_image, agy_attachment_runtime,
