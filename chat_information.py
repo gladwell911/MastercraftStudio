@@ -3,6 +3,30 @@
 import hashlib
 import threading
 import time
+from datetime import datetime
+
+
+def format_quota_reset_time(value: object) -> str | None:
+    """Format a provider's Unix seconds or offset-aware timestamp in local time."""
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            reset = datetime.fromtimestamp(value)
+        elif isinstance(value, str):
+            reset = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                return None
+            reset = reset.astimezone()
+        else:
+            return None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+    today = datetime.now().date()
+    week_offset = ((reset.date() - today).days + today.weekday()) // 7
+    weekday = "一二三四五六日"[reset.weekday()]
+    prefix = {-1: "上", 0: "", 1: "下"}.get(week_offset)
+    day = f"{prefix}周{weekday}" if prefix is not None else f"{reset.year}年{reset.month}月{reset.day}日 周{weekday}"
+    return f"{day} {reset.hour:02d}点{reset.minute:02d}分"
 
 
 class ChatInformationSubscriptions:

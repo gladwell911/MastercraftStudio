@@ -1,8 +1,10 @@
 import ctypes
 import threading
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import chat_information
 import main
 import pytest
 
@@ -663,6 +665,12 @@ def _send_key(window, key):
 
 
 def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkeypatch):
+    class LocalClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 31, 13).astimezone(tz) if tz else datetime(2026, 7, 31, 13)
+
+    monkeypatch.setattr(chat_information, "datetime", LocalClock)
     frame.Show()
     frame.view_mode = "active"
     frame.selected_model = "kimi/main"
@@ -680,11 +688,11 @@ def test_kimi_quota_rows_keep_focus_and_reject_stale_owner(frame, wx_app, monkey
     frame._kimi_quota_request = (1, identity)
     frame._apply_kimi_quota(1, identity, {
         "kind": "ok", "quota": {"usages": {
-            "limit5h": {"usedRatio": .25, "resetAt": "2026-09-27T12:00:00Z"},
-            "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
+            "limit5h": {"usedRatio": .25, "resetAt": datetime(2026, 7, 31, 14, 5).astimezone(timezone.utc).isoformat()},
+            "limit7d": {"usedRatio": .5, "resetAt": datetime(2026, 8, 3, 9, 30).astimezone(timezone.utc).isoformat()}}}}, False)
     rows = list(dialog.information_list.GetStrings())
-    assert "已用 25.0%" in rows[4] and "本地重置" in rows[4]
-    assert "已用 50.0%" in rows[5] and "距重置" in rows[5]
+    assert rows[4].startswith("Kimi 五小时额度：已用 25.0%，本地重置 周五 14点05分（上次更新于 ")
+    assert rows[5].startswith("Kimi 七日额度：已用 50.0%，本地重置 下周一 09点30分（上次更新于 ")
     assert dialog.information_list.GetSelection() == 4
     assert main.wx.Window.FindFocus() is dialog.information_list
     chat["kimi_session_id"] = "session-new"
@@ -936,17 +944,15 @@ def test_kimi_quota_real_thread_delivers_to_wx_dialog(frame, wx_app, monkeypatch
     wx_app.Yield()
 
 
-def test_kimi_seven_day_countdown_timer_changes_only_visible_text(frame, wx_app, monkeypatch):
-    from datetime import datetime, timezone
-
-    clock = [datetime(2029, 12, 31, 22, 0, tzinfo=timezone.utc)]
+def test_kimi_quota_timer_rolls_into_local_week_and_preserves_selection(frame, wx_app, monkeypatch):
+    clock = [datetime(2028, 12, 31, 23, 59)]
 
     class ClockDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
-            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+            return clock[0].astimezone(tz) if tz else clock[0]
 
-    monkeypatch.setattr(main, "datetime", ClockDateTime)
+    monkeypatch.setattr(chat_information, "datetime", ClockDateTime)
     frame.Show()
     frame.view_mode = "active"
     frame.selected_model = "kimi/main"
@@ -960,14 +966,17 @@ def test_kimi_seven_day_countdown_timer_changes_only_visible_text(frame, wx_app,
     identity = dialog.identity
     frame._kimi_quota_request = (1, identity)
     frame._apply_kimi_quota(1, identity, {"kind": "ok", "_account_id": "A", "quota": {"usages": {
-        "limit7d": {"usedRatio": .5, "resetAt": "2030-01-01T00:00:00Z"}}}}, False)
+        "limit5h": {"usedRatio": .25, "resetAt": "2029-01-01T00:30:00"},
+        "limit7d": {"usedRatio": .5, "resetAt": datetime(2029, 1, 1, 9, 30).astimezone(timezone.utc).isoformat()}}}}, False)
     first = dialog.information_list.GetString(5)
+    assert "下周一 09点30分" in first
+    assert "已用 25.0%，重置时间暂不可用" in dialog.information_list.GetString(4)
     calls = []
     monkeypatch.setattr(frame, "_request_kimi_quota", lambda *_a: calls.append("quota"))
-    clock[0] = datetime(2029, 12, 31, 22, 1, tzinfo=timezone.utc)
+    clock[0] = datetime(2029, 1, 1, 0, 0)
     dialog._on_refresh_timer(None)
     second = dialog.information_list.GetString(5)
-    assert first != second and "1 小时 59 分钟" in second
+    assert second.startswith("Kimi 七日额度：已用 50.0%，本地重置 周一 09点30分")
     assert calls == ["quota"]
     assert dialog.information_list.GetSelection() == 5
     assert main.wx.Window.FindFocus() is dialog.information_list
@@ -993,6 +1002,7 @@ def test_kimi_identical_quota_reply_updates_query_time_without_same_minute_repai
         frame._kimi_quota_request = (1, identity)
         frame._apply_kimi_quota(1, identity, payload, False)
         first_rows = list(dialog.information_list.GetStrings())
+        assert "已用 20.0%，重置时间暂不可用" in first_rows[4]
         now[0] += 20
         frame._kimi_quota_request = (2, identity)
         frame._apply_kimi_quota(2, identity, payload, False)
@@ -1366,6 +1376,53 @@ def test_codex_total_and_weekly_quota_rows_ignore_stale_reply(frame, wx_app, mon
         data={"turn_idx": 0, "context_generation": 0, "session_total_tokens": 999},
     ))
     assert dialog.information_list.GetString(1) == "会话累计 token：暂不可用"
+    dialog.Close()
+    wx_app.Yield()
+
+
+def test_codex_quota_recalculates_cached_reset_after_local_week_changes(frame, wx_app, monkeypatch):
+    clock = [datetime(2028, 12, 31, 23, 59)]
+
+    class LocalClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0]
+
+    monkeypatch.setattr(chat_information, "datetime", LocalClock, raising=False)
+    frame.Show()
+    frame.view_mode = "active"
+    frame.selected_model = "codex/main"
+    frame.active_chat_id = frame.current_chat_id = "chat-1"
+    chat = {"id": "chat-1", "model": "codex/main", "codex_account_id": "account-1",
+            "codex_chat_information_account_owner": "account-1",
+            "codex_weekly_quota_label": "Codex 周额度：剩余 50.0%，本地重置 2029-01-01 09:30:00"}
+    frame._current_chat_state = chat
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    request = []
+    monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_a: request.append(True))
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    assert dialog.information_list.GetString(5) == "Codex 周额度：暂不可用"
+    assert request == [True]
+
+    identity = dialog.identity
+    frame._chat_information_request = ("req-1", 1, identity)
+    frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-1", "payload": {
+        "chat_id": "chat-1", "identity": list(identity), "generation": 1,
+        "account": {"account": {"type": "chatgpt", "id": "account-1"}},
+        "rate_limits": {"rateLimits": {"limitId": "codex",
+            "primary": {"windowDurationMins": 300, "usedPercent": 25},
+            "secondary": {"windowDurationMins": 10080, "usedPercent": 40,
+                          "resetsAt": datetime(2029, 1, 1, 9, 30).timestamp()}}},
+    }})
+    assert list(dialog.information_list.GetStrings())[5:] == ["Codex 周额度：剩余 60.0%，本地重置 下周一 09点30分"]
+    dialog.Close()
+    wx_app.Yield()
+
+    clock[0] = datetime(2029, 1, 1, 0, 0)
+    assert frame._show_chat_information()
+    dialog = frame._chat_information_dialog
+    assert dialog.information_list.GetString(5) == "Codex 周额度：剩余 60.0%，本地重置 周一 09点30分"
     dialog.Close()
     wx_app.Yield()
 

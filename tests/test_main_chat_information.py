@@ -285,18 +285,17 @@ def test_codex_repeated_total_refreshes_once_when_snapshot_recovers(frame, monke
 
 
 def test_codex_weekly_quota_uses_only_codex_10080_minute_window():
-    parse = main.ChatFrame._codex_weekly_quota_label
-    assert "剩余 75.0%" in parse({"rateLimits": {"limitId": "codex", "primary": {
+    weekly_window = main.ChatFrame._codex_weekly_quota_window
+    label = main.ChatFrame._codex_weekly_quota_label
+    assert "剩余 75.0%" in label(weekly_window({"rateLimits": {"limitId": "codex", "primary": {
         "windowDurationMins": 300, "usedPercent": 90}, "secondary": {
-        "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}})
-    assert "周窗口暂不可用" in parse({"rateLimits": {"limitId": "other", "primary": {
-        "windowDurationMins": 10080, "usedPercent": 25}}})
-    assert "周窗口暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
-        "windowDurationMins": 300, "usedPercent": 25}}})
-    assert "剩余比例暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
-        "windowDurationMins": 10080, "resetsAt": 1770000000}}})
-    assert "重置时间暂不可用" in parse({"rateLimits": {"limitId": "codex", "primary": {
-        "windowDurationMins": 10080, "usedPercent": 25}}})
+        "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}}))
+    assert weekly_window({"rateLimits": {"limitId": "other", "primary": {
+        "windowDurationMins": 10080, "usedPercent": 25}}}) is None
+    assert weekly_window({"rateLimits": {"limitId": "codex", "primary": {
+        "windowDurationMins": 300, "usedPercent": 25}}}) is None
+    assert "剩余比例暂不可用" in label({"resetsAt": 1770000000})
+    assert "重置时间暂不可用" in label({"usedPercent": 25})
 
 
 def test_codex_without_pending_usage_clears_stale_context_usage(frame):
