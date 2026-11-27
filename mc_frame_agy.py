@@ -483,7 +483,7 @@ class AgySessionsMixin:
 
         def read():
             try:
-                options = agy_settings.read_models(executable, EFFORT_NAMES)
+                options = agy_settings.read_catalog(executable, EFFORT_NAMES)
             except (OSError, subprocess.SubprocessError, AgyError) as exc:
                 self._call_after_if_alive(finish, [], str(exc))
             else:
