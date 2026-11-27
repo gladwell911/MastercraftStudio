@@ -1,5 +1,6 @@
 """Map AGY's advertised ACP settings to the desktop's pending settings."""
 
+import re
 import subprocess
 
 from agy_acp import AgyError
@@ -10,9 +11,10 @@ MODES = {"default": "默认", "accept-edits": "接受编辑", "auto": "自动", 
 FIELDS = {"model": "model", "thought_level": "effort", "mode": "mode"}
 
 
-def read_models(executable, effort_names):
+def read_catalog(executable, effort_names):
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     response = subprocess.run([executable, "models"], check=True, capture_output=True, encoding="utf-8",
-                              timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                              timeout=15, creationflags=creationflags)
     models = {}
     for line in response.stdout.splitlines():
         model_id, separator, label = line.strip().partition("\t")
@@ -30,7 +32,20 @@ def read_models(executable, effort_names):
             model["efforts"].append(effort)
     if not models:
         raise AgyError("AGY 未返回可用模型")
-    return [{"category": "model", "options": list(models.values())}]
+    catalog = [{"category": "model", "options": list(models.values())}]
+    try:
+        help_result = subprocess.run([executable, "--help"], check=True, capture_output=True,
+                                     encoding="utf-8", timeout=5, creationflags=creationflags)
+    except (OSError, subprocess.SubprocessError):
+        return catalog
+    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    advertised = re.search(r"^\s*--mode[ \t]+[^(\r\n]+\(([^()\r\n]+)\)", help_text, re.MULTILINE)
+    if advertised:
+        values = [value.strip() for value in advertised[1].split(",")]
+        modes = [{"value": value, "label": MODES[value]} for value in values if value in MODES]
+        if modes:
+            catalog.append({"category": "mode", "options": modes})
+    return catalog
 
 
 def _values(field):
