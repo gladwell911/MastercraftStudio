@@ -79,6 +79,23 @@ def test_upgrade_initializes_old_only_once(store):
     assert state["latest_readable_seq"] > state["read_seq"]
 
 
+def test_history_unread_badges_use_pair_read_position_and_legacy_baseline_during_a_write(store):
+    store.replace_turns("a", [turn("old")])
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DELETE FROM meta WHERE key='read_state_initialized'")
+    store.initialize()
+    store.upsert_chat({"id": "empty", "title": "Empty"})
+    rows = ["a", "empty", "missing"]
+    assert store.list_unread_chat_ids(rows, pair_id="p") == set()
+
+    store.replace_turns("a", [turn("old"), turn("new")])
+    mark(store, 1)
+    with sqlite3.connect(store.db_path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        assert store.list_unread_chat_ids(rows, pair_id="p") == set()
+        assert store.list_unread_chat_ids(rows, pair_id="other") == {"a"}
+
+
 def test_initialization_cutoff_excludes_completion_waiting_on_transaction(store, monkeypatch):
     store.replace_turns("a", [turn("old"), turn("new", "pending")])
     with sqlite3.connect(store.db_path) as conn:

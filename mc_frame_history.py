@@ -548,6 +548,7 @@ class ChatHistoryMixin:
         return chat
 
     def _load_state(self):
+        self.hide_terminal_chats = False
         if not self.state_path.exists():
             if getattr(self, "_chat_store_enabled", False):
                 self.archived_chats = self.chat_store.list_chat_summaries()
@@ -560,6 +561,7 @@ class ChatHistoryMixin:
         if not bindings.app.is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
+        self.hide_terminal_chats = bool(data.get("hide_terminal_chats", False))
         version = data.get("codex_approval_defaults_version")
         version = version if type(version) is int and version >= 1 else 0
         self.codex_approval_defaults_version = max(1, version)
@@ -772,6 +774,7 @@ class ChatHistoryMixin:
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
+            "hide_terminal_chats": self.hide_terminal_chats,
             "codex_sandbox": normalize_codex_sandbox(getattr(self, "codex_sandbox", DEFAULT_CODEX_SANDBOX)),
             "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
             "codex_approval_defaults_version": max(1, getattr(self, "codex_approval_defaults_version", 1)),
@@ -1178,29 +1181,52 @@ class ChatHistoryMixin:
             return EMPTY_CURRENT_CHAT_TITLE
         return title or EMPTY_CURRENT_CHAT_TITLE
 
+    def _append_terminal_history_filter_item(self, menu):
+        item = menu.AppendCheckItem(int(self._terminal_history_filter_menu_id), "隐藏终端聊天")
+        item.Check(bool(getattr(self, "hide_terminal_chats", False)))
+        return item
+
+    def _toggle_terminal_history_filter(self, event):
+        self.hide_terminal_chats = event.IsChecked()
+        self._terminal_history_filter_item.Check(self.hide_terminal_chats)
+        self._save_state(persist_chat_history=False)
+        self._refresh_history()
+
+    def _history_chat_is_visible(self, chat_id, chat):
+        # Native discovery creates its own deterministic owner ID. A replay
+        # onto an existing MC chat retains the MC owner and adds the mapping.
+        return not getattr(self, "hide_terminal_chats", False) or chat.get("native_identity") != chat_id
+
+    def _history_chats_by_id(self):
+        chats = {}
+        for chat in self.archived_chats:
+            if isinstance(chat, dict) and (chat_id := str(chat.get("id") or "").strip()):
+                chats.setdefault(chat_id, chat)
+        if current_id := self._current_history_id():
+            chats[current_id] = self._current_chat_state or {}
+        return chats
+
+    def _visible_history_chats_in_order(self):
+        rows = [(chat_id, chat) for chat_id, chat in self._history_chats_by_id().items()
+                if self._history_chat_is_visible(chat_id, chat)]
+        return sorted(rows, key=self._history_chat_sort_key)
+
     def _refresh_history(self, keep_id=None):
-        labels = []
-        ids = []
         current_id = self._current_history_id()
-        seen_ids = set()
         selected_id = self.history_list_model.selected_id() if hasattr(self, "history_list_model") else ""
         selection_deferred = getattr(self, "_chat_navigation_history_selection_deferred", False)
         target = selected_id if selection_deferred else str(
             keep_id if keep_id is not None else selected_id or self.view_history_id or ""
         ).strip()
-        for chat_id in self._get_all_chat_ids_in_order():
-            if not chat_id or chat_id in seen_ids:
-                continue
-            seen_ids.add(chat_id)
-            row = self._history_row_for_chat_id(chat_id)
-            if row is None:
-                continue
-            labels.append(row[1])
-            ids.append(chat_id)
+        chats = self._visible_history_chats_in_order()
+        ids = [chat_id for chat_id, _chat in chats]
+        unread_ids = self._unread_history_ids(ids)
+        labels = [self._history_chat_label(chat, is_current=chat_id == current_id, unread=chat_id in unread_ids)
+                  for chat_id, chat in chats]
         selected_idx = None
         if target in ids:
             selected_idx = ids.index(target)
-        elif labels and not selection_deferred:
+        elif labels and (not selection_deferred or selected_id):
             selected_idx = 0
         selected_id = ids[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(ids) else ""
         if hasattr(self, "history_list_model"):
@@ -1218,22 +1244,21 @@ class ChatHistoryMixin:
         if changed:
             self._request_listbox_repaint(self.history_list)
 
-    def _history_chat_label(self, chat: dict, *, is_current: bool = False) -> str:
+    def _unread_history_ids(self, chat_ids: list[str]) -> set[str]:
+        lookup = getattr(getattr(self, "chat_store", None), "list_unread_chat_ids", None)
+        return lookup(chat_ids, pair_id=self._read_pair_id()) if lookup and chat_ids else set()
+
+    def _history_chat_label(self, chat: dict, *, is_current: bool = False, unread: bool = False) -> str:
         title = self._current_history_title() if is_current else str((chat or {}).get("title") or "新聊天")
         if self._is_default_chat_title(title):
             title = EMPTY_CURRENT_CHAT_TITLE
         if not is_current and (chat or {}).get("pinned"):
             title = f"[置顶] {title}"
-        state = self._chat_read_state(str((chat or {}).get("id") or ""))
-        return f"[未读] {title}" if state and state["latest_readable_seq"] > state["read_seq"] else title
+        return f"[未读] {title}" if unread else title
 
-    def _history_chat_sort_key(self, chat_id: str) -> tuple:
-        chat_id = str(chat_id or "").strip()
-        current_id = self._current_history_id()
-        if current_id and chat_id == current_id:
-            chat = self._current_chat_state
-        else:
-            chat = self._find_archived_chat(chat_id)
+    @staticmethod
+    def _history_chat_sort_key(row) -> tuple:
+        chat_id, chat = row
         if not isinstance(chat, dict):
             return (9, 0, 0, chat_id)
         pinned_rank = 0 if chat.get("pinned") else 1
@@ -1245,24 +1270,21 @@ class ChatHistoryMixin:
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             return None
-        current_id = self._current_history_id()
-        if current_id and chat_id == current_id:
-            return chat_id, self._history_chat_label(self._current_chat_state, is_current=True)
-        chat = self._find_archived_chat(chat_id)
-        if not isinstance(chat, dict):
+        is_current = chat_id == self._current_history_id()
+        chat = self._current_chat_state if is_current else self._find_archived_chat(chat_id)
+        if not isinstance(chat, dict) or not self._history_chat_is_visible(chat_id, chat):
             return None
-        return chat_id, self._history_chat_label(chat)
+        unread = chat_id in self._unread_history_ids([chat_id])
+        return chat_id, self._history_chat_label(chat, is_current=is_current, unread=unread)
 
     def _desired_history_index(self, chat_id: str) -> int:
         chat_id = str(chat_id or "").strip()
         ids = list(getattr(self, "history_ids", []) or [])
         if chat_id and chat_id not in ids:
             ids.append(chat_id)
-        ordered = sorted(ids, key=self._history_chat_sort_key)
-        try:
-            return ordered.index(chat_id)
-        except ValueError:
-            return len(ids)
+        chats = self._history_chats_by_id()
+        target_key = self._history_chat_sort_key((chat_id, chats.get(chat_id)))
+        return sum(self._history_chat_sort_key((item_id, chats.get(item_id))) < target_key for item_id in ids)
 
     def _upsert_history_row(self, chat_id: str, *, allow_reorder: bool = True, message_fact: bool = False) -> bool:
         if not hasattr(self, "history_list_model"):
@@ -1270,6 +1292,9 @@ class ChatHistoryMixin:
             return True
         row = self._history_row_for_chat_id(chat_id)
         if row is None:
+            if chat_id in self.history_list_model.labels_by_id:
+                self._refresh_history()
+                return True
             return False
         item_id, label = row
         selected_id = self.history_list_model.selected_id()
@@ -1951,11 +1976,7 @@ class ChatHistoryMixin:
 
     def _get_all_chat_ids_in_order(self):
         """Return the same pinned and recency order shown by the history list."""
-        current_id = self._current_history_id()
-        ids = {current_id} if current_id else set()
-        ids.update(str(chat.get("id") or "").strip() for chat in self.archived_chats if isinstance(chat, dict))
-        ids.discard("")
-        return sorted(ids, key=self._history_chat_sort_key)
+        return [chat_id for chat_id, _chat in self._visible_history_chats_in_order()]
 
     def _adjacent_history_chat_id(self, direction: int):
         """Get the adjacent chat ID in the specified direction (1 for next, -1 for previous)."""
@@ -1963,10 +1984,10 @@ class ChatHistoryMixin:
         anchor_id = str(self.view_history_id or "").strip() if self.view_mode == "history" else ""
         if not anchor_id:
             anchor_id = self.current_chat_id or self.active_chat_id
-        if not anchor_id:
-            idx = self.history_list.GetSelection() if hasattr(self, "history_list") else wx.NOT_FOUND
-            if idx != wx.NOT_FOUND and 0 <= idx < len(self.history_ids):
-                anchor_id = self.history_ids[idx]
+        if hasattr(self, "history_list") and (not anchor_id or (
+            getattr(self, "hide_terminal_chats", False) and anchor_id not in all_ids
+        )):
+            anchor_id = self._selected_history_chat_id() or ""
         if len(all_ids) <= 1 or anchor_id not in all_ids:
             return None
         current_idx = all_ids.index(anchor_id)
