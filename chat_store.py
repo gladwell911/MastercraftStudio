@@ -1248,7 +1248,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
                 revision, "deleted", kind="chat_deleted")
 
-    def _agy_turn_owner_conn(self, conn, chat_id, scope, revision):
+    def _turn_owner_conn(self, conn, chat_id, scope, revision):
         chat = conn.execute(
             "SELECT c.model,c.metadata_json,COALESCE(s.revision,1) AS revision "
             "FROM chats c LEFT JOIN v2_chat_state s ON s.chat_id=c.id "
@@ -1260,11 +1260,35 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         saved_scope = dict(self._metadata_from_row(chat), model=chat["model"])
         return saved_scope if all(saved_scope.get(key) == value for key, value in scope.items()) else None
 
+    def claim_native_tool_turn(self, chat_id, index, scope, revision, session_key, session_id, queued, pending):
+        """Commit the exact FIFO entry before starting a native request."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner = self._turn_owner_conn(conn, chat_id, scope, revision)
+            if owner is None or (owner.get(session_key) or "") != session_id:
+                return False
+            prefix = queued["model"].partition("/")[0] + "/%"
+            if conn.execute(
+                    "SELECT 1 FROM turns WHERE chat_id=? AND turn_index<? "
+                    "AND json_extract(payload_json,'$.model') LIKE ? "
+                    "AND COALESCE(json_extract(payload_json,'$.local_command'),'')='' "
+                    "AND json_extract(payload_json,'$.request_status') IN ('queued','pending','running','unknown')",
+                    (chat_id, index, prefix),
+            ).fetchone():
+                return False
+            row = conn.execute("SELECT payload_json FROM turns WHERE chat_id=? AND turn_index=?",
+                               (chat_id, index)).fetchone()
+            if (row is None or queued.get("request_status") != "queued"
+                    or self._json_dict(row["payload_json"]) != self._json_dict(json.dumps(queued))):
+                return False
+            self._write_turn_conn(conn, chat_id, index, pending)
+            return True
+
     def claim_agy_queued_turn(self, chat_id, index, scope, revision, queued, pending):
         """Claim a persisted AGY prompt before giving it to ACP."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            owner = self._agy_turn_owner_conn(conn, chat_id, scope, revision)
+            owner = self._turn_owner_conn(conn, chat_id, scope, revision)
             if owner is None or owner.get("native_unresolved_turn"):
                 return False
             for row in conn.execute(
@@ -1275,7 +1299,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 if row["turn_index"] == index:
                     if saved != queued or saved.get("request_status") != "queued":
                         return False
-                    self._write_agy_turn_conn(conn, chat_id, index, pending)
+                    self._write_turn_conn(conn, chat_id, index, pending)
                     return True
                 if (saved.get("model") == AGY_MODEL_ID
                         and saved.get("request_status") in {"pending", "running", "unknown", "queued"}):
@@ -1286,7 +1310,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         """Commit the original accepted turn before reporting a known AGY result."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if self._agy_turn_owner_conn(conn, chat_id, scope, revision) is None:
+            if self._turn_owner_conn(conn, chat_id, scope, revision) is None:
                 return False
             row = conn.execute("SELECT payload_json FROM turns WHERE chat_id=? AND turn_index=?",
                                (chat_id, index)).fetchone()
@@ -1302,10 +1326,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 return all(existing.get(key) == value for key, value in terminal.items())
             settled = dict(turn, **existing)
             settled.update(terminal)
-            self._write_agy_turn_conn(conn, chat_id, index, settled)
+            self._write_turn_conn(conn, chat_id, index, settled)
             return True
 
-    def _write_agy_turn_conn(self, conn, chat_id, index, turn):
+    def _write_turn_conn(self, conn, chat_id, index, turn):
         conn.execute(
             "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?) "
             "ON CONFLICT(chat_id,turn_index) DO UPDATE SET payload_json=excluded.payload_json",
@@ -1314,7 +1338,12 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         self._backfill_canonical_turns_conn(conn, chat_id, [turn], index)
 
     @staticmethod
-    def _keep_agy_terminal(old, new):
+    def _keep_settled_turn(old, new):
+        if (isinstance(new, dict) and old.get("tool_queue_claimed")
+                and new.get("request_status") == "queued"
+                and all(old.get(key) == new.get(key) for key in
+                        ("_provider_request_id", "model", "request_question", "created_at"))):
+            return True
         if not isinstance(new, dict) or old.get("_provider_request_id") != new.get("_provider_request_id"):
             return False
         if old.get("agy_queue_claimed") and new.get("request_status") == "queued":
@@ -1336,7 +1365,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
         for index, turn in enumerate(incoming):
             old = existing.get(index)
-            if old is not None and self._keep_agy_terminal(old, turn):
+            if old is not None and self._keep_settled_turn(old, turn):
                 incoming[index] = old
             elif old is not None and not self._same_canonical_turn(old, turn):
                 conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
@@ -1377,7 +1406,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             for offset, turn in enumerate(suffix):
                 index = start + offset
                 old = existing.get(index)
-                if old is not None and self._keep_agy_terminal(old, turn):
+                if old is not None and self._keep_settled_turn(old, turn):
                     suffix[offset] = old
                 elif isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
                     conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))

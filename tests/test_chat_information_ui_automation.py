@@ -978,6 +978,9 @@ def test_kimi_quota_timer_rolls_into_local_week_and_preserves_selection(frame, w
     second = dialog.information_list.GetString(5)
     assert second.startswith("Kimi 七日额度：已用 50.0%，本地重置 周一 09点30分")
     assert calls == ["quota"]
+    clock[0] = datetime(2029, 1, 1, 10, 0)
+    dialog._on_refresh_timer(None)
+    assert dialog.information_list.GetString(5).startswith("Kimi 七日额度：已过期")
     assert dialog.information_list.GetSelection() == 5
     assert main.wx.Window.FindFocus() is dialog.information_list
     dialog.Close()
@@ -1346,7 +1349,7 @@ def test_codex_total_and_weekly_quota_rows_ignore_stale_reply(frame, wx_app, mon
     stale = {"chat_id": "chat-1", "identity": list(identity), "generation": 1,
              "account": {"account": {"type": "chatgpt", "id": "account-1"}},
              "rate_limits": {"rateLimits": {"limitId": "codex", "secondary": {
-                 "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": 1770000000}}}}
+                 "windowDurationMins": 10080, "usedPercent": 25, "resetsAt": time.time() + 3600}}}}
     frame._on_codex_worker_message("chat-1", {"type": "chat_information", "id": "req-old", "payload": stale})
     assert dialog.information_list.GetString(5) == "Codex 周额度：暂不可用"
 
@@ -1397,7 +1400,6 @@ def test_codex_quota_recalculates_cached_reset_after_local_week_changes(frame, w
             "codex_chat_information_account_owner": "account-1",
             "codex_weekly_quota_label": "Codex 周额度：剩余 50.0%，本地重置 2029-01-01 09:30:00"}
     frame._current_chat_state = chat
-    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
     request = []
     monkeypatch.setattr(frame, "_request_codex_chat_information", lambda *_a: request.append(True))
     assert frame._show_chat_information()
@@ -1415,6 +1417,9 @@ def test_codex_quota_recalculates_cached_reset_after_local_week_changes(frame, w
             "secondary": {"windowDurationMins": 10080, "usedPercent": 40,
                           "resetsAt": datetime(2029, 1, 1, 9, 30).timestamp()}}},
     }})
+    frame._flush_codex_background_updates()
+    saved = frame.chat_store.load_chat(chat["id"], include_execution_steps=False)
+    assert saved["codex_weekly_quota"] == {"usedPercent": 40, "resetsAt": datetime(2029, 1, 1, 9, 30).timestamp()}
     assert list(dialog.information_list.GetStrings())[5:] == ["Codex 周额度：剩余 60.0%，本地重置 下周一 09点30分"]
     dialog.Close()
     wx_app.Yield()
@@ -1423,6 +1428,9 @@ def test_codex_quota_recalculates_cached_reset_after_local_week_changes(frame, w
     assert frame._show_chat_information()
     dialog = frame._chat_information_dialog
     assert dialog.information_list.GetString(5) == "Codex 周额度：剩余 60.0%，本地重置 周一 09点30分"
+    clock[0] = datetime(2029, 1, 1, 10, 0)
+    dialog._on_refresh_timer(None)
+    assert dialog.information_list.GetString(5) == "Codex 周额度：已过期"
     dialog.Close()
     wx_app.Yield()
 
@@ -1497,7 +1505,7 @@ def test_first_codex_information_read_starts_worker_off_ui_thread(frame, wx_app,
                     "generation": payload["generation"],
                     "account": {"account": {"type": "chatgpt", "id": "account-1"}},
                     "rate_limits": {"rateLimits": {"limitId": "codex", "primary": {
-                        "windowDurationMins": 10080, "usedPercent": 20, "resetsAt": 1770000000}}},
+                        "windowDurationMins": 10080, "usedPercent": 20, "resetsAt": time.time() + 3600}}},
                 },
             })
             return "req-1"

@@ -105,7 +105,9 @@ default_effort = "low"
             thread.join(timeout=5)
 
 
-def test_kimi_native_settings_keep_history_and_queue_snapshots(loopback_kimi_home, frame, wait_for_wx, monkeypatch):
+def test_kimi_native_settings_keep_history_and_queue_snapshots(
+    loopback_kimi_home, frame, wait_for_wx, wait_for_wx_main_loop, monkeypatch,
+):
     workspace, calls, started, release = loopback_kimi_home
     monkeypatch.setattr(frame, "_workspace_dir_for_kimi", lambda: str(workspace))
     monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_args: None)
@@ -147,7 +149,7 @@ def test_kimi_native_settings_keep_history_and_queue_snapshots(loopback_kimi_hom
         assert [turn["request_status"] for turn in frame.active_session_turns[-2:]] == ["queued", "queued"]
         assert len(calls) == 6
         release.set()
-        wait_for_wx(lambda: all(turn["request_status"] in {"done", "failed"} for turn in frame.active_session_turns),
+        wait_for_wx_main_loop(lambda: all(turn["request_status"] in {"done", "failed"} for turn in frame.active_session_turns),
                     "queued Kimi answers", timeout=30)
 
         turns = frame.active_session_turns

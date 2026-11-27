@@ -53,7 +53,7 @@ def _values(field):
 
 
 def _efforts(model, field):
-    return model.get("efforts", _values(field))
+    return model.get("efforts") or _values(field)
 
 
 def control_options(options, effort_names):
@@ -66,10 +66,10 @@ def control_options(options, effort_names):
     for model in models:
         levels = _efforts(model, effort_field)
         ordered = sorted(levels, key=lambda level: effort_order.get(level, len(effort_order)))
-        model_options[model["value"]] = {
-            "efforts": [(level, effort_names.get(level, level)) for level in ordered],
-            "default_effort": "high" if "high" in levels else effort_field.get("current"),
-        }
+        efforts = [(level, effort_names.get(level, level)) for level in ordered]
+        if efforts and DEFAULTS["effort"] not in levels:
+            efforts.insert(0, ("", "请选择推理强度"))
+        model_options[model["value"]] = {"efforts": efforts, "default_effort": DEFAULTS["effort"]}
     labels = [(model["value"], model["label"]) for model in models]
     if models and DEFAULTS["model"] not in model_options:
         labels.insert(0, ("", "请选择模型"))
@@ -88,9 +88,9 @@ def native_config(options, settings, effort_names):
         value = settings.get(key) or DEFAULTS[key]
         field = fields.get(category, {})
         choices = _efforts(model, field) if key == "effort" else _values(field)
-        if key == "effort" and model.get("efforts") == [] and selected_model != DEFAULTS["model"] and not settings.get(key):
+        if not field and key != "model":
             continue
-        if value not in choices or not field:
+        if value not in choices:
             label = effort_names.get(value, MODES.get(value, value))
             raise AgyError(f"AGY 未提供所需设置（{label}），请选择可用配置后重试。")
         config[field["id"]] = value

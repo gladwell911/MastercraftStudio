@@ -19,6 +19,7 @@ from codex_client import (
     normalize_codex_approval_mode,
     normalize_codex_sandbox,
 )
+from chat_information import CODEX_QUOTA_FIELDS
 from context_usage import NATIVE_USAGE_FIELDS
 from mc_frame_settings import (
     APP_DIR_NAME,
@@ -221,7 +222,7 @@ class ChatHistoryMixin:
             "detail_panel_mode": self._detail_panel_mode() if hasattr(self, "answer_list") else "answers",
             "codex_context_generation": int(state.get("codex_context_generation") or 0),
         }
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_thread_id", "codex_account_id",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, *CODEX_QUOTA_FIELDS, "codex_thread_id", "codex_account_id",
                       "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
                       "kimi_session_id", "kimi_account_id", "kimi_verified_account_id",
                       "kimi_information_generation"):
@@ -487,6 +488,8 @@ class ChatHistoryMixin:
                 asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
         self._chat_turn_dirty_from.pop(normalized, None)
         self._call_after_if_alive(self._refresh_chat_read_row, normalized)
+        self._schedule_next_codex_tool_turn(normalized)
+        self._schedule_next_kimi_tool_turn(normalized)
         self._schedule_next_agy_tool_turn(normalized, turns)
 
     def _refresh_chat_read_row(self, owner):
@@ -613,7 +616,7 @@ class ChatHistoryMixin:
                 current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
                 merged = copy.deepcopy(summary)
                 merged.update(current)
-                for field in (*NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS):
+                for field in (*NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, *CODEX_QUOTA_FIELDS, "kimi_session_id"):
                     if field in summary:
                         merged[field] = copy.deepcopy(summary[field])
                 merged["id"] = self.active_chat_id
@@ -658,7 +661,8 @@ class ChatHistoryMixin:
         self.active_codex_thread_flags = thread_flags if isinstance(thread_flags, list) else []
         self.active_codex_latest_assistant_text = str(data.get("active_codex_latest_assistant_text") or "").strip()
         self.active_codex_latest_assistant_phase = str(data.get("active_codex_latest_assistant_phase") or "").strip()
-        self.active_kimi_session_id = str(data.get("active_kimi_session_id") or "").strip()
+        self.active_kimi_session_id = str(self._current_chat_state.get(
+            "kimi_session_id", data.get("active_kimi_session_id")) or "").strip()
         self.active_kimi_turn_id = str(data.get("active_kimi_turn_id") or "").strip()
         self.active_kimi_turn_active = bool(data.get("active_kimi_turn_active", False))
         self.active_kimi_pending_prompt = str(data.get("active_kimi_pending_prompt") or "").strip()
@@ -1578,7 +1582,7 @@ class ChatHistoryMixin:
         for field in ("kimi_interaction_errors", "kimi_interaction_error"):
             if field in self._current_chat_state:
                 archived[field] = copy.deepcopy(self._current_chat_state[field])
-        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, "codex_account_id", "codex_context_generation",
+        for field in (*AGY_CHAT_FIELDS, *NATIVE_CHAT_FIELDS, *NATIVE_USAGE_FIELDS, *CODEX_QUOTA_FIELDS, "codex_account_id", "codex_context_generation",
                       "codex_terminal_thread", "codex_terminal_host_id", *CODEX_STORAGE_FIELDS,
                       "kimi_account_id", "kimi_verified_account_id", "kimi_information_generation", "kimi_storage_id"):
             if field in self._current_chat_state:
@@ -1886,6 +1890,7 @@ class ChatHistoryMixin:
             if sync_history_selection and not self._select_history_row_if_present(selected_id):
                 self._mark_history_list_dirty(selected_id)
             self._defer_chat_state_save()
+            self._schedule_next_kimi_tool_turn(selected_id)
             self._schedule_next_agy_tool_turn(selected_id, self.active_session_turns)
             if focus_answer_list:
                 if not self._focus_latest_answer_immediately():
@@ -1909,6 +1914,7 @@ class ChatHistoryMixin:
         self._defer_chat_state_save()
         self.SetStatusText(str(chat.get("native_history_status") or "已切换到历史聊天"))
         self._schedule_next_codex_tool_turn(selected_id)
+        self._schedule_next_kimi_tool_turn(selected_id)
         self._schedule_next_agy_tool_turn(selected_id, chat.get("turns") or [])
         if focus_answer_list:
             if not self._focus_latest_answer_immediately():

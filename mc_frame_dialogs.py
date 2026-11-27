@@ -665,6 +665,8 @@ class ChatInformationDialog(wx.Dialog):
         if new_identity != self.identity:
             self.identity = new_identity
         if is_codex_model(model):
+            if chat.get("codex_weekly_quota") is not None:
+                self.set_rows(self.owner._chat_information_rows(chat, model))
             self.owner._request_codex_chat_information(chat, model)
         elif is_kimi_model(model):
             self.owner._refresh_chat_information(chat)

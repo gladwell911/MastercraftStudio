@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -53,7 +54,7 @@ def codex_model_request_gate():
 
 @real_codex
 def test_codex_keeps_completed_history_after_model_and_effort_changes(
-    codex_homes, frame, wait_for_wx, monkeypatch, codex_model_request_gate,
+    codex_homes, frame, wait_for_wx, wait_for_wx_main_loop, monkeypatch, codex_model_request_gate,
 ):
     _ordinary, _private, work, _other_work, calls, _native = codex_homes
     monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(work))
@@ -108,7 +109,7 @@ def test_codex_keeps_completed_history_after_model_and_effort_changes(
     assert [turn["request_status"] for turn in frame.active_session_turns[-2:]] == ["queued", "queued"]
     assert len(calls) == 6
     release.set()
-    wait_for_wx(lambda: all(turn.get("request_status") == "done" for turn in frame.active_session_turns[-3:]),
+    wait_for_wx_main_loop(lambda: all(turn.get("request_status") == "done" for turn in frame.active_session_turns[-3:]),
                 "both queued requests and the held turn complete", timeout=25)
     assert {turn["codex_thread_id"] for turn in frame.active_session_turns} == native_ids
     assert len({turn["codex_turn_id"] for turn in frame.active_session_turns}) == 8
@@ -121,7 +122,7 @@ def test_codex_keeps_completed_history_after_model_and_effort_changes(
 
 @real_codex
 def test_explicit_config_queues_behind_turn_started_with_native_defaults(
-    codex_homes, frame, wait_for_wx, monkeypatch, codex_model_request_gate,
+    codex_homes, frame, wait_for_wx, wait_for_wx_main_loop, monkeypatch, codex_model_request_gate,
 ):
     _ordinary, _private, work, _other_work, calls, _native = codex_homes
     monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(work))
@@ -136,7 +137,7 @@ def test_explicit_config_queues_behind_turn_started_with_native_defaults(
     send(frame, "Independent new settings MC_SETTINGS_LEGACY_FOLLOWUP")
     assert frame.active_session_turns[-1]["request_status"] == "queued"
     release.set()
-    wait_for_wx(lambda: all(turn["request_status"] == "done" for turn in frame.active_session_turns),
+    wait_for_wx_main_loop(lambda: all(turn["request_status"] == "done" for turn in frame.active_session_turns),
                 "the original and independent Codex turns", timeout=20)
     first, last = frame.active_session_turns
     assert first["codex_thread_id"] == last["codex_thread_id"]
@@ -177,7 +178,7 @@ def codex_queue(frame, monkeypatch):
     return chat, started, submitted
 
 
-def test_codex_queue_starts_while_status_is_pending(frame, codex_queue, monkeypatch, wx_app):
+def test_codex_queue_starts_while_status_is_pending(frame, codex_queue, monkeypatch, wait_for_wx_main_loop):
     chat, started, submitted = codex_queue
     frame.active_chat_id = frame.current_chat_id = chat["id"]
     frame.active_session_turns = chat["turns"]
@@ -192,15 +193,14 @@ def test_codex_queue_starts_while_status_is_pending(frame, codex_queue, monkeypa
         thread_id=chat["codex_thread_id"], turn_id=chat["codex_turn_id"],
         data={"turn_idx": 0, "completion_owners": [{"turn_idx": 0, "context_generation": 0}]},
     ))
-    wx_app.ProcessPendingEvents()
-    assert submitted.wait(timeout=1)
+    wait_for_wx_main_loop(submitted.is_set, "durable claim before the Codex worker starts")
     assert len(started) == 1
     assert started[0][0:3] == (chat["id"], 1, "First queued question")
     assert [turn["request_status"] for turn in chat["turns"]] == ["done", "pending", "queued", "pending"]
 
 
 @pytest.mark.parametrize("restore", ["startup", "history"])
-def test_persisted_codex_queue_resumes_in_order(frame, codex_queue, wx_app, restore):
+def test_persisted_codex_queue_resumes_in_order(frame, codex_queue, wait_for_wx, restore):
     chat, started, submitted = codex_queue
     # Old builds could persist the status command as active Codex work.
     frame.chat_store.upsert_chat({**chat, "codex_turn_active": True})
@@ -212,8 +212,7 @@ def test_persisted_codex_queue_resumes_in_order(frame, codex_queue, wx_app, rest
         frame.archived_chats = frame.chat_store.list_chat_summaries()
         assert frame._show_history_chat(chat["id"], focus_answer_list=False)
 
-    wx_app.ProcessPendingEvents()
-    assert submitted.wait(timeout=1)
+    wait_for_wx(submitted.is_set, "durable claim before the Codex worker starts")
     assert len(started) == 1
     assert started[0][0:3] == (chat["id"], 1, "First queued question")
     _, turns, _ = frame._chat_target_for_request(chat["id"])
@@ -266,3 +265,138 @@ def test_agy_chat_rejects_codex_selection_and_keeps_draft(frame, monkeypatch, tm
     assert frame.active_chat_id == source
     assert frame.active_session_turns == original_turns
     assert not started
+
+
+@pytest.mark.parametrize(("provider", "session_key"), [("codex", "codex_thread_id"), ("kimi", "kimi_session_id")])
+def test_settings_fifo_claim_survives_interruption(frame, monkeypatch, wx_app, wait_for_wx, provider, session_key):
+    model = f"{provider}/main"
+    chat_id = f"archived-{provider}"
+    store = frame.chat_store
+    turn = {"model": model, "question": "Original", "request_question": "Original", "request_status": "queued"}
+    chat = {"id": chat_id, "model": model, session_key: "native-session", "turns": [turn]}
+    store.upsert_chat(chat)
+    store.replace_turns(chat_id, [turn])
+    frame.archived_chats = store.list_chat_summaries()
+    monkeypatch.setattr(frame, "_request_kimi_settings_catalog", lambda: None)
+    monkeypatch.setattr(frame, "_request_native_history_refresh", lambda: None)
+    monkeypatch.setattr(frame, "_defer_chat_state_save", lambda: None)
+    monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
+    entries = []
+
+    def start(owner, index, question, worker_model):
+        assert (owner, index, question, worker_model) == (chat_id, 0, "Original", model)
+        persisted, = store.load_turns(chat_id)
+        assert persisted["request_status"] == "pending"
+        assert persisted["tool_queue_claimed"] is True
+        entries.append(persisted)
+
+    monkeypatch.setattr(frame, f"_start_{provider}_worker_for_turn", start)
+    assert frame._show_history_chat(chat_id, focus_answer_list=False)
+    wait_for_wx(lambda: len(entries) == 1, "durable FIFO admission")
+    # The delayed GUI save never ran. An older queued snapshot also cannot
+    # undo a committed claim for this exact row.
+    store.replace_turns_from(chat_id, [turn])
+    frame._chat_turn_dirty_from.clear()
+    frame.archived_chats = store.list_chat_summaries()
+    assert frame._show_history_chat(chat_id, focus_answer_list=False)
+    wx_app.ProcessPendingEvents()
+    assert len(entries) == 1
+    assert store.load_turns(chat_id) == entries
+
+
+def test_cold_catalogs_keep_the_visible_chats_settings_and_draft(frame, monkeypatch):
+    notices = []
+    monkeypatch.setattr(wx, "MessageBox", lambda message, *_: notices.append(message))
+    monkeypatch.setattr(frame, "_request_codex_settings_catalog", lambda: None)
+    monkeypatch.setattr(frame, "_request_kimi_settings_catalog", lambda: None)
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_: None)
+    models = [{"model": name, "supportedReasoningEfforts": [{"reasoningEffort": effort}],
+               "defaultReasoningEffort": effort}
+              for name, effort in (("sol", "medium"), ("astra", "high"))]
+    codex_catalog = {"models": models, "modes": [{"mode": "plan"}], "default_model": "sol"}
+
+    def restore(owner, model, effort, mode):
+        chat = {"id": owner, "model": DEFAULT_CODEX_MODEL, "turns": [
+            {"model": DEFAULT_CODEX_MODEL, "tool_settings": {"tool": "codex", "model": model,
+                                                            "effort": effort, "mode": mode}}]}
+        frame._current_chat_state = chat
+        frame.active_chat_id = frame.current_chat_id = owner
+        frame.active_session_turns = chat["turns"]
+        frame._apply_selected_chat_model_to_combo(chat)
+        return chat
+
+    astra = restore("astra-owner", "astra", "high", "plan")
+    frame.input_edit.SetValue("Do not discard")
+    assert not frame._on_send_clicked(None)
+    assert frame.input_edit.GetValue() == "Do not discard"
+    assert "Codex" in notices[-1]
+    restore("sol-owner", "sol", "medium", "default")
+    frame._apply_codex_settings_catalog(codex_catalog, "")
+    assert frame._pending_tool_settings()["model"] == "sol"
+    frame._apply_selected_chat_model_to_combo(astra)
+    selected = frame._pending_tool_settings()
+    assert (selected["model"], selected["effort"], selected["mode"]) == ("astra", "high", "plan")
+
+    restore("old-owner", "retired-model", "medium", "default")
+    assert not frame._pending_tool_settings()["model"]
+    assert not frame._on_send_clicked(None)
+    assert frame.input_edit.GetValue() == "Do not discard"
+    choose(frame.model_combo, "sol")
+    assert not frame._desktop_tool_settings_error(frame._pending_tool_settings())
+
+    frame._select_tool_route("kimi/main")
+    frame.input_edit.SetValue("Kimi draft")
+    assert not frame._on_send_clicked(None)
+    assert frame.input_edit.GetValue() == "Kimi draft"
+    assert "Kimi Code" in notices[-1]
+    frame._apply_kimi_settings_catalog({"models": [{"model": "default-id"}], "default_model": "default-id"}, "")
+    started = []
+    monkeypatch.setattr(frame, "_start_kimi_worker_for_turn",
+                        lambda *_: started.append(frame.active_session_turns[-1]["tool_settings"]))
+    assert frame._on_send_clicked(None)
+    assert started[0]["model"] == "default-id"
+    assert not frame.input_edit.GetValue()
+
+
+def test_settings_claim_waits_off_ui_and_rejects_changed_revision(frame, monkeypatch, wait_for_wx):
+    chat_id = "locked-codex"
+    turn = {"model": DEFAULT_CODEX_MODEL, "question": "Original", "request_question": "Original",
+            "request_status": "queued"}
+    chat = {"id": chat_id, "model": DEFAULT_CODEX_MODEL, "codex_thread_id": "native-session", "turns": [turn]}
+    frame.archived_chats = [chat]
+    store = frame.chat_store
+    store.upsert_chat(chat)
+    store.replace_turns(chat_id, [turn])
+    real_claim = store.claim_native_tool_turn
+    entered = threading.Event()
+    committed = threading.Event()
+    resume = threading.Event()
+    calls = []
+
+    def gated_claim(*args):
+        entered.set()
+        claimed = real_claim(*args)
+        if claimed:
+            committed.set()
+        assert resume.wait(5)
+        return claimed
+
+    monkeypatch.setattr(store, "claim_native_tool_turn", gated_claim)
+    monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: calls.append(args))
+    pulse = []
+    lock = sqlite3.connect(store.db_path)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        wx.CallAfter(frame._launch_next_codex_tool_turn, chat_id)
+        wx.CallAfter(pulse.append, "UI alive")
+        wait_for_wx(lambda: entered.is_set() and pulse, "wx handler while SQLite is write-locked", timeout=2)
+        assert not committed.is_set()
+        lock.rollback()
+        wait_for_wx(committed.is_set, "durable claim after write lock releases")
+        chat["revision"] = store.allocate_chat_revision(chat_id)
+        resume.set()
+        wait_for_wx(lambda: chat_id not in frame._native_tool_queue_claims, "late claim rejected")
+        assert not calls
+    finally:
+        resume.set()
+        lock.close()

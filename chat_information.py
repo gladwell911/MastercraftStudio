@@ -6,8 +6,11 @@ import time
 from datetime import datetime
 
 
-def format_quota_reset_time(value: object) -> str | None:
-    """Format a provider's Unix seconds or offset-aware timestamp in local time."""
+CODEX_QUOTA_FIELDS = ("codex_account_label", "codex_chat_information_account_owner",
+                      "codex_weekly_quota", "codex_weekly_quota_status")
+
+
+def _quota_reset_datetime(value: object) -> datetime | None:
     try:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             reset = datetime.fromtimestamp(value)
@@ -21,6 +24,19 @@ def format_quota_reset_time(value: object) -> str | None:
     except (ValueError, OverflowError, OSError):
         return None
 
+    return reset
+
+
+def quota_reset_passed(value: object) -> bool:
+    reset = _quota_reset_datetime(value)
+    return reset is not None and reset <= datetime.now(reset.tzinfo)
+
+
+def format_quota_reset_time(value: object) -> str | None:
+    """Format a provider's Unix seconds or offset-aware timestamp in local time."""
+    reset = _quota_reset_datetime(value)
+    if reset is None:
+        return None
     today = datetime.now().date()
     week_offset = ((reset.date() - today).days + today.weekday()) // 7
     weekday = "一二三四五六日"[reset.weekday()]
