@@ -1083,7 +1083,7 @@ class ChatRequestsMixin:
         return True, ""
 
     def _preflight_attachment_draft(self, raw_question, source, model, chat_id, client_send_id,
-                                    attachments, *, agy_context=None) -> tuple[bool, str]:
+                                    attachments, *, agy_context=None, tool_settings=None) -> tuple[bool, str]:
         if getattr(self, "_attachment_preflight", None) is not None:
             return False, "正在检查附件，请稍候"
         expected_state = self._current_chat_state
@@ -1108,6 +1108,7 @@ class ChatRequestsMixin:
                     ok, error = self._submit_question(
                         raw_question, source, model, chat_id, client_send_id=client_send_id,
                         _verified_attachments=(files, prepared),
+                        _tool_settings=tool_settings,
                     )
                     if ok:
                         return
@@ -1140,13 +1141,15 @@ class ChatRequestsMixin:
         return True, ""
 
     def _submit_question(self, question: str, source: str = "local", model: str | None = None, chat_id: str = "", *,
-                         client_send_id: str = "", _verified_attachments=None) -> tuple[bool, str]:
+                         client_send_id: str = "", _verified_attachments=None, _tool_settings=None) -> tuple[bool, str]:
         if getattr(self, "_closing", False):
             return False, "程序正在关闭"
         if self._clear_pending_for(chat_id or self._visible_clear_owner()):
             return False, "正在清空此聊天的上下文"
         automatic_clear_resend = bool(str(getattr(self, "_clear_resend_operation_id", "") or "").strip())
-        tool_settings = self._pending_tool_settings() if source == "local" and model is None else None
+        tool_settings = _tool_settings
+        if tool_settings is None and source == "local" and model is None:
+            tool_settings = self._pending_tool_settings()
         question_origin = "mc" if str(source or "").strip() == "local" else "rc"
         raw_question = str(question or "")
         q = self._strip_attachment_markers(raw_question)
@@ -1170,6 +1173,7 @@ class ChatRequestsMixin:
                     return self._preflight_attachment_draft(
                         raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
                         agy_context=self._agy_attachment_context(candidate or {}, candidate_turns),
+                        tool_settings=tool_settings,
                     )
                 self._validate_agy_submission(candidate or {})
             except AgyError as exc:
@@ -1196,6 +1200,10 @@ class ChatRequestsMixin:
             return False, f"以下附件无法读取，本次未发送，请移除或修复后重试：{failed_names}"
         if not q and not outgoing_attachments:
             return False, "请输入问题，输入框内容为空"
+        if (is_kimi_model(resolved_model) and tool_settings and self._kimi_settings_catalog
+                and not tool_settings.get("model")
+                and (outgoing_attachments or not self._parse_kimi_local_command(q))):
+            return False, "Kimi Code 没有可用的默认模型，请选择模型或检查 Kimi CLI 配置"
         self._answer_list_tail_notice = ""
         self._answer_list_tail_notice_chat_id = ""
 

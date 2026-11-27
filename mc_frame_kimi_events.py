@@ -1371,6 +1371,7 @@ class KimiEventsMixin:
         self._defer_chat_state_save()
         if status == "completed" and any(str(target_turns[i].get("answer_md") or "").strip() for i in finalized):
             self._notify_kimi_answer_completed(answer_identity)
+        self._schedule_next_kimi_tool_turn(chat_id)
         return finalized
 
     def _record_kimi_completion_stage(self, identity: str, stage: str) -> None:
@@ -1572,6 +1573,7 @@ class KimiEventsMixin:
         if not is_current_target:
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
+        self._schedule_next_kimi_tool_turn(chat_id)
 
     def _receive_kimi_interaction(self, event: CodexEvent) -> None:
         session_id = self._event_thread_id(event)
