@@ -20,7 +20,7 @@ AGY_QUOTA_MAX_AGE_SECONDS = 60
 
 
 def agy_usage_owner(chat: dict) -> list:
-    return [chat.get("agy_session_id"), chat.get("agy_native_owner"), chat.get("native_account")]
+    return [chat.get(key) for key in ("agy_session_id", "agy_native_owner", "native_account", "native_identity")]
 
 
 def agy_context_tokens(update: dict) -> list[int] | None:

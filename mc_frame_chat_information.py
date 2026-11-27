@@ -4,7 +4,7 @@ import logging
 import math
 import wx
 from agy_acp import AGY_MODEL_ID
-from agy_information import agy_quota_rows, agy_session_rows, read_agy_quota
+from agy_information import agy_quota_rows, agy_session_rows, agy_usage_owner, read_agy_quota
 from chat_information import ChatInformationSubscriptions, format_quota_reset_time
 from claudecode_client import is_claudecode_model
 from codex_client import codex_model_label_for_model, is_codex_model
@@ -56,8 +56,9 @@ class ChatInformationMixin:
 
     def _chat_information_identity(self, chat: dict, model: str) -> tuple[str, str, str, str]:
         if model == AGY_MODEL_ID:
+            owner = "|".join(str(value or "") for value in agy_usage_owner(chat)[1:])
             return (str(chat.get("id") or ""), model, self._agy_session_id_for_chat(chat),
-                    str(chat.get("native_account") or chat.get("agy_native_owner") or ""))
+                    owner)
         native_id = self._codex_thread_id_for_chat(chat) if is_codex_model(model) else self._kimi_session_id_for_chat(chat)
         account_id = str(chat.get("codex_account_id") or "").strip() if is_codex_model(model) else ""
         return (str(chat.get("id") or ""), model, native_id, account_id)
@@ -249,9 +250,10 @@ class ChatInformationMixin:
 
     def _refresh_agy_chat_information(self, chat: dict) -> None:
         dialog = self._chat_information_dialog
+        if dialog is None or dialog.IsBeingDeleted():
+            return
         owner = self._visible_chat_information_owner()
-        if (dialog is not None and not dialog.IsBeingDeleted()
-                and owner is not None and owner[0] is chat
+        if (owner is not None and owner[0] is chat
                 and dialog.identity == self._chat_information_identity(*owner)):
             dialog.set_rows(self._chat_information_rows(chat, AGY_MODEL_ID))
 
