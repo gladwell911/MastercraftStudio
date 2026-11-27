@@ -189,7 +189,7 @@ def test_agy_quota_late_result_cannot_replace_other_chat_or_steal_focus(
 
 
 def test_agy_quota_timer_keeps_recent_observation_then_shows_expiry_and_refreshes(
-    frame, tmp_path, wx_app, wait_for_wx, agy_attachment_runtime, monkeypatch,
+    frame, tmp_path, wx_app, wait_for_wx_main_loop, agy_attachment_runtime, monkeypatch,
 ):
     import agy_information
     import mc_frame_chat_information
@@ -216,19 +216,21 @@ def test_agy_quota_timer_keeps_recent_observation_then_shows_expiry_and_refreshe
     dialog = frame._chat_information_dialog
     rows = dialog.information_list.GetStrings
     try:
-        wait_for_wx(lambda: "周限额：剩余 93%，重置时间暂不可用" in rows(), "first account quota")
+        wait_for_wx_main_loop(lambda: "周限额：剩余 93%，重置时间暂不可用" in rows(), "first account quota")
+        dialog.information_list.SetFocus()
+        assert wx.Window.FindFocus() == dialog.information_list
         dialog.information_list.SetSelection(5)
         previous = list(rows())
         dialog.refresh_timer.StartOnce(20)
-        wait_for_wx(refresh_started.is_set, "periodic AGY quota query")
+        wait_for_wx_main_loop(refresh_started.is_set, "periodic AGY quota query")
         assert list(rows()) == previous
         clock.now += 61
         dialog.context_timer.StartOnce(20)
-        wait_for_wx(lambda: "周限额：已过期" in rows(), "expired observation during query")
+        wait_for_wx_main_loop(lambda: "周限额：已过期" in rows(), "expired observation during query")
         assert dialog.information_list.GetSelection() == 5
         assert wx.Window.FindFocus() == dialog.information_list
         refresh_ready.set()
-        wait_for_wx(lambda: "周限额：剩余 94%，重置时间暂不可用" in rows(), "refreshed account quota")
+        wait_for_wx_main_loop(lambda: "周限额：剩余 94%，重置时间暂不可用" in rows(), "refreshed account quota")
         assert dialog.information_list.GetSelection() == 5
         assert wx.Window.FindFocus() == dialog.information_list
     finally:
