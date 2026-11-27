@@ -847,12 +847,12 @@ class CodexSessionsMixin:
             turn["codex_start_generation"] = turn["codex_context_generation"]
             self._prepare_codex_tool_turn(turn, turns[:turn_idx])
             if turn.get("codex_settings_force_new") and (
-                    self._codex_should_steer_turn(target_chat, is_current)
-                    or self._codex_active_request_turn_count(turns[:turn_idx])
-                    or any(row.get("request_status") == "queued" for row in turns[:turn_idx] if isinstance(row, dict))):
+                    self._codex_tool_queue_blocked(chat_id, turns[:turn_idx])
+                    or any(self._is_codex_tool_turn_queued(row) for row in turns[:turn_idx])):
                 turn["request_status"] = "queued"
                 if is_current:
                     self.SetStatusText("已排队，将在当前回合结束后发送")
+                self._schedule_next_codex_tool_turn(chat_id)
                 return
         def _worker() -> None:
             self._run_codex_turn_worker(chat_id, turn_idx, question, model, from_recovery=False)
@@ -865,7 +865,7 @@ class CodexSessionsMixin:
         if not settings or not settings.get("model"):
             return
         previous = next((row for row in reversed(prior_turns) if isinstance(row, dict)
-                         and is_codex_model(row.get("model"))
+                         and is_codex_model(row.get("model")) and not row.get("local_command")
                          and (row.get("request_question") or row.get("question"))), None)
         if previous is None:
             return
@@ -875,14 +875,32 @@ class CodexSessionsMixin:
         if previous.get("request_status") == "queued" or changed:
             turn["codex_settings_force_new"] = True
 
+    @staticmethod
+    def _is_codex_tool_turn_queued(turn):
+        return (isinstance(turn, dict) and is_codex_model(turn.get("model"))
+                and turn.get("request_status") == "queued")
+
+    def _codex_tool_queue_blocked(self, chat_id, turns):
+        # A restored UI flag can describe a completed turn or a local command.
+        # Only a live worker, an unsettled native row or a clear operation owns the queue.
+        return (chat_id in self._codex_worker_active_turns
+                or self._codex_active_request_turn_count(turns) > 0
+                or any(isinstance(turn, dict) and is_codex_model(turn.get("model"))
+                       and turn.get("local_command") == "clear"
+                       and turn.get("request_status") in {"pending", "running"} for turn in turns))
+
+    def _schedule_next_codex_tool_turn(self, chat_id):
+        _, turns, _ = self._chat_target_for_request(chat_id)
+        if any(self._is_codex_tool_turn_queued(turn) for turn in turns):
+            self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
+
     def _launch_next_codex_tool_turn(self, chat_id):
         chat, turns, is_current = self._chat_target_for_request(chat_id)
         if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
-                or self._codex_should_steer_turn(chat, is_current)
-                or self._codex_active_request_turn_count(turns)):
+                or self._codex_tool_queue_blocked(chat_id, turns)):
             return
         for index, turn in enumerate(turns):
-            if not isinstance(turn, dict) or turn.get("request_status") != "queued":
+            if not self._is_codex_tool_turn_queued(turn):
                 continue
             turn["request_status"] = "pending"
             self._mark_chat_turns_dirty(None if is_current else chat_id, index)
@@ -940,9 +958,13 @@ class CodexSessionsMixin:
                 answer = self._handle_codex_stop_command(client, target_chat, model=model)
             else:
                 answer = self._build_codex_unsupported_command_markdown(normalized_command or command, args)
-            self._call_after_if_alive(self._on_done, turn_idx, answer, "", model, "", chat_id)
+            self._call_after_if_alive(self._finish_codex_local_command, turn_idx, answer, "", model, chat_id)
         except Exception as exc:
-            self._call_after_if_alive(self._on_done, turn_idx, "", str(exc), model, "", chat_id)
+            self._call_after_if_alive(self._finish_codex_local_command, turn_idx, "", str(exc), model, chat_id)
+
+    def _finish_codex_local_command(self, turn_idx, answer, error, model, chat_id):
+        self._on_done(turn_idx, answer, error, model, "", chat_id)
+        self._schedule_next_codex_tool_turn(chat_id)
 
     def _handle_codex_compact_command(self, client, chat: dict, model: str = "") -> str:
         thread_id = self._codex_thread_id_for_chat(chat)
@@ -997,6 +1019,13 @@ class CodexSessionsMixin:
 
     def _handle_codex_clear_command(self, chat: dict) -> str:
         if isinstance(chat, dict):
+            chat_id = str(chat.get("id") or "").strip()
+            self._clear_codex_worker_active_turn(chat_id)
+            for index, turn in enumerate(chat.get("turns") or ()):
+                if self._is_codex_tool_turn_queued(turn):
+                    self._mark_turn_request_cancelled(turn, "Codex 上下文已清空，排队的问题已取消。")
+                    turn["answer_md"] = turn["request_error"]
+                    self._mark_chat_turns_dirty(chat_id, index)
             self._clear_codex_context_usage_for_thread_change(chat)
             chat["codex_thread_id"] = ""
             chat["codex_turn_id"] = ""
@@ -1593,11 +1622,8 @@ class CodexSessionsMixin:
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
-        if (event_type == "turn_completed" and isinstance(identity_chat, dict)
-                and any(isinstance(row, dict) and row.get("request_status") == "queued"
-                        for row in identity_chat.get("turns") or ())):
-            owner = str(identity_chat.get("id") or chat_id or "")
-            self._call_after_if_alive(self._launch_next_codex_tool_turn, owner)
+        if event_type == "turn_completed" and isinstance(identity_chat, dict):
+            self._schedule_next_codex_tool_turn(str(identity_chat.get("id") or chat_id or ""))
         data = event.data if isinstance(event.data, dict) else {}
         if data.get("interaction_id"):
             if (isinstance(identity_chat, dict) and self._codex_thread_id_for_chat(identity_chat) == event_thread_id
@@ -1659,12 +1685,10 @@ class CodexSessionsMixin:
                     if idx != self._event_scoped_turn_index(turns, event):
                         scoped_event.text = ""
                     self._on_codex_event_for_chat(chat_id, scoped_event)
-                pending_owners = [turn for turn in turns if isinstance(turn, dict)
-                    and is_codex_model(str(turn.get("model") or ""))
-                    and str(turn.get("request_status") or "") in {"pending", "running"}]
-                identity_chat["codex_turn_active"] = bool(pending_owners)
+                native_active = self._codex_active_request_turn_count(turns) > 0
+                identity_chat["codex_turn_active"] = native_active
                 if is_current_chat:
-                    self.active_codex_turn_active = bool(pending_owners)
+                    self.active_codex_turn_active = native_active
                     inflight = [turn for turn in turns if isinstance(turn, dict) and (
                         str(turn.get("request_status") or "") in {"pending", "running"} or
                         (not turn.get("request_status") and turn.get("answer_md") == REQUESTING_TEXT))]
@@ -2235,13 +2259,12 @@ class CodexSessionsMixin:
             return 0
         count = 0
         for turn in turns:
-            if not isinstance(turn, dict):
+            if (not isinstance(turn, dict) or not is_codex_model(turn.get("model"))
+                    or turn.get("local_command")):
                 continue
             status = str(turn.get("request_status") or "").strip()
-            if status in {"done", "failed", "queued"}:
-                continue
             answer_md = str(turn.get("answer_md") or "").strip()
-            if status in {"pending", "running"} or answer_md == REQUESTING_TEXT:
+            if status in {"pending", "running"} or (not status and answer_md == REQUESTING_TEXT):
                 count += 1
         return count
 
@@ -2317,7 +2340,7 @@ class CodexSessionsMixin:
         if not is_current_target:
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
-        self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
+        self._schedule_next_codex_tool_turn(chat_id)
 
     def _on_codex_worker_exit(self, chat_id: str, returncode, source_client=None) -> None:
         if bindings.app.threading.current_thread() is not bindings.app.threading.main_thread():
