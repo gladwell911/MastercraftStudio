@@ -36,6 +36,8 @@ class AgyHandoff:
     source_id: str
     draft: str
     attachments: list
+    cutoff: float
+    completed_indexes: frozenset | None
     cancel: threading.Event = field(default_factory=threading.Event)
     preparing: bool = True
     run: object = None
@@ -119,7 +121,7 @@ class AgyPreparedAttachments:
 
 
 class AgySessionsMixin:
-    def _start_agy_handoff(self, source, question, settings, attachments):
+    def _start_agy_handoff(self, source, visible_turns, question, settings, attachments):
         source_id = source["id"]
         pending = getattr(self, "_agy_handoff", None)
         if pending is not None:
@@ -145,18 +147,55 @@ class AgySessionsMixin:
             return False, "请输入问题，输入框内容为空"
         if source_id in self._native_history_reserved:
             return False, "正在同步原生 Codex 历史，请稍后重试"
-        if self.chat_store.unresolved_agy_handoff(source_id):
-            return False, HANDOFF_UNKNOWN
-        durable = self.chat_store.load_chat(source_id, include_execution_steps=False)
-        cwd = str((durable or {}).get("native_cwd") or source.get("native_cwd") or "")
+        now = time.time()
+        completed = (frozenset(index for index, turn in enumerate(visible_turns)
+                               if turn.get("request_status") in (None, "", "done")
+                               and not turn.get("terminal_final_pending"))
+                     if visible_turns or isinstance(source.get("turns"), list) else None)
+        pending = AgyHandoff(source_id, self.input_edit.GetValue(), [dict(item) for item in attachments],
+                             now, completed)
+        source_scope = {key: source.get(key) for key in ("model", "native_cwd", "codex_thread_id")}
+        chat = {
+            "id": str(uuid.uuid4()), "model": AGY_MODEL_ID,
+            "title_source": "default", "title_revision": 1, "title_updated_at": now,
+            "created_at": now, "updated_at": now, "agy_desktop_settings": True,
+            "agy_handoff_source_id": source_id,
+        }
+        turn = {"question": question, "answer_md": REQUESTING_TEXT, "model": AGY_MODEL_ID,
+                "created_at": now, "tool_settings": dict(settings), "question_origin": "mc"}
+        self._mark_turn_request_pending(turn, AGY_MODEL_ID, question)
+        turn.update(_provider_request_id=uuid.uuid4().hex, request_recoverable=False)
+        self._agy_handoff = pending
+        self.SetStatusText("正在提交 AGY 接续，等待首次提问结果")
+        try:
+            pending.worker = threading.Thread(target=self._submit_agy_handoff,
+                                              args=(pending, chat, turn, source_scope), name="agy-handoff", daemon=True)
+            pending.worker.start()
+        except RuntimeError as exc:
+            self._agy_handoff = None
+            return False, f"无法开始 AGY 接续：{exc}"
+        return True, ""
+
+    def _read_agy_handoff_source(self, pending, source, question):
+        if self.chat_store.unresolved_agy_handoff(pending.source_id):
+            raise AgyError(HANDOFF_UNKNOWN)
+        durable = self.chat_store.load_chat(pending.source_id, include_execution_steps=False)
+        if not durable or (source["codex_thread_id"] and source["codex_thread_id"] != durable.get("codex_thread_id")):
+            raise AgyError("原 Codex 聊天已变更，本次未发送。")
+        cwd = str(durable.get("native_cwd") or source["native_cwd"] or "")
         if not cwd or not Path(cwd).is_absolute():
-            return False, "找不到原 Codex 聊天的实际项目目录，本次未发送。"
+            raise AgyError("找不到原 Codex 聊天的实际项目目录，本次未发送。")
         try:
             cwd = validate_workspace(cwd)
         except AgyError as exc:
-            return False, f"原 Codex 项目目录不可用，本次未发送。{exc}"
+            raise AgyError(f"原 Codex 项目目录不可用，本次未发送。{exc}") from exc
         turns = []
-        for turn in (durable or {}).get("turns", ()):
+        for index, turn in enumerate(durable.get("turns", ())):
+            if pending.completed_indexes is not None and index not in pending.completed_indexes:
+                continue
+            answer_at = turn.get("answer_at")
+            if isinstance(answer_at, (int, float)) and answer_at > pending.cutoff:
+                continue
             if (is_codex_model(turn.get("model") or source["model"]) and not turn.get("local_command")
                     and turn.get("request_status") in (None, "", "done")
                     and not turn.get("terminal_final_pending") and not turn.get("request_error")
@@ -169,32 +208,9 @@ class AgySessionsMixin:
             label, key = ("用户", "question") if role == "user" else ("Codex", "answer_md")
             sections.append(f"{label}：\n{turns[index][key]}")
         sections.append(f"本次提问：\n{question}")
-        prompt = "\n\n".join(sections)
-        pending = AgyHandoff(source_id, self.input_edit.GetValue(), attachments)
-        now = time.time()
-        chat = {
-            "id": str(uuid.uuid4()), "model": AGY_MODEL_ID, "title": self._next_default_chat_title(),
-            "title_source": "default", "title_revision": 1, "title_updated_at": now,
-            "created_at": now, "updated_at": now, "agy_desktop_settings": True,
-            "agy_handoff_source_id": source_id,
-        }
-        turn = {"question": question, "answer_md": REQUESTING_TEXT, "model": AGY_MODEL_ID,
-                "created_at": now, "tool_settings": dict(settings), "question_origin": "mc"}
-        self._mark_turn_request_pending(turn, AGY_MODEL_ID, question)
-        turn.update(_provider_request_id=uuid.uuid4().hex, request_recoverable=False,
-                    agy_handoff_prompt=prompt)
-        self._agy_handoff = pending
-        self.SetStatusText("正在提交 AGY 接续，等待首次提问结果")
-        try:
-            pending.worker = threading.Thread(target=self._submit_agy_handoff,
-                                              args=(pending, chat, turn, cwd), name="agy-handoff", daemon=True)
-            pending.worker.start()
-        except RuntimeError as exc:
-            self._agy_handoff = None
-            return False, f"无法开始 AGY 接续：{exc}"
-        return True, ""
+        return cwd, "\n\n".join(sections)
 
-    def _submit_agy_handoff(self, pending, chat, turn, cwd):
+    def _submit_agy_handoff(self, pending, chat, turn, source):
         client = None
         saved = settled_turn = None
         staged = False
@@ -210,11 +226,13 @@ class AgySessionsMixin:
             if event.get("sessionUpdate") == "usage_update":
                 context = agy_context_tokens(event) or context
             elif event.get("sessionUpdate") == "agent_message_chunk":
-                text = (event.get("content") or {}).get("text")
-                if isinstance(text, str):
-                    answer.append(text)
+                content = event.get("content")
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    answer.append(content["text"])
 
         try:
+            cwd, turn["agy_handoff_prompt"] = self._read_agy_handoff_source(pending, source, turn["question"])
+            chat["title"] = self._next_default_chat_title()
             files, failed = self._normalize_outgoing_attachments(pending.attachments)
             if failed:
                 names = "、".join(item["name"] for item in failed)
@@ -289,7 +307,7 @@ class AgySessionsMixin:
                                                    "input token count", "prompt is too long", "request too large")):
                 error = HANDOFF_OVERFLOW
             else:
-                error = str(exc)
+                error = str(exc) if isinstance(exc, AgyError) else f"无法准备 AGY 接续，本次未发送：{exc}"
         finally:
             try:
                 if client is not None:
@@ -298,20 +316,29 @@ class AgySessionsMixin:
                 saved = None
                 error = HANDOFF_UNKNOWN if staged else "无法保存 AGY 接续，本次未发送。"
             finally:
+                accepted_client = client if saved is chat else None
                 try:
-                    if client is not None:
+                    if client is not None and accepted_client is None:
                         client.close()
                 finally:
-                    self._call_after_if_alive(self._finish_agy_handoff, pending, saved, error)
+                    posted = self._call_after_if_alive(self._finish_agy_handoff, pending, saved, error,
+                                                      accepted_client)
+                    if not posted and accepted_client is not None:
+                        accepted_client.close()
 
-    def _finish_agy_handoff(self, pending, saved, error):
+    def _finish_agy_handoff(self, pending, saved, error, client):
         if self._agy_handoff is not pending:
+            if client is not None:
+                client.close()
             return
         self._agy_handoff = None
         if pending.run:
             self._dismiss_agy_dialog(pending.run)
         if saved:
             chat_id = saved["id"]
+            if client is not None:
+                self._watch_agy_title(client, chat_id)
+                self._agy_clients[chat_id] = client
             self.archived_chats.append(saved)
             if (self._visible_clear_owner() == pending.source_id and self._current_tool() == "agy"
                     and self.input_edit.GetValue() == pending.draft

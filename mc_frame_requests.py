@@ -1163,7 +1163,7 @@ class ChatRequestsMixin:
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
         if (tool_settings and tool_settings.get("tool") == "agy"
                 and is_codex_model((candidate or {}).get("model"))):
-            return self._start_agy_handoff(candidate, q, tool_settings, requested_attachments)
+            return self._start_agy_handoff(candidate, candidate_turns, q, tool_settings, requested_attachments)
         agy_queued = False
         if resolved_model == AGY_MODEL_ID:
             try:
