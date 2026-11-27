@@ -1,14 +1,19 @@
 import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
+from types import SimpleNamespace
+import uuid
 
 import pytest
 import wx
 
-from agy_acp import AgyAcpClient
+import agy_acp
+from agy_acp import AgyAcpClient, find_agy_executable
 from codex_client import DEFAULT_CODEX_MODEL
-from test_agy_settings_ui_automation import isolated_agy
 from test_chat_tool_settings_ui_automation import choose, send
 from test_codex_native_history import codex_homes, real_codex
 
@@ -96,6 +101,34 @@ for line in sys.stdin:
     frame.chat_store.replace_turns(source, frame.active_session_turns)
     frame.Show()
     return source, project, log
+
+
+@pytest.fixture
+def native_agy_for_handoff(frame, monkeypatch, tmp_path):
+    monkeypatch.delenv("MC_AGY_EXECUTABLE", raising=False)
+    assert find_agy_executable(), "AGY must be installed for the native acceptance run"
+    profile = "mc-settings-test-" + uuid.uuid4().hex
+    root = Path(REAL_USERPROFILE) / ".gemini"
+    data = root / profile
+    command = AgyAcpClient.command
+
+    def launch(*args, **kwargs):
+        env = dict(os.environ, USERPROFILE=REAL_USERPROFILE)
+        return subprocess.Popen(*args, env=env, **kwargs)
+
+    # Keep the Codex test process and its background catalog on their fixture profile.
+    monkeypatch.setattr(agy_acp, "subprocess", SimpleNamespace(**dict(vars(subprocess), Popen=launch)))
+    monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
+        lambda executable: [*command(executable), "--app-data-dir", profile,
+                            "--log-file", str(tmp_path / "agy.log")],
+    ))
+    try:
+        yield
+    finally:
+        frame._close_agy_clients()
+        if data.is_dir():
+            assert data.resolve().parent == root.resolve()
+            shutil.rmtree(data)
 
 
 def click_send(frame):
@@ -264,7 +297,7 @@ def test_handoff_keeps_an_attachment_only_exchange_and_its_original_speaker(
 @real_codex
 @pytest.mark.skipif(not os.getenv("MC_TEST_AGY_NATIVE"), reason="requires explicitly enabled, authenticated AGY")
 def test_native_codex_handoff_into_native_agy(
-    codex_homes, frame, monkeypatch, request, wait_for_wx, wait_for_wx_main_loop,
+    codex_homes, frame, native_agy_for_handoff, monkeypatch, wait_for_wx, wait_for_wx_main_loop,
 ):
     _ordinary, _private, workspace, different_default, codex_calls, _native = codex_homes
     monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(workspace))
@@ -289,8 +322,6 @@ def test_native_codex_handoff_into_native_agy(
         return send_acp(client, payload)
 
     with monkeypatch.context() as native_profile:
-        native_profile.setenv("USERPROFILE", REAL_USERPROFILE)
-        request.getfixturevalue("isolated_agy")
         native_profile.setattr(frame, "_workspace_dir_for_codex", lambda: str(different_default))
         native_profile.setattr(AgyAcpClient, "_send", track_acp)
         question = "Reply with exactly HANDOFF_NATIVE_ACK_062."
