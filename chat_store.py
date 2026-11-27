@@ -859,7 +859,10 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
                 ))
                 for index, (old, new) in enumerate(zip(stored, snapshot.turns)):
-                    if self._can_recover_terminal_final(snapshot.identity, old, new):
+                    handoff = index == 0 and self._is_first_agy_handoff_replay(
+                        snapshot.identity, old, snapshot.turns,
+                    )
+                    if self._can_recover_terminal_final(snapshot.identity, old, new, agy_handoff=handoff):
                         recovered[index] = dict(old, answer_md=new["answer_md"], request_status="done",
                                                 request_error="", terminal_final_pending=False,
                                                 provider_message_id=new["provider_message_id"])
@@ -867,6 +870,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                             recovered[index]["answer_at"] = new["answer_at"]
                         if snapshot.identity.provider == "agy":
                             recovered[index].pop("agy_partial_answer_md", None)
+                            for field in ("agy_native_turn_id", "provider_user_message_id"):
+                                if new.get(field):
+                                    recovered[index][field] = new[field]
                     elif (snapshot.identity.provider == "agy" and old.get("request_status") in
                           {"unknown", "cancelled", "failed"} and self._agy_replay_matches(snapshot.identity, old, new)
                           and new.get("agy_replay_followed")):
@@ -1004,6 +1010,26 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             and stored.get("provider_message_id") in (None, "", observed_answer)
         )
 
+    @staticmethod
+    def _is_first_agy_handoff_replay(identity, stored, replay):
+        prompt = stored.get("agy_handoff_prompt")
+        if (identity.provider != "agy" or not prompt or stored.get("request_status") != "unknown"
+                or stored.get("terminal_notification_pair") != identity.pair_id
+                or stored.get("agy_session_id") != identity.session_id):
+            return False
+        first = replay[0]
+        if (first.get("session_id") != identity.session_id or first.get("question") != prompt
+                or not first.get("provider_message_id")):
+            return False
+        for saved_field, native_field in (
+            ("agy_native_turn_id", "agy_native_turn_id"),
+            ("provider_user_message_id", "provider_user_message_id"),
+            ("agy_observed_message_id", "provider_message_id"),
+        ):
+            if stored.get(saved_field) and stored[saved_field] != first.get(native_field):
+                return False
+        return sum(turn.get("question") == prompt for turn in replay) == 1
+
     def _merge_recovered_agy_step(self, conn, owner, session_id, step):
         for entry in conn.execute("SELECT payload_json FROM execution_steps WHERE chat_id=? AND turn_idx=?",
                                   (owner, step["turn_idx"])):
@@ -1018,13 +1044,14 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         self._append_execution_step_on_conn(conn, owner, step)
 
     @staticmethod
-    def _can_recover_terminal_final(identity: NativeSessionIdentity, stored: dict, replayed: dict) -> bool:
+    def _can_recover_terminal_final(identity: NativeSessionIdentity, stored: dict, replayed: dict, *,
+                                    agy_handoff: bool = False) -> bool:
         # Managed admission persisted the owner before the original process
         # exited. A matching, settled provider turn may finish that same row.
         if identity.provider == "agy":
             return (
                 stored.get("request_status") == "unknown"
-                and ChatStore._agy_replay_matches(identity, stored, replayed)
+                and (agy_handoff or ChatStore._agy_replay_matches(identity, stored, replayed))
                 and replayed.get("native_final_explicit") is True
                 and replayed.get("request_status") == "done"
                 and bool(str(replayed.get("answer_md") or "").strip())

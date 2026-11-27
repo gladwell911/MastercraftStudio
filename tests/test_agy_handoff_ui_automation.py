@@ -1,14 +1,19 @@
 import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
+from types import SimpleNamespace
+import uuid
 
 import pytest
 import wx
 
-from agy_acp import AgyAcpClient
+import agy_acp
+from agy_acp import AgyAcpClient, find_agy_executable
 from codex_client import DEFAULT_CODEX_MODEL
-from test_agy_settings_ui_automation import isolated_agy
 from test_chat_tool_settings_ui_automation import choose, send
 from test_codex_native_history import codex_homes, real_codex
 
@@ -86,7 +91,7 @@ for line in sys.stdin:
     frame.active_codex_thread_id = "original-codex"
     frame.active_session_turns.extend([
         {"question": "  第一问\r\n原文  ", "answer_md": "  第一答\n保留结尾  ", "request_status": "done",
-         "attachments": [{"name": "OLD_BINARY", "path": "ignored"}], "model": DEFAULT_CODEX_MODEL},
+         "attachments": [{"name": "prior.bin", "path": "PRIVATE_OLD_BINARY_PATH"}], "model": DEFAULT_CODEX_MODEL},
         {"question": "第二问\n🧪", "answer_md": "第二答\r\n𠀋", "request_status": "done",
          "model": DEFAULT_CODEX_MODEL},
         {"question": "PENDING_QUESTION", "answer_md": "PENDING_OUTPUT", "request_status": "pending",
@@ -96,6 +101,34 @@ for line in sys.stdin:
     frame.chat_store.replace_turns(source, frame.active_session_turns)
     frame.Show()
     return source, project, log
+
+
+@pytest.fixture
+def native_agy_for_handoff(frame, monkeypatch, tmp_path):
+    monkeypatch.delenv("MC_AGY_EXECUTABLE", raising=False)
+    assert find_agy_executable(), "AGY must be installed for the native acceptance run"
+    profile = "mc-settings-test-" + uuid.uuid4().hex
+    root = Path(REAL_USERPROFILE) / ".gemini"
+    data = root / profile
+    command = AgyAcpClient.command
+
+    def launch(*args, **kwargs):
+        env = dict(os.environ, USERPROFILE=REAL_USERPROFILE)
+        return subprocess.Popen(*args, env=env, **kwargs)
+
+    # Keep the Codex test process and its background catalog on their fixture profile.
+    monkeypatch.setattr(agy_acp, "subprocess", SimpleNamespace(**dict(vars(subprocess), Popen=launch)))
+    monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
+        lambda executable: [*command(executable), "--app-data-dir", profile,
+                            "--log-file", str(tmp_path / "agy.log")],
+    ))
+    try:
+        yield
+    finally:
+        frame._close_agy_clients()
+        if data.is_dir():
+            assert data.resolve().parent == root.resolve()
+            shutil.rmtree(data)
 
 
 def click_send(frame):
@@ -132,7 +165,7 @@ def test_codex_handoff_sends_verbatim_history_once_in_source_workspace(
     text, attached = prompt["prompt"]
     assert text["text"] == (
         "以下是已完成的 Codex 历史对话。\n\n"
-        "用户：\n  第一问\r\n原文  \n\nCodex：\n  第一答\n保留结尾  \n\n"
+        "用户：\n  第一问\r\n原文  \n附件：prior.bin\n\nCodex：\n  第一答\n保留结尾  \n\n"
         "用户：\n第二问\n🧪\n\nCodex：\n第二答\r\n𠀋\n\n本次提问：\n新的问题"
     )
     assert attached["resource"]["text"] == "NEW_FILE_CONTENT"
@@ -210,6 +243,7 @@ def test_handoff_waits_for_storage_off_ui_and_keeps_the_send_cutoff(
     frame, handoff_runtime, wait_for_wx, monkeypatch,
 ):
     source, _project, log = handoff_runtime
+    frame.chat_store.replace_turns(source, frame.active_session_turns[:1])
     reading = threading.Event()
     continued = threading.Event()
     load_chat = frame.chat_store.load_chat
@@ -229,20 +263,41 @@ def test_handoff_waits_for_storage_off_ui_and_keeps_the_send_cutoff(
         assert frame.active_chat_id == source
         assert frame.input_edit.GetValue() == "接续截止点"
         frame.active_session_turns[-1].update(answer_md="LATER_COMPLETED_OUTPUT", request_status="done")
-        frame.chat_store.replace_turns(source, frame.active_session_turns)
+        frame.chat_store.replace_turns(source, [frame.active_session_turns[0], {}, frame.active_session_turns[-1]])
         wx.CallAfter(continued.set)
         wait_for_wx(continued.is_set, "wx event while source lookup is delayed")
     finally:
         continued.set()
     wait_for_wx(lambda: frame.active_chat_id != source, "published AGY handoff")
     prompt, = requests(log, "session/prompt")
+    assert "第二问\n🧪\n\nCodex：\n第二答\r\n𠀋" in prompt["prompt"][0]["text"]
     assert "LATER_COMPLETED_OUTPUT" not in prompt["prompt"][0]["text"]
+
+
+def test_handoff_keeps_an_attachment_only_exchange_and_its_original_speaker(
+    frame, handoff_runtime, wait_for_wx,
+):
+    source, _project, log = handoff_runtime
+    frame.active_session_turns.insert(2, {
+        "question": "", "answer_md": "  Kimi 原文\r\n", "request_status": "done", "model": "kimi/main",
+        "attachments": [{"name": "历史输入.txt", "path": "PRIVATE_STORAGE", "data": "PRIVATE_BINARY"}],
+        "received_attachments": [{"name": "历史输出.txt", "path": "PRIVATE_OUTPUT", "data": "PRIVATE_BINARY"}],
+    })
+    frame.chat_store.replace_turns(source, frame.active_session_turns)
+    choose(frame.tool_combo, "AGY")
+    frame.input_edit.ChangeValue("接续这些内容")
+    click_send(frame)
+    wait_for_wx(lambda: frame.active_chat_id != source, "completed mixed-provider history handoff")
+    prompt, = requests(log, "session/prompt")
+    text, = prompt["prompt"]
+    assert "用户：\n附件：历史输入.txt\n\nKimi Code：\n  Kimi 原文\r\n\n附件：历史输出.txt" in text["text"]
+    assert "PRIVATE_" not in text["text"]
 
 
 @real_codex
 @pytest.mark.skipif(not os.getenv("MC_TEST_AGY_NATIVE"), reason="requires explicitly enabled, authenticated AGY")
 def test_native_codex_handoff_into_native_agy(
-    codex_homes, frame, monkeypatch, request, wait_for_wx,
+    codex_homes, frame, native_agy_for_handoff, monkeypatch, wait_for_wx, wait_for_wx_main_loop,
 ):
     _ordinary, _private, workspace, different_default, codex_calls, _native = codex_homes
     monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(workspace))
@@ -258,10 +313,6 @@ def test_native_codex_handoff_into_native_agy(
     source_id = frame.active_chat_id
     native_codex_id = frame.active_codex_thread_id
     assert native_codex_id
-    wait_for_wx(lambda: len(frame.chat_store.load_turns(source_id)) == 2
-                and all(turn.get("request_status") == "done" for turn in frame.chat_store.load_turns(source_id)),
-                "two durable Codex answers")
-
     traffic = []
     send_acp = AgyAcpClient._send
 
@@ -271,8 +322,6 @@ def test_native_codex_handoff_into_native_agy(
         return send_acp(client, payload)
 
     with monkeypatch.context() as native_profile:
-        native_profile.setenv("USERPROFILE", REAL_USERPROFILE)
-        request.getfixturevalue("isolated_agy")
         native_profile.setattr(frame, "_workspace_dir_for_codex", lambda: str(different_default))
         native_profile.setattr(AgyAcpClient, "_send", track_acp)
         question = "Reply with exactly HANDOFF_NATIVE_ACK_062."
@@ -307,10 +356,16 @@ def test_native_codex_handoff_into_native_agy(
             "prompt": [{"type": "text", "text": followup}],
         }
 
+    monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(workspace))
     assert frame._show_history_chat(source_id)
+    assert frame.tool_combo.GetValue() == "Codex"
     send(frame, "Third Codex question after AGY handoff")
-    wait_for_wx(lambda: frame.active_chat_id == source_id and len(frame.active_session_turns) == 3
-                and frame.active_session_turns[-1].get("request_status") == "done",
-                "original native Codex thread still continues", timeout=30)
+    wait_for_wx_main_loop(
+        lambda: len(codex_calls) == 3 and frame.active_chat_id == source_id
+        and len(frame.active_session_turns) >= 3
+        and frame.active_session_turns[2].get("request_status") in {"done", "failed", "unknown"},
+        "original native Codex thread still continues", timeout=20,
+    )
+    assert frame.active_session_turns[2]["request_status"] == "done", frame.active_session_turns[2].get("request_error")
     assert frame.active_session_turns[-1]["codex_thread_id"] == native_codex_id
     assert len(codex_calls) == 3
