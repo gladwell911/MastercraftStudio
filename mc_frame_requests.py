@@ -127,7 +127,8 @@ class ChatRequestsMixin:
         if is_kimi_model(model):
             self._clear_kimi_active_turn(chat_id, turn_idx)
         self._on_done(turn_idx, "", message, model, "", chat_id)
-        if is_codex_model(model):
+        if is_codex_model(model) and any(isinstance(turn, dict) and turn.get("request_status") == "queued"
+                                        for turn in self._chat_target_for_request(chat_id)[1]):
             self._call_after_if_alive(self._launch_next_codex_tool_turn, chat_id)
 
     def _set_active_claudecode_client(self, client, chat_id: str) -> None:
@@ -1273,6 +1274,7 @@ class ChatRequestsMixin:
         self.model_combo.SetValue(bindings.app.model_display_name(resolved_model))
         if tool_settings:
             self._refresh_tool_setting_choices(tool_settings)
+            self._codex_settings_explicit = tool_settings.get("explicit", False)
         self._current_chat_state["id"] = self.active_chat_id or self.current_chat_id or ""
         self._current_chat_state["model"] = resolved_model
         self._current_chat_state["turns"] = self.active_session_turns

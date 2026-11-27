@@ -5,9 +5,10 @@ import main
 
 
 def test_model_combo_contains_openclaw(frame):
+    frame.model_combo.SetValue("openclaw")
     choices = [frame.model_combo.GetString(i) for i in range(frame.model_combo.GetCount())]
     assert "openclaw" in choices
-    assert "codex" in choices
+    assert "codex" not in choices
     assert "claudeCode" in choices
 
 

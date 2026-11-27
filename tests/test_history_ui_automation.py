@@ -521,7 +521,9 @@ def test_ui_automation_primary_tab_sequence_matches_screen_reader_order(frame, w
     expected = [
         frame.input_edit,
         frame.new_chat_button,
+        frame.tool_combo,
         frame.model_combo,
+        frame.reasoning_combo,
         frame.codex_speed_combo,
         frame.send_button,
         frame.notes_notebook_list,

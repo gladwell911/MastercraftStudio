@@ -163,16 +163,8 @@ def test_voice_input_ui_automation_inserts_verbatim_when_editor_focused(frame, m
     assert frame.input_edit.GetValue() == "浠婂ぉ澶╂皵涓嶉敊浠婂ぉ澶╂皵涓嶉敊"
 
 
-def test_ui_automation_model_combo_prioritizes_cli_models(frame):
-    choices = [frame.model_combo.GetString(idx) for idx in range(frame.model_combo.GetCount())]
-
-    assert choices[:5] == [
-        "codex",
-        "codex gpt5.4 medium",
-        "codex gpt5.3spark high",
-        "claudeCode",
-        "openclaw",
-    ]
+def test_ui_automation_keeps_cli_tools_above_other_tools(frame):
+    assert list(frame.tool_combo.GetItems()) == ["Codex", "AGY", "Kimi Code", "其他"]
 
 
 def test_voice_input_ui_automation_speaks_result_after_insert(frame, wx_app, monkeypatch):

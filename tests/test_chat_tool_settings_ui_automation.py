@@ -5,7 +5,9 @@ import wx
 from test_codex_native_history import codex_homes, real_codex
 
 
-def test_chat_tools_have_keyboard_order_and_accessible_names(frame, wait_for_wx):
+def test_chat_tools_have_keyboard_order_and_accessible_names(frame, wait_for_wx, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_BIN", str(tmp_path / "unavailable.exe"))
     frame.Show()
     frame.Raise()
     frame.new_chat_button.SetFocus()
@@ -110,3 +112,29 @@ def test_codex_keeps_completed_history_after_model_and_effort_changes(
     assert [(call["model"], call["reasoning"]["effort"], call.get("service_tier")) for call in calls[-2:]] == [
         ("gpt-6.2-astra", "low", "priority"), ("gpt-6.2-sol", "high", None),
     ]
+
+
+@real_codex
+def test_explicit_config_queues_behind_turn_started_with_native_defaults(
+    codex_homes, frame, wait_for_wx, monkeypatch, codex_model_request_gate,
+):
+    _ordinary, _private, work, _other_work, calls, _native = codex_homes
+    monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(work))
+    started, release = codex_model_request_gate
+    frame.Show()
+    send(frame, "MC_SETTINGS_HOLD with legacy config")
+    wait_for_wx(started.is_set, "the legacy-config native turn", timeout=10)
+    frame.model_combo.SetFocus()
+    wait_for_wx(lambda: "GPT-6.2-Astra" in frame.model_combo.GetItems(), "native Codex model catalog", timeout=20)
+    choose(frame.model_combo, "GPT-6.2-Astra")
+    choose(frame.reasoning_combo, "高")
+    send(frame, "Independent new settings MC_SETTINGS_LEGACY_FOLLOWUP")
+    assert frame.active_session_turns[-1]["request_status"] == "queued"
+    release.set()
+    wait_for_wx(lambda: all(turn["request_status"] == "done" for turn in frame.active_session_turns),
+                "the original and independent Codex turns", timeout=20)
+    first, last = frame.active_session_turns
+    assert first["codex_thread_id"] == last["codex_thread_id"]
+    assert first["codex_turn_id"] != last["codex_turn_id"]
+    assert len(calls) == 2
+    assert (calls[-1]["model"], calls[-1]["reasoning"]["effort"]) == ("gpt-6.2-astra", "high")

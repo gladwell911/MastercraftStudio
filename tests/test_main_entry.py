@@ -80,17 +80,8 @@ def test_app_shows_missing_onedrive_error_before_creating_frame(monkeypatch):
     assert messages[0][0] == "OneDrive 缺失"
 
 
-def test_model_combo_order_prioritizes_cli_models(frame):
-    choices = [frame.model_combo.GetString(idx) for idx in range(frame.model_combo.GetCount())]
-
-    assert choices[:6] == [
-        "codex",
-        "codex gpt5.4 medium",
-        "codex gpt5.3spark high",
-        "claudeCode",
-        "Kimi Code",
-        "openclaw",
-    ]
+def test_tool_combo_lists_cli_providers_first(frame):
+    assert list(frame.tool_combo.GetItems()) == ["Codex", "AGY", "Kimi Code", "其他"]
 
 
 def test_chat_frame_initializes_incremental_list_models(frame):
@@ -523,16 +514,13 @@ def test_model_ids_contains_new_models():
 
 
 def test_model_combo_shows_display_names(frame):
+    frame.model_combo.SetValue("openclaw")
     choices = list(frame.model_combo.GetItems())
     assert "openclaw" in choices
-    assert "codex" in choices
-    assert "codex gpt5.4 medium" in choices
-    assert "codex gpt5.3spark high" in choices
     assert "claudeCode" in choices
+    assert "codex" not in choices
+    assert "Kimi Code" not in choices
     assert "openclaw/main" not in choices
-    assert "codex/main" not in choices
-    assert "codex/gpt-5.4-medium" not in choices
-    assert "codex/gpt-5.3-codex-spark-high" not in choices
     assert "claudecode/default" not in choices
 
 

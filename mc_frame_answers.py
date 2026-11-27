@@ -1491,6 +1491,7 @@ class AnswersMixin:
         self.model_combo.SetValue(snapshot["model_value"])
         self._select_tool_route(snapshot["tool_route"])
         self._refresh_tool_setting_choices(snapshot["tool_settings"])
+        self._codex_settings_explicit = snapshot["tool_settings"].get("explicit", False)
         self.answer_meta = snapshot["answer_meta"]
         self.answer_list.Set(snapshot["answer_strings"])
         self.answer_list_model.visible_ids = list(snapshot["answer_visible_ids"])
