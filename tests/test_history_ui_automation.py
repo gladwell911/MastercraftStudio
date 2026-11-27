@@ -364,6 +364,7 @@ def test_ui_automation_alt_a_clears_visible_history_chat_without_clearing_runnin
             "updated_at": 1.0,
         }
     ]
+    frame._mark_chat_metadata_dirty(frame.archived_chats[0])
     frame._save_state()
     monkeypatch.setattr(frame, "_start_codex_worker_for_turn", lambda *args: None)
     monkeypatch.setattr(frame, "_defer_codex_state_save", lambda: None)
@@ -686,90 +687,260 @@ def test_ui_automation_large_sqlite_history_keeps_history_list_responsive(frame,
     assert frame.history_list.GetSelection() == 1
 
 
-def test_terminal_history_filter_shares_menu_state_and_preserves_active_chat(frame, wx_app, monkeypatch):
+def test_mc_history_excludes_old_and_new_terminal_sessions(frame, wx_app, monkeypatch):
+    import json
     from native_history import NativeSessionIdentity, NativeSessionSnapshot
+    from remote_nats import RemoteNatsTransport
 
     store = frame.chat_store
-    native = NativeSessionSnapshot(
-        NativeSessionIdentity("default", "codex", "storage", "same-session"),
-        "account", main.DEFAULT_CODEX_MODEL, "", "终端聊天", 20,
+    imported = NativeSessionSnapshot(
+        NativeSessionIdentity("default", "codex", "storage", "terminal-session"),
+        "account", main.DEFAULT_CODEX_MODEL, "", "terminal", 20,
     )
-    imported_id, _ = store.native_history_target(native)
-    store.merge_native_history(native, expected_chat_id=imported_id)
-    imported = store.load_chat_summary(imported_id)
-    imported["pinned"] = True
-    store.upsert_chat(imported)
-    # Native replay adds its mapping to the existing MC owner.
+    imported_id = imported.identity.chat_id
+    store.merge_native_history(imported, expected_chat_id=imported_id)
+    store.upsert_chat({**store.load_chat_summary(imported_id), "pinned": True})
+    terminal_turn = {"question": "terminal question", "answer_md": "terminal answer", "request_status": "done"}
+    store.replace_turns(imported_id, [terminal_turn])
+    imported_before = store.load_chat_summary(imported_id)
+    terminal_turns_before = store.load_turns(imported_id)
     continued = NativeSessionSnapshot(
         NativeSessionIdentity("default", "codex", "storage", "continued-session"),
-        "account", main.DEFAULT_CODEX_MODEL, "", "MC 续接", 10,
-        chat_fields={"codex_thread_id": "continued-session"},
+        "account", main.DEFAULT_CODEX_MODEL, "", "continued", 10,
+        chat_fields={"codex_thread_id": "continued-session", "codex_storage_id": "storage"},
         legacy_fields={"codex_thread_id": "continued-session"},
     )
-    store.upsert_chat({"id": "mc-continued", "title": "MC 续接", "model": main.DEFAULT_CODEX_MODEL,
-                       "codex_thread_id": "continued-session", "updated_at": 10})
-    continuing_id, _ = store.native_history_target(continued)
-    assert continuing_id == "mc-continued"
-    store.merge_native_history(continued, expected_chat_id=continuing_id)
-    managed = {"id": "mc-local", "title": "MC 本地", "updated_at": 5}
-    store.upsert_chat(managed)
-    frame.archived_chats = store.list_chat_summaries()
-    frame.active_chat_id = frame.current_chat_id = imported_id
-    frame._current_chat_state = imported
-    frame.active_codex_turn_active = True
-    frame._refresh_history(imported_id)
+    store.upsert_chat({"id": "mc-continued", "title": "continued", "model": main.DEFAULT_CODEX_MODEL,
+                       "codex_thread_id": "continued-session", "codex_storage_id": "storage", "updated_at": 10})
+    store.upsert_chat({"id": "mc-local", "title": "local", "updated_at": 5})
+    frame.state_path.write_text(json.dumps({"hide_terminal_chats": False, "active_chat_id": imported_id,
+        "active_chat": {"id": imported_id}, "active_codex_thread_id": "terminal-session"}), encoding="utf-8")
+    frame._load_state()
+    frame._refresh_history()
     frame.Show()
-    wx_app.Yield()
     frame.history_list.SetFocusFromKbd()
     wx_app.Yield()
 
-    def filter_item(menu):
-        return next(item for item in menu.GetMenuItems() if item.GetItemLabelText() == "隐藏终端聊天")
-
-    def activate(item, handler):
-        event = main.wx.CommandEvent(main.wx.EVT_MENU.typeId, item.GetId())
-        event.SetInt(int(not item.IsChecked()))
-        handler.ProcessEvent(event)
-
-    app_menu = frame.GetMenuBar().GetMenu(0)
-    assert not filter_item(app_menu).IsChecked()
-    activate(filter_item(app_menu), frame)
     assert frame.history_ids == ["mc-continued", "mc-local"]
-    assert frame.history_list.GetSelection() == 0
-    assert _focused_control() is frame.history_list
-    assert frame.active_chat_id == imported_id and frame.active_codex_turn_active
+    assert frame.active_chat_id != imported_id and not frame.active_codex_thread_id
+    assert frame._history_chat_for_id(imported_id) is None
+    assert not frame._show_history_chat(imported_id)
     assert store.load_chat_summary(imported_id)["pinned"]
-    monkeypatch.setattr(frame, "_announce_chat_navigation", lambda *_args: None)
+    assert all(item.GetItemLabelText() != "隐藏终端聊天"
+               for item in frame.GetMenuBar().GetMenu(0).GetMenuItems())
+    menu_labels = []
+    monkeypatch.setattr(frame, "PopupMenu",
+        lambda menu, *_: menu_labels.extend(item.GetItemLabelText() for item in menu.GetMenuItems()))
+    frame._show_tools_menu()
+    assert "隐藏终端聊天" not in menu_labels
+    monkeypatch.setattr(frame, "_announce_chat_navigation", lambda *_: None)
+    frame.history_list.SetSelection(0)
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    focus_before = _focused_control()
     frame.ProcessEvent(main.wx.CommandEvent(main.wx.EVT_MENU.typeId, int(frame._chat_navigation_right_id)))
     assert frame.view_history_id == "mc-local"
-    assert _focused_control() is frame.history_list
-    assert frame.active_chat_id == imported_id and frame.active_codex_turn_active
+    assert _focused_control() is focus_before
 
     new = NativeSessionSnapshot(
         NativeSessionIdentity("default", "codex", "storage", "new-session"),
-        "account", main.DEFAULT_CODEX_MODEL, "", "同步终端聊天", 30,
+        "account", main.DEFAULT_CODEX_MODEL, "", "new terminal", 30,
     )
-    new_id, _ = store.native_history_target(new)
-    frame._publish_native_history_ui(new_id, store.merge_native_history(new, expected_chat_id=new_id), None, new)
+    reads = []
+    monkeypatch.setattr(frame, "_run_remote_ui_route", lambda callback, *args, **kwargs: callback())
+    monkeypatch.setattr(frame, "_call_after_if_alive", lambda callback, *args: callback(*args))
+    frame._scan_native_history([(lambda: [imported, continued, new], reads.append)])
+    assert reads == [continued]
+    assert store.load_chat_summary("mc-continued")["native_identity"] == continued.identity.chat_id
+    assert store.load_chat_summary(new.identity.chat_id) is None
     assert frame.history_ids == ["mc-continued", "mc-local"]
 
-    reopened = main.ChatFrame()
+    assert {chat["chat_id"] for chat in frame._remote_api_history_list_ui()[1]["chats"]} == {"mc-continued", "mc-local"}
+    payload = {"collection_page": True, "limit": 1}
+    first = frame._remote_api_history_collection_worker(payload)[1]
+    assert [chat["chat_id"] for chat in first["chats"]] == ["mc-continued"]
+    second = frame._remote_api_history_collection_worker({**payload, "cursor": first["next_cursor"]})[1]
+    assert [chat["chat_id"] for chat in second["chats"]] == ["mc-local"]
+    assert not second["has_more"]
+    legacy_target = {"chat_id": imported_id, "model": main.DEFAULT_CODEX_MODEL}
+    assert frame._remote_api_history_read_ui(legacy_target)[0] == 404
+    assert frame._remote_api_state_ui(legacy_target)[0] == 404
+    assert frame._remote_api_message_ui({**legacy_target, "text": "stale RC question"})[0] == 404
+    assert frame._remote_api_new_chat_ui(legacy_target)[0] == 409
+    assert frame._remote_api_new_chat({**legacy_target, "model": "agy/main"})[0] == 409
+    assert not frame._remote_attachment_scope({**legacy_target, "_attachment_source": ("default", "rc")}, "send-id")
+    assert frame._remote_api_execution_page_ui(legacy_target, secret="isolated")[0] == 404
+    transport = RemoteNatsTransport(pair_id="default", token="isolated", durable_store=store)
+    for kind in ("content_page", "execution_tail", "mark_chat_read"):
+        assert transport._route_command({**legacy_target, "type": kind})[0] == 404
+    assert store.load_chat_summary(imported_id) == imported_before
+    assert store.load_turns(imported_id) == terminal_turns_before
+    frame.active_chat_id = frame.current_chat_id = "mc-local"
+    frame._current_chat_state = {**store.load_chat_summary("mc-local"), "title": "live local title"}
+    frame._invalidate_remote_history_list_cache()
+    legacy_rows = frame._remote_api_history_list_ui()[1]["chats"]
+    assert [row["chat_id"] for row in legacy_rows].count("mc-local") == 1
+    assert legacy_rows[0]["title"] == "live local title"
+    frame.active_chat_id = frame.current_chat_id = ""
+    frame._current_chat_state = {}
+    frame._save_state()
+    assert "hide_terminal_chats" not in frame.state_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(frame, "_confirm", lambda *_: True)
+    frame._history_clear_non_pinned(None)
+    assert frame.history_ids == []
+    assert store.load_chat_summary(imported_id)["pinned"]
+
+
+def test_delayed_state_save_only_upserts_changed_owners(frame, wx_app, monkeypatch, wait_for_wx_main_loop):
+    store = frame.chat_store
+    with store._connect() as conn:
+        for index in range(1435):
+            store._upsert_chat_conn(conn, {"id": f"archive-{index}", "title": f"archive {index}",
+                                           "updated_at": index})
+    frame.archived_chats = store.list_chat_summaries(mc_owned_only=True)
+    frame.Show()
+    frame._refresh_history()
+    frame.history_list.SetSelection(0)
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    unchanged = {row["id"] for row in frame.archived_chats}
+    changed = {"archive-0", "archive-1"}
+    writes = []
+    real_upsert = store.upsert_chat
+    monkeypatch.setattr(store, "upsert_chat", lambda row: (writes.append(row["id"]), real_upsert(row))[1])
+
+    frame._on_new_chat_clicked(None)
+    assert not unchanged.intersection(writes)
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    callbacks = []
+    key_enqueued_at = []
+    key_delay = []
+    frame.history_list.Bind(main.wx.EVT_KEY_DOWN,
+        lambda event: (callbacks.append("keyboard"), key_delay.append(time.perf_counter() - key_enqueued_at[0]),
+                       event.Skip()))
+    for owner in changed:
+        row = frame._find_archived_chat(owner)
+        row["title"] = f"updated {owner}"
+        frame._mark_chat_metadata_dirty(row)
+    save = frame._save_state
+    def observe_save(*args, **kwargs):
+        key_enqueued_at.append(time.perf_counter())
+        main.wx.CallAfter(_send_listbox_key, frame.history_list, main.wx.WXK_DOWN)
+        result = save(*args, **kwargs)
+        callbacks.append("saved")
+        return result
+    monkeypatch.setattr(frame, "_save_state", observe_save)
+    main.wx.CallAfter(frame._defer_chat_state_save)
+    wait_for_wx_main_loop(lambda: "keyboard" in callbacks, "300 ms history save and following wx callback")
+    assert changed == unchanged.intersection(writes)
+    assert callbacks[:2] == ["saved", "keyboard"]
+    assert key_delay[0] < .25
+    fresh = type(store)(store.db_path)
+    assert {owner: fresh.load_chat_summary(owner)["title"] for owner in changed} == {
+        owner: f"updated {owner}" for owner in changed}
+
+
+def test_repeated_long_answer_render_keeps_selection_and_skips_conversion(frame, monkeypatch):
+    source = "## Heading\n\n" + ("**important** [file](D:/example/source.py)\n" * 650)
+    frame.active_session_turns = [{"model": main.DEFAULT_CODEX_MODEL, "question": f"question {index}",
+        "answer_md": f"{source}\nitem {index}", "request_status": "done"} for index in range(12)]
+    convert = main.md_to_plain
+    conversions = []
+    monkeypatch.setattr(main, "md_to_plain", lambda text: (conversions.append(text), convert(text))[1])
+    frame._render_answer_list()
+    assert len(conversions) == 12
+    frame.answer_list.SetSelection(frame.answer_list.GetCount() - 1)
+    selected = frame.answer_list_model.selected_id()
+    frame._render_answer_list()
+    assert len(conversions) == 12
+    assert frame.answer_list_model.selected_id() == selected
+    assert frame.answer_meta[frame.answer_list.GetSelection()][3] == frame.active_session_turns[-1]["answer_md"]
+    frame.codex_answer_english_filter_enabled = not frame.codex_answer_english_filter_enabled
+    frame._render_answer_list()
+    assert len(conversions) == 24
+    conversions.clear()
+    monkeypatch.setattr(main, "md_to_plain", lambda text: conversions.append(text) or text)
+    frame.active_session_turns = [{"model": main.DEFAULT_CODEX_MODEL, "answer_md": f"answer {index}",
+                                   "request_status": "done"} for index in range(300)]
+    frame.answer_visible_row_limit = 300
+    frame._render_answer_list()
+    frame._render_answer_list()
+    assert len(conversions) == 300
+    frame.active_chat_id = "another-preview-owner"
+    frame.active_session_turns = []
+    frame._render_answer_list()
+    assert len(frame._answer_preview_cache) == 0
+    assert frame._answer_preview_cache_limit == 256
+
+
+@pytest.mark.parametrize("codex", [False, True])
+def test_delayed_state_save_retries_sqlite_busy_after_servicing_keyboard(
+        frame, monkeypatch, wait_for_wx_main_loop, codex):
+    import sqlite3
+
+    owner = frame.active_chat_id = frame.current_chat_id = "busy-delayed-save"
+    frame._current_chat_state = {"id": owner, "title": "before lock"}
+    frame._save_state()
+    frame._current_chat_state["title"] = "after lock"
+    frame.Show()
+    frame._refresh_history()
+    keyboard = []
+    frame.history_list.Bind(main.wx.EVT_KEY_DOWN,
+        lambda event: (keyboard.append(time.perf_counter()), event.Skip()))
+    if codex:
+        frame._codex_background_flush_dirty = True
+        flush = frame._flush_codex_background_updates
+    else:
+        frame._chat_state_flush_dirty = True
+        flush = frame._flush_chat_state_save
+
+    connection = sqlite3.connect(frame.chat_store.db_path)
     try:
-        assert filter_item(reopened.GetMenuBar().GetMenu(0)).IsChecked()
-        assert reopened.history_ids == ["mc-continued", "mc-local"]
+        connection.execute("BEGIN IMMEDIATE")
+        started = time.perf_counter()
+        main.wx.CallAfter(flush)
+        main.wx.CallAfter(_send_listbox_key, frame.history_list, main.wx.WXK_DOWN)
+        wait_for_wx_main_loop(lambda: bool(keyboard), "native key before releasing the SQLite write lock", timeout=1)
+        assert keyboard[0] - started < .25
+        assert frame.chat_store.load_chat_summary(owner)["title"] == "before lock"
     finally:
-        reopened._stop_native_history_refresh()
-        reopened.Destroy()
+        connection.rollback()
+        connection.close()
+    wait_for_wx_main_loop(lambda: frame.chat_store.load_chat_summary(owner)["title"] == "after lock",
+                          "automatically retried SQLite save")
 
-    def popup(menu, *_args):
-        item = filter_item(menu)
-        assert item.IsChecked()
-        activate(item, frame)
 
-    monkeypatch.setattr(frame, "PopupMenu", popup)
-    frame._show_tools_menu()
-    assert not filter_item(app_menu).IsChecked()
-    assert frame.history_ids == [imported_id, new_id, "mc-continued", "mc-local"]
+def test_answer_read_sqlite_writer_lock_leaves_wx_keyboard_available(frame, wx_app, wait_for_wx):
+    import sqlite3
+
+    owner = frame.active_chat_id = frame.current_chat_id = "read-lock-owner"
+    frame._current_chat_state = {"id": owner, "title": "Read lock"}
+    frame.active_session_turns = [{"question": "question", "answer_md": "answer", "request_status": "done"}]
+    frame._persist_chat_history_to_store()
+    frame.Show()
+    frame._refresh_history()
+    frame._render_answer_list()
+    target = next(target for index in range(len(frame.answer_meta)) if (target := frame._selected_read_target(index)))
+    frame.history_list.SetFocusFromKbd()
+    wx_app.Yield()
+    focus_before = _focused_control()
+    keyboard = []
+    frame.history_list.Bind(main.wx.EVT_KEY_DOWN, lambda event: (keyboard.append(event.GetKeyCode()), event.Skip()))
+    database = sqlite3.connect(frame.chat_store.db_path)
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        frame._confirm_answer_read(target)
+        main.wx.CallAfter(_send_listbox_key, frame.history_list, main.wx.WXK_DOWN)
+        wait_for_wx(lambda: bool(keyboard), "native key before release of the SQLite write lock")
+        assert _focused_control() is focus_before
+        assert frame._answer_read_writer_running
+        assert frame.chat_store.get_chat_read_state(owner)["read_seq"] == 0
+    finally:
+        database.rollback()
+        database.close()
+    wait_for_wx(lambda: not frame._answer_read_writer_running and
+        frame.chat_store.get_chat_read_state(owner)["read_seq"] == target["answer_seq"], "persisted answer read")
 
 
 def test_ui_automation_history_enter_can_return_to_empty_new_chat(frame):

@@ -226,6 +226,8 @@ def test_codex_native_deletion_is_proven_in_original_store(codex_homes, frame, w
     ordinary, private, work, _, _, native = codex_homes
     thread_id = native(ordinary, work, "Owned synthetic deletion fixture")
     retained = native(private, work, "Separate synthetic store")
+    frame.chat_store.upsert_chat({"id": "mc-codex-delete", "model": "codex/gpt-5.4-medium",
+                                  "codex_thread_id": thread_id, "codex_storage_id": os.path.normcase(str(ordinary))})
     lookup = CodexAppServerClient(native_home=ordinary, use_native_config=True)
     other = CodexAppServerClient(native_home=private, use_native_config=True)
     try:
@@ -247,6 +249,7 @@ def test_codex_native_deletion_is_proven_in_original_store(codex_homes, frame, w
 @pytest.mark.skipif(os.getenv("MC_KIMI_RUNTIME_TEST") != "1", reason="requires an isolated Kimi runtime")
 def test_kimi_native_deletion_is_proven_by_server_readback(loopback_kimi_home, frame, wait_for_wx):
     from kimi_server_client import KimiServerClient
+    from kimi_history import kimi_history_storage
 
     workspace, _ = loopback_kimi_home
     lookup = KimiServerClient()
@@ -254,6 +257,8 @@ def test_kimi_native_deletion_is_proven_by_server_readback(loopback_kimi_home, f
         lookup.start(timeout=10)
         sid = lookup.create_session(cwd=str(workspace))
         lookup.close()
+        frame.chat_store.upsert_chat({"id": "mc-kimi-delete", "model": "kimi/main",
+                                      "kimi_session_id": sid, "kimi_storage_id": kimi_history_storage()})
 
         def owner():
             frame._remote_api_history_list_ui()

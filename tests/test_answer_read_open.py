@@ -34,6 +34,7 @@ def test_hotkey_empty_or_failed_navigation_never_confirms(monkeypatch):
         confirmations = []
         frame = SimpleNamespace(
             history_ids=["a"], _restore_or_raise=lambda: None,
+            _unread_history_ids=lambda ids: set(ids),
             _visible_answer_owner_chat_id=lambda: "a",
             _chat_read_state=lambda _: {"generation": "g", "latest_readable_seq": 7, "read_seq": 0},
             _show_history_chat=lambda *_, **__: opened,
@@ -56,6 +57,7 @@ def test_hotkey_real_tail_focus_keeps_frozen_cap_when_new_answer_arrives(monkeyp
         return True
     frame = SimpleNamespace(
         history_ids=["a"], _restore_or_raise=lambda: None,
+        _unread_history_ids=lambda ids: set(ids),
         _visible_answer_owner_chat_id=lambda: "a",
         _chat_read_state=lambda _: dict(state), _show_history_chat=hydrate,
         _apply_detail_panel_mode=lambda _: None,
@@ -110,6 +112,7 @@ def test_hotkey_reverse_completion_uses_max_visible_canonical_seq_after_real_bas
         store.mark_chat_read(pair_id="default", chat_id="a", operation_id="test", **target)
     frame = SimpleNamespace(
         history_ids=["a"], _restore_or_raise=lambda: None,
+        _unread_history_ids=lambda ids: set(ids),
         _visible_answer_owner_chat_id=lambda: "a",
         _chat_read_state=lambda _: store.get_chat_read_state("a"),
         _show_history_chat=lambda *_, **__: True, _apply_detail_panel_mode=lambda _: None,
@@ -155,6 +158,7 @@ def test_displayed_completion_before_save_freezes_only_that_turn(tmp_path):
         _get_view_turns=lambda: turns, _chat_read_state=lambda owner: store.get_chat_read_state(owner),
         _read_pair_id=lambda: "p", _on_chat_read_changed=lambda _: None,
         SetStatusText=lambda _: None, _defer_chat_state_save=lambda: None)
+    frame._queue_answer_read_write = lambda target: main.ChatFrame._commit_answer_read(store, "test", target)
     frame._confirm_answer_read = lambda target: main.ChatFrame._confirm_answer_read(frame, target)
     target = main.ChatFrame._selected_read_target(frame)
     assert target["frozen_turn"] == original
@@ -184,6 +188,7 @@ def test_read_second_unsaved_turn_keeps_pagination_contiguous(tmp_path):
         SetStatusText=lambda _: None, _defer_chat_state_save=lambda: None,
         _chat_turn_dirty_from={"a": 1}, _call_after_if_alive=lambda *_: None,
         _refresh_chat_read_row=lambda *_: None)
+    frame._queue_answer_read_write = lambda target: main.ChatFrame._commit_answer_read(store, "test", target)
     frame._confirm_answer_read = lambda target: main.ChatFrame._confirm_answer_read(frame, target)
     frame._flush_pending_answer_reads = lambda owner: main.ChatFrame._flush_pending_answer_reads(frame, owner)
     frame._confirm_answer_read(main.ChatFrame._selected_read_target(frame))
@@ -231,6 +236,7 @@ def test_frozen_read_callback_after_normal_save_confirms_immediately(tmp_path):
     store.replace_turns("a", [turn])
     frame = SimpleNamespace(chat_store=store, _read_pair_id=lambda: "p",
         _on_chat_read_changed=lambda _: None, SetStatusText=lambda _: None)
+    frame._queue_answer_read_write = lambda target: main.ChatFrame._commit_answer_read(store, "test", target)
     main.ChatFrame._confirm_answer_read(frame, target)
     state = store.get_chat_read_state("a", pair_id="p")
     assert state["read_seq"] == state["latest_readable_seq"] > 0

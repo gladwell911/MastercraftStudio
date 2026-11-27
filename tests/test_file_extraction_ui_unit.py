@@ -54,7 +54,7 @@ def test_extracted_file_menu_contains_add_and_send(frame, monkeypatch):
     assert [label for label, _item_id in captured["items"]] == ["添加到文件管理", "发送到手机"]
 
 
-def test_add_selected_extracted_file_to_manager(frame, tmp_path, monkeypatch):
+def test_add_selected_extracted_file_to_manager(frame, tmp_path, monkeypatch, wait_for_wx):
     source = tmp_path / "123.txt"
     source.write_text("payload", encoding="utf-8")
     _set_answer_with_file(frame, str(source))
@@ -64,12 +64,13 @@ def test_add_selected_extracted_file_to_manager(frame, tmp_path, monkeypatch):
 
     assert frame._add_selected_extracted_file_to_manager() is True
 
+    wait_for_wx(lambda: bool(frame.file_library.list_records()), "added file")
     records = frame.file_library.list_records()
     assert len(records) == 1
     assert records[0].name == "123.txt"
 
 
-def test_send_selected_extracted_file_to_phone_publishes_offer(frame, tmp_path, monkeypatch):
+def test_send_selected_extracted_file_to_phone_publishes_offer(frame, tmp_path, monkeypatch, wait_for_wx):
     source = tmp_path / "send-extracted.txt"
     source.write_text("payload", encoding="utf-8")
     _set_answer_with_file(frame, str(source))
@@ -80,6 +81,7 @@ def test_send_selected_extracted_file_to_phone_publishes_offer(frame, tmp_path, 
     frame.extracted_file_list.SetSelection(0)
 
     assert frame._send_selected_extracted_file_to_phone() is True
+    wait_for_wx(lambda: len(published) == 1, "extracted file offer")
     assert len(published) == 1
     assert published[0]["type"] == "file_offer"
     assert published[0]["body"]["name"] == "send-extracted.txt"
@@ -146,7 +148,8 @@ def test_windows_application_key_on_extracted_file_list_shows_menu(frame, monkey
     assert seen["shown"] == 1
 
 
-def test_send_selected_extracted_file_to_phone_marks_waiting_confirmation(frame, tmp_path, monkeypatch):
+def test_send_selected_extracted_file_to_phone_marks_waiting_confirmation(frame, tmp_path, monkeypatch, wait_for_wx):
+    from file_transfer import FileTransferStatus
     source = tmp_path / "waiting-extracted.txt"
     source.write_text("payload", encoding="utf-8")
     _set_answer_with_file(frame, str(source))
@@ -157,6 +160,8 @@ def test_send_selected_extracted_file_to_phone_marks_waiting_confirmation(frame,
 
     assert frame._send_selected_extracted_file_to_phone() is True
 
+    wait_for_wx(lambda: any(record.status == FileTransferStatus.WAITING_CONFIRMATION
+        for record in frame.file_library.list_records()), "extracted file waiting for confirmation")
     records = frame.file_library.list_records()
     assert len(records) == 1
     assert records[0].status.value == "waiting_confirmation"

@@ -2347,8 +2347,9 @@ class ExecutionPageMixin:
                 self._current_chat_state["execution_steps"] = []
         else:
             viewed_chat = self._find_archived_chat(self.view_history_id)
-            if isinstance(viewed_chat, dict):
+            if isinstance(viewed_chat, dict) and viewed_chat.get("detail_panel_mode") != normalized:
                 viewed_chat["detail_panel_mode"] = normalized
+                self._mark_chat_metadata_dirty(viewed_chat)
         show_answers = normalized != "execution"
         show_execution = normalized == "execution"
         if not refresh_execution and previous_mode == normalized and not bool(getattr(self, "_execution_list_dirty", False)):

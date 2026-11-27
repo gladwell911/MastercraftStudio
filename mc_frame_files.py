@@ -80,34 +80,42 @@ class FileManagerMixin:
             return False
         return self._publish_file_offer_for_record(record)
 
-    def _publish_file_offer_for_record(self, record) -> bool:
-        offer = self._file_offer_for_record(record)
-        download_url = str(offer.get("body", {}).get("download_url") or "").strip()
-        if not download_url:
-            error = str(offer.get("body", {}).get("error") or "文件下载地址不可用").strip()
-            self.file_library.update_record_status(
-                record.id,
-                FileTransferStatus.FAILED,
-                error_message=error,
-            )
-            self._refresh_file_manager_if_visible(selected_id=record.id)
-            self.SetStatusText(error)
+    def _publish_file_offer_for_record(self, record, *, chat_id=None) -> bool:
+        if getattr(self, "_closing", False):
             return False
-        self._last_file_offer_event = offer
-        self._broadcast_remote_event(offer)
-        self._mark_file_offer_waiting(record.id)
-        self.SetStatusText(f"已创建文件发送请求：{record.name}")
+        chat_id = str(self.active_chat_id or "") if chat_id is None else chat_id
+        selection = self.file_manager_list_model.selected_id()
+
+        self._desktop_file_executor.submit(self._prepare_file_offer, record, chat_id, selection)
         return True
 
-    def _mark_file_offer_waiting(self, record_id: str) -> None:
-        record = self.file_library.update_record_status(
-            record_id,
-            FileTransferStatus.WAITING_CONFIRMATION,
-            transferred_bytes=0,
-            speed_bytes_per_second=0,
-        )
-        if record is not None:
-            self._refresh_file_manager_if_visible(selected_id=record.id)
+    def _prepare_file_offer(self, record, chat_id, selection) -> None:
+        try:
+            offer = self._file_offer_for_record(record, chat_id=chat_id)
+            download_url = str(offer.get("body", {}).get("download_url") or "").strip()
+            if not download_url:
+                message = str(offer.get("body", {}).get("error") or "文件下载地址不可用").strip()
+                failed = self.file_library.update_record_status(
+                    record.id, FileTransferStatus.FAILED, error_message=message)
+                if failed is None or failed.status != FileTransferStatus.FAILED:
+                    return
+            else:
+                waiting = self.file_library.update_record_status(record.id, FileTransferStatus.WAITING_CONFIRMATION,
+                                                                 transferred_bytes=0, speed_bytes_per_second=0)
+                if waiting is None or waiting.status != FileTransferStatus.WAITING_CONFIRMATION:
+                    return
+                self._last_file_offer_event = offer
+                self._broadcast_remote_event(offer)
+                message = f"已创建文件发送请求：{record.name}"
+        except Exception as exc:
+            message = f"发送到手机失败：{exc}"
+        self._call_after_if_alive(self._finish_file_offer, record, selection, message)
+
+    def _finish_file_offer(self, record, selection, message) -> None:
+        if not getattr(self, "_closing", False) and self.file_library.get_record(record.id) is not None:
+            selected_id = record.id if self.file_manager_list_model.selected_id() == selection else None
+            self._refresh_file_manager_if_visible(selected_id=selected_id)
+            self.SetStatusText(message)
 
     def _file_offer_for_record(self, record, *, public_route_ready=None, chat_id=None) -> dict:
         if public_route_ready is None:
@@ -639,7 +647,7 @@ class FileManagerMixin:
         try:
             service.start()
         except Exception as exc:
-            self.SetStatusText(f"copyparty 文件服务启动失败：{exc}")
+            self._set_status_text_safe(f"copyparty 文件服务启动失败：{exc}")
             return False
         self.file_http_base_url = service.base_url
         return True
@@ -649,11 +657,47 @@ class FileManagerMixin:
         try:
             if dlg.ShowModal() != wx.ID_OK:
                 return False
-            record = self.file_library.add_local_file(Path(dlg.GetPath()))
+            path = Path(dlg.GetPath())
         finally:
             dlg.Destroy()
-        self._refresh_file_manager_list(selected_id=record.id)
+        return self._copy_file_to_manager(path)
+
+    def _copy_file_to_manager(self, path, *, from_answer=False, send=False) -> bool:
+        if getattr(self, "_closing", False):
+            return False
+        library = self.file_library
+        chat_id = str(self.active_chat_id or "")
+        selection = self.file_manager_list_model.selected_id()
+
+        def copy_file():
+            prepared = None
+            try:
+                prepared = library.prepare_local_file(path, deadline=float("inf"))
+                record = library.commit_prepared_file(prepared, deadline=float("inf"), direction=FileDirection.LOCAL)
+            except Exception as exc:
+                action = "发送到手机" if send else "添加到文件管理"
+                self._call_after_if_alive(self.SetStatusText, f"{action}失败：{exc}")
+            else:
+                if send:
+                    self._prepare_file_offer(record, chat_id, selection)
+                else:
+                    self._call_after_if_alive(self._finish_file_manager_copy, record, path, from_answer, selection)
+            finally:
+                if prepared is not None:
+                    prepared[0].unlink(missing_ok=True)
+
+        self._desktop_file_executor.submit(copy_file)
         return True
+
+    def _finish_file_manager_copy(self, record, path, from_answer, selection) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if (from_answer and self.extracted_file_list.HasFocus()
+                and Path(self._selected_extracted_file_path() or "") == path):
+            self._show_file_manager()
+        selected_id = record.id if self.file_manager_list_model.selected_id() == selection else None
+        self._refresh_file_manager_if_visible(selected_id=selected_id)
+        self.SetStatusText(f"已添加文件：{record.name}")
 
     def _show_file_manager_menu(self) -> None:
         menu = wx.Menu()
@@ -709,27 +753,11 @@ class FileManagerMixin:
 
     def _add_selected_extracted_file_to_manager(self) -> bool:
         path = self._selected_extracted_file_path()
-        if not path:
-            return False
-        try:
-            record = self.file_library.add_local_file(Path(path))
-        except Exception as exc:
-            self.SetStatusText(f"添加到文件管理失败：{exc}")
-            return False
-        self._show_file_manager()
-        self._refresh_file_manager_list(selected_id=record.id)
-        return True
+        return bool(path) and self._copy_file_to_manager(Path(path), from_answer=True)
 
     def _send_selected_extracted_file_to_phone(self) -> bool:
         path = self._selected_extracted_file_path()
-        if not path:
-            return False
-        try:
-            record = self.file_library.add_local_file(Path(path))
-        except Exception as exc:
-            self.SetStatusText(f"发送到手机失败：{exc}")
-            return False
-        return self._publish_file_offer_for_record(record)
+        return bool(path) and self._copy_file_to_manager(Path(path), send=True)
 
     def _show_extracted_file_menu(self) -> None:
         menu = wx.Menu()

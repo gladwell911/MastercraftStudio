@@ -1964,6 +1964,7 @@ class KimiEventsMixin:
             target_chat.pop("kimi_interaction_error", None)
         if is_current and (error or previous != current or not current):
             self.SetStatusText(current or status)
+        self._mark_chat_metadata_dirty(target_chat)
         self._defer_codex_state_save()
 
     def _prune_kimi_interaction_errors(self, chat: dict) -> None:

@@ -22,6 +22,7 @@ from kimi_server_client import KimiServerClient, KimiServerError
 from native_history import (
     NATIVE_CHAT_FIELDS, TITLE_FIELDS, NativeDeletionRejected, NativeSessionIdentity, NativeTitleRejected,
 )
+from chat_store import is_mc_owned_chat
 
 
 _LOG = logging.getLogger(__name__)
@@ -203,7 +204,8 @@ class NativeHistoryMixin:
 
     def _native_history_discoverers(self):
         for home, private in codex_history_homes():
-            reader = CodexHistoryReader(home, private, self._read_pair_id(), self.chat_store.list_chat_summaries)
+            reader = CodexHistoryReader(home, private, self._read_pair_id(),
+                                        lambda: self.chat_store.list_chat_summaries(mc_owned_only=True))
             yield reader.list_sessions, reader.read_session
 
         executable = find_agy_executable()
@@ -433,6 +435,8 @@ class NativeHistoryMixin:
             return 409, {}
         chat = (self._current_chat_state if chat_id == self.active_chat_id
                 else self._chat_summary_by_id(chat_id)) or {}
+        if not is_mc_owned_chat(chat_id, chat):
+            return 409, {}
         if ((chat.get("codex_turn_active") and chat_id in getattr(self, "_codex_clients", {}))
                 or chat.get("kimi_turn_active")):
             return 409, {}
@@ -453,6 +457,13 @@ class NativeHistoryMixin:
         return 200, authority
 
     def _scan_native_history(self, discoverers) -> None:
+        try:
+            identities, session_ids = self.chat_store.mc_native_history_candidates()
+        except (sqlite3.Error, OSError) as exc:
+            _LOG.info("Native session discovery deferred (%s)", type(exc).__name__)
+            return
+        if not identities and not any(session_ids.values()):
+            return
         for list_sessions, read_session in discoverers:
             if getattr(self, "_closing", False):
                 return
@@ -464,7 +475,11 @@ class NativeHistoryMixin:
                     if session.identity in seen:
                         continue
                     seen.add(session.identity)
-                    owner, replayed_at = self.chat_store.native_history_target(session)
+                    identity = session.identity
+                    if (identity.session_id not in session_ids.get(identity.provider, ())
+                            and (not identities or identity.chat_id not in identities)):
+                        continue
+                    owner, replayed_at = self.chat_store.native_history_target(session, mc_owned_only=True)
                     if not owner:
                         continue
                     status, authority = self._run_remote_ui_route(
@@ -487,7 +502,7 @@ class NativeHistoryMixin:
                         changed = self.chat_store.merge_native_history(
                             session, expected_chat_id=owner, expected_revision=revision,
                             merge_title=owner not in self._native_title_pending,
-                            observed_between=observed_between)
+                            observed_between=observed_between, mc_owned_only=True)
                         if changed is not None and session.turns:
                             turns = self.chat_store.load_turns(owner)
                     finally:
@@ -502,6 +517,8 @@ class NativeHistoryMixin:
         if changed is None:
             self._schedule_next_codex_tool_turn(owner)
             self._schedule_next_kimi_tool_turn(owner)
+            return 200, {}
+        if not is_mc_owned_chat(owner, changed):
             return 200, {}
         if self.chat_store.get_meta(f"deleted-chat:{owner}"):
             return 200, {}

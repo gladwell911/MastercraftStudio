@@ -745,6 +745,7 @@ class KimiSessionsMixin:
         self._refresh_kimi_information_for_session_change(chat)
         self._publish_kimi_information_session_change(chat)
         if persist:
+            self._mark_chat_metadata_dirty(chat)
             self._save_state()
         return "## Kimi Code 清理\n\n已清除当前聊天关联的 Kimi Code 会话状态。聊天记录不会被删除。"
 

@@ -114,7 +114,7 @@ def test_native_codex_discovers_home_qualified_history(codex_homes, frame, wait_
     ordinary, private, work, other_work, calls, native = codex_homes
     question = "Same terminal question"
     from winpty import PtyProcess
-    from codex_client import CodexAppServerClient
+    from codex_client import CodexAppServerClient, DEFAULT_CODEX_MODEL
 
     tui = PtyProcess.spawn([os.environ["MC_TEST_CODEX_NATIVE"], "--no-alt-screen", question], cwd=str(work),
                            env=dict(os.environ, CODEX_HOME=str(ordinary), TERM="xterm-256color"))
@@ -142,6 +142,9 @@ def test_native_codex_discovers_home_qualified_history(codex_homes, frame, wait_
     finally:
         lookup.close()
     private_id = native(private, other_work, question)
+    for owner, sid, home in (("mc-ordinary", ordinary_id, ordinary), ("mc-private", private_id, private)):
+        frame.chat_store.upsert_chat({"id": owner, "model": DEFAULT_CODEX_MODEL, "codex_thread_id": sid,
+                                      "codex_storage_id": os.path.normcase(str(home))})
     seed_calls = len(calls)
     remote = RemoteNatsTransport(pair_id="default", token="synthetic",
                                 on_history_list=frame._remote_api_history_list_ui,
@@ -223,6 +226,9 @@ def test_app_server_and_legacy_codex_history_keep_their_owner(codex_homes, frame
         assert ended.wait(12)
     finally:
         server.close()
+    frame.chat_store.upsert_chat({"id": "mc-app-server", "model": DEFAULT_CODEX_MODEL,
+                                  "codex_thread_id": app_server_id,
+                                  "codex_storage_id": os.path.normcase(str(ordinary))})
 
     def listing():
         return frame._remote_api_history_list_ui()[1]["chats"]

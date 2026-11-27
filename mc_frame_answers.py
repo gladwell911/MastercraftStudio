@@ -5,6 +5,7 @@ import markdown
 import re
 import uuid
 import wx
+from collections import OrderedDict
 from agy_acp import AGY_MODEL_ID
 from claudecode_client import is_claudecode_model
 from codex_client import is_codex_model
@@ -32,6 +33,7 @@ import mc_frame_bindings as bindings
 
 PARTIAL_ANSWER_TITLE = "部分回答（结果未知）"
 PARTIAL_ANSWER_LABEL = f"{PARTIAL_ANSWER_TITLE}，按 Enter 查看"
+ANSWER_PREVIEW_CACHE_SIZE = 256
 
 
 def _agy_partial_answer_text(turn: dict) -> str:
@@ -390,6 +392,19 @@ class AnswersMixin:
             if self.view_mode == "history"
             else str(self.active_chat_id or self.current_chat_id or (self._current_chat_state or {}).get("id") or "").strip()
         )
+        prior_owner = getattr(self, "_answer_preview_cache_owner", visible_chat_id)
+        self._answer_preview_cache_owner = visible_chat_id
+        cache = getattr(self, "_answer_preview_cache", None)
+        if prior_owner != visible_chat_id:
+            self._reset_answer_visible_row_limit()
+            if cache is not None:
+                cache.clear()
+        limit = max(ANSWER_LIST_DEFAULT_VISIBLE_ROWS, int(getattr(
+            self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0))
+        self._answer_preview_cache_limit = max(ANSWER_PREVIEW_CACHE_SIZE, limit)
+        if cache is not None:
+            while len(cache) > self._answer_preview_cache_limit:
+                cache.popitem(last=False)
         context_usage_label = self._answer_usage_header_label()
         if self._should_show_context_usage_row(context_usage_label, turns):
             self._append_context_usage_row(rows, metas)
@@ -412,10 +427,6 @@ class AnswersMixin:
             if mode == "execution" and refresh_execution:
                 self._render_execution_list()
             return
-        limit = max(
-            ANSWER_LIST_DEFAULT_VISIBLE_ROWS,
-            int(getattr(self, "answer_visible_row_limit", ANSWER_LIST_DEFAULT_VISIBLE_ROWS) or 0),
-        )
         message_keys = self._ordered_answer_message_keys(turns)
         visible_indexes = {index for index, _role in message_keys[-limit:]}
         force_has_more = len(message_keys) > limit
@@ -768,8 +779,18 @@ class AnswersMixin:
                 err = str((turn or {}).get("request_error") or "").strip()
                 return "", err or "上次未完成回答恢复失败，可手动继续"
             return "", ""
-        compact = compact_markdown_summary(self._answer_markdown_for_output(answer_md, model))
-        return answer_md, filter_answer_display_text(remove_emojis(bindings.app.md_to_plain(compact)))
+        cache = getattr(self, "_answer_preview_cache", None)
+        if cache is None:
+            cache = self._answer_preview_cache = OrderedDict()
+        key = (answer_md, model, self.codex_answer_english_filter_enabled)
+        if key not in cache:
+            compact = compact_markdown_summary(self._answer_markdown_for_output(answer_md, model))
+            cache[key] = filter_answer_display_text(remove_emojis(bindings.app.md_to_plain(compact)))
+            if len(cache) > getattr(self, "_answer_preview_cache_limit", ANSWER_PREVIEW_CACHE_SIZE):
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        return answer_md, cache[key]
 
     def _build_answer_detail_html(self, answer_md: str, model: str = "") -> str:
         a_html = markdown.markdown(answer_md, extensions=["extra", "fenced_code", "tables", "sane_lists"])

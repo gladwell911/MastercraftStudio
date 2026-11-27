@@ -135,7 +135,7 @@ def test_file_offer_for_selected_file_manager_record(frame, tmp_path, monkeypatc
     assert offer["body"]["download_url"] == "http://127.0.0.1:18080/offer.txt"
 
 
-def test_send_selected_file_to_phone_publishes_file_offer(frame, tmp_path, monkeypatch):
+def test_send_selected_file_to_phone_publishes_file_offer(frame, tmp_path, monkeypatch, wait_for_wx):
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "send.txt"
     source.write_text("payload", encoding="utf-8")
@@ -147,13 +147,15 @@ def test_send_selected_file_to_phone_publishes_file_offer(frame, tmp_path, monke
     frame.file_manager_list.SetSelection(frame.file_manager_ids.index(record.id))
 
     assert frame._send_selected_file_to_phone() is True
+    wait_for_wx(lambda: len(published) == 1 and
+        frame.file_library.get_record(record.id).status == FileTransferStatus.WAITING_CONFIRMATION, "file offer")
     assert len(published) == 1
     assert published[0]["type"] == "file_offer"
     assert published[0]["body"]["file_id"] == record.id
     assert frame.file_library.get_record(record.id).status == FileTransferStatus.WAITING_CONFIRMATION
 
 
-def test_send_selected_file_to_phone_repairs_public_file_route(frame, tmp_path, monkeypatch):
+def test_send_selected_file_to_phone_repairs_public_file_route(frame, tmp_path, monkeypatch, wait_for_wx):
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "123.txt"
     source.write_text("payload", encoding="utf-8")
@@ -172,8 +174,29 @@ def test_send_selected_file_to_phone_repairs_public_file_route(frame, tmp_path, 
     frame.file_manager_list.SetSelection(frame.file_manager_ids.index(record.id))
 
     assert frame._send_selected_file_to_phone() is True
+    wait_for_wx(lambda: frame.file_library.get_record(record.id).status == FileTransferStatus.WAITING_CONFIRMATION, "route repair")
     assert "proxy" in calls
     assert ("tunnel", 18080) in calls
+
+
+def test_send_selected_file_to_phone_preserves_immediate_acceptance(frame, tmp_path, monkeypatch, wait_for_wx):
+    monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
+    source = tmp_path / "immediate-accept.txt"
+    source.write_text("payload", encoding="utf-8")
+    record = frame.file_library.add_local_file(source)
+    frame._show_file_manager()
+    frame.file_manager_list.SetSelection(frame.file_manager_ids.index(record.id))
+
+    observed = []
+    def accept_at_publication(_offer):
+        observed.append(frame.file_library.get_record(record.id).status)
+        frame.file_library.update_record_status(record.id, FileTransferStatus.ACCEPTED)
+
+    monkeypatch.setattr(frame, "_broadcast_remote_event", accept_at_publication)
+    assert frame._send_selected_file_to_phone()
+    wait_for_wx(lambda: "已创建文件发送请求" in frame.GetStatusBar().GetStatusText(), "file offer completion")
+    assert observed == [FileTransferStatus.WAITING_CONFIRMATION]
+    assert frame.file_library.get_record(record.id).status == FileTransferStatus.ACCEPTED
 
 
 def test_file_offer_does_not_fall_back_to_local_file_url_when_public_route_unavailable(frame, tmp_path, monkeypatch):
@@ -190,7 +213,7 @@ def test_file_offer_does_not_fall_back_to_local_file_url_when_public_route_unava
     assert "公网文件通道不可用" in offer["body"]["error"]
 
 
-def test_send_selected_file_to_phone_fails_when_public_route_unavailable(frame, tmp_path, monkeypatch):
+def test_send_selected_file_to_phone_fails_when_public_route_unavailable(frame, tmp_path, monkeypatch, wait_for_wx):
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "123.txt"
     source.write_text("payload", encoding="utf-8")
@@ -203,14 +226,15 @@ def test_send_selected_file_to_phone_fails_when_public_route_unavailable(frame, 
     frame._show_file_manager()
     frame.file_manager_list.SetSelection(frame.file_manager_ids.index(record.id))
 
-    assert frame._send_selected_file_to_phone() is False
+    assert frame._send_selected_file_to_phone() is True
+    wait_for_wx(lambda: frame.file_library.get_record(record.id).status == FileTransferStatus.FAILED, "failed route")
     assert published == []
     updated = frame.file_library.get_record(record.id)
     assert updated.status == FileTransferStatus.FAILED
     assert "公网文件通道不可用" in updated.error_message
 
 
-def test_send_selected_extracted_file_to_phone_fails_when_public_route_unavailable(frame, tmp_path, monkeypatch):
+def test_send_selected_extracted_file_to_phone_fails_when_public_route_unavailable(frame, tmp_path, monkeypatch, wait_for_wx):
     monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
     source = tmp_path / "123.txt"
     source.write_text("payload", encoding="utf-8")
@@ -224,12 +248,141 @@ def test_send_selected_extracted_file_to_phone_fails_when_public_route_unavailab
     frame.extracted_file_list_model.replace_visible_page([(str(source), source.name)], selected_id=str(source))
     frame.extracted_file_ids = list(frame.extracted_file_list_model.visible_ids)
 
-    assert frame._send_selected_extracted_file_to_phone() is False
+    assert frame._send_selected_extracted_file_to_phone() is True
+    wait_for_wx(lambda: any(row.status == FileTransferStatus.FAILED for row in frame.file_library.list_records()), "failed extracted-file route")
     assert published == []
     records = frame.file_library.list_records()
     assert len(records) == 1
     assert records[0].status == FileTransferStatus.FAILED
     assert "公网文件通道不可用" in records[0].error_message
+
+
+@pytest.mark.parametrize("copy_then_send", [False, True])
+def test_file_offer_route_wait_keeps_selection_and_original_chat(
+        frame, tmp_path, monkeypatch, wait_for_wx, copy_then_send):
+    from threading import Event
+
+    monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
+    route_started, release = Event(), Event()
+    copying, release_copy = Event(), Event()
+    records = []
+    for name in ("first.txt", "second.txt"):
+        source = tmp_path / name
+        source.write_text(name, encoding="utf-8")
+        records.append(frame.file_library.add_local_file(source))
+    first, second = records
+    def wait_for_route():
+        route_started.set()
+        return release.wait(3)
+    monkeypatch.setattr(frame, "_ensure_public_file_route_ready", wait_for_route)
+    source = tmp_path / "extracted.txt"
+    source.write_text("extracted contents", encoding="utf-8")
+    prepare = frame.file_library.prepare_local_file
+    def wait_for_copy(path, *, deadline):
+        copying.set()
+        assert release_copy.wait(5)
+        return prepare(path, deadline=deadline)
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", wait_for_copy)
+    published = []
+    monkeypatch.setattr(frame, "_broadcast_remote_event", published.append)
+    frame.active_chat_id = "initial-chat"
+    frame._show_file_manager()
+    frame.file_manager_list.SetSelection(frame.file_manager_ids.index(first.id))
+    try:
+        if copy_then_send:
+            assert frame._copy_file_to_manager(source, send=True)
+            wait_for_wx(copying.is_set, "copy worker start")
+        else:
+            assert frame._send_selected_file_to_phone()
+            wait_for_wx(route_started.is_set, "route worker start")
+        keyboard = []
+        def navigate():
+            frame.active_chat_id = "other-chat"
+            frame.file_manager_list.SetSelection(frame.file_manager_ids.index(second.id))
+            keyboard.append("keyboard")
+        wx.CallAfter(navigate)
+        wait_for_wx(lambda: bool(keyboard), "keyboard callback with route held")
+        assert not published
+        release_copy.set()
+        wait_for_wx(route_started.is_set, "route worker started after copy")
+    finally:
+        release_copy.set()
+        release.set()
+    wait_for_wx(lambda: bool(published) and "已创建文件发送请求" in frame.GetStatusBar().GetStatusText(),
+                "published file offer")
+    assert published[0]["chat_id"] == "initial-chat"
+    assert frame.file_manager_list_model.selected_id() == second.id
+
+
+def test_file_dialog_returns_before_copy_finishes(frame, tmp_path, monkeypatch, wait_for_wx):
+    from threading import Event
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(frame.file_library, "storage_dir", tmp_path / "storage")
+    source = tmp_path / "copy.txt"
+    source.write_text("complete content", encoding="utf-8")
+    copying, release = Event(), Event()
+    prepare = frame.file_library.prepare_local_file
+    def wait_for_copy(path, *, deadline):
+        copying.set()
+        assert release.wait(3)
+        return prepare(path, deadline=deadline)
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", wait_for_copy)
+    monkeypatch.setattr(wx, "FileDialog", lambda *args, **kwargs: SimpleNamespace(
+        ShowModal=lambda: wx.ID_OK, GetPath=lambda: str(source), Destroy=lambda: None))
+    frame._show_file_manager()
+    try:
+        assert frame._add_file_to_manager_from_dialog()
+        wait_for_wx(copying.is_set, "file preparation")
+        keyboard = []
+        wx.CallAfter(keyboard.append, "keyboard")
+        wait_for_wx(lambda: bool(keyboard), "keyboard callback with copy held")
+        assert not frame.file_library.list_records()
+    finally:
+        release.set()
+    wait_for_wx(lambda: bool(frame.file_manager_ids), "file manager completion")
+    copied, = frame.file_library.list_records()
+    assert copied.stored_path.read_text(encoding="utf-8") == "complete content"
+    assert not list(copied.stored_path.parent.parent.glob(".mc-file-*"))
+
+
+def test_close_drains_prepared_desktop_copy_before_stopping_file_services(frame, tmp_path, monkeypatch, wait_for_wx):
+    from threading import Event
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(frame.file_library, "storage_dir", storage)
+    source = tmp_path / "accepted-copy.txt"
+    source.write_text("complete content", encoding="utf-8")
+    staged, release = Event(), Event()
+    prepare = frame.file_library.prepare_local_file
+
+    def prepare_and_hold(path, *, deadline):
+        result = prepare(path, deadline=deadline)
+        staged.set()
+        if not release.wait(5):
+            result[0].unlink(missing_ok=True)
+            raise TimeoutError("test copy gate")
+        return result
+
+    monkeypatch.setattr(frame.file_library, "prepare_local_file", prepare_and_hold)
+    stops = []
+    monkeypatch.setattr(frame.file_service, "stop", lambda: stops.append("file"))
+    monkeypatch.setattr(frame, "_stop_remote_servers", lambda: stops.append("proxy"))
+    try:
+        assert frame._copy_file_to_manager(source)
+        wait_for_wx(staged.is_set, "copy stage before close")
+        assert len(list(tmp_path.glob(".mc-file-*"))) == 1
+        frame.Close()
+        callback = []
+        wx.CallAfter(callback.append, True)
+        wait_for_wx(lambda: bool(callback), "wx callback while close drains file copy")
+        assert not frame._close_producers_done.is_set() and not stops
+    finally:
+        release.set()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "file copy and close complete")
+    assert (storage / source.name).read_text(encoding="utf-8") == "complete content"
+    assert not list(tmp_path.glob(".mc-file-*"))
+    assert set(stops) == {"file", "proxy"}
 
 
 def test_windows_application_key_on_file_manager_shows_menu(frame, monkeypatch):

@@ -309,6 +309,7 @@ class OpenClawSessionsMixin:
             self.SetStatusText("已同步 OpenClaw 主会话")
             if is_active_target and assistant_changed and had_prior_sync:
                 self._play_finish_sound()
+        self._mark_chat_metadata_dirty(target_chat)
         self._save_state()
 
     def _filter_openclaw_initial_sync_events(

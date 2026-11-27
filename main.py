@@ -22,6 +22,7 @@ import winsound
 import sys
 from dataclasses import dataclass
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -599,6 +600,7 @@ class ChatFrame(
         self.chat_uploads_dir.mkdir(parents=True, exist_ok=True)
         file_storage_dir = os.environ.get("DESKTOP_FILE_STORAGE_DIR", "").strip()
         self.file_library = DesktopFileLibrary(storage_dir=file_storage_dir) if file_storage_dir else DesktopFileLibrary()
+        self._desktop_file_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mc-desktop-file")
         self.file_service = CopypartyFileService(self.file_library)
         self.file_http_base_url = self.file_service.base_url
         self._cloudflared_origin_proxy = None
@@ -773,6 +775,10 @@ class ChatFrame(
         self._kimi_execution_buffer_index = {}
         self._kimi_rest_withdrawals = {}
         self._chat_turn_dirty_from: dict[str, int] = {}
+        self._chat_metadata_dirty_ids: set[str] = set()
+        self._pending_answer_read_writes = deque()
+        self._answer_read_writer_running = False
+        self._failed_answer_read_writes = {}
         self._remote_turn_payload_cache: dict[int, tuple[tuple, dict]] = {}
         self._context_usage_estimate_lock = threading.Lock()
         self._context_usage_estimate_keys: set[tuple[str, int]] = set()
@@ -859,7 +865,6 @@ class ChatFrame(
         self._realtime_call_settings_menu_id = wx.NewIdRef()
         self._load_chat_attachments_menu_id = wx.NewIdRef()
         self._codex_answer_filter_menu_id = wx.NewIdRef()
-        self._terminal_history_filter_menu_id = wx.NewIdRef()
         self._codex_sandbox_menu_id = wx.NewIdRef()
         self._codex_approval_policy_menu_id = wx.NewIdRef()
         self._notes_move_entry_up_id = wx.NewIdRef()
@@ -883,7 +888,6 @@ class ChatFrame(
         self._migrate_legacy_chat_json_if_needed()
         self.chat_store.recover_agy_handoffs()
         self._load_state()
-        self._terminal_history_filter_item.Check(self.hide_terminal_chats)
         self.notes_controller.restore_state(self._current_notes_state)
         if (str(getattr(self.notes_controller, "notes_view", "") or "") == "note_edit"
                 and self._notes_guard_embedded_edit_view(
@@ -935,7 +939,6 @@ class ChatFrame(
         app_menu.Append(int(self._load_chat_attachments_menu_id), "载入图片或文件")
         filter_item = app_menu.AppendCheckItem(int(self._codex_answer_filter_menu_id), "过滤英文内容")
         filter_item.Check(bool(getattr(self, "codex_answer_english_filter_enabled", False)))
-        self._terminal_history_filter_item = self._append_terminal_history_filter_item(app_menu)
         app_menu.Append(int(self._codex_sandbox_menu_id), "Codex 访问权限")
         app_menu.Append(int(self._codex_approval_policy_menu_id), "Codex 执行审批")
         self._tool_mode_menu = wx.Menu()
@@ -1134,7 +1137,6 @@ class ChatFrame(
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=int(self._realtime_call_settings_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=int(self._load_chat_attachments_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=int(self._codex_answer_filter_menu_id))
-        self.Bind(wx.EVT_MENU, self._toggle_terminal_history_filter, id=int(self._terminal_history_filter_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_sandbox(), id=int(self._codex_sandbox_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._show_codex_approval_policy(), id=int(self._codex_approval_policy_menu_id))
         self.Bind(wx.EVT_MENU, lambda _evt: self._notes_move_entry_up(), id=int(self._notes_move_entry_up_id))
@@ -1266,6 +1268,7 @@ class ChatFrame(
     def _record_chat_activity(self, chat: dict, observed_at: float) -> None:
         """Record an accepted message fact using the persisted history clock."""
         chat["updated_at"] = max(float(chat.get("updated_at") or 0.0), float(observed_at))
+        self._mark_chat_metadata_dirty(chat)
         self._upsert_history_row(str(chat.get("id") or ""), message_fact=True)
         self._defer_chat_state_save()
 
@@ -1410,7 +1413,7 @@ class ChatFrame(
     def _call_after_if_alive(self, func, *args, **kwargs) -> bool:
         lock = getattr(self, "_close_admission_lock", None)
         settlement = getattr(func, "__name__", "") in {
-            "_advance_close", "_finish_shortcut_clear", "_drain_kimi_execution_write_results",
+            "_advance_close", "_finish_shortcut_clear", "_finish_answer_read_write", "_drain_kimi_execution_write_results",
             "_drain_kimi_ui_events", "_drain_codex_ui_events", "_continue_kimi_thinking_sync",
         }
         if lock is None or settlement or threading.current_thread() is threading.main_thread():
@@ -1516,7 +1519,6 @@ class ChatFrame(
             close_tasks.append(service.stop)
         # Notes close detaches network I/O and waits for locally accepted writes.
         notes_close = close_tasks.pop(len(clients))
-        tunnel_process = getattr(self, "_managed_cloudflared_process", None)
         nats_process = getattr(getattr(self, "_remote_nats_process", None), "_process", None)
 
         def close_task(task):
@@ -1532,6 +1534,8 @@ class ChatFrame(
             # the live Kimi client. Drain them off wx before stopping clients
             # or fencing callbacks from accepted producers.
             self._native_rename_executor.shutdown(wait=True)
+            self._desktop_file_executor.shutdown(wait=True)
+            tunnel_process = getattr(self, "_managed_cloudflared_process", None)
             deadline = time.monotonic() + 3.0
             workers = [threading.Thread(target=close_task, args=(task,), daemon=True) for task in close_tasks]
             for worker in workers:
@@ -1582,8 +1586,10 @@ class ChatFrame(
             execution_pending = (self._execution_step_persist_worker_running
                                  or bool(self._pending_execution_step_persists))
         with self._close_admission_lock:
-            background_pending = self._accepted_background_callbacks or self._agy_terminal_writes
-        pending = (background_pending or execution_pending or getattr(self, "_pending_kimi_ui_events", None)
+            background_pending = (self._accepted_background_callbacks or self._agy_terminal_writes
+                                  or self._answer_read_writer_running)
+        pending = (background_pending or execution_pending
+                   or getattr(self, "_pending_kimi_ui_events", None)
                    or getattr(self, "_pending_codex_ui_events", None)
                    or getattr(self, "_kimi_execution_write_counts", None)
                    or getattr(self, "_kimi_thinking_sync_counts", None)

@@ -35,7 +35,6 @@ class ChatNavigationMixin:
         self._append_tool_modes(menu, mode_ids)
         filter_item = menu.AppendCheckItem(filter_id, "过滤英文内容")
         filter_item.Check(bool(self.codex_answer_english_filter_enabled))
-        self._append_terminal_history_filter_item(menu)
         self.Bind(wx.EVT_MENU, self._on_open_realtime_call_settings, id=voice_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._load_chat_attachments_via_dialog(), id=attach_id)
         self.Bind(wx.EVT_MENU, lambda _evt: self._toggle_codex_answer_filter(), id=filter_id)
@@ -758,7 +757,10 @@ class ChatNavigationMixin:
         if current in candidates:
             candidates.remove(current)
             candidates.insert(0, current)
+        unread = self._unread_history_ids(candidates)
         for owner in candidates:
+            if owner not in unread:
+                continue
             chosen = self._chat_read_state(owner)
             if not chosen or chosen["latest_readable_seq"] <= chosen["read_seq"]:
                 continue

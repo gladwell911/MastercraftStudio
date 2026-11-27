@@ -9,7 +9,9 @@ import sqlite3
 import sys
 import uuid
 import wx
+from contextlib import nullcontext
 from agy_acp import AGY_CHAT_FIELDS, AGY_MODEL_ID
+from chat_store import is_mc_owned_chat
 from native_history import CODEX_STORAGE_FIELDS, NATIVE_CHAT_FIELDS, allows_final_notification
 from codex_client import (
     DEFAULT_CODEX_APPROVAL_MODE,
@@ -238,10 +240,13 @@ class ChatHistoryMixin:
         # Rewriting them on every UI-thread state save stalls keyboard response
         # once a command-heavy turn has hundreds of steps.
         pending_clear = getattr(self, "_shortcut_clear_pending", {})
+        archived = self._dirty_archived_chats()
         if self.active_chat_id or self.current_chat_id or self.active_session_turns:
             active = self._slim_active_chat_state() if active_snapshot is None else active_snapshot
             active_id = str(active.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-            if active_id and active_id not in pending_clear and not self._agy_terminal_write_rejected(active_id):
+            just_archived = not self.active_chat_id and any(row["id"] == active_id for row in archived)
+            if (is_mc_owned_chat(active_id, active) and not just_archived
+                    and active_id not in pending_clear and not self._agy_terminal_write_rejected(active_id)):
                 active["id"] = active_id
                 active["turns"] = self.active_session_turns if isinstance(self.active_session_turns, list) else []
                 state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
@@ -250,35 +255,56 @@ class ChatHistoryMixin:
                 store.upsert_chat(active)
                 self._persist_dirty_chat_turns(store, active_id, active["turns"])
                 self._persist_initial_execution_steps_if_needed(store, active_id, active_steps)
-        for chat in self.archived_chats:
-            if not isinstance(chat, dict):
-                continue
-            chat_id = str(chat.get("id") or "").strip()
-            if not chat_id or chat_id in pending_clear or self._agy_terminal_write_rejected(chat_id):
+                self._chat_metadata_dirty_ids.discard(active_id)
+                archived = [chat for chat in archived if chat["id"] != active_id]
+        for chat in archived:
+            chat_id = chat["id"]
+            if chat_id in pending_clear or self._agy_terminal_write_rejected(chat_id):
                 continue
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
                 self._persist_dirty_chat_turns(store, chat_id, chat.get("turns") or [])
             steps = chat.get("execution_steps") if isinstance(chat.get("execution_steps"), list) else []
             self._persist_initial_execution_steps_if_needed(store, chat_id, steps)
+            self._chat_metadata_dirty_ids.discard(chat_id)
+
+    def _mark_chat_metadata_dirty(self, chat: dict) -> None:
+        chat_id = str(chat.get("id") or "").strip()
+        if chat is not self._current_chat_state and is_mc_owned_chat(chat_id, chat):
+            self._chat_metadata_dirty_ids.add(chat_id)
+
+    def _dirty_archived_chats(self):
+        pending = self._chat_metadata_dirty_ids | self._chat_turn_dirty_from.keys()
+        pending.discard(self.active_chat_id)
+        if not pending:
+            return []
+        return [chat for chat in self.archived_chats if isinstance(chat, dict)
+                and (chat_id := str(chat.get("id") or "").strip()) in pending
+                and is_mc_owned_chat(chat_id, chat)]
 
     def _capture_close_write_batch(self):
         data = copy.deepcopy(self._state_data())
         active_id = str(self.active_chat_id or self.current_chat_id or "").strip()
         active = None
-        if active_id:
+        if is_mc_owned_chat(active_id, self._current_chat_state):
             active = {**data["active_chat"], "id": active_id,
                       "turns": self.active_session_turns,
                       "execution_steps": self._current_chat_state.get("execution_steps", [])}
-        rows = [chat for chat in ([active] if active else []) + list(self.archived_chats)
+        archived = self._dirty_archived_chats()
+        if active:
+            if not self.active_chat_id and any(row["id"] == active_id for row in archived):
+                active = None
+            else:
+                archived = [chat for chat in archived if chat["id"] != active_id]
+        rows = [chat for chat in ([active] if active else []) + archived
                 if isinstance(chat, dict) and chat.get("id") and not self._agy_terminal_write_rejected(chat["id"])]
         return (
             self.chat_store if self._chat_store_enabled else None,
             self.state_path, data, copy.deepcopy(tuple(rows)), dict(self._chat_turn_dirty_from),
             self._close_publication_pair, self._close_pair_id,
             tuple(sorted(getattr(self, "_pending_remote_finals", ()))),
-            tuple((uuid.uuid4().hex, copy.deepcopy(read))
-                  for read in getattr(self, "_pending_answer_reads", {}).values()),
+            tuple(copy.deepcopy(list(self._failed_answer_read_writes.items()))) + tuple(
+                (uuid.uuid4().hex, copy.deepcopy(read)) for read in getattr(self, "_pending_answer_reads", {}).values()),
             tuple(getattr(self, "_close_unattempted_resends", ())),
         )
 
@@ -348,20 +374,21 @@ class ChatHistoryMixin:
                 if steps and not store.load_recent_execution_steps(owner, limit=1)[0]:
                     store.replace_execution_steps(owner, steps)
             for operation_id, read in reads:
-                owner = read["chat_id"]
-                identity = store.readable_answer_for_turn(owner, turn_index=read["turn_index"],
-                    turn=read["frozen_turn"], generation=read["generation"])
-                if identity:
-                    store.mark_chat_read(pair_id=read["pair_id"], chat_id=owner, generation=read["generation"],
-                        message_id=identity["message_id"], answer_seq=identity["answer_seq"], operation_id=operation_id)
+                try:
+                    ChatHistoryMixin._commit_answer_read(store, operation_id, read)
+                except ValueError as exc:
+                    if str(exc) not in {"STALE_READ_GENERATION", "INVALID_READ_TARGET", "CHAT_NOT_FOUND"}:
+                        raise
             if publish:
                 for owner, index in pending_finals:
                     if (owner, index) in projected:
                         continue
                     turns = store.load_turns(owner)
                     if 0 <= index < len(turns) and turns[index].get("request_status") == "done":
+                        summary = store.load_chat_summary(owner) if owner not in titles else None
                         ChatHistoryMixin._persist_close_turn_facts(
-                            store, publication_pair or pair, owner, titles.get(owner, ""), index, turns[index])
+                            store, publication_pair or pair, owner,
+                            titles.get(owner) or str((summary or {}).get("title") or "").strip(), index, turns[index])
         temporary = path.with_suffix(path.suffix + ".closing")
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
@@ -501,7 +528,7 @@ class ChatHistoryMixin:
         if not normalized:
             return None
         for chat in self.archived_chats:
-            if isinstance(chat, dict) and str(chat.get("id") or "").strip() == normalized:
+            if isinstance(chat, dict) and str(chat.get("id") or "").strip() == normalized and is_mc_owned_chat(normalized, chat):
                 return chat
         return None
 
@@ -553,10 +580,9 @@ class ChatHistoryMixin:
         return chat
 
     def _load_state(self):
-        self.hide_terminal_chats = False
         if not self.state_path.exists():
             if getattr(self, "_chat_store_enabled", False):
-                self.archived_chats = self.chat_store.list_chat_summaries()
+                self.archived_chats = self.chat_store.list_chat_summaries(mc_owned_only=True)
             return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -566,7 +592,6 @@ class ChatHistoryMixin:
         if not bindings.app.is_visible_model_id(self.selected_model):
             self.selected_model = STARTUP_DEFAULT_MODEL_ID
         self.codex_answer_english_filter_enabled = bool(data.get("codex_answer_english_filter_enabled", False))
-        self.hide_terminal_chats = bool(data.get("hide_terminal_chats", False))
         version = data.get("codex_approval_defaults_version")
         version = version if type(version) is int and version >= 1 else 0
         self.codex_approval_defaults_version = max(1, version)
@@ -580,7 +605,7 @@ class ChatHistoryMixin:
 
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and getattr(self, "chat_store", None) is not None:
-            self.archived_chats = self.chat_store.list_chat_summaries()
+            self.archived_chats = self.chat_store.list_chat_summaries(mc_owned_only=True)
         else:
             archived = data.get("archived_chats")
             if isinstance(archived, list):
@@ -589,16 +614,23 @@ class ChatHistoryMixin:
                 legacy = data.get("chats")
                 if isinstance(legacy, list):
                     self.archived_chats = legacy
-        changed = approval_changed
+        changed = approval_changed or "hide_terminal_chats" in data
         if not use_chat_store:
             for chat in self.archived_chats:
                 if isinstance(chat, dict) and self._normalize_archived_chat(chat):
                     changed = True
 
+        active_chat = data.get("active_chat")
+        saved_chat = active_chat if isinstance(active_chat, dict) else {}
+        saved_active_id = str(data.get("active_chat_id") or saved_chat.get("id") or "").strip()
+        saved_summary = self.chat_store.load_chat_summary(saved_active_id) if use_chat_store and saved_active_id else None
+        if saved_active_id and not is_mc_owned_chat(saved_active_id, saved_summary or saved_chat):
+            data = {key: value for key, value in data.items() if not key.startswith("active_")}
+            active_chat = None
+            changed = True
         active_turns = data.get("active_session_turns")
         if isinstance(active_turns, list) and not use_chat_store:
             self.active_session_turns = active_turns
-        active_chat = data.get("active_chat")
         if isinstance(active_chat, dict):
             self._current_chat_state = active_chat
             if self._normalize_detail_panel_fields(self._current_chat_state):
@@ -612,7 +644,7 @@ class ChatHistoryMixin:
         if use_chat_store and getattr(self, "chat_store", None) is not None:
             if self.active_chat_id:
                 self.active_session_turns = self.chat_store.load_turns(self.active_chat_id)
-                summary = self._chat_summary_by_id(self.active_chat_id) or {}
+                summary = saved_summary or {}
                 current = self._current_chat_state if isinstance(self._current_chat_state, dict) else {}
                 merged = copy.deepcopy(summary)
                 merged.update(current)
@@ -745,7 +777,7 @@ class ChatHistoryMixin:
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
         if use_chat_store and persist_chat_history:
             self._persist_chat_history_to_store()
-        self._write_state_data(self._state_data())
+        return self._write_state_data(self._state_data())
 
     def _state_data(self):
         use_chat_store = bool(getattr(self, "_chat_store_enabled", False))
@@ -787,7 +819,6 @@ class ChatHistoryMixin:
             "active_kimi_request_queue": self.active_kimi_request_queue,
             "active_claudecode_session_id": self.active_claudecode_session_id,
             "codex_answer_english_filter_enabled": self.codex_answer_english_filter_enabled,
-            "hide_terminal_chats": self.hide_terminal_chats,
             "codex_sandbox": normalize_codex_sandbox(getattr(self, "codex_sandbox", DEFAULT_CODEX_SANDBOX)),
             "codex_approval_policy": normalize_codex_approval_mode(getattr(self, "codex_approval_policy", DEFAULT_CODEX_APPROVAL_MODE)),
             "codex_approval_defaults_version": max(1, getattr(self, "codex_approval_defaults_version", 1)),
@@ -811,6 +842,8 @@ class ChatHistoryMixin:
     def _write_state_data(self, data):
         try:
             self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            return False
         except Exception:
             pass
 
@@ -1194,22 +1227,6 @@ class ChatHistoryMixin:
             return EMPTY_CURRENT_CHAT_TITLE
         return title or EMPTY_CURRENT_CHAT_TITLE
 
-    def _append_terminal_history_filter_item(self, menu):
-        item = menu.AppendCheckItem(int(self._terminal_history_filter_menu_id), "隐藏终端聊天")
-        item.Check(bool(getattr(self, "hide_terminal_chats", False)))
-        return item
-
-    def _toggle_terminal_history_filter(self, event):
-        self.hide_terminal_chats = event.IsChecked()
-        self._terminal_history_filter_item.Check(self.hide_terminal_chats)
-        self._save_state(persist_chat_history=False)
-        self._refresh_history()
-
-    def _history_chat_is_visible(self, chat_id, chat):
-        # Native discovery creates its own deterministic owner ID. A replay
-        # onto an existing MC chat retains the MC owner and adds the mapping.
-        return not getattr(self, "hide_terminal_chats", False) or chat.get("native_identity") != chat_id
-
     def _history_chats_by_id(self):
         chats = {}
         for chat in self.archived_chats:
@@ -1221,7 +1238,7 @@ class ChatHistoryMixin:
 
     def _visible_history_chats_in_order(self):
         rows = [(chat_id, chat) for chat_id, chat in self._history_chats_by_id().items()
-                if self._history_chat_is_visible(chat_id, chat)]
+                if is_mc_owned_chat(chat_id, chat)]
         return sorted(rows, key=self._history_chat_sort_key)
 
     def _refresh_history(self, keep_id=None):
@@ -1285,7 +1302,7 @@ class ChatHistoryMixin:
             return None
         is_current = chat_id == self._current_history_id()
         chat = self._current_chat_state if is_current else self._find_archived_chat(chat_id)
-        if not isinstance(chat, dict) or not self._history_chat_is_visible(chat_id, chat):
+        if not isinstance(chat, dict) or not is_mc_owned_chat(chat_id, chat):
             return None
         unread = chat_id in self._unread_history_ids([chat_id])
         return chat_id, self._history_chat_label(chat, is_current=is_current, unread=unread)
@@ -1386,8 +1403,9 @@ class ChatHistoryMixin:
         if getattr(self, "_kimi_execution_write_counts", None):
             return
         self._codex_background_flush_dirty = False
-        self._save_state()
-        self._flush_pending_remote_finals()
+        if not self._save_delayed_chat_state("_codex_background_flush_scheduled",
+                CODEX_BACKGROUND_FLUSH_DELAY_MS, self._flush_codex_background_updates):
+            self._codex_background_flush_dirty = True
 
     def _defer_chat_state_save(self) -> None:
         self._chat_state_flush_dirty = True
@@ -1407,8 +1425,24 @@ class ChatHistoryMixin:
         if getattr(self, "_kimi_execution_write_counts", None) or getattr(self, "_agy_terminal_writes", 0):
             return
         self._chat_state_flush_dirty = False
-        self._save_state()
-        self._flush_pending_remote_finals()
+        if not self._save_delayed_chat_state("_chat_state_flush_scheduled", 300, self._flush_chat_state_save):
+            self._chat_state_flush_dirty = True
+
+    def _save_delayed_chat_state(self, scheduled, delay_ms, flush) -> bool:
+        busy_timeout = getattr(getattr(self, "chat_store", None), "busy_timeout", None)
+        try:
+            with busy_timeout(.025) if busy_timeout else nullcontext():
+                if self._save_state() is False:
+                    self.SetStatusText("未能保存聊天状态文件，待下一次保存时重试。")
+                    return False
+                self._flush_pending_remote_finals()
+        except sqlite3.Error as exc:
+            if getattr(exc, "sqlite_errorcode", 0) & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                setattr(self, scheduled, self._call_later_if_alive(delay_ms, flush) is not None)
+                return False
+            self.SetStatusText("未能保存聊天，待下一次保存时重试。")
+            return False
+        return True
 
     def _load_chat_as_current(self, chat: dict) -> None:
         if getattr(self, "_chat_store_enabled", False):
@@ -1486,6 +1520,7 @@ class ChatHistoryMixin:
         if c.get("title_manual"):
             return
         c["title"] = title.strip()[:40] or c.get("title") or "新聊天"
+        self._mark_chat_metadata_dirty(c)
         self._save_state()
         self._refresh_history(chat_id)
 
@@ -1611,6 +1646,7 @@ class ChatHistoryMixin:
             ]
         if not use_chat_store:
             self._mark_chat_turns_dirty(archived_id, 0)
+        self._mark_chat_metadata_dirty(archived)
         self._sort_archived_chats()
 
         self.active_session_turns = []
@@ -1683,33 +1719,75 @@ class ChatHistoryMixin:
         self._upsert_history_row(owner, allow_reorder=False)
 
     def _confirm_answer_read(self, target):
-        if not target:
+        if not target or getattr(self, "_close_write_started", False):
             return
-        try:
-            if "frozen_turn" in target:
-                identity = self.chat_store.readable_answer_for_turn(target["chat_id"],
-                    turn_index=target["turn_index"], turn=target["frozen_turn"], generation=target["generation"])
-                if identity:
-                    target = {**identity, "chat_id": target["chat_id"],
-                              "pair_id": target.get("pair_id") or self._read_pair_id()}
-                else:
-                    pending = getattr(self, "_pending_answer_reads", None)
-                    if pending is None:
-                        pending = self._pending_answer_reads = {}
-                    pending[(target["chat_id"], target["generation"], target["turn_index"])] = {
-                        **copy.deepcopy(target), "pair_id": self._read_pair_id()}
-                    self._defer_chat_state_save()
-                    return
-            state = self.chat_store.mark_chat_read(pair_id=target.get("pair_id") or self._read_pair_id(), chat_id=target["chat_id"],
-                generation=target["generation"], message_id=target["message_id"],
-                answer_seq=target["answer_seq"], operation_id=uuid.uuid4().hex)
+        target = {**target, "pair_id": target.get("pair_id") or self._read_pair_id()}
+        if "frozen_turn" in target:
+            identity = self.chat_store.readable_answer_for_turn(target["chat_id"],
+                turn_index=target["turn_index"], turn=target["frozen_turn"], generation=target["generation"])
+            if identity:
+                target = {**identity, "chat_id": target["chat_id"], "pair_id": target["pair_id"]}
+            else:
+                pending = getattr(self, "_pending_answer_reads", None)
+                if pending is None:
+                    pending = self._pending_answer_reads = {}
+                pending[(target["chat_id"], target["generation"], target["turn_index"])] = copy.deepcopy(target)
+                self._defer_chat_state_save()
+                return
+        self._queue_answer_read_write(target)
+
+    @staticmethod
+    def _commit_answer_read(store, operation_id, target):
+        owner = target["chat_id"]
+        identity = target
+        if "frozen_turn" in target:
+            identity = store.readable_answer_for_turn(owner, turn_index=target["turn_index"],
+                turn=target["frozen_turn"], generation=target["generation"])
+            if identity is None:
+                return None
+        return store.mark_chat_read(pair_id=target["pair_id"], chat_id=owner,
+            generation=identity["generation"], message_id=identity["message_id"],
+            answer_seq=identity["answer_seq"], operation_id=operation_id)
+
+    def _queue_answer_read_write(self, target):
+        operation_id = uuid.uuid4().hex
+        with self._close_admission_lock:
+            self._pending_answer_read_writes.append((operation_id, target))
+            if self._answer_read_writer_running:
+                return
+            self._answer_read_writer_running = True
+        bindings.app.threading.Thread(target=self._write_pending_answer_reads, name="mc-answer-read", daemon=True).start()
+
+    def _write_pending_answer_reads(self):
+        store = self.chat_store
+        while True:
+            with self._close_admission_lock:
+                operation_id, target = self._pending_answer_read_writes.popleft()
+            state = error = None
+            try:
+                state = self._commit_answer_read(store, operation_id, target)
+            except Exception as exc:
+                error = exc
+            with self._close_admission_lock:
+                if isinstance(error, (sqlite3.Error, OSError)):
+                    self._failed_answer_read_writes[operation_id] = target
+                more = bool(self._pending_answer_read_writes)
+                if not more:
+                    self._answer_read_writer_running = False
+            self._call_after_if_alive(self._finish_answer_read_write, state, error)
+            if not more:
+                return
+
+    def _finish_answer_read_write(self, state, error):
+        if state:
             self._on_chat_read_changed(state)
             transport = getattr(self, "_remote_nats_transport", None)
             loop = getattr(transport, "_loop", None)
             if loop is not None and loop.is_running():
                 asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
-        except (ValueError, RuntimeError) as exc:
-            self.SetStatusText(f"已读确认失败：{exc}")
+        elif error is not None and not getattr(self, "_closing", False):
+            self.SetStatusText(f"已读确认失败：{error}")
+        self._schedule_close_progress()
 
     def _flush_pending_answer_reads(self, chat_id):
         pending = getattr(self, "_pending_answer_reads", {})
@@ -1848,6 +1926,7 @@ class ChatHistoryMixin:
         model = self._model_for_chat_selection(chat) or STARTUP_DEFAULT_MODEL_ID
         if isinstance(chat, dict) and chat.get("model") != model:
             chat["model"] = model
+            self._mark_chat_metadata_dirty(chat)
             self._defer_chat_state_save()
         display = bindings.app.model_display_name(model)
         self.selected_model = model
@@ -1877,7 +1956,7 @@ class ChatHistoryMixin:
             current_state_id,
         }
         current_ids.discard("")
-        if selected_id in current_ids:
+        if selected_id in current_ids and is_mc_owned_chat(selected_id, self._current_chat_state):
             self.view_mode = "active"
             self.view_history_id = None
             self._apply_selected_chat_model_to_combo(self._current_chat_state)
@@ -1988,7 +2067,7 @@ class ChatHistoryMixin:
         if not normalized:
             return None
         for c in self.archived_chats:
-            if isinstance(c, dict) and str(c.get("id") or "").strip() == normalized:
+            if isinstance(c, dict) and str(c.get("id") or "").strip() == normalized and is_mc_owned_chat(normalized, c):
                 return c
         return None
 
@@ -2002,9 +2081,7 @@ class ChatHistoryMixin:
         anchor_id = str(self.view_history_id or "").strip() if self.view_mode == "history" else ""
         if not anchor_id:
             anchor_id = self.current_chat_id or self.active_chat_id
-        if hasattr(self, "history_list") and (not anchor_id or (
-            getattr(self, "hide_terminal_chats", False) and anchor_id not in all_ids
-        )):
+        if hasattr(self, "history_list") and anchor_id not in all_ids:
             anchor_id = self._selected_history_chat_id() or ""
         if len(all_ids) <= 1 or anchor_id not in all_ids:
             return None
@@ -2176,7 +2253,7 @@ class ChatHistoryMixin:
         if not normalized:
             return None
         if normalized in {str(self.active_chat_id or "").strip(), str(self.current_chat_id or "").strip()}:
-            if isinstance(getattr(self, "_current_chat_state", None), dict):
+            if isinstance(getattr(self, "_current_chat_state", None), dict) and is_mc_owned_chat(normalized, self._current_chat_state):
                 return self._current_chat_state
         return self._find_archived_chat(normalized)
 
@@ -2285,6 +2362,7 @@ class ChatHistoryMixin:
         if not c:
             return
         c["pinned"] = not bool(c.get("pinned"))
+        self._mark_chat_metadata_dirty(c)
         self._save_state()
         self._refresh_history(c.get("id"))
         self._push_remote_history_changed(c.get("id"))
@@ -2294,7 +2372,8 @@ class ChatHistoryMixin:
         if not self._confirm("确定隐藏所有非置顶聊天吗？原始会话将保留。"):
             return
         candidates = {str(c["id"]).strip(): self._history_hide_identity(c)
-                      for c in self.archived_chats if not c.get("pinned") and c.get("id")}
+                      for c in self.archived_chats if not c.get("pinned")
+                      and is_mc_owned_chat(str(c.get("id") or ""), c)}
         removed = {owner: identity for owner, identity in candidates.items() if identity is not None}
         if getattr(self, "_chat_store_enabled", False):
             try:

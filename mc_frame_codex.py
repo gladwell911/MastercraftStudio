@@ -110,6 +110,7 @@ class CodexSessionsMixin:
         self._remember_codex_storage(chat, thread_id, result["home"], result["cwd"])
         chat["codex_thread_configuration"] = result.get("thread_configuration", {})
         chat["codex_thread_configuration_thread_id"] = thread_id
+        self._mark_chat_metadata_dirty(chat)
         self._defer_codex_state_save()
         self._push_remote_history_changed(chat_id)
         return 200, {key: result[key] for key in ("thread_id", "cwd", "home", "url", "executable", "credential")}
@@ -160,6 +161,7 @@ class CodexSessionsMixin:
                 self._refresh_answer_list_preserving_selection()
         if first_changed is not None and self._visible_clear_owner() == chat_id:
             self.SetStatusText(_CODEX_TERMINAL_RESULT_UNKNOWN)
+        self._mark_chat_metadata_dirty(chat)
         self._defer_codex_state_save()
         self._invalidate_remote_state_cache()
         self._push_remote_state(chat_id)
@@ -416,6 +418,8 @@ class CodexSessionsMixin:
     def _set_codex_service_tier_for_chat(self, chat: dict | None, service_tier: str | None) -> str:
         tier = normalize_codex_service_tier(service_tier)
         if isinstance(chat, dict):
+            if chat.get("codex_service_tier") != tier:
+                self._mark_chat_metadata_dirty(chat)
             chat["codex_service_tier"] = tier
         if chat is getattr(self, "_current_chat_state", None):
             self._current_chat_state["codex_service_tier"] = tier
@@ -1039,6 +1043,7 @@ class CodexSessionsMixin:
             self.active_codex_pending_request = None
             self.active_codex_thread_flags = []
         self._publish_codex_context_thread_change(chat)
+        self._mark_chat_metadata_dirty(chat)
         self._save_state()
         return "## Codex 清理\n\n已清除当前聊天关联的 Codex 线程状态。聊天记录不会被删除。"
 
@@ -1273,6 +1278,7 @@ class CodexSessionsMixin:
                 if (not from_recovery) and (not recovery_context):
                     turn["request_status"] = "pending"
                 self._mark_chat_turns_dirty(None if is_current_target else chat_id, int(turn_idx))
+        self._mark_chat_metadata_dirty(target_chat)
         self._defer_codex_state_save()
 
     def _codex_answer_filter_menu_label(self) -> str:
@@ -1754,6 +1760,7 @@ class CodexSessionsMixin:
                 identity_chat["codex_usage_cache_owner"] = self._information_cache_owner(identity_chat, "codex")
                 identity_chat["codex_session_total_tokens"] = total
             if hits_changed or total_changed:
+                self._mark_chat_metadata_dirty(identity_chat)
                 if not early_codex_usage:
                     self._refresh_chat_information(identity_chat)
                 self._defer_codex_state_save()
@@ -2245,6 +2252,7 @@ class CodexSessionsMixin:
                     turn["request_resume_token"] = {"thread_id": thread_id, "turn_id": turn_id}
                 self._mark_chat_turns_dirty(None if is_current_target else chat_id, turn_idx)
         if not is_current_target:
+            self._mark_chat_metadata_dirty(target_chat)
             self._refresh_visible_history_chat(str(chat_id or "").strip())
         self._defer_codex_state_save()
 

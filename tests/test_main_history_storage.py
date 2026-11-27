@@ -1717,6 +1717,75 @@ def test_close_persists_other_rows_and_attention_after_retired_notification_conf
     assert [event["body"]["text"] for event in events if event["kind"] == "failed"] == ["provider failed"]
 
 
+def test_close_batch_retries_reads_for_valid_answers_after_clear_and_delete(tmp_path):
+    from mc_frame_history import ChatHistoryMixin
+
+    store = main.ChatStore(tmp_path / "history.sqlite3")
+    store.initialize()
+    reads = []
+    for owner in ("cleared", "deleted", "valid"):
+        turn = {"question": owner, "answer_md": owner, "request_status": "done"}
+        store.upsert_chat({"id": owner})
+        store.replace_turns(owner, [turn])
+        reads.append((f"read-{owner}", {"chat_id": owner, "pair_id": "default",
+            **store.readable_answer(owner, turn_index=0)}))
+    store.begin_clear_operation("cleared", idempotency_key="clear-before-close")
+    store.replace_turns("cleared", [{"question": "new", "answer_md": "new", "request_status": "done"}])
+    store.delete_chat("deleted")
+    state_path = tmp_path / "state.json"
+    ChatHistoryMixin._write_close_batch(
+        (store, state_path, {"saved": True}, [], {}, "", "default", (), reads, ()))
+    reopened = main.ChatStore(store.db_path)
+    assert reopened.get_chat_read_state("valid")["read_seq"] == reads[-1][1]["answer_seq"]
+    assert reopened.get_chat_read_state("cleared")["read_seq"] == 0
+    assert reopened.load_chat_summary("deleted") is None
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"saved": True}
+
+
+def test_close_waits_and_retries_an_accepted_answer_read(frame, monkeypatch, wait_for_wx):
+    from threading import Event
+
+    store = frame.chat_store
+    owner = "accepted-close-read"
+    store.upsert_chat({"id": owner})
+    store.replace_turns(owner, [{"question": "q", "answer_md": "answer", "request_status": "done"}])
+    target = {**store.readable_answer(owner, turn_index=0), "chat_id": owner}
+    entered, release, captured = Event(), Event(), Event()
+    attempts = []
+    mark = store.mark_chat_read
+    capture = frame._capture_close_write_batch
+
+    def fail_first(**kwargs):
+        attempts.append(kwargs["operation_id"])
+        if len(attempts) == 1:
+            entered.set()
+            assert release.wait(5)
+            raise sqlite3.OperationalError("database is locked")
+        return mark(**kwargs)
+
+    def capture_batch():
+        captured.set()
+        return capture()
+
+    monkeypatch.setattr(store, "mark_chat_read", fail_first)
+    monkeypatch.setattr(frame, "_capture_close_write_batch", capture_batch)
+    path = frame.state_path
+    try:
+        frame._confirm_answer_read(target)
+        wait_for_wx(entered.is_set, "accepted read reaches gated store write")
+        frame.Close()
+        callback = []
+        wx.CallAfter(callback.append, True)
+        wait_for_wx(lambda: bool(callback), "wx callback while accepted read is still pending")
+        assert frame._close_started and not captured.is_set()
+    finally:
+        release.set()
+    wait_for_wx(lambda: getattr(frame, "_close_complete", False), "close batch commits the retained read")
+    assert captured.is_set() and len(attempts) == 2 and attempts[0] == attempts[1]
+    assert main.ChatStore(store.db_path).get_chat_read_state(owner)["read_seq"] == target["answer_seq"]
+    assert path.is_file() and not path.with_suffix(path.suffix + ".closing").exists()
+
+
 def test_cli_auto_title_updates_after_background_answer(frame, monkeypatch):
     frame.active_chat_id = "chat-new"
     frame.active_session_turns = []

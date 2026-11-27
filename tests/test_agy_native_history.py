@@ -64,6 +64,15 @@ for line in sys.stdin:
 """
 
 
+def _save_mc_agy_owner(frame, session_id, workspace):
+    identity = SimpleNamespace(initialization={"_meta": {"accountId": "fixture-account"}})
+    frame.chat_store.upsert_chat({
+        "id": f"mc-{session_id}", "model": "agy/main",
+        "agy_session_id": session_id, "agy_workspace": str(workspace),
+        "agy_native_owner": AgyAcpClient.native_owner(identity, "default"),
+    })
+
+
 @pytest.mark.parametrize("provider_drive_path", [
     False,
     pytest.param(True, marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows AGY path")),
@@ -89,6 +98,7 @@ def test_discovers_replays_and_resumes_native_history(
     monkeypatch.setenv("MC_AGY_EXECUTABLE", sys._base_executable)
     monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
         lambda executable: [executable, "-u", str(script)]))
+    _save_mc_agy_owner(frame, "terminal-id", project)
 
     frame.chat_store.notification_sync(pair_id="default", device_id="private-device",
                                        baseline=0, incarnation="test", secret="test")
@@ -114,7 +124,7 @@ def test_discovers_replays_and_resumes_native_history(
     assert status == 200, alias
 
     if provider_drive_path:
-        # A row imported before normalization keeps its original workspace across refresh.
+        # An older associated row keeps its original workspace across refresh.
         legacy = frame._find_archived_chat(chat_id)
         legacy["agy_workspace"] = legacy["native_cwd"] = "/" + project.as_posix()
         frame.chat_store.upsert_chat(legacy)
@@ -467,6 +477,7 @@ def test_agy_process_exit_keeps_observed_ids_and_never_publishes_a_final(
     monkeypatch.setenv("MC_AGY_EXECUTABLE", sys._base_executable)
     monkeypatch.setattr(AgyAcpClient, "command", staticmethod(
         lambda executable: [executable, "-u", str(script)]))
+    _save_mc_agy_owner(frame, "original", tmp_path)
     db = ChatStore(frame.chat_store.db_path)
     db.notification_sync(pair_id="default", device_id="private-device", baseline=0,
                          incarnation="test", secret="test")

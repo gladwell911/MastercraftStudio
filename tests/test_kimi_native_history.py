@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from kimi_runtime import child_environment
+from kimi_history import kimi_history_storage
 from remote_nats import RemoteNatsTransport
 from test_kimi_runtime_usage_e2e import loopback_kimi_home
 
@@ -35,6 +36,8 @@ def test_native_history_is_discovered_and_resumed(loopback_kimi_home, frame, mon
     assert "QA_RUNTIME_OK" in native("-p", seed)
     terminal, = json.loads(native("session", "list", "--json"))
     assert "QA_RUNTIME_OK" in native("--session", terminal["id"], "-p", seed)
+    frame.chat_store.upsert_chat({"id": "mc-kimi-native", "model": "kimi/main",
+                                 "kimi_session_id": terminal["id"], "kimi_storage_id": kimi_history_storage()})
     monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_args, **_kwargs: None)
 
     def listed(count):

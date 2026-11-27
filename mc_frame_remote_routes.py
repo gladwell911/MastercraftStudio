@@ -19,6 +19,7 @@ from codex_client import (
 from execution_projection import project_execution_rows
 from kimi_server_client import is_kimi_model
 from native_history import allows_final_notification
+from chat_store import is_mc_owned_chat
 from mc_frame_presentation import _finite_timestamp, execution_answer_to_plain
 from mc_frame_settings import (
     DEFAULT_MODEL_ID,
@@ -32,6 +33,10 @@ import mc_frame_bindings as bindings
 
 
 class RemoteRoutesMixin:
+    def _remote_terminal_history_chat(self, chat_id: str) -> bool:
+        lookup = getattr(getattr(self, "chat_store", None), "is_terminal_history_chat", None)
+        return bool(chat_id and lookup and lookup(chat_id))
+
     def _apply_native_runtime_remote_snapshot(self, chat, snapshot, *, include_request=True):
         if chat.get("model") == AGY_MODEL_ID:
             run = self._agy_run_for_chat(chat)
@@ -865,6 +870,8 @@ class RemoteRoutesMixin:
         if requested_chat_id and requested_chat_id not in current_ids:
             archived_target = self._find_archived_chat(requested_chat_id)
             is_new_chat = archived_target is None
+            if is_new_chat and self._remote_terminal_history_chat(requested_chat_id):
+                return 404, {"accepted": False, "error": "chat_not_found"}
         preview_chat = self._current_chat_state if not requested_chat_id or requested_chat_id in current_ids else archived_target
         if bindings.app.threading.current_thread() is bindings.app.threading.main_thread():
             current_model = self._resolve_current_model()
@@ -1040,6 +1047,8 @@ class RemoteRoutesMixin:
         model = bindings.app.normalize_model_id(payload.get("model"), default="")
         if model != AGY_MODEL_ID:
             return self._run_remote_ui_route(self._remote_api_new_chat_ui, payload)
+        if self._remote_terminal_history_chat(owner):
+            return 409, {"accepted": False, "message": "请使用新的聊天 ID。"}
         with self._agy_creation_lock:
             self._agy_remote_creations += 1
         try:
@@ -1069,6 +1078,8 @@ class RemoteRoutesMixin:
         model = bindings.app.normalize_model_id(payload.get("model"), default="")
         if getattr(self, "_closing", False):
             return 503, {"accepted": False, "message": "电脑端正在关闭"}
+        if self._remote_terminal_history_chat(str(payload.get("chat_id") or "").strip()):
+            return 409, {"accepted": False, "message": "请使用新的聊天 ID。"}
         if model == AGY_MODEL_ID and agy_workspace is None:
             return 400, {"accepted": False, "message": "请选择运行电脑上的 AGY 项目目录"}
         if not model and self._resolve_current_model() == AGY_MODEL_ID:
@@ -1211,7 +1222,8 @@ class RemoteRoutesMixin:
         if isinstance(cached, dict):
             return 200, copy.deepcopy(cached)
         chats = []
-        if self.active_chat_id or self.active_session_turns:
+        current_owner = ""
+        if self.active_chat_id or self.current_chat_id or self.active_session_turns:
             current = dict(self._current_chat_state or {})
             if not current:
                 current = {"id": self.active_chat_id or self.current_chat_id or "", "title": "新聊天", "turns": self.active_session_turns}
@@ -1225,9 +1237,13 @@ class RemoteRoutesMixin:
             current_summary["running"] = bool(self.is_running)
             current_summary["request_kind"] = "user_input" if self.active_codex_pending_request else ""
             self._apply_native_runtime_remote_snapshot(current, current_summary, include_request=False)
-            chats.append(current_summary)
+            if is_mc_owned_chat(current["id"], current):
+                current_owner = current["id"]
+                chats.append(current_summary)
         for chat in self.archived_chats:
-            chats.append(self._remote_chat_summary(chat))
+            owner = str(chat.get("id") or "").strip()
+            if owner != current_owner and is_mc_owned_chat(owner, chat):
+                chats.append(self._remote_chat_summary(chat))
         body = {"accepted": True, "chats": chats}
         self._remote_history_list_cache = copy.deepcopy(body)
         return 200, body
@@ -1261,6 +1277,7 @@ class RemoteRoutesMixin:
         if current_id:
             candidates[current_id] = current
         rows = [chat for chat in candidates.values() if
+                is_mc_owned_chat(str(chat.get("id") or ""), chat) and
                 (not query or query in str(chat.get("title") or "").casefold()) and
                 (section != "pinned" or chat.get("pinned")) and
                 (section != "running" or (chat.get("id") == current_id and self.is_running))]
@@ -1315,7 +1332,7 @@ class RemoteRoutesMixin:
                          "turn_count": len(self.active_session_turns), "running": bool(self.is_running)})
             live.pop("turns", None)
             live.pop("execution_steps", None)
-            return 200, live
+            return 200, live if is_mc_owned_chat(live["id"], live) else {}
         status, current = self._run_remote_ui_route(capture)
         if status != 200:
             return status, current
@@ -1323,12 +1340,16 @@ class RemoteRoutesMixin:
             selected = [current] if current.get("id") and current.get("running") else []
             more, end = False, 0
         else:
-            include_current = not offset and bool(current.get("id")) and (not query or query.casefold() in str(current.get("title") or "").casefold()) and (section != "pinned" or current.get("pinned"))
+            include_current = not payload.get("cursor") and bool(current.get("id")) and (not query or query.casefold() in str(current.get("title") or "").casefold()) and (section != "pinned" or current.get("pinned"))
             size = min(30, max(1, int(payload.get("limit") or 30)))
-            rows, more = self.chat_store.list_chat_summaries_page(limit=max(1, size - int(include_current)),
-                offset=offset, query=query, pinned=section == "pinned")
+            page_size = size - int(include_current)
+            rows, more = self.chat_store.list_chat_summaries_page(limit=max(1, page_size),
+                offset=offset, query=query, pinned=section == "pinned", mc_owned_only=True,
+                exclude_chat_id=current.get("id", ""))
+            if page_size == 0:
+                rows, more = [], bool(rows)
             end = offset + len(rows)
-            selected = ([current] if include_current else []) + [row for row in rows if not include_current or row.get("id") != current.get("id")]
+            selected = ([current] if include_current else []) + rows
         summaries = [self._remote_chat_summary(row) for row in selected]
         for summary in summaries:
             # IDs remain exact; presentation metadata can be bounded independently
@@ -1411,6 +1432,8 @@ class RemoteRoutesMixin:
         body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
         if not owner:
             return 400, {"error": "chat_id_required"}
+        if self._remote_terminal_history_chat(owner):
+            return 404, {"error": "chat_not_found"}
         pair_id = self._read_pair_id()
         if not secret:
             return 503, {"error": "cursor_secret_unavailable"}
@@ -1487,6 +1510,8 @@ class RemoteRoutesMixin:
             chat, has_more, oldest_cursor = self._remote_chat_snapshot_page(source_chat, payload)
         else:
             source_chat = self._find_archived_chat(chat_id) or {}
+            if not source_chat and self._remote_terminal_history_chat(chat_id):
+                return 404, {"accepted": False, "error": "chat_not_found"}
             if (
                 getattr(self, "_chat_store_enabled", False)
                 and getattr(self, "chat_store", None) is not None
@@ -1540,6 +1565,8 @@ class RemoteRoutesMixin:
             state_payload = dict(payload)
             state_payload.setdefault("limit", REMOTE_STATE_DEFAULT_TURN_LIMIT)
             source_chat = self._find_archived_chat(chat_id) or {}
+            if not source_chat and self._remote_terminal_history_chat(chat_id):
+                return 404, {"accepted": False, "error": "chat_not_found"}
             if (
                 getattr(self, "_chat_store_enabled", False)
                 and getattr(self, "chat_store", None) is not None
@@ -1664,6 +1691,7 @@ class RemoteRoutesMixin:
         chat["title_source"] = incoming_source
         chat["title_updated_at"] = incoming_updated_at
         chat["title_revision"] = resolved_revision
+        self._mark_chat_metadata_dirty(chat)
         self._invalidate_remote_history_list_cache()
         self._invalidate_remote_state_cache()
         self._save_state()

@@ -393,8 +393,9 @@ class DesktopFileLibrary:
             temporary.unlink(missing_ok=True)
             raise
 
-    def commit_prepared_file(self, prepared: tuple[Path, str, int], *, deadline: float) -> FileTransferRecord:
-        """Publish a complete worker copy and register it on the UI thread."""
+    def commit_prepared_file(self, prepared: tuple[Path, str, int], *, deadline: float,
+                             direction: FileDirection = FileDirection.DESKTOP_TO_PHONE) -> FileTransferRecord:
+        """Publish a complete worker copy and register it."""
         temporary, name, size = prepared
         if time.monotonic() >= deadline:
             raise TimeoutError("file_preparation_timeout")
@@ -409,7 +410,7 @@ class DesktopFileLibrary:
                 raise TimeoutError("file_preparation_timeout")
             return self.add_record(FileTransferRecord(
                 id=f"file-{uuid.uuid4().hex}", name=target.name, stored_path=target,
-                size_bytes=size, direction=FileDirection.DESKTOP_TO_PHONE,
+                size_bytes=size, direction=direction,
                 status=FileTransferStatus.COMPLETED, created_at=time.time(), transferred_bytes=size,
             ))
 

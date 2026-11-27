@@ -361,6 +361,7 @@ class ChatInformationMixin:
             chat["codex_weekly_quota_status"] = "查询失败"
             chat.pop("codex_weekly_quota", None)
             chat["codex_chat_information_account_owner"] = identity[3]
+            self._mark_chat_metadata_dirty(chat)
             self._defer_codex_state_save()
         self._chat_information_request = None
         self._refresh_chat_information(chat)
@@ -416,6 +417,7 @@ class ChatInformationMixin:
             chat["codex_context_error"] = bool(payload.get("usage_error"))
             chat["codex_snapshot_error"] = bool(payload.get("usage_error"))
             if isinstance(hits, dict) or isinstance(total, int):
+                self._mark_chat_metadata_dirty(chat)
                 self._defer_codex_state_save()
         if payload.get("context_only"):
             self._refresh_chat_information(chat)
@@ -469,6 +471,7 @@ class ChatInformationMixin:
                     dialog.identity = self._chat_information_identity(chat, model)
             chat["codex_account_label"] = account_label
             chat["codex_chat_information_account_owner"] = str(chat.get("codex_account_id") or "").strip()
+            self._mark_chat_metadata_dirty(chat)
             self._defer_codex_state_save()
         self._refresh_chat_information(chat)
 
@@ -754,6 +757,7 @@ class ChatInformationMixin:
                             subscriptions.finished(chat_id, pending)
         if changed:
             self._refresh_chat_information(chat)
+            self._mark_chat_metadata_dirty(chat)
             self._defer_codex_state_save()
 
     def _current_kimi_usage_socket(self, session_id: str, payload: dict) -> bool:
@@ -814,6 +818,7 @@ class ChatInformationMixin:
             changed = True
         if changed:
             self._refresh_chat_information(chat)
+            self._mark_chat_metadata_dirty(chat)
             self._defer_codex_state_save()
 
     @staticmethod
@@ -1136,6 +1141,7 @@ class ChatInformationMixin:
                     and previous.get("protocol") == usage.get("protocol")):
                 return False
             chat["context_usage"] = usage
+            self._mark_chat_metadata_dirty(chat)
             self._invalidate_remote_state_cache()
             self._refresh_chat_information(chat)
             return True

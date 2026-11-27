@@ -642,6 +642,13 @@ class RemoteNatsTransport:
 
     def _route_command(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         command_type = str(payload.get("type") or "").strip().lower()
+        if command_type in {"content_page", "chat_read_state", "mark_chat_read", "execution_tail",
+                            "execution_history", "execution_snapshot", "execution_backfill"}:
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            owner = str(payload.get("chat_id") or body.get("chat_id") or "").strip()
+            is_terminal_history = getattr(self.durable_store, "is_terminal_history_chat", None)
+            if owner and is_terminal_history and is_terminal_history(owner):
+                return 404, {"accepted": False, "error": "chat_not_found"}
         if command_type == "content_page" and self.durable_store is not None:
             body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
             try:

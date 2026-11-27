@@ -106,6 +106,7 @@ def frame(tmp_path, monkeypatch, wx_app, request):
     # Still honor its persistence barrier before destroying wx/native state so
     # no daemon SQLite worker survives the fixture that owns its ChatStore.
     f._closing = True
+    f._desktop_file_executor.shutdown(wait=True)
     f._stop_native_history_refresh()
     if "codex_homes" in request.fixturenames:
         for client in tuple(f._codex_clients.values()):

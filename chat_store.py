@@ -7,6 +7,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -22,6 +23,13 @@ from native_history import (
 
 
 CHAT_PAYLOAD_FIELDS = {"turns", "execution_steps"}
+MC_OWNED_HISTORY = "COALESCE(json_extract(c.metadata_json,'$.native_identity'),'') <> c.id"
+
+
+def is_mc_owned_chat(chat_id: str, chat: dict) -> bool:
+    return bool(chat_id) and chat.get("native_identity") != chat_id
+
+
 CLEAR_OPERATION_STATES = frozenset({
     "requested", "clear_acknowledged", "resend_dispatched", "resend_blocked",
     "completed_with_resend", "completed_clear_only", "completed_no_message", "superseded",
@@ -36,6 +44,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         self.db_path = Path(db_path)
         self.max_execution_steps_per_turn = int(max_execution_steps_per_turn)
         self._native_title_observations = {}
+        self._busy_timeout = ContextVar("chat_store_busy_timeout", default=5.0)
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,8 +616,16 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         return str(rows[0]["message_id"])
 
     @contextmanager
+    def busy_timeout(self, seconds: float):
+        token = self._busy_timeout.set(seconds)
+        try:
+            yield
+        finally:
+            self._busy_timeout.reset(token)
+
+    @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self._busy_timeout.get())
         conn.row_factory = sqlite3.Row
         conn.create_function("unicode_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         try:
@@ -718,7 +735,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             ),
         )
 
-    def _native_history_target(self, conn, snapshot: NativeSessionSnapshot) -> tuple[str, bool]:
+    def _native_history_target(self, conn, snapshot: NativeSessionSnapshot, *, mc_owned_only: bool) -> tuple[str, bool]:
         native_id = snapshot.identity.chat_id
         if conn.execute("SELECT 1 FROM meta WHERE key IN (?,?,?,?)", (
             f"retired-native-history:{native_id}", f"hidden-native-history:{native_id}",
@@ -729,7 +746,8 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             "SELECT chat_id,account FROM native_history_owners WHERE native_chat_id=?", (native_id,)
         ).fetchone()
         if row is not None:
-            return str(row["chat_id"]), row["account"] == snapshot.account
+            owner = str(row["chat_id"])
+            return owner, row["account"] == snapshot.account and (not mc_owned_only or owner != native_id)
 
         # Existing provider-created application chats may predate discovery.
         # The adapter supplies its complete legacy owner identity.
@@ -745,17 +763,19 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     raise ValueError("Invalid legacy storage field")
                 predicates += f" AND COALESCE(json_extract(metadata_json,'$.{field}'),?)=?"
             model_filter, model = ("c.model LIKE ?", "codex/%") if snapshot.identity.provider == "codex" else ("c.model=?", snapshot.model)
+            ownership = f"AND c.id <> ? AND {MC_OWNED_HISTORY} " if mc_owned_only else ""
             legacy = conn.execute(
                 f"SELECT c.id FROM chats c LEFT JOIN native_history_owners n ON n.chat_id=c.id "
                 f"WHERE n.chat_id IS NULL AND {model_filter} AND {predicates} "
                 "AND COALESCE(json_extract(metadata_json,'$.native_identity'),?)=? "
-                "ORDER BY c.created_at,c.id LIMIT 1",
+                f"{ownership}ORDER BY c.created_at,c.id LIMIT 1",
                 (model, *snapshot.legacy_fields.values(),
-                 *(value for value in compatible.values() for _ in range(2)), native_id, native_id),
+                 *(value for value in compatible.values() for _ in range(2)), native_id, native_id,
+                 *((native_id,) if mc_owned_only else ())),
             ).fetchone()
             if legacy is not None:
                 return str(legacy["id"]), True
-        return native_id, True
+        return native_id, not mc_owned_only
 
     def _retain_committed_native_title(self, conn, chat_id, incoming):
         saved = conn.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
@@ -799,9 +819,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 chat[field] = saved[field]
         return chat
 
-    def native_history_target(self, snapshot: NativeSessionSnapshot) -> tuple[str, float]:
+    def native_history_target(self, snapshot: NativeSessionSnapshot, *, mc_owned_only: bool = False) -> tuple[str, float]:
         with self._connect() as conn:
-            owner, matches = self._native_history_target(conn, snapshot)
+            owner, matches = self._native_history_target(conn, snapshot, mc_owned_only=mc_owned_only)
             if not matches or conn.execute(
                 "SELECT 1 FROM meta WHERE key=?", (f"deleted-chat:{owner}",)
             ).fetchone():
@@ -812,13 +832,35 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             replayed_at = metadata.get("native_replayed_at") if metadata.get("native_notification_baseline") else 0
             return owner, self._float_or(replayed_at, 0)
 
+    def mc_native_history_candidates(self) -> tuple[set[str], dict[str, set[str]]]:
+        """Read lightweight candidate identities before enumerating provider history."""
+        sessions = {"codex": set(), "kimi": set(), "agy": set()}
+        identities = set()
+        fields = {"codex": "codex_thread_id", "kimi": "kimi_session_id", "agy": "agy_session_id"}
+        with self._connect() as conn:
+            for row in conn.execute(
+                f"SELECT SUBSTR(c.model,1,INSTR(c.model,'/')-1) AS provider, "
+                "json_extract(c.metadata_json,'$.native_identity') AS identity, "
+                "json_extract(c.metadata_json,'$.codex_thread_id') AS codex_thread_id, "
+                "json_extract(c.metadata_json,'$.kimi_session_id') AS kimi_session_id, "
+                "json_extract(c.metadata_json,'$.agy_session_id') AS agy_session_id "
+                f"FROM chats c WHERE {MC_OWNED_HISTORY}"
+            ):
+                if row["identity"]:
+                    identities.add(row["identity"])
+                field = fields.get(row["provider"])
+                if field and row[field]:
+                    sessions[row["provider"]].add(row[field])
+        return identities, sessions
+
     def merge_native_history(self, snapshot: NativeSessionSnapshot, *, expected_chat_id: str,
                              expected_revision: int = 0, merge_title: bool = True,
-                             observed_between: tuple[float, float] | None = None) -> dict | None:
+                             observed_between: tuple[float, float] | None = None,
+                             mc_owned_only: bool = False) -> dict | None:
         """Commit only an append-compatible replay to the chat that authorized it."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            owner, matches = self._native_history_target(conn, snapshot)
+            owner, matches = self._native_history_target(conn, snapshot, mc_owned_only=mc_owned_only)
             revision = conn.execute("SELECT revision FROM v2_chat_state WHERE chat_id=?", (owner,)).fetchone()
             if (int(revision[0]) if revision else 0) != expected_revision:
                 return None
@@ -1146,13 +1188,22 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             ).fetchone()
             return self._summary_from_row(row) if row else None
 
-    def list_chat_summaries(self) -> list[dict[str, Any]]:
+    def is_terminal_history_chat(self, chat_id: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute(
+                f"SELECT 1 FROM chats c WHERE c.id=? AND NOT ({MC_OWNED_HISTORY})",
+                (chat_id,),
+            ).fetchone() is not None
+
+    def list_chat_summaries(self, *, mc_owned_only: bool = False) -> list[dict[str, Any]]:
+        ownership = f"WHERE {MC_OWNED_HISTORY}" if mc_owned_only else ""
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT c.*, COUNT(t.turn_index) AS turn_count
                 FROM chats c
                 LEFT JOIN turns t ON t.chat_id = c.id
+                {ownership}
                 GROUP BY c.id
                 ORDER BY c.pinned DESC, c.updated_at DESC, c.created_at DESC
                 """
@@ -1160,13 +1211,15 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         return [self._summary_from_row(row) for row in rows]
 
     def list_chat_summaries_page(self, *, limit: int = 30, offset: int = 0,
-                                 query: str = "", pinned: bool = False) -> tuple[list[dict], bool]:
+                                 query: str = "", pinned: bool = False, mc_owned_only: bool = False,
+                                 exclude_chat_id: str = "") -> tuple[list[dict], bool]:
         size = max(1, min(30, int(limit)))
+        ownership = f"AND {MC_OWNED_HISTORY} " if mc_owned_only else ""
         with self._connect() as conn:
             rows = conn.execute("SELECT c.*,(SELECT COUNT(*) FROM turns t WHERE t.chat_id=c.id) turn_count "
                 "FROM chats c WHERE (?='' OR instr(unicode_casefold(c.title),unicode_casefold(?))>0) AND (?=0 OR c.pinned=1) "
-                "ORDER BY c.updated_at DESC,c.id DESC LIMIT ? OFFSET ?",
-                (query, query, int(pinned), size + 1, max(0, int(offset)))).fetchall()
+                f"{ownership}AND c.id<>? ORDER BY c.updated_at DESC,c.id DESC LIMIT ? OFFSET ?",
+                (query, query, int(pinned), exclude_chat_id, size + 1, max(0, int(offset)))).fetchall()
         return [self._summary_from_row(row) for row in rows[:size]], len(rows) > size
 
     def load_chat(self, chat_id: str, *, include_execution_steps: bool = True) -> dict[str, Any] | None:
