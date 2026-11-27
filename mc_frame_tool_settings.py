@@ -216,11 +216,11 @@ class ChatToolSettingsMixin:
         self._refresh_tool_setting_choices(self._pending_tool_settings())
         self._on_model_changed(event)
         if self._current_tool() == "kimi":
-            choice = self._selected_tool_value(self.model_combo)
+            choice = self._selected_tool_value(self.model_combo).rsplit("/", 1)[-1]
             label = self.model_combo.GetStringSelection()
-            if choice == "kimi-code/kimi-for-coding-highspeed" and "K2.7" in label:
+            if choice == "kimi-for-coding-highspeed" and "K2.7" in label:
                 self.SetStatusText("K2.7 Code Highspeed 约消耗 3 倍用量")
-            elif choice == "kimi-code/k3.1-pro-highspeed" and "K3.1" in label:
+            elif choice == "k3.1-pro-highspeed" and "K3.1" in label:
                 self.SetStatusText("K3.1 Pro Highspeed 约消耗 2 倍用量")
 
     def _on_tool_setting_changed(self, _event):
@@ -295,7 +295,8 @@ class ChatToolSettingsMixin:
             chat = self._visible_codex_speed_chat()
             turns = (chat or {}).get("turns") or ()
             prior = next((turn["tool_settings"] for turn in reversed(turns)
-                          if (turn.get("tool_settings") or {}).get("tool") == "kimi"), {})
+                          if isinstance(turn, dict) and isinstance(turn.get("tool_settings"), dict)
+                          and turn["tool_settings"].get("tool") == "kimi"), {})
             selected["model"] = prior.get("model") or (
                 kimi_model_to_server_alias(self._tool_route) if self._tool_route != "kimi/main" else default)
             selected["effort"] = prior.get("effort")
