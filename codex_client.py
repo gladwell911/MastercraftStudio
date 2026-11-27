@@ -545,6 +545,7 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
     command = _item_command(item)
     exit_code = _item_exit_code(item)
     display_kind = "status"
+    phase = str(item.get("phase") or "")
     text = _first_non_empty(raw_text, title)
 
     if item_type == "commandExecution":
@@ -555,6 +556,10 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
     elif item_type == "agentMessage":
         display_kind = "commentary"
         text = raw_text
+    elif item_type == "plan":
+        display_kind = "plan"
+        if method == "item/completed" and raw_text.strip():
+            phase = "final_answer"
     elif item_type == "fileChange":
         display_kind = "artifact"
         text = _first_non_empty(raw_text, title, _item_file_change_summary(item))
@@ -582,7 +587,7 @@ def _event_from_item(method: str, params: dict, raw: dict | None = None) -> Code
         exit_code=exit_code,
         subtype=item_type,
         display_kind=display_kind,
-        phase=str(item.get("phase") or ""),
+        phase=phase,
         status=str(item.get("status") or item_type),
         data=item,
         event_id=str(item.get("id") or ""),

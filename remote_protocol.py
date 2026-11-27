@@ -134,7 +134,7 @@ def format_remote_approval_request(method: str, params: dict) -> str:
         reason = str(params.get("reason") or "").strip()
         if reason:
             lines.append(f"原因：{reason}")
-        lines.append("回复 1 允许本次，2 允许本会话，3 拒绝，4 取消当前轮。")
+        _append_approval_reply_options(lines, params)
         return "\n".join(lines).strip()
     lines.append("Codex 请求执行命令。")
     command = str(params.get("command") or "").strip()
@@ -146,8 +146,21 @@ def format_remote_approval_request(method: str, params: dict) -> str:
         lines.append(f"工作目录：{cwd}")
     if reason:
         lines.append(f"原因：{reason}")
-    lines.append("回复 1 允许本次，2 允许本会话，3 拒绝，4 取消当前轮。")
+    _append_approval_reply_options(lines, params)
     return "\n".join(lines).strip()
+
+
+def _append_approval_reply_options(lines: list[str], params: dict) -> None:
+    allowed = params.get("availableDecisions")
+    options = (
+        ("accept", "1 允许本次"),
+        ("acceptForSession", "2 允许本会话"),
+        ("decline", "3 拒绝"),
+        ("cancel", "4 取消当前轮"),
+    )
+    advertised = [label for decision, label in options if not isinstance(allowed, list) or decision in allowed]
+    if advertised:
+        lines.append("回复 " + "，".join(advertised) + "。")
 
 
 def parse_remote_approval_reply(method: str, text: str) -> str | None:

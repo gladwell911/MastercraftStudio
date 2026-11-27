@@ -95,13 +95,17 @@ def test_standalone_codex_only_notifies_finals_after_successful_native_observati
     assert len(recovered) == len(notifications()) == 2
 
 
-def test_managed_codex_restart_reuses_pending_canonical_message(tmp_path):
+@pytest.mark.parametrize(("stored_status", "stored_answer"), [
+    ("pending", "Transient partial"),
+    ("done", "正在请求..."),
+])
+def test_managed_codex_restart_reuses_pending_canonical_message(tmp_path, stored_status, stored_answer):
     db = tmp_path / "history.db"
     store = ChatStore(db)
     store.initialize()
     identity = NativeSessionIdentity("laptop", "codex", "storage", "thread")
     store.upsert_chat({"id": identity.chat_id, "title": "Terminal owner", "model": "codex/gpt-5.4-medium"})
-    persisted = {"question": "Question", "answer_md": "Transient partial", "request_status": "pending",
+    persisted = {"question": "Question", "answer_md": stored_answer, "request_status": stored_status,
                  "question_origin": "terminal", "terminal_final_pending": True,
                  "terminal_notification_pair": "laptop", "model": "codex/gpt-5.4-medium",
                  "codex_thread_id": "thread", "codex_turn_id": "native-turn"}
@@ -113,9 +117,12 @@ def test_managed_codex_restart_reuses_pending_canonical_message(tmp_path):
     reopened.initialize()
     read = dict(persisted, provider="codex", answer_md="Complete native final", request_status="done",
                 provider_message_id="native-answer", native_final_explicit=True)
+    later = dict(read, question="Later question", answer_md="Later final",
+                 codex_turn_id="later-turn", provider_message_id="later-answer")
     snapshot = NativeSessionSnapshot(identity, "owner", "codex/gpt-5.4-medium", str(tmp_path), "Terminal owner",
-                                     1_770_000_042, turns=[read])
-    assert reopened.merge_native_history(snapshot, expected_chat_id=identity.chat_id)["turn_count"] == 1
+                                     1_770_000_042, turns=[read, later])
+    assert reopened.merge_native_history(snapshot, expected_chat_id=identity.chat_id)["turn_count"] == 2
+    assert reopened.load_turns(identity.chat_id)[1]["answer_md"] == "Later final"
     deduped = reopened.readable_answer(identity.chat_id, turn_index=0)
     assert deduped["message_id"] == before
     assert reopened.load_turns(identity.chat_id)[0]["answer_md"] == "Complete native final"

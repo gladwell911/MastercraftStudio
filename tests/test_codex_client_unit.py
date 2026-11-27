@@ -409,6 +409,32 @@ def test_codex_item_command_execution_normalizes_display_fields():
     assert seen[0].subtype == "commandExecution"
 
 
+def test_completed_plan_is_a_public_final_for_live_and_reopened_codex_thread():
+    from codex_history import _thread_history
+
+    plan = {"id": "plan-1", "type": "plan", "text": "# Synthetic plan\nUse Yellow."}
+    seen = []
+    client = codex_client.CodexAppServerClient(on_event=seen.append)
+    params = {"threadId": "th", "turnId": "tu", "item": plan}
+    client._handle_message({"method": "item/started", "params": params})
+    client._handle_message({"method": "item/completed", "params": params})
+
+    started, completed = seen
+    assert started.phase != "final_answer"
+    assert (completed.item_id, completed.phase, completed.text) == ("plan-1", "final_answer", plan["text"])
+
+    turns, _ = _thread_history({"id": "th", "turns": [{
+        "id": "tu", "status": "completed", "items": [
+            {"id": "input-1", "type": "userMessage", "content": [{"type": "text", "text": "plan"}]},
+            plan,
+        ],
+    }]}, "codex/main")
+    final, = turns
+    assert final["provider_message_id"] == "plan-1"
+    assert final["answer_md"] == plan["text"]
+    assert final["native_final_explicit"] is True
+
+
 def test_codex_client_maps_collab_waiting_end_to_subagent_result_event():
     seen = []
     client = codex_client.CodexAppServerClient(on_event=seen.append)

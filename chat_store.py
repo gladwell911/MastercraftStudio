@@ -868,7 +868,15 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if not keys or stored.get("terminal_notification_pair") != identity.pair_id:
             return False
         session_key, turn_key = keys
-        return (stored.get("request_status") in {"pending", "running", "failed", "unknown"}
+        status = stored.get("request_status")
+        # Older Codex builds could settle a Plan turn before storing its public answer.
+        missing_codex_final = (
+            identity.provider == "codex" and status == "done"
+            and stored.get("terminal_final_pending") is True
+            and not stored.get("provider_message_id")
+            and str(stored.get("answer_md") or "").strip() in {"", "正在请求..."}
+        )
+        return ((missing_codex_final or status in {"pending", "running", "failed", "unknown"})
                 and stored.get(session_key) == replayed.get(session_key) == identity.session_id
                 and bool(stored.get(turn_key)) and stored[turn_key] == replayed.get(turn_key)
                 and replayed.get("native_final_explicit") is True and replayed.get("request_status") == "done"

@@ -268,7 +268,12 @@ def _thread_history(thread, model):
             if part.get("type") == "text" and isinstance(part.get("text"), str)
         )
         messages = [item for item in items if item.get("type") == "agentMessage" and item.get("text")]
-        finals = [item for item in messages if item.get("phase") in ("finalAnswer", "final_answer")]
+        finals = [
+            item for item in items if str(item.get("text") or "").strip()
+            and (item.get("type") == "plan" or (
+                item.get("type") == "agentMessage" and item.get("phase") in ("finalAnswer", "final_answer")
+            ))
+        ]
         explicit_final = bool(finals)
         if not finals:
             finals = [item for item in messages if not item.get("phase")]
