@@ -59,6 +59,7 @@ class ChatModelCombo(wx.ComboBox):
 class ChatToolSettingsMixin:
     def _build_tool_settings_controls(self, panel, row):
         self._tool_mode = ""
+        self._codex_settings_explicit = False
         self._tool_mode_menu_ids = []
         self._tool_route = DEFAULT_CODEX_MODEL
         self._codex_settings_catalog = {}
@@ -116,11 +117,13 @@ class ChatToolSettingsMixin:
         return self._selected_tool_value(self.tool_combo)
 
     def _pending_tool_settings(self):
-        return {"tool": self._current_tool(),
-                "model": self._selected_tool_value(self.model_combo),
-                "effort": self._selected_tool_value(self.reasoning_combo),
-                "speed": self._selected_tool_value(self.codex_speed_combo),
-                "mode": self._tool_mode}
+        tool = self._current_tool()
+        settings = {"tool": tool, "model": self._selected_tool_value(self.model_combo),
+                    "effort": self._selected_tool_value(self.reasoning_combo),
+                    "speed": self._selected_tool_value(self.codex_speed_combo), "mode": self._tool_mode}
+        if tool == "codex" and self._codex_settings_explicit:
+            settings["explicit"] = True
+        return settings
 
     def _refresh_tool_setting_choices(self, selected=None):
         selected = selected or {}
@@ -151,11 +154,13 @@ class ChatToolSettingsMixin:
         if self._current_tool() == tool and self._tool_route == route:
             return
         self._tool_route = route
+        self._codex_settings_explicit = False
         self._set_tool_choices(self.tool_combo, TOOLS, tool)
         self._refresh_tool_setting_choices()
 
     def _sync_tool_settings_from_chat(self, chat, route):
         self._select_tool_route(route)
+        self._codex_settings_explicit = False
         selected = next((turn["tool_settings"] for turn in reversed((chat or {}).get("turns") or [])
                          if isinstance(turn, dict) and isinstance(turn.get("tool_settings"), dict)
                          and turn["tool_settings"].get("tool") == self._current_tool()), None)
@@ -175,14 +180,20 @@ class ChatToolSettingsMixin:
         else:
             self._tool_route = {"codex": DEFAULT_CODEX_MODEL, "agy": AGY_MODEL_ID,
                                 "kimi": "kimi/main", "other": "claudecode/default"}[tool]
+            self._codex_settings_explicit = False
             self._refresh_tool_setting_choices()
         self._on_model_changed(None)
         if tool == "codex":
             self._request_codex_settings_catalog()
 
     def _on_tool_model_changed(self, event):
+        self._on_tool_setting_changed(event)
         self._refresh_tool_setting_choices(self._pending_tool_settings())
         self._on_model_changed(event)
+
+    def _on_tool_setting_changed(self, _event):
+        if self._current_tool() == "codex":
+            self._codex_settings_explicit = True
 
     def _on_tool_model_focus(self, event):
         event.Skip()

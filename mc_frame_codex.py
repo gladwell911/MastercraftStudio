@@ -865,13 +865,14 @@ class CodexSessionsMixin:
         if not settings or not settings.get("model"):
             return
         previous = next((row for row in reversed(prior_turns) if isinstance(row, dict)
-                         and is_codex_model(row.get("model")) and row.get("request_question")), None)
+                         and is_codex_model(row.get("model"))
+                         and (row.get("request_question") or row.get("question"))), None)
         if previous is None:
             return
         before = previous.get("tool_settings") or {}
-        if previous.get("request_status") == "queued" or (
-                before.get("model") and any(settings.get(key) != before.get(key)
-                                            for key in ("model", "effort", "speed", "mode"))):
+        changed = (any(settings.get(key) != before.get(key) for key in ("model", "effort"))
+                   if before.get("model") else settings.get("explicit", False))
+        if previous.get("request_status") == "queued" or changed:
             turn["codex_settings_force_new"] = True
 
     def _launch_next_codex_tool_turn(self, chat_id):
@@ -1592,7 +1593,9 @@ class CodexSessionsMixin:
                 return
         is_current_chat = chat_id in {self.active_chat_id, self.current_chat_id, "", None}
         identity_chat = self._current_chat_state if is_current_chat else self._find_archived_chat(chat_id)
-        if event_type == "turn_completed" and isinstance(identity_chat, dict):
+        if (event_type == "turn_completed" and isinstance(identity_chat, dict)
+                and any(isinstance(row, dict) and row.get("request_status") == "queued"
+                        for row in identity_chat.get("turns") or ())):
             owner = str(identity_chat.get("id") or chat_id or "")
             self._call_after_if_alive(self._launch_next_codex_tool_turn, owner)
         data = event.data if isinstance(event.data, dict) else {}

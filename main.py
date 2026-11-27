@@ -1066,6 +1066,7 @@ class ChatFrame(
         self.tool_combo.Bind(wx.EVT_COMBOBOX, self._on_tool_changed)
         self.model_combo.Bind(wx.EVT_COMBOBOX, self._on_tool_model_changed)
         self.model_combo.Bind(wx.EVT_SET_FOCUS, self._on_tool_model_focus)
+        self.reasoning_combo.Bind(wx.EVT_COMBOBOX, self._on_tool_setting_changed)
         self.codex_speed_combo.Bind(wx.EVT_COMBOBOX, self._on_codex_speed_changed)
         self.input_edit.Bind(wx.EVT_KEY_DOWN, self._monitored_ui_handler("input_key_down", self._on_input_key_down))
         self.input_edit.Bind(wx.EVT_TEXT, self._monitored_ui_handler("input_text", self._on_input_text_changed))

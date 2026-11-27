@@ -15,8 +15,8 @@ from kimi_test_support import (
 )
 
 
-def test_model_combo_contains_kimi(frame):
-    choices = [frame.model_combo.GetString(i) for i in range(frame.model_combo.GetCount())]
+def test_tool_combo_contains_kimi(frame):
+    choices = list(frame.tool_combo.GetItems())
     assert "Kimi Code" in choices
     assert "kimi/main" not in choices
     assert main.model_id_from_display_name("Kimi Code") == "kimi/main"
