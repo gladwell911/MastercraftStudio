@@ -4,7 +4,7 @@
 
 ## 2026-11-26 三家 CLI 共享会话
 
-### T13 下一步
+### T13 本机验收
 
 当前候选从 MC `1ba49dd`（应用源码 `fea9a35`）与 RC `b5f1381` 接续。原失败证据对应 RC `8b9c92f`。使用隔离 MC 数据、NATS、真实账号及合成会话。专用 Android 35 模拟器通过原生桥运行 `arm64-v8a` RC。复验记录两仓提交与 APK SHA-256。
 
@@ -17,12 +17,19 @@
 
 - Codex 审批卡按原生提供的常规决定显示按钮。默认 420 dpi 的 ARM64 候选对同一真实请求返回 200，原生拒绝路径取消了原回合。真实 Plan 选择并提交 Yellow 后，同一回合的方案由 MC 持久保存并在 RC 显示。
 - AGY 原回合追加已在 RC 显示终答，停止控件随终结撤下。本机 `default` 的真实会话按稳定聊天 ID 改名，重开后的来源、原生 ID 和原正文一致。应用改名更新 MC 显示名。
-- Kimi Code 2.6.3 待确认原回合续接。420 dpi 已通过同一审批的点按和追加提交。两种队列追加顺序和直接追加均回读到新的原生回合，试验性源码已撤回。接续按原生回合及结构化 prompt 归属核对，MC 受理回执与终答归属各自取证。
-- 较早离屏通知仍在原延期项。点击旧通知只应打开该终答，较新的终答应保持未读。
+- Kimi Code 2.6.3 在默认 420 dpi 下通过真实审批点按和追加提交。两种队列顺序和直接追加均回读到新的原生回合。试验性源码已撤回。
 
 [本机续验证据、两仓提交、APK 哈希和未通过条件](../../candidate-final/automated-t13/t13-local-20261127.md)。本节限定在隔离本机候选与 ARM64 模拟器。实体笔记本和物理双机改名回读已经移出本机 T13。正式 NATS 整体验收及 TalkBack 发音专项沿用此前范围。下文较早批次只记录当时状态。
 
-- T01–T12 已合入本地双仓候选，整体验收 T13 进行中。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
+**Kimi Code 2.6.3 同回合追加延期。** 固定版本接受直接追加和排队后 Steer，原生转录均将追加记为新回合的 `opener`。真实账号审批场景结果一致。候选继续按下一轮排队，旧 2.5.3 沿用原协议。[原生复验与裁决](../../candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md#kimi-code-同回合追加裁决)
+
+**较早离屏通知已通过本机候选验收。** RC `037f9fd` 配对 MC `48fb873`。同一长聊天中，点击第 4 条终答的通知后，RC 显示对应消息，MC 确认已读到第 4 条，系统清除旧通知，第 24 条终答保持未读，系统通知仍保留。见 [候选结果和 APK 校验](../../candidate-final/automated-t13/t13-older-notification-and-kimi-20261127.md)。
+
+#### 本机验收结论
+
+按用户决定，Kimi 同回合追加延期，本机 T13 按其余范围验收完成。较早终答通知的实装配对为 MC `48fb873`、RC `037f9fd`，QA ARM64 APK SHA-256 为 `EF92C41EDC56545529223B44148D0D763744D79505F2540632C4B3D947606783`。其他通过场景各自使用其证据所列的候选。重启该延期项前，先取得追加属于同一原生回合的证据，再做真实账号审批和 RC 终答的跨端验收。
+
+- T01–T12 已合入本地双仓候选。历史首批候选记录如下。Windows x86-64 冻结包对应 MC `948e72dd4a797204da2e439966379f15b8247ba4`，同批 RC 严格 ARM64 QA 包对应 `8fde55f9261623d8ffb252dfb50165fd6c078036`。日常安装和本批正式发布仍待安排。功能和限制见 [共享会话](remote-control.md#三家-cli-共享会话)。
 - 本机工作区 `D:/code/sj` 下，`_bmad-output/implementation-artifacts/mc-rc-three-cli-shared-sessions-acceptance.md` 逐项记录 A-01 至 A-12 和复现指令，`.build-work/mc-rc-three-cli-shared-sessions/candidate-final` 保存构建脚本、产物哈希、冻结演练和隔离证据。文档提交后重建该批产物仍使用上述源码提交。
 - 从候选工作树用 `package_mc.ps1 -BuildOnly`，并为 `-DistPath`、`-WorkPath` 指定隔离目录。最终包并发运行三家 `--list` 只启动一个 MC，热态复用。用包内 NATS 和 ACP 替身读到了同工具行的执行中、完成与终答。冒烟使用隔离目录并关闭真实 HKCU 注册。
 - 最终源码以实际 Codex 0.171.0 和 Kimi 2.5.3、2.6.3 CLI 配合本地模型替身验证原生历史、继续和适用控制。实际 AGY 1.5.17 通过隔离本地 NATS 验证了同原生 ID 的工具进度、跨临时目录免逐次工具审批和补充问题。此处手机角色的协议探针与 RC 界面验收分别计入。2026-11-26 文档核对另跑 `python -m pytest tests/test_shared_terminal.py tests/test_agy_workspace.py -q -p no:cacheprovider -p no:faulthandler`，使用 `PYTHONUTF8=1`，7 项通过。
