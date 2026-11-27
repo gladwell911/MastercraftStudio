@@ -1,12 +1,19 @@
 import json
+import os
 import sys
+import threading
 
 import pytest
 import wx
 
 from agy_acp import AgyAcpClient
 from codex_client import DEFAULT_CODEX_MODEL
+from test_agy_settings_ui_automation import isolated_agy
 from test_chat_tool_settings_ui_automation import choose, send
+from test_codex_native_history import codex_homes, real_codex
+
+
+REAL_USERPROFILE = os.environ.get("USERPROFILE", "")
 
 
 @pytest.fixture
@@ -195,5 +202,115 @@ def test_lost_handoff_response_tracks_one_native_session_without_retry(
     assert frame._show_history_chat(source)
     choose(frame.tool_combo, "AGY")
     click_send(frame)
-    assert "待确认" in frame.GetStatusBar().GetStatusText()
+    wait_for_wx(lambda: "待确认" in frame.GetStatusBar().GetStatusText(), "blocked repeated handoff")
     assert len(requests(log, "session/new")) == len(requests(log, "session/prompt")) == 1
+
+
+def test_handoff_waits_for_storage_off_ui_and_keeps_the_send_cutoff(
+    frame, handoff_runtime, wait_for_wx, monkeypatch,
+):
+    source, _project, log = handoff_runtime
+    reading = threading.Event()
+    continued = threading.Event()
+    load_chat = frame.chat_store.load_chat
+
+    def delay_source_read(chat_id, **kwargs):
+        if chat_id == source and not continued.is_set():
+            reading.set()
+            assert continued.wait(4), "durable history read blocked the wx send event"
+        return load_chat(chat_id, **kwargs)
+
+    monkeypatch.setattr(frame.chat_store, "load_chat", delay_source_read)
+    frame.input_edit.ChangeValue("接续截止点")
+    choose(frame.tool_combo, "AGY")
+    try:
+        click_send(frame)
+        wait_for_wx(reading.is_set, "background source history lookup")
+        assert frame.active_chat_id == source
+        assert frame.input_edit.GetValue() == "接续截止点"
+        frame.active_session_turns[-1].update(answer_md="LATER_COMPLETED_OUTPUT", request_status="done")
+        frame.chat_store.replace_turns(source, frame.active_session_turns)
+        wx.CallAfter(continued.set)
+        wait_for_wx(continued.is_set, "wx event while source lookup is delayed")
+    finally:
+        continued.set()
+    wait_for_wx(lambda: frame.active_chat_id != source, "published AGY handoff")
+    prompt, = requests(log, "session/prompt")
+    assert "LATER_COMPLETED_OUTPUT" not in prompt["prompt"][0]["text"]
+
+
+@real_codex
+@pytest.mark.skipif(not os.getenv("MC_TEST_AGY_NATIVE"), reason="requires explicitly enabled, authenticated AGY")
+def test_native_codex_handoff_into_native_agy(
+    codex_homes, frame, monkeypatch, request, wait_for_wx,
+):
+    _ordinary, _private, workspace, different_default, codex_calls, _native = codex_homes
+    monkeypatch.setattr(frame, "_workspace_dir_for_codex", lambda: str(workspace))
+    monkeypatch.setattr(frame, "_schedule_first_question_auto_title", lambda *_: None)
+    frame.Show()
+    questions = ["First unique seed SEED_NATIVE_061", "Second unique seed SEED_NATIVE_062"]
+    for index, question in enumerate(questions):
+        send(frame, question)
+        wait_for_wx(lambda: len(frame.active_session_turns) > index
+                    and frame.active_session_turns[index].get("request_status") in {"done", "failed"},
+                    f"Codex turn {index + 1}", timeout=30)
+        assert frame.active_session_turns[index]["request_status"] == "done"
+    source_id = frame.active_chat_id
+    native_codex_id = frame.active_codex_thread_id
+    assert native_codex_id
+    wait_for_wx(lambda: len(frame.chat_store.load_turns(source_id)) == 2
+                and all(turn.get("request_status") == "done" for turn in frame.chat_store.load_turns(source_id)),
+                "two durable Codex answers")
+
+    traffic = []
+    send_acp = AgyAcpClient._send
+
+    def track_acp(client, payload):
+        if payload.get("method") in {"session/new", "session/prompt"}:
+            traffic.append(payload)
+        return send_acp(client, payload)
+
+    with monkeypatch.context() as native_profile:
+        native_profile.setenv("USERPROFILE", REAL_USERPROFILE)
+        request.getfixturevalue("isolated_agy")
+        native_profile.setattr(frame, "_workspace_dir_for_codex", lambda: str(different_default))
+        native_profile.setattr(AgyAcpClient, "_send", track_acp)
+        question = "Reply with exactly HANDOFF_NATIVE_ACK_062."
+        frame.input_edit.ChangeValue(question)
+        choose(frame.tool_combo, "AGY")
+        choose(frame.tool_combo, "Codex")
+        assert frame.active_chat_id == source_id
+        assert frame.input_edit.GetValue() == question
+        assert not traffic
+        choose(frame.tool_combo, "AGY")
+        click_send(frame)
+        wait_for_wx(lambda: frame.active_chat_id != source_id, "native AGY handoff", timeout=70)
+        native_agy_id = frame._current_chat_state["agy_session_id"]
+        assert native_agy_id != native_codex_id
+        assert frame._current_chat_state["agy_workspace"] == str(workspace)
+        assert frame.active_session_turns[0]["request_status"] == "done"
+        assert "HANDOFF_NATIVE_ACK_062" in frame.active_session_turns[0]["answer_md"]
+        opened, first = traffic
+        assert opened["params"]["cwd"] == str(workspace)
+        assert first["params"]["sessionId"] == native_agy_id
+        prompt = first["params"]["prompt"][0]["text"]
+        assert all(f"用户：\n{text}\n\nCodex：\nCODX_08_FULL_TAIL" in prompt for text in questions)
+        assert prompt.endswith("本次提问：\n" + question)
+        followup = "Reply with exactly HANDOFF_NATIVE_FOLLOWUP_063."
+        send(frame, followup)
+        wait_for_wx(lambda: frame.active_session_turns[-1].get("request_status") in {"done", "failed", "unknown"},
+                    "native AGY follow-up", timeout=70)
+        assert frame.active_session_turns[-1]["request_status"] == "done"
+        assert len(traffic) == 3
+        assert traffic[-1]["params"] == {
+            "sessionId": native_agy_id,
+            "prompt": [{"type": "text", "text": followup}],
+        }
+
+    assert frame._show_history_chat(source_id)
+    send(frame, "Third Codex question after AGY handoff")
+    wait_for_wx(lambda: frame.active_chat_id == source_id and len(frame.active_session_turns) == 3
+                and frame.active_session_turns[-1].get("request_status") == "done",
+                "original native Codex thread still continues", timeout=30)
+    assert frame.active_session_turns[-1]["codex_thread_id"] == native_codex_id
+    assert len(codex_calls) == 3
