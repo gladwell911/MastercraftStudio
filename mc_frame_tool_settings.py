@@ -96,13 +96,12 @@ class ChatToolSettingsMixin:
                 "modes": [("default", MODE_NAMES["default"])],
                 "defaults": {"model": model, "effort": effort, "speed": "standard", "mode": "default"},
             }
+        if tool == "agy":
+            return self._agy_tool_settings_options()
         if tool == "kimi":
             return self._kimi_settings_catalog or {
                 "modes": KIMI_MODES, "defaults": {"speed": "standard", "mode": "default"},
             }
-        if tool == "agy":
-            return {"models": [(self._tool_route, bindings.app.model_display_name(self._tool_route))],
-                    "defaults": {"speed": "standard"}}
         return {"models": [(model, bindings.app.model_display_name(model))
                            for model in VISIBLE_MODEL_IDS if tool_for_route(model) == "other"]}
 
@@ -185,6 +184,8 @@ class ChatToolSettingsMixin:
             for key, value in codex_cli_config_for_model(route).items():
                 selected.setdefault("effort" if key == "model_reasoning_effort" else key, value)
             selected.setdefault("speed", self._codex_service_tier_for_chat(chat) or "standard")
+        elif route == AGY_MODEL_ID and not selected:
+            selected = self._agy_prior_tool_settings(chat)
         elif is_kimi_model(route):
             if route != "kimi/main":
                 selected.setdefault("model", kimi_model_to_server_alias(route))
@@ -205,6 +206,8 @@ class ChatToolSettingsMixin:
         self._on_model_changed(None)
         if tool == "codex":
             self._request_codex_settings_catalog()
+        elif tool == "agy":
+            self._request_agy_settings_catalog()
         elif tool == "kimi":
             self._request_kimi_settings_catalog()
 
@@ -228,6 +231,8 @@ class ChatToolSettingsMixin:
         event.Skip()
         if self._current_tool() == "codex":
             self._request_codex_settings_catalog()
+        elif self._current_tool() == "agy":
+            self._request_agy_settings_catalog()
         elif self._current_tool() == "kimi":
             self._request_kimi_settings_catalog()
 

@@ -1158,24 +1158,28 @@ class ChatRequestsMixin:
         if (candidate or {}).get("agy_workspace") and not model:
             model = AGY_MODEL_ID
         resolved_model = bindings.app.normalize_model_id(model or self._resolve_current_model() or "")
+        agy_queued = False
         if resolved_model == AGY_MODEL_ID:
-            if source == "local" and q and not requested_attachments and isinstance(candidate, dict) and candidate.get("id"):
-                control = self._handle_agy_control(candidate, q, local=True)
-                if control is not None:
-                    ok, message = control
-                    if ok:
-                        self.input_edit.ChangeValue("")
-                        if message:
-                            self.SetStatusText(message)
-                    return control
             try:
-                if requested_attachments and _verified_attachments is None:
+                local_control = source == "local" and q and not requested_attachments and (candidate or {}).get("id")
+                if tool_settings and tool_settings.get("tool") == "agy" and q not in {"/stop", "/reply"}:
+                    tool_settings, agy_queued = self._agy_desktop_submission(candidate or {}, candidate_turns, tool_settings)
+                if local_control and not agy_queued:
+                    control = self._handle_agy_control(candidate, q, local=True)
+                    if control is not None:
+                        ok, message = control
+                        if ok:
+                            self.input_edit.ChangeValue("")
+                            if message:
+                                self.SetStatusText(message)
+                        return control
+                if requested_attachments and _verified_attachments is None and not agy_queued:
                     return self._preflight_attachment_draft(
                         raw_question, source, resolved_model, chat_id, client_send_id, requested_attachments,
                         agy_context=self._agy_attachment_context(candidate or {}, candidate_turns),
                         tool_settings=tool_settings,
                     )
-                self._validate_agy_submission(candidate or {})
+                self._validate_agy_submission(candidate or {}, queued=agy_queued)
             except AgyError as exc:
                 return False, str(exc)
         if requested_attachments and is_openrouter_claude_model(resolved_model) and _verified_attachments is None:
@@ -1531,7 +1535,7 @@ class ChatRequestsMixin:
         self._defer_chat_state_save()
         if not automatic_clear_resend:
             self._play_send_sound()
-        self.SetStatusText("已发送")
+        self.SetStatusText("已排队，将在当前回合结束后发送" if agy_queued else "已发送")
         self.view_mode = "active"
         self.view_history_id = None
         self._active_answer_row_index = -1
@@ -1550,10 +1554,15 @@ class ChatRequestsMixin:
             elif is_kimi_model(resolved_model):
                 started = self._start_kimi_worker_for_turn(chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model)
             elif resolved_model == AGY_MODEL_ID:
-                started = self._start_agy_worker_for_turn(
-                    chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model,
-                    prepared_attachments=prepared_attachments,
-                )
+                if agy_queued:
+                    turn["request_status"] = "queued"
+                    self._launch_next_agy_tool_turn(chat_id)
+                    started = True
+                else:
+                    started = self._start_agy_worker_for_turn(
+                        chat_id or self.active_chat_id or self.current_chat_id or "", turn_idx, q, resolved_model,
+                        prepared_attachments=prepared_attachments,
+                    )
             elif is_claudecode_model(resolved_model):
                 started = self._start_claudecode_worker_for_turn(
                     chat_id or self.active_chat_id or self.current_chat_id or "",
@@ -1772,7 +1781,7 @@ class ChatRequestsMixin:
         if getattr(self, "_closing", False):
             return False
         if agy_workspace is None and self._resolve_current_model() == AGY_MODEL_ID:
-            return self._choose_agy_workspace(title, title_manual)
+            return self._start_desktop_agy_chat(title, title_manual)
         manual_title = str(title or "").strip()
         manual = bool(title_manual and manual_title)
         store = getattr(self, "chat_store", None)

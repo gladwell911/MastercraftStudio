@@ -17,7 +17,8 @@ import uuid
 
 AGY_MODEL_ID = "agy/main"
 AGY_WORKSPACE_CAPABILITY = "agy-workspace-v1"
-AGY_CHAT_FIELDS = ("agy_workspace", "agy_session_id", "agy_native_owner", "agy_config", "agy_options")
+AGY_CHAT_FIELDS = ("agy_workspace", "agy_session_id", "agy_native_owner", "agy_config", "agy_options",
+                   "agy_desktop_settings")
 AGY_IMAGE_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
@@ -164,6 +165,14 @@ def configuration_options(result: dict) -> list[dict]:
                 if isinstance(value, dict) and isinstance(value.get("value"), str):
                     values.append({"value": value["value"], "label": value.get("name") or value["value"]})
         if values:
+            if item.get("category") == "model" and isinstance(result.get("models"), dict):
+                variants = result["models"].get("availableModels") or []
+                model_ids = {value["value"] for value in values}
+                for value in values:
+                    prefix = value["value"] + "-"
+                    value["efforts"] = [variant_id.removeprefix(prefix) for entry in variants
+                                        if isinstance(entry, dict) and isinstance(variant_id := entry.get("modelId"), str)
+                                        and variant_id.startswith(prefix) and variant_id not in model_ids]
             options.append({"id": item["id"], "label": item.get("name") or item["id"],
                             "category": item.get("category", ""), "current": item.get("currentValue", ""),
                             "options": values})
@@ -440,11 +449,14 @@ class AgyAcpClient:
         self.options = configuration_options(result) or configuration_options(self.initialization)
         return result
 
-    def configure(self, config: dict, fallback_options: list) -> None:
+    def configure(self, config: dict, fallback_options: list, *, desktop: bool = False) -> None:
         if not config:
             return
-        selected_options(self.options or fallback_options, config)
+        if not desktop:
+            selected_options(self.options or fallback_options, config)
         for key, value in config.items():
+            if desktop:
+                selected_options(self.options or fallback_options, {key: value})
             params = {"sessionId": self.session_id}
             if key == "legacy:model":
                 method = "session/set_model"
@@ -456,7 +468,22 @@ class AgyAcpClient:
                 method = "session/set_config_option"
                 params.update(configId=key, value=value)
             result = self.request(method, params)
-            self.options = configuration_options(result) or self.options
+            advertised = configuration_options(result)
+            if advertised:
+                effort_matrix = {value["value"]: value["efforts"] for option in self.options
+                                 if option["category"] == "model" for value in option["options"] if "efforts" in value}
+                for option in advertised:
+                    if option["category"] == "model":
+                        for value in option["options"]:
+                            if value["value"] in effort_matrix:
+                                value.setdefault("efforts", effort_matrix[value["value"]])
+                self.options = advertised
+
+    def configure_desktop(self, config: dict, fallback_options: list) -> None:
+        self.configure(config, fallback_options, desktop=True)
+        effective = {option["id"]: option["current"] for option in self.options}
+        if any(effective.get(key) != value for key, value in config.items()):
+            raise AgyError("AGY 未确认所选配置，问题还未发送。请检查模型、推理强度和工具模式后重试。")
 
     def begin_prompt(self, question, on_update, on_interaction, *, attachments=()) -> AgyPrompt:
         with self._lock:
