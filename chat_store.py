@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from agy_acp import AGY_MODEL_ID
 from chat_store_execution import ChatStoreExecutionMixin
 from chat_store_notifications import ChatStoreNotificationsMixin
 from chat_store_schema import ChatStoreSchemaMixin, MAX_INT64, V2_MIGRATION_KEY
@@ -832,6 +833,28 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             previous = self._summary_from_row(row) if row else {}
             if snapshot.updated_at and snapshot.updated_at < previous.get("native_updated_at", 0):
                 return None
+            old_count = int(previous.get("turn_count", 0))
+            sent_count = old_count
+            sent_turns = None
+            if snapshot.identity.provider == "agy" and snapshot.turns is not None and old_count:
+                rows = [(entry["turn_index"], self._json_dict(entry["payload_json"])) for entry in conn.execute(
+                    "SELECT turn_index,payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,),
+                )]
+                prompt_rows = [(index, turn) for index, turn in rows
+                               if turn.get("model") != "system" or turn.get("question")]
+                first_queued = next((i for i, (_, turn) in enumerate(prompt_rows)
+                                     if turn.get("model") == AGY_MODEL_ID and turn.get("request_status") == "queued"),
+                                    None)
+                if first_queued is not None:
+                    if (len(snapshot.turns) != first_queued
+                            or any(turn.get("model") != AGY_MODEL_ID or turn.get("request_status") != "queued"
+                                   for _, turn in prompt_rows[first_queued:])):
+                        # A native turn cannot be inserted ahead of already reserved local positions.
+                        return None
+                    sent_turns = prompt_rows[:first_queued]
+                    sent_count = first_queued
+                else:
+                    sent_turns = rows
             conn.execute(
                 "INSERT OR IGNORE INTO native_history_owners(native_chat_id,chat_id,account) VALUES(?,?,?)",
                 (snapshot.identity.chat_id, owner, snapshot.account),
@@ -849,16 +872,16 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             unresolved = previous.get("native_unresolved_turn")
             if unresolved and not snapshot.status:
                 chat["native_history_status"] = unresolved["message"]
-            old_count = int(previous.get("turn_count", 0))
             appended = 0
             recovered = {}
             matched_agy_rows = set()
             accepted_replay = False
-            if snapshot.turns is not None and len(snapshot.turns) >= old_count:
-                stored = (self._json_dict(entry[0]) for entry in conn.execute(
-                    "SELECT payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,)
-                ))
-                for index, (old, new) in enumerate(zip(stored, snapshot.turns)):
+            if snapshot.turns is not None and len(snapshot.turns) >= sent_count:
+                stored = sent_turns if sent_turns is not None else (
+                    (entry["turn_index"], self._json_dict(entry["payload_json"])) for entry in conn.execute(
+                        "SELECT turn_index,payload_json FROM turns WHERE chat_id=? ORDER BY turn_index", (owner,),
+                    ))
+                for (index, old), new in zip(stored, snapshot.turns):
                     handoff = index == 0 and self._is_first_agy_handoff_replay(
                         snapshot.identity, old, snapshot.turns,
                     )
@@ -869,6 +892,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                         if new.get("answer_at"):
                             recovered[index]["answer_at"] = new["answer_at"]
                         if snapshot.identity.provider == "agy":
+                            recovered[index]["agy_native_terminal_reason"] = "end_turn"
                             recovered[index].pop("agy_partial_answer_md", None)
                             for field in ("agy_native_turn_id", "provider_user_message_id"):
                                 if new.get(field):
@@ -877,7 +901,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                           {"unknown", "cancelled", "failed"} and self._agy_replay_matches(snapshot.identity, old, new)
                           and new.get("agy_replay_followed")):
                         matched_agy_rows.add(index)
-                    elif ((snapshot.identity.provider == "agy" and old.get("request_status") == "unknown")
+                    elif ((snapshot.identity.provider == "agy" and (
+                            old.get("request_status") == "unknown" or
+                            (old.get("request_status") == "pending" and old.get("agy_queue_claimed"))))
                           or not self._native_turn_matches(old, new)):
                         recovered.clear()
                         matched_agy_rows.clear()
@@ -887,7 +913,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 else:
                     chat["native_replayed_at"] = snapshot.updated_at
                     accepted_replay = True
-                    appended = len(snapshot.turns) - old_count
+                    appended = len(snapshot.turns) - sent_count
             if unresolved and unresolved["index"] in recovered:
                 chat["native_history_status"] = snapshot.status
                 chat["native_unresolved_turn"] = None
@@ -915,8 +941,13 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                         chat["native_notification_baseline"] = finished_at
             if accepted_replay and snapshot.identity.provider == "agy":
                 for step in snapshot.execution_steps:
-                    if step["turn_idx"] in matched_agy_rows or step["turn_idx"] in recovered:
-                        self._merge_recovered_agy_step(conn, owner, snapshot.identity.session_id, step)
+                    replay_index = step["turn_idx"]
+                    if 0 <= replay_index < sent_count:
+                        index = sent_turns[replay_index][0]
+                        if index in matched_agy_rows or index in recovered:
+                            self._merge_recovered_agy_step(
+                                conn, owner, snapshot.identity.session_id, dict(step, turn_idx=index),
+                            )
             if chat == previous and not appended and not recovered:
                 return None
             self._upsert_chat_conn(conn, chat)
@@ -1050,7 +1081,8 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         # exited. A matching, settled provider turn may finish that same row.
         if identity.provider == "agy":
             return (
-                stored.get("request_status") == "unknown"
+                (stored.get("request_status") == "unknown"
+                 or (stored.get("request_status") == "pending" and stored.get("agy_queue_claimed")))
                 and (agy_handoff or ChatStore._agy_replay_matches(identity, stored, replayed))
                 and replayed.get("native_final_explicit") is True
                 and replayed.get("request_status") == "done"
@@ -1216,20 +1248,45 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
                 revision, "deleted", kind="chat_deleted")
 
+    def _agy_turn_owner_conn(self, conn, chat_id, scope, revision):
+        chat = conn.execute(
+            "SELECT c.model,c.metadata_json,COALESCE(s.revision,1) AS revision "
+            "FROM chats c LEFT JOIN v2_chat_state s ON s.chat_id=c.id "
+            "WHERE c.id=? AND NOT EXISTS (SELECT 1 FROM meta WHERE key=?)",
+            (chat_id, f"deleted-chat:{chat_id}"),
+        ).fetchone()
+        if chat is None or chat["revision"] != revision:
+            return None
+        saved_scope = dict(self._metadata_from_row(chat), model=chat["model"])
+        return saved_scope if all(saved_scope.get(key) == value for key, value in scope.items()) else None
+
+    def claim_agy_queued_turn(self, chat_id, index, scope, revision, queued, pending):
+        """Claim a persisted AGY prompt before giving it to ACP."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner = self._agy_turn_owner_conn(conn, chat_id, scope, revision)
+            if owner is None or owner.get("native_unresolved_turn"):
+                return False
+            for row in conn.execute(
+                "SELECT turn_index,payload_json FROM turns WHERE chat_id=? AND turn_index<=? ORDER BY turn_index",
+                (chat_id, index),
+            ):
+                saved = self._json_dict(row["payload_json"])
+                if row["turn_index"] == index:
+                    if saved != queued or saved.get("request_status") != "queued":
+                        return False
+                    self._write_agy_turn_conn(conn, chat_id, index, pending)
+                    return True
+                if (saved.get("model") == AGY_MODEL_ID
+                        and saved.get("request_status") in {"pending", "running", "unknown", "queued"}):
+                    return False
+            return False
+
     def commit_agy_terminal(self, chat_id, index, scope, revision, turn, terminal):
         """Commit the original accepted turn before reporting a known AGY result."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            chat = conn.execute(
-                "SELECT c.model,c.metadata_json,COALESCE(s.revision,1) AS revision "
-                "FROM chats c LEFT JOIN v2_chat_state s ON s.chat_id=c.id "
-                "WHERE c.id=? AND NOT EXISTS (SELECT 1 FROM meta WHERE key=?)",
-                (chat_id, f"deleted-chat:{chat_id}"),
-            ).fetchone()
-            if chat is None or chat["revision"] != revision:
-                return False
-            saved_scope = dict(self._metadata_from_row(chat), model=chat["model"])
-            if any(saved_scope.get(key) != value for key, value in scope.items()):
+            if self._agy_turn_owner_conn(conn, chat_id, scope, revision) is None:
                 return False
             row = conn.execute("SELECT payload_json FROM turns WHERE chat_id=? AND turn_index=?",
                                (chat_id, index)).fetchone()
@@ -1245,19 +1302,25 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                 return all(existing.get(key) == value for key, value in terminal.items())
             settled = dict(turn, **existing)
             settled.update(terminal)
-            conn.execute(
-                "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?) "
-                "ON CONFLICT(chat_id,turn_index) DO UPDATE SET payload_json=excluded.payload_json",
-                (chat_id, index, json.dumps(settled, ensure_ascii=False)),
-            )
-            self._backfill_canonical_turns_conn(conn, chat_id, [settled], index)
+            self._write_agy_turn_conn(conn, chat_id, index, settled)
             return True
+
+    def _write_agy_turn_conn(self, conn, chat_id, index, turn):
+        conn.execute(
+            "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id,turn_index) DO UPDATE SET payload_json=excluded.payload_json",
+            (chat_id, index, json.dumps(turn, ensure_ascii=False)),
+        )
+        self._backfill_canonical_turns_conn(conn, chat_id, [turn], index)
 
     @staticmethod
     def _keep_agy_terminal(old, new):
-        return (isinstance(new, dict) and old.get("agy_native_terminal_reason") in ("end_turn", "cancelled")
-                and new.get("request_status") == "pending"
-                and old.get("_provider_request_id") == new.get("_provider_request_id"))
+        if not isinstance(new, dict) or old.get("_provider_request_id") != new.get("_provider_request_id"):
+            return False
+        if old.get("agy_queue_claimed") and new.get("request_status") == "queued":
+            return True
+        return (old.get("agy_native_terminal_reason") in ("end_turn", "cancelled")
+                and new.get("request_status") == "pending")
 
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()

@@ -10,6 +10,7 @@ import pytest
 
 from agy_acp import AgyAcpClient
 from chat_store import ChatStore
+from native_history import NativeSessionIdentity, NativeSessionSnapshot
 from shared_terminal_routes import dispatch_terminal
 
 
@@ -74,6 +75,148 @@ def wait_terminal(frame, scope, wait_for_wx_main_loop, expected):
     wait_for_wx_main_loop(lambda: dispatch_terminal(frame, "watch", scope)[1].get("state") == expected,
                           f"AGY terminal state {expected}")
     return dispatch_terminal(frame, "watch", scope)[1]
+
+
+@pytest.fixture
+def persisted_agy_queue(frame, monkeypatch, tmp_path, request):
+    entered = threading.Event()
+    release = threading.Event()
+    prompts = []
+    owner = "queued-agy"
+    identity = NativeSessionIdentity("default", "agy", "fixture-store", "native")
+    chat = {"id": owner, "model": "agy/main", "title": "AGY queue", "agy_workspace": str(tmp_path),
+            "agy_session_id": identity.session_id, "agy_native_owner": "fixture-owner",
+            "native_identity": identity.chat_id, "native_account": "fixture-account"}
+    prior = {"question": "Previous", "answer_md": "Saved answer", "model": "agy/main",
+             "request_status": "done"}
+    turns = [prior, *[
+        {"question": question, "request_question": question, "model": "agy/main", "request_status": "queued",
+         "tool_settings": {"tool": "agy", "model": model, "effort": effort, "mode": "auto"},
+         "_provider_request_id": f"request-{i}"}
+        for i, (question, model, effort) in enumerate([
+            ("First", "gemini-4-carbon", "low"), ("Second", "gemini-4-neon", "high"),
+        ])
+    ]]
+    frame.chat_store.upsert_chat(chat)
+    frame.chat_store.replace_turns(owner, turns)
+    independent = ChatStore(frame.chat_store.db_path)
+
+    def begin(question, update, _interaction, *, attachments):
+        saved = independent.load_turns(owner)
+        prompts.append((question, [turn["request_status"] for turn in saved]))
+        entered.set()
+        def wait():
+            assert release.wait(5)
+            return "cancelled"
+
+        return SimpleNamespace(wait=wait, usage={}, request_count=1)
+
+    class Client(SimpleNamespace):
+        __hash__ = object.__hash__
+
+    client = Client(options=[], configure_desktop=lambda *_: None, begin_prompt=begin,
+                    alive=True, close=lambda: None)
+    monkeypatch.setattr(frame, "_open_agy_client", lambda *_a, **_kw: client)
+    monkeypatch.setattr(frame, "_watch_agy_title", lambda *_: None)
+    monkeypatch.setattr(frame, "_agy_config_for_tool_settings", lambda _options, settings: settings)
+    monkeypatch.setattr(frame, "_refresh_agy_chat_information", lambda *_: None)
+
+    def cleanup():
+        frame._closing = True
+        release.set()
+        frame._close_agy_clients()
+
+    request.addfinalizer(cleanup)
+    return owner, turns, independent, entered, prompts
+
+
+@pytest.mark.parametrize("restore", ["startup", "history"])
+def test_persisted_agy_queue_claims_only_the_first_turn_before_sending(
+        frame, persisted_agy_queue, wx_app, restore):
+    owner, _, independent, entered, prompts = persisted_agy_queue
+    if restore == "startup":
+        frame.state_path.write_text(json.dumps({"active_chat_id": owner}), encoding="utf-8")
+        frame._load_state()
+    else:
+        frame.archived_chats = frame.chat_store.list_chat_summaries()
+        assert frame._show_history_chat(owner, focus_answer_list=False)
+    wx_app.ProcessPendingEvents()
+    assert entered.wait(2)
+    wx_app.ProcessPendingEvents()
+    assert prompts == [("First", ["done", "pending", "queued"])]
+    assert independent.load_turns(owner)[1]["_provider_request_id"] == "request-0"
+
+
+def test_agy_queue_keeps_prompts_unsent_during_and_after_a_failed_claim(
+        frame, persisted_agy_queue, wx_app, monkeypatch, wait_for_wx_main_loop):
+    owner, original, independent, _, prompts = persisted_agy_queue
+    claiming = threading.Event()
+    reject = threading.Event()
+
+    def fail_claim(*_args):
+        claiming.set()
+        reject.wait(2)
+        raise sqlite3.OperationalError("fixture disk error")
+
+    monkeypatch.setattr(frame.chat_store, "claim_agy_queued_turn", fail_claim)
+    frame.state_path.write_text(json.dumps({"active_chat_id": owner}), encoding="utf-8")
+    frame._load_state()
+    wx_app.ProcessPendingEvents()
+    try:
+        assert claiming.wait(2)
+        assert not prompts
+        assert independent.load_turns(owner) == original
+    finally:
+        reject.set()
+    wait_for_wx_main_loop(lambda: owner not in frame._agy_busy, "failed claim published")
+    assert not prompts
+    assert independent.load_turns(owner) == original
+
+
+@pytest.mark.parametrize("evidence", ["explicit", "ordinary replay", "extra"])
+def test_native_recovery_of_claimed_agy_predecessor_controls_fifo(
+        frame, persisted_agy_queue, wx_app, evidence):
+    owner, turns, independent, entered, prompts = persisted_agy_queue
+    native = NativeSessionIdentity("default", "agy", "fixture-store", "native")
+    first = dict(turns[1], request_status="pending", agy_queue_claimed=True, agy_session_id=native.session_id,
+                 agy_native_turn_id="first-turn", provider_user_message_id="first-user",
+                 agy_observed_message_id="first-answer")
+    frame.chat_store.replace_turns(owner, [turns[0], first, turns[2]])
+    # Restart sees the durable claim. A deferred queued save cannot resurrect it.
+    frame.chat_store.replace_turns_from(owner, turns[1:], start_index=1)
+    assert independent.load_turns(owner)[1] == first
+    frame.state_path.write_text(json.dumps({"active_chat_id": owner}), encoding="utf-8")
+    frame._load_state()
+    wx_app.ProcessPendingEvents()
+    assert owner not in frame._agy_busy
+    assert not prompts
+
+    replay = [
+        {"provider": "agy", "session_id": native.session_id, "question": "Previous", "answer_md": "Saved answer"},
+        {"provider": "agy", "session_id": native.session_id, "question": "First",
+         "agy_native_turn_id": "first-turn", "provider_user_message_id": "first-user",
+         "provider_message_id": "first-answer", "answer_md": "First native answer",
+         "request_status": "done", "native_final_explicit": evidence != "ordinary replay"},
+    ]
+    if evidence == "extra":
+        replay.append(dict(replay[-1], agy_native_turn_id="other native turn"))
+    snapshot = NativeSessionSnapshot(native, "fixture-account", "agy/main", ".", "AGY",
+                                     updated_at=100, turns=replay, legacy_fields={"agy_session_id": native.session_id})
+    revision = independent.get_clear_reconciliation_authority(owner)["revision"]
+    assert frame._native_history_authority_ui(snapshot, owner)[0] == 200
+    frame._native_history_reserved.add(owner)
+    changed = independent.merge_native_history(snapshot, expected_chat_id=owner, expected_revision=revision)
+    saved = independent.load_turns(owner)
+    assert saved[2] == turns[2]
+    frame._publish_native_history_ui(owner, changed, saved, snapshot)
+    wx_app.ProcessPendingEvents()
+    if evidence == "explicit":
+        assert entered.wait(2)
+        assert prompts == [("Second", ["done", "done", "pending"])]
+    else:
+        assert owner not in frame._agy_busy
+        assert not prompts
+        assert saved[1] == first
 
 
 @pytest.mark.parametrize("precommit", [False, True])

@@ -622,25 +622,29 @@ class AgySessionsMixin:
         changed = any(settings.get(key) != previous.get(key) for key in ("model", "effort"))
         return settings, queued or bool(run and changed)
 
+    def _schedule_next_agy_tool_turn(self, chat_id, turns):
+        if any(turn.get("model") == AGY_MODEL_ID and turn.get("request_status") == "queued" for turn in turns):
+            self._call_after_if_alive(self._launch_next_agy_tool_turn, chat_id)
+
     def _launch_next_agy_tool_turn(self, chat_id):
         chat, turns, current = self._chat_target_for_request(chat_id)
         if (not chat or getattr(self, "_closing", False) or self._clear_pending_for(chat_id)
-                or chat_id in self._agy_busy):
+                or chat.get("native_unresolved_turn") or chat_id in self._agy_busy
+                or chat_id in self._native_history_reserved or chat_id in self._chat_turn_dirty_from):
             return
         for index, turn in enumerate(turns):
-            if turn.get("model") != AGY_MODEL_ID or turn.get("request_status") != "queued":
+            if turn.get("model") != AGY_MODEL_ID:
                 continue
-            turn["request_status"] = "pending"
-            self._mark_chat_turns_dirty(chat_id, index)
-            if current:
-                self.is_running = True
-                self._active_request_count = 1
-                self.SetStatusText("正在发送排队的问题")
+            status = turn.get("request_status")
+            if status in {"pending", "running", "unknown"}:
+                return
+            if status != "queued":
+                continue
             try:
-                self._start_agy_worker_for_turn(chat_id, index, turn["request_question"], AGY_MODEL_ID)
+                self._start_agy_worker_for_turn(chat_id, index, turn["request_question"], AGY_MODEL_ID, queued=True)
             except (AgyError, RuntimeError) as exc:
-                self._on_done(index, "", str(exc), AGY_MODEL_ID, "", chat_id)
-            self._defer_chat_state_save()
+                if current:
+                    self.SetStatusText(str(exc))
             return
 
     def _agy_attachment_context(self, chat, turns):
@@ -662,7 +666,7 @@ class AgySessionsMixin:
             raise
 
     def _start_agy_worker_for_turn(self, chat_id: str, turn_idx: int, question: str, model: str, *,
-                                   prepared_attachments=None) -> None:
+                                   prepared_attachments=None, queued=False) -> None:
         chat, turns, _ = self._chat_target_for_request(chat_id)
         cwd = str(chat["agy_workspace"])
         session_id = self._agy_session_id_for_chat(chat)
@@ -672,8 +676,7 @@ class AgySessionsMixin:
         config = dict(chat.get("agy_config") or {})
         turn = turns[turn_idx]
         settings = turn.get("tool_settings")
-        turn["request_recoverable"] = False
-        turn["request_resume_token"] = {"session_id": session_id}
+        queued_turn = dict(turn) if queued else None
         run = AgyRun(turn_idx, self._bind_provider_turn(chat_id, turn_idx), self._agy_chat_scope(chat),
                      settings or self._agy_prior_tool_settings(chat))
         if prepared_attachments is not None:
@@ -683,7 +686,11 @@ class AgySessionsMixin:
         durable_scope = dict(zip(AGY_CHAT_SCOPE_FIELDS, run.scope))
         revision = max(1, int(chat.get("revision") or 1))
         pair_id = self._read_pair_id()
-        submitted_turn = dict(turn)
+        submitted_turn = dict(turn, request_recoverable=False, request_resume_token={"session_id": session_id})
+        if queued:
+            submitted_turn.update(request_status="pending", agy_queue_claimed=True)
+        else:
+            turn.update(submitted_turn)
         observed_ids = {}
         context = None
         usage_owner = agy_usage_owner(chat)
@@ -733,12 +740,26 @@ class AgySessionsMixin:
         def on_interaction(interaction_id, method, params):
             enqueue("interaction", ("agy-" + interaction_id, method, params))
 
-        def finish(active_client, answer, reason, error, result_unknown, terminal):
+        def publish_claim():
+            current_chat, current_turns, current = self._chat_target_for_request(chat_id)
+            if self._agy_run_for_chat(current_chat) is run:
+                current_turns[turn_idx].update(submitted_turn)
+                self._invalidate_remote_state_cache()
+                if current:
+                    self.is_running = True
+                    self._active_request_count = 1
+                    self.SetStatusText("正在发送排队的问题")
+
+        def finish(active_client, answer, reason, error, result_unknown, terminal, claim_error):
             current_chat, current_turns, _ = self._chat_target_for_request(chat_id)
             owns = self._agy_run_for_chat(current_chat) is run
             if self._agy_busy.get(chat_id) is run:
                 self._agy_busy.pop(chat_id)
             self._dismiss_agy_dialog(run)
+            if claim_error:
+                if owns and self._visible_clear_owner() == chat_id:
+                    self.SetStatusText(claim_error)
+                return
             if run.terminal_rejected:
                 if active_client is not None:
                     active_client.close()
@@ -782,15 +803,28 @@ class AgySessionsMixin:
                 self._refresh_agy_chat_information(current_chat)
                 if error and self._visible_clear_owner() == chat_id:
                     self.SetStatusText(error)
-                if not result_unknown:
-                    self._launch_next_agy_tool_turn(chat_id)
-
         def work():
             active_client = prepared_attachments.client if prepared_attachments is not None else client
             reason = error = ""
             result_unknown = False
             terminal = None
+            claim_error = ""
             try:
+                if queued:
+                    try:
+                        claimed = store.claim_agy_queued_turn(
+                            chat_id, turn_idx, durable_scope, revision, queued_turn, submitted_turn,
+                        )
+                        if not claimed:
+                            run.saved_chat = store.load_chat(chat_id, include_execution_steps=False)
+                    except sqlite3.Error:
+                        claim_error = "无法确认排队问题的保存状态，请重新打开聊天。"
+                        return
+                    if not claimed:
+                        run.terminal_rejected = True
+                        return
+                    if not self._call_after_if_alive(publish_claim):
+                        return
                 workspace = validate_workspace(cwd)
                 # Idle ACP processes do not see work accepted by a separate terminal.
                 if prepared_attachments is not None and client is not None and client is not active_client:
@@ -852,7 +886,7 @@ class AgySessionsMixin:
                     pending_timer.cancel()
                 flush()
                 if not self._call_after_if_alive(finish, active_client, "".join(full), reason, error,
-                                                result_unknown, terminal):
+                                                result_unknown, terminal, claim_error):
                     if active_client is not None:
                         active_client.close()
 

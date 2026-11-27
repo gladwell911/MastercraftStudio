@@ -1562,7 +1562,7 @@ class ChatRequestsMixin:
             elif resolved_model == AGY_MODEL_ID:
                 if agy_queued:
                     turn["request_status"] = "queued"
-                    self._launch_next_agy_tool_turn(chat_id)
+                    self._bind_provider_turn(chat_id, turn_idx)
                     started = True
                 else:
                     started = self._start_agy_worker_for_turn(
