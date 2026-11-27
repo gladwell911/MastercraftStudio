@@ -235,7 +235,7 @@ class ChatHistoryMixin:
         if self.active_chat_id or self.current_chat_id or self.active_session_turns:
             active = self._slim_active_chat_state() if active_snapshot is None else active_snapshot
             active_id = str(active.get("id") or self.active_chat_id or self.current_chat_id or "").strip()
-            if active_id and active_id not in pending_clear:
+            if active_id and active_id not in pending_clear and not self._agy_terminal_write_rejected(active_id):
                 active["id"] = active_id
                 active["turns"] = self.active_session_turns if isinstance(self.active_session_turns, list) else []
                 state = self._current_chat_state if isinstance(getattr(self, "_current_chat_state", None), dict) else {}
@@ -248,7 +248,7 @@ class ChatHistoryMixin:
             if not isinstance(chat, dict):
                 continue
             chat_id = str(chat.get("id") or "").strip()
-            if not chat_id or chat_id in pending_clear:
+            if not chat_id or chat_id in pending_clear or self._agy_terminal_write_rejected(chat_id):
                 continue
             store.upsert_chat(chat)
             if isinstance(chat.get("turns"), list):
@@ -265,7 +265,7 @@ class ChatHistoryMixin:
                       "turns": self.active_session_turns,
                       "execution_steps": self._current_chat_state.get("execution_steps", [])}
         rows = [chat for chat in ([active] if active else []) + list(self.archived_chats)
-                if isinstance(chat, dict) and chat.get("id")]
+                if isinstance(chat, dict) and chat.get("id") and not self._agy_terminal_write_rejected(chat["id"])]
         return (
             self.chat_store if self._chat_store_enabled else None,
             self.state_path, data, copy.deepcopy(tuple(rows)), dict(self._chat_turn_dirty_from),
@@ -1362,7 +1362,7 @@ class ChatHistoryMixin:
             return
         if not getattr(self, "_chat_state_flush_dirty", False):
             return
-        if getattr(self, "_kimi_execution_write_counts", None):
+        if getattr(self, "_kimi_execution_write_counts", None) or getattr(self, "_agy_terminal_writes", 0):
             return
         self._chat_state_flush_dirty = False
         self._save_state()

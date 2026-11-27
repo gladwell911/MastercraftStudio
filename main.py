@@ -717,6 +717,7 @@ class ChatFrame(
         self._codex_ui_event_lock = threading.Lock()
         self._close_admission_lock = threading.Lock()
         self._accepted_background_callbacks = 0
+        self._agy_terminal_writes = 0
         self._codex_ui_event_flush_scheduled = False
         self._codex_ui_event_drain_timer = None
         self._pending_kimi_ui_events: list[tuple[str, CodexEvent]] = []
@@ -1572,7 +1573,7 @@ class ChatFrame(
             execution_pending = (self._execution_step_persist_worker_running
                                  or bool(self._pending_execution_step_persists))
         with self._close_admission_lock:
-            background_pending = self._accepted_background_callbacks
+            background_pending = self._accepted_background_callbacks or self._agy_terminal_writes
         pending = (background_pending or execution_pending or getattr(self, "_pending_kimi_ui_events", None)
                    or getattr(self, "_pending_codex_ui_events", None)
                    or getattr(self, "_kimi_execution_write_counts", None)

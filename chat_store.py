@@ -1143,11 +1143,55 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             self._insert_clear_fact_conn(conn, pair[0], "events", f"delete-{chat_id}", chat_id,
                 revision, "deleted", kind="chat_deleted")
 
+    def commit_agy_terminal(self, chat_id, index, scope, revision, turn, terminal):
+        """Commit the original accepted turn before reporting a known AGY result."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            chat = conn.execute(
+                "SELECT c.model,c.metadata_json,COALESCE(s.revision,1) AS revision "
+                "FROM chats c LEFT JOIN v2_chat_state s ON s.chat_id=c.id "
+                "WHERE c.id=? AND NOT EXISTS (SELECT 1 FROM meta WHERE key=?)",
+                (chat_id, f"deleted-chat:{chat_id}"),
+            ).fetchone()
+            if chat is None or chat["revision"] != revision:
+                return False
+            saved_scope = dict(self._metadata_from_row(chat), model=chat["model"])
+            if any(saved_scope.get(key) != value for key, value in scope.items()):
+                return False
+            row = conn.execute("SELECT payload_json FROM turns WHERE chat_id=? AND turn_index=?",
+                               (chat_id, index)).fetchone()
+            existing = self._json_dict(row["payload_json"]) if row is not None else {}
+            token = turn.get("_provider_request_id")
+            if not token or (row is not None and existing.get("_provider_request_id") != token):
+                return False
+            if row is None and conn.execute(
+                "SELECT COALESCE(MAX(turn_index)+1,0) FROM turns WHERE chat_id=?", (chat_id,),
+            ).fetchone()[0] != index:
+                return False
+            if existing.get("request_status") not in (None, "", "pending"):
+                return all(existing.get(key) == value for key, value in terminal.items())
+            settled = dict(turn, **existing)
+            settled.update(terminal)
+            conn.execute(
+                "INSERT INTO turns(chat_id,turn_index,payload_json) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id,turn_index) DO UPDATE SET payload_json=excluded.payload_json",
+                (chat_id, index, json.dumps(settled, ensure_ascii=False)),
+            )
+            self._backfill_canonical_turns_conn(conn, chat_id, [settled], index)
+            return True
+
+    @staticmethod
+    def _keep_agy_terminal(old, new):
+        return (isinstance(new, dict) and old.get("agy_native_terminal_reason") in ("end_turn", "cancelled")
+                and new.get("request_status") == "pending"
+                and old.get("_provider_request_id") == new.get("_provider_request_id"))
+
     def replace_turns(self, chat_id: str, turns: list[dict[str, Any]]) -> None:
         normalized = str(chat_id or "").strip()
         if not normalized:
             return
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._replace_turns_conn(conn, normalized, turns)
 
     def _replace_turns_conn(self, conn, normalized, turns):
@@ -1156,7 +1200,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
                     for row in conn.execute("SELECT turn_index,payload_json FROM turns WHERE chat_id=?", (normalized,))}
         for index, turn in enumerate(incoming):
             old = existing.get(index)
-            if old is not None and not self._same_canonical_turn(old, turn):
+            if old is not None and self._keep_agy_terminal(old, turn):
+                incoming[index] = old
+            elif old is not None and not self._same_canonical_turn(old, turn):
                 conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
                 conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
         conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index>=?", (normalized,len(incoming)))
@@ -1177,8 +1223,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
         if not normalized:
             return
         start = max(0, self._int_or(start_index, 0))
-        suffix = turns or []
+        suffix = list(turns or [])
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if attachment_scope:
                 updated = conn.execute(
                     "UPDATE remote_attachment_sends SET state='accepted' "
@@ -1194,7 +1241,9 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
             for offset, turn in enumerate(suffix):
                 index = start + offset
                 old = existing.get(index)
-                if isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
+                if old is not None and self._keep_agy_terminal(old, turn):
+                    suffix[offset] = old
+                elif isinstance(turn, dict) and old is not None and not self._same_canonical_turn(old, turn):
                     conn.execute("DELETE FROM canonical_messages WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
                     conn.execute("DELETE FROM canonical_turns WHERE chat_id=? AND legacy_turn_index=?", (normalized,index))
             end = start + len(suffix)

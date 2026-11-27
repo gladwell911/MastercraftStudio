@@ -1,6 +1,7 @@
 """Workspace selection, session ownership, and chat delivery for AGY."""
 
 from dataclasses import dataclass, field
+import sqlite3
 import threading
 import time
 import uuid
@@ -17,6 +18,10 @@ from agy_execution import AgyExecution, interaction_questions, interaction_resul
 from native_history import NativeSessionIdentity
 
 
+AGY_CHAT_SCOPE_FIELDS = ("model", "agy_session_id", "agy_native_owner", "native_identity",
+                         "native_account", "agy_workspace")
+
+
 @dataclass
 class AgyRun:
     turn_idx: int
@@ -31,6 +36,8 @@ class AgyRun:
     interactions: dict = field(default_factory=dict)
     accepted_actions: dict = field(default_factory=dict)
     dialog: wx.Dialog | None = None
+    terminal_rejected: bool = False
+    saved_chat: dict | None = None
 
     def __post_init__(self):
         self.action_id = self.turn_id
@@ -66,14 +73,17 @@ class AgySessionsMixin:
 
     @staticmethod
     def _agy_chat_scope(chat):
-        return tuple(chat.get(key) for key in
-                     ("model", "agy_session_id", "agy_native_owner", "native_identity", "native_account", "agy_workspace"))
+        return tuple(chat.get(key) for key in AGY_CHAT_SCOPE_FIELDS)
 
     def _agy_run_for_chat(self, chat):
         if not isinstance(chat, dict):
             return None
         run = self._agy_busy.get(chat.get("id"))
         return run if run and run.scope == self._agy_chat_scope(chat) and run.owns_turn() else None
+
+    def _agy_terminal_write_rejected(self, owner):
+        run = self._agy_busy.get(owner)
+        return run is not None and run.terminal_rejected
 
     def _agy_workspace_preference_key(self) -> str:
         return f"agy-workspace:{self._read_pair_id()}"
@@ -275,6 +285,12 @@ class AgySessionsMixin:
         if prepared_attachments is not None:
             prepared_attachments.adopt(run.scope)
         self._agy_busy[chat_id] = run
+        store = self.chat_store
+        durable_scope = dict(zip(AGY_CHAT_SCOPE_FIELDS, run.scope))
+        revision = max(1, int(chat.get("revision") or 1))
+        pair_id = self._read_pair_id()
+        submitted_turn = dict(turn)
+        observed_ids = {}
         client = self._agy_clients.get(chat_id)
         full = []
         batch = []
@@ -314,6 +330,7 @@ class AgySessionsMixin:
                 elif kind == "agent_message_chunk":
                     native_ids["agy_observed_message_id"] = message_id
             if native_ids:
+                observed_ids.update(native_ids)
                 enqueue("native_ids", native_ids)
             if kind == "agent_message_chunk":
                 content = update.get("content") or {}
@@ -327,21 +344,33 @@ class AgySessionsMixin:
         def on_interaction(interaction_id, method, params):
             enqueue("interaction", ("agy-" + interaction_id, method, params))
 
-        def finish(active_client, answer, reason, error, result_unknown):
+        def finish(active_client, answer, reason, error, result_unknown, terminal):
             current_chat, current_turns, _ = self._chat_target_for_request(chat_id)
             owns = self._agy_run_for_chat(current_chat) is run
             if self._agy_busy.get(chat_id) is run:
                 self._agy_busy.pop(chat_id)
             self._dismiss_agy_dialog(run)
+            if run.terminal_rejected:
+                if active_client is not None:
+                    active_client.close()
+                if owns:
+                    self._restore_after_rejected_agy_terminal(chat_id, current_chat, current_turns, run.saved_chat)
+                return
             if active_client is not None:
                 if owns:
                     self._agy_clients[chat_id] = active_client
                 else:
                     active_client.close()
             if owns:
-                if reason == "cancelled":
-                    current_turns[turn_idx].update(request_status="cancelled", request_error="AGY 回合已停止。")
-                    error = "AGY 回合已停止。"
+                if terminal:
+                    current_turns[turn_idx].update(
+                        agy_native_terminal_reason=reason, terminal_notification_pair=pair_id,
+                    )
+                    if reason == "end_turn":
+                        current_turns[turn_idx]["answer_at"] = terminal["answer_at"]
+                    else:
+                        current_turns[turn_idx].update(request_status="cancelled", request_error=terminal["request_error"])
+                        error = terminal["request_error"]
                 elif reason != "end_turn" and not error:
                     error = f"AGY 回合已结束：{reason or '缺少终态'}"
                 turn = current_turns[turn_idx]
@@ -359,6 +388,7 @@ class AgySessionsMixin:
             active_client = prepared_attachments.client if prepared_attachments is not None else client
             reason = error = ""
             result_unknown = False
+            terminal = None
             try:
                 workspace = validate_workspace(cwd)
                 # Idle ACP processes do not see work accepted by a separate terminal.
@@ -388,6 +418,11 @@ class AgySessionsMixin:
                     attachments=prepared_attachments.blocks if prepared_attachments is not None else (),
                 )
                 reason = run.prompt.wait()
+                if reason in ("end_turn", "cancelled"):
+                    terminal = self._commit_agy_terminal(
+                        store, chat_id, run, durable_scope, revision,
+                        submitted_turn, observed_ids, "".join(full), reason, pair_id,
+                    )
             except AgyError as exc:
                 result_unknown = isinstance(exc, AgyResultUnknown)
                 error = str(exc)
@@ -395,12 +430,17 @@ class AgySessionsMixin:
                     active_client.close()
                     active_client = None
             finally:
+                if reason in ("end_turn", "cancelled") and terminal is None and not run.terminal_rejected:
+                    error = ("AGY 已完成，但本地保存未确认。" if reason == "end_turn"
+                             else "AGY 已取消，但本地保存未确认。")
+                    result_unknown = True
                 with lock:
                     pending_timer = timer
                 if pending_timer is not None:
                     pending_timer.cancel()
                 flush()
-                if not self._call_after_if_alive(finish, active_client, "".join(full), reason, error, result_unknown):
+                if not self._call_after_if_alive(finish, active_client, "".join(full), reason, error,
+                                                result_unknown, terminal):
                     if active_client is not None:
                         active_client.close()
 
@@ -412,6 +452,59 @@ class AgySessionsMixin:
             if prepared_attachments is not None and prepared_attachments.fresh_client:
                 prepared_attachments.client.close()
             raise
+
+    def _restore_after_rejected_agy_terminal(self, chat_id, chat, turns, saved):
+        self._chat_turn_dirty_from.pop(chat_id, None)
+        visible = self._visible_clear_owner() == chat_id
+        active = chat_id == self.active_chat_id
+        if saved is None:
+            self._discard_deleted_chat_view(chat_id)
+        else:
+            turns[:] = saved["turns"]
+            chat.clear()
+            chat.update(saved, turns=turns)
+        if active:
+            self.is_running = False
+            self._active_request_count = 0
+            self.new_chat_button.Enable()
+            self._set_input_hint_idle()
+        self._invalidate_remote_state_cache()
+        if visible:
+            self._render_answer_list()
+            self.SetStatusText("原聊天已变更，请查看已保存的记录。")
+
+    def _commit_agy_terminal(self, store, chat_id, run, scope, revision, turn, native_ids, answer, reason, pair_id):
+        cancelled = reason == "cancelled"
+        error = "AGY 回合已停止。" if cancelled else ""
+        terminal = dict(native_ids, agy_native_terminal_reason=reason, terminal_notification_pair=pair_id,
+                        request_status="cancelled" if cancelled else "done",
+                        request_error=error, request_recovered_after_restart=False,
+                        answer_md=error if cancelled else (answer if answer.strip() else "未返回任何内容。"))
+        if not cancelled:
+            terminal["answer_at"] = time.time()
+            if native_ids.get("agy_observed_message_id"):
+                terminal["provider_message_id"] = native_ids["agy_observed_message_id"]
+        with self._close_admission_lock:
+            if getattr(self, "_close_producer_fenced", False):
+                return None
+            self._agy_terminal_writes += 1
+        try:
+            for _ in range(2):
+                try:
+                    if store.commit_agy_terminal(chat_id, run.turn_idx, scope, revision, turn, terminal):
+                        return terminal
+                    run.terminal_rejected = True
+                    run.saved_chat = store.load_chat(chat_id, include_execution_steps=False)
+                    return None
+                except sqlite3.OperationalError:
+                    continue
+                except (sqlite3.Error, ValueError):
+                    return None
+            return None
+        finally:
+            with self._close_admission_lock:
+                self._agy_terminal_writes -= 1
+            self._schedule_close_progress()
 
     def _deliver_agy_events(self, chat_id, run, batch):
         chat, turns, _ = self._chat_target_for_request(chat_id)
