@@ -65,6 +65,8 @@
 
 ## 通知流部署核实
 
+- 对历史通知策略变更，使用混合所有权的旧快照和两条 outbox 发布路径，核对可见通知筛选、控制事实保留、发布前沿与设备处理水位。
+
 - 源码、构建文件、安装进程和数据库身份分别核对。可从实际 PyInstaller PYZ 检查 capability/表实现；再比对手机协商的 feed 与运行库 meta。更晚的构建时间不证明包含某提交，较低序列也不证明应重置身份。
 - 诊断按同一事件拆分 durable/outbox、received/ACK、gate、NotificationManager posted 与系统可见；terminal 在 gate 前 ACK，不能把它报告为已经通知。正常已读取消也不应当作投递失败。
 - 独立 frozen MC 的父目录决定 history 和单实例键；测试 OneDrive、token、显式 NATS TCP 端口均隔离，并启动后核 WebSocket 实际监听 owner。清理只按自有 PID 与完整路径，不按进程名。

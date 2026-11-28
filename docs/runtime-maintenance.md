@@ -12,7 +12,7 @@
 
 | 内容 | 当前策略 |
 |---|---|
-| `history/chat_history.db` 的 `publication_outbox` | `publication_progress` 独立保存 pair/domain 发布前沿。已发布、无阻塞且不超过前沿的副本，至少保留七天后才可清理；权威 `durable_facts`、聊天、已读和通知恢复数据保留。 |
+| `history/chat_history.db` 的 `publication_outbox` | `publication_progress` 独立保存 pair/domain 发布前沿。已确认发布或按终端通知策略跳过、无阻塞且不超过前沿的副本，至少保留七天后才可清理；权威 `durable_facts`、聊天、已读和通知恢复数据保留。 |
 | 一次维护的工作量 | 默认先检查至多500条安全候选，硬上限1000，再筛年龄；近期前缀可能延后后面的旧记录。争锁立即退让，不执行VACUUM。删除释放内部页，不保证文件立即缩小。 |
 | 自动维护 | 活跃发布worker在取批次前检查，最多每300秒处理一个domain的一批，无新增轮询线程。没有worker活动就不清理；这不是数据库总容量上限。 |
 | MC拥有的NATS、Cloudflared日志 | 持续读取管道并轮转，每个日志5 MiB加3个备份。启动时旧超大自有日志保留有界尾部；异常仍排空管道，现有诊断尾部显示安全计数 `log_write_failures=N`。 |

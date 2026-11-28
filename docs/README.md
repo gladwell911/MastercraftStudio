@@ -70,6 +70,8 @@
 - 普通 OpenRouter Claude 附件经过有界后台读取，提交时重验草稿归属。当前选中文件按模态编码，后续请求重放同一会话内可读取的附件，无法读取的历史附件用具名提示表示。
 - 手机端日常跨端回归使用 RC 的 `scripts/run_cross_client_regression.ps1 -Mode Local`；本仓库的 `scripts/nats_e2e_desktop_harness.py` 只提供隔离 strict-V2 fixture。真实 Cloudflare/NATS 与 Codex/Kimi provider 只能由 `-Mode Live` 验证。
 
+配套升级 MC 与 RC 后，纯终端通知停止新建和积压重放。MC 自建聊天关联原生会话后仍可通知。见 [恢复与迁移](remote-slim-protocol.md#recovery-and-migration)。
+
 ## 历史归档
 
 - [语音收尾前交接快照](archive/handoff-before-voice-local-first-2026-11-10.md)：保留原下载/通知/FRP细节与私有证据路径，归档链接已按新位置调整。
