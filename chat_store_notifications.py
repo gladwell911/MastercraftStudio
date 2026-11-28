@@ -10,9 +10,19 @@ from chat_store_execution import _DISCLOSABLE_EXECUTION_FACT
 from native_history import allows_final_notification
 from chat_store_schema import MAX_INT64
 from typing import Any
+from remote_nats_protocol import NOTIFY_KINDS, compact_notification
+
+
+USER_VISIBLE_NOTIFICATION_KINDS = frozenset({"assistant_final", "user_message", "action_required", "failed"})
 
 
 class ChatStoreNotificationsMixin:
+    def _is_terminal_history_chat_conn(self, conn: sqlite3.Connection, chat_id: str) -> bool:
+        return conn.execute(
+            f"SELECT 1 FROM chats c WHERE c.id=? AND NOT ({self._mc_owned_history_filter})",
+            (chat_id,),
+        ).fetchone() is not None
+
     def commit_durable_fact(self, *, pair_id: str, domain: str, envelope: dict[str, Any],
                             execution: bool = False, publication_deadline: float | None = None) -> dict[str, Any]:
         """Atomically store an immutable fact and its byte-stable publication row."""
@@ -50,6 +60,8 @@ class ChatStoreNotificationsMixin:
                     conn.rollback()
                     raise TimeoutError("file_preparation_timeout")
             check_publication_deadline()
+            if kind in USER_VISIBLE_NOTIFICATION_KINDS and self._is_terminal_history_chat_conn(conn, owner):
+                raise ValueError("TERMINAL_HISTORY_NOTIFICATION")
             if event_id.startswith("projection:"):
                 message_id = str((envelope.get("body") or {}).get("message_id") or "").strip()
                 projection_kind = str((envelope.get("body") or {}).get("kind") or "").strip()
@@ -115,9 +127,14 @@ class ChatStoreNotificationsMixin:
         owner = self.normalize_chat_id(chat_id)
         state = self.get_chat_read_state(owner, pair_id=pair_id)
         with self._connect() as conn:
-            row = conn.execute("SELECT title FROM chats WHERE id=?", (owner,)).fetchone()
+            row = conn.execute(
+                f"SELECT title, ({self._mc_owned_history_filter}) AS mc_owned FROM chats c WHERE c.id=?",
+                (owner,),
+            ).fetchone()
         if row is None:
             raise ValueError("CHAT_NOT_FOUND")
+        if not row["mc_owned"]:
+            raise ValueError("TERMINAL_HISTORY_NOTIFICATION")
         event_id = "attention:" + hashlib.sha256(json.dumps(
             [pair_id, owner, state["generation"], kind, operation_id], separators=(",", ":")).encode()).hexdigest()
         # Retries return the immutable original, including its original title.
@@ -192,7 +209,8 @@ class ChatStoreNotificationsMixin:
                 or expected_role is None or "\x00" in normalized_pair + normalized_domain):
             raise ValueError("INVALID_NOTIFICATION_FACT")
         row = conn.execute(
-            "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index,t.payload_json,c.title "
+            "SELECT cm.chat_id,cm.role,cm.turn_id,cm.legacy_turn_index,t.payload_json,c.title,"
+            f" ({self._mc_owned_history_filter}) AS mc_owned "
             "FROM canonical_messages cm "
             "JOIN turns t ON t.chat_id=cm.chat_id AND t.turn_index=cm.legacy_turn_index "
             "JOIN chats c ON c.id=cm.chat_id WHERE cm.message_id=?",
@@ -200,6 +218,8 @@ class ChatStoreNotificationsMixin:
         ).fetchone()
         if row is None or str(row["chat_id"]) != owner or str(row["role"]) != expected_role:
             raise ValueError("STALE_CANONICAL_NOTIFICATION")
+        if not row["mc_owned"]:
+            raise ValueError("TERMINAL_HISTORY_NOTIFICATION")
         turn = self._json_dict(row["payload_json"])
         canonical_text = str(turn.get("question" if expected_role == "user" else "answer_md") or "")
         normalized_origin = str(origin_client or "mc").strip().lower()
@@ -308,7 +328,6 @@ class ChatStoreNotificationsMixin:
         authenticated and bound to the original installation and stream incarnation.
         Only an explicit completion receipt advances the installation checkpoint.
         """
-        from remote_nats_protocol import compact_notification, NOTIFY_KINDS
         pair, device = str(pair_id).strip(), str(device_id).strip()
         if not pair or not device or not incarnation or isinstance(baseline, bool) or not 0 <= int(baseline) <= MAX_INT64:
             raise ValueError("INVALID_NOTIFICATION_SCOPE")
@@ -317,12 +336,6 @@ class ChatStoreNotificationsMixin:
             raise ValueError("STALE_NOTIFICATION_FEED")
         page_limit = max(1, min(100, int(limit)))
         with self._connect() as conn:
-            if "authority_high" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
-                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN authority_high INTEGER NOT NULL DEFAULT 0")
-            if "processed_floor" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
-                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN processed_floor INTEGER NOT NULL DEFAULT 0")
-            if "read_only" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
-                conn.execute("ALTER TABLE notification_snapshots ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0")
             # Expire abandoned and completed snapshots equally. A reset never
             # advances the installation checkpoint, so all eligible facts remain.
             expired = "SELECT snapshot_id FROM notification_snapshots WHERE created_at<? OR snapshot_id NOT IN (SELECT snapshot_id FROM notification_snapshots ORDER BY created_at DESC,rowid DESC LIMIT 32)"
@@ -351,15 +364,27 @@ class ChatStoreNotificationsMixin:
                 source.execute("BEGIN")
                 high_water = int(source.execute("SELECT COALESCE(MAX(sync_sequence),0) FROM durable_facts WHERE pair_id=?", (pair,)).fetchone()[0])
                 authority_high = int(source.execute("SELECT revision FROM authority_cache_revision WHERE singleton=1").fetchone()[0])
-                reusable = source.execute("SELECT * FROM notification_snapshots WHERE pair_id=? AND device_id=? AND incarnation=? AND feed_id=? AND ((?=1 AND authority_high=?) OR (?=0 AND high_water=?)) AND read_only=? AND row_count>=0 AND (?=1 OR (completed=0 AND processed_floor=?)) ORDER BY created_at DESC LIMIT 1", (pair, device, incarnation, feed, int(read_only), authority_high, int(read_only), high_water, int(read_only), int(read_only), processed_floor)).fetchone()
+                reusable = source.execute("SELECT * FROM notification_snapshots WHERE pair_id=? AND device_id=? AND incarnation=? AND feed_id=? AND ((?=1 AND authority_high=?) OR (?=0 AND high_water=?)) AND read_only=? AND (read_only=1 OR ownership_filtered=1) AND row_count>=0 AND (?=1 OR (completed=0 AND processed_floor=?)) ORDER BY created_at DESC LIMIT 1", (pair, device, incarnation, feed, int(read_only), authority_high, int(read_only), high_water, int(read_only), int(read_only), processed_floor)).fetchone()
                 snapshot_id, offset = (str(reusable["snapshot_id"]) if reusable else uuid.uuid4().hex), 0
                 if reusable is None:
                     with self._connect() as writer:
-                        writer.execute("INSERT INTO notification_snapshots(snapshot_id,pair_id,device_id,high_water,incarnation,row_count,read_only,processed_floor,authority_high,feed_id) VALUES(?,?,?,?,?,-1,?,?,?,?)", (snapshot_id, pair, device, high_water, incarnation, int(read_only), processed_floor, authority_high, feed))
+                        writer.execute("INSERT INTO notification_snapshots(snapshot_id,pair_id,device_id,high_water,incarnation,row_count,read_only,processed_floor,authority_high,feed_id,ownership_filtered) VALUES(?,?,?,?,?,-1,?,?,?,?,1)", (snapshot_id, pair, device, high_water, incarnation, int(read_only), processed_floor, authority_high, feed))
                     def records():
                         placeholders = ",".join("?" for _ in NOTIFY_KINDS)
+                        visible_kinds = ",".join("?" for _ in USER_VISIBLE_NOTIFICATION_KINDS)
                         if not read_only:
-                            for row in source.execute(f"SELECT envelope_json FROM durable_facts WHERE pair_id=? AND sync_sequence>? AND sync_sequence<=? AND kind IN ({placeholders}) ORDER BY sync_sequence", (pair, processed_floor, high_water, *sorted(NOTIFY_KINDS))):
+                            # Capture the original H above so omitted facts still
+                            # advance the installation checkpoint on completion.
+                            for row in source.execute(
+                                "SELECT fact.envelope_json FROM durable_facts fact "
+                                "LEFT JOIN chats c ON c.id=fact.chat_id "
+                                "WHERE fact.pair_id=? AND fact.sync_sequence>? AND fact.sync_sequence<=? "
+                                f"AND fact.kind IN ({placeholders}) "
+                                f"AND (fact.kind NOT IN ({visible_kinds}) OR c.id IS NULL "
+                                f"OR ({self._mc_owned_history_filter})) ORDER BY fact.sync_sequence",
+                                (pair, processed_floor, high_water, *sorted(NOTIFY_KINDS),
+                                 *sorted(USER_VISIBLE_NOTIFICATION_KINDS)),
+                            ):
                                 fact = json.loads(row[0])
                                 current = source.execute("SELECT generation FROM read_generations WHERE chat_id=?", (fact["chat_id"],)).fetchone()
                                 exists = source.execute("SELECT 1 FROM chats WHERE id=?", (fact["chat_id"],)).fetchone()
@@ -382,10 +407,14 @@ class ChatStoreNotificationsMixin:
                         writer.execute("UPDATE notification_snapshots SET row_count=? WHERE snapshot_id=?", (count, snapshot_id))
         with self._connect() as conn:
             snapshot = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=?", (snapshot_id, pair, device)).fetchone()
-            if (snapshot is None or snapshot["incarnation"] != incarnation or snapshot["feed_id"] != feed or isinstance(offset, bool)
+            if (snapshot is None or bool(snapshot["read_only"]) != read_only
+                    or (not read_only and not snapshot["ownership_filtered"])
+                    or snapshot["incarnation"] != incarnation or snapshot["feed_id"] != feed or isinstance(offset, bool)
                     or not isinstance(offset, int) or not 0 <= offset <= snapshot["row_count"]):
                 raise ValueError("INVALID_NOTIFICATION_CURSOR")
             result = {"snapshot_id": snapshot_id, "high_water": int(snapshot["high_water"]), "incarnation": incarnation, "baseline": original_baseline, "records": []}
+            if not snapshot["read_only"]:
+                result["covers_notification_replay"] = True
             if feed:
                 result["notification_feed_id"] = feed
             # Reserve continuation/envelope overhead; UTF-8 byte accounting is the
@@ -416,7 +445,9 @@ class ChatStoreNotificationsMixin:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM notification_snapshots WHERE snapshot_id=? AND pair_id=? AND device_id=? AND incarnation=?", (receipt.get("snapshot_id"), pair_id, device_id, incarnation)).fetchone()
-            if row is None or row["feed_id"] != notification_feed_id or receipt.get("offset") != row["row_count"] or row["delivered_count"] != row["row_count"]:
+            if (row is None or row["read_only"] or not row["ownership_filtered"]
+                    or row["feed_id"] != notification_feed_id or receipt.get("offset") != row["row_count"]
+                    or row["delivered_count"] != row["row_count"]):
                 raise ValueError("INCOMPLETE_NOTIFICATION_SNAPSHOT")
             if notification_feed_id:
                 conn.execute("UPDATE notification_feed_devices SET processed_sequence=MAX(processed_sequence,?) WHERE pair_id=? AND device_id=? AND feed_id=?", (row["high_water"], pair_id, device_id, notification_feed_id))
@@ -439,7 +470,8 @@ class ChatStoreNotificationsMixin:
             sql = sql.replace("WHERE NOT EXISTS", "WHERE a.chat_id=? AND NOT EXISTS", 1)
             args = (chat_id, pair_id)
         candidates = conn.execute(
-            sql + " AND (COALESCE(json_extract(t.payload_json,'$.native_history'),0)=0"
+            sql + f" AND {self._mc_owned_history_filter}"
+            " AND (COALESCE(json_extract(t.payload_json,'$.native_history'),0)=0"
             " OR json_extract(t.payload_json,'$.native_final_notify_pair')=?)"
             " AND COALESCE(json_extract(t.payload_json,'$.terminal_final_pending'),0)=0"
             " AND COALESCE(NULLIF(json_extract(t.payload_json,'$.terminal_notification_pair'),''),?)=?"
@@ -629,6 +661,10 @@ class ChatStoreNotificationsMixin:
     def pending_outbox(self, limit: int = 100, *, pair_id: str | None = None,
                        domain: str | None = None, lane: str | None = None) -> list[dict[str, Any]]:
         where, args = "o.published_at IS NULL", []
+        visible_kinds = ",".join(f"'{kind}'" for kind in sorted(USER_VISIBLE_NOTIFICATION_KINDS))
+        terminal_notification = (
+            f"f.kind IN ({visible_kinds}) AND c.id IS NOT NULL AND NOT ({self._mc_owned_history_filter})"
+        )
         if pair_id is not None:
             where += " AND o.pair_id=?"; args.append(str(pair_id))
         if domain is not None:
@@ -639,11 +675,13 @@ class ChatStoreNotificationsMixin:
             where += (" AND f.kind='assistant_final'" if lane == "notification"
                       else " AND (f.kind IS NULL OR f.kind<>'assistant_final')")
             if lane == "notification":
-                where += " AND (o.blocked_reason IS NULL OR o.blocked_reason NOT LIKE 'permanent:%')"
+                where += f" AND (o.blocked_reason IS NULL OR o.blocked_reason NOT LIKE 'permanent:%' OR ({terminal_notification}))"
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT o.* FROM publication_outbox o LEFT JOIN durable_facts f "
-                f"ON f.event_id=o.event_id AND f.pair_id=o.pair_id AND f.domain=o.domain "
+                f"SELECT o.*, ({terminal_notification}) AS terminal_notification "
+                "FROM publication_outbox o LEFT JOIN durable_facts f "
+                "ON f.event_id=o.event_id AND f.pair_id=o.pair_id AND f.domain=o.domain "
+                "LEFT JOIN chats c ON c.id=f.chat_id "
                 f"WHERE {where} ORDER BY o.sync_sequence LIMIT ?",
                 tuple(args + [max(1, int(limit))]),
             ).fetchall()

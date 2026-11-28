@@ -40,6 +40,8 @@ CLEAR_TERMINAL_STATES = frozenset({
 
 
 class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExecutionMixin):
+    _mc_owned_history_filter = MC_OWNED_HISTORY
+
     def __init__(self, db_path: Path, *, max_execution_steps_per_turn: int = 500) -> None:
         self.db_path = Path(db_path)
         self.max_execution_steps_per_turn = int(max_execution_steps_per_turn)
@@ -1190,10 +1192,7 @@ class ChatStore(ChatStoreSchemaMixin, ChatStoreNotificationsMixin, ChatStoreExec
 
     def is_terminal_history_chat(self, chat_id: str) -> bool:
         with self._connect() as conn:
-            return conn.execute(
-                f"SELECT 1 FROM chats c WHERE c.id=? AND NOT ({MC_OWNED_HISTORY})",
-                (chat_id,),
-            ).fetchone() is not None
+            return self._is_terminal_history_chat_conn(conn, chat_id)
 
     def list_chat_summaries(self, *, mc_owned_only: bool = False) -> list[dict[str, Any]]:
         ownership = f"WHERE {MC_OWNED_HISTORY}" if mc_owned_only else ""

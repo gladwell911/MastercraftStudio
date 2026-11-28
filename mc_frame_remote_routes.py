@@ -269,6 +269,7 @@ class RemoteRoutesMixin:
         # V2 notifications are an immutable projection of durable turn state,
         # never of an early provider callback.  This also leaves the canonical
         # message id available until the actual final is persisted.
+        terminal_history = self._remote_terminal_history_chat(resolved_chat_id)
         if store is not None and turn_index is not None:
             turns = store.load_turns(resolved_chat_id)
             if turn_index < 0 or turn_index >= len(turns):
@@ -298,16 +299,17 @@ class RemoteRoutesMixin:
                     == resolved_chat_id
                     else self._chat_summary_by_id(resolved_chat_id)
                 )
-                store.commit_message_notification_fact(
-                    pair_id=transport.subjects.pair_id,
-                    domain="events",
-                    chat_id=resolved_chat_id,
-                    message_id=message_id,
-                    notification_kind="assistant_final",
-                    text=final_text,
-                    chat_title=str((chat_summary or {}).get("title") or "").strip(),
-                    origin_client="mc",
-                )
+                if not terminal_history:
+                    store.commit_message_notification_fact(
+                        pair_id=transport.subjects.pair_id,
+                        domain="events",
+                        chat_id=resolved_chat_id,
+                        message_id=message_id,
+                        notification_kind="assistant_final",
+                        text=final_text,
+                        chat_title=str((chat_summary or {}).get("title") or "").strip(),
+                        origin_client="mc",
+                    )
                 store.commit_message_execution_projection(
                     pair_id=transport.subjects.pair_id,
                     domain="events",
@@ -320,6 +322,8 @@ class RemoteRoutesMixin:
                     asyncio.run_coroutine_threadsafe(transport.drain_outbox(), loop)
                 return True
             except ValueError as exc:
+                if str(exc) == "TERMINAL_HISTORY_NOTIFICATION":
+                    return True
                 if str(exc) not in {"EVENT_ID_CONFLICT", "HISTORICAL_FINAL"}:
                     try:
                         store.quarantine(
@@ -328,6 +332,8 @@ class RemoteRoutesMixin:
                     except Exception:
                         pass
                 return False
+        if terminal_history:
+            return True
         self._publish_remote_nats_event(
             {
                 "type": "final_answer",

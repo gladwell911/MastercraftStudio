@@ -1138,3 +1138,99 @@ def test_actual_transport_feed_sync_and_read_write_authority(tmp_path):
         assert legacy["accepted"]
         await transport._close_async()
     asyncio.run(run())
+
+def test_mixed_terminal_backlog_skips_legacy_rows_and_preserves_mc_notifications(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "mixed-notifications.db")
+        store.initialize()
+        pair, secret = "default", "secret"
+        feed = store.get_meta("notification_feed_id")
+        scope = dict(pair_id=pair, device_id="phone", incarnation="broker", secret=secret,
+                     notification_feed_id=feed)
+
+        def append_final(chat_id, question):
+            turns = store.load_turns(chat_id)
+            turns.append({"question": question, "answer_md": f"Answer to {question}", "request_status": "done"})
+            store.replace_turns(chat_id, turns)
+            answer = store.readable_answer(chat_id, turn_index=len(turns) - 1)
+            return store.commit_message_notification_fact(pair_id=pair, domain="events", chat_id=chat_id,
+                message_id=answer["message_id"], notification_kind="assistant_final", text="", chat_title="")
+
+        # Seed the previous version's durable facts and in-progress snapshot.
+        for chat_id in ("native", "mc"):
+            store.upsert_chat({"id": chat_id, "title": chat_id})
+        old_mc_final = append_final("mc", "old MC question")
+        terminal_finals = [append_final("native", str(i)) for i in range(8)]
+        legacy = store.notification_sync(**scope, baseline=0, limit=1)
+        with store._connect() as conn:
+            conn.execute("UPDATE chats SET metadata_json=json_set(metadata_json,'$.native_identity','native') "
+                         "WHERE id IN ('native','mc')")
+            conn.execute("UPDATE notification_snapshots SET ownership_filtered=0 WHERE snapshot_id=?",
+                         (legacy["snapshot_id"],))
+            conn.execute("UPDATE publication_outbox SET blocked_reason='permanent:old fixture' WHERE event_id=?",
+                         (terminal_finals[0]["event_id"],))
+
+        with pytest.raises(ValueError, match="INVALID_NOTIFICATION_CURSOR"):
+            store.notification_sync(**scope, baseline=0, cursor=legacy["cursor"])
+        recovered = store.notification_sync(**scope, baseline=0)
+        assert recovered["done"] and recovered["covers_notification_replay"]
+        assert [r["event_id"] for r in recovered["records"] if r.get("kind") == "assistant_final"] == [
+            old_mc_final["event_id"]]
+        assert recovered["high_water"] == terminal_finals[-1]["sync_sequence"]
+        assert store.complete_notification_sync(**scope, completion_token=recovered["completion_token"]) == recovered["high_water"]
+
+        with pytest.raises(ValueError, match="TERMINAL_HISTORY_NOTIFICATION"):
+            append_final("native", "new terminal question")
+        with pytest.raises(ValueError, match="TERMINAL_HISTORY_NOTIFICATION"):
+            store.commit_attention_notification(pair_id=pair, chat_id="native", kind="failed",
+                operation_id="terminal-error", text="Terminal error")
+        fresh = append_final("mc", "new MC question")
+
+        broker = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id=pair, token=secret, jetstream=broker, durable_store=store)
+        transport._nats_client = FakeJetStream()
+        assert (await transport._drain_outbox_lane("notification"))[0] == 2
+        assert [json.loads(payload)["event_id"] for _, payload in broker.published] == [
+            old_mc_final["event_id"], fresh["event_id"]]
+        assert not store.pending_outbox(pair_id=pair, lane="notification")
+        assert store.get_checkpoint(f"publisher:{pair}", "events") == fresh["sync_sequence"]
+
+        next_page = store.notification_sync(**scope, baseline=0)
+        assert [r["event_id"] for r in next_page["records"] if r.get("kind") == "assistant_final"] == [
+            fresh["event_id"]]
+        body = fresh["body"]
+        store.mark_chat_read(pair_id=pair, chat_id="mc", generation=body["generation"],
+                            answer_seq=body["answer_seq"], message_id=body["message_id"], operation_id="read-mc-final")
+        assert store.get_chat_read_state("mc", pair_id=pair)["read_seq"] == body["answer_seq"]
+
+    asyncio.run(run())
+
+def test_other_outbox_skips_terminal_attention_and_publishes_control_fact(tmp_path):
+    async def run():
+        store = ChatStore(tmp_path / "terminal-attention.db")
+        store.initialize()
+        pair = "default"
+        store.upsert_chat({"id": "native", "title": "Native"})
+        terminal = [
+            store.commit_attention_notification(pair_id=pair, chat_id="native",
+                kind=kind, operation_id=kind, text="Old terminal attention")
+            for kind in ("action_required", "failed")
+        ]
+        with store._connect() as conn:
+            conn.execute("UPDATE chats SET metadata_json=json_set(metadata_json,'$.native_identity',id) WHERE id='native'")
+            conn.execute("UPDATE publication_outbox SET blocked_reason='permanent:old fixture' WHERE event_id=?",
+                         (terminal[0]["event_id"],))
+        control = store.commit_durable_fact(pair_id=pair, domain="events", envelope={
+            "event_id": "native-clear", "kind": "clear_context", "chat_id": "native",
+            "body": {"operation_id": "clear", "state": "completed_clear_only"},
+        })
+
+        broker = FakeJetStream()
+        transport = RemoteNatsTransport(pair_id=pair, token="secret", jetstream=broker, durable_store=store)
+        transport._nats_client = FakeJetStream()
+        assert (await transport._drain_outbox_lane("other"))[0] == 1
+        assert [json.loads(payload)["event_id"] for _, payload in broker.published] == [control["event_id"]]
+        assert not store.pending_outbox(pair_id=pair, lane="other")
+        assert store.get_checkpoint(f"publisher:{pair}", "events") == control["sync_sequence"]
+
+    asyncio.run(run())

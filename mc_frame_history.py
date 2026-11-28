@@ -342,7 +342,7 @@ class ChatHistoryMixin:
                         message_id=message_id, notification_kind=notification, text=text, chat_title=title,
                         origin_client="mc")
                 except ValueError as exc:
-                    if str(exc) != "EVENT_ID_CONFLICT":
+                    if str(exc) not in {"EVENT_ID_CONFLICT", "TERMINAL_HISTORY_NOTIFICATION"}:
                         store.quarantine(str(exc), {"chat_id": owner, "turn_index": index, "role": role})
 
     @staticmethod
@@ -507,7 +507,7 @@ class ChatHistoryMixin:
                                 origin_client="mc",
                             )
                     except ValueError as exc:
-                        if str(exc) != "EVENT_ID_CONFLICT":
+                        if str(exc) not in {"EVENT_ID_CONFLICT", "TERMINAL_HISTORY_NOTIFICATION"}:
                             store.quarantine(str(exc), {"chat_id": normalized,
                                                        "turn_index": index, "role": role})
             loop = getattr(transport, "_loop", None)

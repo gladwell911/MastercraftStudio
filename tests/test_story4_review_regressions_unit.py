@@ -14,6 +14,25 @@ class _V2Transport:
     _loop = None
 
 
+class _NotificationFrame(SimpleNamespace):
+    _remote_terminal_history_chat = main.ChatFrame._remote_terminal_history_chat
+    _read_pair_id = main.ChatFrame._read_pair_id
+    _flush_chat_state_save = main.ChatFrame._flush_chat_state_save
+    _save_delayed_chat_state = main.ChatFrame._save_delayed_chat_state
+
+    def _call_after_if_alive(self, *_):
+        return False
+
+    def _refresh_chat_read_row(self, _chat_id):
+        pass
+
+    def _schedule_next_codex_tool_turn(self, *_):
+        pass
+
+    _schedule_next_kimi_tool_turn = _schedule_next_codex_tool_turn
+    _schedule_next_agy_tool_turn = _schedule_next_codex_tool_turn
+
+
 def _outbox_kinds(store: ChatStore) -> list[str]:
     return [
         json.loads(bytes(row["payload"]).decode("utf-8"))["kind"]
@@ -25,7 +44,7 @@ def test_persist_dirty_chat_turns_commits_production_user_notification_fact(tmp_
     store = ChatStore(tmp_path / "dirty-turns.db")
     store.initialize()
     store.upsert_chat({"id": "chat-user", "title": "Canonical user owner"})
-    frame = SimpleNamespace(
+    frame = _NotificationFrame(
         _chat_turn_dirty_from={"chat-user": 0},
         _remote_nats_transport=_V2Transport(),
         _current_chat_state={"id": "chat-user", "title": "untrusted UI title"},
@@ -51,7 +70,7 @@ def test_push_remote_final_answer_commits_production_assistant_notification_fact
     store.replace_turns(
             "chat-final", [{"question": "Question", "answer_md": "Canonical final", "request_status": "done"}]
     )
-    frame = SimpleNamespace(
+    frame = _NotificationFrame(
         chat_store=store,
         _remote_nats_transport=_V2Transport(),
         _current_chat_state={"id": "chat-final", "title": "untrusted UI title"},
@@ -69,7 +88,7 @@ def test_persisted_assistant_final_waits_for_done_and_uses_canonical_answer(tmp_
     store = ChatStore(tmp_path / "final-after-persist.db")
     store.initialize()
     store.upsert_chat({"id": "chat-race", "title": "Canonical race owner"})
-    frame = SimpleNamespace(
+    frame = _NotificationFrame(
         _chat_turn_dirty_from={"chat-race": 0},
         _remote_nats_transport=_V2Transport(),
         _current_chat_state={"id": "chat-race", "title": "untrusted UI title"},
@@ -106,7 +125,7 @@ def test_deferred_final_is_published_after_save_with_history_once(tmp_path):
     turn = {"question": "Question", "answer_md": main.REQUESTING_TEXT, "request_status": "pending"}
     store.replace_turns("chat-deferred", [turn])
     history_changes = []
-    frame = SimpleNamespace(
+    frame = _NotificationFrame(
         chat_store=store,
         _remote_nats_transport=_V2Transport(),
         _current_chat_state={"id": "chat-deferred", "title": "Deferred owner"},
@@ -142,7 +161,7 @@ def test_deferred_final_retries_after_notification_commit_failure(tmp_path):
         "question": "Question", "answer_md": "Final answer", "request_status": "done",
     }])
     history_changes = []
-    frame = SimpleNamespace(
+    frame = _NotificationFrame(
         chat_store=store,
         _remote_nats_transport=_V2Transport(),
         _current_chat_state={"id": "chat-retry", "title": "Retry owner"},
@@ -208,6 +227,8 @@ def test_slow_persistence_worker_defers_close_without_draining_under_live_sqlite
         _persist_execution_step=main.ChatFrame._persist_execution_step,
         chat_store=store,
     )
+
+    frame._persist_queued_execution_step = main.ChatFrame._persist_queued_execution_step.__get__(frame)
 
     assert (
         main.ChatFrame._flush_execution_step_persists_sync(

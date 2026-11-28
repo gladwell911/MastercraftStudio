@@ -245,8 +245,16 @@ class ChatStoreSchemaMixin:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('notification_feed_id',?)", (uuid.uuid4().hex,))
         conn.execute("CREATE TABLE IF NOT EXISTS notification_feed_devices (pair_id TEXT NOT NULL, device_id TEXT NOT NULL, feed_id TEXT NOT NULL, baseline INTEGER NOT NULL, processed_sequence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(pair_id,device_id,feed_id))")
-        if "feed_id" not in {row[1] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}:
-            conn.execute("ALTER TABLE notification_snapshots ADD COLUMN feed_id TEXT NOT NULL DEFAULT ''")
+        snapshot_columns = {row["name"] for row in conn.execute("PRAGMA table_info(notification_snapshots)")}
+        for column, definition in (
+            ("feed_id", "TEXT NOT NULL DEFAULT ''"),
+            ("authority_high", "INTEGER NOT NULL DEFAULT 0"),
+            ("processed_floor", "INTEGER NOT NULL DEFAULT 0"),
+            ("read_only", "INTEGER NOT NULL DEFAULT 0"),
+            ("ownership_filtered", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in snapshot_columns:
+                conn.execute(f"ALTER TABLE notification_snapshots ADD COLUMN {column} {definition}")
         if conn.execute("SELECT 1 FROM meta WHERE key='publication_progress_initialized'").fetchone() is None:
             for scope in conn.execute("SELECT DISTINCT pair_id,domain FROM publication_outbox").fetchall():
                 self._advance_publication_progress(conn, scope["pair_id"], scope["domain"])

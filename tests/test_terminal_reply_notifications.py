@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from chat_store import ChatStore
@@ -7,7 +5,7 @@ from codex_history import CodexHistoryReader
 from native_history import NativeSessionIdentity, NativeSessionSnapshot
 
 
-def test_standalone_codex_only_notifies_finals_after_successful_native_observation(tmp_path, monkeypatch):
+def test_standalone_codex_keeps_native_history_without_notification_facts(tmp_path, monkeypatch):
     import codex_history
 
     db = tmp_path / "history.db"
@@ -56,7 +54,7 @@ def test_standalone_codex_only_notifies_finals_after_successful_native_observati
     assert store.load_turns(identity.chat_id)[0]["answer_md"] == "Identical reply"
     assert notifications() == []
     old_id = store.readable_answer(identity.chat_id, turn_index=0)["message_id"]
-    with pytest.raises(ValueError, match="HISTORICAL_FINAL"):
+    with pytest.raises(ValueError, match="TERMINAL_HISTORY_NOTIFICATION"):
         store.commit_message_notification_fact(
             pair_id="default", domain="events", chat_id=identity.chat_id,
             message_id=old_id, notification_kind="assistant_final", text="ignored", chat_title="ignored",
@@ -71,28 +69,16 @@ def test_standalone_codex_only_notifies_finals_after_successful_native_observati
     assert observe(170, 180, 181)["turn_count"] == 6
     assert observe(170, 182, 183) is None
 
-    observed = {}
-    for payload in store.replay_after(pair_id="default", domain="events", sync_sequence=0):
-        fact = json.loads(payload)
-        observed[fact["body"]["message_id"]] = fact
-    assert set(observed) == {
-        store.readable_answer(identity.chat_id, turn_index=index)["message_id"] for index in (2, 5)
-    }
+    assert not store.replay_after(pair_id="default", domain="events", sync_sequence=0)
+    assert not notifications()
     assert not notifications("laptop")
     for index in (2, 5):
-        target = store.readable_answer(identity.chat_id, turn_index=index)
-        assert observed[target["message_id"]]["chat_id"] == identity.chat_id
-        assert observed[target["message_id"]]["body"] == {
-            "message_id": target["message_id"], "text": "Identical reply", "chat_title": "Native chat",
-            "answer_seq": target["answer_seq"], "generation": target["generation"],
-        }
+        assert store.readable_answer(identity.chat_id, turn_index=index) is not None
 
     store = ChatStore(db)
     store.initialize()
     assert observe(170, 190, 191) is None
-    recovered = [record for record in register("default")["records"] if record.get("kind") == "assistant_final"]
-    assert {record["event_id"] for record in recovered} == {fact["event_id"] for fact in observed.values()}
-    assert len(recovered) == len(notifications()) == 2
+    assert not any(record.get("kind") == "assistant_final" for record in register("default")["records"])
 
 
 @pytest.mark.parametrize(("stored_status", "stored_answer"), [
@@ -126,14 +112,10 @@ def test_managed_codex_restart_reuses_pending_canonical_message(tmp_path, stored
     deduped = reopened.readable_answer(identity.chat_id, turn_index=0)
     assert deduped["message_id"] == before
     assert reopened.load_turns(identity.chat_id)[0]["answer_md"] == "Complete native final"
-    events = reopened.replay_after(pair_id="laptop", domain="events", sync_sequence=0)
-    fact, = map(json.loads, events)
-    assert fact["body"]["message_id"] == before
-    assert fact["body"]["text"] == "Complete native final"
-    assert not reopened.pending_outbox(pair_id="default", lane="notification")
+    revision = reopened.get_clear_reconciliation_authority(identity.chat_id)["revision"]
     assert reopened.merge_native_history(snapshot, expected_chat_id=identity.chat_id,
-                                         expected_revision=fact["revision"]) is None
-    assert len(reopened.pending_outbox(pair_id="laptop", lane="notification")) == 1
+                                         expected_revision=revision) is None
+    assert not reopened.pending_outbox(lane="notification")
 
 
 def test_kimi_readback_tracks_the_last_complete_public_frame(tmp_path):
@@ -180,6 +162,5 @@ def test_kimi_readback_tracks_the_last_complete_public_frame(tmp_path):
     add("only-tool", 60, final_id="tool-text", with_tool=True)
     assert observe(70)["turn_count"] == 3
     assert [turn["answer_md"] for turn in store.load_turns(identity.chat_id)] == ["Identical reply"] * 3
-    payload, = store.replay_after(pair_id="laptop", domain="events", sync_sequence=0)
-    assert json.loads(payload)["body"]["message_id"] == store.readable_answer(identity.chat_id, turn_index=1)["message_id"]
-    assert not store.pending_outbox(pair_id="default", lane="notification")
+    assert store.readable_answer(identity.chat_id, turn_index=1) is not None
+    assert not store.pending_outbox(lane="notification")

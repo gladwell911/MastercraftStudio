@@ -485,9 +485,13 @@ class RemoteNatsTransport:
             for row in rows:
                 if self._stop_requested:
                     return published, False, False
+                identity = dict(pair_id=row["pair_id"], domain=row["domain"])
+                if row.get("terminal_notification"):
+                    self.durable_store.mark_outbox_acked(
+                        row["sync_sequence"], consumer_id=f"publisher:{row['pair_id']}", **identity)
+                    continue
                 if str(row.get("blocked_reason") or "").startswith("permanent:"):
                     return published, False, False
-                identity = dict(pair_id=row["pair_id"], domain=row["domain"])
                 raw = bytes(row["payload"])
                 try:
                     envelope = validate_v2_durable(decode_payload(raw))

@@ -335,3 +335,22 @@ def test_feed_only_installation_final_is_durable_before_next_recovery_pull(store
     assert len(after) == len(before) + 1
     assert all(row["payload"] == before[row["event_id"]] for row in after if row["event_id"] in before)
     assert all("notification_feed_id" not in json.loads(row["payload"]) for row in after)
+
+def test_upgrade_rejects_fully_delivered_legacy_receipt_before_first_sync(store):
+    latest = page(store, notification_feed_id=store.get_meta("notification_feed_id"))
+    assert latest["done"] and latest["high_water"] > 0
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE notification_snapshots DROP COLUMN ownership_filtered")
+
+    upgraded = ChatStore(store.db_path)
+    upgraded.initialize()
+    with pytest.raises(ValueError, match="INCOMPLETE_NOTIFICATION_SNAPSHOT"):
+        upgraded.complete_notification_sync(
+            pair_id="pair", device_id="install", incarnation="stream-a", secret="secret",
+            completion_token=latest["completion_token"],
+            notification_feed_id=latest["notification_feed_id"],
+        )
+    with upgraded._connect() as conn:
+        assert conn.execute(
+            "SELECT processed_sequence FROM notification_feed_devices WHERE pair_id='pair' AND device_id='install'"
+        ).fetchone()[0] == 0
